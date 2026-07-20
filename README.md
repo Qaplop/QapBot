@@ -251,6 +251,7 @@ migration job moves data older than the retention window from hot to history —
 |----------|-------------|----------|---------|
 | `DISCORD_TOKEN` | Production Discord bot token | Yes | - |
 | `DISCORD_TOKEN_DEV` | Development Discord bot token (for testing) | Yes | - |
+| `DISCORD_GUILD_ID` | **DEV/PROD mode switch**: your test server's guild ID enables DEV mode (DEV token/credentials, guild-scoped commands); `0` enables PROD mode (PROD token, global commands). Set it in `.env`, not as a machine-global variable — a global value leaks into every process (e.g. test runs) and takes precedence over `.env`. | No | 0 (PROD) |
 | `DISCORD_GUILD_ID_FOR_CLEANUP` | Test server guild ID for command cleanup | Yes | - |
 | `DEV_PLAYERREGISTRATION_CHANNEL_ID` | DEV-only channel ID for player registration welcome message (restricts where the message can be bumped/reposted in dev mode) | No | 0 |
 | `COC_API_EMAIL` | Clash of Clans API email (production) | Yes | - |
