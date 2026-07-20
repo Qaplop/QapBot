@@ -1,0 +1,6 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- Medium blue rounded square with moderate padding -->
+  <rect x="10" y="10" width="44" height="44" rx="10" fill="#3b82c9"/>
+  <!-- White number "1" (larger, vertically centered) -->
+  <text x="32" y="35" font-family="Arial, sans-serif" font-size="38" font-weight="bold" text-anchor="middle" dominant-baseline="middle" fill="white">1</text>
+</svg>

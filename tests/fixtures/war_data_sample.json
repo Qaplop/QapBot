@@ -1,0 +1,35 @@
+{
+  "state": "inWar",
+  "team_size": 2,
+  "attacks_per_member": 2,
+  "clan": {
+    "tag": "#CLAN1",
+    "name": "TestClan",
+    "members": [
+      {
+        "tag": "#P1",
+        "name": "Alice",
+        "townhall": 15,
+        "attacks": [
+          {"defenderTag": "#O1", "stars": 2}
+        ]
+      },
+      {
+        "tag": "#P2",
+        "name": "Bob",
+        "townhall": 14,
+        "attacks": []
+      }
+    ]
+  },
+  "opponent": {
+    "tag": "#OPP1",
+    "name": "OpponentClan",
+    "members": [
+      {"tag": "#O1", "name": "Enemy1", "townhall": 14, "attacks": []},
+      {"tag": "#O2", "name": "Enemy2", "townhall": 13, "attacks": []}
+    ]
+  },
+  "start_time": "20260101T000000.000Z",
+  "end_time": "20260102T000000.000Z"
+}

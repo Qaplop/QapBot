@@ -1,0 +1,33 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "smoke: fast offline unit smoke (no network, no Discord, no CoC)",
+    "live: DEV live smoke (network + real Discord; CoC optional depending on test)",
+    "integration: requires in-memory DB, mocked APIs",
+    "discord: requires mocked Discord client/interaction objects",
+    "e2e: end-to-end with live test bot (manual only)",
+    "slow: tests that take > 5s individually",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    # aiosqlite worker thread delivers a callback to an already-closed per-test
+    # event loop (pytest-asyncio asyncio_mode="auto" tears down the loop before
+    # the thread can complete). This is a known benign race; suppress it.
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning",
+]
+
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "qapbot/scripts/*",
+    # UI-heavy / bot-lifecycle files: ~90% Discord wiring, not unit-testable
+    "qapbot/ui_clan_management.py",
+    "QBdiscordcmds.py",
+    "QapBot.py",
+]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true

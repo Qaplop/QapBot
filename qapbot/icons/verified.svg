@@ -1,0 +1,7 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- Medium blue rounded square with moderate padding -->
+  <rect x="10" y="10" width="44" height="44" rx="10" fill="#3b82c9"/>
+  <!-- White shield with checkmark (shorter vertical) -->
+  <path d="M 28 17 L 32 16.5 L 36 17 Q 40 18 44.5 20.5 L 44.5 33 C 44.5 40 38.5 45.5 32 47.5 C 25.5 45.5 19.5 40 19.5 33 L 19.5 20.5 Q 24 18 28 17 Z" fill="white"/>
+  <path d="M 25.5 32.5 L 29.8 36.8 L 38.5 26" stroke="#3b82c9" stroke-width="3.9" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>

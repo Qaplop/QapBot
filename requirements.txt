@@ -1,0 +1,10 @@
+aiosqlite==0.22.1
+coc.py==4.0.0
+discord.py==2.7.1
+matplotlib==3.11.1
+psutil==7.2.2
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-cov==7.1.0
+python-dotenv==1.2.2
+wcwidth==0.8.2

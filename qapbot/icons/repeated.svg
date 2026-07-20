@@ -1,0 +1,10 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- Medium blue rounded square with moderate padding -->
+  <rect x="10" y="10" width="44" height="44" rx="10" fill="#3b82c9"/>
+  <!-- White circular arrows (repeat symbol) -->
+  <path d="M 25 23 C 21 25 19 28 19 32 C 19 37 24 41 28 42 M 39 41 C 43 39 45 36 45 32 C 45 27 40 23 36 22" stroke="white" stroke-width="4.5" stroke-linecap="round" fill="none"/>
+  <!-- Arrowhead at end of right curve, rotated to align with tangent -->
+  <path d="M 36 44 L 26 48 L 27 36 Z" fill="white"/>
+  <!-- Arrowhead at end of left curve, rotated to align with tangent -->
+  <path d="M 28 20 L 38 16 L 37 28 Z" fill="white"/>
+</svg>

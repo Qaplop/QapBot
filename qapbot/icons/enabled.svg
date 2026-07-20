@@ -1,0 +1,7 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- Medium-bright green rounded square with moderate padding -->
+  <rect x="10" y="10" width="44" height="44" rx="10" fill="#42b347"/>
+  <!-- White bell icon (scaled 1.5x) -->
+  <path d="M 32 15 C 26 15 21.5 19.5 21.5 25.5 L 21.5 30 C 21.5 36 18.5 39 15.5 42 L 48.5 42 C 45.5 39 42.5 36 42.5 30 L 42.5 25.5 C 42.5 19.5 38 15 32 15 Z M 27.5 45 C 27.5 47.55 29.45 49.5 32 49.5 C 34.55 49.5 36.5 47.55 36.5 45" fill="white"/>
+  <circle cx="41" cy="21" r="5.25" fill="#ffcc00"/>
+</svg>

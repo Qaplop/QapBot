@@ -1,0 +1,33 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- Medium orange rounded square with moderate padding -->
+  <rect x="10" y="10" width="44" height="44" rx="10" fill="#ea580c"/>
+  <!-- White crossed swords at 45 degrees, centered and properly overlapping, 20% larger -->
+  
+  <!-- Sword 1 (bottom-left to top-right, -45 degrees) -->
+  <g transform="rotate(-45 32 32)">
+    <!-- Handle (20% larger) -->
+    <rect x="30.548" y="45.0282" width="2.904" height="8.712" fill="white"/>
+    <!-- Crossguard (20% larger) -->
+    <rect x="25.886" y="43.1502" width="13.068" height="2.178" fill="white"/>
+    <!-- Blade with pointed tip (20% longer and wider, stretched +20% length) -->
+    <polygon points="28.6604,43.1502 35.3396,43.1502 33.5168,11.96276 32,9.96276 30.4832,11.96276" fill="white"/>
+  </g>
+  
+  <!-- Sword 2 (bottom-right to top-left, +45 degrees) -->
+  <g transform="rotate(45 32 32)">
+    <!-- Handle (20% larger) -->
+    <rect x="30.548" y="45.0282" width="2.904" height="8.712" fill="white"/>
+    <!-- Crossguard (20% larger) -->
+    <rect x="25.886" y="43.1502" width="13.068" height="2.178" fill="white"/>
+    <!-- Blade with pointed tip (20% longer and wider, stretched +20% length) -->
+    <polygon points="28.6604,43.1502 35.3396,43.1502 33.5168,11.96276 32,9.96276 30.4832,11.96276" fill="white"/>
+  </g>
+  
+  <!-- Pommels in foreground (smaller, r=1.8) -->
+  <g transform="rotate(-45 32 32)">
+    <circle cx="32" cy="53.62" r="1.98" fill="#fbbf24"/>
+  </g>
+  <g transform="rotate(45 32 32)">
+    <circle cx="32" cy="53.62" r="1.98" fill="#fbbf24"/>
+  </g>
+</svg>

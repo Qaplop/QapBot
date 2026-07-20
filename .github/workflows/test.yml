@@ -1,0 +1,58 @@
+name: QapBot Tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      NO_COC_API: "true"
+      DISCORD_TOKEN: "ci-dummy-token"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run offline smoke
+        run: python -m pytest -m "smoke" -x -q --tb=short
+
+  full-offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: smoke
+    env:
+      NO_COC_API: "true"
+      DISCORD_TOKEN: "ci-dummy-token"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run offline full (smoke + integration + discord)
+        run: python -m pytest -m "smoke or integration or discord" --tb=short
+
+      - name: Coverage (informational)
+        run: python -m pytest -m "smoke or integration or discord" --cov --cov-report=term-missing --cov-report=xml --cov-fail-under=0
+
+      - name: Upload coverage.xml
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
