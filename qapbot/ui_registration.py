@@ -1354,8 +1354,18 @@ class UnlinkConfirmView(discord.ui.View):
         player_name = self.player_data.get("player_name", "Unknown")
         
         success = await unlink_player(self.user_id, player_tag)
-        
+
         if success:
+            # STEP: ROLE SYNC
+            # Recheck clan/member/CoC roles immediately after unlinking, mirroring
+            # the post-link role sync in complete_account_linking_flow (STEP 3.5).
+            if interaction.guild:
+                try:
+                    from qapbot.guild_role_manager import sync_roles_for_user
+                    await sync_roles_for_user(interaction.guild, str(interaction.guild.id), int(self.user_id))
+                except Exception as _role_sync_e:
+                    logging.warning(f"[ROLE-SYNC] Post-unlink role sync failed for {self.user_id}: {_role_sync_e}")
+
             # Check if user still has accounts
             user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
             user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
