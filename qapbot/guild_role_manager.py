@@ -928,6 +928,9 @@ async def create_all_clan_roles(
             if c not in all_clans:
                 all_clans.append(c)
 
+    # Create roles in alphabetical order by clan name for a predictable Discord role list
+    all_clans.sort(key=lambda tag: (CACHE.get_clan_name(tag, tag) or tag).lower())
+
     result: Dict[str, Optional[str]] = {}
     for clan_tag in all_clans:
         clan_name = CACHE.get_clan_name(clan_tag, clan_tag)

@@ -1,6 +1,27 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-25 (8)
+- Changed: Member clans are now consistently shown and processed in alphabetical order
+  (by clan name, not tag) in both `MemberClansConfigurationView` and
+  `WelcomeMessageConfigView` (qapbot/ui_clan_management.py), and — most importantly — when
+  Discord clan roles are actually created:
+  - `MemberClansConfigurationView._add_clan_buttons()`: was `sorted(guild_clans)` (tag order,
+    e.g. tag "#2G..." before "#2J..." regardless of name) → now sorted by clan name.
+  - `WelcomeMessageConfigView._add_family_and_clan_buttons()`: clan buttons were in
+    `get_guild_clans_including_member_config()` order (tag-sorted) → now sorted by name.
+  - `guild_role_manager.create_all_clan_roles()`: clans were role-created in
+    member_clans-list-then-family-iteration order → now sorted alphabetically by name
+    before role creation, so newly created Discord roles land in alphabetical order.
+  - `_handle_clan_role_changes_for_guild()` (shared helper, ui_clan_management.py): iterated
+    a Python `set` (arbitrary order) when creating roles for newly-covered clans → now
+    sorted alphabetically by name.
+  - `MemberClansConfigurationView._on_apply()`'s two inline role-creation loops (newly added
+    individual clans, and clans from newly added families) → same fix, both now sorted
+    alphabetically by name before creating roles.
+  Files changed: qapbot/ui_clan_management.py, qapbot/guild_role_manager.py.
+  All 1403 tests pass.
+
 2026-07-25 (7)
 - Changed: The three previous-owner DM notifications sent when a player account is removed
   from a user (API-token ownership proof, admin override, and unverified-duplicate removal)

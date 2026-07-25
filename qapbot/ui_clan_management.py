@@ -3601,7 +3601,8 @@ async def _handle_clan_role_changes_for_guild(
     added = new_coverage - old_coverage
     removed = old_coverage - new_coverage
 
-    for clan_tag in added:
+    # Create roles in alphabetical order by clan name for a predictable Discord role list
+    for clan_tag in sorted(added, key=lambda tag: (CACHE.get_clan_name(tag, tag) or tag).lower()):  # type: ignore[arg-type]
         clan_name = CACHE.get_clan_name(clan_tag, clan_tag)  # type: ignore[arg-type]
         await guild_role_manager.create_clan_role(guild, guild_id, clan_tag, clan_name or clan_tag)
         logging.info(f"[ROLES] Auto-created clan role for {clan_tag} in guild {guild_id}")
@@ -3805,8 +3806,12 @@ class MemberClansConfigurationView(discord.ui.View):
         """Add buttons for each available clan to toggle membership."""
         from qapbot.cache_manager import CACHE
         
-        # Use guild_clans from parent ClanManagementView (single source of truth)
-        clans_to_show = sorted(self.clan_management_view.guild_clans)
+        # Use guild_clans from parent ClanManagementView (single source of truth),
+        # sorted alphabetically by clan name (not tag) for a stable, readable order
+        clans_to_show = sorted(
+            self.clan_management_view.guild_clans,
+            key=lambda tag: (CACHE.get_clan_name(tag, tag) or tag).lower()  # type: ignore[arg-type]
+        )
         
         # Calculate how many clan buttons we can show (Discord limit is 25 total)
         # Reserve buttons for control buttons, account for family buttons
@@ -4056,16 +4061,23 @@ class MemberClansConfigurationView(discord.ui.View):
 
                 roles_created = False
 
-                # Create Discord role for any newly added individual clan
-                for added_tag in new_clans_set - old_clans_set:
+                # Create Discord role for any newly added individual clan, alphabetically by name
+                newly_added_clans = sorted(
+                    new_clans_set - old_clans_set,
+                    key=lambda tag: (CACHE.get_clan_name(tag, tag) or tag).lower()  # type: ignore[arg-type]
+                )
+                for added_tag in newly_added_clans:
                     clan_name = CACHE.get_clan_name(added_tag, added_tag)  # type: ignore[arg-type]
                     await guild_role_manager.create_clan_role(interaction.guild, guild_id, added_tag, clan_name or added_tag)
                     logging.info(f"[ROLES] Auto-created clan role for {added_tag} in guild {guild_id}")
                     roles_created = True
 
-                # Create Discord roles for clans in any newly added family
+                # Create Discord roles for clans in any newly added family, alphabetically by name
                 for added_family_id in new_families_set - old_families_set:
-                    family_clans = CACHE.clan_families.get(added_family_id, {}).get("clans", [])
+                    family_clans = sorted(
+                        CACHE.clan_families.get(added_family_id, {}).get("clans", []),
+                        key=lambda tag: (CACHE.get_clan_name(tag, tag) or tag).lower()  # type: ignore[arg-type]
+                    )
                     for clan_tag in family_clans:
                         clan_name = CACHE.get_clan_name(clan_tag, clan_tag)  # type: ignore[arg-type]
                         await guild_role_manager.create_clan_role(interaction.guild, guild_id, clan_tag, clan_name or clan_tag)
@@ -6294,7 +6306,12 @@ class WelcomeMessageConfigView(discord.ui.View):
             self.add_item(button)  # type: ignore[arg-type]
             added += 1
 
-        for clan_tag in self._all_clan_tags:
+        # Clan buttons, sorted alphabetically by clan name (not tag)
+        sorted_clan_tags = sorted(
+            self._all_clan_tags,
+            key=lambda tag: (CACHE.get_clan_name(tag, tag) or tag).lower()  # type: ignore[arg-type]
+        )
+        for clan_tag in sorted_clan_tags:
             if added >= self._MAX_FAMILY_CLAN_SLOTS:
                 break
             clan_name = CACHE.get_clan_name(clan_tag, clan_tag) or clan_tag  # type: ignore[arg-type]
