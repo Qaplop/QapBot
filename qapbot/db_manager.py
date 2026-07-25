@@ -1626,6 +1626,36 @@ class WarHistoryDB:
             "CREATE INDEX IF NOT EXISTS idx_guild_member_clans_guild_id ON guild_member_clans(guild_id)"
         )
 
+        # Guild welcome-message family selections (clan-link mode, multi-select, per-family toggle)
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS guild_welcome_families (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                family_tag TEXT NOT NULL,
+                FOREIGN KEY (guild_id) REFERENCES guild_config(guild_id) ON DELETE CASCADE,
+                FOREIGN KEY (family_tag) REFERENCES clan_families(family_tag) ON DELETE CASCADE,
+                UNIQUE (guild_id, family_tag)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_guild_welcome_families_guild_id ON guild_welcome_families(guild_id)"
+        )
+
+        # Guild welcome-message individual clan selections (clan-link mode, multi-select)
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS guild_welcome_clans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                clan_tag TEXT NOT NULL,
+                FOREIGN KEY (guild_id) REFERENCES guild_config(guild_id) ON DELETE CASCADE,
+                FOREIGN KEY (clan_tag) REFERENCES clans(clan_tag) ON DELETE CASCADE,
+                UNIQUE (guild_id, clan_tag)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_guild_welcome_clans_guild_id ON guild_welcome_clans(guild_id)"
+        )
+
         # Per-clan Discord role IDs per guild (populated when clan_role_enabled)
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS guild_clan_roles (
@@ -4673,7 +4703,28 @@ class WarHistoryDB:
             (guild_id,)
         )
         clans = [c[0] for c in await clans_cursor.fetchall()]
-        
+
+        # Get welcome-message family selections (clan-link mode)
+        welcome_families_cursor = await self._conn.execute(
+            "SELECT family_tag FROM guild_welcome_families WHERE guild_id = ?",
+            (guild_id,)
+        )
+        welcome_family_tags = [f[0] for f in await welcome_families_cursor.fetchall()]
+
+        # Get welcome-message individual clan selections (clan-link mode)
+        welcome_clans_cursor = await self._conn.execute(
+            "SELECT clan_tag FROM guild_welcome_clans WHERE guild_id = ?",
+            (guild_id,)
+        )
+        welcome_clan_tags = [c[0] for c in await welcome_clans_cursor.fetchall()]
+
+        # Backward-compat: guilds configured under the old single-clan welcome_clan_tag
+        # column (before multi-select) haven't populated the new junction tables yet.
+        # Fall back to that single tag so their existing welcome message keeps working
+        # until the admin next saves via the new selector.
+        if not welcome_family_tags and not welcome_clan_tags and row["welcome_clan_tag"]:
+            welcome_clan_tags = [row["welcome_clan_tag"]]
+
         # Load per-clan role IDs
         clan_roles_cursor = await self._conn.execute(
             "SELECT clan_tag, role_id FROM guild_clan_roles WHERE guild_id = ?",
@@ -4704,6 +4755,8 @@ class WarHistoryDB:
             "welcome_message_mode": row["welcome_message_mode"] or "clan_link",
             "welcome_apply_channel_id": row["welcome_apply_channel_id"],
             "welcome_clan_tag": row["welcome_clan_tag"],
+            "welcome_clan_tags": welcome_clan_tags,
+            "welcome_family_tags": welcome_family_tags,
             "member_families": families,
             "member_clans": clans,
             "clan_roles": clan_roles
@@ -4730,6 +4783,10 @@ class WarHistoryDB:
             for clan_tag in config.get("member_clans", []):
                 await self._ensure_clan_exists(clan_tag)
             for family_tag in config.get("member_families", []):
+                await self._ensure_family_exists(family_tag)
+            for clan_tag in config.get("welcome_clan_tags", []):
+                await self._ensure_clan_exists(clan_tag)
+            for family_tag in config.get("welcome_family_tags", []):
                 await self._ensure_family_exists(family_tag)
             
             await self._conn.execute("BEGIN")
@@ -4806,6 +4863,22 @@ class WarHistoryDB:
             for clan_tag in config.get("member_clans", []):
                 await self._conn.execute(
                     "INSERT OR IGNORE INTO guild_member_clans (guild_id, clan_tag) VALUES (?, ?)",
+                    (guild_id, clan_tag)
+                )
+
+            # Delete existing welcome-message family/clan selections and re-insert
+            await self._conn.execute("DELETE FROM guild_welcome_families WHERE guild_id = ?", (guild_id,))
+            await self._conn.execute("DELETE FROM guild_welcome_clans WHERE guild_id = ?", (guild_id,))
+
+            for family_tag in config.get("welcome_family_tags", []):
+                await self._conn.execute(
+                    "INSERT OR IGNORE INTO guild_welcome_families (guild_id, family_tag) VALUES (?, ?)",
+                    (guild_id, family_tag)
+                )
+
+            for clan_tag in config.get("welcome_clan_tags", []):
+                await self._conn.execute(
+                    "INSERT OR IGNORE INTO guild_welcome_clans (guild_id, clan_tag) VALUES (?, ?)",
                     (guild_id, clan_tag)
                 )
             

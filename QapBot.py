@@ -81,7 +81,7 @@ if "Dragon Duke" not in coc.HERO_ORDER:
 import discord  # Added for Discord exception handling
 from discord.ext import commands  # Added for Bot/commands support
 from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 import signal  # added for graceful shutdown
 import time
 import QBcore
@@ -2830,33 +2830,43 @@ async def on_member_join(member: discord.Member) -> None:
             if not clan_info:
                 clan_info = t('welcome_message.no_clan_configured', guild_id=guild_id_int)
         else:
-            # Default: clan link mode
-            # Prefer explicitly configured welcome clan; fall back to first member_clan / family clan
-            main_clan_tag = config.get("welcome_clan_tag") or None
-            if not main_clan_tag:
-                member_clans = config.get("member_clans", [])
-                member_families = config.get("member_families", [])
-                if member_clans:
-                    main_clan_tag = member_clans[0]
-                elif member_families:
-                    first_family = member_families[0]
-                    family_data = CACHE.clan_families.get(first_family, {})
-                    family_clans = family_data.get("clans", [])
-                    if family_clans:
-                        main_clan_tag = family_clans[0]
+            # Default: clan link mode — one link per selected clan (individual selections
+            # plus every clan belonging to a selected family). Zero selections is allowed;
+            # the clan-link line is simply omitted from the welcome message in that case.
+            welcome_family_tags = config.get("welcome_family_tags", [])
+            welcome_clan_tags = config.get("welcome_clan_tags", [])
 
-            if main_clan_tag:
-                clan_tag_url = main_clan_tag.replace("#", "")
-                clan_link = f"<https://link.clashofclans.com/en?action=OpenClanProfile&tag={clan_tag_url}>"
-                clan_info = t('welcome_message.clan_info', guild_id=guild_id_int, clan_link=clan_link)
+            resolved_clan_tags: List[str] = []
+            _seen_tags: set[str] = set()
+            for family_id in welcome_family_tags:
+                for clan_tag in CACHE.clan_families.get(family_id, {}).get("clans", []):
+                    if clan_tag not in _seen_tags:
+                        resolved_clan_tags.append(clan_tag)
+                        _seen_tags.add(clan_tag)
+            for clan_tag in welcome_clan_tags:
+                if clan_tag not in _seen_tags:
+                    resolved_clan_tags.append(clan_tag)
+                    _seen_tags.add(clan_tag)
+
+            if resolved_clan_tags:
+                clan_link_lines = [
+                    f"<https://link.clashofclans.com/en?action=OpenClanProfile&tag={tag.replace('#', '')}>"
+                    for tag in resolved_clan_tags
+                ]
+                if len(resolved_clan_tags) == 1:
+                    clan_info = t('welcome_message.clan_info', guild_id=guild_id_int, clan_link=clan_link_lines[0])
+                else:
+                    clan_info = t('welcome_message.clan_info_plural', guild_id=guild_id_int,
+                                   clan_links="\n".join(clan_link_lines))
             else:
-                clan_info = t('welcome_message.no_clan_configured', guild_id=guild_id_int)
+                clan_info = ""
         
         # Combine message parts
         parts = [greeting]
         if register_info:
             parts.append(register_info)
-        parts.append(clan_info)
+        if clan_info:
+            parts.append(clan_info)
         welcome_message = "\n\n".join(parts)
         
         # Send message to channel

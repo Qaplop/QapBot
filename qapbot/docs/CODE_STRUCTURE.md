@@ -290,8 +290,11 @@ all rebuild/button-handler paths so the reference is never lost.
 - `_signal_shutdown_handler`: uses `loop.call_soon_threadsafe(event.set)` so SIGINT wakes the
   asyncio selector immediately (bare `event.set()` from a signal handler does NOT write to the
   self-pipe — selector stays asleep up to 300 s until the next I/O event)
-- `on_member_join`: welcome message gated on `welcome_message_enabled`; uses `welcome_clan_tag`
-  config value for clan_link mode (falls back to member_clans[0] if unset)
+- `on_member_join`: welcome message gated on `welcome_message_enabled`; for clan_link mode,
+  resolves `welcome_family_tags` (all clans in each selected family) + `welcome_clan_tags`
+  (individually selected clans), de-duplicates, and emits one clan-link line per clan
+  (`welcome_message.clan_info` for exactly one clan, `clan_info_plural` for 2+). Zero
+  selections is valid — the clan-link line is simply omitted, no fallback text shown.
 
 🟩 QBhelperfunctions.py
 - Leaderboard generation and formatting
@@ -425,11 +428,17 @@ all rebuild/button-handler paths so the reference is never lost.
 - Configuration views: ChannelConfigurationView, LanguageConfigurationView, NotificationThresholdConfigurationView
 - RoleConfigurationView: Newbie/member role assignment configuration
 - WelcomeMessageConfigView: Pending-state welcome config dialog (no DB writes until Save)
-  · Row 0: Clan dropdown (disabled in apply_channel mode)
-  · Row 1: ChannelSelect (disabled in clan_link mode)
-  · Row 2: Clan Link / Apply Channel mode toggle buttons
-  · Row 3: Save (validates config) + Cancel buttons; edits dialog in-place, no followup messages
-  · _on_toggle_welcome_message: blocks enabling if chosen mode has no clan/channel configured
+  · clan_link mode: toggle buttons for families (🏰/🏯) + individual clans (✅/➕), filling rows 0-3
+    (max 20 slots: 5 families + up to 15 clans); row 4 always has mode toggle + Save/Cancel
+  · Per-family mutual exclusion: selecting a family deselects any individually-picked clans
+    belonging to it; individually picking a clan deselects its owning family (if selected).
+    Families are independent of each other (Family A whole-selected, Family B partial clans OK)
+  · apply_channel mode: row 0 has ChannelSelect instead of family/clan buttons (`_build_items()`
+    fully rebuilds items from pending state on every mode switch/toggle)
+  · Persists to `welcome_clan_tags`/`welcome_family_tags` (multi-select, see DATABASE_ARCHITECTURE.md);
+    legacy single `welcome_clan_tag` column is read-only fallback for un-migrated guilds
+  · Save allows zero clan-link selections (welcome message just omits the clan-link line);
+    only apply_channel mode with no channel is blocked
 - Family management: CreateFamilyModal, EditFamilyView, RenameFamilyModal, AddClanModal
 - MemberClansConfigurationView: Member clan/family selection for role system
 - ClanManagementLinkAccountView: Admin account linking with notification settings

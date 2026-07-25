@@ -4530,11 +4530,20 @@ async def _format_clan_management_config(guild: discord.Guild) -> Tuple[discord.
         mode_detail = f"\n{t('ui_components.basic_config.config_welcome_apply_channel', guild_id=guild_id_int, channel=apply_channel_display)}"
     else:
         mode_label = t('ui_components.basic_config.config_welcome_mode_clan_link', guild_id=guild_id_int)
-        welcome_clan_tag = guild_config.get("welcome_clan_tag", "")
-        if welcome_clan_tag:
-            clan_data = CACHE.clan_name_cache.get(welcome_clan_tag, {})
-            clan_name = clan_data.get("name", welcome_clan_tag) if clan_data else welcome_clan_tag
-            clan_display = clan_name
+        welcome_clan_tags = guild_config.get("welcome_clan_tags", [])
+        welcome_family_tags = guild_config.get("welcome_family_tags", [])
+        selection_lines = []
+        for family_id in welcome_family_tags:
+            family_data = CACHE.clan_families.get(family_id, {})
+            family_name = family_data.get("name", family_id)
+            clan_count = len(family_data.get("clans", []))
+            selection_lines.append(f"🏰 {family_name} ({clan_count} clans)")
+        for clan_tag in welcome_clan_tags:
+            clan_data = CACHE.clan_name_cache.get(clan_tag, {})
+            clan_name = clan_data.get("name", clan_tag) if clan_data else clan_tag
+            selection_lines.append(f"• {clan_name}")
+        if selection_lines:
+            clan_display = "\n".join(selection_lines)
         else:
             clan_display = f"❌ {t('ui_components.basic_config.config_channel_not_set', guild_id=guild_id_int)}"
         mode_detail = f"\n{t('ui_components.basic_config.config_welcome_clan', guild_id=guild_id_int, clan=clan_display)}"

@@ -86,9 +86,17 @@ The `get_clan_attack_history_sync()` method in `db_manager.py` aggregates `SUM(s
   Key columns: language, role IDs (newbie/member/coc roles), registration config,
   war notification config, welcome message config:
   `welcome_message_enabled` (BOOLEAN DEFAULT 0), `welcome_message_mode` (TEXT DEFAULT 'clan_link'),
-  `welcome_apply_channel_id` (TEXT), `welcome_clan_tag` (TEXT)
+  `welcome_apply_channel_id` (TEXT), `welcome_clan_tag` (TEXT, legacy single-clan column —
+  superseded by `guild_welcome_clans`/`guild_welcome_families` below; kept as a read-only
+  fallback in `get_guild_config()` for guilds not yet re-saved under the new multi-select UI)
 - `guild_member_families` - Junction: guilds ↔ families
 - `guild_member_clans` - Junction: guilds ↔ clans
+- `guild_welcome_families` - Junction: guilds ↔ families selected (as a whole) for the welcome
+  message's clan-link mode. Independent from `guild_member_families` (member-role granting).
+- `guild_welcome_clans` - Junction: guilds ↔ individually-selected clans for the welcome
+  message's clan-link mode. A clan and its owning family are mutually exclusive per guild
+  (enforced by `WelcomeMessageConfigView`, not by a DB constraint) — different families are
+  independent of each other.
 - `guild_clan_roles` - Per-clan Discord role IDs scoped to a guild (one role id per
   clan_tag within a guild_id); backs per-clan role assignment.
 - `subscriptions` - Channel subscriptions for updates

@@ -1,6 +1,32 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-25
+- Changed: Welcome message clan-link mode now supports selecting multiple clans and/or
+  multiple clan families (previously a single-clan dropdown). Per-family mutual exclusion:
+  selecting an entire family deselects any individually-picked clans that belong to it, and
+  individually picking a clan deselects its owning family (if selected) — but families are
+  independent of each other (e.g. Family A can be whole-selected while Family B has 2 of 5
+  clans picked individually). The resulting welcome message shows one clan-profile link per
+  resolved clan (family members + individually selected clans, de-duplicated).
+  - DB: new junction tables `guild_welcome_families` / `guild_welcome_clans` (mirrors the
+    existing `guild_member_families`/`guild_member_clans` pattern). `get_guild_config()` falls
+    back to the legacy single `welcome_clan_tag` column (read-only) for guilds not yet
+    re-saved under the new UI, so existing configurations keep working. `save_guild_config()`
+    writes/clears both new tables on every save.
+  - UI: `WelcomeMessageConfigView` (qapbot/ui_clan_management.py) replaced the single-select
+    clan dropdown with toggle buttons (🏰/🏯 for families, ✅/➕ for clans, up to 20 slots
+    across rows 0-3; row 4 always has the Clan Link/Apply Channel mode toggle + Save/Cancel).
+    Enabling the welcome message with zero clan-link selections is now allowed — the
+    clan-link line is simply omitted from the welcome message (only apply_channel mode with
+    no channel configured is still blocked).
+  - i18n: added `welcome_message.clan_info_plural` (en/de) for the multi-clan-link case.
+  - Files changed: qapbot/db_manager.py, qapbot/ui_clan_management.py,
+    qapbot/QBdiscocmdshelper.py (_format_clan_management_config display), QapBot.py
+    (on_member_join clan-link resolution), qapbot/translations/{en,de}.json,
+    qapbot/docs/CODE_STRUCTURE.md, qapbot/docs/DATABASE_ARCHITECTURE.md.
+  All 1403 tests pass.
+
 2026-07-18 (12)
 - Changed: reorganized `/help` command list into a 4th category. Added a new
   "🔍 Clan / Player Info & Analysis" section positioned between "Leaderboards & Subscriptions"

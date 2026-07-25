@@ -95,7 +95,7 @@
   "welcome_message": {
     "greeting": "Willkommen {user_mention} bei **{server_name}**! 🎉\n\nWir freuen uns, dich hier zu haben!\nDu bist Mitglied Nummer {member_count} auf diesem Server.",
     "register_info": "Du kannst zu {channel_mention} gehen, um deine Clash of Clans Spielerkonten zu registrieren und den Mitgliedsstatus auf diesem Server zu erhalten.",
-    "clan_info": "Falls du noch kein Mitglied unseres Clans bist, kannst du uns hier finden:\n{clan_link}",    "apply_channel_info": "Du kannst dich f\u00fcr unseren Clan in {channel_mention} bewerben.",    "apply_channel_info_plural": "Du kannst dich f\u00fcr unsere Clans in {channel_mention} bewerben.",    "no_channel_configured": "Bitte frage einen Server-Administrator, wo du deine Spielerkonten registrieren kannst.",
+    "clan_info": "Falls du noch kein Mitglied unseres Clans bist, kannst du uns hier finden:\n{clan_link}",    "clan_info_plural": "Falls du noch kein Mitglied eines unserer Clans bist, kannst du uns hier finden:\n{clan_links}",    "apply_channel_info": "Du kannst dich f\u00fcr unseren Clan in {channel_mention} bewerben.",    "apply_channel_info_plural": "Du kannst dich f\u00fcr unsere Clans in {channel_mention} bewerben.",    "no_channel_configured": "Bitte frage einen Server-Administrator, wo du deine Spielerkonten registrieren kannst.",
     "no_clan_configured": "Bitte frage einen Server-Administrator nach dem Clan-Link."
   },
   "warnotifications": {

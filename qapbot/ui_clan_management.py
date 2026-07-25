@@ -2206,12 +2206,13 @@ class ClanManagementView(discord.ui.View):
         guild_config = CACHE.server_config.get(guild_id_str, {})
         current_enabled = guild_config.get("welcome_message_enabled", False)
 
-        # Consistency check: block enabling if no clan/channel is configured
+        # Consistency check: block enabling if apply_channel mode has no channel configured.
+        # Clan-link mode is allowed with zero clans/families selected — the welcome message
+        # simply omits the clan-link line in that case.
         if not current_enabled:
             mode = guild_config.get("welcome_message_mode", "clan_link")
-            no_clan = mode == "clan_link" and not guild_config.get("welcome_clan_tag", "")
             no_channel = mode == "apply_channel" and not guild_config.get("welcome_apply_channel_id", "")
-            if no_clan or no_channel:
+            if no_channel:
                 await interaction.followup.send(
                     t('ui_components.basic_config.welcome_enable_blocked', guild_id=guild_id_int),
                     ephemeral=True
@@ -6185,11 +6186,20 @@ class SwitchViewContinueView(discord.ui.View):
 
 
 class WelcomeMessageConfigView(discord.ui.View):
-    """Ephemeral view for configuring the welcome message mode and apply/ticket channel.
+    """Ephemeral view for configuring the welcome message mode, clan-link selection and apply/ticket channel.
+
+    Clan-link mode supports multi-selecting entire clan families and/or individual clans via
+    toggle buttons. Mutual exclusion is enforced per-family: selecting a family deselects any
+    individually-selected clans that belong to it, and individually selecting a clan that
+    belongs to a currently-selected family deselects that family. Different families are fully
+    independent of each other (e.g. Family A selected as a whole while Family B has 2 of 5
+    clans picked individually).
 
     Changes are held in pending instance variables and only written to CACHE/DB when Save is clicked.
     Cancel or timeout discards all pending changes.
     """
+
+    _MAX_FAMILY_CLAN_SLOTS = 20  # 4 rows x 5 buttons, row 4 reserved for mode/save/cancel
 
     def __init__(
         self,
@@ -6205,59 +6215,122 @@ class WelcomeMessageConfigView(discord.ui.View):
         self.config_message: Optional[discord.Message] = None
 
         from qapbot.cache_manager import CACHE
-        from qapbot.i18n import t
         from qapbot.QBdiscocmdshelper import get_guild_clans_including_member_config
         guild_id = guild.id
         guild_config = CACHE.server_config.get(str(guild_id), {})
 
         # Pending state — only written to DB on Save
         self._pending_mode: str = guild_config.get("welcome_message_mode", "clan_link")
-        self._pending_clan_tag: str = guild_config.get("welcome_clan_tag", "")
-        self._pending_channel_id: str = guild_config.get("welcome_apply_channel_id", "")
+        self._pending_clan_tags: List[str] = list(guild_config.get("welcome_clan_tags", []))
+        self._pending_family_tags: List[str] = list(guild_config.get("welcome_family_tags", []))
+        self._pending_channel_id: str = guild_config.get("welcome_apply_channel_id", "") or ""
 
-        # Row 0: clan selector (enabled in clan_link mode only)
-        clan_tags = get_guild_clans_including_member_config(guild_id)
-        if clan_tags:
-            clan_options: List[discord.SelectOption] = []
-            for tag in clan_tags[:25]:  # Discord limit: 25 options
-                clan_data = CACHE.clan_name_cache.get(tag, {})
-                clan_name = clan_data.get("name", tag) if clan_data else tag
-                clan_options.append(discord.SelectOption(
-                    label=clan_name[:100],
-                    value=tag,
-                    default=(tag == self._pending_clan_tag)
-                ))
-            clan_select = discord.ui.Select(
-                placeholder=t('ui_components.basic_config.welcome_clan_select_placeholder', guild_id=guild_id),
-                options=clan_options,
-                min_values=1,
-                max_values=1,
-                custom_id="welcome_clan_select",
-                disabled=(self._pending_mode != "clan_link"),
-                row=0
+        # Universe of selectable families (attached to this guild) and clans
+        member_family_ids = guild_config.get("member_families", [])
+        self._families: Dict[str, Dict[str, Any]] = {
+            fid: CACHE.clan_families[fid] for fid in member_family_ids if fid in CACHE.clan_families
+        }
+        # Also surface any pending family selections not (any longer) in member_families,
+        # so a previously-saved selection remains visible/toggleable instead of disappearing.
+        for fid in self._pending_family_tags:
+            if fid not in self._families and fid in CACHE.clan_families:
+                self._families[fid] = CACHE.clan_families[fid]
+
+        self._all_clan_tags: List[str] = get_guild_clans_including_member_config(guild_id)
+
+        # Map clan_tag -> owning family_id, restricted to families actually shown here
+        self._family_of_clan: Dict[str, str] = {}
+        for fid, fdata in self._families.items():
+            for clan_tag in fdata.get("clans", []):
+                self._family_of_clan[clan_tag] = fid
+
+        self._build_items()
+
+    # ── Item construction ───────────────────────────────────────────────
+
+    def _build_items(self) -> None:
+        """Rebuild all view items from current pending state."""
+        self.clear_items()
+        if self._pending_mode == "clan_link":
+            self._add_family_and_clan_buttons()
+        else:
+            self._add_channel_select()
+        self._add_mode_and_control_buttons()
+
+    def _add_family_and_clan_buttons(self) -> None:
+        """Add toggle buttons for families (row 0..3) followed by individual clans, filling rows 0-3."""
+        from qapbot.cache_manager import CACHE
+
+        state = {"row": 0, "col": 0}
+
+        def next_row() -> int:
+            r = state["row"]
+            state["col"] += 1
+            if state["col"] == 5:
+                state["col"] = 0
+                state["row"] += 1
+            return r
+
+        added = 0
+        for family_id, family_data in list(self._families.items())[:5]:
+            if added >= self._MAX_FAMILY_CLAN_SLOTS:
+                break
+            family_name = family_data.get("name", "Unknown Family")
+            selected = family_id in self._pending_family_tags
+            display_name = family_name[:25] + "..." if len(family_name) > 25 else family_name
+            button = discord.ui.Button(
+                label=display_name,
+                emoji="🏰" if selected else "🏯",
+                style=discord.ButtonStyle.success if selected else discord.ButtonStyle.secondary,
+                custom_id=f"welcome_family_{family_id}",
+                row=next_row()
             )
-            clan_select.callback = self._on_clan_select  # type: ignore[assignment]
-            self.add_item(clan_select)  # type: ignore[arg-type]
+            button.callback = self._make_family_toggle_callback(family_id)  # type: ignore[assignment]
+            self.add_item(button)  # type: ignore[arg-type]
+            added += 1
 
-        # Row 1: channel selector (enabled in apply_channel mode only)
+        for clan_tag in self._all_clan_tags:
+            if added >= self._MAX_FAMILY_CLAN_SLOTS:
+                break
+            clan_name = CACHE.get_clan_name(clan_tag, clan_tag) or clan_tag  # type: ignore[arg-type]
+            selected = clan_tag in self._pending_clan_tags
+            display_name = clan_name[:30] + "..." if len(clan_name) > 30 else clan_name
+            button = discord.ui.Button(
+                label=display_name,
+                emoji="✅" if selected else "➕",
+                style=discord.ButtonStyle.success if selected else discord.ButtonStyle.secondary,
+                custom_id=f"welcome_clan_{clan_tag}",
+                row=next_row()
+            )
+            button.callback = self._make_clan_toggle_callback(clan_tag)  # type: ignore[assignment]
+            self.add_item(button)  # type: ignore[arg-type]
+            added += 1
+
+    def _add_channel_select(self) -> None:
+        """Add the apply/ticket channel selector (row 0), shown only in apply_channel mode."""
+        from qapbot.i18n import t
+        guild_id = self.guild.id
         channel_select = discord.ui.ChannelSelect(
             placeholder=t('ui_components.basic_config.welcome_channel_select_placeholder', guild_id=guild_id),
             min_values=1,
             max_values=1,
             channel_types=[discord.ChannelType.text],
             custom_id="welcome_apply_channel_select",
-            disabled=(self._pending_mode != "apply_channel"),
-            row=1
+            row=0
         )
         channel_select.callback = self._on_channel_select  # type: ignore[assignment]
         self.add_item(channel_select)  # type: ignore[arg-type]
 
-        # Row 2: mode toggle buttons (highlighted = active)
+    def _add_mode_and_control_buttons(self) -> None:
+        """Add mode toggle + Save/Cancel buttons, always on row 4."""
+        from qapbot.i18n import t
+        guild_id = self.guild.id
+
         clan_link_btn = discord.ui.Button(
             label=t('ui_components.basic_config.config_welcome_mode_clan_link', guild_id=guild_id),
             style=discord.ButtonStyle.success if self._pending_mode == "clan_link" else discord.ButtonStyle.secondary,
             custom_id="welcome_mode_clan_link",
-            row=2
+            row=4
         )
         clan_link_btn.callback = self._on_mode_clan_link  # type: ignore[assignment]
         self.add_item(clan_link_btn)  # type: ignore[arg-type]
@@ -6266,17 +6339,16 @@ class WelcomeMessageConfigView(discord.ui.View):
             label=t('ui_components.basic_config.config_welcome_mode_apply_channel', guild_id=guild_id),
             style=discord.ButtonStyle.success if self._pending_mode == "apply_channel" else discord.ButtonStyle.secondary,
             custom_id="welcome_mode_apply_channel",
-            row=2
+            row=4
         )
         apply_channel_btn.callback = self._on_mode_apply_channel  # type: ignore[assignment]
         self.add_item(apply_channel_btn)  # type: ignore[arg-type]
 
-        # Row 3: Save / Cancel
         save_btn = discord.ui.Button(
             label=t('ui_components.basic_config.welcome_save', guild_id=guild_id),
             style=discord.ButtonStyle.success,
             custom_id="welcome_save",
-            row=3
+            row=4
         )
         save_btn.callback = self._on_save  # type: ignore[assignment]
         self.add_item(save_btn)  # type: ignore[arg-type]
@@ -6285,12 +6357,12 @@ class WelcomeMessageConfigView(discord.ui.View):
             label=t('ui_components.basic_config.welcome_cancel', guild_id=guild_id),
             style=discord.ButtonStyle.secondary,
             custom_id="welcome_cancel",
-            row=3
+            row=4
         )
         cancel_btn.callback = self._on_cancel  # type: ignore[assignment]
         self.add_item(cancel_btn)  # type: ignore[arg-type]
 
-    # ── Sync helper ────────────────────────────────────────────────────
+    # ── Display helper ───────────────────────────────────────────────────
 
     def _build_header_content(self, guild_id_int: int, error: str = "") -> str:
         """Return the dialog message content built from current pending state."""
@@ -6305,12 +6377,18 @@ class WelcomeMessageConfigView(discord.ui.View):
         not_set = t('ui_components.basic_config.config_channel_not_set', guild_id=guild_id_int)
 
         if self._pending_mode == "clan_link":
-            if self._pending_clan_tag:
-                clan_data = CACHE.clan_name_cache.get(self._pending_clan_tag, {})
-                clan_name = clan_data.get("name", self._pending_clan_tag) if clan_data else self._pending_clan_tag
-                detail = t('ui_components.basic_config.config_welcome_clan', guild_id=guild_id_int, clan=clan_name)
-            else:
-                detail = t('ui_components.basic_config.config_welcome_clan', guild_id=guild_id_int, clan=not_set)
+            lines: List[str] = []
+            for family_id in self._pending_family_tags:
+                family_data = self._families.get(family_id) or CACHE.clan_families.get(family_id, {})
+                family_name = family_data.get("name", family_id)
+                clan_count = len(family_data.get("clans", []))
+                lines.append(f"🏰 {family_name} ({clan_count} clans)")
+            for clan_tag in self._pending_clan_tags:
+                clan_data = CACHE.clan_name_cache.get(clan_tag, {})
+                clan_name = clan_data.get("name", clan_tag) if clan_data else clan_tag
+                lines.append(f"• {clan_name}")
+            selection_display = "\n".join(lines) if lines else not_set
+            detail = t('ui_components.basic_config.config_welcome_clan', guild_id=guild_id_int, clan=selection_display)
         else:
             apply_display = not_set
             if self._pending_channel_id:
@@ -6332,23 +6410,6 @@ class WelcomeMessageConfigView(discord.ui.View):
             content += f"\n\n⚠️ {error}"
         return content
 
-    def _sync_item_states(self) -> None:
-        """Update button styles and select disabled states in-place from pending."""
-        for item in self.children:
-            if not hasattr(item, 'custom_id'):
-                continue
-            cid = item.custom_id  # type: ignore[union-attr]
-            if cid == "welcome_mode_clan_link":
-                item.style = discord.ButtonStyle.success if self._pending_mode == "clan_link" else discord.ButtonStyle.secondary  # type: ignore[union-attr]
-            elif cid == "welcome_mode_apply_channel":
-                item.style = discord.ButtonStyle.success if self._pending_mode == "apply_channel" else discord.ButtonStyle.secondary  # type: ignore[union-attr]
-            elif cid == "welcome_clan_select":
-                item.disabled = (self._pending_mode != "clan_link")  # type: ignore[union-attr]
-                for opt in item.options:  # type: ignore[union-attr]
-                    opt.default = (opt.value == self._pending_clan_tag)
-            elif cid == "welcome_apply_channel_select":
-                item.disabled = (self._pending_mode != "apply_channel")  # type: ignore[union-attr]
-
     async def _push_update(self, guild_id_int: int, error: str = "") -> None:
         """Edit config_message in-place with current pending state."""
         content = self._build_header_content(guild_id_int, error=error)
@@ -6360,26 +6421,46 @@ class WelcomeMessageConfigView(discord.ui.View):
 
     # ── Interaction callbacks ───────────────────────────────────────────
 
-    async def _on_clan_select(self, interaction: discord.Interaction) -> None:
-        """Update pending clan selection and switch pending mode to clan_link."""
-        await interaction.response.defer(thinking=False, ephemeral=False)
-        if not interaction.guild:
-            return
-        self._pending_clan_tag = interaction.data['values'][0]  # type: ignore[index]
-        self._pending_mode = "clan_link"
-        self._pending_channel_id = ""
-        self._sync_item_states()
-        await self._push_update(interaction.guild.id)
+    def _make_family_toggle_callback(self, family_id: str):
+        """Create callback toggling an entire family; deselects its individually-picked clans."""
+        async def callback(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(thinking=False, ephemeral=False)
+            if not interaction.guild:
+                return
+            if family_id in self._pending_family_tags:
+                self._pending_family_tags.remove(family_id)
+            else:
+                self._pending_family_tags.append(family_id)
+                family_clan_set = set(self._families.get(family_id, {}).get("clans", []))
+                self._pending_clan_tags = [c for c in self._pending_clan_tags if c not in family_clan_set]
+            self._build_items()
+            await self._push_update(interaction.guild.id)
+        return callback
+
+    def _make_clan_toggle_callback(self, clan_tag: str):
+        """Create callback toggling an individual clan; deselects its owning family, if selected."""
+        async def callback(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(thinking=False, ephemeral=False)
+            if not interaction.guild:
+                return
+            if clan_tag in self._pending_clan_tags:
+                self._pending_clan_tags.remove(clan_tag)
+            else:
+                self._pending_clan_tags.append(clan_tag)
+                owning_family = self._family_of_clan.get(clan_tag)
+                if owning_family and owning_family in self._pending_family_tags:
+                    self._pending_family_tags.remove(owning_family)
+            self._build_items()
+            await self._push_update(interaction.guild.id)
+        return callback
 
     async def _on_channel_select(self, interaction: discord.Interaction) -> None:
-        """Update pending channel selection and switch pending mode to apply_channel."""
+        """Update pending channel selection."""
         await interaction.response.defer(thinking=False, ephemeral=False)
         if not interaction.guild:
             return
         self._pending_channel_id = str(interaction.data['values'][0])  # type: ignore[index]
-        self._pending_mode = "apply_channel"
-        self._pending_clan_tag = ""
-        self._sync_item_states()
+        self._build_items()
         await self._push_update(interaction.guild.id)
 
     async def _on_mode_clan_link(self, interaction: discord.Interaction) -> None:
@@ -6389,16 +6470,12 @@ class WelcomeMessageConfigView(discord.ui.View):
         await self._set_pending_mode(interaction, "apply_channel")
 
     async def _set_pending_mode(self, interaction: discord.Interaction, mode: str) -> None:
-        """Switch pending mode and clear the opposing pending value."""
+        """Switch pending mode. Prior clan/family/channel selections are preserved either way."""
         await interaction.response.defer(thinking=False, ephemeral=False)
         if not interaction.guild:
             return
         self._pending_mode = mode
-        if mode == "clan_link":
-            self._pending_channel_id = ""
-        else:
-            self._pending_clan_tag = ""
-        self._sync_item_states()
+        self._build_items()
         await self._push_update(interaction.guild.id)
 
     async def _on_save(self, interaction: discord.Interaction) -> None:
@@ -6413,13 +6490,8 @@ class WelcomeMessageConfigView(discord.ui.View):
         guild_id_str = str(interaction.guild.id)
         guild_id_int = interaction.guild.id
 
-        # Consistency check before writing
-        if self._pending_mode == "clan_link" and not self._pending_clan_tag:
-            await self._push_update(
-                guild_id_int,
-                error=t('ui_components.basic_config.welcome_error_no_clan', guild_id=guild_id_int)
-            )
-            return
+        # Consistency check before writing. Clan-link mode with zero clans/families selected
+        # is allowed — the welcome message simply omits the clan-link line in that case.
         if self._pending_mode == "apply_channel" and not self._pending_channel_id:
             await self._push_update(
                 guild_id_int,
@@ -6431,12 +6503,11 @@ class WelcomeMessageConfigView(discord.ui.View):
         if guild_id_str not in CACHE.server_config:
             CACHE.server_config[guild_id_str] = {}
         CACHE.server_config[guild_id_str]["welcome_message_mode"] = self._pending_mode
-        if self._pending_mode == "clan_link":
-            CACHE.server_config[guild_id_str]["welcome_clan_tag"] = self._pending_clan_tag
-            CACHE.server_config[guild_id_str].pop("welcome_apply_channel_id", None)
-        else:
-            CACHE.server_config[guild_id_str]["welcome_apply_channel_id"] = self._pending_channel_id
-            CACHE.server_config[guild_id_str].pop("welcome_clan_tag", None)
+        CACHE.server_config[guild_id_str]["welcome_clan_tags"] = list(self._pending_clan_tags)
+        CACHE.server_config[guild_id_str]["welcome_family_tags"] = list(self._pending_family_tags)
+        CACHE.server_config[guild_id_str]["welcome_apply_channel_id"] = self._pending_channel_id or None
+        # Legacy single-clan column is no longer used going forward.
+        CACHE.server_config[guild_id_str].pop("welcome_clan_tag", None)
         await CACHE.persist_server_config(guild_id_str)
 
         # Refresh main config embed
