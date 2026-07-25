@@ -957,6 +957,22 @@ async def get_mode_autocomplete_choices(
     
     return choices[:max_choices]
 
+
+def _extract_clan_and_coc_role(player_obj) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolve (current_clan_tag, coc_role) from a coc.py Player object.
+
+    coc_role uses the same mapping as the periodic sync (coc_cache.py): Role.name gives
+    "member"/"elder"/"co_leader"/"leader" — co_leader is remapped to "coLeader" to match
+    COC_ROLE_PRIORITY in guild_role_manager.py.
+    """
+    current_clan_tag = player_obj.clan.tag if player_obj.clan else None
+    raw_role = getattr(player_obj, "role", None)
+    raw_role_name = getattr(raw_role, "name", None) if raw_role else None
+    coc_role = ("coLeader" if raw_role_name == "co_leader" else raw_role_name) if raw_role_name else None
+    return current_clan_tag, coc_role
+
+
 async def _link_player_to_user(
     target_user_id: int,
     player_tag_raw: str,
@@ -1169,6 +1185,20 @@ async def _link_player_to_user(
         # SECURITY: Always reset verified status to False for account theft protection
         unassigned_player["verified"] = False
 
+        # Refresh live CoC data before restoring — the UNASSIGNED pool is excluded from the
+        # periodic per-clan sync (coc_cache.py skips "UNASSIGNED"), so th_level/
+        # current_clan_tag/coc_role can be stale or (for older entries) never set at all.
+        # Without this, the instant sync_roles_for_user() right after restore has nothing
+        # to assign the CoC/clan role from. Best-effort: keep stale values on API failure.
+        try:
+            restored_player_obj = await CACHE.get_player(normalized_tag)
+            if restored_player_obj:
+                if hasattr(restored_player_obj, "town_hall"):
+                    unassigned_player["th_level"] = restored_player_obj.town_hall
+                unassigned_player["current_clan_tag"], unassigned_player["coc_role"] = _extract_clan_and_coc_role(restored_player_obj)
+        except Exception as api_error:
+            logging.warning(f"Could not refresh live CoC data for {normalized_tag} during UNASSIGNED restore: {api_error}")
+
         # Ensure target user entry exists only now that mutation is required
         target_entry = CACHE.user_accounts.get(account_tag)
         if not isinstance(target_entry, dict):
@@ -1210,7 +1240,7 @@ async def _link_player_to_user(
         
         player_name = player_obj.name if hasattr(player_obj, "name") else "Unknown"
         th_level = player_obj.town_hall if hasattr(player_obj, "town_hall") else None
-        current_clan_tag = player_obj.clan.tag if player_obj.clan else None
+        current_clan_tag, coc_role = _extract_clan_and_coc_role(player_obj)
     except Exception as api_error:
         from qapbot.i18n import t
         logging.warning(f"Failed to fetch player info for {normalized_tag}: {api_error}")
@@ -1229,10 +1259,11 @@ async def _link_player_to_user(
 
     target_players.append({
         "player_tag": normalized_tag,  # Database uses player_tag field
-        "player_name": player_name, 
+        "player_name": player_name,
         "verified": False,
         "th_level": th_level,
-        "current_clan_tag": current_clan_tag
+        "current_clan_tag": current_clan_tag,
+        "coc_role": coc_role
     })
     await CACHE.persist_user(account_tag)
     
@@ -1641,7 +1672,42 @@ async def complete_account_linking_flow(
     
     player_name = player_entry.get("player_name", "Unknown")
     is_verified = player_entry.get("verified", False)
-    
+
+    async def _assign_and_sync_roles_for_link() -> None:
+        """STEP 2.5: member role assignment + CoC/clan role sync.
+
+        SIMPLE mode doesn't gate roles on verification, so this must run right after
+        linking (not deferred until the user interacts with the optional API-verification
+        prompt) — called both here, before that prompt is shown, and again below for the
+        normal (no-prompt) path. Safe to call twice: assign_member_role/sync_roles_for_user
+        are idempotent.
+        """
+        if not interaction.guild:
+            return
+        should_assign_member_role = False
+        _linking_guild_id_str = str(interaction.guild.id)
+        _member_role_strict: bool = CACHE.server_config.get(_linking_guild_id_str, {}).get("member_role_strict", False)
+
+        if not _member_role_strict:
+            # SIMPLE mode: any linked account qualifies
+            should_assign_member_role = True
+        elif (api_token_override or is_verified or (api_token and player_entry.get("verified", False))) or admin_override:
+            # STRICT mode: require API verification or admin override
+            should_assign_member_role = True
+
+        if should_assign_member_role:
+            player_clan_tag = player_entry.get("current_clan_tag")
+            try:
+                await assign_member_role(interaction.guild, target_user_id, player_name, player_clan_tag)
+            except Exception as e:
+                logging.error(f"Failed to assign member role to user {target_user_id}: {e}")
+
+        try:
+            from qapbot.guild_role_manager import sync_roles_for_user
+            await sync_roles_for_user(interaction.guild, _linking_guild_id_str, target_user_id)
+        except Exception as _role_sync_e:
+            logging.warning(f"[ROLE-SYNC] Post-link role sync failed for {target_user_id}: {_role_sync_e}")
+
     # STEP 2: API VERIFICATION
     verification_message = None
     
@@ -1683,6 +1749,10 @@ async def complete_account_linking_flow(
             # Return failure status - do NOT continue to notification prompt
             return False, verification_message
     elif show_api_prompt and not is_verified:
+        # SIMPLE mode doesn't gate roles on verification — assign/sync now instead of
+        # making the user wait for a skip/verify click just to get their roles.
+        await _assign_and_sync_roles_for_link()
+
         # Show API verification prompt for unverified players
         # Notification check will happen in the button callbacks (verify/skip)
         from qapbot.ui_registration import ApiVerificationPromptView
@@ -1715,32 +1785,9 @@ async def complete_account_linking_flow(
         # Return early - notification check will happen after user interacts with API prompt
         return True, link_msg
     
-    # STEP 2.5: ROLE ASSIGNMENT
-    # Assign member role if:
-    # SIMPLE mode: player is linked to a player in a member clan (no verification needed)
-    # STRICT mode: player is API-verified (or admin_override)
-    # In both modes: player must be in a member clan/family
-    if interaction.guild:
-        should_assign_member_role = False
-        _linking_guild_id_str = str(interaction.guild.id)
-        _member_role_strict: bool = CACHE.server_config.get(_linking_guild_id_str, {}).get("member_role_strict", False)
+    # STEP 2.5: ROLE ASSIGNMENT + CoC/CLAN ROLE SYNC
+    await _assign_and_sync_roles_for_link()
 
-        if not _member_role_strict:
-            # SIMPLE mode: any linked account qualifies
-            should_assign_member_role = True
-        elif (api_token_override or is_verified or (api_token and player_entry.get("verified", False))) or admin_override:
-            # STRICT mode: require API verification or admin override
-            should_assign_member_role = True
-            
-        if should_assign_member_role:
-            # Get player's current clan tag
-            player_clan_tag = player_entry.get("current_clan_tag")
-            
-            try:
-                await assign_member_role(interaction.guild, target_user_id, player_name, player_clan_tag)
-            except Exception as e:
-                logging.error(f"Failed to assign member role to user {target_user_id}: {e}")
-    
     # STEP 3: NOTIFICATION CHECK (only if we didn't show API prompt and skip not requested)
     # Combine registration message and verification message if both exist
     combined_message = link_msg
@@ -1767,16 +1814,6 @@ async def complete_account_linking_flow(
                 await interaction.followup.send(combined_message, ephemeral=True)
             else:
                 await interaction.response.send_message(combined_message, ephemeral=True)
-
-    # STEP 3.5: CoC + CLAN ROLE SYNC
-    # Run immediately after linking so newly-registered users get CoC and clan roles
-    # without waiting for the periodic background sync (up to 5 min).
-    if interaction.guild:
-        try:
-            from qapbot.guild_role_manager import sync_roles_for_user
-            await sync_roles_for_user(interaction.guild, str(interaction.guild.id), target_user_id)
-        except Exception as _role_sync_e:
-            logging.warning(f"[ROLE-SYNC] Post-link role sync failed for {target_user_id}: {_role_sync_e}")
 
     return True, combined_message
 

@@ -1,6 +1,29 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-25 (12)
+- Fixed: Re-linking an account previously moved to the UNASSIGNED pool (unlink then relink)
+  never got a CoC in-game role, since that pool is excluded from the periodic per-clan sync
+  and `coc_role`/`current_clan_tag`/`th_level` could be stale or unset. Restore path in
+  `_link_player_to_user()` now refetches live player data before restoring. Extracted the
+  clan/role resolution into `_extract_clan_and_coc_role()`, shared with the fresh-link path.
+  File: qapbot/QBdiscocmdshelper.py. 1406 tests pass (2 pre-existing unrelated failures).
+
+2026-07-25 (11)
+- Fixed: In SIMPLE (non-strict) mode, role assignment/sync on link was deferred until the
+  user clicked skip/verify on the optional API-verification prompt, instead of running right
+  after linking. `complete_account_linking_flow()` now runs role assignment + sync before
+  that prompt is shown (extracted into `_assign_and_sync_roles_for_link()`, also reused for
+  the normal no-prompt path). File: qapbot/QBdiscocmdshelper.py.
+  1406 tests pass (2 pre-existing unrelated failures).
+
+2026-07-25 (10)
+- Fixed: New CoC in-game role (member/elder/coLeader/leader) wasn't assigned instantly on
+  link — only after the next update cycle. `_link_player_to_user()` never set `coc_role` on
+  new players, so the instant `sync_roles_for_user()` found nothing to assign. Now reads
+  `player_obj.role` from the CoC API at link time. File: qapbot/QBdiscocmdshelper.py.
+  1406 tests pass (2 pre-existing unrelated failures).
+
 2026-07-25 (9)
 - Added: Auto-role assignments are now rechecked immediately (instead of waiting up to 5 min
   for the periodic background sync) at two points in the registration message flow that
