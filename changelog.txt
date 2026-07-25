@@ -1,6 +1,26 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-25 (9)
+- Added: Auto-role assignments are now rechecked immediately (instead of waiting up to 5 min
+  for the periodic background sync) at two points in the registration message flow that
+  previously missed it:
+  - Unlinking a player account (`UnlinkConfirmView._on_confirm`, qapbot/ui_registration.py):
+    after `unlink_player()` succeeds, now calls `sync_roles_for_user()` so clan/member/CoC
+    roles are dropped right away — e.g. removing your only account in a clan now immediately
+    strips that clan's role instead of leaving it until the next sync.
+  - Verifying an already-linked account via the "My Accounts" -> Verify button
+    (`VerifyAccountModal.on_submit`, qapbot/ui_registration.py): previously only called
+    `assign_member_role()`; now also calls `sync_roles_for_user()` afterward, matching the
+    two sibling verification-completion paths (`ApiVerificationPromptView.skip_button`,
+    `ApiTokenEntryModal.on_submit`) which already did this.
+  Both calls are wrapped in try/except with a `[ROLE-SYNC]` warning log, matching the existing
+  post-link role-sync pattern in `complete_account_linking_flow()` (STEP 3.5), and rely on
+  `sync_roles_for_user()`'s own guild-config gating (no-op if auto-role isn't enabled).
+  File changed: qapbot/ui_registration.py. Also removed the now-completed backlog.txt item.
+  1406 tests pass (2 pre-existing failures unrelated to this change: a live-smoke test and a
+  cache_manager unit test, both failing before this change too).
+
 2026-07-25 (8)
 - Changed: Member clans are now consistently shown and processed in alphabetical order
   (by clan name, not tag) in both `MemberClansConfigurationView` and

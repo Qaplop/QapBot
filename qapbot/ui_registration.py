@@ -715,7 +715,16 @@ class VerifyAccountModal(discord.ui.Modal, title="Verify Account"):
                     await assign_member_role(interaction.guild, interaction.user.id, player_name, player_clan_tag)  # type: ignore[arg-type]
                 except Exception as e:
                     logging.error(f"Failed to assign member role after verification: {e}")
-            
+
+            # Sync CoC + clan roles immediately (mirrors ApiTokenEntryModal.on_submit /
+            # ApiVerificationPromptView.skip_button, which perform the same sync)
+            if interaction.guild:
+                try:
+                    from qapbot.guild_role_manager import sync_roles_for_user
+                    await sync_roles_for_user(interaction.guild, str(interaction.guild.id), interaction.user.id)
+                except Exception as _role_sync_e:
+                    logging.warning(f"[ROLE-SYNC] Post-verify role sync failed for {interaction.user.id}: {_role_sync_e}")
+
             # If called from AccountManagementView, refresh it after verification
             if self.parent_view and self.parent_view.original_interaction:
                 # Defer the modal response first
