@@ -2850,7 +2850,7 @@ async def on_member_join(member: discord.Member) -> None:
 
             if resolved_clan_tags:
                 clan_link_lines = [
-                    f"<https://link.clashofclans.com/en?action=OpenClanProfile&tag={tag.replace('#', '')}>"
+                    f"**{CACHE.get_clan_name(tag, tag)}**: <https://link.clashofclans.com/en?action=OpenClanProfile&tag={tag.replace('#', '')}>"
                     for tag in resolved_clan_tags
                 ]
                 if len(resolved_clan_tags) == 1:
