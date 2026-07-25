@@ -1,6 +1,46 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-25 (5)
+- Fixed: The clan selection dropdown in /clanmanagement (ClanManagementView._add_clan_select,
+  qapbot/ui_clan_management.py) listed clans in `guild_clans` order (tag-sorted, e.g. "The
+  Marines III" before "The Marines" before "The Marines II") instead of alphabetically by
+  name. Now sorted by clan name (case-insensitive) before building the dropdown options.
+  All 1403 tests pass.
+
+2026-07-25 (4)
+- Fixed: Registering by player NAME (e.g. "Killer") when the name wasn't yet in the
+  war-history cache incorrectly reported "Player #KILLER could not be found in Clash of
+  Clans" instead of finding the player via a live clan-roster search.
+  Root cause: `normalize_clan_tag()`'s validation pattern (`^#[A-Z0-9]{5,10}$`) also matches
+  short all-letter/digit player names with no explicit '#' prefix (e.g. "Killer" -> 6
+  uppercase letters -> passes as a "valid tag"). `PlayerSubstringModal.on_submit()`
+  (qapbot/ui_registration.py) tried the direct-tag interpretation BEFORE the live CoC API
+  name search across the guild's clans, so a plain name that happened to fit the tag pattern
+  hijacked the flow and skipped the name search entirely.
+  Fix: reordered the fallback — an explicit leading '#' is now required to prioritize the
+  direct-tag path; otherwise the live API name search (across `self.clans_in_guild`) runs
+  first, and only falls back to interpreting the input as a raw tag if that search finds
+  nothing. This is a pure interaction-order fix; `normalize_clan_tag()` itself is unchanged
+  since it's still needed and correct for genuine tag input.
+  Also audited every location that reads `member_clans`/`member_families` from guild config
+  for missing family-expansion ("family-blind") bugs. Found and fixed one: the role-sync
+  trigger in `qapbot/coc_cache.py` (`_maybe_trigger_role_sync`) only checked
+  `clan_tag in config.get("member_clans", [])`, so guilds configured with ONLY a clan family
+  (no individual member clans — like the reporter's server) never got CoC-role/clan-role
+  syncs triggered for clan-member updates. Fixed to also expand `member_families` into their
+  constituent clan tags, matching the pattern already used correctly everywhere else
+  (`get_guild_clans_including_member_config`, `is_player_in_member_clans`,
+  `guild_role_manager.sync_roles_for_user`, `cache_manager._is_clan_tracked`, etc.) — all of
+  which were confirmed already family-aware and needed no changes.
+  Files changed: qapbot/ui_registration.py (PlayerSubstringModal.on_submit),
+  qapbot/coc_cache.py. All 1403 tests pass.
+
+2026-07-25 (3)
+- Changed: Welcome message clan-link lines are now sorted alphabetically by clan name
+  (case-insensitive) instead of family-then-individual insertion order.
+  File changed: QapBot.py (on_member_join). All 1403 tests pass.
+
 2026-07-25 (2)
 - Changed: Welcome message clan-link lines now show the clan name before the link
   (e.g. "**The Marines**: <link>") instead of a bare link, for both the single-clan and

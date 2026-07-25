@@ -372,7 +372,17 @@ class CoCClanCache:
                         continue
                     if not config.get("coc_role_enabled") and not config.get("clan_role_enabled"):
                         continue
-                    if clan_tag not in config.get("member_clans", []):
+                    # Clan is covered by this guild if it's an individually configured member
+                    # clan OR a member of one of the guild's member families. Family-only guilds
+                    # (no individual member_clans) must still trigger role sync for their clans.
+                    _covered = clan_tag in config.get("member_clans", [])
+                    if not _covered:
+                        for _family_id in config.get("member_families", []):
+                            family_data = self.cache_manager.clan_families.get(_family_id, {})  # type: ignore[union-attr]
+                            if clan_tag in family_data.get("clans", []):
+                                _covered = True
+                                break
+                    if not _covered:
                         continue
                     guild = _qbcore.bot.get_guild(int(guild_id_str))
                     if not guild:

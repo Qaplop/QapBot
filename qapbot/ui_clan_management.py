@@ -473,9 +473,14 @@ class ClanManagementView(discord.ui.View):
         """Add dropdown for selecting clans."""
         from qapbot.cache_manager import CACHE
         
-        # Build clan options from guild_clans
+        # Build clan options from guild_clans, sorted alphabetically by clan name
+        # (self.guild_clans itself is tag-sorted, not name-sorted)
+        sorted_clan_tags = sorted(
+            self.guild_clans,
+            key=lambda tag: (CACHE.get_clan_name(tag, "Unknown") or "Unknown").lower()  # type: ignore[arg-type]
+        )
         clan_options = []
-        for clan_tag in self.guild_clans[:25]:  # Discord limit
+        for clan_tag in sorted_clan_tags[:25]:  # Discord limit
             clan_name = CACHE.get_clan_name(clan_tag, "Unknown")  # type: ignore[arg-type]
             label = f"{clan_name} ({clan_tag})"
             if len(label) > 100:

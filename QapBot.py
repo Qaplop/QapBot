@@ -2848,6 +2848,9 @@ async def on_member_join(member: discord.Member) -> None:
                     resolved_clan_tags.append(clan_tag)
                     _seen_tags.add(clan_tag)
 
+            # Sort alphabetically by clan name (case-insensitive) for a stable, readable list
+            resolved_clan_tags.sort(key=lambda tag: (CACHE.get_clan_name(tag, tag) or tag).lower())
+
             if resolved_clan_tags:
                 clan_link_lines = [
                     f"**{CACHE.get_clan_name(tag, tag)}**: <https://link.clashofclans.com/en?action=OpenClanProfile&tag={tag.replace('#', '')}>"

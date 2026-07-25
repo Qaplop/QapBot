@@ -1724,34 +1724,18 @@ class PlayerSubstringModal(discord.ui.Modal, title="Enter Player Data"):
                     )
                     return
         
-        # If no matches in player list, try direct tag entry (process_player_registration handles CoC API lookup)
+        # If no matches in player list, try a live API name search or direct tag entry.
         if not matches:
-            direct_tag = normalize_clan_tag(substr_raw) if substr_raw else None
-            logging.debug(f"PlayerSubstringModal: No list matches, attempting direct tag registration for '{direct_tag}'")
-            if direct_tag:
-                # Delete clan selection message before processing
-                if self.clan_selection_interaction:
-                    try:
-                        await self.clan_selection_interaction.delete_original_response()
-                        logging.debug("Successfully deleted clan selection message (direct tag)")
-                    except Exception as e:
-                        logging.debug(f"Could not delete clan selection message: {e}")
-                
-                # process_player_registration will handle CoC API lookup and validation
-                await process_player_registration(
-                    interaction=interaction,
-                    player_tag=direct_tag,
-                    player_name=None,  # Will be fetched from CoC API
-                    api_token=api_token,
-                    use_followup=True
-                )
-                return
-            
-            # Invalid tag format or no tag provided — try a live API name search as final fallback.
-            # This is safe here because we already deferred above (no 3-second window applies).
-            # Handles new clan members not yet in war history cache.
-            if substr and self.clans_in_guild:
-                logging.debug(f"PlayerSubstringModal: Trying live API name search for '{substr_raw}'")
+            # An explicit leading '#' is a strong signal the user intended to enter a tag.
+            # Without it, prefer a live name search first — normalize_clan_tag()'s pattern
+            # (5-10 alphanumeric chars) also matches short plain player names (e.g. "Killer"
+            # -> "#KILLER"), which would otherwise hijack real name searches and report a
+            # bogus "player tag not found" error instead of finding the player via the live
+            # clan roster (which includes members not yet present in the war-history cache).
+            explicit_tag_intent = substr_raw.startswith('#')
+
+            if not explicit_tag_intent and substr and self.clans_in_guild:
+                logging.debug(f"PlayerSubstringModal: Trying live API name search for '{substr_raw}' before tag fallback")
                 for clan_tag in self.clans_in_guild:
                     try:
                         clan_obj = await CACHE.coc_clan_cache.get_clan(clan_tag)
@@ -1766,7 +1750,30 @@ class PlayerSubstringModal(discord.ui.Modal, title="Enter Player Data"):
                 # Deduplicate by tag
                 seen: Set[str] = set()
                 matches = [m for m in matches if not (m["tag"] in seen or seen.add(m["tag"]))]  # type: ignore[func-returns-value]
-                logging.debug(f"PlayerSubstringModal: Live API search found {len(matches)} additional matches")
+                logging.debug(f"PlayerSubstringModal: Live API search found {len(matches)} matches for '{substr_raw}'")
+
+            # Only fall back to raw tag lookup if the live name search (if attempted) found nothing.
+            if not matches:
+                direct_tag = normalize_clan_tag(substr_raw) if substr_raw else None
+                logging.debug(f"PlayerSubstringModal: No name matches, attempting direct tag registration for '{direct_tag}'")
+                if direct_tag:
+                    # Delete clan selection message before processing
+                    if self.clan_selection_interaction:
+                        try:
+                            await self.clan_selection_interaction.delete_original_response()
+                            logging.debug("Successfully deleted clan selection message (direct tag)")
+                        except Exception as e:
+                            logging.debug(f"Could not delete clan selection message: {e}")
+
+                    # process_player_registration will handle CoC API lookup and validation
+                    await process_player_registration(
+                        interaction=interaction,
+                        player_tag=direct_tag,
+                        player_name=None,  # Will be fetched from CoC API
+                        api_token=api_token,
+                        use_followup=True
+                    )
+                    return
 
             if not matches:
                 logging.info(f"PlayerSubstringModal: No matches for '{substr_raw}' (checked {len(self.player_list)} players + live API)")
