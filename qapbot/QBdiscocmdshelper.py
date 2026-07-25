@@ -963,7 +963,8 @@ async def _link_player_to_user(
     display_name: str,
     admin_override: bool = False,
     api_token_override: bool = False,
-    api_token_user_id: Optional[str] = None
+    api_token_user_id: Optional[str] = None,
+    guild_name: Optional[str] = None
 ) -> Tuple[bool, str]:
     """
     Core logic for linking a CoC player tag to a Discord user in CACHE.user_accounts.
@@ -983,6 +984,7 @@ async def _link_player_to_user(
         admin_override: If True, allows bot admin to override verified player security check (default: False)
         api_token_override: If True, user provided valid API token as proof of ownership (default: False)
         api_token_user_id: User ID of previous owner when using API token override (for DM notification)
+        guild_name: Discord server name where this linking action happened (for DM notification context)
     
     Returns:
         (ok, message)
@@ -1045,7 +1047,12 @@ async def _link_player_to_user(
                             player_name_for_dm = removed_player.get("player_name", "Unknown")
                             other_display_name = other_user_data.get("display_name", "Unknown User")
                             
-                            dm_message = t('playerregistration.api_token_removed_dm', player_name=player_name_for_dm, player_tag=normalized_tag)
+                            dm_message = t(
+                                'playerregistration.api_token_removed_dm',
+                                player_name=player_name_for_dm,
+                                player_tag=normalized_tag,
+                                guild_name=guild_name or t('playerregistration.unknown_server_name')
+                            )
                             success = await CACHE.send_user_dm(str(other_user_id), dm_message)
                             
                             if success:
@@ -1082,7 +1089,12 @@ async def _link_player_to_user(
                             player_name_for_dm = removed_player.get("player_name", "Unknown")
                             other_display_name = other_user_data.get("display_name", "Unknown User")
                             
-                            dm_message = t('playerregistration.admin_removed_verified_dm', player_name=player_name_for_dm, player_tag=normalized_tag)
+                            dm_message = t(
+                                'playerregistration.admin_removed_verified_dm',
+                                player_name=player_name_for_dm,
+                                player_tag=normalized_tag,
+                                guild_name=guild_name or t('playerregistration.unknown_server_name')
+                            )
                             success = await CACHE.send_user_dm(str(other_user_id), dm_message)
                             
                             if success:
@@ -1124,7 +1136,12 @@ async def _link_player_to_user(
                 try:
                     from qapbot.i18n import t
                     player_name_for_dm = other_player.get("player_name", "Unknown")
-                    dm_message = t('playerregistration.unverified_removed_dm', player_name=player_name_for_dm, player_tag=normalized_tag)
+                    dm_message = t(
+                        'playerregistration.unverified_removed_dm',
+                        player_name=player_name_for_dm,
+                        player_tag=normalized_tag,
+                        guild_name=guild_name or t('playerregistration.unknown_server_name')
+                    )
                     success = await CACHE.send_user_dm(str(other_user_id), dm_message)
                     
                     if success:
@@ -1497,7 +1514,6 @@ async def complete_account_linking_flow(
     if existing_owner and not api_token and not admin_override:
         # Player is already linked to another user
         prev_user_id, prev_display_name, is_verified = existing_owner
-        status = "verified" if is_verified else "unverified"
         
         # Check if interaction response has already been used
         if interaction.response.is_done():
@@ -1506,13 +1522,19 @@ async def complete_account_linking_flow(
             guild_id = interaction.guild.id if interaction.guild else None
             user_id = str(interaction.user.id)
             
+            # Verified accounts are API-protected (re-link requires proof of ownership);
+            # unverified accounts still require a token, but aren't "protected" per se.
+            status_key = (
+                'playerregistration.already_linked_needs_api_token_verified'
+                if is_verified else
+                'playerregistration.already_linked_needs_api_token_unverified'
+            )
             error_msg = t(
-                'ui_components.errors.player_already_linked',
+                status_key,
                 user_id=user_id,
                 guild_id=guild_id,
                 player_tag=normalized_tag,
-                prev_display_name=prev_display_name,
-                status=status
+                prev_display_name=prev_display_name
             )
             
             await interaction.followup.send(error_msg, ephemeral=True)
@@ -1574,7 +1596,8 @@ async def complete_account_linking_flow(
         display_name, 
         admin_override=admin_override,
         api_token_override=api_token_override,
-        api_token_user_id=api_token_user_id
+        api_token_user_id=api_token_user_id,
+        guild_name=interaction.guild.name if interaction.guild else None
     )
     
     if not ok:

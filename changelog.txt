@@ -1,6 +1,37 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-25 (7)
+- Changed: The three previous-owner DM notifications sent when a player account is removed
+  from a user (API-token ownership proof, admin override, and unverified-duplicate removal)
+  now mention which Discord server the action happened on.
+  `_link_player_to_user()` gained a `guild_name: Optional[str] = None` parameter, passed by
+  its only caller `complete_account_linking_flow()` as `interaction.guild.name`. Added a
+  `playerregistration.unknown_server_name` fallback key for the (rare) case guild_name is
+  unavailable. Updated `api_token_removed_dm`, `admin_removed_verified_dm`, and
+  `unverified_removed_dm` (en/de) to include a `{guild_name}` mention.
+  Files changed: qapbot/QBdiscocmdshelper.py, qapbot/translations/{en,de}.json.
+  All 1403 tests pass.
+
+2026-07-25 (6)
+- Fixed: Trying to link a player account already linked (and API-verified) to another user
+  showed the raw untranslated key "ui_components.errors.player_already_linked" instead of a
+  proper message. Root cause: `complete_account_linking_flow()`'s followup-message fallback
+  (used when `interaction.response` is already consumed, so the API-token modal can't be
+  shown) referenced a translation key that was never defined — the modal path (shown when
+  the response is still available) already had correct text via `ApiTokenOwnershipModal`.
+  Fix: added two new `playerregistration.*` keys (en/de) distinguishing the two cases —
+  `already_linked_needs_api_token_verified` ("already linked and verified/API-protected by
+  X — provide a valid CoC API token to prove ownership and re-link, previous owner will be
+  notified") and `already_linked_needs_api_token_unverified` (same wording but "unverified"
+  instead of "verified/API-protected"). File changed: qapbot/QBdiscocmdshelper.py
+  (complete_account_linking_flow), qapbot/translations/{en,de}.json.
+  Verified the previous-owner DM warning notification system referenced by the user is
+  already implemented and unaffected by this bug: `_link_player_to_user()`'s API-token-
+  override and admin-override branches both already call `CACHE.send_user_dm()` with the
+  `playerregistration.api_token_removed_dm` message when a player is re-linked away from its
+  previous owner — no changes needed there. All 1403 tests pass.
+
 2026-07-25 (5)
 - Fixed: The clan selection dropdown in /clanmanagement (ClanManagementView._add_clan_select,
   qapbot/ui_clan_management.py) listed clans in `guild_clans` order (tag-sorted, e.g. "The
