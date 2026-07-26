@@ -301,7 +301,7 @@ async def _refresh_groups_live(
     import coc  # type: ignore[import-untyped]
 
     mode = "DEV" if CONFIG.is_dev_mode else "PROD"
-    print(f"[API] Logging in with {mode}-mode credentials ({CONFIG.coc_email})...")
+    print(f"[API] Logging in with {mode}-mode credentials...")
     client = coc.Client(key_count=10, throttler=coc.BatchThrottler, throttle_limit=100)
     await client.login(CONFIG.coc_email, CONFIG.coc_password)
 
