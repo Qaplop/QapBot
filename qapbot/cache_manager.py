@@ -3106,11 +3106,21 @@ class CacheManager:
                         break
 
             if not _league_rank and _season_over:
-                logging.info(
+                # NOTE: this does NOT mean league_rank is unknown in the DB — it may
+                # already be correctly populated from earlier in the active season.
+                # It only means THIS call couldn't (re-)derive it from a source safe
+                # to trust post-season, so it leaves whatever's already stored alone.
+                # If league_rank genuinely is still empty in the DB, it isn't stuck
+                # forever: QBhelperfunctions.update_cwl_group_stats's self-heal fills
+                # it in (via the same safe-rank cross-check) the moment this group's
+                # standings are computed, on both the very first computation and every
+                # later re-render.
+                logging.debug(
                     f"[CWL-ROUNDS] group {_group_id} season={cwl_season}: "
-                    f"league_rank still unknown but league group state='{_lg_state}' "
-                    "(season already ended) — skipping clan_name_cache fallback to "
-                    "avoid recording a post-promotion league as historical data"
+                    f"league group state='{_lg_state}' (season already ended) — "
+                    "this call found no fresh, trustworthy source for league_rank; "
+                    "any existing DB value is left as-is (see update_cwl_group_stats "
+                    "self-heal for how a genuinely still-empty value gets filled in)"
                 )
 
             if not _league_rank and not _season_over:

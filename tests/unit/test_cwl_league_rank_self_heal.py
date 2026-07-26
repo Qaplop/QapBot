@@ -186,3 +186,78 @@ class TestUpdateCwlGroupStatsSelfHealWiring:
 
         db.update_cwl_league_rank.assert_not_awaited()
         assert result[0]["league_rank"] == "Master League III"
+
+    @pytest.mark.asyncio
+    async def test_self_heal_also_fires_on_first_ever_computation(self, monkeypatch):
+        """Reproduces the gap this closes: a group whose league_rank never got
+        populated during its active season (still empty) reaches all_ended=True
+        for the very first time via the "compute fresh" branch, not the
+        cwl_ended=1 short-circuit. Without this fix, league_rank would stay
+        empty forever for any clan only ever reached via the auto-post
+        background loop, since that loop skips update_cwl_group_stats entirely
+        once cwl_ended is observed True — it would never get a second chance."""
+        self._clear_ttl_cache()
+        clan_tags = ["#A", "#B", "#C", "#D"]  # 4 clans -> expected_rounds = 3
+        cache = MagicMock()
+        cache.get_current_war_data = MagicMock(return_value=None)
+        cache.clan_name_cache = {}
+
+        db = MagicMock()
+        db.get_cwl_group_info = AsyncMock(return_value={
+            "league_group_id": "grp1",
+            "clan_tags": clan_tags,
+            "league_rank": "",  # never populated
+            "cwl_ended": False,  # not yet marked ended going into this call
+            "rows": [],
+        })
+        db_stars = {ct: (10, 100.0) for ct in clan_tags}
+        ended = {ct: 3 for ct in clan_tags}  # all rounds complete -> all_ended=True
+        db.get_cwl_group_war_stats = AsyncMock(return_value=(db_stars, ended))
+        db.update_cwl_group_stats_batch = AsyncMock(return_value=len(clan_tags))
+        db.update_cwl_league_rank = AsyncMock()
+        cache.db_manager = db
+        monkeypatch.setattr("QBhelperfunctions.CACHE", cache)
+        monkeypatch.setattr("QBhelperfunctions._cwl_self_heal_league_rank",
+                             lambda rows, season, recorded: "Master League III" if not recorded else None)
+
+        import QBhelperfunctions
+        result = await QBhelperfunctions.update_cwl_group_stats("#A", "2026-07")
+
+        db.update_cwl_league_rank.assert_awaited_once_with(
+            "2026-07", "grp1", "Master League III", force=True
+        )
+        assert all(r["league_rank"] == "Master League III" for r in result)
+
+    @pytest.mark.asyncio
+    async def test_no_self_heal_attempt_when_season_not_yet_fully_ended(self, monkeypatch):
+        """all_ended=False (still mid-season) must not invoke the self-heal at all —
+        group_rank isn't final yet, so "safe rank" reasoning doesn't apply."""
+        self._clear_ttl_cache()
+        clan_tags = ["#A", "#B", "#C", "#D"]
+        cache = MagicMock()
+        cache.get_current_war_data = MagicMock(return_value=None)
+        cache.clan_name_cache = {}
+
+        db = MagicMock()
+        db.get_cwl_group_info = AsyncMock(return_value={
+            "league_group_id": "grp1",
+            "clan_tags": clan_tags,
+            "league_rank": "",
+            "cwl_ended": False,
+            "rows": [],
+        })
+        db_stars = {ct: (10, 100.0) for ct in clan_tags}
+        ended = {"#A": 3, "#B": 3, "#C": 2, "#D": 3}  # #C short one round -> all_ended=False
+        db.get_cwl_group_war_stats = AsyncMock(return_value=(db_stars, ended))
+        db.update_cwl_group_stats_batch = AsyncMock(return_value=len(clan_tags))
+        db.update_cwl_league_rank = AsyncMock()
+        cache.db_manager = db
+        monkeypatch.setattr("QBhelperfunctions.CACHE", cache)
+        self_heal_called = MagicMock()
+        monkeypatch.setattr("QBhelperfunctions._cwl_self_heal_league_rank", self_heal_called)
+
+        import QBhelperfunctions
+        await QBhelperfunctions.update_cwl_group_stats("#A", "2026-07")
+
+        self_heal_called.assert_not_called()
+        db.update_cwl_league_rank.assert_not_awaited()

@@ -2579,6 +2579,35 @@ _cwl_group_stats_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 _CWL_GROUP_STATS_TTL: float = 600.0   # 10 minutes
 
 
+async def _apply_cwl_self_heal(
+    db: Any, rows: List[Dict[str, Any]], cwl_season: str, group_id: str, league_rank: str
+) -> str:
+    """Run the safe-rank self-heal cross-check against *rows* and, if it finds a
+    correction, persist it (bypassing the cwl_ended freeze via force=True) and
+    reflect it in *rows* in place. Returns the (possibly corrected) league_rank.
+
+    Called from both branches of update_cwl_group_stats: the cwl_ended=1
+    short-circuit (re-validates an already-frozen value on every subsequent
+    render) and the initial computation (fills in league_rank immediately if
+    it's still empty the moment a group's standings are first fully computed,
+    rather than leaving it permanently empty for any group whose
+    _process_league_group_response population never got a chance to run before
+    the season ended — see changelog.txt 2026-07-26).
+    """
+    healed = _cwl_self_heal_league_rank(rows, cwl_season, league_rank)
+    if healed is None:
+        return league_rank
+    logging.info(
+        f"[CWL-GROUP-STATS] Self-heal: group {group_id} / {cwl_season} "
+        f"league_rank corrected {league_rank!r} -> {healed!r} "
+        "(safe-rank cross-check against a fresh, unambiguous group member)"
+    )
+    await db.update_cwl_league_rank(cwl_season, group_id, healed, force=True)
+    for r in rows:
+        r["league_rank"] = healed
+    return healed
+
+
 async def update_cwl_group_stats(
     clan_tag: str,
     cwl_season: Optional[str] = None,
@@ -2638,17 +2667,7 @@ async def update_cwl_group_stats(
     if group_info["cwl_ended"]:
         rows = group_info["rows"]
         if all(r.get("total_stars") is not None for r in rows):
-            healed = _cwl_self_heal_league_rank(rows, cwl_season, league_rank)
-            if healed is not None:
-                logging.info(
-                    f"[CWL-GROUP-STATS] Self-heal: group {group_id} / {cwl_season} "
-                    f"league_rank corrected {league_rank!r} -> {healed!r} "
-                    "(safe-rank cross-check against a fresh, unambiguous group member)"
-                )
-                await db.update_cwl_league_rank(cwl_season, group_id, healed, force=True)
-                league_rank = healed
-                for r in rows:
-                    r["league_rank"] = healed
+            league_rank = await _apply_cwl_self_heal(db, rows, cwl_season, group_id, league_rank)
             result = _build_standings_result(rows, clan_tags, league_rank)
             _cwl_group_stats_cache[_cache_key] = (_time.monotonic(), result)
             return result
@@ -2722,6 +2741,15 @@ async def update_cwl_group_stats(
             "cwl_ended": all_ended,
             "league_rank": league_rank,
         })
+
+    # Give the self-heal a chance right at season-completion time too — not just
+    # on later re-renders. Without this, a group whose league_rank never got
+    # populated during its active season (e.g. _process_league_group_response
+    # never ran for it before the season ended) would stay empty forever for
+    # any clan reached only via the auto-post loop, since that loop skips
+    # calling update_cwl_group_stats again once cwl_ended is observed True.
+    if all_ended:
+        league_rank = await _apply_cwl_self_heal(db, merged_rows, cwl_season, group_id, league_rank)
 
     result = _build_standings_result(merged_rows, clan_tags, league_rank)
     _cwl_group_stats_cache[_cache_key] = (_time.monotonic(), result)

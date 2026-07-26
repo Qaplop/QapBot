@@ -1,6 +1,38 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-26 (14)
+- Fixed: two follow-up gaps found while verifying (13)'s self-heal against real prod logs.
+  1. Self-heal never got a chance to run for a group whose league_rank was *never* populated
+     during its active season (still empty/NULL) — it only lived in update_cwl_group_stats'
+     cwl_ended=1 short-circuit, not the initial "compute fresh" branch that first sets
+     cwl_ended=1. Since the background auto-post loop (QapBot.py) skips calling
+     update_cwl_group_stats again once cwl_ended is observed True, an actively-subscribed
+     clan reached only through that loop would never get a second chance — league_rank would
+     stay empty forever unless someone happened to run /leaderboard cwlinfo/cwlgroup manually
+     for that exact clan. Fixed by factoring the self-heal application (log + persist with
+     force=True + reflect in rows) into a shared `_apply_cwl_self_heal` helper and calling it
+     from both branches — the short-circuit (as before) and the initial computation, right
+     after all_ended is determined for the first time.
+  2. `_process_league_group_response`'s "league_rank still unknown" log line (added in (7))
+     was misleading: it fires purely based on THIS call's local derivation attempt coming up
+     empty, regardless of whether the DB already has a correct value from earlier in the
+     season (the common, harmless case) or is genuinely still empty (the rarer, real gap —
+     now closed by fix 1 above). Observed on prod: "group 9457c3866f02bfcc ... league_rank
+     still unknown" for a group whose league_rank was in fact already correctly "Crystal
+     League III" in the DB — alarming-looking but harmless, since the guard only prevents
+     *this call* from writing, it never touched the existing value. Reworded the message to
+     be accurate (doesn't claim the DB value is unknown) and downgraded it from INFO to DEBUG
+     since it's an expected, routine occurrence for any ended group being reprocessed, not a
+     problem signal on its own.
+  Added 2 tests to tests/unit/test_cwl_league_rank_self_heal.py: self-heal firing on the very
+  first all_ended computation (reproduces the exact gap), and confirming it's NOT attempted
+  while all_ended is still False (group_rank isn't final yet, so "safe rank" doesn't apply).
+  Tests: 1422 passed, 5 deselected. pyright: 0 errors.
+  Files changed: QBhelperfunctions.py (_apply_cwl_self_heal new, update_cwl_group_stats),
+  qapbot/cache_manager.py (_process_league_group_response log message),
+  tests/unit/test_cwl_league_rank_self_heal.py.
+
 2026-07-26 (13)
 - Added: permanent self-heal for cwl_league_groups.league_rank, closing the gap the (7)/(11)/
   (12) fixes and one-time repair left open — a frozen (cwl_ended=1) row's league_rank was never
