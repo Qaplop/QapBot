@@ -4,14 +4,20 @@ corrupted by the post-promotion-league bug (fixed 2026-07-26 in
 cache_manager.py's _process_league_group_response).
 
 Root cause (see changelog.txt 2026-07-26 and DATABASE_ARCHITECTURE.md):
-    The clan_name_cache fallback used to populate league_rank was gated on the
-    DB's own `cwl_ended` column instead of the league group's live API `.state`.
-    `cwl_ended` only flips once every clan's expected war count is observed in
-    war_summary, which can lag days behind the real-world season end — while a
-    clan's league in clan_name_cache updates almost immediately after
-    promotion/demotion. Any reprocessing of a league group in that lag window
-    wrote the clan's *next*-season league into the *current* season's row,
-    which was then frozen there once `cwl_ended` finally flipped to 1.
+    cache_manager._process_league_group_response, which populates league_rank,
+    had no notion of "first time seeing this group" vs. "re-processing a group
+    already recorded" — it re-derived league_rank from some group member's
+    *current* league on every fresh get_league_group() response. That's only
+    correct at the moment a group is first discovered (every member shares one
+    league purely by construction); once the real season ends, members
+    promote/demote at different rates and diverge to different current
+    leagues, so re-deriving from "any member" on a later call is a coin flip.
+    Two earlier attempts gated this on live API `.state` and on `cwl_ended`
+    respectively — both treated the symptom. The actual fix: only ever
+    populate league_rank when `db.cwl_group_exists()` reports no row existed
+    for this (group_id, season) before this call — the one moment every
+    member is *guaranteed* to share one league. An already-known group's
+    league_rank is now never touched again by that function, full stop.
 
     The code bug is already fixed going forward. This script helps find rows
     that were corrupted *before* that fix landed, and applies corrections.

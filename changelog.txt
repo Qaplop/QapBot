@@ -1,6 +1,41 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-26 (15)
+- Fixed: root-cause fix for the CWL league_rank bug (7)/(11)/(12)/(13)/(14), replacing the
+  `.state`-based gate with a correct-by-construction one. Prompted by the project owner asking
+  why this happened in the first place and pointing out the actual fix: a league group's
+  members are, by definition, all in the same league the moment the group is first discovered
+  — so league_rank only ever needs deriving once, at that moment, using whichever member's
+  cache is already fresh or (cheaply) one targeted get_clan() call if none are.
+  The real defect: `cache_manager._process_league_group_response` had no notion of "first time
+  seeing this group" vs. "re-processing an already-recorded one" — the same "trust any member's
+  current league" logic ran on *every* fresh get_league_group() response, gated only on whether
+  the API's live `.state` currently reported the season as active. That gate worked but treated
+  a symptom, not the disease, and needed increasingly complex machinery (staleness windows,
+  season-boundary arithmetic) to stay correct.
+  Fix: added `db_manager.cwl_group_exists(group_id, cwl_season)` — a cheap indexed lookup,
+  checked BEFORE `upsert_cwl_league_data` so it reflects pre-insert state. league_rank
+  population (raw_data check, then fresh clan_name_cache entry, then one targeted get_clan()
+  call) now only ever runs when this reports the group is genuinely new. An already-known
+  group's league_rank is never touched again by this function afterwards, regardless of API
+  state — update_cwl_group_stats's self-heal ((13)/(14)) remains the only other path that can
+  correct it later, and only via a verified safe-rank cross-check.
+  Kept the 8-day cache-staleness check on the fallback (a cached value can be stale from long
+  before this brand-new group even without any season-timing concern — that's a general
+  cache-freshness question, unrelated to the season-divergence bug this whole fix line was
+  chasing). Removed entirely: the `.state` inspection, the season-window arithmetic, and the
+  "season already ended, skipping" log line — none of it is reachable anymore since population
+  never runs on an already-known group regardless of what state the API reports.
+  Replaced `tests/unit/test_cwl_league_rank_season_gate.py` (tested the now-removed `.state`
+  gate; 6 tests) with `tests/unit/test_cwl_league_rank_new_group_gate.py` (9 tests: new-group
+  population from cache/API/raw_data, existing-group never-repopulates including the exact
+  divergent-members production shape, and cwl_group_exists checked before the upsert).
+  Tests: 1425 passed, 5 deselected. pyright: 0 errors.
+  Files changed: qapbot/cache_manager.py (_process_league_group_response),
+  qapbot/db_manager.py (cwl_group_exists new), tests/unit/test_cwl_league_rank_new_group_gate.py
+  (new, replaces test_cwl_league_rank_season_gate.py), qapbot/docs/DATABASE_ARCHITECTURE.md.
+
 2026-07-26 (14)
 - Fixed: two follow-up gaps found while verifying (13)'s self-heal against real prod logs.
   1. Self-heal never got a chance to run for a group whose league_rank was *never* populated

@@ -3057,6 +3057,28 @@ class CacheManager:
             if db is None:
                 return
 
+            # league_rank is populated ONLY at the moment this exact group is
+            # discovered for the first time — checked BEFORE the upsert below,
+            # so it reflects whether a row for this (group_id, season) existed
+            # coming into this call. That moment is the only one where every
+            # member is *guaranteed* to share one league: a freshly-discovered
+            # group is necessarily still within its own active season. Any
+            # later re-processing of an already-known group (new rounds
+            # revealed, repeat polls, etc.) never touches league_rank again —
+            # once a season ends, promotions/demotions apply almost
+            # immediately and members can diverge to *different* current
+            # leagues, so re-deriving from "any member's current league" at
+            # that point is a coin flip, not a fact. This bit QapBot in
+            # production twice (see changelog.txt 2026-07-26): a group's
+            # league_rank got overwritten with a promoted/demoted member's
+            # *post*-season league instead of the league the group actually
+            # played. QBhelperfunctions.update_cwl_group_stats's self-heal is
+            # the backstop for a group whose league_rank is still empty after
+            # this (e.g. the one API call below failed) or, in the rare case
+            # something else still gets it wrong — it only ever corrects using
+            # a verified safe-rank cross-check, never a blind "any member" guess.
+            _is_new_group = not await db.cwl_group_exists(_group_id, cwl_season)
+
             _new_rows = await db.upsert_cwl_league_data(
                 league_group_id=_group_id,
                 cwl_season=cwl_season,
@@ -3064,127 +3086,81 @@ class CacheManager:
                 rounds=_revealed,
             )
 
-            # Populate league_rank going forward (only writes when column is NULL).
-            # Try raw_data first, then fall back to clan_name_cache for any group clan.
-            #
-            # Both sources describe a clan's *current* league, not "the league this
-            # group played at this season" — those two are only guaranteed to be the
-            # same thing while the season is still active. Once the season has ended
-            # in-game (state == "warEnded"), promotions/demotions are applied almost
-            # immediately, and every clan in the group can diverge to a *different*
-            # current league (some promoted, some demoted, some unchanged) — so ANY
-            # single clan picked as "the representative" can just as easily be wrong
-            # as right. This bit QapBot in production: a group's league_rank got
-            # written from a demoted member's post-CWL league ("Crystal League I")
-            # even though the group (and the clan the standings were rendered for)
-            # had actually played that season in "Master League III" — confirmed
-            # against the in-game war log (see changelog.txt 2026-07-26).
-            #
-            # Our own cwl_ended DB column is not a safe proxy for "season over" either:
-            # it only flips once update_cwl_group_stats_batch observes every clan's
-            # expected war count in war_summary, which can lag well behind the
-            # real-world end of the season (e.g. a delayed/missing war_summary row).
-            # The league group's own live API `.state` is authoritative and immediate,
-            # so every source below is gated on it: while still "preparation"/"inWar"
-            # a clan's current league IS this season's league and both sources are
-            # safe to trust; once "warEnded" (or anything else), skip both entirely
-            # and leave league_rank unset rather than lock in a wrong value.
-            _lg_state = str(getattr(lg, "state", "") or "").lower()
-            _season_over = _lg_state not in ("preparation", "inwar", "in_war")
-
             _league_rank: str = ""
-            if not _season_over and _raw_data and isinstance(_raw_data, dict):
-                _raw_data_d: Dict[str, Any] = cast(Dict[str, Any], _raw_data)
-                _clans_raw = cast(List[Any], _raw_data_d.get("clans") or [])
-                for _cr in _clans_raw:
-                    _cr_dict = cast(Dict[str, Any], _cr) if isinstance(_cr, dict) else {}
-                    _wl_raw = _cr_dict.get("warLeague")
-                    _wl: Dict[str, Any] = cast(Dict[str, Any], _wl_raw) if isinstance(_wl_raw, dict) else {}
-                    _wl_name: str = cast(str, _wl.get("name") or "")
-                    if _wl_name:
-                        _league_rank = _wl_name
-                        break
-
-            if not _league_rank and _season_over:
-                # NOTE: this does NOT mean league_rank is unknown in the DB — it may
-                # already be correctly populated from earlier in the active season.
-                # It only means THIS call couldn't (re-)derive it from a source safe
-                # to trust post-season, so it leaves whatever's already stored alone.
-                # If league_rank genuinely is still empty in the DB, it isn't stuck
-                # forever: QBhelperfunctions.update_cwl_group_stats's self-heal fills
-                # it in (via the same safe-rank cross-check) the moment this group's
-                # standings are computed, on both the very first computation and every
-                # later re-render.
-                logging.debug(
-                    f"[CWL-ROUNDS] group {_group_id} season={cwl_season}: "
-                    f"league group state='{_lg_state}' (season already ended) — "
-                    "this call found no fresh, trustworthy source for league_rank; "
-                    "any existing DB value is left as-is (see update_cwl_group_stats "
-                    "self-heal for how a genuinely still-empty value gets filled in)"
-                )
-
-            if not _league_rank and not _season_over:
-                # Fallback: clan_name_cache — but only trust fresh entries.
-                # A clan that is CWL-only / passive may have last been fetched
-                # before last month's promotion/demotion, making its cached
-                # war_league stale.  We accept the cached value only when
-                # last_checked_via_api is within 8 days; otherwise we fire
-                # one get_clan() call for the first candidate clan so the
-                # in-place cache update gives us the correct current league.
-                #
-                # Safety: even if get_clan() runs after the season ends and
-                # returns the post-promotion league, update_cwl_league_rank
-                # will NOT write it because its SQL guard (cwl_ended = 0)
-                # freezes the row once the season is marked ended.
-                _STALE_DAYS = 8
-                _stale_cutoff = datetime.now(_dt_timezone.utc) - timedelta(days=_STALE_DAYS)
-                _refresh_candidate: str = ""
-                for _ct in _clan_tags:
-                    _entry = self.clan_name_cache.get(_ct)
-                    if isinstance(_entry, dict):
-                        _lr = _entry.get("war_league") or ""
-                        if _lr:
-                            # Accept only if recently refreshed.
-                            _last_chk: str = _entry.get("last_checked_via_api") or ""
-                            _is_stale = True
-                            if _last_chk:
-                                try:
-                                    _lc_dt = datetime.fromisoformat(_last_chk)
-                                    if _lc_dt.tzinfo is None:
-                                        _lc_dt = _lc_dt.replace(tzinfo=_dt_timezone.utc)
-                                    _is_stale = _lc_dt < _stale_cutoff
-                                except (ValueError, TypeError):
-                                    _is_stale = True
-                            if not _is_stale:
-                                _league_rank = str(_lr)  # fresh — use directly
-                                break
-                            elif not _refresh_candidate:
-                                _refresh_candidate = _ct  # stale — remember for API call
-                    elif not _refresh_candidate and _ct:
-                        _refresh_candidate = _ct  # no entry at all → candidate
+            if _is_new_group:
+                # Try raw_data first — free if present. get_league_group() is
+                # not currently known to include per-clan warLeague, but this
+                # costs nothing to check in case that ever changes.
+                if _raw_data and isinstance(_raw_data, dict):
+                    _raw_data_d: Dict[str, Any] = cast(Dict[str, Any], _raw_data)
+                    _clans_raw = cast(List[Any], _raw_data_d.get("clans") or [])
+                    for _cr in _clans_raw:
+                        _cr_dict = cast(Dict[str, Any], _cr) if isinstance(_cr, dict) else {}
+                        _wl_raw = _cr_dict.get("warLeague")
+                        _wl: Dict[str, Any] = cast(Dict[str, Any], _wl_raw) if isinstance(_wl_raw, dict) else {}
+                        _wl_name: str = cast(str, _wl.get("name") or "")
+                        if _wl_name:
+                            _league_rank = _wl_name
+                            break
 
                 if not _league_rank:
-                    # All cached values were stale or absent.  Fetch one clan
-                    # profile from the API to get an up-to-date war_league.
-                    _fetch_tag = _refresh_candidate or (_clan_tags[0] if _clan_tags else "")
-                    if _fetch_tag:
-                        try:
-                            logging.info(
-                                f"[CWL-ROUNDS] group {_group_id}: war_league stale"
-                                f" (>{_STALE_DAYS}d) in clan_name_cache — "
-                                f"refreshing via get_clan({_fetch_tag})"
-                            )
-                            await self.coc_clan_cache.get_clan(_fetch_tag)
-                            # _update_clan_metadata (called by get_clan) writes the
-                            # fresh war_league into clan_name_cache in-place.
-                            _fresh = self.clan_name_cache.get(_fetch_tag)
-                            if isinstance(_fresh, dict):
-                                _league_rank = str(_fresh.get("war_league") or "")
-                        except Exception as _ge:
-                            logging.warning(
-                                f"[CWL-ROUNDS] get_clan({_fetch_tag}) for "
-                                f"league_rank failed: {_ge}"
-                            )
+                    # Fallback: clan_name_cache — but only trust reasonably fresh
+                    # entries. A clan's cached war_league can be stale from long
+                    # before this month's group even though the group itself is
+                    # brand new (e.g. a passive Tier-3 clan not routinely
+                    # re-polled). Accept a cached value only when
+                    # last_checked_via_api is within 8 days; otherwise fire one
+                    # get_clan() call for the first candidate clan — cheap in
+                    # both compute and API budget, since every member of a
+                    # brand-new group shares the same answer.
+                    _STALE_DAYS = 8
+                    _stale_cutoff = datetime.now(_dt_timezone.utc) - timedelta(days=_STALE_DAYS)
+                    _refresh_candidate: str = ""
+                    for _ct in _clan_tags:
+                        _entry = self.clan_name_cache.get(_ct)
+                        if isinstance(_entry, dict):
+                            _lr = _entry.get("war_league") or ""
+                            if _lr:
+                                _last_chk: str = _entry.get("last_checked_via_api") or ""
+                                _is_stale = True
+                                if _last_chk:
+                                    try:
+                                        _lc_dt = datetime.fromisoformat(_last_chk)
+                                        if _lc_dt.tzinfo is None:
+                                            _lc_dt = _lc_dt.replace(tzinfo=_dt_timezone.utc)
+                                        _is_stale = _lc_dt < _stale_cutoff
+                                    except (ValueError, TypeError):
+                                        _is_stale = True
+                                if not _is_stale:
+                                    _league_rank = str(_lr)  # fresh — use directly
+                                    break
+                                elif not _refresh_candidate:
+                                    _refresh_candidate = _ct  # stale — remember for API call
+                        elif not _refresh_candidate and _ct:
+                            _refresh_candidate = _ct  # no entry at all → candidate
+
+                    if not _league_rank:
+                        # No fresh cache entry anywhere in the group — one
+                        # targeted API call is enough.
+                        _fetch_tag = _refresh_candidate or (_clan_tags[0] if _clan_tags else "")
+                        if _fetch_tag:
+                            try:
+                                logging.info(
+                                    f"[CWL-ROUNDS] group {_group_id}: new group, no "
+                                    f"fresh cached war_league in the group — "
+                                    f"refreshing via get_clan({_fetch_tag})"
+                                )
+                                await self.coc_clan_cache.get_clan(_fetch_tag)
+                                # _update_clan_metadata (called by get_clan) writes the
+                                # fresh war_league into clan_name_cache in-place.
+                                _fresh = self.clan_name_cache.get(_fetch_tag)
+                                if isinstance(_fresh, dict):
+                                    _league_rank = str(_fresh.get("war_league") or "")
+                            except Exception as _ge:
+                                logging.warning(
+                                    f"[CWL-ROUNDS] get_clan({_fetch_tag}) for "
+                                    f"league_rank failed: {_ge}"
+                                )
 
             if _league_rank:
                 await db.update_cwl_league_rank(cwl_season, _group_id, _league_rank)

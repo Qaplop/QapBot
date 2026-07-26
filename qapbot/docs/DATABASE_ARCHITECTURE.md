@@ -572,6 +572,23 @@ re-check) rather than trusting them long-term.
   `db_manager.update_cwl_league_rank(..., force=True)` — a new parameter that drops the
   `cwl_ended` guard specifically for this already-verified corrective path, never for the
   original derivation path the guard was built to constrain.
+  **Root-cause fix, replacing the `.state` gate above**: the `.state`-based gate treated a
+  symptom, not the disease. The actual defect was that `_process_league_group_response` had no
+  concept of "first time seeing this group" vs. "re-processing a group already recorded" — the
+  same "trust any member's current league" logic ran on *every* call, gated only on whether the
+  API currently reported the season as active. The real fix: only ever populate `league_rank`
+  when `db.cwl_group_exists(group_id, season)` reports no row existed before this call. That is
+  the one moment every member is *guaranteed* to share one league — a freshly-discovered group
+  is necessarily still within its own active season, no `.state` inspection needed. An
+  already-known group's `league_rank` is now never touched again by this function, regardless
+  of what the API reports; `update_cwl_group_stats`'s self-heal remains the only other path that
+  can touch it later, and only via the verified safe-rank cross-check. This also simplified the
+  fallback: raw_data → fresh `clan_name_cache` entry (8-day staleness check, kept — a cached
+  value can be stale from long before this brand-new group even without any season-timing
+  concern) → exactly one `get_clan()` call if nothing fresh is cached. New
+  `db_manager.cwl_group_exists()` method. Tests replaced:
+  `tests/unit/test_cwl_league_rank_season_gate.py` (tested the now-removed `.state` gate) →
+  `tests/unit/test_cwl_league_rank_new_group_gate.py` (9 tests for the new-group gate).
 
 ### 2026-04-07: Index Cleanup + Partial Index (Complete ✅)
 - Dropped 5 legacy duplicate indexes (exact duplicates of idx_wa_*/idx_ws_* indexes added earlier):

@@ -3985,6 +3985,26 @@ class WarHistoryDB:
 
     # ── CWL league group + round tables ───────────────────────────────
 
+    async def cwl_group_exists(self, league_group_id: str, cwl_season: str) -> bool:
+        """Return True if (league_group_id, cwl_season) already has at least one
+        row in cwl_league_groups — i.e. this is NOT the first time this exact
+        group has been seen. Checked BEFORE upsert_cwl_league_data so it reflects
+        state as of before this call's insert.
+
+        Used to gate cwl_league_groups.league_rank population to genuine first
+        discovery — the only moment every member of a group is *guaranteed* to
+        share one league (see cache_manager._process_league_group_response).
+        Only checks the hot ("main") schema: a CWL season currently being
+        discovered for the first time can never already be old enough to have
+        been swept into the history schema by monthly_history_migration.
+        """
+        await self._ensure_connection()
+        cursor = await self._conn.execute(
+            "SELECT 1 FROM cwl_league_groups WHERE league_group_id = ? AND cwl_season = ? LIMIT 1",
+            (league_group_id, cwl_season),
+        )
+        return (await cursor.fetchone()) is not None
+
     async def upsert_cwl_league_data(
         self,
         league_group_id: str,
