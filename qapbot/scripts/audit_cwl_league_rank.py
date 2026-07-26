@@ -69,14 +69,17 @@ Commands:
           1. Computes each group's group_rank/total_stars from war_summary —
              offline, no API calls — for every group in that season, not just
              the handful that happened to have an on-demand /leaderboard query.
-          2. A clan that finished a "safe" middle rank (conservatively: not
-             within the top 3 or bottom 2 of its group — no version of the
-             promotion/demotion rules moves anyone outside that band) is
-             guaranteed to have played the SAME league the following season.
-             So if that clan's `clans.war_league` was refreshed any time after
-             --fresh-after, its current live league IS this season's true
-             league for the whole group (all members share one league by
-             construction).
+          2. A clan that finished a "safe" middle rank is guaranteed to have
+             played the SAME league the following season. For leagues with
+             empirically-measured promotion/demotion counts (see
+             _TRUSTED_LEAGUE_PROMO_RULES — derived by `evaluate-promo-rules`
+             below), the exact safe band is used; for any other league, a
+             conservative universal band (not within the top 3 / bottom 2 —
+             no rule version seen anywhere moves anyone outside that) is used
+             instead. So if that clan's `clans.war_league` was refreshed any
+             time after --fresh-after, its current live league IS this
+             season's true league for the whole group (all members share one
+             league by construction).
           3. Where that reconstructed league differs from what's stored,
              corrects it (with --yes); otherwise just confirms it.
 
@@ -256,17 +259,41 @@ def fix(group_id: str, season: str, correct_league: str, apply: bool) -> None:
 
 
 # ── reconstruct ──────────────────────────────────────────────────────────────
-# Conservative, league-independent promotion/demotion bounds: no rule table
-# version seen in QBhelperfunctions.py promotes more than 3 or demotes more
-# than 2. A clan ranked outside [MAX_PROMOTED+1, n_clans-MAX_DEMOTED] is
-# therefore GUARANTEED to have stayed in the same league the following season,
-# regardless of which league it was actually in or which rule version applied.
+# Conservative, league-independent fallback bound: no rule table version seen
+# in QBhelperfunctions.py promotes more than 3 or demotes more than 2. A clan
+# ranked outside [MAX_PROMOTED+1, n_clans-MAX_DEMOTED] is GUARANTEED to have
+# stayed in the same league the following season, regardless of which league
+# it was actually in or which rule version applied. Used for any league not in
+# _TRUSTED_LEAGUE_PROMO_RULES below.
 MAX_PROMOTED = 3
 MAX_DEMOTED = 2
 
+# Per-league promo/demo counts empirically measured 2026-07-26 via this script's
+# own `evaluate-promo-rules` command against real season 2026-07 data — see
+# QBhelperfunctions.py's _CWL_PROMO_RULES_FROM_2026_05 (keep in sync if that
+# table changes) and changelog.txt 2026-07-26 for the full derivation.
+# Deliberately excludes any league evaluate-promo-rules didn't actually see
+# real data for (e.g. Bronze/Silver — no war-tracked clans that low), and
+# Titan League III/II/I + Legend League, whose measured data was inconclusive
+# (see evaluate_promo_rules's docstring) — those fall back to the conservative
+# universal band above instead of trusting a specific number we're not
+# confident in.
+_TRUSTED_LEAGUE_PROMO_RULES: Dict[str, Tuple[int, int]] = {
+    "Gold League I":       (2, 2),
+    "Crystal League III":  (2, 2),
+    "Crystal League I":    (2, 2),
+    "Master League III":   (2, 2),
+    "Master League II":    (2, 2),
+    "Master League I":     (2, 2),
+    "Champion League III": (2, 2),
+    "Champion League II":  (2, 2),
+    "Champion League I":   (4, 1),
+}
 
-def _safe_rank_band(n_clans: int) -> Optional[Tuple[int, int]]:
-    lo, hi = MAX_PROMOTED + 1, n_clans - MAX_DEMOTED
+
+def _safe_rank_band(n_clans: int, league_name: str = "") -> Optional[Tuple[int, int]]:
+    n_promoted, n_demoted = _TRUSTED_LEAGUE_PROMO_RULES.get(league_name, (MAX_PROMOTED, MAX_DEMOTED))
+    lo, hi = n_promoted + 1, n_clans - n_demoted
     return (lo, hi) if lo <= hi else None
 
 
@@ -382,7 +409,8 @@ def reconstruct(
 
     for gid, members in groups.items():
         n = len(members)
-        band = _safe_rank_band(n)
+        recorded_league = members[0].league_rank or ""
+        band = _safe_rank_band(n, recorded_league)
         if band is None:
             no_safe_rank_band.append(gid)
             continue
@@ -418,18 +446,17 @@ def reconstruct(
                 fresh_leagues.setdefault(info[0], []).append(tag)
 
         if not fresh_leagues:
-            no_fresh_evidence.append((gid, safe_tags, members[0].league_rank or ""))
+            no_fresh_evidence.append((gid, safe_tags, recorded_league))
             continue
         if len(fresh_leagues) > 1:
             disagreement.append((gid, [t for tags in fresh_leagues.values() for t in tags]))
             continue
 
         reconstructed_league, source_tags = next(iter(fresh_leagues.items()))
-        recorded = members[0].league_rank or ""
-        if reconstructed_league == recorded:
-            already_correct.append((gid, recorded))
+        if reconstructed_league == recorded_league:
+            already_correct.append((gid, recorded_league))
         else:
-            would_fix.append((gid, recorded, reconstructed_league, source_tags[0]))
+            would_fix.append((gid, recorded_league, reconstructed_league, source_tags[0]))
 
     # ── Optional live refresh for the "no fresh evidence" bucket ───────────────
     still_no_evidence: List[str] = []

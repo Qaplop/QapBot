@@ -1,6 +1,35 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-26 (18)
+- Fixed: investigated all 19 of (17)'s "disagreement" Champion League II groups by hand —
+  100% cleanly matched the newly-discovered Champion League I (4, 1) pattern (ranks 1-4
+  promoted, 5-7 unchanged, rank 8 demoted). Root cause confirmed exactly: these groups
+  actually played Champion League I; the old bug picked the one *demoted* (rank 8) clan as
+  its wrongful "representative", writing that clan's post-season Champion League II onto the
+  whole group. Corrected all 19 (152 rows) via `fix`.
+  Updated `reconstruct`'s safe-rank band from a single conservative universal (3, 2) to
+  per-league where we have empirically-measured evidence: new `_TRUSTED_LEAGUE_PROMO_RULES`
+  dict (Gold League I, Crystal League III/I, Master League III/II/I, Champion League III/II/I
+  — exactly the leagues `evaluate-promo-rules` actually saw real data for) with the
+  conservative band retained as fallback for everything else, including Titan/Legend
+  (deliberately excluded — still inconclusive). Re-ran `reconstruct` with the tightened band:
+  disagreement dropped 274 -> 208, and it caught 8 *more* corrections the old blanket band had
+  missed entirely (7 more "wrong demoted representative" cases, one tier further up the ladder
+  — Champion League I mislabeled as the true Titan League III, confirmed by the identical
+  rank-pattern check; 1 Master League II/III case). Applied all 8. Confirmed stable
+  (`would be fixed: 0` on re-run); disagreement count changed slightly (208 -> 215) purely
+  because 7 of the 8 newly-corrected groups landed on Titan League III, which isn't in the
+  trusted table, so they fall back to the imprecise conservative band on re-evaluation — the
+  DB values are correct, the script just can't self-confirm Titan-tier yet (consistent with
+  (17)'s finding).
+  Also: gave the corrected prod `fix` command as a single line instead of a multi-line
+  `for...do...done` with backslash continuations — the latter can't be reliably pasted into
+  an interactive SSH terminal (many clients send each line as its own command as soon as a
+  newline is seen, breaking a continued statement).
+  Tests: 1425 passed (unchanged). Files changed: qapbot/scripts/audit_cwl_league_rank.py
+  (_TRUSTED_LEAGUE_PROMO_RULES, _safe_rank_band, reconstruct's docstring).
+
 2026-07-26 (17)
 - Added: `evaluate-promo-rules` subcommand to `qapbot/scripts/audit_cwl_league_rank.py` —
   empirically measures real CWL promotion/demotion counts per league (Supercell has never
