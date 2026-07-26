@@ -227,6 +227,7 @@ archive/
 archive_old/
 qapbot/scripts/*.txt
 qapbot/scripts/*.jpg
+cwl_reconstruct_*.tsv
 qapbot.db*
 qapbot_history.db*
 orphan_analysis.txt

@@ -1,6 +1,49 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-26 (12)
+- Added: `reconstruct` subcommand to `qapbot/scripts/audit_cwl_league_rank.py` — bulk repair
+  for cwl_league_groups.league_rank across a whole CWL season, without the ~200,000 live API
+  calls a blanket clan refresh would cost.
+  Context: found that season 2026-07 has 211,688 cwl_league_groups rows / 26,467 distinct
+  groups, but only 6 groups had ever had group_rank computed (that only happens when a clan
+  is actively queried via /leaderboard cwlinfo/cwlgroup — the other ~26,461 groups' league_rank
+  values, however wrong, have never been shown to any user). The (7)/(11) fixes only stop new
+  corruption; they don't repair what's already wrong.
+  Approach (a clan finishing a "safe" middle rank — conservatively outside the top 3 / bottom 2
+  of its group, a league-independent bound derived from every promotion/demotion count seen in
+  QBhelperfunctions._CWL_PROMO_RULES_* — is guaranteed to have stayed in the same league the
+  next season):
+    1. Compute group_rank/total_stars for every group in the season directly from war_summary
+       (already fully populated regardless of who queries a group) — zero API calls.
+    2. For a safe-rank clan, cross-check its CURRENT clans.war_league against the recorded
+       league_rank, but only trust it if last_checked_via_api is on/after a caller-supplied
+       --fresh-after cutoff (the date this season's promotions/demotions applied) — otherwise
+       the "current" league could itself reflect a LATER season's outcome.
+    3. Where the fresh, safe-rank evidence disagrees with what's stored, correct it.
+  Actively-subscribed clans refresh every cycle and passively-tracked Master III+ clans refresh
+  every ~12-22h (see fetch_clan_war_data's TTL gate + CLAN_WAR_TRACKING.md's tier model), so
+  clans.war_league is very likely already fresh for exactly the leagues this bug hit — meaning
+  most of the season was resolvable with NO new API calls at all.
+  Added `--refresh-missing`: for the remaining groups with no fresh cached evidence, fetches
+  ONE safe-rank clan per group live (not all 8, and not the other ~20k irrelevant clans) via
+  CONFIG.coc_email/coc_password, which already auto-select DEV/PROD credentials for whichever
+  machine the script runs on.
+  Validated against known-correct answers before trusting it: correctly reconstructed both the
+  (7) and (11) incidents ("Champion League III" / "Master League III") from scratch. Spot-
+  checked a sample of its "disagreement" bucket (cases where multiple safe-rank clans in a
+  group disagreed on current league) and confirmed it correctly declines to guess — traced to
+  incomplete per-war data skewing that clan's computed rank, not a flaw in the method.
+  Results for season 2026-07 (data/qapbot.db, applied): offline pass found 6,465 confirmed
+  corrections (0 API calls) + 7,081 already-correct; --refresh-missing resolved 957 of the
+  961 remaining candidates for 939 more corrections (5 clans had no live match — deleted/
+  private). Total: 7,404 groups corrected. Remaining unresolved: 11,686 groups with incomplete
+  war_summary data (can't be ranked at all — a separate, unrelated data-completeness problem,
+  not fixable by any API refresh) and 274 flagged as disagreement (left untouched).
+  Writes a TSV audit trail (`cwl_reconstruct_<season>.tsv`, gitignored) before any write.
+  Tests: 1409 passed, 5 deselected (script has no automated tests — one-time DB tool).
+  Files changed: qapbot/scripts/audit_cwl_league_rank.py, .gitignore (ignore the TSV report).
+
 2026-07-26 (11)
 - Fixed: confirmed and fixed a second, related instance of the 2026-07-26 (7)/(10) CWL
   league_rank bug for #2JYQ909PC "The Marines II" (group `e29562f5ac3ddc68`, season "2026-07"),
