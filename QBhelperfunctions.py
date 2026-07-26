@@ -2343,14 +2343,55 @@ def _load_cwl_analysis_from_db_sync(
 # Rules dict: league_name → (n_promoted, n_demoted)
 #
 # ── Rules valid from 2026-05 onwards ────────────────────────────────────────
+# Supercell has never published these numbers. Empirically measured 2026-07-26
+# via `qapbot/scripts/audit_cwl_league_rank.py evaluate-promo-rules` — for every
+# clan in a fully-ranked, complete-data 8-clan group in season 2026-07, compared
+# its final rank against its CURRENT live league (fetched fresh right after that
+# season's promotions applied). Gold League I through Champion League III: huge
+# sample sizes (hundreds to 5000+ clans per league) cleanly confirm (2, 2) with
+# ~100% consistency at the rank boundary — left unchanged.
+#
+# Champion League I corrected 2026-07-26: (2, 2) -> (4, 1). n=66, unambiguous:
+# ranks 1-4 100% promoted, ranks 5-7 ~89% unchanged, rank 8 ~89% demoted (only
+# the bottom rank demotes, not the bottom two).
+#
+# NOT corrected — inconclusive, see changelog.txt 2026-07-26 and the
+# evaluate-promo-rules script's docstring:
+#   - Titan League I/II/III, Legend League: the measured data is too noisy to
+#     trust — even top-ranked clans show only a ~35/65 split between promoted
+#     and unchanged (every other league shows ~100/0 at its rank boundary), and
+#     whole groups scatter across Titan I/II/III with often zero members
+#     remaining at the group's own recorded league. Initially read as "this
+#     tier doesn't follow a rank-based model at all" (e.g. a broader trophy/
+#     medal-pool mechanic, the way Legend League already works globally) — but
+#     that conclusion doesn't hold up: cross-checking against
+#     `reconstruct`'s own confirmation status showed 97.8% of these groups'
+#     *recorded* league_rank was never independently verified (all fell into
+#     "disagreement" under the old, too-conservative safe-rank band), so the
+#     "before" side of every comparison could itself still be the old,
+#     never-corrected value. The likelier explanation: Titan/Legend is a small,
+#     rarely-independently-verified population, so historical corruption from
+#     before the 2026-07-26 root-cause fix has had the most opportunity to
+#     accumulate uncorrected there. Champion League I shows the same 0%
+#     confirmation rate yet still gave a clean, unambiguous (4, 1) signal, so
+#     low confirmation alone doesn't explain the Titan/Legend messiness —
+#     genuinely inconclusive without more data. Left at the old placeholder
+#     values; revisit with evaluate-promo-rules once a season or two of
+#     league_rank populated entirely under the new only-at-group-creation
+#     logic has accumulated (should be unambiguous either way by then).
+#   - Champion League II: ~5% of groups (19 of 371 sampled) show 6-7 of 8
+#     members jumping to a MUCH higher league, including two-tier jumps
+#     (Champion II -> Titan III) a single normal promotion can't produce.
+#     This looks like leftover corrupted league_rank data our earlier bulk
+#     fix didn't catch (i.e. these 19 groups' recorded "Champion League II" is
+#     itself probably wrong), not a real promotion-rule quirk — needs manual
+#     spot-checking, not a rule-table change.
 _CWL_PROMO_RULES_FROM_2026_05: Dict[str, Tuple[int, int]] = {
-    # Add the 2026-05+ rules here once the official numbers are confirmed.
-    # Placeholder: copy of the pre-2026-05 rules until the real numbers are known.
     "Legend League":       (0, 2),
     "Titan League I":      (2, 2),
     "Titan League II":     (2, 2),
     "Titan League III":    (2, 2),
-    "Champion League I":   (2, 2),
+    "Champion League I":   (4, 1),
     "Champion League II":  (2, 2),
     "Champion League III": (2, 2),
     "Master League I":     (2, 2),

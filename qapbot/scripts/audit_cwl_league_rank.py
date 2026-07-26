@@ -498,6 +498,155 @@ def reconstruct(
     print(f"\nApplied {len(would_fix)} group correction(s), {n_applied} row(s) updated.")
 
 
+# ── evaluate-promo-rules ─────────────────────────────────────────────────────
+# Supercell has never published exact CWL promotion/demotion counts per league.
+# This empirically measures them: for a season whose cwl_league_groups.league_rank
+# is already known-correct (verified by `reconstruct` above), compare each
+# clan's final rank in its group against its CURRENT live league (clans.war_league,
+# gated to entries refreshed after --fresh-after so "current" reliably means
+# "the outcome of THIS season", not some later one). Aggregated across every
+# 8-clan group in the season, this gives a real sample size per (league, rank)
+# instead of guessing from 1-2 examples.
+LEAGUE_LADDER: List[str] = [
+    "Bronze League III", "Bronze League II", "Bronze League I",
+    "Silver League III", "Silver League II", "Silver League I",
+    "Gold League III", "Gold League II", "Gold League I",
+    "Crystal League III", "Crystal League II", "Crystal League I",
+    "Master League III", "Master League II", "Master League I",
+    "Champion League III", "Champion League II", "Champion League I",
+    "Titan League III", "Titan League II", "Titan League I",
+    "Legend League",
+]
+_LADDER_INDEX: Dict[str, int] = {name: i for i, name in enumerate(LEAGUE_LADDER)}
+
+
+def evaluate_promo_rules(season: str, fresh_after: str) -> None:
+    if len(season) != 7:
+        print(f"[ERROR] --season must be a plain 'YYYY-MM' regular season, got {season!r}.")
+        return
+    try:
+        fresh_after_dt = datetime.fromisoformat(fresh_after).replace(tzinfo=timezone.utc)
+    except ValueError:
+        print(f"[ERROR] --fresh-after must be YYYY-MM-DD, got {fresh_after!r}.")
+        return
+
+    conn = _connect()
+    group_rows = [r for r in _fetch_all_rows(conn, None) if r.cwl_season == season]
+    war_stats = _bulk_group_war_stats(conn, season)
+    clan_info: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+    for r in conn.execute("SELECT clan_tag, war_league, last_checked_via_api FROM clans"):
+        clan_info[r["clan_tag"]] = (r["war_league"], r["last_checked_via_api"])
+    conn.close()
+
+    groups: Dict[str, List[Row]] = {}
+    for r in group_rows:
+        groups.setdefault(r.league_group_id, []).append(r)
+
+    # (league, rank) -> counts
+    tally: Dict[Tuple[str, int], Dict[str, int]] = {}
+    non_standard_size = 0
+    incomplete = 0
+    unknown_league = 0
+
+    for members in groups.values():
+        n = len(members)
+        recorded_league = members[0].league_rank or ""
+        if not recorded_league or recorded_league not in _LADDER_INDEX:
+            unknown_league += 1
+            continue
+        if n != 8:
+            non_standard_size += 1
+            continue
+
+        ranked: List[Tuple[str, int, float]] = []
+        missing = False
+        for m in members:
+            stats = war_stats.get(m.clan_tag)
+            if stats is None:
+                missing = True
+                break
+            ranked.append((m.clan_tag, stats[0], stats[1]))
+        if missing:
+            incomplete += 1
+            continue
+        ranked.sort(key=lambda t: (-t[1], -t[2]))
+
+        rec_idx = _LADDER_INDEX[recorded_league]
+        for rank, (tag, _s, _d) in enumerate(ranked, start=1):
+            key = (recorded_league, rank)
+            bucket = tally.setdefault(key, {"promoted": 0, "unchanged": 0, "demoted": 0, "no_evidence": 0})
+            info = clan_info.get(tag)
+            if not info or not info[0] or not info[1] or info[0] not in _LADDER_INDEX:
+                bucket["no_evidence"] += 1
+                continue
+            try:
+                lc = datetime.fromisoformat(info[1])
+                if lc.tzinfo is None:
+                    lc = lc.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                bucket["no_evidence"] += 1
+                continue
+            if lc < fresh_after_dt:
+                bucket["no_evidence"] += 1
+                continue
+            cur_idx = _LADDER_INDEX[info[0]]
+            if cur_idx > rec_idx:
+                bucket["promoted"] += 1
+            elif cur_idx < rec_idx:
+                bucket["demoted"] += 1
+            else:
+                bucket["unchanged"] += 1
+
+    print(f"Season {season}: {len(groups)} group(s) total "
+          f"({non_standard_size} non-8-clan excluded, {incomplete} incomplete war data excluded, "
+          f"{unknown_league} unknown recorded league excluded)")
+    print(f"Only counts clans whose clans.war_league was refreshed on/after {fresh_after}\n")
+
+    leagues_seen = sorted({lg for (lg, _r) in tally.keys()}, key=lambda lg: _LADDER_INDEX.get(lg, -1))
+    suggested: Dict[str, Tuple[int, int]] = {}
+    for lg in leagues_seen:
+        print(f"=== {lg} ===")
+        n_promoted = 0
+        n_demoted = 0
+        rank_rows = []
+        for rank in range(1, 9):
+            c = tally.get((lg, rank))
+            if not c:
+                continue
+            total = c["promoted"] + c["unchanged"] + c["demoted"]
+            rank_rows.append((rank, c, total))
+        # Suggest n_promoted: contiguous top ranks where promoted is the majority outcome.
+        for rank, c, total in rank_rows:
+            if total > 0 and c["promoted"] * 2 > total:
+                n_promoted = rank
+            else:
+                break
+        # Suggest n_demoted: contiguous bottom ranks where demoted is the majority outcome.
+        for rank, c, total in reversed(rank_rows):
+            if total > 0 and c["demoted"] * 2 > total:
+                n_demoted = 9 - rank
+            else:
+                break
+        suggested[lg] = (n_promoted, n_demoted)
+
+        for rank, c, total in rank_rows:
+            if total == 0:
+                print(f"  rank {rank}: no fresh evidence ({c['no_evidence']} sampled, all stale/unknown)")
+                continue
+            pct_p = 100 * c["promoted"] / total
+            pct_d = 100 * c["demoted"] / total
+            print(f"  rank {rank}: promoted={c['promoted']:4d} ({pct_p:5.1f}%)  "
+                  f"unchanged={c['unchanged']:4d}  demoted={c['demoted']:4d} ({pct_d:5.1f}%)  "
+                  f"[n={total}, no_evidence={c['no_evidence']}]")
+        print(f"  suggested: (n_promoted={n_promoted}, n_demoted={n_demoted})\n")
+
+    print("Suggested _CWL_PROMO_RULES entries (review the per-rank breakdown above before trusting —")
+    print("this is majority-vote inference from one season, not a verified rule):")
+    for lg in leagues_seen:
+        p, d = suggested[lg]
+        print(f'    "{lg}": ({p}, {d}),')
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
@@ -525,6 +674,12 @@ def main() -> None:
                                "coc_password, which auto-select DEV/PROD credentials for this machine).")
     p_recon.add_argument("--concurrency", type=int, default=20, help="Max parallel API calls for --refresh-missing (default 20).")
 
+    p_eval = sub.add_parser("evaluate-promo-rules",
+                             help="Empirically measure promotion/demotion counts per league from real season data.")
+    p_eval.add_argument("--season", required=True, help="Regular season with already-correct league_rank, e.g. '2026-07'.")
+    p_eval.add_argument("--fresh-after", required=True,
+                         help="YYYY-MM-DD: only trust clans.war_league if last_checked_via_api is on/after this date.")
+
     args = p.parse_args()
     if args.command == "report":
         report(args.clan, args.seasons)
@@ -533,6 +688,8 @@ def main() -> None:
     elif args.command == "reconstruct":
         reconstruct(args.season, args.fresh_after, apply=args.yes, output=args.output,
                     refresh_missing=args.refresh_missing, concurrency=args.concurrency)
+    elif args.command == "evaluate-promo-rules":
+        evaluate_promo_rules(args.season, args.fresh_after)
 
 
 if __name__ == "__main__":
