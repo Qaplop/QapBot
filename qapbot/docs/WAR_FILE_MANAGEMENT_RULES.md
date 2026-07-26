@@ -19,6 +19,10 @@ War file lifecycle management operates in three stages:
   - If war is already archived AND already present in history DB, skip saving again
   - Logs: [FINALIZED-WAR-SKIP]
 
+- Friendly-War Skip (unconditional pre-save guard)
+  - Wars with `type == 'friendly'` are never saved to `data/temp/` at all (regardless of state)
+  - Logs: [FRIENDLY-SKIP]
+
 **Stage 2: File Management (QBhelperfunctions.py)**
 - `manage_war_files()` function handles complete lifecycle of war files:
   - Detection (current vs old wars)
@@ -31,7 +35,11 @@ War file lifecycle management operates in three stages:
 - After successful database write, files are moved to archive with content comparison (QBcsvhandling._append_current_war_to_history):
   - **Archive doesn't exist** → Move temp file to archive
   - **Archive exists + identical content** → Delete temp file (avoid duplicates)
-  - **Archive exists + different content** → Replace archive with updated file (late attacks)
+  - **Archive exists + different content** → Replace archive with updated file (late attacks),
+    UNLESS the temp file has *fewer* total attacks than the archive (regression guard: an
+    older/incomplete re-fetch can never have more attacks than an already-archived war, since
+    CoC never removes attacks retroactively) — in that case the temp file is discarded and the
+    archive is preserved. Logs: [REGRESSION-GUARD]
 - After late-attack checks/updates, temp files are moved/refreshed in archive (QBhelperfunctions._archive_and_log_war_file)
 - This ensures:
   - All war data permanently preserved
@@ -51,7 +59,9 @@ PRE-SAVE FILTER (before temp file creation):
 
 manage_war_files() FILE DISCOVERY:
 │
-├─ List files via glob: data/temp/{SAFE_CLAN_TAG}_*_war_data.json
+├─ List files via glob: data/temp/shard_N/{SAFE_CLAN_TAG}_*_war_data.json
+├─   (temp/ is sharded into 10 subdirectories, same as archive/ — shard chosen
+├─    by clan-tag prefix via QBcsvhandling.get_war_shard_dir())
 ├─ Sort by modification time (oldest → newest)
 └─ Identify CURRENT WAR FILE (only if current_opponent_tag provided):
   ├─ newest filename parts[1] (opponent segment) == current_opponent_tag (cleaned)
@@ -77,6 +87,8 @@ For each matching war file (excluding current war file, if any):
 │
 └─ Step 3: _process_war_history() (finalization + dedupe)
   ├─ If archive file exists AND content identical → DELETE temp ([DUPLICATE-SKIP]) and STOP
+  ├─ If archive file exists AND content differs AND temp has FEWER attacks than archive
+  │   → DELETE temp, preserve archive ([REGRESSION-GUARD]) and STOP
   ├─ Else load/validate JSON structure
   │  ├─ Missing opponent.tag → move to archive and STOP ([ARCHIVE] Moved incomplete ...)
   │  └─ Cannot extract start_time → FAIL (manage_war_files archives the file)
@@ -336,10 +348,12 @@ CORRUPTED/INVALID FILE
 ```
 [STALE-WAR-SKIP] Skipping JSON save for {clan} vs {opponent}: war ended X hours ago (>24h threshold)
 [FINALIZED-WAR-SKIP] Skipping JSON save for {clan} vs {opponent}: war {war_id} already in history and archive (fully finalized)
+[FRIENDLY-SKIP] Skipping JSON save for {clan} vs {opponent}: friendly wars are never tracked
 [MANAGE-WAR-FILES] Processing old war: {filename}
 [FINALIZE-OLD-WAR] Processing {filename} - state=war_ended, is_cwl={is_cwl}
 [FINALIZE-ORPHAN-REGULAR] Processing orphaned regular war {filename} - state={state} (can't refetch from API)
 [DUPLICATE-SKIP] Deleted duplicate temp file {filename} - identical to archive
+[REGRESSION-GUARD] Discarded temp {filename}: temp has N attacks < archive N attacks — archive preserved
 [ARCHIVE] Moved {filename} to archive
 ```
 

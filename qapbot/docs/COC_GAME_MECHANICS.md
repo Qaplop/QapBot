@@ -131,7 +131,10 @@ Do NOT use markdown links inside this file (plain text paths only per project st
 
 - Stores fetched league war objects keyed by war_tag to avoid redundant API calls
   within a single cycle when multiple orphaned clans share the same war.
-- Has no eviction — must be bounded (see `Fix _league_war_cache size cap` in backlog).
+- Bounded: entries expire via a TTL (`_LEAGUE_WAR_CACHE_TTL`) and a hard size cap
+  (`_LEAGUE_WAR_CACHE_MAX_ENTRIES`, oldest evicted first), enforced once per cycle in
+  `qapbot/cache_manager.py`. The companion `_league_group_cache` is bounded the same way
+  (`_LEAGUE_GROUP_CACHE_TTL` / `_LEAGUE_GROUP_CACHE_MAX_ENTRIES`).
 
 ---
 

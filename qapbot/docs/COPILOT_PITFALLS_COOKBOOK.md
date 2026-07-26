@@ -106,8 +106,9 @@ See also: ../qapbot/docs/CODE_STRUCTURE.md § Discord Interaction Pitfall
 
 Rule: search first.
 
-- Use grep_search for symbols / exact strings.
-- Use semantic_search for “do we already do something like this?”
+- Use exact-string/symbol search (grep/ripgrep) to find existing usages of a name.
+- Use semantic/fuzzy search (or just browse related modules) to answer "do we already do
+  something like this?" when you don't know the exact name.
 
 If a helper is close but missing one parameter, prefer extending it with an optional parameter rather than creating a near-duplicate.
 
@@ -175,7 +176,7 @@ Correct pattern:
 
 ```python
 from qapbot.cache_manager import CACHE
-rows = await CACHE.db_manager.get_clan_history(clan_tag, month, year)
+rows = CACHE.db_manager.get_clan_attack_history_sync(clan_tag, month, year)
 ```
 
 One-off scripts under `qapbot/scripts/` may use direct sqlite3 for offline validation/repair.
@@ -226,7 +227,7 @@ See also: QBcore.py `_maintenance_interaction_check`
 
 ---
 
-## Pitfall 13: Windows BSOD from excessive glob.glob() calls at startup (WdFilter.sys overload)
+## Pitfall 12: Windows BSOD from excessive glob.glob() calls at startup (WdFilter.sys overload)
 
 Symptom: Fatal system error / immediate reboot with no Python traceback during bot startup,
 specifically during `load_all_temp_war_stats()`. Multiple different BSOD codes across
@@ -297,7 +298,7 @@ The M×N glob.glob() fix above was the real solution.
 
 ---
 
-## Pitfall 12: sys.exit() inside an asyncio task hangs the process
+## Pitfall 13: sys.exit() inside an asyncio task hangs the process
 
 Symptom: `sys.exit(42)` called inside `periodic_main()` task; bot hangs, Ctrl+C stops
 working, `bot.run()` never returns.
@@ -322,7 +323,7 @@ See also: ../qapbot/docs/DATABASE_ARCHITECTURE.md § Migration Principles (Princ
 
 ---
 
-## Pitfall 13: Adding Phase-1 skip logic — check BOTH `track_war_updates` AND `is_deleted`
+## Pitfall 14: Adding Phase-1 skip logic — check BOTH `track_war_updates` AND `is_deleted`
 
 Symptom: A newly added "skip this clan" condition only checks `track_war_updates=False`,
 missing the `is_deleted=True` gate, so deleted clans are still polled and generate errors.

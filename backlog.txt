@@ -26,7 +26,6 @@ Immediate next steps:
   tier3_stat_calls/elapsed turn out high.
 - Wrap the war simulation in a small piece of C code to gain performance
 - Wie geht Cleanup Messages mit gelöschten Kanälen um?
-- A channel that gets removed also should get the subscriptions removed. check if there is a a way to detect channel deletion.
 - Add /admin Backup Data command that mimics the BackupProd.bat behaviour and auto-moves excessive .\archive file numbers to .\archive_old with nightly maintenance auto-run
 - log_time_gaps.py script anwenden und weitere blocking und langläufer operationen finden
 - Try to make the db fully in memory. This might also open-up the potential to improve the caching staregy and only cache temp war files since all other data is in-memory then anyway.
@@ -46,7 +45,6 @@ Immediate next steps:
 - Add on_message handler for DM so that bot can reply to direct chat input from users
 - /clan management: Regular users should be able to use the viewing functions but not the action buttons
 - New Feature: Add scores for "th-level difference" and "up-hits/drops" in CW/CWL
-- New Feature: Add detailed player analysis as discord bot command, players may participate in wars for different clans.
 
 Low prio changes:
 - Output der coc api prüfen und ggfs. weitere Daten verwenden.

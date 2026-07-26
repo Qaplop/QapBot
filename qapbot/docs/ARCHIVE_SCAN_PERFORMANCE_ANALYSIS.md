@@ -4,6 +4,11 @@ Date: 2026-07-18
 Status: **Deferred** — full rescan kept intentionally. Revisit if archive_scan cost
 grows significantly above the current ~1s baseline (see "When to revisit" below).
 
+⏱ **Time-sensitive figures** — the `~320K files` / `~1s baseline` numbers above grow with
+archive size over time, not with code changes (see also `backlog.txt`'s "Monitor
+[PRE-SCAN-TIMING]..." item, which tracks exactly this). Re-verify against a fresh
+`[PRE-SCAN-TIMING]` log line rather than trusting these as current.
+
 ## Background
 
 As part of a broader update-cycle performance investigation (2026-07-18, see
@@ -52,7 +57,7 @@ replace (same filename) never needs to add or remove a set entry.
 ### Added (war finalization moves temp/ → archive/) — **the real problem**
 Traced every `archive_set.add(...)` call site. Found the **common/normal**
 finalization path does NOT update the set:
-- `QapBot.py` `_do_deferred_moves()` (~line 1455) — Phase-3's batched/deferred
+- `QapBot.py` `_do_deferred_moves()` (~line 1477) — Phase-3's batched/deferred
   file moves (the standard path per the P0-batch design) calls
   `os.replace(src, dst)` for every deferred move and **never calls
   `archive_set.add()`**. Harmless *today* only because the set is thrown away

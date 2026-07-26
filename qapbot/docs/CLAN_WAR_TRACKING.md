@@ -12,14 +12,15 @@ All write paths that change `track_war_updates` and `has_active_subscriptions` o
 | `has_active_subscriptions` | cache_manager.py | `update_all_clan_subscription_statuses()` | Startup or bulk family changes | All clans in batch recalc | Computed |
 | `track_war_updates` | cache_manager.py | `update_clan_subscription_status()` | Subscribe / Unsubscribe | Only upgrades: sets True if signal is True and current value is False | One-way ratchet via `_calculate_track_war_updates()` |
 | `track_war_updates` | cache_manager.py | `update_all_clan_subscription_statuses()` | Startup or bulk family changes | Only upgrades: sets True for newly-eligible passively tracked clans | One-way ratchet via `_calculate_track_war_updates()` |
-| `track_war_updates` | qapbot/coc_cache.py | `_update_clan_metadata()` | War league change detected | Only for clans where current value is False and league entered Master III+ | True only (promotion); demotions are ignored |
+| `track_war_updates` | qapbot/coc_cache.py | `_update_clan_metadata()` | War league change detected, clan not subscribed | Current value False and league entered Master III+ | True (promotion) |
+| `track_war_updates` | qapbot/coc_cache.py | `_update_clan_metadata()` | War league change detected, clan not subscribed | Current value True and league dropped below Master III | False (demotion); also purges the clan's temp war files |
 | `has_active_subscriptions` | QBhelperfunctions.py | `_upsert_enemy_clan_on_war_start()` | Enemy clan first encountered | Unconditional | False (enemies start passively tracked) |
 | `track_war_updates` | QBhelperfunctions.py | `_upsert_enemy_clan_on_war_start()` | Enemy clan first encountered | M3+ enemy (CWL or regular war) | True (joined 22h pool) |
 | `track_war_updates` | QBhelperfunctions.py | `_upsert_enemy_clan_on_war_start()` | Enemy clan first encountered | Below M3 or unknown league | False |
 | `has_active_subscriptions` | QBhelperfunctions.py | `_harvest_cwl_group_clans()` | CWL group harvest | All new group clans | False |
 | `track_war_updates` | QBhelperfunctions.py | `_harvest_cwl_group_clans()` | CWL group harvest | Group clan in Master III+ | True (22h polling) |
 | `track_war_updates` | QBhelperfunctions.py | `_harvest_cwl_group_clans()` | CWL group harvest | Group clan below Master III | False |
-| `has_active_subscriptions` | qapbot/ui_clan_management.py | `add_member_clan()` | Guild member_clan added | On failure to fetch clan | False |
+| `has_active_subscriptions` | qapbot/ui_clan_management.py | `MemberClansConfigurationView._on_apply()` | Guild member_clan added, clan not yet cached | Unconditional (both fetch-success and fetch-failure branches) | False |
 
 ---
 
@@ -78,13 +79,17 @@ When an admin adds or removes a clan from a family or guild member-clan list,
 
 File: qapbot/coc_cache.py `CoCClanCache._update_clan_metadata()`
 
-Fires on every CoC API fetch for any clan. If the API returns a different `warLeague` than stored:
+Fires on every CoC API fetch for any clan. If the API returns a different `warLeague` than stored,
+and the clan is NOT subscribed (`has_active_subscriptions=False`):
 
-- Only upgrades: if the clan's current `track_war_updates` is False and the new league is in
+- Promotion: if the clan's current `track_war_updates` is False and the new league is in
   `_WAR_UPDATE_LEAGUES` (Master III+), the flag is set to True.
-- Demotions (e.g. Master III → Crystal I) are silently ignored — the flag stays True.
-- Tracked / subscribed clans (`has_active_subscriptions=True`) are doubly immune and bypass
-  this block entirely.
+- Demotion: if the clan's current `track_war_updates` is True and the new league drops out of
+  `_WAR_UPDATE_LEAGUES`, the flag is set to False — the clan's temp war files are removed first
+  (`_cleanup_temp_war_files()`) to prevent orphans, then it leaves the 22h polling pool. Added
+  2026-06-29; this is no longer a pure one-way ratchet (see Critical Constraints below).
+- Subscribed clans (`has_active_subscriptions=True`) are immune and bypass this block entirely —
+  their `track_war_updates` stays True regardless of league movement.
 - Persisted via `persist_clan()`.
 
 
@@ -119,11 +124,11 @@ Entry guards prevent this from running for unsubscribed clans or below-threshold
 
 ### 8. New clan added via member-clan UI
 
-File: qapbot/ui_clan_management.py `add_member_clan()`
+File: qapbot/ui_clan_management.py `MemberClansConfigurationView._on_apply()`
 
-Creates a minimal cache entry when the clan is not already cached. Sets `has_active_subscriptions=False`.
-Does NOT populate `war_league` or `track_war_updates` — the DB COALESCE default (1 = True) fills
-the gap on persist.
+Creates a minimal cache entry when the clan is not already cached. Sets `has_active_subscriptions=False`
+unconditionally (both the fetch-succeeds and fetch-fails branches). Does NOT populate `war_league` or
+`track_war_updates` — the DB COALESCE default (1 = True) fills the gap on persist.
 
 ---
 
@@ -147,8 +152,10 @@ ELSE  (passively tracked clan):
         → signal = False  (no upgrade triggered)
 ```
 
-Signal = False never causes a downgrade. The only time track_war_updates can be False
-is when the clan was added below the threshold and has never since qualified.
+Within these two callers, signal = False never causes a downgrade — this function/caller pair is
+still a pure one-way ratchet. Globally, though, `track_war_updates` CAN go from True back to False
+via a separate path: `qapbot/coc_cache.py` `_update_clan_metadata()` actively demotes non-subscribed
+clans that drop below Master III (see write path 5 and Critical Constraint 1 above).
 
 The league set (`_WAR_UPDATE_LEAGUES`) is defined identically in both:
 - qapbot/coc_cache.py  (module-level frozenset)
@@ -208,19 +215,24 @@ SQLite INSERT OR REPLACE with COALESCE defaults
 | QapBot.py polling loop | True + has_active_subscriptions=False → polled only if >22h since last update (Tier 2) |
 | QBdiscordcmds.py /admin stats | Count active / 22h-polled / enemy-only breakdown |
 | QBdiscordcmds.py /list Tracked Clans | Filter and split actively tracked vs passively tracked for chart |
-| qapbot/scripts/chart_clans_per_league.py | Stacked bar chart: solid = actively tracked, hatched = passively tracked |
+| qapbot/chart_clans_per_league.py | Stacked bar chart: solid = actively tracked, hatched = passively tracked |
 
 ---
 
 ## Critical Constraints
 
-1. track_war_updates is a one-way ratchet — once True it can never be set back to False by any
-   automated code path. This applies across all triggers: unsubscribe, channel deletion, family
-   removal, league demotion, and bot restart. The only way to clear it would be a manual DB edit.
+1. track_war_updates is a one-way ratchet in `cache_manager.py` (`update_clan_subscription_status()`,
+   `update_all_clan_subscription_statuses()`) — those two paths only ever upgrade, never downgrade.
+   This applies to unsubscribe, channel deletion, family removal, and bot restart: none of those
+   triggers can clear the flag.
+   **Exception (since 2026-06-29)**: `qapbot/coc_cache.py` `_update_clan_metadata()` DOES downgrade
+   `track_war_updates` back to False for non-subscribed clans whose league drops below Master III
+   (see write path 5 above) — league demotion is no longer ratcheted. Subscribed clans remain immune
+   in all cases.
 
 2. Subscribed clans are doubly immune — if `has_active_subscriptions=True`, the upgrade signal
    from Tier 1 fires unconditionally, and the `_update_clan_metadata` league-change block also
-   skips such clans entirely (qapbot/coc_cache.py).
+   skips such clans entirely, in both directions (qapbot/coc_cache.py).
 
 3. Below-threshold actively tracked clans still get CWL war data — they are in the 22h polling pool, so
    their own CWL wars are fetched and stored. However, `_harvest_cwl_group_clans` has an entry
@@ -299,6 +311,7 @@ if clan_data.get('is_deleted'):
 
 | Date       | Change                               | Affected files |
 |---|---|---|
+| 2026-06-29 | Added CWL league demotion support — non-subscribed clans dropping below Master III now have `track_war_updates` reset to False (temp war files cleaned up); `_update_clan_metadata` is no longer a pure one-way ratchet | qapbot/coc_cache.py |
 | 2026-05-31 | Added `is_deleted` clan deletion detection system | QBhelperfunctions.py, qapbot/coc_cache.py, qapbot/cache_manager.py, qapbot/db_manager.py, QapBot.py |
 | 2026-04-11 | Master II → Master III (lowered threshold) | _WAR_UPDATE_LEAGUES (×2), _CWL_HARVEST_LEAGUES |
 | 2026-04-11 | track_war_updates made a one-way ratchet (never downgrades) | cache_manager.py, qapbot/coc_cache.py |

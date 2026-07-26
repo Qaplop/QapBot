@@ -53,7 +53,8 @@ A powerful, modular Discord bot designed for Clash of Clans clan management, fea
 ## 🚀 Quick Start
 
 ### Prerequisites
-- Python 3.10 or higher
+- Python 3.14 or higher (tested with 3.14.5 — see Library Versions above; the codebase relies
+  on 3.14-specific event-loop-policy behavior on Windows)
 - Discord bot token ([create one here](https://discord.com/developers/applications))
 - Clash of Clans API credentials ([get them here](https://developer.clashofclans.com))
 
@@ -128,32 +129,52 @@ A powerful, modular Discord bot designed for Clash of Clans clan management, fea
 
 ## 📋 Commands
 
+QapBot's slash-command surface is intentionally small — related actions are consolidated into a
+single command with an `action` choice parameter (`/list`, `/admin`) rather than one command per
+action. There is no separate `/clans`, `/list_families`, `/list_players`, `/list_accounts`,
+`/link_account`, `/import_data`, or `/removeclan` command — those are now `/list` actions or
+`/admin` actions, listed below. Account linking itself happens via the registration message UI
+(buttons/modals), not a slash command — see `qapbot/docs/REGISTRATION_MESSAGE_WORKFLOWS.md`.
+
 ### User Commands
-- `/subscribe` - Subscribe a channel to clan or family leaderboard updates
-- `/unsubscribe` - Unsubscribe a channel from updates
-- `/leaderboard` - Display leaderboards with various modes
-- `/subscriptions` - List subscriptions for the channel or server
-- `/clans` - List all tracked clans
-- `/list_families` - Display all clan families
-- `/list_players` - Show players in a clan or family
-- `/status` - Display bot status and statistics
+- `/subscribe` - Subscribe a channel to clan or clan family leaderboard updates
+- `/unsubscribe` - Unsubscribe a channel from clan or clan family leaderboard updates
+- `/leaderboard` - Display leaderboard(s) for subscribed clans or families with various modes
+- `/subscriptions` - List clan/family subscriptions for the current channel or entire server
+- `/list` - Consolidated list command; pick an `action`:
+  - **ACCOUNTS** - All Discord user accounts and their registered players
+  - **FAMILIES** - All clan families and their member clans
+  - **PLAYERS** - All players for a given clan or family (`clan`/`family` parameter)
+  - **TRACKED_CLANS** - Chart of tracked clans per war league
+- `/whois` - Show a Discord user's linked CoC accounts, or a player's war history (by tag/name
+  substring); also available as two right-click context-menu entries ("whois" on a user, and on
+  a message)
+- `/status` - Show bot status: uptime, memory usage, cache statistics
 - `/ping` - Check bot latency
 - `/help` - Show help information
 
 ### Admin Commands
-- `/admin` - Administrative diagnostic actions with multiple action choices:
-  - **POST_REGISTRATION** - Post player registration welcome message (server admin)
-  - **CLEANUP_MESSAGES** - Clean up orphaned messages in current channel (server admin)
-  - **CLEANUP_MESSAGES_ALL** - Clean up messages across all channels (bot admin only)
-  - **CHECK_LOGS** - Scan and summarize QapBot logs (bot admin only)
-  - **CHECK_DATA** - Validate data consistency and check current wars (bot admin only)
-  - **LIST_ALL_SUBSCRIPTIONS** - View all channel subscriptions (bot admin only)
-- `/link_account` - Link a CoC player to a Discord user (with autocomplete)
-- `/import_data` - Import player accounts from ClashPerk embed
-- `/list_accounts` - List all registered Discord accounts with verification status
-- `/list_families` - List all clan families and their member clans
-- `/list_players` - List players for a clan or family with tags and names
-- `/removeclan` - Remove a clan from tracking if not subscribed
+- `/admin` - Administrative diagnostic actions and utilities; pick an `action` (permission scope
+  noted per action — "admin" = server admin, "bot admin" = bot's configured `SERVER_ADMIN` only):
+  - **CLEANUP_MESSAGES** - Clean up orphaned messages in current channel (admin)
+  - **CLEANUP_MESSAGES_ALL** - Clean up messages across all channels/servers (bot admin)
+  - **CHECK_LOGS** - Scan and summarize QapBot logs (bot admin)
+  - **CHECK_DATA** - Validate data consistency (bot admin)
+  - **LIST_ALL_SUBSCRIPTIONS** - View all channel subscriptions (bot admin)
+  - **TEST_NOTIFY** - Test war notifications for a clan (bot admin)
+  - **REMOVE_CLAN** - Remove a clan from tracking (admin)
+  - **LIST_CLANS** - List all tracked clans with names and tags (admin)
+  - **IMPORT_DATA** - Import player accounts from a ClashPerk embed (bot admin)
+  - **DEBUG_MESSAGE** - Fetch and analyze a Discord message structure (admin)
+  - **REFRESH_DATA** - Force-refresh all clan data from the CoC API (bot admin)
+  - **RETRIEVE_CWL** - Backfill CWL history for a clan (bot admin)
+  - **BACKFILL_CWL_GROUPS** - Fetch league groups for clans with <7 rounds (bot admin)
+  - **WAR_PREDICT** - Predict outcome between two clans (bot admin)
+  - **START_UPDATE_CYCLE** - Skip the sleep phase and start the next update cycle immediately (bot admin)
+  - **OPTIMIZE_DB** - Run archive move + DB ANALYZE/REINDEX/VACUUM now (bot admin)
+  - **MEMORY_PROFILE** - Dump memory allocation stats to the log file (bot admin)
+  - **MAINTENANCE_START** - Suspend updates and close the DB for safe external access (bot admin)
+  - **MAINTENANCE_END** - Restart the bot and resume normal operation (bot admin)
 
 ## 🏗️ Architecture
 
@@ -169,10 +190,10 @@ QapBot/
 ├── requirements.txt       # Python dependencies
 ├── qapbot/
 │   ├── cache_manager.py   # In-memory cache manager (CACHE) with write-through DB persistence
-│   ├── db_manager.py      # SQLite database operations (WarHistoryDB, 17 tables)
+│   ├── db_manager.py      # SQLite database operations (WarHistoryDB, 22 tables)
 │   ├── config.py          # Configuration values and validation logic
 │   ├── constants.py       # Centralized constants (API limits, timeouts, thresholds)
-│   ├── exceptions.py      # Custom exception hierarchy (16 exception classes)
+│   ├── exceptions.py      # Custom exception hierarchy (21 exception classes)
 │   ├── formatting.py      # Leaderboard rendering, alignment, MODE_REGISTRY
 │   ├── war_notifications.py  # War notification system with DM reminders
 │   ├── ui_common.py       # Shared Discord UI utilities
@@ -293,7 +314,7 @@ migration job moves data older than the retention window from hot to history —
 
 ### Production Server
 - **Platform**: Any standard Linux/Windows machine (e.g., physical or virtual, Ubuntu)
-- **Python Version**: 3.10 or higher (tested with 3.14.5)
+- **Python Version**: 3.14 or higher (tested with 3.14.5)
 - **Mode**: Set environment to use global commands
 - **Logs**: `data/logs/qapbot.log` in your installation directory
 
@@ -305,7 +326,11 @@ migration job moves data older than the retention window from hot to history —
 
 ## 🧪 Testing
 
-**Work in progress.**
+Run tests via `.\run_tests.ps1` (repo root, PowerShell) — never construct a raw `pytest`
+command directly; the wrapper applies the canonical deselect list and skips live/Discord tests
+by default (pass `-Full` to include them). 1403 tests pass as of 2026-07-26. See
+`qapbot/docs/TEST_CONCEPT.md` for the full test tier design (smoke / integration / discord /
+live / e2e), fixture strategy, and CI pipeline details.
 
 ## 🌐 Internationalization
 
@@ -350,7 +375,7 @@ Contributions are welcome! Please:
 5. Update documentation
 6. Submit a pull request
 
-See [copilot-instructions.md](.github/copilot-instructions.md) and [CODE_STRUCTURE.md](CODE_STRUCTURE.md) for detailed development guidelines.
+See [copilot-instructions.md](.github/copilot-instructions.md) and [CODE_STRUCTURE.md](qapbot/docs/CODE_STRUCTURE.md) for detailed development guidelines.
 
 ### Development Workflow
 
@@ -374,10 +399,9 @@ See [copilot-instructions.md](.github/copilot-instructions.md) and [CODE_STRUCTU
    - Check Discord message formatting (2000 char limit)
    - Validate error handling for API failures
 
-4. **Documentation**
-   - Update changelog in `changelog.txt` under `Change-Log:` section
-   - Update `copilot-instructions.md` for architectural changes
-   - Update `CODE_STRUCTURE.md` for new modules or flows
+4. **Documentation** — see `copilot-instructions.md` Cardinal Rules 14 (keep docs current) and
+   its Changelog Management section (how/where to log in `changelog.txt`) for the full,
+   canonical rules — don't duplicate them here.
 
 ### Key Conventions
 - **Single-Source-of-Truth**: All runtime data managed via CACHE object

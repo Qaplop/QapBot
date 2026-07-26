@@ -1,6 +1,209 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-26 (11)
+- Fixed: confirmed and fixed a second, related instance of the 2026-07-26 (7)/(10) CWL
+  league_rank bug for #2JYQ909PC "The Marines II" (group `e29562f5ac3ddc68`, season "2026-07"),
+  found via the (10) audit and independently confirmed against the in-game war log (Kriegsliga-
+  Verlauf screen), which shows the clan played July's CWL in "Meister-Liga III" (Master League
+  III), not the recorded "Crystal League I".
+  This exposed that the 2026-07-26 (7) fix was incomplete: the real flaw isn't just `cwl_ended`
+  lag, it's that both the `raw_data` lookup and the `clan_name_cache` fallback pick a single
+  "representative" clan's *current* league and write it for the whole group. That's only valid
+  while the season is still active — all 8 group members share one league only by construction
+  (grouping happens at that shared league). Once the real season ends, promotions/demotions
+  apply almost immediately and members diverge to *different* current leagues (some promoted,
+  some demoted, some unchanged) — so picking any single one is a coin flip. Confirmed root
+  cause here: the two bottom-of-group clans (#292VRCJVU, #2QVGCQQPV, ranks 7-8, demoted after
+  July) had "Crystal League I" as their current live league by the time the fallback ran, and
+  that value got written for all 8 clans in the group — including the 6 that were promoted or
+  stayed unchanged at "Master League III"/"Master League II".
+  Fix: `cache_manager.py`'s `_process_league_group_response` — moved the `.state` gate (added in
+  (7)) so it also covers the `raw_data` lookup, which previously ran completely unconditionally
+  regardless of season state (only the `clan_name_cache` fallback was gated before). Now neither
+  source is trusted once the league group reports anything other than "preparation"/"inWar".
+  Data correction: corrected `league_rank` from "Crystal League I" to "Master League III" for
+  all 8 clans in group `e29562f5ac3ddc68` / season "2026-07" in `data/qapbot.db`, using the
+  (10) audit script (`fix e29562f5ac3ddc68 2026-07 "Master League III" --yes`).
+  Added 3 tests to `tests/unit/test_cwl_league_rank_season_gate.py`: a divergent-group-members
+  reproduction of this exact incident, plus two covering the newly-gated `raw_data` path
+  (populates normally during an active season, skipped once the season has ended).
+  Tests: 1409 passed, 5 deselected.
+  Files changed: qapbot/cache_manager.py (_process_league_group_response),
+  tests/unit/test_cwl_league_rank_season_gate.py, qapbot/docs/DATABASE_ARCHITECTURE.md.
+
+2026-07-26 (9)
+- Fixed: 5 of 12 qapbot/docs/*.md files (TEST_CONCEPT.md, CLAN_AND_WAR_CYCLE_ARCHITECTURE.md,
+  CLAN_WAR_TRACKING.md, CWL_ROUND_TRACKING_PLAN.md, ARCHIVE_SCAN_PERFORMANCE_ANALYSIS.md) were
+  never referenced anywhere in copilot-instructions.md — undiscoverable to any tool/session
+  that doesn't happen to browse qapbot/docs/ directly. Added all 5 to the Additional Resources
+  index. Found during a final sign-off check of today's whole memory/rules consolidation.
+  2668 tokens, still under the file's own ~3000 budget. 1406 tests pass.
+
+2026-07-26 (10)
+- Added: `qapbot/scripts/audit_cwl_league_rank.py` — a `report`/`fix` tool for correcting
+  cwl_league_groups.league_rank rows already corrupted by the bug fixed in 2026-07-26 (7),
+  for use on any DB (prod included) where the code fix alone can't repair pre-existing bad
+  rows. `report [--clan TAG] [--seasons N]` lists recent completed seasons' recorded
+  league_rank next to the clan's current live league for manual review; `fix GROUP_ID SEASON
+  "Correct League Name" [--yes]` applies a correction (dry run without --yes), checking both
+  the hot DB and the history DB (older seasons swept out by monthly_history_migration).
+  Investigated whether other groups might be affected: tried predicting each clan's expected
+  next-season league from its group_rank and QBhelperfunctions.py's hardcoded
+  _CWL_PROMO_RULES_* table — abandoned this approach after testing it against the real DB:
+  even restricted to just each clan's most recent season transition, it flagged >1000 clans
+  as "wrong," almost all false positives, meaning that table doesn't track real CWL promotion
+  outcomes closely enough to use as ground truth. No reliable blanket detector exists; the
+  script intentionally ships without one rather than presenting noise as findings.
+  Cross-checked the bot's own logs (last ~2 weeks retained) for direct evidence instead: only
+  two groups had their `cwl_ended` flag observed flipping to 1 in that window — the confirmed
+  #2J00L8YRU group (8a56c4022a9b2d94, flipped 2026-07-16, ~1 week after the season's real end,
+  the lag window that enabled this bug) and #2JYQ909PC "The Marines II"'s group
+  (e29562f5ac3ddc68, flipped 2026-07-21 19:58:11 — the same moment as the /leaderboard
+  cwlgroup screenshot that reported this bug). The latter's season "2026-07" was recorded as
+  "Crystal League I"; see 2026-07-26 (11) below — confirmed wrong and fixed the same day.
+  Tests: 1406 passed, 5 deselected (script has no automated tests — it's a one-time DB tool,
+  matching the convention of the other scripts in qapbot/scripts/).
+  Files changed: qapbot/scripts/audit_cwl_league_rank.py (new).
+
+2026-07-26 (8)
+- Added: `[tool.pyright]` config in `pyproject.toml`, matching the project owner's existing
+  VS Code Pylance strict-mode setting so `pyright` on the command line (or any other tool/
+  collaborator) sees the same bar as the IDE, instead of that bar being an undiscoverable
+  personal machine setting. Relaxed the "unknown type from an untyped source" rule family
+  project-wide (unittest.mock objects and coc.py, which has no type stubs, both trip these
+  constantly with no real bug behind it — tried scoping the relaxation to tests/ only via
+  `executionEnvironments`, but per-environment blocks don't reliably inherit the top-level
+  venv in this pyright version, so relaxed globally instead). Fixed 2 real findings introduced
+  earlier today (missing `Any` annotation on `_extract_clan_and_coc_role`'s `player_obj` param
+  in QBdiscocmdshelper.py). Net: 76 pre-existing findings remain as a starting backlog (mostly
+  one test file), down from the 500+/2400+ noise floor before tuning.
+- Changed: `.github/workflows/test.yml` now also triggers on `push` to `main` (previously
+  `workflow_dispatch`-only), since prod actually runs Linux and this is the only point in the
+  loop that would ever test against that OS — the project owner's local DEV testing is Windows
+  and manual PROD deploy already happens before any GitHub sync, so this doesn't change the
+  deploy process, just adds an earlier Linux-compat signal. Also bumped `python-version` from
+  3.13 to 3.14 in both jobs to match actual DEV/PROD Python version (README already documented
+  3.14; CI just hadn't been updated).
+- Added Cardinal Rule 15 to copilot-instructions.md: never commit real infrastructure details
+  (hostnames, IPs, UNC paths, hardware/vendor specifics, credentials) — placeholders only, per
+  the convention Rule 4 already established. In-game/Discord identifiers (clan tags/names,
+  player tags, guild/channel IDs) are explicitly fine to reference directly — confirmed with
+  the project owner these aren't the concern, only real infrastructure is. Prompted by a
+  pre-sync leak audit of today's doc changes (all clean) that had no rule backing it.
+  1406 tests pass (parallel session's CWL league-rank fix + its 3 new tests included; not
+  authored by this session).
+
+2026-07-26 (7)
+- Fixed: `/leaderboard cwlgroup` could show a clan's post-promotion league instead of the
+  league it actually competed in for the requested CWL season. Reported case: "The Marines"
+  (#2J00L8YRU) competed in Champion League III for CWL 2026-07 but the generated standings
+  image showed "Champion League II" (their league *after* the post-season promotion).
+  Root cause: `cache_manager.py`'s `_process_league_group_response` falls back to
+  `clan_name_cache` to learn a clan's league (the `get_league_group()` API response doesn't
+  include `warLeague` per clan). This fallback was gated on the DB's own `cwl_ended` column
+  via `update_cwl_league_rank`'s SQL guard (`league_rank IS NULL OR cwl_ended = 0`) — but
+  `cwl_ended` only flips once `update_cwl_group_stats_batch` observes every clan's expected
+  war count in `war_summary`, which can lag days behind the real-world season end. Clans get
+  promoted/demoted almost immediately after CWL ends, so any reprocessing of the league group
+  in that lag window (e.g. a delayed round/war file, or the command itself triggering a fresh
+  `get_league_group()` call) wrote the clan's *new* league into `league_rank` — which then got
+  frozen permanently once `cwl_ended` finally flipped to 1.
+  Fix: gate the fallback on the league group's own live API `.state` field instead
+  (`"preparation"`/`"inWar"` = season still active, safe to trust `clan_name_cache`; anything
+  else = season already ended in-game, skip the fallback entirely and leave `league_rank`
+  unset rather than risk recording the wrong league). This is a strictly more reliable signal
+  than our own DB bookkeeping, which is derived data that can lag.
+  Data correction: manually corrected `league_rank` from "Champion League II" to "Champion
+  League III" for all 8 clans in group `8a56c4022a9b2d94` / season "2026-07" in
+  `data/qapbot.db`.
+  Added `tests/unit/test_cwl_league_rank_season_gate.py` (3 tests) covering active-season
+  fallback, warEnded-skips-fallback, and preparation-state-is-active. Docs: added a dated note
+  to `qapbot/docs/DATABASE_ARCHITECTURE.md`'s `league_rank` history entry.
+  Tests: 1406 passed, 5 deselected.
+  Files changed: qapbot/cache_manager.py (_process_league_group_response),
+  tests/unit/test_cwl_league_rank_season_gate.py (new), qapbot/docs/DATABASE_ARCHITECTURE.md.
+
+2026-07-26 (6)
+- Changed: Further CODE_STRUCTURE.md trim — "Main Files & Responsibilities" had a 3rd copy of
+  content already fully detailed in Function Tree (predict_war_between_clans,
+  generate_cwl_group_analysis_embeds, guild_role_manager.py's whole function inventory);
+  trimmed to one-liners + pointers. 978→972 lines; confirmed the rest of that section is
+  genuinely unique per-file content, not redundant.
+  Added a "⏱ time-sensitive figure" convention for stats that drift purely with usage/time
+  (not code changes, so Cardinal Rule 14 doesn't catch them): DATABASE_ARCHITECTURE.md's
+  Database Size + player_name_index row count, and ARCHIVE_SCAN_PERFORMANCE_ANALYSIS.md's
+  file-count baseline now explicitly flag themselves as needing periodic re-verification
+  rather than being trusted long-term. Docs-only change. 1403 tests pass.
+
+2026-07-26 (5)
+- Changed: Audited README.md (never covered by the earlier docs sweep) and backlog.txt for
+  staleness. README.md had significant drift: the whole Commands section listed 7 slash
+  commands that no longer exist (`/clans`, `/list_families`, `/list_players`, `/list_accounts`,
+  `/link_account`, `/import_data`, `/removeclan` — consolidated into `/list` and `/admin`
+  actions since) and was missing `/list`, `/whois`, and 13 of 19 real `/admin` actions —
+  rewrote the section from the actual @app_commands.command/@app_commands.choices
+  registrations. Also fixed: table count (17→22), exception count (16→21), an internal
+  Python-version inconsistency (3.10 vs 3.14 — code relies on 3.14-specific event-loop-policy
+  behavior), a broken CODE_STRUCTURE.md link (wrong path), and a "Testing: Work in progress"
+  claim that's long since untrue (now points to TEST_CONCEPT.md + run_tests.ps1).
+  backlog.txt: removed 2 items confirmed already implemented — channel-deletion subscription
+  cleanup (`on_guild_channel_delete` in QBcore.py already does this) and detailed
+  cross-clan player analysis (already covered by `/whois`'s DB-backed report). Docs-only
+  change. 1403 tests pass.
+
+2026-07-26 (4)
+- Changed: Resolved the last flagged doc redundancy — TEST_CONCEPT.md explained "how to run
+  tests" in three overlapping places (§7 command reference, §14 daily-workflow diagram, §15
+  Convenience Scripts). Merged §15 into §7 as the single canonical section (raw pytest command
+  blocks compressed into one marker-expression table), fixed §14's step 3 to use
+  `run_tests.ps1 -Full` instead of a raw pytest command, deleted old §15, renumbered old §16
+  ("Key Risks") to §15. 720→691 lines. Docs-only change. 1403 tests pass.
+
+2026-07-26 (3)
+- Changed: Follow-up to (2) — updated DATABASE_ARCHITECTURE.md's "Database Size" section with
+  current prod-mirror figures (verified directly against data/qapbot.db + qapbot_history.db:
+  ~113.4M war_attacks rows, ~5.34M war_summary rows, ~38.3GB combined — the old figures were
+  ~98K/~5.5K/~500KB, many months stale). Removed/annotated references to 8 one-time migration
+  scripts confirmed intentionally deleted after use. Consolidated redundancy: copilot-
+  instructions.md no longer restates the same ~5 rules three times (Cardinal Rule prose +
+  "While Writing Code" bullets + a "QapBot-Specific Patterns" code-example section) — deleted
+  the fully-duplicate section, trimmed the workflow bullets to point at Cardinal Rules instead
+  (2674→2375 tokens). Merged its two overlapping doc-pointer lists ("Deep-dive references" +
+  "Additional Resources") into one. Trimmed CODE_STRUCTURE.md's Account Protection section
+  (prose→table) and de-duplicated Function-Tree entries already covered in Main Flows
+  (1069→978 lines; also fixed an internal self-duplication of 3 functions listed twice).
+  Fixed cross-file duplicates: the Discord.py Modal Pattern code example (was in 3 files, now
+  1 canonical + 2 pointers), the coc.Client init snippet (RATE_LIMITING_IMPLEMENTATION.md vs
+  CLAN_AND_WAR_CYCLE_ARCHITECTURE.md), an internal near-verbatim is_deleted/_ESSENTIAL_CLAN_FIELDS
+  duplicate in DATABASE_ARCHITECTURE.md (also caught a second stale claim there: a nonexistent
+  `_clans_migrations` ALTER TABLE step). Docs-only change. 1403 tests pass.
+
+2026-07-26 (2)
+- Changed: Full documentation audit (Cardinal Rule 14 in action) across all 12
+  `qapbot/docs/*.md` files plus `copilot-instructions.md`, cross-checked against actual code
+  (schemas, function names, line-count/anchor references, CI config, test counts). Fixed dozens
+  of stale claims: nonexistent functions/scripts, wrong line anchors, an undocumented DB
+  hot/history split (`qapbot_history.db`), wrong table/index lists, a wrong CI-trigger claim
+  (`test.yml` is `workflow_dispatch`-only, not automatic), TEST_CONCEPT.md describing ~15% of
+  the real test suite, and Copilot-specific tool names (`grep_search`/`semantic_search`)
+  replaced with tool-agnostic phrasing since this file now serves multiple AI tools.
+  `REGISTRATION_MESSAGE_WORKFLOWS.md` gained a full STEP 2.5 (role assignment/sync) section
+  documenting yesterday's role-sync fixes, which weren't reflected anywhere. Flagged (not
+  auto-fixed, needs human judgment): `DATABASE_ARCHITECTURE.md`'s "Database Size" section is
+  off by ~3 orders of magnitude vs. the local dev DB's actual row counts — unclear if that's
+  stale prod figures or dev-only bloat. Docs-only change, no application code touched.
+
+2026-07-26 (1)
+- Changed: Added Cardinal Rule 14 to `.github/copilot-instructions.md` — docs must be updated
+  in the same change that touches something they document, and new significant
+  features/refactors get a new doc under `qapbot/docs/` if none covers them. Also fixed that
+  file's own stale "Changelog Management" section (pointed at `backlog.txt`/bottom-of-file,
+  a leftover from before `changelog.txt` was split out). Added `CLAUDE.md` at repo root
+  pointing to copilot-instructions.md, and migrated two Claude-private memory notes
+  (changelog discipline, run_tests.ps1 usage) into the repo so they're git-tracked and
+  visible to any tool. Docs-only change, no application code touched.
+
 2026-07-25 (12)
 - Fixed: Re-linking an account previously moved to the UNASSIGNED pool (unlink then relink)
   never got a CoC in-game role, since that pool is excluded from the periodic per-clan sync

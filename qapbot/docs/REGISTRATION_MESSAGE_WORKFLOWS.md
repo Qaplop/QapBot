@@ -275,23 +275,67 @@ AFTER PLAYER IDENTIFIED:
                 │                                │
                 ▼                                ▼
     ┌────────────────────────┐      ┌──────────────────────────┐
-    │ show_api_prompt=True?  │      │ Show ApiVerification     │
-    └───────┬────────────────┘      │ PromptView with buttons: │
-            │                       │ - Enter API token        │
-            ├────────────┐          │ - Skip verification      │
-            │            │          └──────────────────────────┘
-            ▼            ▼                     │
-      ┌─────────┐  ┌─────────┐               │
-      │ YES     │  │ NO      │               └──► RETURN EARLY
-      └────┬────┘  └────┬────┘                   (notification check
-           │            │                         happens in button
-           │            ▼                         callbacks)
-           │     ┌─────────────┐
-           │     │ Continue to │
-           │     │ Step 3      │
-           │     └─────────────┘
-           │
+    │ show_api_prompt=True?  │      │ call _assign_and_sync_   │
+    └───────┬────────────────┘      │ roles_for_link()         │
+            │                       │ (STEP 2.5, see below —   │
+            ├────────────┐          │ runs BEFORE the prompt   │
+            │            │          │ is sent, so SIMPLE-mode  │
+            ▼            ▼          │ users get roles now,     │
+      ┌─────────┐  ┌─────────┐      │ not after clicking a     │
+      │ YES     │  │ NO      │      │ button)                  │
+      └────┬────┘  └────┬────┘      └──────────┬───────────────┘
+           │            │                      │
+           │            ▼                      ▼
+           │     ┌─────────────┐   ┌──────────────────────────┐
+           │     │ Continue to │   │ Show ApiVerification     │
+           │     │ Step 2.5    │   │ PromptView with buttons: │
+           │     └─────────────┘   │ - Enter API token        │
+           │                       │ - Skip verification      │
+           │                       └──────────┬────────────────┘
+           │                                  │
+           │                                  └──► RETURN EARLY
+           │                                       (notification check
+           │                                       happens in button
+           │                                       callbacks; role sync
+           │                                       already ran above)
            └──────► (Show API prompt above)
+
+═══════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2.5: ROLE ASSIGNMENT + CoC/CLAN ROLE SYNC               │
+│ call _assign_and_sync_roles_for_link() (nested helper in     │
+│ complete_account_linking_flow(), QBdiscocmdshelper.py)       │
+└─────────────────┬───────────────────────────────────────────┘
+                  │
+      Runs from TWO call sites, safely (both are idempotent):
+      1) Inside the "show_api_prompt" branch above, BEFORE the
+         prompt message is sent.
+      2) Here, for the normal (no-prompt) path — already-verified
+         or token-verified flows land here directly.
+                  │
+                  ▼
+    ┌───────────────────────────┐
+    │ assign_member_role():     │
+    │ SIMPLE mode → always      │
+    │ STRICT mode → only if     │
+    │ verified/token/admin      │
+    └───────────┬────────────────┘
+                │
+                ▼
+    ┌───────────────────────────┐
+    │ sync_roles_for_user():    │
+    │ (guild_role_manager.py)   │
+    │ assigns highest CoC role  │
+    │ + all clan roles for the  │
+    │ user's linked accounts.   │
+    │ Internally strict-mode-   │
+    │ aware — no premature      │
+    │ grants in STRICT mode.    │
+    │ No-ops entirely if the    │
+    │ guild has no role feature │
+    │ enabled.                  │
+    └───────────────────────────┘
 
 ═══════════════════════════════════════════════════════════════════
 
@@ -670,6 +714,11 @@ BUTTON: Change Mode
                               └─────────────────────────┘
 ```
 
+Both **Verify** (`VerifyAccountModal.on_submit()`) and **Unlink**
+(`UnlinkConfirmView._on_confirm()`) call `sync_roles_for_user()` directly after their
+respective data change, so clan/member/CoC roles are rechecked immediately — see Key Decision
+Point 6 above.
+
 ---
 
 ## Key Decision Points
@@ -701,6 +750,20 @@ BUTTON: Change Mode
    - **BUG RISK**: Sending error twice when verification fails
    - **FIXED**: Removed duplicate error sending in `process_player_registration()` errors when verification fails
    - **BUG RISK**: Sending error twice when verification fails
+
+6. **Role Sync Timing** (Link Accounts / Unlink / Verify)
+   - Location: `_assign_and_sync_roles_for_link()` in `complete_account_linking_flow()`
+     (QBdiscocmdshelper.py); mirrored by direct `sync_roles_for_user()` calls in
+     `UnlinkConfirmView._on_confirm()` and `VerifyAccountModal.on_submit()` (ui_registration.py)
+   - Critical: In SIMPLE (non-strict) mode, role assignment must NOT be gated on verification
+     — it must run immediately after linking/unlinking/verifying, not deferred until a later
+     button click.
+   - **BUG RISK (fixed 2026-07-25)**: Role assignment originally sat only after the whole
+     verification block, so the "show API prompt" branch returned early before it ran —
+     SIMPLE-mode users had to click Skip/Verify just to get roles they should already have had.
+     Similarly, unlinking and the "My Accounts" Verify button didn't call `sync_roles_for_user()`
+     at all, so role removal/CoC-rank updates waited for the periodic background sync (up to 30
+     min for role-enabled clans, per the `_ROLE_GATE` in `QBhelperfunctions.py`).
 
 ### Interaction Response Patterns
 
@@ -770,6 +833,11 @@ BUTTON: Change Mode
 - [ ] API prompt shown - Skip verification
 - [ ] Notifications already enabled (simple success)
 - [ ] Notifications disabled (show prompt)
+- [ ] SIMPLE mode: member/clan/CoC roles assigned immediately on link, BEFORE clicking
+      Skip/Enter-token on the API prompt (not just after)
+- [ ] STRICT mode: no roles assigned until verified (token or admin override)
+- [ ] Restoring a player from the UNASSIGNED pool (unlink then relink) gets a correct,
+      freshly-fetched CoC role — not a stale/missing one from before it was unassigned
 
 ### War Notifications Workflow
 - [ ] No accounts linked (error)
@@ -788,33 +856,36 @@ BUTTON: Change Mode
 - [ ] Enter API token - empty (validation)
 - [ ] registration message remains after success
 - [ ] registration message remains after failure
+- [ ] Verifying via this flow triggers an immediate `sync_roles_for_user()` call (not just
+      `assign_member_role()`) — was a gap fixed 2026-07-25
+
+### My Accounts Workflow
+- [ ] No accounts linked (error)
+- [ ] Has accounts - show AccountManagementView with player selector
+- [ ] Verify button → VerifyAccountModal → success triggers member-role assignment AND
+      `sync_roles_for_user()`
+- [ ] Set Primary button updates primary flag
+- [ ] Unlink button → confirmation → success triggers `sync_roles_for_user()` (e.g. removing
+      a user's only account in a clan should immediately drop that clan's role)
 
 ---
 
 ## Architecture Notes
 
 ### Modal Class Pattern (CRITICAL)
-```python
-# CORRECT - TextInput as class attribute
-class MyModal(discord.ui.Modal, title="Hardcoded Title"):
-    my_input = discord.ui.TextInput(label="English Label", placeholder="Default")
-    
-    def __init__(self, guild_id=None):
-        super().__init__()  # NO title parameter!
-        # Only translate placeholder, NOT label
-        self.my_input.placeholder = t('translated.placeholder', guild_id=guild_id)
-
-# WRONG - Will cause "Unknown interaction" errors
-class MyModal(discord.ui.Modal):
-    def __init__(self):
-        super().__init__(title="Title")  # WRONG!
-        self.my_input = discord.ui.TextInput(...)  # WRONG!
-```
+See Cardinal Rule 9 (`.github/copilot-instructions.md`) and `../qapbot/docs/CODE_STRUCTURE.md`
+§ Discord.py Patterns for the full pattern + code example. One nuance specific to this flow
+worth calling out here: only the `TextInput.placeholder` gets translated after `super().__init__()`
+— the `label` stays hardcoded English (discord.py's Modal lifecycle requires TextInput labels as
+class attributes, set before any translation context is available).
 
 ### Modular Flow Design
 - **Linking** happens immediately in `_link_player_to_user()`
 - **Verification** is a separate step in `verify_and_update_player()`
-- **Notifications** checked last in `check_and_prompt_war_notifications()`
+- **Role assignment + sync** runs via `_assign_and_sync_roles_for_link()` (nested helper in
+  `complete_account_linking_flow()`) — BEFORE the notification check, and before the optional
+  API-verification prompt is even shown, so SIMPLE-mode users don't wait on a button click
+- **Notifications** checked last, in `check_and_prompt_war_notifications()`
 - Each step can be entered independently or as part of full flow
 
 ### Cache Consistency

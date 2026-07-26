@@ -22,7 +22,7 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 📖 Details: ../qapbot/docs/CODE_STRUCTURE.md § Cache Management
 
 ### 3) Search before creating
-- DO: Use grep_search / semantic_search before adding new helpers.
+- DO: Search the codebase for an existing implementation before adding a new helper (use whatever search tool your environment provides — grep/ripgrep, semantic search, etc.).
 - DON'T: Create near-duplicates.
 - WHY: Avoid inconsistent behavior.
 
@@ -96,6 +96,27 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
   "coc_role_enabled": bool(row["coc_role_enabled"])
   ```
 
+### 14) Keep docs current — a stale doc is a bug, not a formatting nit
+- DO: When a change touches something already documented (in this file or `../qapbot/docs/*.md`), update that documentation in the **same** change — not as a follow-up.
+- DO: When adding a significant feature or doing a significant refactor, add a new doc under `../qapbot/docs/` (or a new section in an existing one) if nothing already covers it.
+- DON'T: Leave a doc referencing a file, convention, or location that the change just moved or renamed.
+- WHY: This file's own Changelog Management section pointed at `backlog.txt` long after that convention moved to `changelog.txt` — a leftover from when both lived in one file that was later split, and nobody updated the doc when the split happened. A stale doc actively misleads (worse than no doc), and any tool/model following it reproduces the mistake as project practice.
+📖 Where: cardinal rules/patterns → this file. Architecture deep-dives → `../qapbot/docs/*.md`.
+
+### 15) Never commit real infrastructure details — placeholders only
+- DO: Use the established placeholder convention for anything about the production
+  environment: `<PROD_BOT_ROOT>`, `${PROD_DATA_DIR}`, `<PROD_SSD_UNC>`, `HOST-NAME`,
+  "server-machine", etc. — see Rule 4.
+- DON'T: Write a real hostname, IP address, UNC path, hardware/vendor/model name, or
+  credential into any tracked file (docs, changelog, code comments, commit messages).
+- OK to reference directly: in-game/Discord identifiers (clan tags/names, player tags,
+  guild/channel IDs) — these are public data, not infrastructure, and don't need scrubbing.
+- WHY: The project owner deliberately keeps hosting details out of the repo (which is or may
+  become public) — that's *why* Rule 4's placeholders exist. Before syncing a batch of doc
+  changes, a 2026-07-26 sweep confirmed no leaks had occurred, but it was a manual check with
+  no rule backing it — this makes the expectation explicit instead of relying on catching it
+  after the fact each time.
+
 ---
 
 ## Quick reference (most common)
@@ -124,7 +145,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 2) Workflow message clutter → prefer `edit_message()` single-message flows; cleanup old responses.
 3) Hardcoded English → always use `t()`; ephemeral/DM must pass both `user_id` and `guild_id`.
 4) Interaction already responded → modal submit: defer then followup; buttons/selects: check `is_done()`.
-5) Duplicate helpers → search with grep_search / semantic_search before adding.
+5) Duplicate helpers → search the codebase before adding (Cardinal Rule 3).
 6) Missing context/flags → thread `guild_id`, `user_id`, admin flags, and CONFIG values through signatures.
 7) Losing fields in CACHE dicts → update in-place or preserve unknown keys when rebuilding.
 8) Thinking indicator stuck → use `thinking=False` when only editing; `thinking=True` only with followup.
@@ -132,34 +153,22 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 10) Positional DB row access (`row[0]`) → NEVER — use `row["column_name"]`; ALTER TABLE shifts indices silently (caused `coc_role_enabled` to always read `created_at` → always True). Use `conn.row_factory = aiosqlite.Row` / `sqlite3.Row`. Alias aggregates: `SELECT COUNT(*) AS cnt` → `row["cnt"]`.
 11) New column via ALTER TABLE stays NULL for up to 12 h → add the field name to `_ESSENTIAL_CLAN_FIELDS` in `fetch_clan_war_data()` (`QBhelperfunctions.py`); the bypass forces an immediate backfill fetch for any cache entry missing it. **Exception: `is_deleted` does NOT belong in `_ESSENTIAL_CLAN_FIELDS`** — its safe default is `False` (not deleted); it is managed by the deletion detection system.
 12) Phase-1 skip logic — always preserve BOTH guards in order: `track_war_updates=False → skip`, then `is_deleted=True → skip`. A subscribed clan can have `track_war_updates=True` and `is_deleted=True` simultaneously (Supercell can delete any clan).
-
----
-
-## Deep-dive references (use these instead of long examples here)
-
-- Architecture + patterns: ../qapbot/docs/CODE_STRUCTURE.md
-- DB schema + migration rules: ../qapbot/docs/DATABASE_ARCHITECTURE.md
-- Rate limiting + parallel pipeline: ../qapbot/docs/RATE_LIMITING_IMPLEMENTATION.md
-- Welcome/registration flows: ../qapbot/docs/REGISTRATION_MESSAGE_WORKFLOWS.md
-- War temp/archive lifecycle: ../qapbot/docs/WAR_FILE_MANAGEMENT_RULES.md
+13) Deleting a tracked Discord message → wrap in try/except: `except discord.NotFound: pass` (already deleted), `except Exception: log and continue` (never let cleanup crash the calling flow).
 
 ---
 
 ## Implementation Workflow
 
 ### Before Writing Code
-1. **Search for existing functionality** (grep_search, semantic_search)
+1. **Search for existing functionality** (Cardinal Rule 3)
 2. **Read relevant module docs** (../qapbot/docs/CODE_STRUCTURE.md for responsibilities)
 3. **Identify data flow** (what CACHE properties are involved?)
 4. **Check environment** (dev vs prod paths if file operations)
 5. **Plan rollback** (what to revert if change fails?)
 
 ### While Writing Code
-- Use CACHE for ALL runtime data
-- Use `t()` for ALL user-facing text
-- Follow discord.py patterns (Modal titles, TextInput as class attrs)
-- Check account ownership before linking operations
-- Add type hints and docstrings for new functions
+- Follow Cardinal Rules 1, 2, 5, 9 (account protection, CACHE, i18n, modal pattern)
+- Meet the Code Quality Standards below (type hints, docstrings, comments, error handling)
 - Log with appropriate level (DEBUG for verbose, INFO for actions)
 
 ### After Writing Code
@@ -167,81 +176,11 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 - Check integration: Do dependent functions still work?
 - Verify cache consistency: Are save/load operations paired?
 - Test error paths: Are failures handled gracefully?
-- Update documentation if architecture changed
+- Update documentation per Cardinal Rule 14 if the change touches anything documented
 - **Run tests with:** `.\run_tests.ps1` — NEVER construct a raw pytest command.
   Pass extra filters as trailing args: `.\run_tests.ps1 -k my_test` or `--lf`.
   The script encodes the canonical deselects; calling it directly keeps the
   command identical every run so VS Code auto-approves without prompting.
-
----
-
-## QapBot-Specific Patterns
-
-### Cache Management
-```python
-# ALWAYS use CACHE object
-clan_name = CACHE.clan_name_cache.get(clan_tag, "Unknown")
-CACHE.user_accounts[user_id] = {"players": [...]}
-await CACHE.persist_user(user_id)  # Write-through to database
-
-# NEVER create shadow data structures
-# DON'T: clan_names = {}  # Wrong!
-```
-
-### CoC API Calls
-```python
-# Use cached clan data to reduce API calls
-clan = await CACHE.coc_clan_cache.get_clan(clan_tag)
-
-# Direct API calls for fresh data (DEPRECATED - use CACHE instead)
-# clan = await QBcore.coc_client.get_clan(clan_tag)
-```
-
-### Player Registration
-```python
-# Check ownership before linking
-previous_owner = get_any_player_owner(player_tag, requesting_user_id)
-if previous_owner:
-    verified_owner = get_verified_player_owner(player_tag, requesting_user_id)
-    if verified_owner:
-        # Requires admin override
-        show_admin_override_dialog()
-    else:
-        # Requires confirmation
-        show_confirmation_dialog()
-```
-
-### Message Deletion Cleanup
-```python
-# Always wrap in try/except
-try:
-    await interaction.delete_original_response()
-except discord.NotFound:
-    pass  # Message already deleted
-except Exception as e:
-    logging.warning(f"Failed to delete message: {e}")
-```
-
-### Discord.py Modal Pattern
-```python
-# CORRECT - Title in class definition, TextInput as class attribute
-class MyModal(discord.ui.Modal, title="My Modal Title"):
-    my_input = discord.ui.TextInput(
-        label="Input Label",
-        placeholder="Placeholder text"
-    )
-    
-    def __init__(self, guild_id=None):
-        super().__init__()  # NO title parameter!
-        # Translate placeholders AFTER super().__init__()
-        self.my_input.placeholder = t('key', guild_id=guild_id)
-    
-    async def on_submit(self, interaction):
-        await interaction.response.defer(ephemeral=True)
-        value = self.my_input.value
-        # ... process ...
-        await interaction.followup.send("Done", ephemeral=True)
-```
 
 ---
 
@@ -270,34 +209,40 @@ class MyModal(discord.ui.Modal, title="My Modal Title"):
 
 ## Changelog Management
 
-**When implementing features or fixes, document in `backlog.txt`:**
+**Update `../changelog.txt` for every code change (feature, fix, refactor), without being asked:**
 
-- **Location**: Under `Change-Log:` section (not at top)
-- **Format**: Date-based (YYYY-MM-DD)
-- **Content**: Concise description (Fixed/Added/Modified/Removed), root cause, implementation details, impact
-- **Documentation Updates**: Update `copilot-instructions.md` and `../qapbot/docs/CODE_STRUCTURE.md` together with `changelog.txt` if architecture changed
+- **Location**: `changelog.txt` at the repo root (NOT `backlog.txt` — that's the separate feature/idea roadmap).
+- **Position**: New entries go at the very TOP of the file, immediately after the `===========` header line.
+- **Format**: `YYYY-MM-DD (N)` heading using TODAY's real date — `N` increments per entry added that day (1, 2, 3, ... do not reuse or renumber older entries, even across days).
+- **Content**: Short and crisp — a few lines stating what changed (Fixed/Added/Changed) and why, plus the file(s) touched and the test result. Not a multi-paragraph blow-by-blow of every branch/file touched.
+- **Documentation Updates**: See Cardinal Rule 14 — update the relevant doc(s) in the same pass, not as a follow-up.
+- **Tests**: Run `.\run_tests.ps1` (see "After Writing Code" above) and report the real pass count in the entry — never a raw `pytest` count, which misreports deliberately-deselected tests as failures.
 
-**Example**:
+**Example** (see `changelog.txt` itself for the full live convention):
 ```
-Change-Log:
-===========
-2026-01-03
-- Refactored: Copilot instructions optimized for token efficiency
-  - Reduced from 8,000 to 4,000 tokens via consolidation and referencing
-  - Moved detailed architecture to CODE_STRUCTURE.md
-  - Added Cardinal Rules section for priority focus
-  - Result: 2x effectiveness, AI processes entire file
+2026-07-25 (12)
+- Fixed: Re-linking an account previously moved to the UNASSIGNED pool never got a CoC
+  in-game role, since that pool is excluded from the periodic per-clan sync. Restore path
+  in `_link_player_to_user()` now refetches live player data before restoring.
+  File: qapbot/QBdiscocmdshelper.py. 1403 tests pass.
 ```
 
 ---
 
-## Additional Resources
+## Additional Resources (deep dives — use these instead of long examples here)
 
 📖 **../qapbot/docs/CODE_STRUCTURE.md**: Module responsibilities, data flows, function trees, architecture details  
 📖 **../qapbot/docs/DATABASE_ARCHITECTURE.md**: SQLite schema, migration history, backup/recovery, performance  
-📖 **../qapbot/docs/COC_GAME_MECHANICS.md**: CWL round schedule, regular war states, passive/inactive tracking, warlog visibility  
-📖 **../README.md**: Installation, environment variables, commands, deployment, features  
+📖 **../qapbot/docs/RATE_LIMITING_IMPLEMENTATION.md**: CoC API rate limiting, parallel fetch pipeline  
 📖 **../qapbot/docs/REGISTRATION_MESSAGE_WORKFLOWS.md**: Player registration and notification workflows  
+📖 **../qapbot/docs/WAR_FILE_MANAGEMENT_RULES.md**: War temp/archive file lifecycle  
+📖 **../qapbot/docs/CLAN_AND_WAR_CYCLE_ARCHITECTURE.md**: DB schema for clans/CWL, the Phase-1 update-cycle pipeline, coc_client init, hot/history DB split mechanics  
+📖 **../qapbot/docs/CLAN_WAR_TRACKING.md**: Clan war tracking logic — track_war_updates tiers, league promotion/demotion handling  
+📖 **../qapbot/docs/CWL_ROUND_TRACKING_PLAN.md**: CWL round-number tracking design (implemented) — `cwl_league_rounds`/`cwl_league_groups` schema and population  
+📖 **../qapbot/docs/COC_GAME_MECHANICS.md**: CWL round schedule, regular war states, passive/inactive tracking, warlog visibility  
+📖 **../qapbot/docs/ARCHIVE_SCAN_PERFORMANCE_ANALYSIS.md**: Archive-directory rescan cost analysis — dated investigation, revisit trigger noted inside  
+📖 **../qapbot/docs/TEST_CONCEPT.md**: Test tier design (smoke/integration/discord/live/e2e), fixture strategy, coverage targets, CI pipeline — see also "Run tests with" above for the one-line version  
+📖 **../README.md**: Installation, environment variables, commands, deployment, features  
 📖 **../backlog.txt**: Feature roadmap
 📖 **../changelog.txt**: Changelog
 

@@ -1,8 +1,8 @@
 # Database Architecture (SQLite)
 
 **Status**: Production - Database-only mode (no feature flags)  
-**Database**: `data/qapbot.db` (SQLite with WAL mode)  
-**Last Updated**: 2026-05-31
+**Database**: `data/qapbot.db` (hot, SQLite with WAL mode) + `data/qapbot_history.db` (history, ATTACHed as schema `history`)  
+**Last Updated**: 2026-07-26
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### Advantages for QapBot
 - **Zero Configuration**: Embedded in Python, no separate server process
-- **Single File**: Easy backup, deployment, server-machine-compatible
+- **Few Files**: Easy backup, deployment, server-machine-compatible (two files since the hot/history DB split — see below)
 - **ACID Compliant**: Reliable transactions and data integrity
 - **Performance**: 10-100x faster for filtered queries vs CSV/JSON parsing
 - **Built-in Support**: `sqlite3` module in Python standard library
@@ -56,9 +56,35 @@ PRAGMA mmap_size=8589934592;      -- 8 GB shared kernel page cache (HDD/server-m
 
 ---
 
+## Hot/History DB Split
+
+`WarHistoryDB.initialize()` always `ATTACH`es a second SQLite file as schema
+`history` (default path derived from the hot path, e.g. `data/qapbot.db` →
+`data/qapbot_history.db`; overridable via `history_db_path`). The `history`
+schema gets its own WAL/synchronous pragmas (`PRAGMA history.journal_mode=WAL`,
+`PRAGMA history.synchronous=NORMAL`) since ATTACHing does not retroactively
+apply the main connection's pragmas.
+
+**Retention model**: `main` (the hot DB) always holds the current calendar
+month plus the immediately preceding one in full; everything strictly older
+is migrated to `history` once a month by `nightly_db_maintenance()`
+(cutoff computed by `_history_cutoff()`). Only the 4 time-series tables are
+mirrored on both schemas: `war_attacks`, `war_summary`, `cwl_league_groups`,
+`cwl_league_rounds` — all other maindata tables (clans, users, guild_config,
+etc.) stay hot-only. Migration is batched (`_migrate_table_batch_by_date()`)
+rather than one giant transaction, to avoid holding the write lock for long.
+
+Queries that need the full time range (e.g. `/whois`, full-history reports)
+`UNION`/`UNION ALL` against `main.<table>` and `history.<table>` explicitly.
+
+Code: `qapbot/db_manager.py` — `initialize()`, `_create_history_schema()`,
+`attach_history_db()`, `_history_cutoff()`, `nightly_db_maintenance()`.
+
+---
+
 ## Database Schema
 
-### Core Tables (20 total)
+### Core Tables (22 total)
 
 **Per-Attack Tables** (Phase 8 - Complete, sole war data store since Phase 9):
 - `war_attacks` - Per-attack rows: one row per attack per player per war. UNIQUE(war_id, player_tag, attack_order). Sentinel rows (attack_order=0) record missed-all-attacks players.
@@ -122,9 +148,11 @@ The `get_clan_attack_history_sync()` method in `db_manager.py` aggregates `SUM(s
 
 **Search Index** (2026-05-15 - Complete):
 - `player_name_index` - Fast name-lookup index: one row per unique player_tag with their most
-  recent known name and `last_seen` ISO timestamp. ~125 K rows on production.
-  Loaded entirely into `CACHE.player_name_index: Dict[str,str]` at startup (<100 ms); in-memory
-  O(n) search replaces a 50–100 s `LIKE '%substr%'` scan over 50 M `war_attacks` rows.
+  recent known name and `last_seen` ISO timestamp. ~6.2 M rows on production (⏱ time-sensitive,
+  verified 2026-07-26 — see Database Size below for the re-verify note).
+  Loaded entirely into `CACHE.player_name_index: Dict[str,str]` at startup; in-memory
+  O(n) search replaces a `LIKE '%substr%'` scan over the full `war_attacks` table (now ~113 M
+  rows combined across the hot + history DBs — see Database Size below).
   Populated/maintained by `_upsert_player_name_index_in_conn()` inside every war write path
   (INSERT OR IGNORE ... ON CONFLICT DO UPDATE WHERE excluded.last_seen > stored).
   Also updated by `update_player_name_index_sync()` when coc_cache detects a live API name change.
@@ -245,13 +273,13 @@ subsequent `GET /clans/{tag}` call. Without special handling this generates hund
 | Skip in polling loop | `QapBot.py` Phase-1 build | After the `track_war_updates` skip, any clan with `is_deleted=True` is also skipped; no API calls, no errors |
 | Auto-restore | `qapbot/coc_cache.py` `_update_clan_metadata()` | Any successful `GET /clans/{tag}` response for a clan where `is_deleted=True` → clears to `False` + logs `[CLAN-RESTORED]` + persists |
 | DB persistence | `qapbot/cache_manager.py` `persist_clan()` | Passes `is_deleted` from cache dict to `save_clan()` |
-| DB schema | `qapbot/db_manager.py` | `is_deleted BOOLEAN NOT NULL DEFAULT 0`; idempotent `ALTER TABLE` migration in `_clans_migrations` applied at startup |
+| DB schema | `qapbot/db_manager.py` | `is_deleted BOOLEAN NOT NULL DEFAULT 0`, baked directly into the base `CREATE TABLE IF NOT EXISTS clans` statement (no separate `ALTER TABLE` migration — `db_manager.py` has none currently; see Hot/History DB Split above) |
 
-**Migration safety**: Pre-migration rows get `NULL` → `get_all_clans_dict()` maps `NULL → False`.
-No clan is incorrectly skipped after the migration.
+**Migration safety**: `get_all_clans_dict()` maps a `NULL` value to `False`, so any legacy row
+predating this column is never incorrectly skipped.
 
-**is_deleted does NOT belong in `_ESSENTIAL_CLAN_FIELDS`**: the field is managed by the
-deletion detection system, not the essential-field bypass. Its safe default is `False` (not deleted).
+(See the `_ESSENTIAL_CLAN_FIELDS` exception note above — `is_deleted` intentionally does not
+belong there, since it's managed by this deletion-detection system instead.)
 
 ---
 
@@ -283,7 +311,8 @@ deletion detection system, not the essential-field bypass. Its safe default is `
 - Catches `sqlite3.OperationalError` containing "database is locked"
 - Re-creates the coroutine on each attempt (consumed coroutines cannot be re-awaited)
 - Wrapped methods (user-facing, must never fail):
-  `save_user()`, `save_guild_config()`, `save_subscriptions_for_channel()`, `save_clan_family()`
+  `save_user()`, `save_guild_config()`, `save_subscriptions_for_channel()`, `save_clan_family()`,
+  `save_leaderboard_message()`, `delete_leaderboard_message()`
 - Each wraps an `_impl` method that holds `_write_lock` with `finally: release()` + `rollback()`,
   so retries always get a clean connection state
 - Not wrapped (periodic/background — tolerate transient failure):
@@ -356,10 +385,15 @@ SQLite database (data/qapbot.db)
 ```bash
 # Daily automated backup via nightly VACUUM INTO (prod server-machine — runs automatically)
 # DB lives at: ${PROD_DATA_DIR}/data/qapbot.db  (eSATA SSD)
+# Since the hot/history DB split, back up BOTH files:
+#   ${PROD_DATA_DIR}/data/qapbot.db          (hot: current + previous month)
+#   ${PROD_DATA_DIR}/data/qapbot_history.db  (history: everything older)
 
 # Manual backup before a risky change (run on server-machine shell)
 cp ${PROD_DATA_DIR}/data/qapbot.db \
   ${PROD_BOT_ROOT}/backups/qapbot_$(date +%Y%m%d_%H%M%S).db
+cp ${PROD_DATA_DIR}/data/qapbot_history.db \
+  ${PROD_BOT_ROOT}/backups/qapbot_history_$(date +%Y%m%d_%H%M%S).db
 ```
 
 > ⚠️ **Production data is accessible from Windows at `${PROD_SSD_UNC}`.**
@@ -398,16 +432,34 @@ Copy-Item "data\qapbot_backup_YYYYMMDD_HHMMSS.db" "data\qapbot.db"
 ### Query Performance
 - **War history lookup**: <10ms for single clan/month
 - **Leaderboard generation**: <50ms for 50-player clan
-- **Full history scan**: <500ms for all clans (47k+ records)
+- **Full history scan**: figures below are stale (dated from when the DB held ~47K records,
+  vs. millions today — see Database Size); not re-benchmarked at current scale, don't rely on
+  the old <500ms figure
 
 ### Database Size
-- **War attacks/summary**: Varies by clan count and retention (~98k attack rows, ~5.5k war summaries)
-- **Maindata**: ~500 KB (clans, users, config)
-- **Expected growth**: ~50 MB/year at current rate
+
+**⏱ Time-sensitive figures — verified 2026-07-26, not code-change-triggered.** Unlike most of
+this doc (kept current via the "update docs in the same change" rule — see Cardinal Rule 14 in
+`.github/copilot-instructions.md`), these numbers grow purely with usage over time, with no
+single code change to hang an update on. The previous version of this section (~98K attack
+rows, ~500 KB maindata) was many months stale before this refresh. Don't treat the numbers
+below as current without re-checking if it's been a while — re-verify directly against
+`data/qapbot.db` + `data/qapbot_history.db` (see query pattern in git history / ask for a
+re-check) rather than trusting them long-term.
+
+- **Hot DB** (`data/qapbot.db`): ~21.9 GB — `war_attacks` 65.1 M rows, `war_summary` 3.0 M rows,
+  `clans` ~399 K rows, `player_name_index` ~6.2 M rows, `cwl_league_groups` ~524 K rows,
+  `cwl_league_rounds` ~1.83 M rows
+- **History DB** (`data/qapbot_history.db`): ~16.4 GB — `war_attacks` 48.3 M rows, `war_summary`
+  2.36 M rows, `cwl_league_groups` ~262 K rows, `cwl_league_rounds` ~440 K rows
+- **Combined**: ~38.3 GB total, ~113.4 M `war_attacks` rows, ~5.34 M `war_summary` rows
+- **Maindata** (`users`/`user_players`/config tables): tiny by comparison — low hundreds of rows
 
 ### Optimization
 - Indexes on all lookup columns (clan_tag, player_tag, war_id, date)
-- Composite indexes on war_attacks (war_id, player_tag, clan_tag) and war_summary (clan_tag, war_id)
+- Composite indexes: `war_attacks(war_id, clan_tag)`, `war_attacks(clan_tag, date)`,
+  plus a UNIQUE(war_id, player_tag, attack_order) index; `war_summary` has a
+  UNIQUE(war_id, clan_tag) index, `war_summary(clan_tag, date)` and `war_summary(clan_tag, cwl_season)`
 - `idx_ws_war_id ON war_summary(war_id)` — added 2026-03-08; required for efficient JOIN
   between `war_attacks.war_id` and `war_summary.war_id` (without it SQLite full-scanned
   `war_summary` for every matching row in `war_attacks`)
@@ -477,10 +529,34 @@ Copy-Item "data\qapbot_backup_YYYYMMDD_HHMMSS.db" "data\qapbot.db"
   destructions (avg% × team_size per war) to match in-game display.
 - New db_manager methods: `get_cwl_group_info()`, `get_cwl_group_war_stats()`,
   `update_cwl_group_stats_batch()`, `update_cwl_league_rank()`
-- Migration script: `qapbot/scripts/migrate_cwl_league_groups_v2.py` — backfills
+- Migration script (one-time use, deleted after completion): `migrate_cwl_league_groups_v2.py` — backfilled
   `league_rank` for past seasons using majority-vote from `clans.war_league`.
   Tie fallback: median-by-tier heuristic (picks middle league when votes are tied).
   Tested on 2026-04 (1715 groups updated, 10 ties resolved by heuristic) and 2026-05.
+- **2026-07-26 fix**: `_process_league_group_response`'s `clan_name_cache` fallback (used
+  because `get_league_group()` doesn't return `warLeague` per clan) must gate on the league
+  group's **live API `.state`** (`"preparation"` / `"inWar"` = safe, anything else = season
+  already ended), not on the DB's own `cwl_ended` column. `cwl_ended` only flips once
+  `update_cwl_group_stats_batch` observes every clan's expected war count in `war_summary`,
+  which can lag well behind the real-world season end — and a clan's league in
+  `clan_name_cache` reflects promotions/demotions almost immediately after the season ends.
+  A group processed again in that lag window silently overwrote (or first-populated)
+  `league_rank` with the clan's *next*-season league. Symptom: `/leaderboard cwlgroup` run
+  after CWL ended showed the clan's post-promotion league instead of the one it actually
+  competed in.
+  **Same-day follow-up**: a second, related incident (confirmed against the in-game war log)
+  showed the actual flaw is broader than just `cwl_ended` lag. Both the `raw_data` lookup and
+  the `clan_name_cache` fallback pick a single "representative" clan's *current* league and
+  apply it to the whole group. That's only valid while the season is active — group members
+  share one league only by construction (grouping happens at that shared league). Once the
+  real season ends, promotions/demotions apply almost immediately and members diverge to
+  *different* current leagues (some up, some down, some unchanged), so any one of them can be
+  wrong. Confirmed case: a group's `league_rank` was written as "Crystal League I" — the
+  post-CWL league of two *demoted* bottom-of-group clans — while the group (and every other
+  member, including the clan the standings were rendered for) had actually played that season
+  in "Master League III". Fix: gate **both** sources (not just the cache fallback) on the
+  league group's live `.state`; the `raw_data` path previously ran unconditionally regardless
+  of season state.
 
 ### 2026-04-07: Index Cleanup + Partial Index (Complete ✅)
 - Dropped 5 legacy duplicate indexes (exact duplicates of idx_wa_*/idx_ws_* indexes added earlier):
@@ -494,7 +570,8 @@ Copy-Item "data\qapbot_backup_YYYYMMDD_HHMMSS.db" "data\qapbot.db"
 - Loaded at startup into `CACHE.player_name_index` via `load_player_name_index_sync()`.
 - Maintained by `_upsert_player_name_index_in_conn()` inside all war write paths.
 - Sentinel rows (attack_order=0) ARE included (changed from excluded, also 2026-05-16: see below).
-- Backfill script: `qapbot/scripts/backfill_player_name_index.py` (offline, idempotent, ~60–120 s).
+- Backfill script (one-time use, deleted after completion): `backfill_player_name_index.py`
+  (offline, idempotent, ~60–120 s).
 - Also removed `backfill_cwl_round_numbers()` from db_manager (was a post-season safety net now
   obsolete as all future CWL seasons start with round tracking active).
   Also removed `idx_ws_cwl_round_backfill` index (only used by the removed method).
@@ -572,11 +649,14 @@ Copy-Item "data\qapbot_backup_YYYYMMDD_HHMMSS.db" "data\qapbot.db"
 **Code:**
 - Database manager: `qapbot/db_manager.py`
 - Cache manager: `qapbot/cache_manager.py`
-- Migration script: `qapbot/scripts/migrate_maindata_to_db.py`
-- Validation script: `qapbot/scripts/validate_maindata_migration.py`
 - Consistency check: `/admin integrity` command (replaces deprecated check_database_consistency.py)
+- On-demand nightly maintenance runner (still present): `qapbot/scripts/run_db_maintenance_now.py`
+- Maindata migration (completed, script deleted): migrate_maindata_to_db.py
+- Maindata migration validation (completed, script deleted): validate_maindata_migration.py
 - war_history migration (completed 2026-03-08, script deleted): migrate_war_history_to_war_attacks.py
 - war_attacks backfill migration (completed 2026-03-08, script deleted): backfill_map_positions.py
+- player_name_index backfill (completed, script deleted): backfill_player_name_index.py
+- CWL league-group v2 migration (completed, script deleted): migrate_cwl_league_groups_v2.py
 
 **Documentation:**
 - Architecture: `qapbot/docs/CODE_STRUCTURE.md`

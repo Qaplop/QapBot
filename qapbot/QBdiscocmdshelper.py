@@ -958,7 +958,7 @@ async def get_mode_autocomplete_choices(
     return choices[:max_choices]
 
 
-def _extract_clan_and_coc_role(player_obj) -> Tuple[Optional[str], Optional[str]]:
+def _extract_clan_and_coc_role(player_obj: Any) -> Tuple[Optional[str], Optional[str]]:
     """
     Resolve (current_clan_tag, coc_role) from a coc.py Player object.
 

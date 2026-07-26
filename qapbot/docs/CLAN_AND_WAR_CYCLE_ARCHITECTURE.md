@@ -7,7 +7,7 @@
 ## Database Schema
 
 ### Clans Table (db_manager.py)
-**Location**: [qapbot/db_manager.py](../db_manager.py#L1072)
+**Location**: [qapbot/db_manager.py](../db_manager.py#L1453)
 
 ```sql
 CREATE TABLE IF NOT EXISTS clans (
@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS clans (
     last_checked_via_api TEXT,
     war_league TEXT,
     track_war_updates BOOLEAN NOT NULL DEFAULT 1,
+    is_deleted BOOLEAN NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 )
@@ -28,7 +29,10 @@ CREATE TABLE IF NOT EXISTS clans (
 - idx_clans_has_subs ON clans(has_active_subscriptions)
 - idx_clans_last_war_update ON clans(last_war_update)
 
-**Migrations**: ALTER TABLE statements for war_league and track_war_updates (applied idempotently in _create_maindata_schema).
+**Migrations**: war_league, track_war_updates and is_deleted are now baked directly into the
+`CREATE TABLE IF NOT EXISTS` above (no separate `ALTER TABLE clans` migration statements remain
+in `_create_maindata_schema` — the earlier idempotent ALTER-TABLE approach was superseded once
+the base schema was updated to include these columns from the start).
 
 ## Clan Fetching Pipeline
 
@@ -44,13 +48,14 @@ CREATE TABLE IF NOT EXISTS clans (
 - `clear_expired()`: Removes stale entries
 
 ### 2. CACHE.get_current_war_from_api(clan_tag)
-**Location**: [qapbot/cache_manager.py](../cache_manager.py#L2718)
+**Location**: [qapbot/cache_manager.py](../cache_manager.py#L2832)
 
 Wrapper around `coc_client.get_current_war()` with retry logic. Does NOT cache war data (fresh on every call).
 
 ## Phase-1 Update Cycle
 
-**Location**: [QapBot.py](../../QapBot.py#L749-L802)
+**Location**: [QapBot.py](../../QapBot.py#L543-L949) (categorization starts in `async def main()`
+at L543; parallel fetch loop/semaphore at L850-L949)
 
 ### Step 1: Categorize Clans to Update
 - Active clans (has_active_subscriptions=True): update every cycle
@@ -64,7 +69,7 @@ Wrapper around `coc_client.get_current_war()` with retry logic. Does NOT cache w
 - Record cycle stats: api_fetched, api_no_war, api_fail:*
 
 ### Step 3: fetch_clan_war_data()
-**Location**: [QBhelperfunctions.py](../../QBhelperfunctions.py#L5726-L6000)
+**Location**: [QBhelperfunctions.py](../../QBhelperfunctions.py#L6230-L6597)
 
 **Phase 1a - Optional API fetch for clan metadata**:
 - Throttle: 30min for role-enabled clans, 12h for others
@@ -89,7 +94,7 @@ Wrapper around `coc_client.get_current_war()` with retry logic. Does NOT cache w
 
 - `WarDataFetchError`: Failed API call (wrapped around coc.NotFound, coc.PrivateWarLog, etc.)
 - `WarProcessingError`: War processing failures
-- Caught in Phase-1 loop (QapBot.py#L778) and bucketed into cycle stats
+- Caught in Phase-1 loop (QapBot.py#L904-L929, inside `fetch_single_clan()`) and bucketed into cycle stats
 
 ### Specific Cases
 - **NotFound (404)**: Clan deleted or tag invalid → Record as api_fail:NotFound
@@ -116,12 +121,12 @@ _track = _wl_name in _WAR_UPDATE_LEAGUES  # Master III+ → True
 ## Clan Data Persistence
 
 ### CACHE.persist_clan(clan_tag)
-**Location**: [qapbot/cache_manager.py](../cache_manager.py#L2071)
+**Location**: [qapbot/cache_manager.py](../cache_manager.py#L2107)
 
 Writes modified clan_name_cache entry to DB via `db_manager.save_clan()`.
 
 ### db_manager.save_clan() / _save_clan_unlocked()
-**Location**: [qapbot/db_manager.py](../db_manager.py#L3122)
+**Location**: [qapbot/db_manager.py](../db_manager.py#L3699) / [../db_manager.py#L3655](../db_manager.py#L3655)
 
 UPSERT (INSERT ... ON CONFLICT):
 - Inserts new clan or updates existing
@@ -131,7 +136,7 @@ UPSERT (INSERT ... ON CONFLICT):
 ## DB Startup and Migrations
 
 ### WarHistoryDB.initialize()
-**Location**: [qapbot/db_manager.py](../db_manager.py#L706)
+**Location**: [qapbot/db_manager.py](../db_manager.py#L962)
 
 1. Create async connection with aiosqlite
 2. Enable WAL mode (journal_mode=WAL)
@@ -139,22 +144,13 @@ UPSERT (INSERT ... ON CONFLICT):
 4. Call `_create_schema()` → all migrations
 
 ### _create_schema() / _create_maindata_schema()
-**Location**: [qapbot/db_manager.py](../db_manager.py#L862)
+**Location**: [qapbot/db_manager.py](../db_manager.py#L1144) / [../db_manager.py#L1446](../db_manager.py#L1446)
 
-Idempotent (CREATE TABLE IF NOT EXISTS + try/except for ALTER TABLE).
-
-**Key migrations for clans table**:
-```python
-_clans_migrations = [
-    "ALTER TABLE clans ADD COLUMN war_league TEXT",
-    "ALTER TABLE clans ADD COLUMN track_war_updates BOOLEAN NOT NULL DEFAULT 1",
-]
-for _migration_sql in _clans_migrations:
-    try:
-        await self._conn.execute(_migration_sql)
-    except Exception:
-        pass  # Column already exists
-```
+Idempotent (CREATE TABLE IF NOT EXISTS for every table). No `ALTER TABLE` migration
+statements remain anywhere in db_manager.py — new columns (e.g. `war_league`,
+`track_war_updates`, `is_deleted` on `clans`) are now added directly to the base
+`CREATE TABLE IF NOT EXISTS` definitions rather than via separate idempotent ALTER-TABLE
+migration steps.
 
 ## CWL Season Naming (normalize_cwl_season)
 
@@ -176,29 +172,24 @@ Affected tables (all have a `cwl_season` column): `war_summary`,
 and `cwl_league_rounds.league_group_id` are `sha256(f"{season}:{sorted_tags}")[:16]`
 — must be recomputed whenever season is corrected.
 
-**Repair script**: [qapbot/scripts/fix_cwl_season_labels.py](../scripts/fix_cwl_season_labels.py)
-— dry-run by default, `--apply` to commit. Merges with any already-correct
-row (keeps most complete stats) to avoid PK conflicts on `cwl_league_groups
-(cwl_season, clan_tag)`.
+**Repair script**: `fix_cwl_season_labels.py` was a one-time repair tool for rows mislabeled
+before `normalize_cwl_season()` existed — deleted after use, no longer in `qapbot/scripts/`.
+If a similar repair is ever needed again, re-derive it from the disambiguation rules above and
+the `(cwl_season, clan_tag)` PK-merge requirement on `cwl_league_groups`.
 
 ## coc_client Initialization
 
-**Location**: [QapBot.py](../../QapBot.py#L219)
+**Location**: [QapBot.py](../../QapBot.py#L237), inside `startup_login()`.
 
-```python
-async def startup_login():
-    if QBcore.coc_client is None:
-        QBcore.coc_client = coc.Client(
-            key_count=10, 
-            throttler=coc.BatchThrottler, 
-            throttle_limit=100  # 10 keys × 10 req/sec
-        )
-        CACHE.coc_client = QBcore.coc_client
-        CACHE.db_manager = WarHistoryDB()
-        await CACHE.db_manager.initialize(CONFIG.db_path)
-```
+The `coc.Client(key_count=10, throttler=coc.BatchThrottler, throttle_limit=100)` construction
+itself is documented in `../qapbot/docs/RATE_LIMITING_IMPLEMENTATION.md` (canonical source —
+don't duplicate its detail here). What's specific to this doc's scope is the rest of the
+startup sequence around it: once the client exists, it's stored in both `QBcore.coc_client`
+(back-compat) and `CACHE.coc_client`, then `CACHE.db_manager = WarHistoryDB()` is constructed
+and `await CACHE.db_manager.initialize(CONFIG.db_path)` runs — all guarded by
+`if QBcore.coc_client is None` so `startup_login()` is idempotent across reconnects.
 
-**Location**: [qapbot/cache_manager.py](../cache_manager.py#L178)
+**Location**: [qapbot/cache_manager.py](../cache_manager.py#L176)
 
 `self.coc_clan_cache = CoCClanCache(soft_ttl_seconds=280, hard_ttl_seconds=600)`
 
@@ -211,10 +202,10 @@ are dominated by the intentional inter-cycle `Sleeping for Ns` pauses — filter
 
 **Root causes found (confirmed via data/logs/qapbot.log 2026-07-11)**:
 1. **Nightly full VACUUM took 2688s (44.8 min)** on the 33 GB `data/qapbot.db` (freed 2.4 GB).
-   `nightly_db_maintenance()` in [qapbot/db_manager.py](../db_manager.py#L4763) triggers VACUUM
+   `nightly_db_maintenance()` in [qapbot/db_manager.py](../db_manager.py#L5717) triggers VACUUM
    whenever `freelist_count > 500 pages` (~2-8 MB) — a fixed threshold that does NOT scale with
    DB size, so as the DB grows, nightly VACUUM duration grows too (self-reinforcing). Runs daily
-   at 03:00 UTC (`QapBot.py` ~line 1660). Blocks DB-backed Discord commands via
+   at 03:00 UTC (`QapBot.py` ~line 2060, the `hour == 3, minute == 0` scheduling gate). Blocks DB-backed Discord commands via
    `QBcore.db_maintenance_mode` for the whole VACUUM duration (event loop / gateway heartbeat NOT
    blocked — only DB commands are gated).
 2. **Backlog catch-up cycles after the stall**: normal cycles process ~600-800 clans in 40-100s;
@@ -227,7 +218,7 @@ are dominated by the intentional inter-cycle `Sleeping for Ns` pauses — filter
    in QapBot.py before DB maintenance) — the large count reflects genuine scale (thousands of
    tracked clans, e.g. cycle logs show up to ~8000 total clans/6885 fetched in one cycle), not an
    obvious bug. One nightly archive-move run moved 77,603 files (3.3 GB) in 56.4s.
-4. Pre-scan optimization already exists (`QapBot.py` ~line 903: single `glob.glob()` for temp
+4. Pre-scan optimization already exists (`QapBot.py` ~line 952: single `glob.glob()` for temp
    shards + `os.scandir()` for archive shards once per cycle, shared across Phase 2/3) — do NOT
    re-introduce per-clan directory scans.
 
@@ -323,11 +314,15 @@ the same treatment).
 `/leaderboard cwlinfo` / `cwlinfo_comp` / `cwlgroup`, `/analyse` both subcommands (leaguegroup,
 cwlopponent) — all now correctly see historical data regardless of age.
 
-**Group 4 — maintenance scripts — ✅ DONE** (mix of full rewrites and documented-safe-as-is):
-`fix_cwl_season_labels.py`, `check_cwl_completeness.py`, `harvest_cwl_war_tags.py`,
-`backfill_cwl_groups_from_war_summary.py`, `backfill_player_name_index.py`, `db_analysis.py`,
+**Group 4 — maintenance scripts — ✅ DONE** (mix of full rewrites and documented-safe-as-is;
+historical record — several of these were one-time-use and have since been deleted, marked
+below):
+`fix_cwl_season_labels.py` (deleted), `check_cwl_completeness.py` (deleted),
+`harvest_cwl_war_tags.py`, `backfill_cwl_groups_from_war_summary.py` (deleted),
+`backfill_player_name_index.py` (deleted), `db_analysis.py` (deleted),
 `verify_all_cwl_history.py`, `analyze_cwl_rounds.py` were rewritten to be hot/history-aware.
-`fix_cwl_season_2026_06.py`, `backfill_cwl_rounds_via_api.py`, `recover_missing_cwl_history.py`
+`fix_cwl_season_2026_06.py` (deleted), `backfill_cwl_rounds_via_api.py` (deleted),
+`recover_missing_cwl_history.py` (still present)
 were deliberately left unchanged with a documented rationale (see `changelog.txt` 2026-07-11
 entry and each script's docstring) — either because they can only ever target current/live data,
 or because their writes to `main` self-heal via the next monthly migration.
@@ -357,8 +352,11 @@ ClashPerk embeds, not DB backup).
 
 - `WarHistoryDB._history_cutoff()` — computes the monthly migration cutoff.
 - `WarHistoryDB.monthly_history_migration()` — orchestrates the monthly migration.
-- `qapbot/scripts/run_history_migration_now.py` — CLI wrapper to trigger the migration
-  on demand (outside the day-1 schedule), e.g. right after deploying this feature.
+- `qapbot/scripts/run_db_maintenance_now.py` — CLI wrapper to trigger
+  `WarHistoryDB.nightly_db_maintenance()` on demand (outside its normal once-a-day schedule),
+  which includes the monthly hot→history migration as one of its steps. (The old dedicated
+  `run_history_migration_now.py` one-time script has been deleted; this is the current
+  equivalent.)
 - `attach_history_db(conn, db_path, history_db_path=None, read_only=False)` (module-level in
   `qapbot/db_manager.py`) — convenience helper for standalone scripts using a bare `sqlite3`
   connection instead of `WarHistoryDB`; ATTACHes history + creates its schema (skipped when

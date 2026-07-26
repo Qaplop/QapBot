@@ -308,7 +308,7 @@ _CacheManager._process_league_group_response(lg_response, season)
 - [x] Implement `CacheManager._process_league_group_response(lg, season)` method in `cache_manager.py`:
   - called directly from `get_league_group()` on every fresh API response (no callback/hook needed)
 - [x] Hook into war finalization path: resolve round via Layer 2 *before* the `war_summary` INSERT so `round_number` is written on first write (no deferred UPDATE)
-- [ ] Update `analyze_cwl_rounds.py` to use DB round numbers instead of positional ranking
+- [x] Update `analyze_cwl_rounds.py` to use DB round numbers instead of positional ranking (script rewritten to read `round_number` / `cwl_league_rounds` throughout; no positional-ranking code remains — see changelog.txt "Rewrote: analyze_cwl_rounds.py — DB-backed round numbers, UNKNOWN row, 4-part filename support")
 - [x] No separate backfill script needed — the Layer 2 backfill UPDATE covers all prior rounds automatically on first finalization per group
 - [x] Tests (1317 passed)
 
@@ -317,15 +317,15 @@ _CacheManager._process_league_group_response(lg_response, season)
 - [x] Take a prod DB backup before deploying (`BackupProd.bat`)
 - [x] Deploy to server-machine — new tables and index are created automatically on first bot startup via `CREATE TABLE IF NOT EXISTS`
 - [x] `cwl_league_groups`: 616 rows written for 2026-04 season (Layer 1 fired during active April CWL polling). ✅
-- [x] `cwl_league_rounds`: **Empty for May 2026** — code deployed on May 9 (last day of May CWL). April groups were already `ended` (all warTags `#0`), May groups fired too late. **June 2026 will be the first season with full round data.** No bug — this is an expected first-season gap.
-- [x] `war_summary.round_number`: NULL for all May 2026 rows — direct consequence of empty `cwl_league_rounds`. Expected. Will populate from June 2026 onward.
+- [x] `cwl_league_rounds`: **Empty for May 2026** — code deployed on May 9 (last day of May CWL). April groups were already `ended` (all warTags `#0`), May groups fired too late. **June 2026 will be the first season with full round data.** No bug — this is an expected first-season gap. Confirmed: June and July 2026 both show full `cwl_league_rounds`/`cwl_league_groups` data.
+- [x] `war_summary.round_number`: NULL for all May 2026 rows — direct consequence of empty `cwl_league_rounds`. Expected. Confirmed populated (100% coverage on CWL rows) from June 2026 onward.
 - [x] Prod data recovery confirmed: 2026-05-08 rows went from 18,652 → 20,785 after running `recover_missing_wars_20260509.py` and one bot cycle. ✅
 - [x] No binding errors, crashes, or data divergence after fix deployment. ✅
-- [ ] Run `analyze_cwl_rounds.py` against prod data for June 2026 season; verify round numbers are correct
-- [ ] Monitor June 2026 CWL — confirm Layer 1 captures groups at season start and Layer 2 fills gaps
+- [x] Run `analyze_cwl_rounds.py` against prod data for June 2026 season; verify round numbers are correct — confirmed: `cwl_league_rounds`/`cwl_league_groups` are populated for 2026-06 and 2026-07, and `war_summary.round_number` coverage is 100% for CWL wars in both seasons (verified directly against `data/qapbot.db`)
+- [x] Monitor June 2026 CWL — confirm Layer 1 captures groups at season start and Layer 2 fills gaps — confirmed via the same DB check above; no gap remained for June or July 2026
 
 ### Phase: Post-approval cleanup (after one season confirmed working)
 
-- [ ] Remove the `_ws_migrations` list and `_legacy_indexes` DROP list from `db_manager.py` (legacy cleanup deferred until feature is stable)
-- [ ] Update `analyze_cwl_rounds.py` to remove the positional-ranking fallback once DB round numbers are fully reliable
+- [x] Remove the `_ws_migrations` list and `_legacy_indexes` DROP list from `db_manager.py` — confirmed removed; no references remain in `qapbot/db_manager.py`
+- [x] Update `analyze_cwl_rounds.py` to remove the positional-ranking fallback once DB round numbers are fully reliable — confirmed: no positional/chronological-ranking fallback code remains in the script
 - [x] Update this plan doc status from `Draft` to `Implemented`

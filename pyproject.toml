@@ -31,3 +31,34 @@ omit = [
 [tool.coverage.report]
 fail_under = 70
 show_missing = true
+
+[tool.pyright]
+# Matches the project-wide VS Code user setting (Pylance / python.analysis.typeCheckingMode:
+# strict) so `pyright` on the command line reports the same findings anyone sees in-editor —
+# committed here so the strict bar isn't just a personal, undiscoverable machine setting.
+typeCheckingMode = "strict"
+pythonVersion = "3.14"
+venvPath = "."
+venv = "venv"
+exclude = ["venv", "data", "archive", "archive_old", "__pycache__", ".claude", ".workspace_tools"]
+
+# The "unknown type propagated from an untyped source" rule family is turned off project-wide.
+# Two untyped sources dominate here: (1) unittest.mock objects (MagicMock/AsyncMock) throughout
+# tests/, which are untyped by design — strict mode's reportUnknown* rules otherwise flood test
+# files with ~2000+ findings that reflect the mock library, not a real bug; (2) coc.py itself
+# has no type stubs (see the `# type: ignore[import-untyped]` on every `import coc`), so any
+# attribute pulled off a coc.py object reads as "unknown" even in application code. Tried scoping
+# this to tests/ only via `[[tool.pyright.executionEnvironments]]`, but per-environment blocks
+# don't reliably inherit the top-level venvPath/venv in this pyright version — repeating
+# venvPath/venv inside the block is rejected as "unrecognized setting" and breaks import
+# resolution for every file under that root instead. Simpler and more robust to relax these
+# specific rules everywhere; every OTHER strict rule (unused imports/code, attribute-access
+# issues, call-signature mismatches, deprecated usage, etc.) still applies everywhere including
+# tests/.
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownParameterType = "none"
+reportUnknownLambdaType = "none"
+reportMissingParameterType = "none"
+reportMissingTypeArgument = "none"

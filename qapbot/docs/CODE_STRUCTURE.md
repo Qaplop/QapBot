@@ -14,61 +14,19 @@ QapBot is a modular Python Discord bot for Clash of Clans, featuring:
 
 ### Three-Tier Permission System
 
-**CRITICAL**: Account protection prevents unauthorized player account hijacking and maintains data integrity.
+**CRITICAL**: Account protection prevents unauthorized player account hijacking and maintains data integrity. Each tier trades increasing trust (Discord server role or bot-admin config) for increasing power to re-link a player account already claimed by someone else.
 
-#### 1. Regular User
-- **Permission Level**: Default for all Discord users
-- **Can Do**: Link UNLINKED player accounts through registration message flow
-- **Restrictions**: Cannot link players already linked to another Discord user
-- **Security Check**: If player is already linked (verified or unverified), operation blocked with error
-- **No Confirmation**: Direct linking for unlinked players
-
-#### 2. Guild Administrator
-- **Permission Level**: Discord users with server administrator permissions
-- **Can Do**: 
-  - Manage clan subscriptions for their guild
-  - Access clan management interface
-  - Link players to Discord users in their guild
-  - **Re-link UNVERIFIED accounts** (requires confirmation)
-- **Restrictions**: Cannot re-link VERIFIED accounts
-- **Protection Flow** (for unverified re-linking):
-  1. Detect player is unverified and linked to different Discord user
-  2. Show warning with player info and current owner's display name/Discord ID
-  3. Require explicit confirmation (Confirm/Cancel buttons)
-  4. **On Confirm**: Remove player from previous user, send DM notification to previous owner
-  5. **On Cancel**: No changes made
-- **DM Notification**: Previous owner receives DM explaining player was removed (unverified)
-
-#### 3. Bot Server Admin
-- **Permission Level**: Configured via `CONFIG.server_admin` in qapbot/config.py (specific Discord username)
-- **Can Do**:
-  - All regular and guild admin permissions
-  - Access bot-wide admin commands
-  - **Re-link VERIFIED accounts** (requires explicit confirmation with admin override)
-- **Highest Privilege**: Can override verified account protection
-- **Protection Flow** (for verified re-linking):
-  1. Detect player is VERIFIED by different Discord user (via `get_verified_player_owner()`)
-  2. Show "Admin Override Required" warning with player info and verified owner details
-  3. Require explicit 2-step confirmation:
-     - Warning dialog explaining consequence
-     - Final "Admin Override Confirm" button with clear label
-  4. **On Confirm**: Remove verified player from previous user, send DM notification, log admin action
-  5. **On Cancel**: No changes made
-- **Audit Trail**: All admin override actions logged with full context
+| Tier | Permission Level | Can Do | Confirmation Flow | Key Function / View |
+|---|---|---|---|---|
+| **1. Regular User** | Default for all Discord users | Link UNLINKED player accounts via registration message flow | None — direct link. Blocked with an error if the player is already linked (verified or unverified) to anyone else | registration message flow |
+| **2. Guild Administrator** | Discord users with server administrator permissions | Manage clan subscriptions, access clan management interface, link players to Discord users in their guild, **re-link UNVERIFIED accounts** (cannot re-link VERIFIED accounts) | Warning shows player info + current owner's display name/Discord ID → Confirm/Cancel buttons. On Confirm: player removed from previous user + DM sent to previous owner. On Cancel: no changes made | Guild-admin linking UI |
+| **3. Bot Server Admin** | Configured via `CONFIG.server_admin` in qapbot/config.py (specific Discord username) | All Tier 1/2 permissions, bot-wide admin commands, **re-link VERIFIED accounts** (admin override) | 2-step: "Admin Override Required" warning with verified-owner details → explicit "Admin Override Confirm" button. On Confirm: verified player removed from previous user, DM sent, action logged (audit trail). On Cancel: no changes made | `get_verified_player_owner()`, `ClanManagementAdminOverrideView` / `AdminOverrideConfirmView` |
 
 #### Rule 4: API Token Override (Cryptographic Proof)
-- **Who**: Any user who can provide valid CoC API token
-- **What**: Override all protection rules with cryptographic proof of rightful ownership
-- **When**: Player is linked (verified or not) to another Discord user
-- **How**:
-  1. User attempts to link already-linked player
-  2. System shows `ApiTokenOwnershipModal` explaining ownership conflict
-  3. User enters CoC API token
-  4. System validates token via `validate_api_token_for_player()`
-  5. **On Success**: Previous link removed, player linked to new user (with verification), DM sent to previous owner
-  6. **On Failure**: Linking rejected with error message
-- **Security**: API token serves as cryptographic proof stronger than admin permissions
-- **Use Case**: Legitimate account recovery when player changes Discord accounts
+Cuts across all three tiers above: any user who can supply a valid CoC API token for an already-linked player (verified or not) can override the protection rules with cryptographic proof of rightful ownership — evidence treated as stronger than any admin permission. This is the intended path for legitimate account recovery when a player switches Discord accounts.
+- **Flow**: user attempts to link an already-linked player → `ApiTokenOwnershipModal` explains the ownership conflict and prompts for the token → validated via `validate_api_token_for_player()`.
+- **On Success**: previous link removed, player linked to new user (with verification), DM sent to previous owner.
+- **On Failure**: linking rejected with error message.
 
 ### Account State Transitions
 
@@ -141,7 +99,7 @@ CACHE.temp_war_metadata: Dict[str, Dict[str, str]]  # clan_tag -> {state, start_
 # filepath is the absolute path to the temp JSON, kept current by save_war_object().
 # Used by war_notifications._get_active_wars() to open files directly without glob.glob().
 CACHE.clan_history: Dict[str, List[Any]]  # clan_tag -> list of war records (loaded from DB on demand)
-CACHE.history_cache: Dict[Tuple[str, Optional[int], Optional[int]], List[Dict[str, Any]]]  # filtered history cache
+CACHE.history_cache: Dict[Tuple[str, Optional[int], Optional[int], Optional[str]], List[Dict[str, Any]]]  # (clan_tag, month, year, cwl_season) -> filtered history cache
 
 # CWL in-memory caches (survive across cycles within a session)
 # Evicted by evict_stale_cwl_caches() once per cycle (called after Phase 3).
@@ -165,7 +123,7 @@ CACHE.db_manager: WarHistoryDB  # All database operations via this reference
 
 ### Write-Through Pattern
 - All cache mutations persist immediately to SQLite database
-- `save_all()` is now a no-op (just logs) — all persistence is write-through
+- `save_all()` has been removed entirely — there is no batch-save method; all persistence is write-through
 - `load_all()` loads all data from database on startup
 - Per-entity persist methods: `persist_user()`, `persist_clan()`, `persist_clan_family()`, etc.
 - Error handling: try/except + log + re-raise on all write-through methods
@@ -267,7 +225,7 @@ view.message = msg
 
 Views updated with this pattern: WarNotificationPromptView, UnifiedNotificationView,
 LanguageSelectionView, BuddyPlayerSelectView, RemoveBuddyView, AccountActionView,
-LanguageSelectView, TestNotifyView. Multi-state views propagate `view.message` through
+LanguageSelectView. Multi-state views propagate `view.message` through
 all rebuild/button-handler paths so the reference is never lost.
 
 ---
@@ -303,15 +261,14 @@ all rebuild/button-handler paths so the reference is never lost.
 - Argument parsing and normalization
 - `_mark_clan_deleted(clan_tag)`: async helper called when CoC API returns `NotFound` for a clan.
   Sets `is_deleted=True` in `clan_name_cache` and persists to DB. Logs one `[CLAN-DELETED]` warning.
-  The clan is then skipped by the Phase-1 loop until `_update_clan_metadata` clears the flag on a
-  successful `get_clan` response.
-- predict_war_between_clans(clan1_tag, clan2_tag, n_players, apm): pre-war Monte Carlo prediction
-  between any two clans using top-N players by TH; fetches live clan data, resolves per-clan
-  CWL leagues, loads skill factors from DB, returns Discord-formatted result string
-- generate_cwl_group_analysis_embeds(): /analyse leaguegroup engine; falls back to DB data
-  after CWL season ends (_load_cwl_analysis_from_db_sync via asyncio.to_thread)
+  The clan is then skipped by the Phase-1 loop until cleared automatically (see coc_cache.py's
+  `_update_clan_metadata` auto-restore below).
+- `predict_war_between_clans()` — pre-war Monte Carlo prediction between any two clans; full
+  steps in Function Tree § QBhelperfunctions.py.
+- `generate_cwl_group_analysis_embeds()` — `/analyse leaguegroup` engine; full steps in
+  Function Tree § QBhelperfunctions.py.
 
-🟧 qapbot/coc_cache.py (~410 lines)
+🟧 qapbot/coc_cache.py (~710 lines)
 - CoCClanCache class with stale-while-revalidate strategy (soft_ttl=280s, stale 280-600s, hard_ttl=600s)
 - Background refresh for stale entries, blocking fetch for expired/missing
 - Updates clan_name_cache, warlog status, and player TH/clan info on every fetch
@@ -325,26 +282,30 @@ all rebuild/button-handler paths so the reference is never lost.
 - _schedule_role_sync_for_clan / _do_role_sync: fires background role sync after every real API
   fetch; guards with CONFIG.is_dev_mode check (skip non-dev guilds, matching periodic loop)
 
-🟧 qapbot/cache_manager.py (~1980 lines)
+🟧 qapbot/cache_manager.py (~3230 lines)
 - CacheManager class with write-through persistence to SQLite database
 - All data loaded from database on startup, persisted via write-through on mutation
 - Error handling with try/except + log + re-raise on all write-through methods
 - Provides centralized access to db_manager for all database operations
 - No JSON persistence (only temp war files in data/temp/ remain as JSON)
 - `player_name_index: Dict[str, str]` — in-memory {player_tag: player_name} map loaded at startup via `load_player_name_index()`
-- `search_player_names(query, limit=25)`: synchronous O(n) substring search over in-memory index; used by /whois name lookup; no cap applied before sorting (caller slices [:25])
+- `search_player_names(query, limit=25)`: synchronous O(n) substring search over in-memory index, sorted alphabetically then capped at `limit`. NOT used by /whois — `/whois` searches `CACHE.player_name_index` inline instead so it can prioritise guild members before slicing to 25 (this method's own cap would cut off guild members that sort later alphabetically). Currently only covered by unit tests.
 
-🟨 qapbot/db_manager.py (Database Layer - ~2700 lines)
-- WarHistoryDB class for ALL SQLite database operations (17 tables)
+🟨 qapbot/db_manager.py (Database Layer - ~6200 lines)
+- WarHistoryDB class for ALL SQLite database operations (22 tables)
 - WAL mode enabled for server-machine reliability and concurrent reads
 - Idempotent operations (INSERT OR IGNORE, CREATE TABLE IF NOT EXISTS)
 - Batch transaction support for performance (1000+ rows per commit)
 - Automatic connection recovery: `_ensure_connection()` / `_reconnect()`
 - Explicit BEGIN/ROLLBACK transactions on 6 compound write methods
+- Hot/history DB split: `war_attacks`, `war_summary`, `cwl_league_groups`, `cwl_league_rounds`
+  are mirrored into a second attached database (`data/qapbot_history.db`, schema alias
+  `history`) via `ATTACH DATABASE`; the other tables stay hot-only
 - Tables: war_attacks, war_summary, clans, clan_families, clan_family_members, users,
-  user_players, guild_config, guild_member_families, guild_member_clans, subscriptions,
+  user_players, user_buddies, guild_config, guild_member_families, guild_member_clans,
+  guild_welcome_families, guild_welcome_clans, guild_clan_roles, subscriptions,
   notification_state, channel_notification_state, leaderboard_messages,
-  cwl_league_groups, cwl_league_rounds, player_name_index
+  cwl_league_groups, cwl_league_rounds, player_name_index, bot_metadata
 - Key new methods (Phase 8):
   · `add_war_attack_records_sync()`: INSERT OR IGNORE per-attack rows into war_attacks
   · `add_war_summary_sync()`: INSERT OR REPLACE a war_summary row
@@ -368,7 +329,7 @@ all rebuild/button-handler paths so the reference is never lost.
 - **Production Status**: Database-only mode (no feature flags), all data stored in SQLite
 📖 See: DATABASE_ARCHITECTURE.md for schema and architecture details
 
-🟪 QBdiscordcmds.py (~2820 lines)
+🟪 QBdiscordcmds.py (~4320 lines)
 - Discord command handlers (/leaderboard, /subscribe, /admin, /clan management, /whois, /list, /help, etc.)
 - /analyse command group: analyse_group containing `/analyse leaguegroup` to rank all CWL group players
 - /whois slash command + two right-click context menus (user and message) sharing _whois_logic()
@@ -378,7 +339,7 @@ all rebuild/button-handler paths so the reference is never lost.
 - leaderboard_clan_autocomplete: passes guild_id to restrict fallback to guild-subscribed clans only (cross-server isolation)
 - Note: Account management (/myaccounts) and notifications (/notify) deprecated - functionality moved to registration message UI
 
-� QBcore.py
+🟦 QBcore.py
 - Core bot and CoC client initialization
 - Global bot instance and singleton pattern
 - Shutdown coordination and cleanup management- `backfill_idle_event` (asyncio.Event, starts set): cleared while `/admin Backfill CWL Groups`
@@ -399,16 +360,16 @@ all rebuild/button-handler paths so the reference is never lost.
   lock state. A 30-second concurrent.futures.wait() timeout provides a safety net
   that falls back to sequential execution rather than hanging forever.
   Workers exist only during the computation, never idle in the background.
-- _SIM_N_WORKERS / _SIM_MIN_CHUNK: configured at startup by init_sim_pool(); runs
+- _sim_n_workers / _sim_min_chunk: configured at startup by init_sim_pool(); runs
   in-process below the chunk threshold to keep test monkeypatching compatible
 - shutdown_sim_pool(): no-op kept for API compatibility with cleanup callers
 
-🟩 qapbot/ui_common.py (~170 lines)
+🟩 qapbot/ui_common.py (~220 lines)
 - GenericSelectView: Reusable dropdown selection view
 - LanguageSelectView: Standalone language selection for /language command
 - update_user_metadata_from_interaction: Utility for user metadata updates
 
-🟩 qapbot/ui_registration.py (~1740 lines)
+🟩 qapbot/ui_registration.py (~1920 lines)
 - RegistrationView (4 buttons: Link Account, War Notifications, API Verification, My Accounts)
 - AccountActionView: Verify existing or link new player
 - AccountManagementView: Single-message account overview with player selection dropdown
@@ -417,13 +378,13 @@ all rebuild/button-handler paths so the reference is never lost.
 - PlayerSubstringModal, VerifyAccountModal, ApiTokenOwnershipModal: Registration modals
 - Callback functions: _clan_filter_callback, _user_player_select_callback, _show_player_search_modal
 
-🟩 qapbot/ui_notifications.py (~960 lines)
+🟩 qapbot/ui_notifications.py (~1430 lines)
 - WarNotificationPromptView: Post-registration notification opt-in
 - UnifiedNotificationView: Complete notification management (enable/disable, type, mode)
 - LanguageSelectionView: Language picker within notification flow
 - NotificationSettingsView: Clan-wide and user-specific notification configuration
 
-🟩 qapbot/ui_clan_management.py (~5430 lines)
+🟩 qapbot/ui_clan_management.py (~6550 lines)
 - ClanManagementView: Main hub with mode switching (config, roles, families, registrations, notifications)
 - Configuration views: ChannelConfigurationView, LanguageConfigurationView, NotificationThresholdConfigurationView
 - RoleConfigurationView: Newbie/member role assignment configuration
@@ -446,23 +407,17 @@ all rebuild/button-handler paths so the reference is never lost.
 - ImportDataConfirmView, SwitchViewContinueView: ClashPerk data import
 
 🟩 qapbot/guild_role_manager.py
-- Discord role management for CoC In-Game Roles (Member/Elder/Co-Leader/Leader) and Per-Clan Roles
-- normalize_discord_role_name: strips illegal chars, enforces 100-char limit
-- get_or_create_discord_role: idempotent find-or-create (never duplicates)
-- create_coc_ingame_roles / delete_all_coc_ingame_roles: 4 CoC rank roles lifecycle
-- create_clan_role / delete_clan_role_from_guild / create_all_clan_roles: per-clan roles lifecycle
-- sync_roles_for_user / sync_all_roles_for_guild: assign/remove roles for one user or all guild members
-- _get_highest_coc_role_for_user: reads player["coc_role"] (memory-only, set by coc_cache)
-- Bootstrap: _coc_role_refreshed_clans (module-level set); on first sync_all_roles_for_guild call per
-  process lifetime, forces get_clan() for each member clan so coc_role is populated after restart
-- coc_role values in player dicts: "member", "elder", "coLeader", "leader" (match COC_ROLE_PRIORITY)
+- Discord role management for CoC In-Game Roles (Member/Elder/Co-Leader/Leader) and Per-Clan
+  Roles — full function inventory + sync/bootstrap call graph in Function Tree § guild_role_manager.py
+- Data model: `_get_highest_coc_role_for_user` reads `player["coc_role"]` (memory-only, set by
+  coc_cache); values are `"member"`, `"elder"`, `"coLeader"`, `"leader"` (match COC_ROLE_PRIORITY)
 
-🟫 qapbot/QBdiscocmdshelper.py (~4314 lines)
+🟫 qapbot/QBdiscocmdshelper.py (~4713 lines)
 - Command helper functions (admin checks, display formatting, etc.)
-- Player registration helpers (build_player_list_for_clan, process_player_registration, complete_account_linking_flow)
+- Player registration helpers (process_player_registration, complete_account_linking_flow)
 - Account management helpers (set_primary_account, unlink_player) - used by AccountManagementView
 - Notification formatting (format_notification_settings) - used by RegistrationView and UnifiedNotificationView
-- Autocomplete factory functions (create_clan_autocomplete, create_family_autocomplete, create_mode_autocomplete)
+- Autocomplete factory functions (create_clan_autocomplete, create_family_autocomplete)
 - Playerregistration command helpers (setup_playerregistration_message, update_playerregistration_subscription)
 - get_clan_family_autocomplete_choices(current, channel_id, guild_id, mode, max_choices):
   `guild_id` restricts the fallback in "subscribed_first" mode to clans/families subscribed
@@ -499,7 +454,7 @@ all rebuild/button-handler paths so the reference is never lost.
 - Used by 6+ modules to eliminate hardcoded values
 
 🟫 qapbot/exceptions.py
-- Custom exception hierarchy (16 exception classes)
+- Custom exception hierarchy (21 exception classes)
 - Base: QapBotError with message and context support
 - Configuration: ConfigurationError
 - Cache: CacheError, CacheSaveError, CacheLoadError, CacheCorruptionError
@@ -620,7 +575,7 @@ all rebuild/button-handler paths so the reference is never lost.
         │   │   ├── _merge_entries()
         │   │   │   └── uses MODE_REGISTRY from qapbot/formatting.py 🟫
         │   │   ├── _load_history_filtered()
-        │   │   │   └── CACHE.load_clan_history(clan_tag) 🟧
+        │   │   │   └── CACHE.get_clan_history(clan_tag) 🟧
         │   │   │       └── db_manager.get_clan_attack_history_sync() (war_attacks only)
         │   │   └── CACHE.load_temp_war_stats(clan_tag) 🟧
         │   │       └── _load_war_data_from_json() 🟫
@@ -709,17 +664,14 @@ _split_and_post_leaderboard_helper()
     │   │   ├── calculate_content_hash() 🟦
     │   │   └── _split_and_post_leaderboard_helper() 🟩
     │   └── cwlinfo mode:
-    │       ├── generate_cwlinfo_embeds() 🟩  (async, single embed per season)
+    │       ├── generate_cwlinfo_embeds() 🟩  (async, single embed per season; skill-factor call
+    │       │   chain — _cwl_compute_skill_factors() → _load_skill_factors_for_clan() →
+    │       │   calculate_win_probability() — is the same as in Regular Update Cycle above;
+    │       │   per-player fallback logs: "Skill-data source for clan X: 5 players CWL 03/26, ...")
     │       │   ├── CACHE.get_league_group(clan_tag) → live CWL group (ongoing season)
     │       │   ├── _generate_cwlinfo_archive_embeds()  (sync, reads war_summary DB table)
     │       │   │   └── CACHE.db_manager.get_war_summaries_sync(clan_tag, is_cwl=True)
-    │       │   ├── asyncio.ensure_future(update_cwl_group_stats())  ← free piggyback
-    │       │   ├── _cwl_compute_skill_factors()  ← unified skill loader (all modes)
-    │       │   │   ├── _load_skill_factors_for_clan() × all group clans  ← universal base
-    │       │   │   │   · per-player fallback: current CWL → latest past CWL → base rates
-    │       │   │   │   · logs: "Skill-data source for clan X: 5 players CWL 03/26, ..."
-    │       │   │   └── [comp_mode only] compute_player_skill_factors_from_attacks()  ← current-season overlay
-    │       │   └── calculate_win_probability(player_skill_factors=...)  ← skill-adjusted Monte Carlo
+    │       │   └── asyncio.ensure_future(update_cwl_group_stats())  ← free piggyback
     │       └── post_cwlinfo_embeds_to_discord(content_hash=...) 🟩
     │           ├── delete_leaderboard_messages_for_context() 🟩
     │           └── discord_retry(channel.send(embeds=[embed]))
@@ -749,65 +701,51 @@ _split_and_post_leaderboard_helper()
 
 ## Function Tree (Key Functions Only)
 
-🟦 QapBot.py
-└── main()
-    ├── startup_login()
-    └── periodic_main()
-    ├── fetch_clan_war_data() 🟩 (parallel gather)
-    ├── process_orphaned_cwl_wars() 🟩
-    ├── process_clan_war_data() 🟩 (sequential)
-        ├── generate_leaderboard_text() 🟩
-        └── post_leaderboards_to_subscribed_channels() 🟦
-            ├── generate_leaderboard_text() 🟩
-            ├── calculate_content_hash() 🟦
-            ├── delete_leaderboard_messages_for_context() 🟩
-            ├── post_leaderboard_to_discord() 🟩
-                ├── calculate_content_hash() 🟦
-                ├── _split_and_post_leaderboard_helper() 🟩
+Complete per-file inventory of key functions and their call relationships. Where a function's
+behavior is already fully explained in **Main Flows** above, its entry here is trimmed to a
+one-line pointer ("see Main Flows § ...") instead of repeating the description — full detail is
+kept here only for functions not narrated elsewhere.
+
+🟦 QapBot.py — full call graph in Main Flows § Regular Update Cycle; inventory:
+├── main() → startup_login(), periodic_main()
+├── fetch_clan_war_data() 🟩 (Phase 1, parallel gather)
+├── process_orphaned_cwl_wars() 🟩 (Phase 2)
+├── process_clan_war_data() 🟩 (Phase 3, sequential)
+├── post_leaderboards_to_subscribed_channels() 🟦
+├── generate_leaderboard_text() 🟩
+├── calculate_content_hash() 🟦
+├── delete_leaderboard_messages_for_context() 🟩
+├── post_leaderboard_to_discord() 🟩
+└── _split_and_post_leaderboard_helper() 🟩
 
 🟩 QBhelperfunctions.py
-├── generate_leaderboard_text()
-│   ├── generate_war_info_text()
+├── generate_leaderboard_text() — full call graph in Main Flows § Regular Update Cycle (Phase 3B)
+│   ├── generate_war_info_text() — see Main Flows § War Info Text Sentinel Pattern
 │   ├── calculate_leaderboard()
-│   │   ├── _merge_entries()
-│   │   │   └── uses MODE_REGISTRY from qapbot/formatting.py 🟫
-│   │   ├── _load_history_filtered()
-│   │   │   └── CACHE.load_clan_history(clan_tag) 🟧
-│   │   │       └── db_manager.get_clan_history() (SQLite)
-│   │   └── CACHE.load_temp_war_stats(clan_tag) 🟧
-│   │       └── _load_war_data_from_json() 🟫
+│   │   ├── _merge_entries() — player name change handling via PlayerID; uses MODE_REGISTRY (qapbot/formatting.py 🟫)
+│   │   ├── _load_history_filtered() → CACHE.get_clan_history(clan_tag) 🟧 → db_manager.get_clan_attack_history_sync() (SQLite)
+│   │   └── CACHE.load_temp_war_stats(clan_tag) 🟧 → _load_war_data_from_json() 🟫
 │   └── render_leaderboard() 🟫
-├── post_leaderboard_to_discord()
-│   ├── normalize_leaderboard_text()
+├── post_leaderboard_to_discord() — see Main Flows § Regular Update Cycle
+│   ├── normalize_leaderboard_text() — content normalization for change detection
 │   ├── Discord API calls (channel.send/edit)
 │   └── CACHE.leaderboard_messages management 🟧
-├── generate_cwlinfo_embeds()  [async]
+├── generate_cwlinfo_embeds()  [async] — call graph in Main Flows § Regular Update Cycle & § Discord Bot Commands (cwlinfo mode); detail not covered there:
 │   ├── _generate_cwlinfo_archive_embeds()  [sync; reads war_summary DB via get_war_summaries_sync]
 │   │   └── _lineup_from_json(ascending=True for my clan, False for opponent)
 │   │       · My clan sorted low→high TH so highest THs meet at centre "vs"
 │   │       · Score box: `my⭐ – opp⭐ · dest% – dest%` (warended/inwar)
 │   │       · Bidi fix: \u200e LRM before tag code blocks on vs. lines
-│   ├── CACHE.get_league_group() / CACHE.get_league_war()  (live CWL season)
-│   ├── asyncio.ensure_future(update_cwl_group_stats())  ← piggyback, no extra API call
-│   ├── _cwl_compute_skill_factors()  ← unified skill loader (all modes)
-│   │   ├── Universal base (always): _load_skill_factors_for_clan() × all group clans
-│   │   · db_manager.get_player_cwl_attacks_multi_season_sync() — per-player best season (clan-agnostic)
-│   │   · searches across ALL clans: player history survives clan transfers between CWLs
-│   │   │   · fallback chain: current CWL → latest past CWL → base rates
-│   │   └── comp_mode overlay: get_cwl_attack_records_sync() + live cache attacks
-│   │       → compute_player_skill_factors_from_attacks(); update() over base
+│   ├── _cwl_compute_skill_factors() internals: fallback chain current CWL → latest past CWL → base rates;
+│   │   searches across ALL clans so player history survives clan transfers between CWLs
+│   │   (comp_mode overlay: get_cwl_attack_records_sync() + live cache attacks → compute_player_skill_factors_from_attacks())
 │   └── _cwl_append_prediction()  ← single-line display; 📊 prefix for non-comp
-├── post_cwlinfo_embeds_to_discord()
+├── post_cwlinfo_embeds_to_discord() — see Main Flows § Regular Update Cycle
 │   ├── delete_leaderboard_messages_for_context()
 │   └── CACHE.set_leaderboard_message()
-├── update_cwl_group_stats(clan_tag, cwl_season)  [async; module-level TTL cache 600s]
-│   ├── db.get_cwl_group_info() → group_id, clan_tags, cwl_ended, rows
+├── update_cwl_group_stats(clan_tag, cwl_season)  [async; module-level TTL cache 600s] — see Main Flows § Discord Bot Commands (cwlgroup mode); detail not covered there:
 │   ├── Short-circuit: cwl_ended=1 + all total_stars non-null → return cached DB data
-│   ├── db.get_cwl_group_war_stats() → stars_map + ended_map
-│   │   · SQL: SUM(clan_stars) + SUM(CASE WHEN result='win' THEN 10 ELSE 0 END)
-│   │   · SQL: SUM(clan_destruction * team_size)  [matches in-game display]
-│   ├── Folds in live in_war round: live_stars + live_avg_destr × team_size
-│   ├── Ranks clans (stars DESC, destruction DESC)
+│   ├── SQL: SUM(clan_stars) + SUM(CASE WHEN result='win' THEN 10 ELSE 0 END); SUM(clan_destruction * team_size) [matches in-game display]
 │   └── db.update_cwl_group_stats_batch()  [skips unchanged rows]
 ├── generate_cwl_group_image(standings, cwl_season)  [sync; run in asyncio.to_thread]
 │   · matplotlib Agg backend (no display); dark CoC theme (#3B2A1F background)
@@ -831,59 +769,30 @@ _split_and_post_leaderboard_helper()
 │   ├── Builds synthetic war_data dict with all attacks still remaining
 │   └── calculate_win_probability() → Win/Lose/Draw % formatted for Discord
 ├── update_clan_war_info_and_stats()
-│   ├── CoC API calls: 2 per clan_tag
-│   │   ├── ALWAYS: get_clan() via CACHE.coc_clan_cache.get_clan()
-│   │   └── ALWAYS: get_current_war() via CACHE.get_current_war_from_api()
-│   ├── CACHE.save_war_object(clan_tag, war) 🟧
-│   │   └── Saves JSON war data file to data/temp/
-│   ├── CACHE.get_temp_war_stats(clan_tag) 🟧
-│   ├── CACHE.set_temp_war_stats(clan_tag, stats) 🟧
+│   ├── CoC API calls: 2 per clan_tag — ALWAYS get_clan() (CACHE.coc_clan_cache.get_clan()) + ALWAYS get_current_war() (CACHE.get_current_war_from_api())
+│   ├── CACHE.save_war_object(clan_tag, war) 🟧 — saves JSON war data file to data/temp/
+│   ├── CACHE.get_temp_war_stats(clan_tag) 🟧 / CACHE.set_temp_war_stats(clan_tag, stats) 🟧
 │   ├── QBwarsim.calculate_win_probability()
 │   └── CACHE updates (clan_name_cache, war object)
 ├── manage_war_files() - synchronous war file lifecycle management
-│   ├── Scans data/temp/ for all war files
-│   ├── Identifies current war for this clan (newest file + opponent match + active state)
+│   ├── Scans data/temp/ for all war files; identifies current war (newest file + opponent match + active state)
 │   ├── Processes old/stale wars: validate → check history → finalize → archive
 │   ├── Deletes duplicate temp file when archive exists and JSON is identical
-│   ├── Result: data/temp/ cleaned, completed wars in archive/
-│   └── Returns: None (side-effect driven)
-├── process_orphaned_cwl_wars() - separate async processing of orphaned CWL wars
-│   ├── Identify orphaned wars: files with state != "war_ended" not newest in clan
-│   ├── Group by clan_tag to determine which war is current
-│   ├── For each orphaned war:
-│   │   ├── Fetch final state via get_league_war(war_tag) [CoC API call]
-│   │   ├── Update JSON file with final data
-│   │   └── Trigger manage_war_files() to finalize updated wars
-│   ├── Result: Updated orphaned CWL wars are finalized and archived (if API fetch succeeds)
+│   └── Result: data/temp/ cleaned, completed wars in archive/ (side-effect driven, returns None)
+├── process_orphaned_cwl_wars() — see Main Flows § Regular Update Cycle (Phase 2) for the overall flow; detail not covered there:
+│   ├── Identifies orphaned wars: files with state != "war_ended" not newest in clan
+│   ├── Groups by clan_tag to determine which war is current
 │   └── Runs AFTER Phase 1 completes (separate async phase)
-├── _process_war_history() - consolidated finalization logic (nested function)
-│   ├── Load war data from JSON file
-│   ├── Check if war already in history
-│   ├── Update history with late attacks if present
+├── _process_war_history() - consolidated finalization logic (module-level function)
+│   ├── Load war data from JSON → check if already in history → update with late attacks if present
 │   ├── Append to history if new war (based on war type)
-│   ├── Move JSON to archive after processing
-│   └── Invalidate history cache
+│   └── Move JSON to archive after processing; invalidate history cache
 ├── generate_message_key()
-├── calculate_leaderboard()
-│   ├── _load_history_filtered()
-│   │   └── CACHE.load_clan_history(clan_tag) 🟧
-│   │       └── db_manager.get_clan_history() (SQLite)
-│   ├── _merge_entries()
-│   │   └── Player name change handling via PlayerID
-│   └── CACHE.load_temp_war_stats(clan_tag) 🟧
-│       └── _load_war_data_from_json() 🟫
-├── normalize_leaderboard_text()
-│   └── Content normalization for change detection
-├── _merge_entries()
-│   └── Player name change handling via PlayerID
-├── _load_history_filtered()
-│   └── CACHE.load_clan_history(clan_tag) 🟧
-│       └── db_manager.get_clan_history() (SQLite)
 ├── _normalize_api_datetime()
 ├── _build_war_id_from_dt()
 ├── _current_war_temp_csv()
 ├── get_effective_leaderboard_month_year()
-└── _split_and_post_leaderboard_helper()
+└── _split_and_post_leaderboard_helper() — see Main Flows § War Info Text Sentinel Pattern
     └── Discord message splitting for long leaderboards
 
 🟧 qapbot/coc_cache.py
@@ -935,16 +844,14 @@ _split_and_post_leaderboard_helper()
 │   │   └── Saves JSON war data to data/temp/
 │   ├── load_temp_war_stats(clan_tag)
 │   │   └── _load_war_data_from_json() 🟫
-│   ├── load_clan_history(clan_tag)
-│   │   └── db_manager.get_clan_history() (from SQLite)
+│   ├── get_clan_history(clan_tag)
+│   │   └── db_manager.get_clan_attack_history_sync() (from SQLite)
 │   └── cleanup_stale_message_ids()
 └── CACHE (global instance)
 
 🟪 QBdiscordcmds.py
 ├── Discord command handlers (functions)
-│   ├── /leaderboard
-│   │   ├── generate_leaderboard_text() 🟩
-│   │   └── post_leaderboard_to_discord() 🟩
+│   ├── /leaderboard — full call graph in Main Flows § Discord Bot Commands
 │   ├── /subscribe / /unsubscribe
 │   ├── /removeclan
 │   ├── /admin (multiple actions)
@@ -961,8 +868,15 @@ _split_and_post_leaderboard_helper()
 │   │   ├── REFRESH_DATA          — force refresh all clan CoC API data across all
 │   │   │   guilds (subscribed + families + member_clans); bot admin only;
 │   │   │   invalidates coc_clan_cache for every tag then parallel-fetches all
+│   │   ├── RETRIEVE_CWL          — backfill CWL history for a clan (bot admin)
+│   │   ├── BACKFILL_CWL_GROUPS   — fetch CWL league groups for clans with <7 rounds
+│   │   │                           in war_summary for a season (bot admin)
+│   │   ├── WAR_PREDICT           — predict outcome between two clans via
+│   │   │                           predict_war_between_clans() (bot admin)
 │   │   ├── START_UPDATE_CYCLE    — interrupt sleep and start next update cycle immediately
 │   │   │                           (bot admin); queues cycle if one is already running
+│   │   ├── OPTIMIZE_DB           — run nightly maintenance (archive move + DB
+│   │   │                           ANALYZE/REINDEX/VACUUM) immediately (bot admin)
 │   │   ├── MEMORY_PROFILE        — dump memory allocation stats to log file (bot admin)
 │   │   ├── MAINTENANCE_START     — suspend updates and close DB for safe data access
 │   │   └── MAINTENANCE_END       — restart bot and resume normal operation
@@ -976,8 +890,6 @@ _split_and_post_leaderboard_helper()
 🟫 QBcsvhandling.py
 ├── _load_war_data_from_json()
 │   └── Loads war stats from JSON files in data/temp/ (private)
-├── _get_clan_history_csv_filename()
-│   └── Returns path to history CSV file (legacy, unused)
 └── Note: CSV history functions deprecated, war history stored in SQLite database
 
 🟫 qapbot/config.py
@@ -1021,7 +933,7 @@ _split_and_post_leaderboard_helper()
 
 🟫 qapbot/discord_health.py
 ├── discord_retry()
-├── get_stats() (returns retry statistics)
+├── get_simple_discord_stats() (returns retry statistics)
 
 🟫 qapbot/coc_health.py
 ├── coc_retry()                    # main wrapper — routes all CoC API exceptions
@@ -1035,7 +947,10 @@ _split_and_post_leaderboard_helper()
 
 - data/qapbot.db - SQLite database (WAL mode) - PRIMARY data store for all persistent data
   * War history, user accounts, subscriptions, clan families, server config, notification state, leaderboard messages, clan name cache, CWL round tracking
-  * All tables (17): war_attacks, war_summary, clans, clan_families, clan_family_members, users, user_players, guild_config, guild_member_families, guild_member_clans, subscriptions, notification_state, channel_notification_state, leaderboard_messages, cwl_league_groups, cwl_league_rounds
+  * data/qapbot_history.db is ATTACHed to the same connection as schema `history`; the 4
+    time-series tables (war_attacks, war_summary, cwl_league_groups, cwl_league_rounds) are
+    mirrored there as part of the hot/history DB split
+  * All tables (22): war_attacks, war_summary, clans, clan_families, clan_family_members, users, user_players, user_buddies, guild_config, guild_member_families, guild_member_clans, guild_welcome_families, guild_welcome_clans, guild_clan_roles, subscriptions, notification_state, channel_notification_state, leaderboard_messages, cwl_league_groups, cwl_league_rounds, player_name_index, bot_metadata
 - data/logs/ - Rotating log files (daily)
 - data/temp/ - JSON war data files for active wars (format: {CLAN_TAG}_{OPPONENT_TAG}_{YYYYMMDDHHMM}_war_data.json)
   * Managed by unified war file lifecycle (manage_war_files)

@@ -3066,8 +3066,34 @@ class CacheManager:
 
             # Populate league_rank going forward (only writes when column is NULL).
             # Try raw_data first, then fall back to clan_name_cache for any group clan.
+            #
+            # Both sources describe a clan's *current* league, not "the league this
+            # group played at this season" — those two are only guaranteed to be the
+            # same thing while the season is still active. Once the season has ended
+            # in-game (state == "warEnded"), promotions/demotions are applied almost
+            # immediately, and every clan in the group can diverge to a *different*
+            # current league (some promoted, some demoted, some unchanged) — so ANY
+            # single clan picked as "the representative" can just as easily be wrong
+            # as right. This bit QapBot in production: a group's league_rank got
+            # written from a demoted member's post-CWL league ("Crystal League I")
+            # even though the group (and the clan the standings were rendered for)
+            # had actually played that season in "Master League III" — confirmed
+            # against the in-game war log (see changelog.txt 2026-07-26).
+            #
+            # Our own cwl_ended DB column is not a safe proxy for "season over" either:
+            # it only flips once update_cwl_group_stats_batch observes every clan's
+            # expected war count in war_summary, which can lag well behind the
+            # real-world end of the season (e.g. a delayed/missing war_summary row).
+            # The league group's own live API `.state` is authoritative and immediate,
+            # so every source below is gated on it: while still "preparation"/"inWar"
+            # a clan's current league IS this season's league and both sources are
+            # safe to trust; once "warEnded" (or anything else), skip both entirely
+            # and leave league_rank unset rather than lock in a wrong value.
+            _lg_state = str(getattr(lg, "state", "") or "").lower()
+            _season_over = _lg_state not in ("preparation", "inwar", "in_war")
+
             _league_rank: str = ""
-            if _raw_data and isinstance(_raw_data, dict):
+            if not _season_over and _raw_data and isinstance(_raw_data, dict):
                 _raw_data_d: Dict[str, Any] = cast(Dict[str, Any], _raw_data)
                 _clans_raw = cast(List[Any], _raw_data_d.get("clans") or [])
                 for _cr in _clans_raw:
@@ -3078,7 +3104,16 @@ class CacheManager:
                     if _wl_name:
                         _league_rank = _wl_name
                         break
-            if not _league_rank:
+
+            if not _league_rank and _season_over:
+                logging.info(
+                    f"[CWL-ROUNDS] group {_group_id} season={cwl_season}: "
+                    f"league_rank still unknown but league group state='{_lg_state}' "
+                    "(season already ended) — skipping clan_name_cache fallback to "
+                    "avoid recording a post-promotion league as historical data"
+                )
+
+            if not _league_rank and not _season_over:
                 # Fallback: clan_name_cache — but only trust fresh entries.
                 # A clan that is CWL-only / passive may have last been fetched
                 # before last month's promotion/demotion, making its cached

@@ -2,7 +2,9 @@
 
 **Status**: Implemented  
 **Created**: 2026-02-17  
-**Last updated**: 2026-02-18  
+**Last updated**: 2026-07-26 (accuracy audit, then redundancy pass merging the "how to run
+tests" content that was duplicated across §7/§14/old-§15 into one canonical §7; old §15
+"Convenience Scripts" was folded into §7 and removed, so §16 "Key Risks" is now §15)  
 **Audience**: Developer(s), CI/CD pipeline
 
 ---
@@ -38,37 +40,41 @@ Note: `pytest`, `pytest-asyncio`, and `pytest-cov` are already included in `requ
 ```
 tests/
 ├── conftest.py              # Shared fixtures (CACHE mock, in-memory DB, fake war data)
+├── builders.py              # Programmatic test-data builders (see section 11)
 ├── fixtures/                # Static test data files
-│   ├── war_data_sample.json
-│   ├── cwl_war_sample.json
-│   └── translations_test.json
+│   └── war_data_sample.json
 ├── smoke_live/               # Live DEV smoke (network + real Discord; CoC optional) — runs only with -m live
 │   ├── test_live_leaderboard.py
 │   ├── test_live_status_and_admin_checks.py
-│   └── test_live_message_assertions.py
+│   ├── test_live_message_assertions.py
+│   └── _review.py           # shared review/approval helper, not a test module
 ├── unit/                    # Pure logic, no I/O — runs in smoke + full
 │   ├── test_formatting.py
 │   ├── test_warsim.py
 │   ├── test_constants.py
 │   ├── test_exceptions.py
 │   ├── test_i18n.py
-│   ├── test_config.py
 │   ├── test_helpers_pure.py
-│   └── test_csv_handling.py
+│   ├── test_csv_handling.py
+│   └── ... (50+ more files; the suite has grown far beyond this original tier design)
 ├── integration/             # Real DB, mocked APIs — runs in full only
 │   ├── test_db_manager.py
 │   ├── test_cache_manager.py
 │   ├── test_coc_cache.py
-│   └── test_account_protection.py
+│   ├── test_account_protection.py
+│   └── ... (test_coc_cache_failures.py, test_db_manager_extended.py, test_guild_roles.py)
 ├── discord/                 # Mocked Discord interactions — runs in full only
 │   ├── test_commands.py
 │   ├── test_ui_registration.py
-│   ├── test_ui_notifications.py
-│   ├── test_ui_clan_management.py
-│   └── test_discord_helper.py
-└── e2e/                     # Optional: live bot on test server (manual trigger only)
-    └── test_bot_lifecycle.py
+│   ├── test_discord_helper.py
+│   └── ... (10+ more phase-specific files, e.g. test_ui_notifications_phase*.py, test_ui_clan_management_phase4.py)
+└── e2e/                     # Not yet created. Marker exists in pyproject.toml; tier remains deferred (see section 8).
 ```
+
+Note: the file lists above are illustrative of the original tier design (2026-02-17/18 session). The
+suite has grown substantially since — as of this audit, `tests/unit/` alone has 50+ files. Only the two
+`fixtures/` files originally planned (`cwl_war_sample.json`, `translations_test.json`) were never created;
+`war_data_sample.json` is the only fixture file that exists.
 
 ---
 
@@ -90,11 +96,21 @@ markers = [
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
+    # aiosqlite worker thread delivers a callback to an already-closed per-test
+    # event loop under asyncio_mode="auto"; known benign race, suppressed.
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning",
 ]
 
 [tool.coverage.run]
-source = ["qapbot", "QBhelperfunctions", "QBwarsim", "QBcsvhandling"]
-omit = ["tests/*", "qapbot/scripts/*"]
+source = ["."]
+omit = [
+    "tests/*",
+    "qapbot/scripts/*",
+    # UI-heavy / bot-lifecycle files: ~90% Discord wiring, not unit-testable
+    "qapbot/ui_clan_management.py",
+    "QBdiscordcmds.py",
+    "QapBot.py",
+]
 
 [tool.coverage.report]
 fail_under = 70
@@ -106,6 +122,13 @@ show_missing = true
 ## 5. Fixture Strategy
 
 ### 5.1 conftest.py — Core Fixtures
+
+**Note — planned vs. actual**: the code block below is the original fixture design from this
+concept's first session. The real `tests/conftest.py` today only implements `sample_war_data()`
+and `mock_interaction()` as shared fixtures (plus `review_timeout_seconds`, `fixtures_dir`, and
+the `--review-timeout-seconds` CLI option). The `db()`, `mock_cache()`, and `mock_coc_client()`
+fixtures shown below were never added as shared fixtures — individual test modules construct
+their own local `WarHistoryDB(":memory:")` instances and CACHE/coc-client mocks inline instead.
 
 ```python
 """Shared fixtures for all QapBot tests."""
@@ -430,69 +453,34 @@ This tier is deferred until the other tiers are stable. It requires:
 
 ## 7. Running Tests — Command Reference
 
-### Smoke Test (during development)
+**Canonical local invocation**: always run tests via `.\run_tests.ps1` (repo root, PowerShell)
+rather than constructing a raw `pytest` command. No `run_tests_smoke.bat` / `run_tests_full.bat`
+ever existed — this script is the only convenience wrapper. It resolves `venv\Scripts\python.exe`
+automatically (falling back to `python` on PATH), always runs with `-x -q --tb=short`, and applies
+the repo's canonical `--deselect` list (known-broken/irrelevant tests) before any extra args.
+Defaults to `-m "not live"`.
 
-```bash
-pytest -m smoke -x -q --tb=short
-```
-- `-m smoke` — offline unit smoke only (no Discord/CoC)
-- `-x` — stop on first failure (fail-fast for iteration speed)
-- `-q` — quiet output
-- **Expected time**: < 30 seconds
-
-Run the live DEV portion explicitly:
-
-```bash
-pytest -m live -x -q --tb=short
-```
-
-Optional developer feedback (without editing `.env`):
-
-```bash
-pytest -m live -x -q --tb=short --review-timeout-seconds 20
+```powershell
+.\run_tests.ps1              # fast local tests only (skips @pytest.mark.live) — < 30 sec
+.\run_tests.ps1 -Full        # all tests including live DEV Discord smoke
+.\run_tests.ps1 -k my_test   # pass extra pytest filters through (still skips live)
+.\run_tests.ps1 -Full -k foo # full run with an additional filter
+.\run_tests.ps1 -Full --cov --cov-report=term-missing  # full run + coverage report
 ```
 
-Note: `/admin` live smoke coverage is part of the normal `live` marker run (no separate flag).
+The raw `pytest -m ...` invocations below describe the marker-based tiers conceptually, and are
+what CI runs directly on Linux (see § 9), where the wrapper doesn't apply. For local Windows
+development, use `run_tests.ps1` with the equivalent marker/filter instead of typing these by hand.
 
-Run both suites in one go (unit smoke + live DEV smoke):
-
-```bash
-pytest -m "smoke or live" -x -q --tb=short
-```
-
-Note: `-m "smoke and live"` selects only tests that have BOTH markers. In this concept, `smoke` and `live` are intentionally disjoint (offline vs. Discord-posting), so the intersection is empty.
-
-### Full Regression Test (before prod deployment)
-
-Offline full regression (recommended for pre-commit / pre-PR):
-
-```bash
-pytest -m "smoke or integration or discord" --tb=short --cov --cov-report=term-missing
-```
-- Runs the full offline suite (unit + integration + mocked Discord)
-- Generates coverage report
-
-If you explicitly want to include DEV live smoke in the same run:
-
-```bash
-pytest -m "smoke or integration or discord or live" --tb=short --review-timeout-seconds 0
-```
-
-Note: Some Discord workflows require human interaction (Views/Modals). Those are covered by `e2e` manual runs and/or targeted manual checklists.
-
-### Specific Module
-
-```bash
-pytest tests/unit/test_warsim.py -v
-pytest tests/integration/test_db_manager.py -v
-```
-
-### Coverage Only
-
-```bash
-pytest --cov --cov-report=html
-# Open htmlcov/index.html in browser
-```
+| Intent | Marker expression | Notes |
+|---|---|---|
+| Offline unit smoke only | `-m smoke` | No Discord/CoC. Expected time < 30s. |
+| Live DEV smoke only | `-m live` | Add `--review-timeout-seconds 20` for an optional manual ✅/❌ review pause. `/admin` live coverage is part of this marker, no separate flag. |
+| Unit smoke + live DEV smoke | `-m "smoke or live"` | `-m "smoke and live"` would select the *intersection*, which is empty — `smoke` and `live` are intentionally disjoint (offline vs. Discord-posting). |
+| Full offline regression (unit + integration + mocked Discord) | `-m "smoke or integration or discord"` | Recommended pre-commit/pre-PR; add `--cov --cov-report=term-missing` for coverage. |
+| Full regression + live DEV smoke | `-m "smoke or integration or discord or live"` | Add `--review-timeout-seconds 0` to skip the manual pause. Interaction-heavy Views/Modals still need `e2e` manual runs or a targeted manual checklist. |
+| One module | `pytest tests/unit/test_warsim.py -v` | Bypasses markers entirely. |
+| Coverage report only | `pytest --cov --cov-report=html` | Open `htmlcov/index.html`. |
 
 ---
 
@@ -659,17 +647,17 @@ def make_player(tag="#P1", name="Player1", th=15, verified=False, clan_tag=None)
 │  Development Cycle                                       │
 │                                                         │
 │  1. Make code change                                    │
-│  2. Run: pytest -m smoke -x -q           (< 30 sec)    │
+│  2. Run: .\run_tests.ps1                 (< 30 sec)    │
 │     → GREEN? Continue coding                            │
 │     → RED? Fix immediately                              │
 │                                                         │
 │  Pre-Deployment                                         │
 │                                                         │
-│  3. Run: pytest -m "smoke or integration or discord" --cov --cov-report=term  (< 5 min)     │
+│  3. Run: .\run_tests.ps1 -Full --cov --cov-report=term  (< 5 min)                           │
 │     → All GREEN + coverage ≥ 70%? Deploy               │
 │     → RED or coverage drop? Investigate                 │
 │                                                         │
-│  CI (automatic on push/PR)                              │
+│  CI (manual trigger only — workflow_dispatch)           │
 │                                                         │
 │  4. Smoke job runs first (fail-fast)                    │
 │  5. Full job runs if smoke passes                       │
@@ -679,25 +667,7 @@ def make_player(tag="#P1", name="Player1", th=15, verified=False, clan_tag=None)
 
 ---
 
-## 15. Convenience Scripts
-
-### Windows Batch (`run_tests_smoke.bat`)
-```batch
-@echo off
-call venv\Scripts\activate
-pytest -m smoke -x -q --tb=short
-```
-
-### Windows Batch (`run_tests_full.bat`)
-```batch
-@echo off
-call venv\Scripts\activate
-pytest -m "smoke or integration or discord" --tb=short --cov --cov-report=term-missing
-```
-
----
-
-## 16. Key Risks and Mitigations
+## 15. Key Risks and Mitigations
 
 | Risk | Mitigation |
 |------|-----------|
