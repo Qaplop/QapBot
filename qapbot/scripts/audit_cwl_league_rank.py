@@ -16,6 +16,15 @@ Root cause (see changelog.txt 2026-07-26 and DATABASE_ARCHITECTURE.md):
     The code bug is already fixed going forward. This script helps find rows
     that were corrupted *before* that fix landed, and applies corrections.
 
+    As of 2026-07-26, a permanent self-heal also runs automatically inside the
+    live bot (QBhelperfunctions._cwl_self_heal_league_rank, wired into
+    update_cwl_group_stats) — it re-checks a frozen group's league_rank every
+    time its standings are served, using the same "safe rank" reasoning as this
+    script's `reconstruct` command below. This script is still useful for (a) a
+    one-time bulk repair right after deploying that fix (the self-heal only
+    fires on-demand, one group at a time, as users query it) and (b) manual
+    investigation (`report`, `fix`).
+
 IMPORTANT — there is no reliable automatic detector for this:
     An earlier version of this script tried to predict each clan's expected
     league from its group_rank and a hardcoded promotion/demotion-count table

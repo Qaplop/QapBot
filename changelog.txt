@@ -1,6 +1,36 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-26 (13)
+- Added: permanent self-heal for cwl_league_groups.league_rank, closing the gap the (7)/(11)/
+  (12) fixes and one-time repair left open — a frozen (cwl_ended=1) row's league_rank was never
+  re-examined again, so any row corrupted before the write-time fixes landed would stay wrong
+  forever without the manual `reconstruct` script.
+  `QBhelperfunctions._cwl_self_heal_league_rank(rows, cwl_season, recorded_league, now=None)`
+  (new): reuses the same league-independent "safe middle rank" reasoning validated in (12)'s
+  `reconstruct` command — a clan ranked outside the top-3/bottom-2 band of its group (no
+  promotion/demotion rule version seen in _CWL_PROMO_RULES_* moves anyone further) is
+  guaranteed to have stayed in the same league the following season. If such a clan's current
+  live league in clan_name_cache disagrees with the group's frozen league_rank, and the cache
+  entry was refreshed within a bounded window after the season ended (roughly day 12 of the
+  season's month through day 12 of the *next* month — past that, "current" league may already
+  reflect a LATER season, not this one), the frozen value is corrected. In-memory only, no API
+  or extra DB calls beyond the one write when a correction actually fires.
+  Wired into `update_cwl_group_stats`'s existing `cwl_ended=1` short-circuit (QBhelperfunctions.py)
+  — runs every time an ended group's standings are served (i.e. every /leaderboard cwlinfo /
+  cwlgroup render), which is also the only point league_rank is ever shown to a user.
+  `db_manager.update_cwl_league_rank` gained a `force: bool = False` parameter — the self-heal
+  calls it with `force=True` to bypass the `cwl_ended` freeze guard for this one, already-
+  verified corrective path; the original derivation path (_process_league_group_response) is
+  unaffected and still frozen by the guard as before.
+  Added `tests/unit/test_cwl_league_rank_self_heal.py` (11 tests): the pure self-heal function's
+  window/band/disagreement/staleness logic, plus its wiring into update_cwl_group_stats
+  (correction persisted with force=True; no-op leaves league_rank untouched).
+  Tests: 1420 passed, 5 deselected. pyright: 0 errors on all 4 changed/added files.
+  Files changed: QBhelperfunctions.py (_cwl_self_heal_league_rank, update_cwl_group_stats),
+  qapbot/db_manager.py (update_cwl_league_rank), tests/unit/test_cwl_league_rank_self_heal.py
+  (new), qapbot/docs/DATABASE_ARCHITECTURE.md.
+
 2026-07-26 (12)
 - Added: `reconstruct` subcommand to `qapbot/scripts/audit_cwl_league_rank.py` — bulk repair
   for cwl_league_groups.league_rank across a whole CWL season, without the ~200,000 live API

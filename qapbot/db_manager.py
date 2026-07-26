@@ -4280,7 +4280,7 @@ class WarHistoryDB:
         return [row["clan_tag"] for row in rows]
 
     async def update_cwl_league_rank(
-        self, cwl_season: str, group_id: str, league_rank: str
+        self, cwl_season: str, group_id: str, league_rank: str, *, force: bool = False
     ) -> None:
         """Set league_rank for all clans in a group.
 
@@ -4291,16 +4291,27 @@ class WarHistoryDB:
         promotion/demotion) from overwriting the historically-correct value.
 
         Called from _process_league_group_response when the league name is known.
+
+        force=True bypasses the freeze entirely. Used only by the deliberate,
+        already-verified self-heal cross-check in
+        QBhelperfunctions._cwl_self_heal_league_rank / update_cwl_group_stats —
+        never by the original derivation path this guard was built to constrain.
         """
         await self._ensure_connection()
         await self._write_lock.acquire()
         try:
-            await self._conn.execute(
-                "UPDATE cwl_league_groups SET league_rank = ? "
-                "WHERE league_group_id = ? AND cwl_season = ? "
-                "AND (league_rank IS NULL OR cwl_ended = 0)",
-                (league_rank, group_id, cwl_season),
-            )
+            if force:
+                sql = (
+                    "UPDATE cwl_league_groups SET league_rank = ? "
+                    "WHERE league_group_id = ? AND cwl_season = ?"
+                )
+            else:
+                sql = (
+                    "UPDATE cwl_league_groups SET league_rank = ? "
+                    "WHERE league_group_id = ? AND cwl_season = ? "
+                    "AND (league_rank IS NULL OR cwl_ended = 0)"
+                )
+            await self._conn.execute(sql, (league_rank, group_id, cwl_season))
             await self._conn.commit()
         finally:
             self._write_lock.release()

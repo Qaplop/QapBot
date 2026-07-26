@@ -557,6 +557,21 @@ re-check) rather than trusting them long-term.
   in "Master League III". Fix: gate **both** sources (not just the cache fallback) on the
   league group's live `.state`; the `raw_data` path previously ran unconditionally regardless
   of season state.
+  **Bulk repair + permanent self-heal**: the write-time fixes above don't repair rows already
+  corrupted before they landed, and a frozen (`cwl_ended=1`) row's `league_rank` was never
+  re-examined afterwards. Two additions close that: (1) `qapbot/scripts/audit_cwl_league_rank.py
+  reconstruct` — a one-time, mostly-zero-API-call bulk repair per season (see the script's
+  docstring); ran against season 2026-07, corrected 7,404 of 26,467 groups. (2)
+  `QBhelperfunctions._cwl_self_heal_league_rank`, wired into `update_cwl_group_stats`'s
+  `cwl_ended=1` short-circuit — every time an ended group's standings are served, it
+  cross-checks the frozen `league_rank` against the current live league of any group member
+  ranked outside the top-3/bottom-2 band (a rank no promotion/demotion rule version can move),
+  using `clan_name_cache` only (no API calls). Only trusted within a bounded window after the
+  season ends (until roughly when the *next* season's own promotions would apply — past that,
+  "current league" may reflect a later season, not this one). Corrections bypass the freeze via
+  `db_manager.update_cwl_league_rank(..., force=True)` — a new parameter that drops the
+  `cwl_ended` guard specifically for this already-verified corrective path, never for the
+  original derivation path the guard was built to constrain.
 
 ### 2026-04-07: Index Cleanup + Partial Index (Complete ✅)
 - Dropped 5 legacy duplicate indexes (exact duplicates of idx_wa_*/idx_ws_* indexes added earlier):

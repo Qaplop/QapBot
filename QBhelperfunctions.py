@@ -2422,6 +2422,100 @@ def _get_cwl_promo_rules(season: str, league_name: str) -> Tuple[int, int]:
     return rules.get(league_name, (2, 2))
 
 
+# ── CWL league_rank self-heal ──────────────────────────────────────────────────
+#
+# Background: cwl_league_groups.league_rank was, before the 2026-07-26 fixes to
+# _process_league_group_response (see changelog.txt), sometimes written wrong and
+# then frozen once cwl_ended=1 — a clan's *current* league got recorded for a
+# group instead of the league it actually played that season. The write-time bug
+# is fixed, but a group's *existing* frozen value is never re-examined once
+# cwl_ended=1 (see the short-circuit in update_cwl_group_stats below), so any row
+# corrupted before the fix stays wrong forever unless something re-checks it.
+#
+# This performs that re-check every time an ended group's standings are served
+# (cheap — in-memory clan_name_cache only, no API/DB calls), using the same
+# league-independent "safe middle rank" reasoning validated in
+# qapbot/scripts/audit_cwl_league_rank.py's `reconstruct` command: no version of
+# the promotion/demotion rules below moves a clan more than 3 ranks up or 2 down,
+# so a clan ranked outside that band is guaranteed to have stayed in the same
+# league the following season. If that clan's CURRENT live league (in
+# clan_name_cache) disagrees with the group's frozen league_rank — and the cache
+# entry was refreshed within the window where "current" still means "this
+# season's outcome" — the frozen value is corrected.
+_CWL_SAFE_RANK_MAX_PROMOTED = 3
+_CWL_SAFE_RANK_MAX_DEMOTED = 2
+
+
+def _cwl_self_heal_league_rank(
+    rows: List[Dict[str, Any]],
+    cwl_season: str,
+    recorded_league: str,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """Return a corrected league_rank for an ended CWL group, or None if there's
+    nothing to correct (already right, or not enough/ambiguous evidence).
+
+    *rows* are the group's DB rows (each with clan_tag + group_rank). *now*
+    defaults to the real current time; a caller-supplied value is only for tests.
+    """
+    if len(cwl_season) != 7:
+        return None  # bonus mid-month CWL — group_rank/league semantics differ, skip
+
+    try:
+        season_start = datetime.strptime(cwl_season, "%Y-%m").replace(tzinfo=_tz.utc)
+    except ValueError:
+        return None
+
+    # Promotions/demotions apply within roughly a week or two of the season's own
+    # wars ending (~day 9); this margin gives that a buffer. The window closes
+    # once the FOLLOWING season's own promotions would plausibly have applied —
+    # past that point clans.war_league may reflect a LATER season, not this one.
+    _MARGIN_DAYS = 11
+    window_start = season_start + timedelta(days=_MARGIN_DAYS)
+    _next_month = season_start.month + 1
+    _next_year = season_start.year
+    if _next_month > 12:
+        _next_month = 1
+        _next_year += 1
+    window_end = season_start.replace(year=_next_year, month=_next_month) + timedelta(days=_MARGIN_DAYS)
+
+    now = now or datetime.now(_tz.utc)
+    if now < window_start or now >= window_end:
+        return None  # too early or too late to trust current league for this season
+
+    n = len(rows)
+    lo, hi = _CWL_SAFE_RANK_MAX_PROMOTED + 1, n - _CWL_SAFE_RANK_MAX_DEMOTED
+    if lo > hi:
+        return None  # group too small for any rank to be unambiguously safe
+
+    candidates: Dict[str, List[str]] = {}
+    for row in rows:
+        rank = row.get("group_rank")
+        if rank is None or not (lo <= rank <= hi):
+            continue
+        entry = CACHE.clan_name_cache.get(row.get("clan_tag", ""))
+        if not isinstance(entry, dict):
+            continue
+        wl = entry.get("war_league")
+        last_checked = entry.get("last_checked_via_api")
+        if not wl or not last_checked:
+            continue
+        try:
+            lc_dt = datetime.fromisoformat(last_checked)
+            if lc_dt.tzinfo is None:
+                lc_dt = lc_dt.replace(tzinfo=_tz.utc)
+        except (ValueError, TypeError):
+            continue
+        if lc_dt >= window_start:
+            candidates.setdefault(wl, []).append(row["clan_tag"])
+
+    if len(candidates) != 1:
+        return None  # no fresh safe-rank evidence, or disagreement — don't guess
+
+    reconstructed = next(iter(candidates))
+    return reconstructed if reconstructed != recorded_league else None
+
+
 # ── CWL medal rewards (versioned by season) ────────────────────────────────────
 #
 # Each league entry maps to:
@@ -2544,6 +2638,17 @@ async def update_cwl_group_stats(
     if group_info["cwl_ended"]:
         rows = group_info["rows"]
         if all(r.get("total_stars") is not None for r in rows):
+            healed = _cwl_self_heal_league_rank(rows, cwl_season, league_rank)
+            if healed is not None:
+                logging.info(
+                    f"[CWL-GROUP-STATS] Self-heal: group {group_id} / {cwl_season} "
+                    f"league_rank corrected {league_rank!r} -> {healed!r} "
+                    "(safe-rank cross-check against a fresh, unambiguous group member)"
+                )
+                await db.update_cwl_league_rank(cwl_season, group_id, healed, force=True)
+                league_rank = healed
+                for r in rows:
+                    r["league_rank"] = healed
             result = _build_standings_result(rows, clan_tags, league_rank)
             _cwl_group_stats_cache[_cache_key] = (_time.monotonic(), result)
             return result
