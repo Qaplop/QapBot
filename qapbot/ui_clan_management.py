@@ -863,7 +863,21 @@ class ClanManagementView(discord.ui.View):
         try:
             # For modes that don't need clan_tag (config, roles, families), use first guild clan or empty string
             logging.debug(f"self.clan_tag={self.clan_tag}, self.guild_clans={self.guild_clans}, len={len(self.guild_clans) if self.guild_clans else 0}")
-            clan_tag_to_use = self.clan_tag if self.clan_tag else (self.guild_clans[0] if self.guild_clans else "")
+            clan_dropdown_modes = ("registrations", "notifications")
+            if selected_mode in clan_dropdown_modes and self.mode not in clan_dropdown_modes:
+                # Entering a clan-scoped screen from one that had no clan selector
+                # (config/roles/families): default to the alphabetically-first clan
+                # instead of carrying over the previous mode's clan_tag (e.g. the
+                # "most active clan" default), which would otherwise appear as an
+                # arbitrary pre-selection in the alphabetically-sorted dropdown.
+                from qapbot.cache_manager import CACHE
+                sorted_clan_tags = sorted(
+                    self.guild_clans,
+                    key=lambda tag: (CACHE.get_clan_name(tag, "Unknown") or "Unknown").lower()  # type: ignore[arg-type]
+                )
+                clan_tag_to_use = sorted_clan_tags[0] if sorted_clan_tags else ""
+            else:
+                clan_tag_to_use = self.clan_tag if self.clan_tag else (self.guild_clans[0] if self.guild_clans else "")
             logging.debug(f"clan_tag_to_use={clan_tag_to_use}")
             
             # Ensure we have a guild object

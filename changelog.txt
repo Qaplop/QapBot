@@ -1,6 +1,20 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-26 (16)
+- Fixed: clan-select dropdown in `/clan management`'s War Notifications and Registration
+  Management screens was pre-selecting the wrong clan. Root cause: switching mode carried over
+  `self.clan_tag` unconditionally, which on the very first switch from Basic Configuration (the
+  landing mode, which has no clan dropdown) still held `get_most_active_clan_for_guild`'s pick —
+  an arbitrary clan by subscription count, not related to the dropdown's alphabetical order — so
+  it could land anywhere, including the last option, looking like a stuck/wrong default.
+  Fix: in `ClanManagementView._on_mode_select`, when entering "registrations" or "notifications"
+  from a mode without a clan selector (config/roles/families), recompute the default as the
+  alphabetically-first clan (same sort `_add_clan_select` uses) instead of reusing the carried
+  `clan_tag`. Switching directly between the two clan-scoped screens still preserves whatever
+  clan the user had selected, since that transition skips the reset.
+  Files changed: qapbot/ui_clan_management.py (_on_mode_select).
+
 2026-07-26 (15)
 - Fixed: root-cause fix for the CWL league_rank bug (7)/(11)/(12)/(13)/(14), replacing the
   `.state`-based gate with a correct-by-construction one. Prompted by the project owner asking
