@@ -330,6 +330,12 @@ async def _refresh_groups_live(
     DEV or PROD credentials automatically based on this machine's .env
     (DISCORD_GUILD_ID) — see qapbot/config.py. There is no separate "which
     environment am I on" check here; CONFIG *is* that check.
+
+    Persists each successful fetch's war_league + last_checked_via_api back
+    into the clans table — the same fields the live bot itself keeps fresh via
+    _update_clan_metadata — so a repeat run doesn't pay for the exact same API
+    calls again for data that hasn't changed (clans.last_checked_via_api was
+    exactly why these candidates were "no fresh evidence" in the first place).
     """
     import coc  # type: ignore[import-untyped]
 
@@ -339,6 +345,7 @@ async def _refresh_groups_live(
     await client.login(CONFIG.coc_email, CONFIG.coc_password)
 
     results: Dict[str, str] = {}
+    fetched_clans: Dict[str, str] = {}  # clan_tag -> war_league, for persistence below
     sem = asyncio.Semaphore(concurrency)
     done = 0
 
@@ -352,6 +359,7 @@ async def _refresh_groups_live(
                     wl_name = getattr(wl, "name", None) if wl else None
                     if wl_name:
                         results[gid] = wl_name
+                        fetched_clans[tag] = wl_name
                         break
                 except Exception:
                     continue
@@ -361,6 +369,20 @@ async def _refresh_groups_live(
 
     await asyncio.gather(*[_one(gid, tags) for gid, tags, _rec in candidates])
     await client.close()
+
+    if fetched_clans:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(CONFIG.db_path)
+        try:
+            conn.executemany(
+                "UPDATE clans SET war_league = ?, last_checked_via_api = ? WHERE clan_tag = ?",
+                [(wl, now_iso, tag) for tag, wl in fetched_clans.items()],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        print(f"[API] persisted fresh war_league for {len(fetched_clans)} clan(s) to the clans table.")
+
     return results
 
 
@@ -503,6 +525,8 @@ def reconstruct(
     print(f"Full detail written to {out_path}")
 
     if not would_fix:
+        print("\nNo corrections needed — every group with usable evidence already matches "
+              "its recorded league_rank. Nothing written.")
         return
 
     if not apply:

@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-26 (19)
+- Fixed: `reconstruct --refresh-missing` never persisted what it fetched. `_refresh_groups_live`
+  called get_clan() live for each "no fresh evidence" group's safe-rank candidate but only used
+  the result in-memory for that run's decision — clans.war_league / last_checked_via_api in the
+  DB were never updated. Symptom the project owner hit on prod: running --refresh-missing twice
+  in a row re-fetched the exact same 597 clans live both times (confirmed correct — 0 corrections
+  needed either time, the math checked out exactly: 590 of 597 confirmed already-correct, 7
+  revealed genuine safe-rank disagreement), silently wasting the second run's entire API budget
+  since nothing about those clans could have changed between the two calls seconds apart. Fixed:
+  every successful live fetch now also UPDATEs clans.war_league + last_checked_via_api, so a
+  repeat run (or the live bot's own routine polling) doesn't pay for the same fetch again.
+  Also fixed a separate UX gap this exposed: `reconstruct` returned completely silently when
+  `would_fix` was empty — correct behavior (nothing to write) looked identical to a run doing
+  nothing at all. Added an explicit "No corrections needed" message for that case.
+  Tests: 1425 passed (unchanged). pyright: 0 errors.
+  Files changed: qapbot/scripts/audit_cwl_league_rank.py (_refresh_groups_live persistence,
+  reconstruct's empty-would_fix message).
+
 2026-07-26 (18)
 - Fixed: investigated all 19 of (17)'s "disagreement" Champion League II groups by hand —
   100% cleanly matched the newly-discovered Champion League I (4, 1) pattern (ranks 1-4
