@@ -1,6 +1,27 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-30 (3)
+- Fixed: `/leaderboard` with the new `scope="all"` default took minutes to respond on prod
+  instead of the sub-second DB query expected. Two causes, both fixed:
+  1. `get_player_attack_history_sync()`'s `player_tag IN (...) AND date BETWEEN ...` query only
+     had a single-column `idx_wa_player_tag` index to work with, so SQLite had to rowid-fetch
+     every historical row for each player (across all time) just to filter down to one month.
+     Added composite index `idx_wa_player_tag_date(player_tag, date)` (kept the old single-column
+     index rather than dropping it — DROP INDEX on the ~5.6M-row war_attacks table is nightly-
+     maintenance-only, never safe to run unconditionally at every connection open/startup).
+  2. The real dominant cost: `QBdiscordcmds.leaderboard()` resolved scope="all" rosters by
+     `await`ing `CACHE.coc_clan_cache.get_clan()` one clan at a time in a for-loop. With no
+     clan/family filter (the common case — a channel's full set of subscribed clans/families),
+     a cache miss/expiry means a live CoC API call per clan, sequentially — that's what actually
+     produced the multi-minute delay. Switched to a single `asyncio.gather(...,
+     return_exceptions=True)` batch across every distinct constituent clan (same pattern already
+     used by ui_clan_management.py's guild-clan refresh).
+  Files: qapbot/db_manager.py (composite index ×3 schema sites + major_indexes REINDEX list),
+  QBdiscordcmds.py (parallel roster gather).
+  Docs: qapbot/docs/DATABASE_ARCHITECTURE.md.
+  Tests: 1464 passed (up from 1462; +2 new). pyright: 0 errors.
+
 2026-07-30 (2)
 - Added: `/leaderboard` now auto-highlights the invoking user's own registered player(s) in the
   rendered table — their row is bolded/colored via ANSI escape codes inside a ` ```ansi ` Discord

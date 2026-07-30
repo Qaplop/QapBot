@@ -634,8 +634,8 @@ re-check) rather than trusting them long-term.
 ### 2026-07-30: Leaderboard "scope=all" — Cross-Clan Player History (Complete ✅)
 - New method `get_player_attack_history_sync(player_tags, month, year)`: same aggregation as
   `get_clan_attack_history_sync()` but filtered by `WHERE player_tag IN (...)` instead of
-  `clan_tag = ?`. Uses the existing `idx_wa_player_tag` index — one index seek per player tag,
-  not a full-table scan, so cost scales with roster size, not total history volume.
+  `clan_tag = ?`. Uses `idx_wa_player_tag_date(player_tag, date)` (added 2026-07-30, see below)
+  — one index range scan per player tag scoped to the requested month, not a full-table scan.
 - `WarID` is returned as the composite `"{clan_tag}::{war_id}"`. Reason: `war_id` is only unique
   per `(war_id, clan_tag)` pair — it's derived from the *opponent* tag + date, from that clan's
   own point of view (see `war_id = f"{opponent_tag}_{start_dt_compact}"` in
@@ -657,6 +657,36 @@ re-check) rather than trusting them long-term.
   is only reached from the manual `/leaderboard` command, not the automatic per-subscription
   posting loop, so the extra per-invocation DB round trip is not a concern.
 - 1457 tests passing.
+
+### 2026-07-30: Leaderboard scope="all" Perf Fix — Composite Index + Parallel Roster Fetch (Complete ✅)
+- Reported symptom: `/leaderboard` (scope="all", the new default from the entry above) took
+  *minutes* to respond on prod, not the sub-second DB query expected from an indexed lookup.
+  Root-caused to two separate issues, both fixed:
+  1. **DB query**: `get_player_attack_history_sync()`'s `WHERE player_tag IN (...) AND date
+     BETWEEN ...` only had `idx_wa_player_tag(player_tag)` to work with — a single-column index.
+     SQLite narrowed to the right player_tag via the index, but then had to rowid-fetch *every*
+     row that player ever has in `war_attacks`, across all time, just to discard everything
+     outside the requested month. For a long-tenured player with a large history, multiplied by
+     every player_tag in a family's roster, that's a lot of avoidable I/O.
+     Fix: added composite index `idx_wa_player_tag_date(player_tag, date)` to both the main and
+     history `war_attacks` schemas (`_create_history_schema_sync`, both `initialize()` blocks).
+     The old single-column `idx_wa_player_tag` is deliberately **kept, not dropped** — `war_attacks`
+     has ~5.6M rows, and `DROP INDEX` on a table that size is slow enough that it belongs in
+     nightly maintenance, not something to run unconditionally on every connection open/startup
+     the way `CREATE INDEX IF NOT EXISTS` safely can. Added `idx_wa_player_tag_date` to
+     `major_indexes` in `run_nightly_maintenance_routine()`'s REINDEX list.
+  2. **Roster fetch (the dominant cost in practice)**: `QBdiscordcmds.leaderboard()`'s scope="all"
+     roster resolution awaited `CACHE.coc_clan_cache.get_clan()` **one clan at a time in a plain
+     for-loop**. A cache miss/expiry there is a live CoC API call — with no clan/family filter
+     given (the common case: a channel's full set of subscribed clans/families), that's a
+     sequential chain of live API calls, one per constituent clan, which is exactly what turned
+     into minutes. Fixed by deduplicating every distinct constituent clan across all requested
+     tags up front and fetching them all in a single `asyncio.gather(..., return_exceptions=True)`
+     batch — the same pattern already used by `ui_clan_management.py`'s guild-clan refresh.
+  Files: qapbot/db_manager.py (composite index ×3 creation sites + major_indexes),
+  QBdiscordcmds.py (parallel roster gather).
+  Tests: 1464 passed (up from 1462; +2 new tests — composite index exists + is chosen by the
+  query planner via EXPLAIN QUERY PLAN). pyright: 0 errors.
 
 ### Future Phases
 **Not currently planned:**

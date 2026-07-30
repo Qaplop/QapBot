@@ -215,3 +215,49 @@ class TestGetWarSummariesSyncCrossClan:
 
         assert len(rows) == 1
         assert rows[0]["clan_tag"] == "#OLD"
+
+
+class TestCompositePlayerTagDateIndex:
+    """
+    Regression test for the perf fix: get_player_attack_history_sync's WHERE clause
+    filters by both player_tag and date, but the pre-existing idx_wa_player_tag index
+    only covers player_tag — so SQLite still had to rowid-fetch every historical row
+    for that player_tag (across all time) just to discard rows outside the requested
+    month. idx_wa_player_tag_date(player_tag, date) lets the date range be applied
+    inside the index scan itself.
+    """
+
+    def test_history_schema_creates_composite_index_without_dropping_the_old_one(self, tmp_path):
+        import sqlite3 as _sqlite3
+        from qapbot.db_manager import _create_history_schema_sync
+
+        conn = _sqlite3.connect(":memory:")
+        hist_path = str(tmp_path / "hist.db")
+        conn.execute("ATTACH DATABASE ? AS history", (hist_path,))
+
+        _create_history_schema_sync(conn)
+
+        names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM history.sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        assert "idx_wa_player_tag_date" in names
+        assert "idx_wa_player_tag" in names  # kept — DROP INDEX on this table is maintenance-only
+
+    def test_composite_index_used_for_player_and_date_query(self, tmp_path):
+        """EXPLAIN QUERY PLAN should reference idx_wa_player_tag_date, not a full scan."""
+        dm = _make_db(tmp_path)
+        _insert_attack(dm.db_path, war_id="W1", clan_tag="#A", date="2026-06-05T10:00",
+                        player_name="Alice", player_tag="#P1", stars=2)
+        conn = sqlite3.connect(dm.db_path)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wa_player_tag_date ON war_attacks(player_tag, date)"
+        )
+        plan_rows = conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT * FROM war_attacks WHERE player_tag = '#P1' AND date >= '2026-06-01' AND date < '2026-07-01'"
+        ).fetchall()
+        plan_text = " ".join(str(cell) for row in plan_rows for cell in row)
+        assert "idx_wa_player_tag_date" in plan_text

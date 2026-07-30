@@ -709,20 +709,36 @@ async def leaderboard(
 
     # Resolve current rosters for scope="all" — credits a current member's stats
     # even for wars fought while registered to a clan no longer tracked/subscribed
-    # here. Uses the same stale-while-revalidate coc_clan_cache as everywhere else,
-    # so this is normally a cache hit (already warmed by the war-info update above
-    # or a recent prior command/loop iteration).
+    # here. Uses the same stale-while-revalidate coc_clan_cache as everywhere else.
+    #
+    # PERF: fetch every distinct constituent clan in ONE parallel gather instead of
+    # awaiting them one at a time — a cache miss/expiry is a live CoC API call, and
+    # sequentially awaiting a whole channel's subscribed clans/families (no clan
+    # filter given) is what made /leaderboard take minutes to respond on prod.
+    # Same pattern as ui_clan_management.py's guild-clan refresh.
     member_tags_by_tag: Dict[str, Set[str]] = {}
     if scope == "all":
-        for tag in tags:
-            constituent = CACHE.clan_families[tag].get('clans', []) if tag in CACHE.clan_families else [tag]
+        tag_to_constituent: Dict[str, List[str]] = {
+            tag: (CACHE.clan_families[tag].get('clans', []) if tag in CACHE.clan_families else [tag])
+            for tag in tags
+        }
+        all_constituent_clans: Set[str] = {ct for cts in tag_to_constituent.values() for ct in cts}
+        clan_results = await asyncio.gather(
+            *(CACHE.coc_clan_cache.get_clan(ct) for ct in all_constituent_clans),
+            return_exceptions=True,
+        )
+        clan_obj_by_tag: Dict[str, Any] = {}
+        for ct, result in zip(all_constituent_clans, clan_results):
+            if isinstance(result, BaseException):
+                logging.warning(f"[leaderboard scope=all] Failed to fetch roster for {ct}: {result}")
+            else:
+                clan_obj_by_tag[ct] = result
+        for tag, constituent in tag_to_constituent.items():
             roster: Set[str] = set()
             for ct in constituent:
-                try:
-                    clan_obj = await CACHE.coc_clan_cache.get_clan(ct)
+                clan_obj = clan_obj_by_tag.get(ct)
+                if clan_obj is not None:
                     roster.update(m.tag for m in clan_obj.members if getattr(m, "tag", None))
-                except Exception as e:
-                    logging.warning(f"[leaderboard scope=all] Failed to fetch roster for {ct}: {e}")
             member_tags_by_tag[tag] = roster
 
     # Auto-highlight (bold, via ANSI code block) the invoking user's own registered

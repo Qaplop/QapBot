@@ -101,6 +101,12 @@ def _create_history_schema_sync(conn: Any) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS history.idx_wa_war_clan ON war_attacks(war_id, clan_tag)")
     conn.execute("CREATE INDEX IF NOT EXISTS history.idx_wa_clan_date ON war_attacks(clan_tag, date)")
     conn.execute("CREATE INDEX IF NOT EXISTS history.idx_wa_zero_attacks ON war_attacks(attack_order) WHERE attack_order = 0")
+    # Composite (player_tag, date) — get_player_attack_history_sync (leaderboard scope="all")
+    # filters by both; without date in the index, SQLite would rowid-fetch every historical
+    # row for that player_tag just to filter down to one month. idx_wa_player_tag (above) is
+    # kept rather than dropped: DROP INDEX on the multi-million-row war_attacks table is slow
+    # enough that it must only run during nightly maintenance, never on a connection open.
+    conn.execute("CREATE INDEX IF NOT EXISTS history.idx_wa_player_tag_date ON war_attacks(player_tag, date)")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS history.war_summary (
@@ -1199,6 +1205,15 @@ class WarHistoryDB:
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_wa_zero_attacks ON war_attacks(attack_order) WHERE attack_order = 0"
         )
+        # Composite (player_tag, date) — get_player_attack_history_sync (leaderboard
+        # scope="all") filters by both; without date in the index, SQLite would
+        # rowid-fetch every historical row for that player_tag just to filter down to
+        # one month. idx_wa_player_tag (above) is kept rather than dropped: DROP INDEX
+        # on this multi-million-row table is slow enough that it must only run during
+        # nightly maintenance, never on every connection/startup.
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wa_player_tag_date ON war_attacks(player_tag, date)"
+        )
 
         # ── war_summary: one row per war per actively tracked clan ──
         logging.info("[DB-SCHEMA] Verifying war_summary table + indexes...")
@@ -1371,6 +1386,9 @@ class WarHistoryDB:
         )
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS history.idx_wa_zero_attacks ON war_attacks(attack_order) WHERE attack_order = 0"
+        )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS history.idx_wa_player_tag_date ON war_attacks(player_tag, date)"
         )
 
         await self._conn.execute("""
@@ -2578,9 +2596,14 @@ class WarHistoryDB:
         joined/switched to a currently-tracked clan still gets credit for stars
         earned while registered to a clan that is no longer tracked/subscribed.
 
-        Uses the existing idx_wa_player_tag index — one index seek per player tag
-        rather than a full-table scan, so cost scales with roster size, not with
-        total history volume.
+        Uses idx_wa_player_tag_date(player_tag, date) — a composite index so the
+        date-range filter is applied inside the index range scan itself. Without
+        date in the index, SQLite still narrows by player_tag first (via the older
+        single-column idx_wa_player_tag) but then has to rowid-fetch every row that
+        player ever has in war_attacks, across all time, just to discard everything
+        outside the requested month — for a long-tenured player with a large full
+        history, that's the difference between reading a handful of rows and
+        reading thousands, multiplied by every player_tag in the roster.
 
         WarID is returned as "{clan_tag}::{war_id}" (composite) because the raw
         war_id is only unique per (war_id, clan_tag) pair (it's derived from the
@@ -5997,8 +6020,10 @@ class WarHistoryDB:
                     page_size = _page_size_early
 
                     major_indexes = [
-                        # war_attacks (4): idx_wa_clan_tag / idx_wa_war_id dropped 2026-04-25
+                        # war_attacks (5): idx_wa_clan_tag / idx_wa_war_id dropped 2026-04-25;
+                        # idx_wa_player_tag_date added 2026-07-30 (leaderboard scope="all")
                         "idx_wa_player_tag", "idx_wa_war_clan", "idx_wa_clan_date", "idx_wa_zero_attacks",
+                        "idx_wa_player_tag_date",
                         # war_summary (4)
                         "idx_ws_clan_tag", "idx_ws_clan_date", "idx_ws_cwl_season", "idx_ws_war_id",
                         # clans (2)
