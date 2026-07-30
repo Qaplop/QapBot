@@ -287,6 +287,7 @@
       "nothing_to_do_no_subs": "Nothing to do! No clans are subscribed for this channel and no clan provided.",
       "cwlgroup_no_data": "No CWL data found in the database for {clan_name} ({tag}) in season {season}.",
       "cwlgroup_year_without_month": "Please also specify a month when filtering by year (e.g. month=5 year=2026).",
+      "invalid_month_spec": "Invalid month value: {error}",
       "invalid_mode_with_valid": "Invalid mode '{mode}'. Valid: {valid_modes}.",
       "failed_to_save_clan_cache": "Failed to save clan cache after removing {clan_display}.",
       "error_scanning_logs": "Error scanning logs: {error}.",

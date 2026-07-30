@@ -2564,15 +2564,149 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] get_clan_attack_history_sync failed: {e}")
                 raise
 
+    def get_player_attack_history_sync(
+        self,
+        player_tags: List[str],
+        month: Optional[int] = None,
+        year: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Cross-clan variant of get_clan_attack_history_sync: aggregates war_attacks
+        for a set of player tags regardless of which clan_tag they fought under.
+
+        Used by the leaderboard "all clans" scope so that a player who has since
+        joined/switched to a currently-tracked clan still gets credit for stars
+        earned while registered to a clan that is no longer tracked/subscribed.
+
+        Uses the existing idx_wa_player_tag index — one index seek per player tag
+        rather than a full-table scan, so cost scales with roster size, not with
+        total history volume.
+
+        WarID is returned as "{clan_tag}::{war_id}" (composite) because the raw
+        war_id is only unique per (war_id, clan_tag) pair (it's derived from the
+        opponent tag + date, from that clan's point of view), so two different
+        home clans could otherwise collide on the same war_id string.
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not player_tags:
+            return []
+
+        date_clause = ""
+        date_params: list[Any] = []
+        if month is not None and year is not None:
+            start_date = f"{year:04d}-{month:02d}-01"
+            end_date = f"{year + 1:04d}-01-01" if month == 12 else f"{year:04d}-{month + 1:02d}-01"
+            date_clause = " AND date >= ? AND date < ?"
+            date_params = [start_date, end_date]
+        elif year is not None:
+            start_date = f"{year:04d}-01-01"
+            end_date = f"{year + 1:04d}-01-01"
+            date_clause = " AND date >= ? AND date < ?"
+            date_params = [start_date, end_date]
+
+        # Chunk to stay well under SQLite's default host-parameter limit (999)
+        # even for large clan families.
+        records: list[Dict[str, Any]] = []
+        _CHUNK = 400
+        tags_list = list(player_tags)
+        with self._sync_conn() as conn:
+            try:
+                for i in range(0, len(tags_list), _CHUNK):
+                    chunk = tags_list[i:i + _CHUNK]
+                    placeholders = ",".join("?" for _ in chunk)
+                    params: list[Any] = list(chunk) + date_params
+
+                    cursor = conn.execute(f"""
+                        WITH wa AS (
+                            SELECT * FROM main.war_attacks
+                            UNION ALL SELECT * FROM history.war_attacks
+                        )
+                        SELECT clan_tag || '::' || war_id           AS composite_war_id,
+                               date, player_name, player_tag, th_level,
+                           SUM(stars)                                            AS stars,
+                           COALESCE(MAX(max_attacks), 0)
+                               - COALESCE(MAX(missed_attacks), 0)                AS attacks,
+                           MAX(missed_attacks)                                   AS missed_attacks,
+                           MAX(max_attacks)                                      AS max_attacks,
+                           MAX(defensive_stars)                                  AS defensive_stars,
+                           MAX(times_defended)                                   AS times_defended,
+                           SUM(destruction)                                      AS total_destruction
+                        FROM wa
+                        WHERE player_tag IN ({placeholders}){date_clause}
+                          AND attack_order > 0
+                        GROUP BY war_id, clan_tag, player_tag
+                        ORDER BY date DESC
+                    """, params)
+
+                    for row in cursor.fetchall():
+                        records.append({
+                            "WarID": row["composite_war_id"],
+                            "Date": row["date"],
+                            "Player": row["player_name"],
+                            "PlayerID": row["player_tag"],
+                            "TH_lvl": row["th_level"],
+                            "Stars": row["stars"],
+                            "Attacks": row["attacks"],
+                            "Missed_Attacks": row["missed_attacks"],
+                            "Max_Attacks": row["max_attacks"],
+                            "Defensive_Stars": row["defensive_stars"],
+                            "Times_Defended": int(row["times_defended"] or 0),
+                            "Total_Dest_Pct": float(row["total_destruction"] or 0.0),
+                        })
+
+                    # Include players with 0 attacks (attack_order == 0 = missed all)
+                    cursor2 = conn.execute(f"""
+                        WITH wa AS (
+                            SELECT * FROM main.war_attacks
+                            UNION ALL SELECT * FROM history.war_attacks
+                        )
+                        SELECT clan_tag || '::' || war_id AS composite_war_id,
+                               date, player_name, player_tag, th_level,
+                               0 AS stars, 0 AS attacks,
+                               missed_attacks, max_attacks, defensive_stars, times_defended
+                        FROM wa
+                        WHERE player_tag IN ({placeholders}){date_clause}
+                          AND attack_order = 0
+                        ORDER BY date DESC
+                    """, params)
+                    for row in cursor2.fetchall():
+                        records.append({
+                            "WarID": row["composite_war_id"],
+                            "Date": row["date"],
+                            "Player": row["player_name"],
+                            "PlayerID": row["player_tag"],
+                            "TH_lvl": row["th_level"],
+                            "Stars": 0,
+                            "Attacks": 0,
+                            "Missed_Attacks": row["missed_attacks"],
+                            "Max_Attacks": row["max_attacks"],
+                            "Defensive_Stars": row["defensive_stars"],
+                            "Times_Defended": int(row["times_defended"] or 0),
+                            "Total_Dest_Pct": 0.0,
+                        })
+
+                logging.debug(
+                    f"[DB-QUERY-SYNC] player war_attacks: {len(records)} records for {len(tags_list)} player tags"
+                )
+                return records
+
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_player_attack_history_sync failed: {e}")
+                raise
+
     def get_war_summaries_sync(
-        self, clan_tag: str, *, season: Optional[str] = None, is_cwl: Optional[bool] = None,
+        self, clan_tag: Optional[str], *, season: Optional[str] = None, is_cwl: Optional[bool] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve war_summary rows for a clan.
+        Retrieve war_summary rows for a clan, or (with clan_tag=None) across all clans.
 
         Args:
-            clan_tag: Clan tag
+            clan_tag: Clan tag, or None to query across every clan (used for
+                cross-clan CWL-season lookups by the "all clans" leaderboard scope)
             season: Optional CWL season filter, e.g. '2026-02'
             is_cwl: Optional filter — True = CWL only, False = regular only
             limit: Max rows to return
@@ -2584,15 +2718,18 @@ class WarHistoryDB:
         if not self.db_path:
             raise RuntimeError("Database not initialized. Call initialize() first.")
 
-        clauses = ["clan_tag = ?"]
-        params: list[Any] = [clan_tag]
+        clauses: list[str] = []
+        params: list[Any] = []
+        if clan_tag is not None:
+            clauses.append("clan_tag = ?")
+            params.append(clan_tag)
         if season is not None:
             clauses.append("cwl_season = ?")
             params.append(season)
         if is_cwl is not None:
             clauses.append("is_cwl = ?")
             params.append(1 if is_cwl else 0)
-        where = " AND ".join(clauses)
+        where = " AND ".join(clauses) if clauses else "1=1"
         sql = (
             "WITH ws AS ("
             "SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary"

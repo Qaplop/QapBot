@@ -286,6 +286,7 @@
       "nothing_to_do_no_subs": "Nichts zu tun! Es gibt keine Clan-Abos für diesen Kanal und kein Clan wurde angegeben.",
       "cwlgroup_no_data": "Für {clan_name} ({tag}) wurden in Saison {season} keine CWL-Daten in der Datenbank gefunden.",
       "cwlgroup_year_without_month": "Bitte gib zusätzlich einen Monat an, wenn du nach Jahr filterst (z.B. month=5 year=2026).",
+      "invalid_month_spec": "Ungültiger Monatswert: {error}",
       "invalid_mode_with_valid": "Ungültiger Modus '{mode}'. Gültig: {valid_modes}.",
       "failed_to_save_clan_cache": "Fehler beim Speichern des Clan-Cache nach dem Entfernen von {clan_display}.",
       "error_scanning_logs": "Fehler beim Scannen der Protokolle: {error}.",

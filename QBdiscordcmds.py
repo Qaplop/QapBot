@@ -46,12 +46,12 @@ from qapbot.emojis import BotEmojis
 import platform
 import psutil
 import QBcore
-from typing import Optional, Union, Any, Dict, List, Tuple
+from typing import Optional, Union, Any, Dict, List, Tuple, Set
 from QBhelperfunctions import (
     generate_leaderboard_text, generate_cwlinfo_embeds, generate_cwlinfo_comp_embeds, post_discord_content_with_tracking, post_leaderboard_to_discord,
     update_clan_war_info_and_stats, generate_cwl_group_analysis_embeds,
     update_cwl_group_stats, generate_cwl_group_image,
-    build_cwl_opponent_embeds,
+    build_cwl_opponent_embeds, parse_month_argument,
 )
 from QapBot import GLOBAL_GUILD_ID, run_nightly_maintenance_routine, is_monthly_migration_due
 from qapbot.config import CONFIG
@@ -491,21 +491,27 @@ async def unsubscribe_mode_autocomplete(interaction: discord.Interaction, curren
 @app_commands.describe(
     clan="Clan or clan-family tag or name. Leave empty for this channel's subscriptions.",
     mode="Leaderboard mode: attack (total stars), defense (def stars taken), avgstars (stars per attack), currentwar (ongoing war), etc.",
-    month="Month number (1-12)",
+    month="Month: a number (6), a range (6-7), a list (1;3;5), or trailing count (-2 = last 2 months)",
     year="Year (YYYY)",
     cwl_only="Restrict to CWL stats only",
     season="CWL season to filter by (YYYY-MM or YYYY-MM-DD for mid-month CWL, e.g. 2026-05 or 2026-06-15). Overrides month/year and forces CWL mode.",
+    scope="ALL: count every clan a current member played for (default). OWN: this server's clans only.",
 )
+@app_commands.choices(scope=[
+    app_commands.Choice(name="All clans a current member played for (default)", value="all"),
+    app_commands.Choice(name="Own clans only (current member clans of this server)", value="own"),
+])
 @app_commands.guild_only()
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
 async def leaderboard(
     interaction: discord.Interaction,
     clan: Optional[str] = None,
     mode: Optional[str] = None,
-    month: Optional[int] = None,
+    month: Optional[str] = None,
     year: Optional[int] = None,
     cwl_only: Optional[bool] = False,
     season: Optional[str] = None,
+    scope: Optional[str] = None,
 ):
     """
     Show leaderboard(s) using slash parameters with autocomplete for target and mode.
@@ -514,12 +520,21 @@ async def leaderboard(
         - If clan omitted: uses all subscribed clans/families for this channel
         - Mode: if omitted, uses subscription mode per entry or DEFAULT_MODE
         - CWL-only modifier toggles "_cwl" suffix on the mode
-        - Month/year: year only -> YTD; month+year -> specific month; neither -> current month
+        - Month: single month, "a-b" range, "a;b;c" list, or "-N" for the trailing N months
+          (may cross a year boundary, e.g. "-2" in January = December + January)
+        - Month/year: year only -> YTD; month+year -> specific period(s); neither -> current month
+        - Scope: "all" (default) credits a current member's stats even for wars fought
+          while registered to a clan no longer tracked/subscribed here; "own" restricts to
+          wars fought by this server's current member clans, as before
     """
     if not await _safe_defer(interaction, thinking=True, ephemeral=True):
         return
-    _log_cmd(interaction, "leaderboard", clan=clan, mode=mode, month=month, year=year, cwl_only=cwl_only, season=season)
-    
+    _log_cmd(interaction, "leaderboard", clan=clan, mode=mode, month=month, year=year, cwl_only=cwl_only, season=season, scope=scope)
+
+    scope = (scope or "all").lower()
+    if scope not in ("own", "all"):
+        scope = "all"
+
     # Convert 2-digit year to 4-digit year (add 2000)
     if year is not None and year < 100:
         year = year + 2000
@@ -527,13 +542,35 @@ async def leaderboard(
     # Season override: normalise YYYY-MM-DD → Monday of its ISO week; extract
     # month/year for the time window; force CWL mode on all modes.
     cwl_season: Optional[str] = None
+    season_period: Optional[Tuple[int, int]] = None
     if season:
         from qapbot.constants import normalize_cwl_season
         cwl_season = normalize_cwl_season(season.strip())
         _sp = cwl_season.split("-")
         year = int(_sp[0])
-        month = int(_sp[1])
+        season_period = (int(_sp[1]), year)
         cwl_only = True
+
+    # Parse the month argument (single value, range, list, or trailing "-N") into an
+    # ordered list of (month, year) pairs. A season override always wins.
+    month_periods: Optional[List[Tuple[int, int]]] = None
+    if season_period is not None:
+        month_periods = [season_period]
+    elif month is not None:
+        try:
+            month_periods = parse_month_argument(month, datetime.now(timezone.utc), year)
+        except ValueError as e:
+            guild_id = interaction.guild.id if interaction.guild else None
+            await interaction.followup.send(
+                t('commands.errors.invalid_month_spec', guild_id=guild_id, error=str(e)),
+                ephemeral=True,
+            )
+            return
+
+    # cwlgroup only ever targets a single month (a CWL season maps to one month) —
+    # take the earliest resolved period as its target, ignoring ranges/lists.
+    cwlgroup_month: Optional[int] = month_periods[0][0] if month_periods else None
+    cwlgroup_year: Optional[int] = month_periods[0][1] if month_periods else year
 
     subs = CACHE.get_all_subscriptions_flat()
     if not interaction.channel:
@@ -592,22 +629,19 @@ async def leaderboard(
 
     # Resolve time window
     now = datetime.now(timezone.utc)
-    explicit_time = (month is not None or year is not None)
-    per_tag_periods: List[Tuple[Union[int, List[int]], int]] = []
+    explicit_time = (month_periods is not None or year is not None)
+    per_tag_periods: List[Tuple[Union[int, List[int], List[Tuple[int, int]]], int]] = []
     if explicit_time:
-        if year and not month:
-            yr = year
-            month_range = builtins.list(builtins.range(1, now.month + 1)) if yr == now.year else builtins.list(builtins.range(1, 13))
-        elif not year and month:
-            yr = now.year
-            month_range = month
-        elif year and month:
-            yr = year
-            month_range = month
+        if month_periods is not None:
+            periods = month_periods
         else:
-            yr = now.year
-            month_range = now.month
-        per_tag_periods = [(month_range, yr)] * len(tags)
+            # year given without a month -> year-to-date within that year
+            yr = year if year else now.year
+            month_range = builtins.list(builtins.range(1, now.month + 1)) if yr == now.year else builtins.list(builtins.range(1, 13))
+            periods = [(m, yr) for m in month_range]
+        month_range = periods  # for the log line below only
+        yr = periods[-1][1]
+        per_tag_periods = [(periods, yr)] * len(tags)
     else:
         yr = now.year
         month_range = now.month
@@ -672,7 +706,25 @@ async def leaderboard(
     for clan_tag in clans_needing_updates:  # type: ignore[misc]
         if not await update_clan_war_info_and_stats(clan_tag):  # type: ignore[arg-type]
             logging.warning(f"War data processing failed for {clan_tag}")
-    
+
+    # Resolve current rosters for scope="all" — credits a current member's stats
+    # even for wars fought while registered to a clan no longer tracked/subscribed
+    # here. Uses the same stale-while-revalidate coc_clan_cache as everywhere else,
+    # so this is normally a cache hit (already warmed by the war-info update above
+    # or a recent prior command/loop iteration).
+    member_tags_by_tag: Dict[str, Set[str]] = {}
+    if scope == "all":
+        for tag in tags:
+            constituent = CACHE.clan_families[tag].get('clans', []) if tag in CACHE.clan_families else [tag]
+            roster: Set[str] = set()
+            for ct in constituent:
+                try:
+                    clan_obj = await CACHE.coc_clan_cache.get_clan(ct)
+                    roster.update(m.tag for m in clan_obj.members if getattr(m, "tag", None))
+                except Exception as e:
+                    logging.warning(f"[leaderboard scope=all] Failed to fetch roster for {ct}: {e}")
+            member_tags_by_tag[tag] = roster
+
     # Generate and post leaderboards for requested targets
     for i, tag in enumerate(tags):
         is_family = tag in CACHE.clan_families
@@ -691,7 +743,7 @@ async def leaderboard(
             if interaction.channel and isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
                 guild_id = interaction.guild.id if interaction.guild else None
                 # Year without month: error — we can't know which month to show
-                if year is not None and month is None:
+                if year is not None and cwlgroup_month is None:
                     await interaction.followup.send(
                         t('commands.errors.cwlgroup_year_without_month', guild_id=guild_id),
                         ephemeral=True,
@@ -703,9 +755,9 @@ async def leaderboard(
                     # Exact season was given via the season parameter: use it directly
                     _season = cwl_season
                     _explicit_season = True
-                elif month is not None:
-                    _yr = year if year is not None else datetime.now().year
-                    _month_prefix = f"{_yr}-{month:02d}"
+                elif cwlgroup_month is not None:
+                    _yr = cwlgroup_year if cwlgroup_year is not None else datetime.now().year
+                    _month_prefix = f"{_yr}-{cwlgroup_month:02d}"
                     # Look up the most recent sub-season for this month so that a
                     # mid-month bonus CWL (e.g. "2026-06-16") is returned instead
                     # of the plain YYYY-MM key that would miss it in the DB.
@@ -748,7 +800,11 @@ async def leaderboard(
                     img_bytes = await asyncio.to_thread(generate_cwl_group_image, standings, _season, tag)
                     await post_discord_content_with_tracking(tag, interaction.channel, f"cwlgroup_{_season}", file_bytes=img_bytes, file_name="cwlgroup.png", update_existing=False)
         else:
-            text = await asyncio.to_thread(generate_leaderboard_text, tag, month=period_month, year=period_year, mode=per_tag_modes[i], cwl_season=cwl_season)
+            text = await asyncio.to_thread(
+                generate_leaderboard_text, tag, month=period_month, year=period_year,
+                mode=per_tag_modes[i], cwl_season=cwl_season,
+                scope=scope, member_player_tags=member_tags_by_tag.get(tag),
+            )
             if interaction.channel and isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
                 await post_leaderboard_to_discord(text, tag, month=period_month, year=period_year, channel=interaction.channel, mode=per_tag_modes[i], cwl_season=cwl_season)
 

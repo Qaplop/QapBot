@@ -631,6 +631,33 @@ re-check) rather than trusting them long-term.
   (total_rows − missed-attack rows) instead of a 5M-row filtered scan.
 - All changes are idempotent: `DROP INDEX IF EXISTS` / `CREATE INDEX IF NOT EXISTS`
 
+### 2026-07-30: Leaderboard "scope=all" — Cross-Clan Player History (Complete ✅)
+- New method `get_player_attack_history_sync(player_tags, month, year)`: same aggregation as
+  `get_clan_attack_history_sync()` but filtered by `WHERE player_tag IN (...)` instead of
+  `clan_tag = ?`. Uses the existing `idx_wa_player_tag` index — one index seek per player tag,
+  not a full-table scan, so cost scales with roster size, not total history volume.
+- `WarID` is returned as the composite `"{clan_tag}::{war_id}"`. Reason: `war_id` is only unique
+  per `(war_id, clan_tag)` pair — it's derived from the *opponent* tag + date, from that clan's
+  own point of view (see `war_id = f"{opponent_tag}_{start_dt_compact}"` in
+  `QBhelperfunctions.py`) — so two different home clans can coincidentally collide on the same
+  war_id string (e.g. both fought the same opponent on the same day). The composite key avoids
+  merging two unrelated wars into one `Wars_Count` entry when aggregating across clan_tags.
+- `get_war_summaries_sync(clan_tag, ...)` now accepts `clan_tag=None` to query CWL-season summary
+  rows across every clan_tag (needed to resolve `cwl_season` filtering for the cross-clan query
+  above, since `war_summary` rows also carry their own `clan_tag`).
+- Purpose: the `/leaderboard` command's new `scope="all"` option (default) credits a player
+  currently rostered in a tracked clan for wars fought while registered to a clan that is no
+  longer tracked/subscribed (e.g. they switched clans mid-month). `scope="own"` restores the
+  previous per-clan-only behavior. See `QBhelperfunctions._load_history_rows()` /
+  `calculate_leaderboard(scope=...)` for the dispatch, and `QBdiscordcmds.leaderboard()` for how
+  the current roster (`CACHE.coc_clan_cache.get_clan()`) is resolved per target clan/family.
+- Chunks the player-tag `IN (...)` clause at 400 tags per query to stay under SQLite's default
+  host-parameter limit even for large clan families.
+- Not cached across calls (unlike `_load_history_filtered`'s per-clan history_cache) — this path
+  is only reached from the manual `/leaderboard` command, not the automatic per-subscription
+  posting loop, so the extra per-invocation DB round trip is not a concern.
+- 1457 tests passing.
+
 ### Future Phases
 **Not currently planned:**
 - Phase 4: Temp war stats (JSON → DB)

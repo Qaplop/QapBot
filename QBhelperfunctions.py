@@ -176,6 +176,58 @@ def _load_history_filtered(clan_tag: str, month: Optional[int], year: Optional[i
     CACHE.history_cache[key] = filtered
     return filtered
 
+def _load_history_filtered_by_players(player_tags: Set[str], month: Optional[int], year: Optional[int], cwl_season: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Load historical war data for a specific set of players, regardless of which
+    clan_tag they fought under (used by leaderboard scope="all").
+
+    Unlike _load_history_filtered, this is not cached across calls — it's only used
+    for the manual /leaderboard command (not the automatic per-subscription posting
+    loop), so the extra DB round-trip per invocation is not a concern.
+    """
+    if not player_tags or CACHE.db_manager is None:
+        return []
+    rows = CACHE.db_manager.get_player_attack_history_sync(sorted(player_tags), month, year)
+    if cwl_season is not None:
+        # war_summary rows aren't scoped to one clan here, so match on the same
+        # "{clan_tag}::{war_id}" composite key used in get_player_attack_history_sync.
+        summary_rows = CACHE.db_manager.get_war_summaries_sync(None, season=cwl_season)
+        allowed = {f"{row['clan_tag']}::{row['war_id']}" for row in summary_rows}
+        rows = [r for r in rows if r.get("WarID") in allowed]
+    return rows
+
+def _load_history_rows(
+    clan_tag: str,
+    month: Optional[int],
+    year: Optional[int],
+    cwl_season: Optional[str],
+    *,
+    scope: str = "own",
+    member_player_tags: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Load history rows for a clan or clan family for a single month, honoring
+    leaderboard scope.
+
+    scope="own" (default, unchanged behavior): only wars fought by the clan(s)
+        themselves are counted — a player's stats from a clan that has since left
+        the family/guild are not included.
+    scope="all": counts every war fought by a player currently rostered in the
+        target clan(s), even wars fought while registered to a clan that is no
+        longer tracked/subscribed. Falls back to "own" behavior if the current
+        roster couldn't be resolved (member_player_tags is empty/None).
+    """
+    if scope == "all" and member_player_tags:
+        return _load_history_filtered_by_players(member_player_tags, month, year, cwl_season)
+    if clan_tag in CACHE.clan_families:
+        clan_tags = CACHE.clan_families[clan_tag].get("clans", [])
+    else:
+        clan_tags = [clan_tag]
+    rows: List[Dict[str, Any]] = []
+    for tag in clan_tags:
+        rows.extend(_load_history_filtered(tag, month, year, cwl_season))
+    return rows
+
 def _merge_entries(history_rows: List[Dict[str, Any]], temp_stats: Dict[str, Dict[str, Any]], war_in_progress: bool, mode: str) -> Dict[str, Dict[str, Any]]:
     """
     Merge historical war data with current temporary war statistics using PlayerID for consistency.
@@ -331,7 +383,7 @@ def _merge_entries(history_rows: List[Dict[str, Any]], temp_stats: Dict[str, Dic
 
 # --- Leaderboard calculation ---
 
-def calculate_leaderboard(clan_tag: str, month: Optional[int] = None, year: Optional[int] = None, *, cwl_only: bool = False, mode: str = DEFAULT_MODE, cwl_season: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+def calculate_leaderboard(clan_tag: str, month: Optional[int] = None, year: Optional[int] = None, *, cwl_only: bool = False, mode: str = DEFAULT_MODE, cwl_season: Optional[str] = None, scope: str = "own", member_player_tags: Optional[Set[str]] = None) -> Dict[str, Dict[str, Any]]:
     """
     Calculate leaderboard statistics for a clan or clan family with comprehensive data processing.
     This function aggregates historical war data with current war statistics to
@@ -345,6 +397,12 @@ def calculate_leaderboard(clan_tag: str, month: Optional[int] = None, year: Opti
         month: Optional month filter (1-12) - if None, includes all months
         year: Optional year filter (4-digit) - if None, includes all years
         cwl_only: Whether to include only CWL (Clan War League) wars
+        scope: "own" (default) counts only wars fought by the clan(s) themselves;
+            "all" counts every war fought by a player currently rostered in the
+            target clan(s), even ones fought while registered to a clan that is
+            no longer tracked/subscribed (requires member_player_tags)
+        member_player_tags: Current roster tags for the target clan(s), used only
+            when scope="all" — resolved by the caller (needs a live CoC API call)
 
     Returns:
         Dictionary keyed by PlayerID containing comprehensive player statistics:
@@ -388,15 +446,18 @@ def calculate_leaderboard(clan_tag: str, month: Optional[int] = None, year: Opti
         clan_tags = CACHE.clan_families[clan_tag].get("clans", [])
     else:
         clan_tags = [clan_tag]
-    # Aggregate history and temp stats for all relevant clans
-    all_history_rows = []
+    # Aggregate history for all relevant clans (or, for scope="all", for every
+    # player currently rostered in those clans regardless of which clan_tag the
+    # underlying wars were fought under).
+    all_history_rows: List[Dict[str, Any]] = []
+    if mode != "currentwar":
+        all_history_rows = _load_history_rows(clan_tag, month, year, cwl_season, scope=scope, member_player_tags=member_player_tags)
+        if cwl_only:
+            all_history_rows = [r for r in all_history_rows if r.get("Max_Attacks", 2) == 1]
+    # Temp (in-progress war) stats are always per-clan — an ongoing war only exists
+    # for the clan(s) actually in it right now, so scope doesn't apply here.
     all_temp_stats = {}
     for tag in clan_tags:
-        if (mode != "currentwar"):
-            history_rows = _load_history_filtered(tag, month, year, cwl_season)
-            if cwl_only:
-                history_rows = [r for r in history_rows if r.get("Max_Attacks", 2) == 1]
-            all_history_rows.extend(history_rows)  # type: ignore[misc]
         temp_stats = CACHE.get_temp_war_stats(tag)
         include_temp = False
         if temp_stats:
@@ -434,11 +495,11 @@ def calculate_leaderboard(clan_tag: str, month: Optional[int] = None, year: Opti
     return _merge_entries(all_history_rows, all_temp_stats, war_in_progress, mode=mode)  # type: ignore[arg-type]
 
 async def post_leaderboard_to_discord(
-    leaderboard_text: str, 
-    clan_tag: str, 
-    month: Union[int, List[int]], 
-    year: int, 
-    channel: Union[discord.TextChannel, discord.Thread], 
+    leaderboard_text: str,
+    clan_tag: str,
+    month: Union[int, List[int], List[Tuple[int, int]]],
+    year: Optional[int],
+    channel: Union[discord.TextChannel, discord.Thread],
     mode: str = DEFAULT_MODE,
     cwl_season: Optional[str] = None,
 ) -> None:
@@ -450,8 +511,10 @@ async def post_leaderboard_to_discord(
     Args:
         leaderboard_text: Formatted leaderboard content ready for Discord
         clan_tag: Clash of Clans clan tag (normalized format: #ABCDEFGH)
-        month: Month(s) for leaderboard - int (1-12) or list of ints for ranges ([1,2,3,...])
-        year: Year for leaderboard (4-digit format)
+        month: Month(s) for leaderboard - int (1-12), list of ints for ranges
+            ([1,2,3,...]), or list of (month, year) pairs for periods crossing a
+            year boundary (in which case `year` is ignored/overwritten)
+        year: Year for leaderboard (4-digit format); ignored when month is a list of pairs
         channel: Discord channel or thread where leaderboard will be posted
         mode: Leaderboard mode ("attack", "avgstars", "attackdefratio", "stars_cwl", etc.)
 
@@ -479,7 +542,14 @@ async def post_leaderboard_to_discord(
         cwl_only = True
 
     # Determine month_str for message key and deletion
-    if isinstance(month, list):
+    if isinstance(month, list) and month and isinstance(month[0], tuple):
+        # (month, year) pairs — a period that may cross a year boundary. Encode
+        # both month and year per entry so the key stays unique/deterministic;
+        # readability doesn't matter here, it's only compared for equality.
+        periods_repr: List[Tuple[int, int]] = list(month)  # type: ignore[arg-type]
+        month_str = "+".join(f"{y}{m:02d}" for m, y in periods_repr)
+        year = periods_repr[-1][1]
+    elif isinstance(month, list):
         if len(month) == 1:
             month_str = f"{month[0]:02d}"
         elif len(month) > 1:
@@ -489,6 +559,9 @@ async def post_leaderboard_to_discord(
     else:
         month_str = f"{month:02d}" if isinstance(month, int) else "current"  # type: ignore[misc]
 
+    # By this point year is always resolved: callers pass a real int, or (when month
+    # is a list of (month, year) pairs) the branch above overwrites it from the pairs.
+    assert year is not None
     # Compose mode string
     # "currentwar" and "cwlinfo" use just their name (no month/year) since they reflect
     # live state rather than a historical period.
@@ -4011,13 +4084,111 @@ async def post_discord_content_with_tracking(
             logging.debug(f"[{log_tag}] Debug message send failed for {clan_tag}: {_de}")
 
 
+def _periods_contiguous(periods: List[Tuple[int, int]]) -> bool:
+    """True if consecutive (month, year) pairs represent consecutive calendar months."""
+    for i in range(1, len(periods)):
+        pm, py = periods[i - 1]
+        cm, cy = periods[i]
+        if py * 12 + pm + 1 != cy * 12 + cm:
+            return False
+    return True
+
+def _format_periods_label(periods: List[Tuple[int, int]]) -> str:
+    """
+    Human-readable label for an ordered list of (month, year) pairs.
+
+    Examples: "06-07/2026" (contiguous, same year), "2025-12 to 2026-01"
+    (contiguous, crossing a year boundary), "01+03+05/2026" (a non-contiguous
+    explicit list — must not be rendered as "01-05", which would misleadingly
+    imply Feb and Apr were included too).
+    """
+    if len(periods) == 1:
+        m, y = periods[0]
+        return f"{m:02d}/{y}"
+    years = {y for _, y in periods}
+    if _periods_contiguous(periods):
+        m0, y0 = periods[0]
+        m1, y1 = periods[-1]
+        if len(years) == 1:
+            return f"{m0:02d}-{m1:02d}/{y0}"
+        return f"{y0}-{m0:02d} to {y1}-{m1:02d}"
+    if len(years) == 1:
+        y0 = years.pop()
+        return "+".join(f"{m:02d}" for m, _ in periods) + f"/{y0}"
+    return "+".join(f"{y}-{m:02d}" for m, y in periods)
+
+def parse_month_argument(spec: str, now: datetime, explicit_year: Optional[int] = None) -> List[Tuple[int, int]]:
+    """
+    Parse the /leaderboard `month` command-line argument into an ordered list of
+    (month, year) pairs, oldest first.
+
+    Supported forms:
+        "6"       -> a single month
+        "6-7"     -> an inclusive range (June, July)
+        "1;3;5"   -> an explicit list of months (semicolon-separated)
+        "-2"      -> the trailing N months, ending at (and including) the
+                     current month — may cross a year boundary (e.g. "-2" in
+                     January covers December of the previous year + January)
+
+    Raises:
+        ValueError: on malformed input, an out-of-range month (range/list forms
+            only — the negative form derives months from `now` and can't go out
+            of range), or an explicit year combined with the negative form (that
+            form is always relative to `now`, so pairing it with a fixed year
+            would be ambiguous).
+    """
+    spec = spec.strip()
+    if not spec:
+        raise ValueError("Month value must not be empty.")
+
+    if re.fullmatch(r"-\d+", spec):
+        n = int(spec[1:])
+        if n < 1:
+            raise ValueError("Number of trailing months must be at least 1.")
+        if explicit_year is not None:
+            raise ValueError("Can't combine an explicit year with a relative '-N' month value.")
+        pairs: List[Tuple[int, int]] = []
+        for offset in range(n - 1, -1, -1):
+            total = (now.year * 12 + (now.month - 1)) - offset
+            y, m0 = divmod(total, 12)
+            pairs.append((m0 + 1, y))
+        return pairs
+
+    base_year = explicit_year or now.year
+    try:
+        if ";" in spec:
+            raw_months = [int(x.strip()) for x in spec.split(";") if x.strip()]
+            if not raw_months:
+                raise ValueError("empty list")
+        elif "-" in spec:
+            a_str, b_str = spec.split("-", 1)
+            a, b = int(a_str), int(b_str)
+            raw_months = list(range(a, b + 1)) if a <= b else list(range(a, b - 1, -1))
+        else:
+            raw_months = [int(spec)]
+    except ValueError:
+        raise ValueError(
+            f"Could not parse month value '{spec}'. Use a month number (6), "
+            "a range (6-7), a list (1;3;5), or a trailing count (-2)."
+        )
+
+    for m in raw_months:
+        if not (1 <= m <= 12):
+            raise ValueError(f"Month must be between 1 and 12 (got {m}).")
+
+    pairs = [(m, base_year) for m in raw_months]
+    pairs.sort(key=lambda p: p[1] * 100 + p[0])
+    return pairs
+
 def generate_leaderboard_text(
     clan_tag: str,
-    month: Optional[Union[int, List[int]]] = None, 
-    year: Optional[int] = None, 
-    mode: str = DEFAULT_MODE, 
+    month: Optional[Union[int, List[int], List[Tuple[int, int]]]] = None,
+    year: Optional[int] = None,
+    mode: str = DEFAULT_MODE,
     style: str = "discord",
     cwl_season: Optional[str] = None,
+    scope: str = "own",
+    member_player_tags: Optional[Set[str]] = None,
 ) -> str:
     """
     Generate formatted leaderboard text for a clan or clan family.
@@ -4028,20 +4199,27 @@ def generate_leaderboard_text(
 
     Args:
         clan_tag: Clash of Clans clan tag or family tag
-        month: Month(s) for leaderboard data (1-12 or list of months)
-        year: Year for leaderboard data
+        month: Month(s) for leaderboard data — a single month (1-12), a list of
+            months (assumed to share `year`), or a list of (month, year) pairs
+            for periods that cross a year boundary (e.g. Dec + Jan)
+        year: Year for leaderboard data (ignored when month is a list of pairs)
         mode: Leaderboard mode (attack, avgstars, attackdefratio, etc.)
         style: Output style ("discord" or "terminal")
-    
+        scope: "own" (default) counts only wars fought by the clan(s) themselves;
+            "all" counts every war fought by a player currently rostered in the
+            target clan(s), even ones fought under a clan no longer tracked/subscribed
+        member_player_tags: Current roster tags for the target clan(s); required
+            for scope="all", ignored otherwise
+
     Returns:
         Formatted leaderboard text ready for Discord or terminal display
-    
+
     Behavior:
         - Aggregates player stats by PlayerID across all clans in a family
         - Produces one line per player, regardless of how many clans they played for
         - Supports multi-month and single-month aggregation
         - Uses unified formatting and rendering for output
-    
+
     Example:
         # Get leaderboard for a clan family for August 2025
         text = generate_leaderboard_text("FAMILYTAG", month=8, year=2025)
@@ -4074,45 +4252,52 @@ def generate_leaderboard_text(
     logging.debug(f"generate_leaderboard_text() called with: clan_tag={clan_tag}, clan_name={clan_name}, mode={mode}, month={month}, year={year}, type(month)={type(month)}")
 
     # --- Unified month handling ---
-    # Always build a list of months to aggregate, even for single month
-    if isinstance(month, int):
-        months = [month]
+    # Always build an ordered list of (month, year) pairs to aggregate, even for a
+    # single month. Accepting (month, year) pairs directly — rather than just a
+    # list of months sharing one `year` — lets a period cross a year boundary,
+    # e.g. a "last 2 months" request made in January (Dec of last year + Jan this year).
+    if isinstance(month, list) and month and isinstance(month[0], tuple):
+        periods: Optional[List[Tuple[int, int]]] = list(month)  # type: ignore[assignment]
+    elif isinstance(month, int):
+        periods = [(month, year or datetime.now().year)]
     elif isinstance(month, list):
-        months = month
+        yy = year or datetime.now().year
+        periods = [(m, yy) for m in month]  # type: ignore[misc]
     else:
         # If month is None and not currentwar mode, default to current month
         if mode != "currentwar":
-            months = [datetime.now().month]
+            periods = [(datetime.now().month, year or datetime.now().year)]
         else:
-            months = None
-    year = year or datetime.now().year
+            periods = None
 
     aggregated: Dict[str, Dict[str, Any]] = {}
-    all_month_labels = []
-    if months is None:
+    if periods is None:
         stats_by_player = {}
     else:
-        for m in months:
-            logging.debug(f"Processing month {m} for aggregation")
-            stats = calculate_leaderboard(clan_tag, m, year, cwl_only=cwl_only, mode=mode, cwl_season=cwl_season)
-            logging.debug(f"Stats for month {m}: {len(stats)} players")
+        for m, y in periods:
+            logging.debug(f"Processing month {m}/{y} for aggregation")
+            stats = calculate_leaderboard(clan_tag, m, y, cwl_only=cwl_only, mode=mode, cwl_season=cwl_season, scope=scope, member_player_tags=member_player_tags)
+            logging.debug(f"Stats for month {m}/{y}: {len(stats)} players")
             # Load history for this specific month to get war IDs
-            history_rows = _load_history_filtered(clan_tag, m, year, cwl_season)
+            history_rows = _load_history_rows(clan_tag, m, y, cwl_season, scope=scope, member_player_tags=member_player_tags)
             month_war_ids: set[str] = set()
             for row in history_rows:
                 war_id = row.get("WarID") or row.get("WarId", "")
                 if war_id:
                     month_war_ids.add(war_id)  # type: ignore[misc]
+            # Sortable across year boundaries — plain month numbers alone would treat
+            # January (1) as "earlier" than December (12) of the previous period.
+            period_key = y * 100 + m
             for pid, v in stats.items():
                 if pid not in aggregated:
                     aggregated[pid] = v.copy()
                     aggregated[pid]["_war_ids"] = month_war_ids.copy()
-                    # Track latest month for TH level updates
-                    aggregated[pid]["_last_month"] = m
+                    # Track latest period for TH level updates
+                    aggregated[pid]["_last_period_key"] = period_key
                 else:
                     # Only add stats from wars we haven't seen before
                     new_wars = month_war_ids - aggregated[pid].get("_war_ids", set())
-                    if new_wars or m == months[-1]:  # Always include current month for ongoing wars
+                    if new_wars or (m, y) == periods[-1]:  # Always include the last period for ongoing wars
                         aggregated[pid]["Stars"] += v.get("Stars", 0)
                         aggregated[pid]["Attacks"] += v.get("Attacks", 0)
                         aggregated[pid]["Missed_Attacks"] += v.get("Missed_Attacks", 0)
@@ -4121,16 +4306,15 @@ def generate_leaderboard_text(
                         aggregated[pid]["Defs_Count"] = aggregated[pid].get("Defs_Count", 0) + v.get("Defs_Count", 0)
                         aggregated[pid]["Wars_Count"] = len(aggregated[pid].get("_war_ids", set()) | month_war_ids)
                         aggregated[pid]["_war_ids"] |= month_war_ids
-                        # BUGFIX (2026-02-07): Always use latest month's TH level for multi-month aggregations
+                        # BUGFIX (2026-02-07): Always use latest period's TH level for multi-month aggregations
                         # This ensures players who upgrade TH mid-period show their current TH level
-                        if m >= aggregated[pid].get("_last_month", 0):
+                        if period_key >= aggregated[pid].get("_last_period_key", 0):
                             aggregated[pid]["TH_lvl"] = v.get("TH_lvl", aggregated[pid].get("TH_lvl", 0))
-                            aggregated[pid]["_last_month"] = m
-            all_month_labels.append(f"{m:02d}")  # type: ignore[misc]
-        # Clean up temporary war ID tracking and month tracking, then recompute derived metrics
+                            aggregated[pid]["_last_period_key"] = period_key
+        # Clean up temporary war ID tracking and period tracking, then recompute derived metrics
         for pid, agg in aggregated.items():
             agg.pop("_war_ids", None)
-            agg.pop("_last_month", None)
+            agg.pop("_last_period_key", None)
             defs = agg.get("Defs_Count", 0)
             agg["Stars_per_Def"] = (agg.get("Defensive_Stars", 0) / defs) if defs else 0.0
             agg["Def_Stars_per_War"] = agg["Stars_per_Def"]  # legacy alias
@@ -4142,10 +4326,8 @@ def generate_leaderboard_text(
             if cwl_season and len(cwl_season.split("-")) == 3:
                 # Dated mid-month CWL season (e.g. "2026-06-15"): show exact season key
                 month_label = f" for {cwl_season}"
-            elif len(months) > 1:
-                month_label = f" for {all_month_labels[0]}-{all_month_labels[-1]}/{year}"
             else:
-                month_label = f" for {all_month_labels[0]}/{year}"
+                month_label = f" for {_format_periods_label(periods)}"
         logging.debug(f"Unified aggregation complete. Total players: {len(stats_by_player)}")
     if not stats_by_player:
         _mode_short_labels: Dict[str, str] = {

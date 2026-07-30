@@ -1,6 +1,27 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-30 (1)
+- Added: `/leaderboard` new `scope` option ("all" default / "own") — "all" credits a player
+  currently rostered in a target clan for wars fought while registered to a clan that is no
+  longer tracked/subscribed (e.g. they switched clans mid-month); "own" restores the previous
+  per-clan-only behavior. New `get_player_attack_history_sync()` in db_manager.py queries
+  war_attacks by player_tag across all clan_tags (uses the existing idx_wa_player_tag index —
+  cost scales with roster size, not total history volume, so this shouldn't meaningfully slow
+  leaderboard generation even for large families).
+- Changed: `/leaderboard`'s `month` argument now accepts a range ("6-7"), a semicolon list
+  ("1;3;5"), or a trailing count ("-2" = last 2 months) in addition to a single month number.
+  The trailing-count form can cross a year boundary (e.g. "-2" in January covers December of
+  the previous year + January) — `generate_leaderboard_text()` / `calculate_leaderboard()` now
+  aggregate over explicit (month, year) pairs instead of a month list + one shared year, so this
+  is computed correctly instead of just being unsupported.
+  Files: qapbot/db_manager.py (get_player_attack_history_sync, get_war_summaries_sync clan_tag
+  now optional), QBhelperfunctions.py (calculate_leaderboard/generate_leaderboard_text scope +
+  period-pairs support, new parse_month_argument/_load_history_rows/_format_periods_label
+  helpers), QBdiscordcmds.py (/leaderboard command wiring), qapbot/translations/{en,de}.json.
+  Docs: qapbot/docs/DATABASE_ARCHITECTURE.md, qapbot/docs/CODE_STRUCTURE.md.
+  Tests: 1457 passed (up from 1425; +32 new tests for month parsing and scope="all"). pyright: 0 errors.
+
 2026-07-26 (19)
 - Fixed: `reconstruct --refresh-missing` never persisted what it fetched. `_refresh_groups_live`
   called get_clan() live for each "no fresh evidence" group's safe-rank candidate but only used

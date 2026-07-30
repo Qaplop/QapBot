@@ -655,7 +655,16 @@ _split_and_post_leaderboard_helper()
 
 └── Discord command handlers
     ├── /leaderboard
-    │   ├── Argument parsing (clan, mode, time)
+    │   ├── Argument parsing (clan, mode, time, scope)
+    │   │   ├── `month` accepts a single value ("6"), a range ("6-7"), a semicolon list
+    │   │   │   ("1;3;5"), or a trailing count ("-2" = last 2 months, may cross a year
+    │   │   │   boundary) — parsed by `parse_month_argument()` into (month, year) pairs
+    │   │   └── `scope`: "all" (default) credits a current clan member's stats even for wars
+    │   │       fought while registered to a clan no longer tracked/subscribed here; "own"
+    │   │       restores the previous per-clan-only behavior. Resolves the current roster via
+    │   │       `CACHE.coc_clan_cache.get_clan()` per target clan/family, then threads
+    │   │       `member_player_tags` through to `calculate_leaderboard(scope=...)` — see
+    │   │       DATABASE_ARCHITECTURE.md § 2026-07-30 for the cross-clan DB query.
     │   ├── await asyncio.to_thread(generate_leaderboard_text, ...)  ← offloads CPU chain to thread
     │   │   ├── calculate_leaderboard() (see above)
     │   │   └── render_leaderboard() 🟫
