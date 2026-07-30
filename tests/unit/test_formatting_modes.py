@@ -530,3 +530,90 @@ class TestFindOptimalSpaceCombination:
             result = _find_optimal_space_combination(cell, gap, target, text_display_width_float)
             result_width = text_display_width_float(result)
             assert result_width >= original_width
+
+
+# ---------------------------------------------------------------------------
+# render_leaderboard — highlight_player_ids (auto-highlight a player's own row)
+# ---------------------------------------------------------------------------
+
+class TestRenderLeaderboardHighlight:
+
+    @pytest.mark.smoke
+    def test_highlighted_row_wrapped_in_ansi_codes(self) -> None:
+        from qapbot.formatting import render_leaderboard, _ANSI_HIGHLIGHT, _ANSI_RESET
+
+        players = _stats_dict(
+            make_player_stats(tag="#P1", name="Alice", stars=6, attacks=2, defensive_stars=2, wars_count=1),
+            make_player_stats(tag="#P2", name="Bob", stars=4, attacks=2, defensive_stars=1, wars_count=1),
+        )
+        result = render_leaderboard(
+            clan_tag="#C", clan_name="Clan", month_label="", war_info_line="",
+            stats_by_player=players, mode="attack", highlight_player_ids={"#P1"},
+        )
+        lines = result.split("\n")
+        alice_line = next(l for l in lines if "Alice" in l)
+        bob_line = next(l for l in lines if "Bob" in l)
+        assert alice_line.startswith(_ANSI_HIGHLIGHT)
+        assert alice_line.endswith(_ANSI_RESET)
+        assert _ANSI_HIGHLIGHT not in bob_line
+        assert _ANSI_RESET not in bob_line
+
+    @pytest.mark.smoke
+    def test_no_highlight_set_means_no_ansi_codes(self) -> None:
+        from qapbot.formatting import render_leaderboard, _ANSI_HIGHLIGHT
+
+        players = _stats_dict(
+            make_player_stats(tag="#P1", name="Alice", stars=6, attacks=2, defensive_stars=2, wars_count=1),
+        )
+        result = render_leaderboard(
+            clan_tag="#C", clan_name="Clan", month_label="", war_info_line="",
+            stats_by_player=players, mode="attack",
+        )
+        assert _ANSI_HIGHLIGHT not in result
+
+    @pytest.mark.smoke
+    def test_terminal_style_never_gets_ansi_codes(self) -> None:
+        """Console/log output must stay plain even if a caller passes highlight_player_ids."""
+        from qapbot.formatting import render_leaderboard, _ANSI_HIGHLIGHT
+
+        players = _stats_dict(
+            make_player_stats(tag="#P1", name="Alice", stars=6, attacks=2, defensive_stars=2, wars_count=1),
+        )
+        result = render_leaderboard(
+            clan_tag="#C", clan_name="Clan", month_label="", war_info_line="",
+            stats_by_player=players, mode="attack", style="terminal",
+            highlight_player_ids={"#P1"},
+        )
+        assert _ANSI_HIGHLIGHT not in result
+
+    @pytest.mark.smoke
+    def test_highlight_works_in_grouped_by_th_mode(self) -> None:
+        """avgstarsbyth groups rows by TH level via a separate code path — must highlight there too."""
+        from qapbot.formatting import render_leaderboard, _ANSI_HIGHLIGHT
+
+        players = _stats_dict(
+            make_player_stats(tag="#P1", name="Alice", th=16, stars=6, attacks=2, defensive_stars=2, wars_count=1),
+            make_player_stats(tag="#P2", name="Bob", th=15, stars=4, attacks=2, defensive_stars=1, wars_count=1),
+        )
+        result = render_leaderboard(
+            clan_tag="#C", clan_name="Clan", month_label="", war_info_line="",
+            stats_by_player=players, mode="avgstarsbyth", highlight_player_ids={"#P1"},
+        )
+        lines = result.split("\n")
+        alice_line = next(l for l in lines if "Alice" in l)
+        bob_line = next(l for l in lines if "Bob" in l)
+        assert _ANSI_HIGHLIGHT in alice_line
+        assert _ANSI_HIGHLIGHT not in bob_line
+
+    @pytest.mark.smoke
+    def test_unmatched_highlight_id_leaves_everything_plain(self) -> None:
+        from qapbot.formatting import render_leaderboard, _ANSI_HIGHLIGHT
+
+        players = _stats_dict(
+            make_player_stats(tag="#P1", name="Alice", stars=6, attacks=2, defensive_stars=2, wars_count=1),
+        )
+        result = render_leaderboard(
+            clan_tag="#C", clan_name="Clan", month_label="", war_info_line="",
+            stats_by_player=players, mode="attack", highlight_player_ids={"#SOMEONE_ELSE"},
+        )
+        assert _ANSI_HIGHLIGHT not in result

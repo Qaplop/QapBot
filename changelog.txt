@@ -1,6 +1,25 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-30 (2)
+- Added: `/leaderboard` now auto-highlights the invoking user's own registered player(s) in the
+  rendered table — their row is bolded/colored via ANSI escape codes inside a ` ```ansi ` Discord
+  code block instead of a plain ` ``` ` block. Plain code blocks ignore all markdown/ANSI, and
+  `**bold**` markdown doesn't work inside a code block at all, so this is the only way to
+  highlight a row without breaking the table's monospace column alignment. Caveat: some older
+  mobile Discord clients don't render the ANSI codes and show the raw escape sequence as text
+  instead — there's no way to detect the client from the bot side, so this is an accepted
+  trade-off rather than something worth working around.
+  `render_leaderboard()` gained a `highlight_player_ids` param (formatting.py); wraps the
+  matching row(s) via `_ANSI_HIGHLIGHT`/`_ANSI_RESET`, restricted to style="discord" only.
+  `generate_leaderboard_text()` threads it through; QBdiscordcmds.leaderboard() resolves the
+  caller's player_tag(s) from `CACHE.user_accounts`. All leaderboard message fences in
+  `_split_and_post_leaderboard_helper()` switched from ` ``` ` to ` ```ansi ` (harmless no-op
+  when nothing is highlighted).
+  Files: qapbot/formatting.py, QBhelperfunctions.py, QBdiscordcmds.py.
+  Docs: qapbot/docs/CODE_STRUCTURE.md.
+  Tests: 1462 passed (up from 1457; +5 new tests for the highlight rendering). pyright: 0 errors.
+
 2026-07-30 (1)
 - Added: `/leaderboard` new `scope` option ("all" default / "own") — "all" credits a player
   currently rostered in a target clan for wars fought while registered to a clan that is no

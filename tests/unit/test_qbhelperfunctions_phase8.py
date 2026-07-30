@@ -182,6 +182,7 @@ def test_generate_leaderboard_text_multimonth_aggregates_and_renders(monkeypatch
         stats_by_player: Dict[str, Dict[str, Any]],
         mode: str,
         style: str = "discord",
+        **_kwargs: Any,
     ) -> str:
         _ = (clan_tag, war_info_line, mode, style)
         player = stats_by_player["#P1"]

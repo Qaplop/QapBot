@@ -665,13 +665,23 @@ _split_and_post_leaderboard_helper()
     │   │       `CACHE.coc_clan_cache.get_clan()` per target clan/family, then threads
     │   │       `member_player_tags` through to `calculate_leaderboard(scope=...)` — see
     │   │       DATABASE_ARCHITECTURE.md § 2026-07-30 for the cross-clan DB query.
+    │   ├── Resolves the invoking user's own registered player tag(s) from
+    │   │   `CACHE.user_accounts` and passes them as `highlight_player_ids` so their
+    │   │   row is auto-bolded in the rendered table (see render_leaderboard() below)
     │   ├── await asyncio.to_thread(generate_leaderboard_text, ...)  ← offloads CPU chain to thread
     │   │   ├── calculate_leaderboard() (see above)
     │   │   └── render_leaderboard() 🟫
+    │   │       └── wraps a highlighted row in ANSI bold/color escape codes (`_ANSI_HIGHLIGHT`
+    │   │           / `_ANSI_RESET` in formatting.py) — style="discord" only; requires the
+    │   │           message be posted in a ` ```ansi ` code block to actually render as color
+    │   │           (not every mobile Discord client renders it — falls back to raw escape text)
     │   ├── post_leaderboard_to_discord() 🟩
     │   │   ├── delete_leaderboard_messages_for_context() 🟩
     │   │   ├── calculate_content_hash() 🟦
     │   │   └── _split_and_post_leaderboard_helper() 🟩
+    │   │       └── all leaderboard code-block fences use the ` ```ansi ` language tag (not
+    │   │           plain ` ``` `) so the highlight above can render; harmless no-op when no
+    │   │           row is highlighted
     │   └── cwlinfo mode:
     │       ├── generate_cwlinfo_embeds() 🟩  (async, single embed per season; skill-factor call
     │       │   chain — _cwl_compute_skill_factors() → _load_skill_factors_for_clan() →

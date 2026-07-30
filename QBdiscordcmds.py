@@ -725,6 +725,15 @@ async def leaderboard(
                     logging.warning(f"[leaderboard scope=all] Failed to fetch roster for {ct}: {e}")
             member_tags_by_tag[tag] = roster
 
+    # Auto-highlight (bold, via ANSI code block) the invoking user's own registered
+    # player(s) in the rendered table, so they can spot themselves in a long list.
+    highlight_player_ids: Set[str] = set()
+    user_entry = CACHE.user_accounts.get(str(interaction.user.id))
+    if user_entry:
+        for p in user_entry.get('players', []):
+            if isinstance(p, dict) and p.get('player_tag'):
+                highlight_player_ids.add(p['player_tag'])
+
     # Generate and post leaderboards for requested targets
     for i, tag in enumerate(tags):
         is_family = tag in CACHE.clan_families
@@ -804,6 +813,7 @@ async def leaderboard(
                 generate_leaderboard_text, tag, month=period_month, year=period_year,
                 mode=per_tag_modes[i], cwl_season=cwl_season,
                 scope=scope, member_player_tags=member_tags_by_tag.get(tag),
+                highlight_player_ids=highlight_player_ids,
             )
             if interaction.channel and isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
                 await post_leaderboard_to_discord(text, tag, month=period_month, year=period_year, channel=interaction.channel, mode=per_tag_modes[i], cwl_season=cwl_season)

@@ -4189,6 +4189,7 @@ def generate_leaderboard_text(
     cwl_season: Optional[str] = None,
     scope: str = "own",
     member_player_tags: Optional[Set[str]] = None,
+    highlight_player_ids: Optional[Set[str]] = None,
 ) -> str:
     """
     Generate formatted leaderboard text for a clan or clan family.
@@ -4210,6 +4211,9 @@ def generate_leaderboard_text(
             target clan(s), even ones fought under a clan no longer tracked/subscribed
         member_player_tags: Current roster tags for the target clan(s); required
             for scope="all", ignored otherwise
+        highlight_player_ids: PlayerIDs to bold/color in the rendered table (style="discord"
+            only) — see render_leaderboard(). The caller must post the result inside a
+            ```ansi code block for the highlight to actually render.
 
     Returns:
         Formatted leaderboard text ready for Discord or terminal display
@@ -4358,7 +4362,7 @@ def generate_leaderboard_text(
         logging.debug("Leaderboard stats_by_player:")
         for pid, stats in stats_by_player.items():
             logging.debug(f"PlayerID: {pid}, Name: {stats.get('Player','')}, Stars: {stats.get('Stars',0)}, Attacks: {stats.get('Attacks',0)}, Missed_Attacks: {stats.get('Missed_Attacks',0)}, Defensive_Stars: {stats.get('Defensive_Stars',0)}, Wars_Count: {stats.get('Wars_Count',0)}, Def_Stars_per_War: {stats.get('Def_Stars_per_War',0.0)}")
-    return render_leaderboard(clan_tag, clan_name or "Unknown", month_label, war_info_line, stats_by_player, mode, style=style)
+    return render_leaderboard(clan_tag, clan_name or "Unknown", month_label, war_info_line, stats_by_player, mode, style=style, highlight_player_ids=highlight_player_ids)
 
 # --- Message key generation (single source of truth) ---
 
@@ -4458,7 +4462,7 @@ async def _split_and_post_leaderboard_helper(channel: Union[discord.TextChannel,
 
             if plain and code:
                 # Combine: plain text then code block in one message.
-                combined = plain + '\n```\n' + code + '\n```'
+                combined = plain + '\n```ansi\n' + code + '\n```'
                 if len(combined) <= DISCORD_MESSAGE_MAX_LENGTH:
                     combined_msg = await discord_retry(
                         lambda m=combined: channel.send(m),
@@ -4499,7 +4503,7 @@ async def _split_and_post_leaderboard_helper(channel: Union[discord.TextChannel,
 
     # If message is short enough, post directly without splitting logic
     DISCORD_LIMIT = DISCORD_MESSAGE_MAX_LENGTH
-    formatted_text = '```' + text + '```'
+    formatted_text = '```ansi\n' + text + '```'
     if len(formatted_text) <= DISCORD_LIMIT:
         msg = await discord_retry(
             lambda: channel.send(formatted_text),
@@ -4543,7 +4547,7 @@ async def _split_and_post_leaderboard_helper(channel: Union[discord.TextChannel,
     if not table_lines:
         # No table, just post header
         if header_content:
-            formatted_header = '```' + header_content + '```'
+            formatted_header = '```ansi\n' + header_content + '```'
             msg = await discord_retry(
                 lambda: channel.send(formatted_header),
                 "send_leaderboard_header"
@@ -4559,7 +4563,7 @@ async def _split_and_post_leaderboard_helper(channel: Union[discord.TextChannel,
         # Calculate base sizes
         header_size = len(header_content) if header_content else 0
         table_header_size = len(table_header) + len(table_separator) + 2 if table_header else 0  # +2 for newlines
-        code_block_overhead = 6  # ```...```
+        code_block_overhead = 11  # ```ansi\n ... ``` — tagged fence so ANSI highlight codes render
         safety_margin = 50  # Extra safety margin
         
         # First message: header + table header + as many players as fit
@@ -4588,7 +4592,7 @@ async def _split_and_post_leaderboard_helper(channel: Union[discord.TextChannel,
             first_content_parts.append(table_separator)  # type: ignore[misc]
         first_content_parts.extend(first_chunk_players)  # type: ignore[misc]
         
-        first_message = '```' + '\n'.join(first_content_parts) + '```'  # type: ignore[arg-type]
+        first_message = '```ansi\n' + '\n'.join(first_content_parts) + '```'  # type: ignore[arg-type]
         msg1 = await discord_retry(
             lambda: channel.send(first_message),
             "send_leaderboard_first_chunk"
@@ -4620,7 +4624,7 @@ async def _split_and_post_leaderboard_helper(channel: Union[discord.TextChannel,
                 remaining_players = remaining_players[len(chunk_players):]  # type: ignore[arg-type]
             
             # Build continuation message - just players, no headers
-            continuation_message = '```' + '\n'.join(chunk_players) + '```'  # type: ignore[arg-type]
+            continuation_message = '```ansi\n' + '\n'.join(chunk_players) + '```'  # type: ignore[arg-type]
             msg = await discord_retry(
                 lambda: channel.send(continuation_message),
                 f"send_leaderboard_continuation_{len(messages_posted)}"  # type: ignore[arg-type]

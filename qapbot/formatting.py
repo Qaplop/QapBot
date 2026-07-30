@@ -27,8 +27,16 @@ Integration:
 import unicodedata
 import math
 from wcwidth import wcwidth, wcswidth  # type: ignore[import-untyped]
-from typing import List, Dict, Any, Union, Callable, cast
+from typing import List, Dict, Any, Union, Callable, Optional, Set, cast
 import logging
+
+# ANSI escape codes for highlighting a row inside a Discord ```ansi code block.
+# Discord supports a small subset of ANSI SGR codes there (bold/underline + 8
+# foreground/8 background colors) — this is the only way to bold/color text
+# without breaking the table's monospace column alignment. Not rendered by
+# every mobile client (older ones show the raw escape sequence as text).
+_ANSI_HIGHLIGHT = "[1;33m"  # bold + yellow foreground
+_ANSI_RESET = "[0m"
 
 # MODE_REGISTRY contains leaderboard mode definitions with lambda sort functions
 # Type checker cannot infer types for lambda parameter 'p' (player dict), so we suppress warnings
@@ -621,6 +629,16 @@ def best_practice_player_cell(name: str, target_width: int) -> str:
     logging.debug(f"Final cell for '{name}': '{cell}', gap={gap}, width={width_float(cell)}")
     return cell
 
+def _highlight_row(row_text: str, player_id: str, highlight_player_ids: Optional[Set[str]], style: str) -> str:
+    """Wrap a rendered row in ANSI bold/color codes if its player is highlighted.
+
+    Only applies for style="discord" — "terminal" output (console/log display) never
+    gets ANSI codes injected, even if a caller passes highlight_player_ids for it.
+    """
+    if style == "discord" and highlight_player_ids and player_id in highlight_player_ids:
+        return f"{_ANSI_HIGHLIGHT}{row_text}{_ANSI_RESET}"
+    return row_text
+
 def render_leaderboard(
     clan_tag: str,
     clan_name: str,
@@ -629,7 +647,8 @@ def render_leaderboard(
     stats_by_player: Dict[str, Dict[str, Any]],
     mode: str,
     *,
-    style: str = 'discord'
+    style: str = 'discord',
+    highlight_player_ids: Optional[Set[str]] = None,
     ) -> str:
     """
     Render a complete leaderboard with dynamic column sizing and Unicode compatibility.
@@ -642,6 +661,9 @@ def render_leaderboard(
         stats_by_player (Dict[str, Dict[str, Any]]): Player stats dict from calculate_leaderboard/_merge_entries
         mode (str): Leaderboard mode identifier (e.g., "attack", "avgstars", "defense")
         style (str): Output style - "discord" (code blocks) or "terminal" (plain text)
+        highlight_player_ids: PlayerIDs to bold/color (via ANSI codes) in "discord" style;
+            ignored for "terminal" style. Requires the message be posted in a ```ansi
+            code block for the codes to render instead of showing as raw text.
     Returns:
         str: Formatted leaderboard text ready for display
     """
@@ -727,7 +749,7 @@ def render_leaderboard(
                 if len(cols) > 6:  # type: ignore[misc]
                     avg_dest = p.get("Avg_Dest_Pct", 0.0)  # type: ignore[misc]
                     row_parts.append(right_pad_number(f"{avg_dest:.1f}%", cols[6][1]))  # type: ignore[misc]
-                lines.append(" ".join(row_parts))
+                lines.append(_highlight_row(" ".join(row_parts), p.get("PlayerID", ""), highlight_player_ids, style))  # type: ignore[misc]
     else:
         # Original non-grouped rendering
         sorted_players = sorted(stats_by_player.values(), key=sort_key)  # type: ignore[arg-type]
@@ -783,6 +805,6 @@ def render_leaderboard(
                 if len(cols) > 6:
                     avg_dest = p.get("Avg_Dest_Pct", 0.0)
                     row_parts.append(right_pad_number(f"{avg_dest:.1f}%", cols[6][1]))
-            lines.append(" ".join(row_parts))
+            lines.append(_highlight_row(" ".join(row_parts), p.get("PlayerID", ""), highlight_player_ids, style))
     body = "\n".join(lines)
     return body
