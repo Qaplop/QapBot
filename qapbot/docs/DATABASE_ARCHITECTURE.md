@@ -690,7 +690,7 @@ re-check) rather than trusting them long-term.
   Tests: 1464 passed (up from 1462; +2 new tests — composite index exists + is chosen by the
   query planner via EXPLAIN QUERY PLAN). pyright: 0 errors.
 
-### 2026-07-30: Startup Hang Fix — Composite Index Build Moved to Background Task (Complete ✅)
+### 2026-07-30: Startup Hang Fix — Composite Index Build Moved to Background Task (SUPERSEDED — see next entry ⚠️)
 - Reported symptom: after the perf fix above shipped, the bot failed to start on prod at all —
   `❌ Startup login timed out after 60 seconds (includes DB init + CoC API authentication)`. Logs
   showed the hang starting right at `[DB-SCHEMA] Verifying war_attacks table + indexes...` with
@@ -734,6 +734,96 @@ re-check) rather than trusting them long-term.
   Tests: 1466 passed (up from 1464; +2 new — `build_expensive_indexes=False` skips only the
   composite index, and the background task actually builds it on both schemas after `initialize()`
   returns). pyright: 0 errors.
+
+### 2026-07-30: Startup Hang Fix, Take 2 — Composite Index Build Moved to `nightly_db_maintenance()` (SUPERSEDED — see next entry ⚠️)
+- The background-task fix above (fire-and-forget `asyncio.create_task`) shipped, and the bot
+  started correctly — but immediately afterward, live production logs showed PHASE-1's clan-fetch
+  writes failing en masse: `[DB-WRITE-THROUGH] Failed to persist clan #...: database is locked`,
+  cascading into `WarDataFetchError` for every affected clan.
+- Root cause: moving the build off the event loop via `asyncio.to_thread` only solved *that*
+  problem. `CREATE INDEX` is a write transaction that holds SQLite's single writer lock (even in
+  WAL mode, only one writer at a time) for its *entire* build — which thread runs it is irrelevant.
+  The background task opened its own raw connection with zero coordination with the rest of the
+  app: no pool drain, no `db_maintenance_mode` flag, nothing. It started building
+  `idx_wa_player_tag_date` on `history.war_attacks` at the exact moment `periodic_main()`'s
+  PHASE-1 was doing parallel live-clan-data writes for ~1555 clans — every one of those writes
+  hit the lock and failed once its (short, hot-path) `busy_timeout` expired.
+  **General lesson: `asyncio.to_thread`/a background task only keeps a blocking DB operation off
+  the event loop. It does nothing to stop that operation from locking out every other writer in
+  the app for its full duration — for anything that takes longer than a moment, that coordination
+  has to be explicit (pool drain / maintenance-mode flag / scheduled low-traffic window), not
+  assumed away by "it's a background task now".**
+- Fix: removed the background task entirely (and `_composite_index_build_task`). `initialize()`
+  now calls `_warn_if_composite_index_missing()` — a cheap **read-only** `sqlite_master` check
+  that only logs a warning if the index is missing, never writes anything. The actual
+  `CREATE INDEX` moved into `nightly_db_maintenance()`'s `_run()`, as a new "Step 1.5" right after
+  the WAL checkpoint and before REINDEX/VACUUM — the one place in this codebase that already:
+  1. `self._pool.drain(timeout=120)`s first — waits for in-flight sync workers to finish, then
+     makes new `pool.acquire()` calls raise a clean `RuntimeError` ("draining for maintenance")
+     instead of racing for the lock and failing with a raw `OperationalError`.
+  2. Sets `QBcore.db_maintenance_mode = True` — blocks Discord commands with a friendly message
+     for the duration.
+  This runs automatically on the next scheduled nightly maintenance. To build the index sooner
+  without waiting for that schedule, trigger maintenance manually via the `/admin` "Optimize DB"
+  action or `qapbot/scripts/run_db_maintenance_now.py` — both call the same
+  `nightly_db_maintenance()` method, during a time of your choosing rather than immediately after
+  a live restart.
+  Files: qapbot/db_manager.py.
+  Tests: 1467 passed (up from 1464 net; replaced the background-task test with
+  `test_initialize_never_builds_composite_index_itself` and added
+  `test_nightly_maintenance_builds_missing_composite_index`). pyright: 0 errors.
+
+### 2026-07-30: Startup Ordering Fix (Final) — DB Init Sequenced Strictly Before CoC Login (Complete ✅)
+- The maintenance-deferred fix above worked, but had a real usability cost: a fresh deploy
+  wouldn't get the leaderboard scope="all" perf benefit until the next scheduled nightly run (or
+  a manually-triggered one) — and it meant "ensure schema is fully up to date" was split across
+  two different code paths (`_create_schema()` for everything except this one index, and
+  `nightly_db_maintenance()` for this index alone) for no reason a future maintainer could infer
+  from either file in isolation.
+- **Root insight**: the actual danger was never "building this index inline" — it was that other
+  code (`periodic_main()`'s PHASE-1) was already writing to the DB concurrently by the time the
+  build ran. Fix the ordering, not the index.
+- Fix: added `QapBot.initialize_database()`, called as a new "Step 1.5" in `on_ready()` — strictly
+  BEFORE Step 2 (CoC login) and, since `periodic_main()` only starts later in the same
+  initialization sequence, strictly before any other code path in the app could possibly write to
+  the DB. It:
+  1. Calls `WarHistoryDB.initialize()` under its own `asyncio.wait_for(timeout=1800.0)` — 30
+     minutes, generous enough for a legitimately slow first-run migration, but bounded so a
+     genuinely stuck migration doesn't hang forever silently. This is now fully decoupled from the
+     CoC-login timeout, which stays a tight 60s in `on_ready()`'s Step 2 (pure API auth has no
+     legitimate reason to be slow).
+  2. Sets `QBcore.db_maintenance_mode = True` for the duration — the same flag
+     `nightly_db_maintenance()` already uses, so Discord commands get the existing friendly
+     "maintenance in progress" message instead of erroring. Discord's gateway connection is already
+     established by the time `on_ready()` runs (that's what triggers `on_ready()` in the first
+     place), so the bot still shows "online" throughout — only command *execution* is gated.
+  `startup_login()` had its DB-init block removed entirely — it's now purely CoC client
+  creation + login, decoupled from database concerns.
+- `idx_wa_player_tag_date` moved back inline into `_create_schema()` (main) and
+  `_create_history_schema()` (history) — built exactly the same way as every other index in this
+  codebase, with no special-casing. It's safe now purely because of *when* `initialize()` runs,
+  not because of anything clever inside `_create_schema()` itself. Logs the elapsed time only when
+  a build exceeds 5 seconds, so a normal (post-first-run) restart stays quiet.
+- Removed `nightly_db_maintenance()`'s "Step 1.5" create-if-missing block from the entry above —
+  redundant now that `initialize()` always guarantees the index exists before maintenance could
+  ever run. Maintenance's existing REINDEX loop (`major_indexes`, which already lists
+  `idx_wa_player_tag_date`) still periodically rebuilds it for fragmentation, same as any other
+  index — that's a distinct, ongoing concern from one-time creation.
+- `_create_history_schema_sync()`'s `build_expensive_indexes` flag (used by
+  `_SyncConnectionPool._create_conn()`, passed `False`) stays as a defensive measure: pool-fill
+  runs synchronously on the event-loop thread inside `initialize()`, and must never attempt this
+  build itself even though, in the current ordering, `_create_schema()`/`_create_history_schema()`
+  (which run first) always beat it to it.
+- **General lesson (kept from the previous entry, still the core takeaway)**: a background task
+  or `asyncio.to_thread` only keeps a blocking DB operation off the event loop — it does nothing to
+  stop that operation from locking out every other writer in the app for its full duration. The
+  only real fix for a rare-but-slow exclusive DB operation is controlling *when* it can run
+  relative to everything else that might write concurrently: either a dedicated, coordinated
+  maintenance window (drained pool + blocked commands), or — better when the trigger is "this
+  needs to exist before the app is fully useful anyway" — sequencing it before any concurrent
+  writer can exist in the first place.
+  Files: QapBot.py, qapbot/db_manager.py.
+  Tests: 1467 passed. pyright: 0 errors (QapBot.py, qapbot/db_manager.py).
 
 ### Future Phases
 **Not currently planned:**

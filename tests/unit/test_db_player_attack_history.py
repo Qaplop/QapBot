@@ -290,24 +290,63 @@ class TestCompositePlayerTagDateIndex:
         assert "idx_wa_player_tag" in names
         assert "idx_wa_clan_date" in names
 
-    async def test_background_task_builds_composite_index_after_initialize(self, tmp_path):
-        """initialize() must schedule (not await) the composite-index build.
+    async def test_initialize_builds_composite_index_on_both_schemas(self, tmp_path):
+        """Regression test for the 2026-07-30 startup incidents (two of them).
 
-        WarHistoryDB.initialize() is called inside startup_login()'s 60s login
-        timeout — it must return promptly regardless of table size. The actual
-        idx_wa_player_tag_date build happens in a fire-and-forget background
-        task; this test awaits that task explicitly and checks it did its job
-        on both main.* and history.*.
+        Attempt 1: built this index inline inside initialize(), awaited directly
+        inside startup_login()'s 60s login timeout — the first build on a huge
+        table took minutes and blew that budget (startup hang).
+        Attempt 2: moved the build to a fire-and-forget background task to dodge
+        the timeout — but CREATE INDEX holds SQLite's single writer lock for its
+        whole duration regardless of which thread runs it, so the uncoordinated
+        background write collided with live concurrent writes ("database is
+        locked" storm).
+        Final fix: QapBot.py's initialize_database() now calls initialize()
+        BEFORE CoC login and BEFORE periodic_main() can start any concurrent
+        writes, with its own generous (non-60s) timeout — so it's safe again for
+        initialize() to build this index inline, synchronously, same as any
+        other index. This test confirms it still does, on both schemas.
         """
         from qapbot.db_manager import WarHistoryDB
 
         db = WarHistoryDB()
-        db_path = str(tmp_path / "bg_test.db")
-        history_db_path = str(tmp_path / "bg_test_history.db")
+        db_path = str(tmp_path / "init_test.db")
+        history_db_path = str(tmp_path / "init_test_history.db")
         await db.initialize(db_path, history_db_path)
         try:
-            assert db._composite_index_build_task is not None
-            await db._composite_index_build_task
+            main_names = {
+                row[0] for row in sqlite3.connect(db_path).execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            }
+            hist_names = {
+                row[0] for row in sqlite3.connect(history_db_path).execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            }
+            assert "idx_wa_player_tag_date" in main_names
+            assert "idx_wa_player_tag_date" in hist_names
+        finally:
+            if db.conn:
+                await db.conn.close()
+
+    async def test_nightly_maintenance_reindexes_composite_index_without_error(self, tmp_path):
+        """nightly_db_maintenance() must handle idx_wa_player_tag_date cleanly.
+
+        The index is created by initialize() now (see test above), not by
+        maintenance — maintenance only REINDEXes indexes that already exist
+        (major_indexes list). This exercises that REINDEX path end-to-end and
+        confirms the index survives a full maintenance run (WAL checkpoint ->
+        REINDEX/VACUUM -> ANALYZE).
+        """
+        from qapbot.db_manager import WarHistoryDB
+
+        db = WarHistoryDB()
+        db_path = str(tmp_path / "maint_test.db")
+        history_db_path = str(tmp_path / "maint_test_history.db")
+        await db.initialize(db_path, history_db_path)
+        try:
+            await db.nightly_db_maintenance()
 
             main_names = {
                 row[0] for row in sqlite3.connect(db_path).execute(

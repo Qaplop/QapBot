@@ -183,11 +183,22 @@ the `(cwl_season, clan_tag)` PK-merge requirement on `cwl_league_groups`.
 
 The `coc.Client(key_count=10, throttler=coc.BatchThrottler, throttle_limit=100)` construction
 itself is documented in `../qapbot/docs/RATE_LIMITING_IMPLEMENTATION.md` (canonical source —
-don't duplicate its detail here). What's specific to this doc's scope is the rest of the
-startup sequence around it: once the client exists, it's stored in both `QBcore.coc_client`
-(back-compat) and `CACHE.coc_client`, then `CACHE.db_manager = WarHistoryDB()` is constructed
-and `await CACHE.db_manager.initialize(CONFIG.db_path)` runs — all guarded by
-`if QBcore.coc_client is None` so `startup_login()` is idempotent across reconnects.
+don't duplicate its detail here). Once the client exists, it's stored in both `QBcore.coc_client`
+(back-compat) and `CACHE.coc_client` — all guarded by `if QBcore.coc_client is None` so
+`startup_login()` is idempotent across reconnects.
+
+**Database init is a separate, earlier step (2026-07-30)**: `startup_login()` no longer touches
+the database at all. `on_ready()` calls `QapBot.initialize_database()` as its own "Step 1.5",
+strictly BEFORE the CoC-login step (`startup_login()`, wrapped in a 60s timeout) and before
+`periodic_main()` can start. This constructs `CACHE.db_manager = WarHistoryDB()` and awaits
+`initialize()` under its own generous 30-minute timeout, with `QBcore.db_maintenance_mode = True`
+for the duration (blocks Discord commands with the existing maintenance message; the gateway
+connection is already up, so the bot still shows online). See
+[DATABASE_ARCHITECTURE.md](DATABASE_ARCHITECTURE.md)'s "2026-07-30: Startup Ordering Fix (Final)"
+entry for why this ordering matters: it's what makes it safe for a rare, first-run-only slow
+schema migration (e.g. building a new index on a multi-million-row table) to run inline in
+`_create_schema()` without racing any concurrent DB writer or sharing a timeout budget with CoC
+login.
 
 **Location**: [qapbot/cache_manager.py](../cache_manager.py#L176)
 

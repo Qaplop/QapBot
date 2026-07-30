@@ -75,12 +75,15 @@ def _create_history_schema_sync(conn: Any, build_expensive_indexes: bool = True)
             — a composite index whose FIRST build on a multi-million-row
             production ``war_attacks`` table is a full table scan + sort that
             can take minutes. ``_SyncConnectionPool._create_conn()`` passes
-            False here because pool-fill runs synchronously on the event-loop
-            thread during ``initialize()``; building it there would freeze
-            the whole bot (not just time out a coroutine) for the full
-            build duration. ``WarHistoryDB.initialize()`` builds it exactly
-            once via a dedicated background task
-            (``_build_composite_indexes_background()``) instead — see there.
+            False here defensively: pool-fill runs synchronously on the
+            event-loop thread inside ``initialize()`` (plain blocking Python,
+            not awaited) — if it ever ran before ``_create_schema()``/
+            ``_create_history_schema()`` finish building this index (they run
+            first in the current ordering and always build it inline, see
+            those methods), attempting the build here too would freeze the
+            whole bot, not just time out a coroutine. Tests and standalone
+            migration/diagnostic scripts keep the default True — their DBs
+            are small/fresh, so building inline there is fine and expected.
     """
     conn.execute("""
         CREATE TABLE IF NOT EXISTS history.war_attacks (
@@ -274,9 +277,9 @@ class _SyncConnectionPool:
             conn.execute("PRAGMA history.journal_mode=WAL")
             conn.execute("PRAGMA history.synchronous=NORMAL")
             # build_expensive_indexes=False: pool-fill runs synchronously on the
-            # event-loop thread (see initialize()) — building idx_wa_player_tag_date
-            # here for the first time would freeze the whole bot, not just this
-            # coroutine. WarHistoryDB.initialize() builds it once in the background.
+            # event-loop thread (see initialize()) — see that flag's docstring above
+            # for why this stays False here defensively even though _create_schema()/
+            # _create_history_schema() (which run first) already build it inline.
             _create_history_schema_sync(conn, build_expensive_indexes=False)
         return conn
 
@@ -405,7 +408,6 @@ class WarHistoryDB:
         self._pool: Optional[_SyncConnectionPool] = None  # Created in initialize()
         self._global_stats_cache: Optional[Dict[str, int]] = None  # TTL cache — see get_global_db_statistics_sync
         self._global_stats_cache_ts: float = 0.0
-        self._composite_index_build_task: Optional['asyncio.Task[None]'] = None  # see _build_composite_indexes_background
 
     @property
     def _conn(self) -> Any:
@@ -1081,14 +1083,6 @@ class WarHistoryDB:
             self._initialized = True
             logging.info("[DB-INIT] Database initialized successfully")
 
-            # Fire-and-forget: build idx_wa_player_tag_date if missing. NOT awaited —
-            # its first build on a multi-million-row production table can take minutes,
-            # and initialize() must return promptly (it runs inside startup_login()'s
-            # 60s login timeout). See _build_composite_indexes_background() docstring.
-            self._composite_index_build_task = asyncio.create_task(
-                self._build_composite_indexes_background()
-            )
-
         except aiosqlite.Error as e:
             logging.error(f"[DB-INIT] Failed to initialize database: {e}")
             if self.conn:
@@ -1241,12 +1235,21 @@ class WarHistoryDB:
         # on this multi-million-row table is slow enough that it must only run during
         # nightly maintenance, never on every connection/startup.
         #
-        # NOT created inline here (unlike the other indexes above): the FIRST build on
-        # a multi-million-row production table is a full scan + sort that can take
-        # minutes, and this method is awaited directly inside startup_login()'s 60s
-        # login timeout — building it here caused a 2026-07-30 startup hang/timeout on
-        # prod. initialize() schedules _build_composite_indexes_background() instead,
-        # which builds it exactly once via a dedicated connection, off the critical path.
+        # Its FIRST build on a multi-million-row table is a full scan + sort that can
+        # take minutes — safe here (2026-07-30) because QapBot.py's initialize_database()
+        # now calls WarHistoryDB.initialize() strictly BEFORE CoC login and BEFORE
+        # periodic_main() starts, with its own generous timeout (not the tight 60s
+        # CoC-login one) and QBcore.db_maintenance_mode set — so nothing else can be
+        # concurrently writing to the DB while this builds, and a slow first build no
+        # longer shares a timeout budget with anything else. Every restart after the
+        # first is a cheap IF-NOT-EXISTS check.
+        _t0_idx = _time.monotonic()
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wa_player_tag_date ON war_attacks(player_tag, date)"
+        )
+        _idx_elapsed = _time.monotonic() - _t0_idx
+        if _idx_elapsed > 5.0:
+            logging.info(f"[DB-SCHEMA] idx_wa_player_tag_date (main) built in {_idx_elapsed:.1f}s (first run after schema change)")
 
         # ── war_summary: one row per war per actively tracked clan ──
         logging.info("[DB-SCHEMA] Verifying war_summary table + indexes...")
@@ -1376,6 +1379,7 @@ class WarHistoryDB:
         if not self.conn:
             raise RuntimeError("Database not initialized. Call initialize() first.")
 
+        import time as _time
         _attached = {row["name"] async for row in await self._conn.execute("PRAGMA database_list")}  # type: ignore[misc]
         if "history" not in _attached:
             logging.debug("[DB-SCHEMA] No 'history' schema attached — skipping history.* table creation")
@@ -1420,9 +1424,20 @@ class WarHistoryDB:
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS history.idx_wa_zero_attacks ON war_attacks(attack_order) WHERE attack_order = 0"
         )
-        # idx_wa_player_tag_date intentionally NOT created here — see the matching
-        # comment in _create_schema() (main.war_attacks section). Built once by
-        # _build_composite_indexes_background(), off the critical startup path.
+        # See the matching comment in _create_schema() (main.war_attacks section) for
+        # why building this here, inline, is safe: initialize_database() in QapBot.py
+        # sequences WarHistoryDB.initialize() strictly before CoC login and
+        # periodic_main(), so a slow first-time build here never races a concurrent
+        # writer and never shares a timeout budget with CoC login. This is the big
+        # table (history.war_attacks, potentially millions of rows) — the one most
+        # likely to actually take minutes on its first build.
+        _t0_idx_hist = _time.monotonic()
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS history.idx_wa_player_tag_date ON war_attacks(player_tag, date)"
+        )
+        _idx_hist_elapsed = _time.monotonic() - _t0_idx_hist
+        if _idx_hist_elapsed > 5.0:
+            logging.info(f"[DB-SCHEMA] idx_wa_player_tag_date (history) built in {_idx_hist_elapsed:.1f}s (first run after schema change)")
 
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS history.war_summary (
@@ -1493,83 +1508,6 @@ class WarHistoryDB:
                 league_group_id TEXT    NOT NULL
             )
         """)
-
-    async def _build_composite_indexes_background(self) -> None:
-        """Build ``idx_wa_player_tag_date`` on main.* and history.* if missing (one-time).
-
-        2026-07-30 incident: this composite index used to be created inline in
-        ``_create_schema()``/``_create_history_schema()``, awaited directly inside
-        ``initialize()`` — which itself runs inside ``startup_login()``'s 60s login
-        timeout. Its *first* build on a multi-million-row production ``war_attacks``
-        table is a full table scan + sort that can take several minutes, so the bot
-        never finished logging in and the whole process hung. Every subsequent
-        restart would have been fast (``IF NOT EXISTS`` is a cheap metadata check) —
-        it was purely the one-time build that blew the budget.
-
-        Fix: skip it in the awaited schema-creation path entirely and build it here
-        instead, via ``asyncio.to_thread`` on a dedicated plain ``sqlite3`` connection
-        (same pattern as ``run_nightly_maintenance()``'s ``_run()``). This task is
-        scheduled with ``asyncio.create_task`` (fire-and-forget) at the end of
-        ``initialize()``, so it never blocks bot startup — Discord login, cache
-        loading, etc. all proceed immediately. Queries that would benefit from the
-        index (e.g. leaderboard scope="all") simply fall back to the slower
-        ``idx_wa_player_tag`` single-column index until this finishes.
-
-        Best-effort: any failure is logged, not raised — this is a pure performance
-        optimization, never something that should crash or block the bot.
-        """
-        def _build() -> None:
-            import sqlite3 as _sq
-            import time as _time
-            import os as _os
-            assert self.db_path  # only scheduled from initialize(), after db_path is set
-            conn = _sq.connect(self.db_path, timeout=300)
-            try:
-                # Building this index requires an external sort over the whole table —
-                # same RAM profile as VACUUM. Use the same server-machine-safe pragmas as
-                # run_nightly_maintenance() (temp_store=FILE, modest cache_size) rather
-                # than the hot-path _apply_sync_pragmas (temp_store=MEMORY, 8 GB mmap),
-                # which risk an OOM kill on a memory-constrained server-machine.
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("PRAGMA cache_size=-131072")  # 128 MB
-                conn.execute("PRAGMA temp_store=FILE")
-                conn.execute(f"PRAGMA temp_store_directory='{_os.path.dirname(str(self.db_path))}'")
-                if self.history_db_path:
-                    conn.execute("ATTACH DATABASE ? AS history", (self.history_db_path,))
-                    conn.execute("PRAGMA history.journal_mode=WAL")
-                    conn.execute("PRAGMA history.synchronous=NORMAL")
-
-                _exists_main = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_wa_player_tag_date'"
-                ).fetchone()
-                if not _exists_main:
-                    logging.info("[DB-INIT] Building idx_wa_player_tag_date on main.war_attacks (one-time, background)...")
-                    _t0 = _time.monotonic()
-                    conn.execute("CREATE INDEX idx_wa_player_tag_date ON war_attacks(player_tag, date)")
-                    conn.commit()
-                    logging.info(f"[DB-INIT] idx_wa_player_tag_date (main) built in {_time.monotonic() - _t0:.1f}s")
-
-                if self.history_db_path:
-                    _exists_hist = conn.execute(
-                        "SELECT 1 FROM history.sqlite_master WHERE type='index' AND name='idx_wa_player_tag_date'"
-                    ).fetchone()
-                    if not _exists_hist:
-                        logging.info(
-                            "[DB-INIT] Building idx_wa_player_tag_date on history.war_attacks "
-                            "(one-time, background — this can take several minutes on a large table)..."
-                        )
-                        _t0 = _time.monotonic()
-                        conn.execute("CREATE INDEX history.idx_wa_player_tag_date ON war_attacks(player_tag, date)")
-                        conn.commit()
-                        logging.info(f"[DB-INIT] idx_wa_player_tag_date (history) built in {_time.monotonic() - _t0:.1f}s")
-            finally:
-                conn.close()
-
-        try:
-            await asyncio.to_thread(_build)
-        except Exception as e:
-            logging.warning(f"[DB-INIT] Background composite-index build failed (non-fatal, will retry next restart): {e}")
 
     async def _create_maindata_schema(self) -> None:
         """Create maindata tables (idempotent — safe to call on new and existing databases)."""

@@ -234,9 +234,63 @@ for _sig in (getattr(signal, 'SIGINT', None), getattr(signal, 'SIGTERM', None)):
 
 # --- Unique functions kept locally ---
 
+async def initialize_database() -> None:
+    """
+    Initialize the database (schema creation + any first-run index/schema migrations).
+
+    Runs once per process (guarded by ``CACHE.db_manager is None``), BEFORE CoC API
+    login and BEFORE the periodic update cycle (``periodic_main()``) starts. This is
+    a deliberate ordering, not incidental:
+
+    2026-07-30 incident history — two earlier attempts got this wrong:
+      1. DB init originally happened inside ``startup_login()``, itself wrapped in
+         ``asyncio.wait_for(..., timeout=60.0)`` in ``on_ready()``. A first-time schema
+         migration (a composite index build on a multi-million-row table) took minutes,
+         not seconds, and blew that 60s budget — the bot never finished starting.
+      2. Deferring the slow migration to a fire-and-forget background task solved the
+         timeout, but not the real problem: the migration still holds SQLite's single
+         writer lock for its whole duration, and running it with zero coordination
+         while ``periodic_main()``'s PHASE-1 was already doing live concurrent writes
+         caused a "database is locked" storm across the whole app.
+    Fix: DB init (including any slow migration) now runs to completion, sequenced
+    strictly BEFORE anything else in the app could possibly write to the DB —
+    ``periodic_main()`` and CoC login both happen after this returns. Discord's
+    gateway connection is already up by the time ``on_ready()`` runs, so the bot still
+    shows online; ``QBcore.db_maintenance_mode`` blocks Discord commands with the
+    existing friendly "maintenance in progress" message for the (normally instant,
+    occasionally multi-minute on a first run after a schema change) duration.
+
+    A generous 30-minute timeout guards against a genuinely stuck/hung migration
+    without constraining the CoC-login timeout, which stays a tight, separate 60s in
+    ``on_ready()`` — that one has no legitimate reason to ever be slow.
+    """
+    if CACHE.db_manager is not None:
+        return  # already initialized (e.g. duplicate on_ready invocation)
+
+    logging.info("💾 Initializing database (includes any pending first-run schema migrations)...")
+    QBcore.db_maintenance_mode = True
+    try:
+        from qapbot.db_manager import WarHistoryDB
+        db_manager = WarHistoryDB()
+        await asyncio.wait_for(
+            db_manager.initialize(CONFIG.db_path, CONFIG.history_db_path),
+            timeout=1800.0,
+        )
+        CACHE.db_manager = db_manager
+        logging.info(f"[DB] Database initialized at {CONFIG.db_path} (history: {CONFIG.history_db_path})")
+    except asyncio.TimeoutError:
+        logging.error("❌ Database initialization timed out after 30 minutes")
+        raise RuntimeError("Database initialization timed out - bot cannot start")
+    except Exception as e:
+        logging.error(f"[DB] Failed to initialize database: {e}")
+        raise RuntimeError("Database initialization failed - bot cannot start")
+    finally:
+        QBcore.db_maintenance_mode = False
+
+
 async def startup_login() -> None:
     """
-    Initialize and authenticate the Clash of Clans API client with BatchThrottler.
+    Authenticate the Clash of Clans API client with BatchThrottler.
 
     Behavior:
         - Creates coc.Client with BatchThrottler for true parallelization (10 req/sec)
@@ -244,6 +298,10 @@ async def startup_login() -> None:
         - Authenticates with CoC API
         - Stores client in CACHE for centralized API access
         - Ensures QBcore.coc_client is ready for backward compatibility
+
+    Database initialization happens separately, in ``initialize_database()``, called
+    before this function so its (occasionally slow, first-run-only) schema migrations
+    never share this function's tight login timeout — see that function's docstring.
 
     Rate Limiting:
         - Uses coc.py's BatchThrottler for efficient parallel request handling
@@ -259,7 +317,7 @@ async def startup_login() -> None:
         DEV Mode (DISCORD_GUILD_ID > 0):
         - COC_API_EMAIL_DEV: Clash of Clans API account email
         - COC_API_PASSWORD_DEV: Clash of Clans API account password
-        
+
         PROD Mode (DISCORD_GUILD_ID == 0):
         - COC_API_EMAIL: Clash of Clans API account email
         - COC_API_PASSWORD: Clash of Clans API account password
@@ -283,24 +341,13 @@ async def startup_login() -> None:
 
             # Store in CACHE for centralized access
             CACHE.coc_client = QBcore.coc_client
-        
-        # Initialize database manager (always required, even without CoC API)
-        try:
-            from qapbot.db_manager import WarHistoryDB
-            CACHE.db_manager = WarHistoryDB()
-            if CACHE.db_manager:  # type: ignore
-                await CACHE.db_manager.initialize(CONFIG.db_path, CONFIG.history_db_path)  # type: ignore
-                logging.info(f"[DB] Database initialized at {CONFIG.db_path} (history: {CONFIG.history_db_path})")
-        except Exception as e:
-            logging.error(f"[DB] Failed to initialize database: {e}")
-            raise RuntimeError("Database initialization failed - bot cannot start")
-        
+
         # Suppress verbose HTTP logging from coc.py library (403 Forbidden responses for private war logs)
         logging.getLogger('coc.http').setLevel(logging.WARNING) # set back to DEBUG/INFO for debugging if needed
         # Suppress PyNaCl voice warning from discord.py (we don't use voice features)
         logging.getLogger('discord.voice_client').setLevel(logging.ERROR)
         logging.getLogger('discord.player').setLevel(logging.ERROR)
-    
+
     # Login to CoC API (skip when NO_COC_API is set)
     if not CONFIG.no_coc_api:
         await QBcore.coc_client.login(CONFIG.coc_email, CONFIG.coc_password)  # type: ignore[union-attr]
@@ -2561,13 +2608,23 @@ async def on_ready() -> None:
         if QBcore.shutdown_event is None:  # type: ignore[misc]
             QBcore.shutdown_event = asyncio.Event()
             logging.info("✅ Created shutdown event")
-        
-        # Step 2: Authenticate with CoC API (initializes database first)
+
+        # Step 1.5: Initialize database FIRST, strictly before CoC login and before
+        # periodic_main() can possibly start. See initialize_database()'s docstring —
+        # this ordering is what keeps a rare, first-run-only slow schema migration
+        # (a) off the tight 60s CoC-login timeout below and (b) from ever racing with
+        # live concurrent DB writes, since nothing else touches the DB yet at this point.
+        try:
+            await initialize_database()
+        except Exception as e:
+            logging.error(f"❌ Error during database initialization: {e}")
+            return
+
+        # Step 2: Authenticate with CoC API (database already initialized above)
         if CONFIG.no_coc_api:
-            logging.info("🔐 [NO_COC_API] Skipping CoC API authentication, initializing database only...")
+            logging.info("🔐 [NO_COC_API] Skipping CoC API authentication...")
             try:
                 await asyncio.wait_for(startup_login(), timeout=60.0)
-                logging.info("✅ Database initialized (NO_COC_API mode)")
             except Exception as e:
                 logging.error(f"❌ Error during startup: {e}")
                 return
@@ -2577,14 +2634,14 @@ async def on_ready() -> None:
                 await asyncio.wait_for(startup_login(), timeout=60.0)
                 logging.info("✅ CoC API authentication completed")
             except asyncio.TimeoutError:
-                logging.error("❌ Startup login timed out after 60 seconds (includes DB init + CoC API authentication)")
+                logging.error("❌ CoC API login timed out after 60 seconds")
                 logging.error("🛑 Cannot continue without CoC API access")
                 return
             except Exception as e:
                 logging.error(f"❌ Error during CoC API login: {e}")
                 logging.error("🛑 Cannot continue without CoC API access")
                 return
-        
+
         # Step 3: Load cache data with timeout protection (database now initialized)
         logging.info("📂 Loading cache data...")
         try:
