@@ -80,7 +80,7 @@ _patch_coc_battle_modifiers()
 from qapbot.constants import SECONDS_PER_HOUR
 from qapbot.i18n import t  # type: ignore[attr-defined]
 
-BOT_VERSION: str = "1.2.89"
+BOT_VERSION: str = "1.2.90"
 
 # Discord bot configuration and initialization
 intents: discord.Intents = discord.Intents.default()
