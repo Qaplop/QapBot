@@ -261,3 +261,66 @@ class TestCompositePlayerTagDateIndex:
         ).fetchall()
         plan_text = " ".join(str(cell) for row in plan_rows for cell in row)
         assert "idx_wa_player_tag_date" in plan_text
+
+    def test_build_expensive_indexes_false_skips_composite_index_only(self, tmp_path):
+        """Regression test for the 2026-07-30 startup-hang incident.
+
+        _SyncConnectionPool._create_conn() passes build_expensive_indexes=False
+        because pool-fill runs synchronously on the event-loop thread during
+        initialize() — building idx_wa_player_tag_date there for the first time
+        (a full-table scan+sort on a multi-million-row prod table) blocked
+        Discord login past its 60s timeout. Everything else must still be created.
+        """
+        import sqlite3 as _sqlite3
+        from qapbot.db_manager import _create_history_schema_sync
+
+        conn = _sqlite3.connect(":memory:")
+        hist_path = str(tmp_path / "hist2.db")
+        conn.execute("ATTACH DATABASE ? AS history", (hist_path,))
+
+        _create_history_schema_sync(conn, build_expensive_indexes=False)
+
+        names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM history.sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        assert "idx_wa_player_tag_date" not in names
+        assert "idx_wa_player_tag" in names
+        assert "idx_wa_clan_date" in names
+
+    async def test_background_task_builds_composite_index_after_initialize(self, tmp_path):
+        """initialize() must schedule (not await) the composite-index build.
+
+        WarHistoryDB.initialize() is called inside startup_login()'s 60s login
+        timeout — it must return promptly regardless of table size. The actual
+        idx_wa_player_tag_date build happens in a fire-and-forget background
+        task; this test awaits that task explicitly and checks it did its job
+        on both main.* and history.*.
+        """
+        from qapbot.db_manager import WarHistoryDB
+
+        db = WarHistoryDB()
+        db_path = str(tmp_path / "bg_test.db")
+        history_db_path = str(tmp_path / "bg_test_history.db")
+        await db.initialize(db_path, history_db_path)
+        try:
+            assert db._composite_index_build_task is not None
+            await db._composite_index_build_task
+
+            main_names = {
+                row[0] for row in sqlite3.connect(db_path).execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            }
+            hist_names = {
+                row[0] for row in sqlite3.connect(history_db_path).execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            }
+            assert "idx_wa_player_tag_date" in main_names
+            assert "idx_wa_player_tag_date" in hist_names
+        finally:
+            if db.conn:
+                await db.conn.close()

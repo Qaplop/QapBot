@@ -1,6 +1,30 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-07-30 (4)
+- Fixed: bot failed to start on prod ("Startup login timed out after 60 seconds") — a direct
+  regression from (3) below. `idx_wa_player_tag_date` was created inline inside
+  `_create_schema()`/`_create_history_schema()`, awaited directly inside `initialize()`, which
+  itself runs inside `startup_login()`'s 60s login timeout. Its FIRST build on the multi-
+  million-row prod `history.war_attacks` table is a full table scan + sort that takes minutes,
+  not seconds — every restart after the first would have been instant (`IF NOT EXISTS` is a
+  cheap check), but that first build alone blew the login budget and the bot never came up.
+  Fix: stopped building this index inline on the awaited startup path entirely. Added
+  `WarHistoryDB._build_composite_indexes_background()`, scheduled via `asyncio.create_task`
+  (fire-and-forget, NOT awaited) at the end of `initialize()` — builds the index on a dedicated
+  `sqlite3` connection via `asyncio.to_thread`, using the same server-machine-safe pragmas as
+  `run_nightly_maintenance()` (temp_store=FILE, 128 MB cache — avoids the OOM-kill risk of the
+  hot-path pragmas' 8 GB mmap during a large external sort). Also added a
+  `build_expensive_indexes` flag to `_create_history_schema_sync()` (the sync/pool-fill helper),
+  defaulting True for tests/migrations but passed False from `_SyncConnectionPool._create_conn()`
+  — pool-fill runs synchronously on the event-loop thread, so it must never attempt this build
+  itself (that would freeze the whole process, not just time out a coroutine). Until the
+  background build finishes, scope="all" leaderboard queries simply fall back to the slower
+  `idx_wa_player_tag` single-column index — a temporary perf cost, never a correctness issue.
+  Files: qapbot/db_manager.py.
+  Docs: qapbot/docs/DATABASE_ARCHITECTURE.md.
+  Tests: 1466 passed (up from 1464; +2 new). pyright: 0 errors.
+
 2026-07-30 (3)
 - Fixed: `/leaderboard` with the new `scope="all"` default took minutes to respond on prod
   instead of the sub-second DB query expected. Two causes, both fixed:

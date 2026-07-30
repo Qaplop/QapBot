@@ -669,7 +669,9 @@ re-check) rather than trusting them long-term.
      outside the requested month. For a long-tenured player with a large history, multiplied by
      every player_tag in a family's roster, that's a lot of avoidable I/O.
      Fix: added composite index `idx_wa_player_tag_date(player_tag, date)` to both the main and
-     history `war_attacks` schemas (`_create_history_schema_sync`, both `initialize()` blocks).
+     history `war_attacks` schemas. **Note (2026-07-30, superseded below):** this was originally
+     built inline inside `initialize()`'s awaited schema-creation path — that caused a startup
+     hang on prod; see the entry below for the corrected background-build approach.
      The old single-column `idx_wa_player_tag` is deliberately **kept, not dropped** — `war_attacks`
      has ~5.6M rows, and `DROP INDEX` on a table that size is slow enough that it belongs in
      nightly maintenance, not something to run unconditionally on every connection open/startup
@@ -687,6 +689,51 @@ re-check) rather than trusting them long-term.
   QBdiscordcmds.py (parallel roster gather).
   Tests: 1464 passed (up from 1462; +2 new tests — composite index exists + is chosen by the
   query planner via EXPLAIN QUERY PLAN). pyright: 0 errors.
+
+### 2026-07-30: Startup Hang Fix — Composite Index Build Moved to Background Task (Complete ✅)
+- Reported symptom: after the perf fix above shipped, the bot failed to start on prod at all —
+  `❌ Startup login timed out after 60 seconds (includes DB init + CoC API authentication)`. Logs
+  showed the hang starting right at `[DB-SCHEMA] Verifying war_attacks table + indexes...` with
+  nothing further for the full 60s.
+- Root cause: `idx_wa_player_tag_date` (added above) was created via `await self._conn.execute(...)`
+  inside `_create_schema()`/`_create_history_schema()`, which are awaited synchronously inside
+  `WarHistoryDB.initialize()` — itself awaited inside `startup_login()`, which
+  `QapBot.py`'s `on_ready()` wraps in `asyncio.wait_for(..., timeout=60.0)`. Building this index
+  for the FIRST time on `history.war_attacks` (~5.6M rows) is a full table scan + sort that takes
+  minutes on server-machine/SATA storage — far more than the 60s login budget. Every subsequent
+  restart would have been instant (`CREATE INDEX IF NOT EXISTS` is a cheap metadata check once the
+  index exists) — it was purely the one-time build that broke startup.
+- Fix:
+  1. Removed the inline `CREATE INDEX ... idx_wa_player_tag_date` calls from `_create_schema()`
+     (main) and `_create_history_schema()` (history) entirely — these async methods no longer
+     touch this index at all.
+  2. Added `WarHistoryDB._build_composite_indexes_background()`: checks for the index on both
+     `main.*` and `history.*` (cheap `sqlite_master`/`history.sqlite_master` lookup) and builds
+     whichever is missing, using a dedicated plain `sqlite3` connection opened via
+     `asyncio.to_thread` — same pattern as `run_nightly_maintenance()`'s `_run()`. Uses the same
+     server-machine-safe pragmas as maintenance (`temp_store=FILE`, 128 MB `cache_size`) rather
+     than the hot-path pragmas (`temp_store=MEMORY`, 8 GB `mmap_size`) — building a composite
+     index over millions of rows needs an external sort, the same RAM profile as `VACUUM`, and the
+     hot-path pragmas risk the OOM-kill scenario already documented for `VACUUM` above.
+  3. `initialize()` schedules this via `asyncio.create_task(...)` (fire-and-forget, NOT awaited)
+     as its very last step, after the sync connection pool is built. `initialize()` therefore
+     returns immediately regardless of table size — Discord login, cache loading, and the rest of
+     `on_ready()` all proceed without waiting on the index build.
+  4. `_create_history_schema_sync()` (the sync/pool-fill helper, also used by tests and migration
+     scripts) gained a `build_expensive_indexes: bool = True` parameter.
+     `_SyncConnectionPool._create_conn()` passes `False`: pool-fill (`_fill()`) runs *synchronously
+     on the event-loop thread* inside `initialize()` (it's plain blocking Python, not awaited) — if
+     it tried to build this index too, the entire bot process would freeze for the full build
+     duration (worse than the original bug, which only broke one coroutine's timeout). Tests and
+     standalone migration/diagnostic scripts keep the default `True` — their DBs are small/fresh,
+     so building inline there is fine and expected.
+  - Correctness is unaffected either way: absence of the index just means queries fall back to the
+    slower `idx_wa_player_tag` single-column index (rowid-fetch + filter) until the background
+    build finishes — a temporary performance cost, never wrong results.
+  Files: qapbot/db_manager.py.
+  Tests: 1466 passed (up from 1464; +2 new — `build_expensive_indexes=False` skips only the
+  composite index, and the background task actually builds it on both schemas after `initialize()`
+  returns). pyright: 0 errors.
 
 ### Future Phases
 **Not currently planned:**

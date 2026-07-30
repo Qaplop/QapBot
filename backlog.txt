@@ -1,6 +1,8 @@
 Project Backlog, Improvement Ideas and General Remarks
 
 Immediate next steps:
+- Now we want to add a command /highlightme when issued in a channel where there are one or more leaderboards subscribed replace the existing leaderboards (delete and repost mechanism already implemented!) with a new version that has the calling user's player accounts highlighted. Only repost when the calling user is actually listed in a leaderboard and hence the highlighting takes effect. The command should be on time only meaning that when the update cycle updates the leaderboard again the highlighting is removed again. When the command is issued in a channel with no leaderboard subscribed or the calling user is not included in any subscribed leaderboards nothing happens except that the user gets a small ephemeral message pointing out that there is no leaderboard present or he is not included in any.
+
 - Add: Maintenance duration to /status and/or /admin Check Logs: 2026-07-18 12:30:58,132 [INFO] [NIGHTLY-MAINTENANCE] END — total duration 239.4s
 - Known lower-priority follow-up (not fixed,
   admin-only/rarely invoked, no crash risk): the `/admin` CWL-group-backfill
