@@ -1,6 +1,18 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-01 (6)
+- Fixed: `CacheManager.save_war_object()` (`qapbot/cache_manager.py`) wrote temp war JSON files
+  directly via `open(target_file, "w")`, which truncates to 0 bytes before any new content is
+  written — a disk-full or crash mid-write destroyed the previously-good file with nothing valid
+  left in its place. Confirmed as the cause of several corrupted temp war files found post-incident
+  (`[TEMP-WAR-LOAD] Failed to read ...` — some 0-byte, some truncated mid-JSON). Now writes to a
+  sibling `.tmp` file and `os.replace()`s it into place atomically, matching the existing pattern in
+  `persist_cwl_recovery_file()` (`QBhelperfunctions.py`) — a failed write now leaves the existing
+  good file untouched instead of corrupting it. `manage_war_files()`'s existing Rule 3 (archive any
+  file that still fails to parse) is unchanged and remains the safety net for genuine corruption.
+  Files: qapbot/cache_manager.py, qapbot/docs/WAR_FILE_MANAGEMENT_RULES.md. 1474 tests pass.
+
 2026-08-01 (5)
 - Fixed: a continuously-running bot would NOT automatically advance a chunked history migration one
   night at a time as expected — it would only ever auto-fire the migration ONCE per calendar month

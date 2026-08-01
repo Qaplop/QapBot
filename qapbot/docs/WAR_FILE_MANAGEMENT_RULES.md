@@ -248,7 +248,20 @@ For each matching war file (excluding current war file, if any):
 **Scenario**: File system error, incomplete save, encoding issue  
 **Detection**: JSON parse fails  
 **Handling**: Archive corrupted file (Rule 3)  
-**Result**: ✅ No retry loops, file archived for investigation
+**Result**: ✅ No retry loops, file archived for investigation  
+**2026-08-01 hardening**: `CacheManager.save_war_object()` previously wrote directly to the target
+file (`open(target_file, "w")`), which truncates to 0 bytes before a single byte of new content is
+written — a disk-full/crash mid-write left the file corrupted with the *previous good version
+already destroyed*. Confirmed as the cause of several corrupted temp files during the 2026-08-01
+disk-full incident (`[TEMP-WAR-LOAD] Failed to read ...: Expecting value: line 1 column 1 (char 0)`
+for total-loss files, `Unterminated string` / mid-line JSON errors for partial writes). Fixed to
+write to a sibling `.tmp` file and `os.replace()` into place atomically (same pattern already used
+by `persist_cwl_recovery_file()` in `QBhelperfunctions.py`) — a failed write now leaves the
+previously-good file completely untouched instead of destroying it. This doesn't change Case 5's
+detection/handling (still archived via Rule 3 if corruption ever does occur, e.g. mid-`.tmp`-write
+disk-full followed by an unrelated corruption of the swapped-in file), it just makes the specific
+failure mode that caused tonight's corruption far less likely to destroy already-good data going
+forward.
 
 ### Case 6: Missing Opponent Data
 **Scenario**: API returned partial data, network error during save  

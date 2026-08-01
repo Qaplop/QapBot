@@ -2620,10 +2620,29 @@ class CacheManager:
                 "attacks": [simple_attack(a) for a in getattr(coc_war_obj, "attacks", []) if a is not None]  # type: ignore[arg-type, misc]
             }
             
-            # Write to target file (temp or archive, based on earlier determination)
+            # Write to target file (temp or archive, based on earlier determination).
+            # Atomic write-to-tmp + os.replace() (same pattern as
+            # persist_cwl_recovery_file() in QBhelperfunctions.py) — added 2026-08-01
+            # after the disk-full incident corrupted several temp war files.
+            # open(target_file, "w") truncates the file to 0 bytes BEFORE writing a
+            # single byte of new content; if the write then fails partway (disk full,
+            # crash, etc.), the previously-good content is already destroyed with
+            # nothing valid left in its place. Writing to a sibling .tmp file first
+            # means a failed write leaves the existing good file completely untouched;
+            # os.replace() only swaps it in once the new content is fully and
+            # successfully written, and is atomic on the same filesystem/directory.
             _file_is_new = not os.path.exists(target_file)
-            with open(target_file, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
+            _tmp_target_file = target_file + ".tmp"
+            try:
+                with open(_tmp_target_file, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
+                os.replace(_tmp_target_file, target_file)
+            except Exception:
+                try:
+                    os.remove(_tmp_target_file)
+                except OSError:
+                    pass
+                raise
             
             # Cache the full war object payload so get_current_war_data() can
             # return it without re-reading the JSON from disk.
