@@ -2212,7 +2212,11 @@ async def admin(
         async def _run_optimize_and_reply() -> None:
             QBcore.db_maintenance_idle_event.clear()
             try:
-                _run_migration_opt = await is_monthly_migration_due()
+                # ignore_in_process_claim=True: a manual admin trigger should always be
+                # able to run "one more chunk" of a still-incomplete migration, regardless
+                # of what already auto-fired earlier in this bot process or what day of
+                # the month it is — see is_monthly_migration_due()'s docstring.
+                _run_migration_opt = await is_monthly_migration_due(ignore_in_process_claim=True)
                 result = await run_nightly_maintenance_routine(_db_mgr, _run_migration_opt)
                 try:
                     await interaction.followup.send(

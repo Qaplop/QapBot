@@ -34,6 +34,7 @@ Usage:
 """
 import argparse
 import asyncio
+import logging
 import os
 import sys
 
@@ -41,6 +42,16 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 
 from qapbot.config import CONFIG  # noqa: E402
 from qapbot.db_manager import WarHistoryDB  # noqa: E402
+
+# Standalone script — nothing else in this process configures a logging handler,
+# so without this, every logging.info() call inside nightly_db_maintenance()
+# (checkpoint/VACUUM/REINDEX/ANALYZE progress) is silently dropped. Same format
+# QapBot.py's own logging uses.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 
 
 async def _run(db_path: str, history_db_path: str) -> None:

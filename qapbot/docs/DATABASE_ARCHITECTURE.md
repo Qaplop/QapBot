@@ -877,6 +877,116 @@ re-check) rather than trusting them long-term.
   `qapbot/scripts/run_history_migration_now.py` (new), `qapbot/docs/CLAN_AND_WAR_CYCLE_ARCHITECTURE.md`
   (corrected stale claim). All existing tests pass (see changelog.txt for the count).
 
+### 2026-08-01 (same-day follow-up): Time-Budgeted Chunking — Migration No Longer Has To Finish In One Sitting
+- **Why**: the disk-full incident above got fixed, but recovery surfaced a second real problem —
+  once WAL growth stopped being the blocker, the sheer backlog size was: a live progress check
+  showed ~597 rows/sec sustained even on SSD, and ~22.9M `war_attacks` rows still remained after
+  the first 8.3M, projecting to ~10h40m to finish in one uninterrupted run. `monthly_history_migration()`
+  sets `db_maintenance_mode=True` for its entire duration, blocking all Discord commands — nobody
+  can hold a live production bot offline for half a day.
+- **Fix**: `monthly_history_migration()` gained a `time_budget_seconds` parameter (threaded through
+  `_migrate_table_batch_by_date()` / `_migrate_cwl_table_by_season()` as a `deadline` checked between
+  batches/seasons). When the deadline passes, the run stops cleanly — not an error — and returns a
+  `"[HIST-MIGRATE] PARTIAL"` result. Also added `batch_size` and `checkpoint_every_batches` as
+  first-class tunables (batch_size already existed; checkpoint_every_batches is new) so a one-off
+  recovery run with ample free disk can trade checkpoint overhead for throughput.
+  **Correctness note**: the "only mark done on success" fix from the entry above used to check
+  `not result.startswith("[HIST-MIGRATE] ERROR")` — that would have wrongly treated a PARTIAL result
+  as success (PARTIAL isn't an ERROR string either), silently disabling retry exactly like the
+  original bug. Replaced with a real `fully_completed: bool` threaded through from each table's
+  `(moved, completed)` return tuple — the `bot_metadata` "done" stamp is now gated on that boolean,
+  not on string-sniffing the result message. Covered by
+  `tests/unit/test_history_migration_time_budget.py`.
+- **Automatic-path safety**: without a bounded automatic path, simply restarting the bot mid-backlog
+  would immediately re-trigger an *unbounded* `monthly_history_migration()` via `QapBot.py`'s
+  standalone safety-net task (`is_monthly_migration_due()` re-hydrates as "not done" from
+  `bot_metadata` on every fresh process, and that check isn't gated by hour==3) — trading a manual
+  multi-hour block for an automatic one on every restart. New config
+  `CONFIG.history_migration_time_budget_minutes` (env `HISTORY_MIGRATION_TIME_BUDGET_MINUTES`,
+  default 90) is now passed to both automatic call sites in `QapBot.py`
+  (`run_nightly_maintenance_routine()`'s Step 0.5 and the standalone safety-net task), so any
+  automatic trigger is bounded the same way a manual one would be.
+- **Implementation gotcha worth remembering**: the deadline-check code initially used `_time.monotonic()`
+  (`_time` being `import time as _time` — the *same object identity* as the real `time` module, not a
+  copy). A test that monkeypatched `_time.monotonic` to a fake deterministic clock also silently
+  hijacked `asyncio`'s own event-loop scheduler (`base_events.py`'s `_run_once()` calls
+  `time.monotonic()` every iteration), producing wildly unpredictable extra ticks and a test that
+  measured "0 rows moved" instead of the expected partial progress. Fixed by adding a separate
+  module-level `_monotonic = _time.monotonic` reference used only by the migration deadline checks —
+  rebinding that name in a test affects only this code, not the shared `time` module. General lesson:
+  never monkeypatch an attribute on a module that's also relied on by the async runtime itself
+  (`time`, `asyncio`, etc.) — bind a local reference to patch instead.
+- **Not done automatically across nights yet**: `is_monthly_migration_due()`'s "claim" (setting
+  `CACHE.last_history_migration` the moment it returns due) still means the automatic path only
+  fires once per bot-process lifetime per month, even with `time_budget_seconds` now bounding each
+  individual firing. **Correction, same day (see next entry)**: this note originally said
+  `/admin Execute Nightly Maintenance` could be used to "advance to the next chunk" — that turned
+  out to be wrong as written: `/admin` called the same `is_monthly_migration_due()` with the same
+  claim behavior, so if an automatic trigger had already claimed the month in-process (e.g. right
+  after a restart), `/admin` would silently skip the migration step too, with no error. Fixed below.
+- Files: `qapbot/db_manager.py`, `qapbot/scripts/run_history_migration_now.py`, `qapbot/config.py`,
+  `QapBot.py`, `README.md`, `tests/unit/test_history_migration_time_budget.py` (new, 3 tests).
+  1470 tests pass.
+
+### 2026-08-01 (second same-day follow-up): `/admin` Can Now Force Another Migration Chunk On Demand
+- **Why**: after the mid-recovery VACUUM (this entry's predecessor), the operator asked whether
+  `/admin Execute Nightly Maintenance` could be used instead of restarting the bot to advance the
+  migration further while it kept serving Discord normally in between. It's wired to do exactly
+  that (`QBdiscordcmds.py` already called `run_nightly_maintenance_routine()` with
+  `is_monthly_migration_due()`'s result) — but tracing it through surfaced the bug in the entry
+  above: if the automatic safety-net had already claimed the month in-memory earlier in the same
+  bot process (very likely, since it fires within the first cycle after any restart while the
+  backlog remains), a subsequent `/admin` invocation would find `is_monthly_migration_due()` already
+  False and silently run archive-move + VACUUM/REINDEX/ANALYZE only, skipping the migration step
+  with no indication anything was skipped.
+- **Fix**: `is_monthly_migration_due()` gained an `ignore_in_process_claim: bool = False` parameter.
+  When True, it bypasses both the `day == 1` gate and the in-memory claim, re-deriving purely from
+  persisted `bot_metadata` — i.e. "is there NOT yet a recorded full completion for this calendar
+  month", full stop. `QBdiscordcmds.py`'s `/admin` handler now passes
+  `ignore_in_process_claim=True`. At the time this entry was first written, the two automatic paths
+  (scheduled nightly window, standalone safety-net in `periodic_main()`) were left unchanged — see
+  the next entry for why the scheduled path also needed this.
+  Tests: `tests/unit/test_is_monthly_migration_due.py` (new, 4 tests) — pins the bypass behavior and
+  confirms the automatic-path default is unchanged.
+- **Net result**: an operator can now run `/admin Execute Nightly Maintenance` repeatedly (any day,
+  any time) to advance a large migration in bounded (`CONFIG.history_migration_time_budget_minutes`)
+  chunks while the bot keeps running and serving other commands in between — no SSH/script/restart
+  needed for this path specifically, though the CLI script remains available for larger
+  batch-size/checkpoint-interval tuning on a dedicated recovery run.
+- Files: `QapBot.py` (`is_monthly_migration_due`), `QBdiscordcmds.py` (admin call site),
+  `tests/unit/test_is_monthly_migration_due.py` (new). 1474 tests pass.
+
+### 2026-08-01 (third same-day follow-up): Scheduled Nightly Path Now Auto-Advances the Migration Every Night
+- **Why**: the operator asked directly — "if I let the bot run from here, will it do one chunk per
+  night automatically until done?" The honest answer at that point was no. The scheduled 03:00 UTC
+  nightly task (`_maint_due`, gated on hour==3 + >20h since the last maintenance run — no day
+  restriction) already runs every single night regardless of day-of-month. But the migration step
+  within it used the DEFAULT `is_monthly_migration_due()` — gated on `day == 1` AND claimed
+  in-memory the first time it fires. So on a continuously-running bot process (no restarts), the
+  migration would only ever be triggered automatically ONCE per calendar month (whenever first
+  claimed — likely immediately after any restart via the standalone safety net), then silently never
+  again until day 1 of the following month, regardless of how much backlog remained.
+- **Fix**: the scheduled path's migration-due check now uses
+  `is_monthly_migration_due(ignore_in_process_claim=True)` — the same bypass added for `/admin` in
+  the entry above, reused here. This is safe specifically because the surrounding `if _maint_due`
+  block already has its own independent throttle (hour==3 AND >20h since last run), so re-deriving
+  "still not done this month" fresh from `bot_metadata` every night naturally caps at once per
+  night — no separate spam-guard needed. The standalone safety-net `elif` branch deliberately keeps
+  calling the DEFAULT (claiming) `is_monthly_migration_due()` as its own condition, unchanged — that
+  branch has no other throttle, and bypassing its claim too would make it re-fire on every ~5-minute
+  cycle for as long as backlog remains, reintroducing exactly the "block Discord for hours
+  continuously" problem the time-budget feature exists to prevent.
+- **Net result**: a bot left running continuously now genuinely advances the migration by one
+  bounded (`CONFIG.history_migration_time_budget_minutes`, default 90 min) chunk every night at
+  03:00 UTC, with no manual intervention required, until `bot_metadata` shows a full completion for
+  the current month — at which point it correctly stops firing on its own. Manual `/admin` triggers
+  (previous entry) remain available to advance faster than one chunk/night if desired.
+- Files: `QapBot.py` (`periodic_main()`'s migration-due call sites). 1474 tests pass (no new tests —
+  covered indirectly by the existing `is_monthly_migration_due()` bypass tests; the branching logic
+  itself is exercised by the existing `test_periodic_main_control.py` control-flow suite's pattern,
+  not duplicated here since `periodic_main()`'s full loop isn't unit-tested end-to-end — see that
+  file's module docstring).
+
 ### Future Phases
 **Not currently planned:**
 - Phase 4: Temp war stats (JSON → DB)

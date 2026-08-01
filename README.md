@@ -288,6 +288,7 @@ migration job moves data older than the retention window from hot to history —
 | `PROD_DATA_DIR` | Base directory for `data/`, `archive/`, and `archive_old/` — set this on prod to point to the external SSD. **Ignored in DEV mode even if set.** | No | *(bot root)* |
 | `DB_PATH` | Path to the hot SQLite database file (current + previous calendar month of war data) | No | `data/qapbot.db` |
 | `HISTORY_DB_PATH` | Path to the history SQLite database file (ATTACHed as schema `history`; everything older than `DB_PATH`'s retention window) | No | `data/qapbot_history.db` |
+| `HISTORY_MIGRATION_TIME_BUDGET_MINUTES` | Cap on a single *automatic* `monthly_history_migration()` run (scheduled nightly window + standalone safety-net path — not the manual `run_history_migration_now.py` CLI, which takes its own `--time-budget-minutes`). A capped run reports PARTIAL and keeps retrying on later nights instead of blocking Discord commands for however long a large backlog takes in one sitting. | No | `90` |
 
 ## 🏭 Production Environment
 

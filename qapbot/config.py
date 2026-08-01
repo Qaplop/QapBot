@@ -135,6 +135,13 @@ class BotConfig:
     # Database settings
     db_path: str = "data/qapbot.db"        # SQLite database file path (hot: current + previous calendar month)
     history_db_path: str = "data/qapbot_history.db"  # SQLite history database (ATTACHed as schema 'history'; everything older than db_path's window)
+    # Cap on a single automatic monthly_history_migration() run (QapBot.py's scheduled nightly
+    # window + standalone safety-net path only — NOT the manual run_history_migration_now.py CLI,
+    # which takes its own --time-budget-minutes). Added 2026-08-01: a first-ever run against a
+    # large backlog can take 10+ hours; without a cap, the automatic path would block Discord
+    # commands for the whole thing in one sitting. A capped run reports PARTIAL (not done), so
+    # is_monthly_migration_due() keeps retrying on later nights until the backlog is cleared.
+    history_migration_time_budget_minutes: float = 90.0
     
     # DEV-only: Skip CoC API connection entirely (for testing without valid API token)
     no_coc_api: bool = False
@@ -281,6 +288,10 @@ def load_config() -> BotConfig:
     # Database configuration
     db_path = os.getenv("DB_PATH", os.path.join(data_dir, "qapbot.db"))
     history_db_path = os.getenv("HISTORY_DB_PATH", os.path.join(data_dir, "qapbot_history.db"))
+    try:
+        history_migration_time_budget_minutes = float(os.getenv("HISTORY_MIGRATION_TIME_BUDGET_MINUTES", "90"))
+    except ValueError:
+        history_migration_time_budget_minutes = 90.0
     
     # DEV-only: Skip CoC API connection (for testing without valid API token)
     no_coc_api = os.getenv("NO_COC_API", "false").lower() in ("true", "1", "yes")
@@ -306,6 +317,7 @@ def load_config() -> BotConfig:
         investigate_dir=investigate_dir,
         db_path=db_path,
         history_db_path=history_db_path,
+        history_migration_time_budget_minutes=history_migration_time_budget_minutes,
         is_dev_mode=is_dev_mode,
         discord_guild_id=discord_guild_id,
         dev_playerregistration_channel_id=dev_playerregistration_channel_id,

@@ -363,9 +363,15 @@ ClashPerk embeds, not DB backup).
 
 - `WarHistoryDB._history_cutoff()` — computes the monthly migration cutoff.
 - `WarHistoryDB.monthly_history_migration()` — orchestrates the monthly migration. Every
-  `_MIGRATION_CHECKPOINT_INTERVAL_BATCHES` (20) batches, `_migrate_table_batch_by_date()` runs an
-  unqualified `PRAGMA wal_checkpoint(PASSIVE)` to bound WAL growth during the run — see the
-  2026-08-01 incident in `DATABASE_ARCHITECTURE.md`'s Migration History for why this exists.
+  `_MIGRATION_CHECKPOINT_INTERVAL_BATCHES` (20, overridable via `checkpoint_every_batches`) batches,
+  `_migrate_table_batch_by_date()` runs an unqualified `PRAGMA wal_checkpoint(PASSIVE)` to bound WAL
+  growth during the run — see the 2026-08-01 incident in `DATABASE_ARCHITECTURE.md`'s Migration
+  History for why this exists. Also accepts `time_budget_seconds`: stops cleanly (result prefixed
+  `"[HIST-MIGRATE] PARTIAL"`, not an error, not marked done) once the budget is spent, so a large
+  backlog can be chunked across multiple runs instead of blocking Discord commands for however long
+  it takes in one sitting — see the same-day follow-up entry in `DATABASE_ARCHITECTURE.md`.
+  `CONFIG.history_migration_time_budget_minutes` bounds the automatic (QapBot.py-triggered) paths;
+  `run_history_migration_now.py --time-budget-minutes N` bounds a manual CLI run.
 - `qapbot/scripts/run_db_maintenance_now.py` — CLI wrapper to trigger only
   `WarHistoryDB.nightly_db_maintenance()` on demand (WAL checkpoint → VACUUM/REINDEX → ANALYZE).
   **Correction (2026-08-01): this does NOT run the monthly migration** — `nightly_db_maintenance()`

@@ -1,6 +1,78 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-01 (5)
+- Fixed: a continuously-running bot would NOT automatically advance a chunked history migration one
+  night at a time as expected — it would only ever auto-fire the migration ONCE per calendar month
+  (whenever first claimed, typically immediately via the restart safety-net), then silently do
+  nothing further until day 1 of the following month, no matter how much backlog remained. Root
+  cause: the scheduled 03:00 UTC nightly task already runs every night (no day restriction), but its
+  migration-due check used the default `is_monthly_migration_due()`, gated on `day == 1` AND an
+  in-memory once-per-process claim. Found by directly answering an operator's question during the
+  ongoing 2026-08-01 incident recovery ("will it just do one chunk per night with no intervention?").
+  Fix: the scheduled path now calls `is_monthly_migration_due(ignore_in_process_claim=True)` (added
+  earlier today for `/admin`) — safe because the surrounding block already throttles to once/night
+  via `_maint_due`. The rare standalone safety-net fallback deliberately keeps the default (claiming)
+  check, since it has no other throttle and bypassing it too would make it re-fire every ~5-minute
+  cycle instead.
+  Net effect: a bot left running now genuinely completes a large migration backlog one bounded chunk
+  per night, fully unattended, on top of the `/admin`-triggered manual option from earlier today.
+  Files: QapBot.py. 1474 tests pass.
+
+2026-08-01 (4)
+- Fixed: `/admin Execute Nightly Maintenance` couldn't actually be used to advance a chunked
+  migration on demand, despite being wired to call it. `is_monthly_migration_due()` claims the
+  month in-memory the moment it returns True, and only fires once per bot-process lifetime — so if
+  the automatic safety-net had already claimed it earlier in the same process (very likely, it
+  fires within the first cycle after any restart while backlog remains), a later `/admin` invocation
+  would silently skip the migration step with no error, only running the VACUUM/REINDEX/ANALYZE
+  part. Found while answering an operator question during the ongoing 2026-08-01 (1)-(3) incident
+  recovery about using `/admin` instead of restarting the bot between chunks.
+  Added `ignore_in_process_claim: bool = False` to `is_monthly_migration_due()` — bypasses both the
+  `day == 1` gate and the in-memory claim, re-deriving purely from persisted `bot_metadata`.
+  `QBdiscordcmds.py`'s `/admin` handler now passes `ignore_in_process_claim=True`; the two automatic
+  paths (nightly window, standalone safety-net) are unchanged, so they still only auto-fire once per
+  process per month. Operators can now repeatedly trigger `/admin` to push a large migration forward
+  in bounded chunks while the bot keeps running normally in between.
+  Files: QapBot.py, QBdiscordcmds.py, tests/unit/test_is_monthly_migration_due.py (new, 4 tests).
+  1474 tests pass.
+
+2026-08-01 (3)
+- Added: `monthly_history_migration()` can now be time-budgeted and chunked instead of having to
+  finish in one sitting. Live incident recovery (2026-08-01 (1)/(2)) hit a second blocker after the
+  disk-full fix: the real backlog (~22.9M+ rows remaining) projected to ~10h40m even at healthy SSD
+  throughput — far too long to keep a live bot's Discord commands blocked. New `time_budget_seconds`
+  param (threaded through `_migrate_table_batch_by_date`/`_migrate_cwl_table_by_season` as a
+  `deadline`) stops cleanly, not as an error, once the budget is spent, returning a
+  "[HIST-MIGRATE] PARTIAL" result; the "mark done" gate is now a real `fully_completed` boolean
+  built from each table's `(moved, completed)` return, not a string-prefix check (the old
+  `not result.startswith("ERROR")` approach would have wrongly treated PARTIAL as success). Also
+  added `batch_size`/`checkpoint_every_batches` as CLI-tunable knobs on
+  `run_history_migration_now.py` for a faster one-off recovery run.
+  New `CONFIG.history_migration_time_budget_minutes` (env `HISTORY_MIGRATION_TIME_BUDGET_MINUTES`,
+  default 90) bounds the *automatic* trigger paths in QapBot.py too — without this, simply
+  restarting the bot mid-backlog would re-trigger an unbounded run via the standalone safety-net
+  task within the first cycle.
+  Also fixed a test-authoring gotcha found while covering this: monkeypatching `_time.monotonic`
+  (where `_time` is `import time as _time`, the same object as the real `time` module) also hijacks
+  asyncio's own event-loop clock, corrupting the test. Added an isolated `_monotonic` module-level
+  reference used only by the deadline checks.
+  Files: qapbot/db_manager.py, qapbot/scripts/run_history_migration_now.py, qapbot/config.py,
+  QapBot.py, README.md, qapbot/docs/DATABASE_ARCHITECTURE.md,
+  tests/unit/test_history_migration_time_budget.py (new). 1470 tests pass.
+
+2026-08-01 (2)
+- Fixed: `run_history_migration_now.py` and `run_db_maintenance_now.py` ran silently with zero
+  progress output — neither script (nor anything they import) configures a logging handler, so
+  every `logging.info()` call inside `monthly_history_migration()`/`nightly_db_maintenance()`
+  (including the per-batch "[HIST-MIGRATE] moved batch of 5000 rows" progress lines) was silently
+  dropped. Found live during tonight's incident recovery (2026-08-01 (1)) — a multi-hour resumed
+  migration run produced no visible output, making it impossible to tell slow-but-working apart
+  from stuck. Both scripts now call `logging.basicConfig(level=INFO, ...)` with the same
+  `%(asctime)s [%(levelname)s] %(message)s` format QapBot.py's own logging uses.
+  Files: qapbot/scripts/run_history_migration_now.py, qapbot/scripts/run_db_maintenance_now.py.
+  1467 tests pass.
+
 2026-08-01 (1)
 - Fixed: prod disk-full incident during tonight's first-ever `monthly_history_migration()` run
   (8.3M+ row backlog). Root cause: the migration disables `wal_autocheckpoint` on both DB schemas
