@@ -1678,7 +1678,9 @@ def _archive_move_nightly() -> None:
         _log.error(f"[ARCHIVE-MOVE] Failed: {_exc} — DB maintenance will still proceed")
 
 
-async def run_nightly_maintenance_routine(db_mgr: Any, run_migration: bool) -> str:
+async def run_nightly_maintenance_routine(
+    db_mgr: Any, run_migration: bool, migration_time_budget_seconds: Optional[float] = None
+) -> str:
     """
     Full nightly maintenance routine: Step 0 (archive file move) + Step 0.5
     (optional monthly hot->history migration) + Steps 1-3 (WAL checkpoint,
@@ -1694,6 +1696,16 @@ async def run_nightly_maintenance_routine(db_mgr: Any, run_migration: bool) -> s
         run_migration: Whether Step 0.5 (monthly_history_migration) should run
             this call. Callers decide this (e.g. day-of-month gate for the
             scheduled task; same gate re-checked for the admin command).
+        migration_time_budget_seconds: How long Step 0.5 may run for, if
+            run_migration is True. Defaults to
+            CONFIG.history_migration_time_budget_minutes * 60 (the scheduled
+            nightly task's budget) when not given. Added 2026-08-01 so the
+            /admin command — an interactive, user-awaited call, unlike the
+            fire-and-forget scheduled task — can pass a much shorter budget:
+            migration isn't /admin's purpose (the opportunistic per-cycle
+            chunking already carries the bulk of migration progress), and a
+            long migration wait risks the Discord interaction token expiring
+            (~15 min) before the reply can be sent.
 
     Returns:
         The nightly_db_maintenance() result string (for display to the caller).
@@ -1709,14 +1721,17 @@ async def run_nightly_maintenance_routine(db_mgr: Any, run_migration: bool) -> s
         # before the VACUUM/REINDEX pass below so the freed space from the
         # migration DELETEs is picked up by nightly_db_maintenance()'s
         # freelist-based VACUUM trigger in the same run.
-        # time_budget_seconds caps how long this can block Discord commands in
-        # one sitting (2026-08-01: an uncapped first-ever run against a large
+        # The budget caps how long this can block Discord commands in one
+        # sitting (2026-08-01: an uncapped first-ever run against a large
         # backlog took 10+ hours). A capped run reports PARTIAL, not done, so
-        # is_monthly_migration_due() keeps retrying on later nights.
+        # is_monthly_migration_due() keeps retrying later.
         if run_migration:
-            await db_mgr.monthly_history_migration(
-                time_budget_seconds=CONFIG.history_migration_time_budget_minutes * 60
+            _budget = (
+                migration_time_budget_seconds
+                if migration_time_budget_seconds is not None
+                else CONFIG.history_migration_time_budget_minutes * 60
             )
+            await db_mgr.monthly_history_migration(time_budget_seconds=_budget)
         # Steps 1-3: WAL checkpoint → REINDEX/VACUUM → ANALYZE (blocks
         # Discord commands internally via db_maintenance_mode).
         return await db_mgr.nightly_db_maintenance()
@@ -2190,12 +2205,13 @@ async def periodic_main() -> None:
                 # a large backlog can take several separate time-budgeted runs to finish,
                 # and a bot left running continuously (no restart) would otherwise only
                 # ever fire the migration once, then silently never again until next
-                # month's day 1. Uses ignore_in_process_claim=True here — safe because
-                # this whole block is already gated by _maint_due's own throttle (hour==3
-                # AND >20h since last maintenance run), so re-deriving "still not done
-                # this month" fresh every night naturally caps at once/night, same
-                # mechanism /admin Execute Nightly Maintenance uses to let an operator
-                # force a chunk on demand.
+                # month's day 1. _migration_due here uses ignore_in_process_claim=True —
+                # re-derives fresh from bot_metadata every cycle, no day-of-month
+                # restriction. Two consumers below with different cadences: the
+                # `if _maint_due` branch is itself throttled to once/night (hour==3 AND
+                # >20h since last run); the `elif` branch (opportunistic per-cycle chunk)
+                # is NOT further throttled here — it fires every cycle the migration is
+                # still due, bounded per-firing by history_migration_cycle_chunk_minutes.
                 _migration_due = await is_monthly_migration_due(ignore_in_process_claim=True)
                 if _maint_due and CACHE.db_manager is not None:
                     # Pre-set timestamp so a later cycle in the same 03:xx window does not
@@ -2215,25 +2231,38 @@ async def periodic_main() -> None:
                             QBcore.db_maintenance_idle_event.set()  # signal: maintenance done
 
                     asyncio.create_task(_nightly_maintenance_task())
-                elif await is_monthly_migration_due() and CACHE.db_manager is not None:
-                    # Deliberately the DEFAULT (claiming, once-per-process) due-check here,
-                    # NOT the ignore_in_process_claim one used above — this is a rare
-                    # fallback for "the 03:00 maintenance window didn't fire today for some
-                    # reason" and must NOT re-fire every ~5-minute cycle just because the
-                    # migration is still incomplete (unlike the block above, nothing else
-                    # throttles this branch's condition to once/night).
+                elif (
+                    _migration_due
+                    and CACHE.db_manager is not None
+                    and CONFIG.history_migration_cycle_chunk_minutes > 0
+                ):
+                    # Opportunistic per-cycle migration chunk — added 2026-08-01, same
+                    # incident as everything else above. Rather than only advancing the
+                    # migration once/night (or relying on a rare "the nightly window didn't
+                    # fire" safety net), spend up to history_migration_cycle_chunk_minutes of
+                    # the sleep phase's otherwise-idle time on migration whenever it's still
+                    # due — reuses the exact same asyncio.create_task() +
+                    # db_maintenance_idle_event gate machinery the sleep-wait below already
+                    # has, so the next cycle simply waits if this chunk runs long, same as it
+                    # already does for nightly maintenance. Uses the same
+                    # ignore_in_process_claim=True check as the block above (re-derives fresh
+                    # from bot_metadata every cycle, no day-of-month restriction), so this
+                    # supersedes the old once-per-process "safety net" entirely — it's now a
+                    # strict superset (fires on any day, any time, every cycle, not just as a
+                    # rare fallback). Self-limiting: once is_monthly_migration_due() reports
+                    # done, this branch's condition is simply False and costs nothing.
                     _db_mgr2 = CACHE.db_manager
 
-                    async def _standalone_migration_task() -> None:
+                    async def _cycle_migration_chunk_task() -> None:
                         QBcore.db_maintenance_idle_event.clear()
                         try:
                             await _db_mgr2.monthly_history_migration(
-                                time_budget_seconds=CONFIG.history_migration_time_budget_minutes * 60
+                                time_budget_seconds=CONFIG.history_migration_cycle_chunk_minutes * 60
                             )
                         finally:
                             QBcore.db_maintenance_idle_event.set()
 
-                    asyncio.create_task(_standalone_migration_task())
+                    asyncio.create_task(_cycle_migration_chunk_task())
 
                 # Subtract cycle duration from the configured interval so the
                 # wall-clock period between cycle starts stays constant.

@@ -1,6 +1,42 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-01 (8)
+- Fixed: `/admin Execute Nightly Maintenance` shared the same 90-minute migration budget
+  (`CONFIG.history_migration_time_budget_minutes`) as the fire-and-forget scheduled 03:00 UTC task,
+  via the common `run_nightly_maintenance_routine()`. Wrong for `/admin` specifically — it's an
+  interactive, user-awaited command whose job is the maintenance steps (checkpoint/VACUUM/REINDEX/
+  ANALYZE), not migration (the opportunistic per-cycle chunk already carries that automatically),
+  and a long migration wait risks the ~15-min Discord interaction token expiring before the reply
+  sends. `run_nightly_maintenance_routine()` gained an optional `migration_time_budget_seconds`
+  param (defaults to the scheduled task's existing 90-min value, unaffected); `/admin` now passes
+  a new, separate `CONFIG.history_migration_admin_budget_minutes` (env
+  `HISTORY_MIGRATION_ADMIN_BUDGET_MINUTES`, default 1 min).
+  Files: QapBot.py, QBdiscordcmds.py, qapbot/config.py, README.md, qapbot/docs/DATABASE_ARCHITECTURE.md.
+  1474 tests pass.
+
+2026-08-01 (7)
+- Added: opportunistic per-cycle history migration chunking, on top of today's other migration
+  fixes. Operator's idea — the update cycle already sleeps for the unused remainder of
+  SLEEP_INTERVAL after each cycle (~4-4.5 min idle out of 5 min by default); instead of leaving
+  that idle, spend it on the migration too when there's still backlog, using the exact same
+  time-budget machinery already built today. Replaced the old rare "standalone safety-net" branch
+  in `periodic_main()` with one that fires every cycle (not just once/process/month), bounded to
+  the new `CONFIG.history_migration_cycle_chunk_minutes` (env `HISTORY_MIGRATION_CYCLE_CHUNK_MINUTES`,
+  default 4) via the same asyncio.create_task()/db_maintenance_idle_event pattern already in use —
+  a strict superset of what the old safety net covered.
+  Trade-off (documented, not hidden): while real backlog remains, Discord commands are blocked
+  roughly chunk_minutes out of every SLEEP_INTERVAL cycle instead of once nightly — but total
+  backlog completion time drops by roughly an order of magnitude in exchange, and it's
+  self-limiting (costs nothing once the migration reports done, which routine future months should
+  hit within the first cycle or two). Set the env var to 0 to disable and keep only the once-a-night
+  cadence.
+  Also documented (no code change): a stale `bot_metadata` "done" stamp written by the pre-fix code
+  earlier tonight was blocking every automatic path from re-triggering even after today's fixes
+  were deployed — cleared manually via `DELETE FROM bot_metadata WHERE key = 'last_history_migration';`.
+  Files: QapBot.py, qapbot/config.py, README.md, qapbot/docs/DATABASE_ARCHITECTURE.md.
+  1474 tests pass.
+
 2026-08-01 (6)
 - Fixed: `CacheManager.save_war_object()` (`qapbot/cache_manager.py`) wrote temp war JSON files
   directly via `open(target_file, "w")`, which truncates to 0 bytes before any new content is

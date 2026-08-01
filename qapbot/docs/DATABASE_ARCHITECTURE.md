@@ -981,11 +981,93 @@ re-check) rather than trusting them long-term.
   03:00 UTC, with no manual intervention required, until `bot_metadata` shows a full completion for
   the current month — at which point it correctly stops firing on its own. Manual `/admin` triggers
   (previous entry) remain available to advance faster than one chunk/night if desired.
+  **Superseded same-day (see two entries below)**: the standalone safety-net branch described above
+  as deliberately unchanged was replaced entirely by a much better mechanism — turning "re-firing
+  every ~5-minute cycle" from a problem to avoid into the actual design.
 - Files: `QapBot.py` (`periodic_main()`'s migration-due call sites). 1474 tests pass (no new tests —
   covered indirectly by the existing `is_monthly_migration_due()` bypass tests; the branching logic
   itself is exercised by the existing `test_periodic_main_control.py` control-flow suite's pattern,
   not duplicated here since `periodic_main()`'s full loop isn't unit-tested end-to-end — see that
   file's module docstring).
+
+### 2026-08-01 (operational note, no code change): Stale Pre-Fix `bot_metadata` Stamp Blocked Every Automatic Path
+- After deploying the `ignore_in_process_claim` fix (two entries above) and restarting the bot
+  twice, the operator found the migration still wasn't auto-triggering via any path — scheduled
+  window, safety-net, or (had it been tried) `/admin`. Root cause: `bot_metadata["last_history_migration"]`
+  still held the value written by the *original pre-fix* failed run from earlier that night
+  (`2026-08-01T05:25:59Z`, written by the old unconditional-stamp code before any of today's fixes
+  existed). Every variant of `is_monthly_migration_due()` compares this stamp's year/month against
+  "now" — both August 2026 — so every path correctly-per-its-own-logic concluded "already done this
+  month" even though the real backlog was nowhere near finished.
+  **Lesson**: fixing the code that produces a bad value does not retroactively fix a bad value that
+  code already wrote before the fix was deployed. This exact stamp had been read and flagged as
+  evidence of the original bug much earlier the same night — the follow-up step of clearing it once
+  the fix landed was missed until the operator noticed the symptom (automatic paths silently doing
+  nothing) and asked directly.
+- **Manual fix applied**: `DELETE FROM bot_metadata WHERE key = 'last_history_migration';` run
+  directly against the live DB via `sqlite3` CLI (safe with the bot running — single statement,
+  well within `busy_timeout`). No code change — this is a one-time data correction, documented here
+  so a future incident with a similar shape (persisted "done" state written before a fix, not
+  cleared after) is recognized faster.
+
+### 2026-08-01 (fourth same-day follow-up): Opportunistic Per-Cycle Migration Chunking
+- **Why**: operator proposal — the update cycle already sleeps for the unused remainder of
+  `SLEEP_INTERVAL` after each cycle (~4-4.5 min idle out of a 5-min default interval, cycles
+  typically taking under a minute). Rather than only advancing the migration in one large chunk a
+  night (or relying on a rare safety net), spend that already-idle time on migration too, using the
+  exact same time-budget/chunking machinery already built for the other paths.
+- **Fix**: the old standalone safety-net `elif` branch (default `is_monthly_migration_due()`, fires
+  rarely, only once per process per month) was replaced with an opportunistic chunk branch: fires on
+  *every* cycle where `_migration_due` (the `ignore_in_process_claim=True` check computed once per
+  cycle, shared with the `if _maint_due` branch above it) is true, bounded to
+  `CONFIG.history_migration_cycle_chunk_minutes` (default 4 min) via the same
+  `asyncio.create_task()` + `QBcore.db_maintenance_idle_event` clear/set pattern the nightly-window
+  branch already uses — reuses 100% existing infrastructure, no new synchronization primitives.
+  Since the sleep-wait already runs concurrently with whatever background task was launched, and the
+  chunk is deliberately sized to usually finish within the idle window, the existing
+  `db_maintenance_idle_event` gate at the end of the sleep-wait mostly finds it already set (little
+  to no actual blocking of the *next* cycle) — restoring the validity of that gate's original "normally
+  already set" comment, which the once-a-night 90-minute chunks had been violating.
+  This branch is a strict superset of the safety net it replaced (fires on any day, any time, not
+  just as a rare once-a-month fallback), so nothing was lost by removing it.
+- **Trade-off, stated plainly**: while a real backlog remains, this means Discord commands
+  (`db_maintenance_mode`) are blocked for roughly `chunk_minutes` out of every `SLEEP_INTERVAL`
+  cycle — i.e. *mostly* blocked with brief ~cycle-duration windows of availability, rather than
+  *mostly* available with one longer nightly block. In exchange, total backlog completion time drops
+  roughly in proportion to how much of the idle window gets used (e.g. ~4 of ~5 idle minutes per
+  cycle vs. ~90 of ~1440 minutes per night is roughly an order of magnitude more throughput).
+  Self-limiting: once `is_monthly_migration_due()` reports done, the branch's condition is false and
+  it costs nothing — for routine future months (one month's worth of newly-aged-out data, not a
+  multi-year backlog), this will likely complete within the first cycle or two, making the
+  "mostly blocked" state last minutes, not days. Set `HISTORY_MIGRATION_CYCLE_CHUNK_MINUTES=0` to
+  disable and fall back to the once-a-night-only cadence if this trade-off isn't wanted.
+- Files: `QapBot.py` (`periodic_main()`), `qapbot/config.py` (new
+  `history_migration_cycle_chunk_minutes` + env var), `README.md`. 1474 tests pass (same rationale
+  as the entry above for no new dedicated test — `periodic_main()`'s loop isn't unit-tested
+  end-to-end).
+
+### 2026-08-01 (fifth same-day follow-up): `/admin` Migration Budget Decoupled From the Scheduled Nightly One
+- **Why**: operator noticed `run_nightly_maintenance_routine()` is shared verbatim between the
+  scheduled 03:00 UTC task and the `/admin` "Execute Nightly Maintenance" command — both were using
+  the same `CONFIG.history_migration_time_budget_minutes` (90 min) for the migration step. That's
+  fine for the fire-and-forget scheduled task, but wrong for `/admin`: it's an interactive,
+  user-awaited command whose actual purpose is the maintenance steps (WAL checkpoint / VACUUM /
+  REINDEX / ANALYZE), not migration progress — the opportunistic per-cycle chunk (entry above)
+  already carries the bulk of that automatically. A 90-minute wait on an interactive command is also
+  a functional risk: `QBdiscordcmds.py`'s own comment already notes the Discord interaction token
+  expires after ~15 minutes, so a long migration chunk risks the reply silently failing to send.
+- **Fix**: `run_nightly_maintenance_routine()` gained an optional `migration_time_budget_seconds`
+  parameter (defaults to the existing scheduled-nightly value when not given, so the scheduled
+  caller in `periodic_main()` is unaffected). The `/admin` handler now passes a new, separate,
+  much shorter budget: `CONFIG.history_migration_admin_budget_minutes` (env
+  `HISTORY_MIGRATION_ADMIN_BUDGET_MINUTES`, default 1 min).
+- **Net result**: `/admin Execute Nightly Maintenance` now stays fast and focused on its actual
+  job — a quick 1-minute migration nibble (if due) followed by the real maintenance steps — instead
+  of potentially hanging for up to 90 minutes on migration before the interaction can even be
+  replied to. The scheduled nightly task and the opportunistic per-cycle chunk are both unaffected.
+- Files: `QapBot.py` (`run_nightly_maintenance_routine`), `QBdiscordcmds.py` (admin call site),
+  `qapbot/config.py` (new `history_migration_admin_budget_minutes` + env var), `README.md`.
+  1474 tests pass.
 
 ### Future Phases
 **Not currently planned:**

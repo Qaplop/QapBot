@@ -135,13 +135,33 @@ class BotConfig:
     # Database settings
     db_path: str = "data/qapbot.db"        # SQLite database file path (hot: current + previous calendar month)
     history_db_path: str = "data/qapbot_history.db"  # SQLite history database (ATTACHed as schema 'history'; everything older than db_path's window)
-    # Cap on a single automatic monthly_history_migration() run (QapBot.py's scheduled nightly
-    # window + standalone safety-net path only — NOT the manual run_history_migration_now.py CLI,
-    # which takes its own --time-budget-minutes). Added 2026-08-01: a first-ever run against a
-    # large backlog can take 10+ hours; without a cap, the automatic path would block Discord
-    # commands for the whole thing in one sitting. A capped run reports PARTIAL (not done), so
-    # is_monthly_migration_due() keeps retrying on later nights until the backlog is cleared.
+    # Cap on the scheduled nightly window's monthly_history_migration() run (QapBot.py's
+    # 03:00 UTC path only — NOT the manual run_history_migration_now.py CLI, which takes its
+    # own --time-budget-minutes, and not the per-cycle chunk below). Added 2026-08-01: a
+    # first-ever run against a large backlog can take 10+ hours; without a cap, the automatic
+    # path would block Discord commands for the whole thing in one sitting. A capped run
+    # reports PARTIAL (not done), so is_monthly_migration_due() keeps retrying.
     history_migration_time_budget_minutes: float = 90.0
+    # Opportunistic per-cycle migration chunk (added 2026-08-01, same incident): rather than
+    # only advancing the migration once/night, spend up to this many minutes of the otherwise-
+    # idle sleep window (between update cycles, ~4-4.5 min of a 5-min SLEEP_INTERVAL by
+    # default) on migration whenever it's still due. Self-limiting — once
+    # is_monthly_migration_due() reports done, this does nothing, so it costs nothing during
+    # routine months where each month's backlog is small enough to finish in one or two cycles.
+    # During an active large backlog it dominates the idle window (Discord commands blocked
+    # most of the time, not just briefly) in exchange for finishing far faster than
+    # once-a-night chunking alone. Set to 0 to disable (falls back to the once-a-night
+    # scheduled-window chunk only). Keep below the typical idle window (SLEEP_INTERVAL minus
+    # typical cycle duration) so the gate at the end of the sleep-wait rarely actually blocks.
+    history_migration_cycle_chunk_minutes: float = 4.0
+    # Cap on Step 0.5's migration run specifically for the /admin "Execute Nightly Maintenance"
+    # command (added 2026-08-01) — deliberately much shorter than
+    # history_migration_time_budget_minutes. /admin is an interactive, user-awaited command
+    # (Discord interaction token expires after ~15 min); migration progress isn't its purpose
+    # (the per-cycle chunk above already carries the bulk of it) — this just takes a quick
+    # nibble so the command stays fast and focused on the actual maintenance steps
+    # (WAL checkpoint / VACUUM / REINDEX / ANALYZE).
+    history_migration_admin_budget_minutes: float = 1.0
     
     # DEV-only: Skip CoC API connection entirely (for testing without valid API token)
     no_coc_api: bool = False
@@ -292,7 +312,15 @@ def load_config() -> BotConfig:
         history_migration_time_budget_minutes = float(os.getenv("HISTORY_MIGRATION_TIME_BUDGET_MINUTES", "90"))
     except ValueError:
         history_migration_time_budget_minutes = 90.0
-    
+    try:
+        history_migration_cycle_chunk_minutes = float(os.getenv("HISTORY_MIGRATION_CYCLE_CHUNK_MINUTES", "4"))
+    except ValueError:
+        history_migration_cycle_chunk_minutes = 4.0
+    try:
+        history_migration_admin_budget_minutes = float(os.getenv("HISTORY_MIGRATION_ADMIN_BUDGET_MINUTES", "1"))
+    except ValueError:
+        history_migration_admin_budget_minutes = 1.0
+
     # DEV-only: Skip CoC API connection (for testing without valid API token)
     no_coc_api = os.getenv("NO_COC_API", "false").lower() in ("true", "1", "yes")
 
@@ -318,6 +346,8 @@ def load_config() -> BotConfig:
         db_path=db_path,
         history_db_path=history_db_path,
         history_migration_time_budget_minutes=history_migration_time_budget_minutes,
+        history_migration_cycle_chunk_minutes=history_migration_cycle_chunk_minutes,
+        history_migration_admin_budget_minutes=history_migration_admin_budget_minutes,
         is_dev_mode=is_dev_mode,
         discord_guild_id=discord_guild_id,
         dev_playerregistration_channel_id=dev_playerregistration_channel_id,

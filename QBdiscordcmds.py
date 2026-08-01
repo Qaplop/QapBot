@@ -2217,7 +2217,17 @@ async def admin(
                 # of what already auto-fired earlier in this bot process or what day of
                 # the month it is — see is_monthly_migration_due()'s docstring.
                 _run_migration_opt = await is_monthly_migration_due(ignore_in_process_claim=True)
-                result = await run_nightly_maintenance_routine(_db_mgr, _run_migration_opt)
+                # Short budget (default 1 min, not the 90-min scheduled-nightly one) — this
+                # is an interactive, user-awaited command whose actual purpose is the
+                # maintenance steps (checkpoint/VACUUM/REINDEX/ANALYZE), not migration
+                # progress (the opportunistic per-cycle chunk already carries that); a long
+                # migration wait here also risks the Discord interaction token (~15 min)
+                # expiring before the reply can be sent.
+                result = await run_nightly_maintenance_routine(
+                    _db_mgr,
+                    _run_migration_opt,
+                    migration_time_budget_seconds=CONFIG.history_migration_admin_budget_minutes * 60,
+                )
                 try:
                     await interaction.followup.send(
                         f"✅ **Nightly maintenance complete.**\n```\n{result}\n```",
