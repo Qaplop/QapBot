@@ -5764,6 +5764,13 @@ class WarHistoryDB:
             cutoff = first_of_this_month.replace(month=first_of_this_month.month - 1)
         return cutoff.isoformat(), cutoff.strftime("%Y-%m")
 
+    # Batches between periodic mid-migration WAL checkpoints (see
+    # _migrate_table_batch_by_date). 20 batches * 5000 rows/batch = 100K rows
+    # of slack between checkpoints — bounds WAL growth to a small, safe amount
+    # even across a multi-hour migration, without checkpointing so often that
+    # it reintroduces per-batch random-I/O stalls.
+    _MIGRATION_CHECKPOINT_INTERVAL_BATCHES = 20
+
     async def _migrate_table_batch_by_date(self, table: str, cutoff_date: str, batch_size: int) -> int:
         """Move rows with ``date < cutoff_date`` from ``main.<table>`` to ``history.<table>``.
 
@@ -5775,8 +5782,21 @@ class WarHistoryDB:
         Assumes the table has an ``id INTEGER PRIMARY KEY AUTOINCREMENT``
         column (true for ``war_attacks`` and ``war_summary``) and a ``date``
         column holding an ISO-ish, lexicographically-sortable string.
+
+        Every ``_MIGRATION_CHECKPOINT_INTERVAL_BATCHES`` batches, runs a
+        ``PASSIVE`` WAL checkpoint (unqualified — covers both ``main`` and
+        ``history``, same as ``nightly_db_maintenance()``). Without this, the
+        caller's ``wal_autocheckpoint=0`` (set for the whole migration) means
+        the WAL never shrinks for the entire run — on 2026-08-01 a
+        first-ever migration of 8M+ rows ran for ~4h45m uncheckpointed and
+        grew both WAL files to fill the disk (287 GB + 103 GB), aborting the
+        migration and then failing every other DB write for the rest of the
+        night. A periodic PASSIVE checkpoint (non-blocking, safe to run
+        mid-transaction-series) keeps the WAL bounded to ~100K rows' worth of
+        changes regardless of total migration size.
         """
         total_moved = 0
+        batches_since_checkpoint = 0
         while True:
             cur = await self._conn.execute(
                 f"SELECT id FROM main.{table} WHERE date < ? ORDER BY id LIMIT ?",
@@ -5806,6 +5826,13 @@ class WarHistoryDB:
                 self._write_lock.release()
             total_moved += len(ids)
             logging.info(f"[HIST-MIGRATE] {table}: moved batch of {len(ids)} rows (total {total_moved})")
+            batches_since_checkpoint += 1
+            if batches_since_checkpoint >= self._MIGRATION_CHECKPOINT_INTERVAL_BATCHES:
+                batches_since_checkpoint = 0
+                try:
+                    await self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except Exception as _ckpt_ex:
+                    logging.warning(f"[HIST-MIGRATE] Periodic mid-migration checkpoint failed: {_ckpt_ex}")
         return total_moved
 
     async def _migrate_cwl_table_by_season(self, table: str, cutoff_month: str) -> int:
@@ -5942,14 +5969,23 @@ class WarHistoryDB:
                 _qbcore.db_maintenance_mode = False
                 logging.info("[HIST-MIGRATE] db_maintenance_mode=False — Discord commands unblocked")
 
-        try:
-            import datetime as _dt2
-            await self.set_bot_metadata(
-                "last_history_migration",
-                _dt2.datetime.now(_dt2.timezone.utc).isoformat(),
-            )
-        except Exception as _meta_ex:
-            logging.warning(f"[HIST-MIGRATE] Could not persist migration timestamp: {_meta_ex}")
+        # Only stamp "done for this month" on an actual success. Persisting this
+        # unconditionally (the pre-2026-08-01-incident behaviour) marks a run that
+        # errored out partway (e.g. mid-migration disk-full) as fully complete —
+        # is_monthly_migration_due() then skips retrying for the rest of the month,
+        # silently stranding whatever hadn't been moved yet with no automatic
+        # retry. The migration itself is naturally resumable (each batch re-selects
+        # remaining rows below the cutoff), so simply not claiming success lets the
+        # next due check (or a manual re-run) pick up exactly where it left off.
+        if not result.startswith("[HIST-MIGRATE] ERROR"):
+            try:
+                import datetime as _dt2
+                await self.set_bot_metadata(
+                    "last_history_migration",
+                    _dt2.datetime.now(_dt2.timezone.utc).isoformat(),
+                )
+            except Exception as _meta_ex:
+                logging.warning(f"[HIST-MIGRATE] Could not persist migration timestamp: {_meta_ex}")
 
         return result
 

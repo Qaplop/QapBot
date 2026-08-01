@@ -825,6 +825,58 @@ re-check) rather than trusting them long-term.
   Files: QapBot.py, qapbot/db_manager.py.
   Tests: 1467 passed. pyright: 0 errors (QapBot.py, qapbot/db_manager.py).
 
+### 2026-08-01: Disk-Full Incident During First-Ever Monthly Migration — WAL Growth Bounded (Complete ✅)
+- **Incident**: The 2026-08-01 03:00 UTC nightly window ran `monthly_history_migration()` for the
+  first time against the full accumulated `war_attacks` backlog (~8.3M+ rows past the July cutoff,
+  never migrated before this feature existed at this scale). The migration sets
+  `PRAGMA wal_autocheckpoint=0` on both `main` and `history` for the *entire* run (by design, to
+  avoid random-I/O stalls from checkpointing every 5000-row batch), restoring it + running one
+  `wal_checkpoint(PASSIVE)` only in the `finally` block at the very end. For a run that finishes in
+  minutes this is fine; for the first run against an 8M+-row backlog it took ~4h45m
+  (02:00:29→06:44:54) and never checkpointed once in that window — both WAL files grew unbounded
+  the entire time until the volume hit 0 bytes free (`qapbot.db-wal` reached 287.9 GB,
+  `qapbot_history.db-wal` 103.8 GB, on a 457 GB volume otherwise holding only ~48 GB of hot+history
+  DB + archive data). The migration errored with `database or disk is full`; the `finally` block's
+  own recovery checkpoint then *also* failed for the same reason (`Could not restore
+  autocheckpoint/checkpoint: database or disk is full`); `db_maintenance_mode` was still cleared
+  and the normal update cycle resumed, immediately cascading into `OSError: [Errno 28] No space
+  left on device` on every subsequent DB write and war-file save for the rest of the run.
+  A second, independent bug compounded recovery: `monthly_history_migration()` persisted
+  `bot_metadata["last_history_migration"] = now` **unconditionally in a bare `try` block outside**
+  the main `try/except/finally`, regardless of whether `result` indicated success or `ERROR`. This
+  wrongly marked the (failed, partial) migration as done-for-the-month, so
+  `QapBot.is_monthly_migration_due()` would have skipped retrying for the rest of August even
+  after the underlying disk-full condition was fixed — no automatic recovery path.
+- **Fix 1 (root cause)**: `_migrate_table_batch_by_date()` now runs an unqualified
+  `PRAGMA wal_checkpoint(PASSIVE)` (covers both `main` and `history`, non-blocking) every
+  `_MIGRATION_CHECKPOINT_INTERVAL_BATCHES` (20) batches — bounds WAL growth to ~100K rows' worth of
+  changes regardless of total migration size, while still avoiding a checkpoint on every single
+  batch commit.
+- **Fix 2**: the final `set_bot_metadata("last_history_migration", ...)` call is now gated on
+  `result` not starting with `"[HIST-MIGRATE] ERROR"` — a partial/failed run is never marked done,
+  so the next due-check (or a manual re-run) retries automatically. The migration was already
+  naturally resumable/idempotent (`_migrate_table_batch_by_date` re-selects whatever rows are still
+  below the cutoff on each call) — this fix just stops the false "done" marker from suppressing
+  that retry.
+- **Recovery tooling**: re-added `qapbot/scripts/run_history_migration_now.py` (a prior version of
+  this doc's cousin, `CLAN_AND_WAR_CYCLE_ARCHITECTURE.md`, said this had been deleted in favor of
+  `run_db_maintenance_now.py` "including" the migration step — that claim was wrong;
+  `nightly_db_maintenance()` has never had a migration step, only
+  `QapBot.run_nightly_maintenance_routine()` calls both in sequence, gated by `day == 1`. Restored
+  the standalone script so an operator can force-run just `monthly_history_migration()` on demand
+  (bypassing the day-of-month gate) to resume an interrupted run without waiting for next month.
+- **Recovery procedure for an interrupted migration** (this incident or any future one): 1) stop
+  the bot, 2) free enough disk space on the volume holding both DB files for a checkpoint to
+  succeed (checkpointing writes the pending WAL content back into the main DB files, so the volume
+  needs room for both files to grow by roughly the pending WAL size), 3)
+  `python qapbot/scripts/run_history_migration_now.py --yes` to resume/finish the migration
+  (naturally idempotent — safe to re-run), 4) `python qapbot/scripts/run_db_maintenance_now.py --yes`
+  to checkpoint + VACUUM/REINDEX + ANALYZE and reclaim the space freed by the migration's DELETEs,
+  5) restart the bot.
+- Files: `qapbot/db_manager.py` (`_migrate_table_batch_by_date`, `monthly_history_migration`),
+  `qapbot/scripts/run_history_migration_now.py` (new), `qapbot/docs/CLAN_AND_WAR_CYCLE_ARCHITECTURE.md`
+  (corrected stale claim). All existing tests pass (see changelog.txt for the count).
+
 ### Future Phases
 **Not currently planned:**
 - Phase 4: Temp war stats (JSON → DB)

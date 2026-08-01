@@ -362,12 +362,23 @@ ClashPerk embeds, not DB backup).
 ### Helper reference
 
 - `WarHistoryDB._history_cutoff()` — computes the monthly migration cutoff.
-- `WarHistoryDB.monthly_history_migration()` — orchestrates the monthly migration.
-- `qapbot/scripts/run_db_maintenance_now.py` — CLI wrapper to trigger
-  `WarHistoryDB.nightly_db_maintenance()` on demand (outside its normal once-a-day schedule),
-  which includes the monthly hot→history migration as one of its steps. (The old dedicated
-  `run_history_migration_now.py` one-time script has been deleted; this is the current
-  equivalent.)
+- `WarHistoryDB.monthly_history_migration()` — orchestrates the monthly migration. Every
+  `_MIGRATION_CHECKPOINT_INTERVAL_BATCHES` (20) batches, `_migrate_table_batch_by_date()` runs an
+  unqualified `PRAGMA wal_checkpoint(PASSIVE)` to bound WAL growth during the run — see the
+  2026-08-01 incident in `DATABASE_ARCHITECTURE.md`'s Migration History for why this exists.
+- `qapbot/scripts/run_db_maintenance_now.py` — CLI wrapper to trigger only
+  `WarHistoryDB.nightly_db_maintenance()` on demand (WAL checkpoint → VACUUM/REINDEX → ANALYZE).
+  **Correction (2026-08-01): this does NOT run the monthly migration** — `nightly_db_maintenance()`
+  has no migration step; only `QapBot.run_nightly_maintenance_routine()` (Step 0.5, day==1-gated)
+  calls `monthly_history_migration()` before it. A previous version of this doc claimed the two
+  were combined here — they weren't; that claim was never re-verified against the code after an
+  earlier refactor split them apart, and nothing caught the drift until the 2026-08-01 incident
+  needed a way to force-run the migration standalone. Re-added
+  `qapbot/scripts/run_history_migration_now.py` (previously deleted, per the note this replaces)
+  for exactly that: force-running `monthly_history_migration()` on demand, bypassing the day==1
+  gate, e.g. to resume a run that errored out partway. Run this first, then
+  `run_db_maintenance_now.py` to reclaim the freed space — same order
+  `run_nightly_maintenance_routine()` uses.
 - `attach_history_db(conn, db_path, history_db_path=None, read_only=False)` (module-level in
   `qapbot/db_manager.py`) — convenience helper for standalone scripts using a bare `sqlite3`
   connection instead of `WarHistoryDB`; ATTACHes history + creates its schema (skipped when

@@ -1,6 +1,28 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-01 (1)
+- Fixed: prod disk-full incident during tonight's first-ever `monthly_history_migration()` run
+  (8.3M+ row backlog). Root cause: the migration disables `wal_autocheckpoint` on both DB schemas
+  for its entire duration and only checkpoints once at the very end — fine for a short run, but
+  this first run took ~4h45m and never checkpointed once, growing both WAL files unbounded until
+  the volume hit 0 bytes free (287.9 GB + 103.8 GB of WAL). `_migrate_table_batch_by_date()` now
+  runs a non-blocking `PRAGMA wal_checkpoint(PASSIVE)` every 20 batches (~100K rows) to bound WAL
+  growth regardless of total migration size.
+  Also fixed a second bug that blocked automatic recovery: `monthly_history_migration()` persisted
+  `last_history_migration` as done even when the run errored out partway, which would have
+  silently suppressed any retry for the rest of the month. That write is now gated on actual
+  success — the migration was already naturally resumable, so this just stops the false "done"
+  marker from hiding that.
+  Restored `qapbot/scripts/run_history_migration_now.py` (an on-demand CLI to force-run just the
+  migration, bypassing the day==1 gate) to resume tonight's interrupted run once disk space is
+  freed — also corrected a stale claim in CLAN_AND_WAR_CYCLE_ARCHITECTURE.md that
+  `run_db_maintenance_now.py` already covered this (it never did; `nightly_db_maintenance()` has no
+  migration step).
+  Files: qapbot/db_manager.py, qapbot/scripts/run_history_migration_now.py (new),
+  qapbot/docs/DATABASE_ARCHITECTURE.md, qapbot/docs/CLAN_AND_WAR_CYCLE_ARCHITECTURE.md.
+  1467 tests pass.
+
 2026-07-30 (6)
 - Fixed (final): reworked bot startup ordering instead of special-casing the composite-index
   build again. (5) below deferred `idx_wa_player_tag_date` creation to `nightly_db_maintenance()`
