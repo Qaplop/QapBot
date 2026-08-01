@@ -43,15 +43,28 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 from qapbot.config import CONFIG  # noqa: E402
 from qapbot.db_manager import WarHistoryDB  # noqa: E402
 
-# Standalone script — nothing else in this process configures a logging handler,
-# so without this, every logging.info() call inside nightly_db_maintenance()
-# (checkpoint/VACUUM/REINDEX/ANALYZE progress) is silently dropped. Same format
-# QapBot.py's own logging uses.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+def _configure_logging(log_file: str | None) -> None:
+    """Standalone script — nothing else in this process configures a logging
+    handler, so without this, every logging.info() call inside
+    nightly_db_maintenance() (checkpoint/VACUUM/REINDEX/ANALYZE progress) is
+    silently dropped. Same format QapBot.py's own logging uses.
+
+    Also writes to a FILE, not just stdout (added 2026-08-01 — see the matching
+    fix in run_history_migration_now.py) — a lost SSH session or an
+    unexpectedly killed process still leaves a record of what happened.
+    """
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        try:
+            os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+            handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        except OSError as e:
+            print(f"WARNING: could not open log file {log_file} ({e}) — continuing with console-only logging.")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+    )
 
 
 async def _run(db_path: str, history_db_path: str) -> None:
@@ -74,8 +87,15 @@ def main() -> None:
     parser.add_argument("--db", default=CONFIG.db_path, help="Path to the hot qapbot.db (default: CONFIG.db_path)")
     parser.add_argument("--history-db", default=getattr(CONFIG, "history_db_path", None),
                          help="Path to qapbot_history.db (default: CONFIG.history_db_path)")
+    parser.add_argument("--log-file", default=os.path.join(CONFIG.data_dir, "logs", "db_maintenance_now.log"),
+                         help="Also write progress to this file, not just stdout (default: "
+                              "<data_dir>/logs/db_maintenance_now.log). Pass an empty string to disable.")
     parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
     args = parser.parse_args()
+
+    _configure_logging(args.log_file or None)
+    if args.log_file:
+        print(f"Logging to stdout AND {args.log_file}")
 
     if not args.yes:
         print("This will run VACUUM/REINDEX/ANALYZE against the hot DB (and ANALYZE against")

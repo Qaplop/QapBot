@@ -1,6 +1,49 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-02 (2)
+- Fixed: `fast_bulk_history_migration()` never set a temp-storage location before rebuilding
+  indexes, so `CREATE INDEX` over the large `war_attacks` table used SQLite's default temp
+  location — on this NAS, a 4.8 GB tmpfs `/tmp`, unrelated to the data volume's hundreds of GB
+  free. Surfaced when manually rebuilding indexes via the `sqlite3` CLI as a stopgap after the
+  original `--fast` run died silently (OOM was suspected but cleanly ruled out via `free -h`/`dmesg`
+  showing no memory pressure or OOM-killer signature) — the second `CREATE INDEX` failed outright
+  with `SQLITE_FULL`, pointing straight at the real cause. `nightly_db_maintenance()` already works
+  around this exact class of problem for VACUUM (documented there against a different historical
+  incident); `fast_bulk_history_migration()` just didn't replicate it. Now sets `PRAGMA
+  temp_store=FILE` + `temp_store_directory` to the DB's own directory before touching any index.
+  Files: qapbot/db_manager.py. 1478 tests pass.
+
+2026-08-02 (1)
+- Fixed: `run_history_migration_now.py`/`run_db_maintenance_now.py` only ever logged to stdout —
+  no record survived if the SSH session died or the process itself got killed mid-run (both
+  happened during tonight's `--fast` recovery: once losing the terminal to a network drop, once
+  losing the process itself to an unexplained kill with zero diagnostic trail). Both scripts now
+  also write to a file by default (`<data_dir>/logs/history_migration_now.log` /
+  `db_maintenance_now.log`, override with `--log-file`, empty string disables) alongside stdout —
+  a lost terminal or an unexpectedly killed process still leaves a record of what happened up to
+  that point.
+  Files: qapbot/scripts/run_history_migration_now.py, qapbot/scripts/run_db_maintenance_now.py.
+  1478 tests pass.
+
+2026-08-01 (9)
+- Added: fast bulk history migration mode, for clearing a large backlog dramatically faster than
+  the routine batched path. Root cause of the ~900-1000 rows/sec ceiling observed during tonight's
+  incident recovery (despite the data being only ~10 GB, which should copy in minutes on SSD):
+  `war_attacks` carries 5 secondary indexes on each schema plus a UNIQUE constraint — every row
+  moved was paying 12 B-tree updates (6 inserting into history, 6 deleting from main), and that
+  per-row index-maintenance cost, not disk I/O, was the actual bottleneck.
+  New `WarHistoryDB.fast_bulk_history_migration()`: temporarily drops war_attacks' 5 secondary
+  indexes on BOTH schemas (never the UNIQUE constraint, which INSERT OR IGNORE's idempotency
+  depends on), moves data in large single-commit chunks (default 1M rows, still individually
+  checkpointed) instead of 5000-row batches, then rebuilds every dropped index in one efficient
+  bulk pass. Indexes are always rebuilt in a finally block even on a mid-run error. Strictly
+  requires the bot to be stopped (drops main.war_attacks' own query indexes for the duration,
+  unlike the routine path which never touches main's indexes).
+  New CLI flag: `run_history_migration_now.py --fast [--fast-chunk-size N]`.
+  Files: qapbot/db_manager.py, qapbot/scripts/run_history_migration_now.py,
+  tests/unit/test_fast_bulk_history_migration.py (new, 4 tests). 1478 tests pass.
+
 2026-08-01 (8)
 - Fixed: `/admin Execute Nightly Maintenance` shared the same 90-minute migration budget
   (`CONFIG.history_migration_time_budget_minutes`) as the fire-and-forget scheduled 03:00 UTC task,

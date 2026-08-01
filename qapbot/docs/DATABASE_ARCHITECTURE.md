@@ -1069,6 +1069,79 @@ re-check) rather than trusting them long-term.
   `qapbot/config.py` (new `history_migration_admin_budget_minutes` + env var), `README.md`.
   1474 tests pass.
 
+### 2026-08-01 (sixth same-day follow-up): Fast Bulk Migration Mode — Drop Indexes, Bulk Move, Rebuild
+- **Why**: with WAL growth and chunking both fixed, the operator asked why the batched path still
+  only moved ~900-1000 rows/sec on SSD when the underlying backlog was only ~10 GB — data that size
+  should copy in minutes on SSD, not the ~5-7 hours the current rate implied for the remaining ~19M
+  rows. Root cause: `war_attacks` carries 5 secondary indexes on EACH schema (`idx_wa_player_tag`,
+  `idx_wa_war_clan`, `idx_wa_clan_date`, `idx_wa_zero_attacks`, `idx_wa_player_tag_date`) plus the
+  UNIQUE(war_id, player_tag, attack_order) constraint index. Every row moved was paying 6 B-tree
+  updates inserting into `history` and 6 more deleting from `main` — 12 index updates per row is
+  what actually limited throughput, not disk I/O; raw sequential I/O for ~10 GB on SSD would indeed
+  take minutes, not hours.
+- **Fix**: new `WarHistoryDB.fast_bulk_history_migration(chunk_size=1_000_000)` — temporarily drops
+  the 5 secondary indexes on BOTH `main.war_attacks` and `history.war_attacks` (never the UNIQUE
+  constraint — `INSERT OR IGNORE`'s idempotency depends on it), migrates `war_attacks` in large
+  single-commit chunks (default 1M rows, each still individually checkpointed) instead of 5000-row
+  batches, then rebuilds every dropped index in one efficient sorted `CREATE INDEX` pass each —
+  dramatically cheaper than millions of incremental per-row updates. `war_summary`/CWL tables keep
+  using the existing batched methods (much smaller volume, not the bottleneck).
+  New helper `_bulk_move_chunk()` finds each chunk's upper `id` bound via `OFFSET`-based keyset
+  pagination (`SELECT id ... ORDER BY id LIMIT 1 OFFSET chunk_size-1`) rather than either (a) an
+  `IN (...)` list of a million ids — would exceed SQLite's default bound-parameter limit
+  (~32,766) — or (b) `LIMIT`/`ORDER BY` on `DELETE`, a non-default SQLite compile-time option not
+  guaranteed available.
+- **Safety**: this mode strictly REQUIRES the bot to be stopped — dropping `main.war_attacks`'
+  indexes, even briefly, would badly degrade any concurrent live query against it (unlike the
+  routine batched path, which never touches `main`'s indexes for exactly this reason). Dropped
+  indexes are rebuilt in a `finally` block regardless of success or failure, so an interrupted or
+  errored run never leaves a restarted bot with degraded query performance. Each chunk remains its
+  own committed transaction (same resumability as the batched path). No `time_budget_seconds` —
+  this mode is meant to run once, to completion, with chunk size (not a time budget) as the safety
+  valve bounding uncheckpointed WAL growth.
+- **CLI**: `run_history_migration_now.py --fast [--fast-chunk-size N]` — ignores
+  `--batch-size`/`--checkpoint-every-batches`/`--time-budget-minutes` in this mode. Confirmation
+  prompt (without `--yes`) is fast-mode-specific, emphasizing the bot-stopped requirement.
+- Files: `qapbot/db_manager.py` (`fast_bulk_history_migration`, `_bulk_move_chunk`,
+  `_drop_war_attacks_secondary_indexes`, `_rebuild_war_attacks_secondary_indexes`),
+  `qapbot/scripts/run_history_migration_now.py` (`--fast`/`--fast-chunk-size`),
+  `tests/unit/test_fast_bulk_history_migration.py` (new, 4 tests — correctness across chunk
+  boundaries, indexes dropped mid-run and rebuilt after, indexes rebuilt even on a simulated
+  mid-run error, idempotent re-run). 1478 tests pass.
+
+### 2026-08-02: `fast_bulk_history_migration()` Silent Death Root-Caused — Small tmpfs `/tmp`, Not OOM
+- **Why**: the `--fast` run from the entries above died silently partway through recovery (`ps`
+  showed the process alive, then gone, with the 5 secondary indexes on both schemas never
+  rebuilt). OOM was the leading suspect (the NAS became briefly unresponsive around the same
+  time) but was cleanly ruled out: `free -h` showed only 4% memory used, and `dmesg` had no
+  OOM-killer signature at all (a real OOM kill produces a very distinctive multi-line block that
+  would dominate a `tail -50`, not be absent).
+  The actual cause surfaced while manually rebuilding the missing indexes via the `sqlite3` CLI as
+  a stopgap: the second `CREATE INDEX` failed outright with `Error: stepping, database or disk is
+  full (13)` — even though the data volume itself had hundreds of GB free. Root cause: `CREATE
+  INDEX` over a table this large needs real external-sort temp space, and SQLite's default temp
+  location (typically `/tmp`) is unrelated to the data volume — on this NAS, `/tmp` is a tmpfs
+  (RAM-backed) capped at 4.8 GB. `fast_bulk_history_migration()` never set `SQLITE_TMPDIR` /
+  `PRAGMA temp_store_directory`, so it was silently subject to the same tiny limit — almost
+  certainly what killed the original run too (SQLITE_FULL raised inside `_rebuild_war_attacks_secondary_indexes()`'s
+  per-index `try/except`... except that only explains a logged-and-skipped single index, not the
+  total silence observed, so the exact mechanism of the *first* death is still not 100% certain —
+  but the tmpfs constraint is confirmed real and reproducible, and is fixed regardless).
+  **This was already a known class of problem in this codebase**: `nightly_db_maintenance()`
+  already works around it for VACUUM, with a comment documenting a *different* historical incident
+  with the same "mystery SIGKILL, no log entry" symptom (an overly large `cache_size` triggering a
+  real OOM there) — `fast_bulk_history_migration()` just didn't replicate that existing fix when it
+  was added.
+- **Fix**: `fast_bulk_history_migration()` now sets `PRAGMA temp_store=FILE` +
+  `PRAGMA temp_store_directory=<the DB's own directory>` before touching any index — same pattern,
+  same target directory (the data volume itself, effectively unlimited headroom by comparison to a
+  4.8 GB tmpfs) as `nightly_db_maintenance()` already uses for VACUUM.
+- **Operational workaround** (for anyone hitting `SQLITE_FULL` on a manual `CREATE INDEX`/`VACUUM`
+  via the `sqlite3` CLI directly, independent of this code fix): `export SQLITE_TMPDIR=<dir on the
+  data volume>` before running `sqlite3` — read directly by the CLI, takes priority over the OS
+  default.
+- Files: `qapbot/db_manager.py` (`fast_bulk_history_migration`).
+
 ### Future Phases
 **Not currently planned:**
 - Phase 4: Temp war stats (JSON → DB)

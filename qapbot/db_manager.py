@@ -6091,6 +6091,242 @@ class WarHistoryDB:
 
         return result
 
+    # war_attacks' secondary indexes — identical set on both `main` and `history`
+    # schemas (see _create_schema()/_create_history_schema()). Used ONLY by
+    # fast_bulk_history_migration() below to temporarily drop + rebuild them; the
+    # UNIQUE(war_id, player_tag, attack_order) constraint is deliberately never
+    # included here — INSERT OR IGNORE's idempotency depends on it, so it must
+    # never be dropped. MUST be kept in sync with the CREATE INDEX statements in
+    # _create_schema()/_create_history_schema() (and their _sync counterparts) —
+    # duplicated here rather than shared because those methods build DDL strings
+    # inline rather than from a shared constant; a schema change there needs the
+    # matching update made here too.
+    _WAR_ATTACKS_SECONDARY_INDEX_DDL: List[Tuple[str, str]] = [
+        # (index_name, CREATE INDEX statement — unqualified, targets whichever
+        # schema the caller prefixes onto the statement/name at execution time)
+        ("idx_wa_player_tag", "CREATE INDEX IF NOT EXISTS {schema}idx_wa_player_tag ON war_attacks(player_tag)"),
+        ("idx_wa_war_clan", "CREATE INDEX IF NOT EXISTS {schema}idx_wa_war_clan ON war_attacks(war_id, clan_tag)"),
+        ("idx_wa_clan_date", "CREATE INDEX IF NOT EXISTS {schema}idx_wa_clan_date ON war_attacks(clan_tag, date)"),
+        ("idx_wa_zero_attacks", "CREATE INDEX IF NOT EXISTS {schema}idx_wa_zero_attacks ON war_attacks(attack_order) WHERE attack_order = 0"),
+        ("idx_wa_player_tag_date", "CREATE INDEX IF NOT EXISTS {schema}idx_wa_player_tag_date ON war_attacks(player_tag, date)"),
+    ]
+
+    async def _drop_war_attacks_secondary_indexes(self) -> None:
+        for schema in ("", "history."):
+            for name, _ddl in self._WAR_ATTACKS_SECONDARY_INDEX_DDL:
+                await self._conn.execute(f"DROP INDEX IF EXISTS {schema}{name}")
+
+    async def _rebuild_war_attacks_secondary_indexes(self) -> None:
+        for schema in ("", "history."):
+            for name, ddl in self._WAR_ATTACKS_SECONDARY_INDEX_DDL:
+                try:
+                    await self._conn.execute(ddl.format(schema=schema))
+                except Exception as _idx_ex:
+                    logging.error(f"[HIST-MIGRATE-FAST] Failed to rebuild index {schema}{name}: {_idx_ex}")
+
+    async def _bulk_move_chunk(self, table: str, cutoff_date: str, chunk_size: int) -> Tuple[int, bool]:
+        """Move up to ``chunk_size`` rows matching ``date < cutoff_date`` from
+        ``main.<table>`` to ``history.<table>`` in ONE transaction — no per-row
+        secondary-index maintenance (caller must have already dropped them).
+
+        Finds the chunk's upper ``id`` bound via ``OFFSET`` (keyset pagination)
+        rather than collecting a chunk_size-long list of ids to bind as an
+        ``IN (...)`` clause — a 1M-entry parameter list would exceed SQLite's
+        default bound-parameter limit (~32766) — and rather than relying on
+        ``LIMIT``/``ORDER BY`` on ``DELETE``, which is a non-default SQLite
+        compile-time option not guaranteed available.
+
+        Returns:
+            ``(moved_count, is_last_chunk)`` — ``is_last_chunk`` is True when
+            fewer than ``chunk_size`` matching rows remained (i.e. this chunk
+            cleared the entire remaining backlog for this table).
+        """
+        cur = await self._conn.execute(
+            f"SELECT id FROM main.{table} WHERE date < ? ORDER BY id LIMIT 1 OFFSET ?",
+            (cutoff_date, chunk_size - 1),
+        )
+        boundary_row = await cur.fetchone()
+        boundary_id = boundary_row["id"] if boundary_row else None
+
+        await self._write_lock.acquire()
+        try:
+            await self._conn.execute("BEGIN")
+            if boundary_id is not None:
+                await self._conn.execute(
+                    f"INSERT OR IGNORE INTO history.{table} SELECT * FROM main.{table} WHERE date < ? AND id <= ?",
+                    (cutoff_date, boundary_id),
+                )
+                del_cur = await self._conn.execute(
+                    f"DELETE FROM main.{table} WHERE date < ? AND id <= ?",
+                    (cutoff_date, boundary_id),
+                )
+            else:
+                await self._conn.execute(
+                    f"INSERT OR IGNORE INTO history.{table} SELECT * FROM main.{table} WHERE date < ?",
+                    (cutoff_date,),
+                )
+                del_cur = await self._conn.execute(
+                    f"DELETE FROM main.{table} WHERE date < ?",
+                    (cutoff_date,),
+                )
+            moved = del_cur.rowcount if del_cur.rowcount and del_cur.rowcount > 0 else 0
+            await self._conn.commit()
+        except Exception:
+            await self._conn.rollback()
+            raise
+        finally:
+            self._write_lock.release()
+        return moved, boundary_id is None
+
+    async def fast_bulk_history_migration(self, chunk_size: int = 1_000_000) -> str:
+        """
+        One-off FAST alternative to ``monthly_history_migration()`` for clearing a
+        large backlog quickly (added 2026-08-01, same incident as everything else
+        this method's siblings document). NOT for routine/automatic use — the only
+        intended caller is ``qapbot/scripts/run_history_migration_now.py --fast``,
+        run with the bot STOPPED.
+
+        Why the normal batched path is slow: with all secondary indexes present,
+        every row moved costs 6 B-tree updates on the ``history`` side (5
+        secondary indexes + the UNIQUE constraint) and 6 more removing it from
+        ``main`` — that per-row index-maintenance work, not disk I/O, is what
+        limited a live 2026-08-01 run to ~900-1000 rows/sec even on fast SSD
+        despite the underlying data being only ~10 GB.
+
+        What this does instead: temporarily drops the 5 secondary indexes on
+        BOTH ``main.war_attacks`` and ``history.war_attacks`` (the UNIQUE
+        constraint is never touched — ``INSERT OR IGNORE``'s idempotency depends
+        on it), migrates ``war_attacks`` in large chunks (default 1M rows, one
+        commit each — see ``_bulk_move_chunk``) instead of 5000-row batches, then
+        rebuilds every dropped index in one efficient sorted pass each via
+        ``CREATE INDEX`` — far cheaper than millions of incremental updates.
+        ``war_summary``/CWL tables are migrated via the existing (already fast
+        enough at their much smaller volume) methods — no index-dropping there.
+
+        Safety:
+          - REQUIRES the bot to be stopped — dropping ``main.war_attacks``'
+            indexes, even briefly, would badly degrade any concurrent live query
+            against it. The 5000-row batched ``monthly_history_migration()``
+            path never touches ``main``'s indexes for exactly this reason and
+            remains the right choice for anything running alongside a live bot.
+          - Indexes are ALWAYS rebuilt in the ``finally`` block, even if the
+            migration itself errors out partway — a subsequent bot start should
+            never see ``main.war_attacks`` missing its query indexes.
+          - Each chunk is still its own committed transaction (same
+            resumability guarantee as the batched path — safe to interrupt and
+            re-run; already-migrated rows simply won't match `date < cutoff`
+            again). No ``time_budget_seconds`` here: this is meant to run once,
+            to completion; chunk size (not a time budget) is the safety valve
+            bounding how much uncheckpointed WAL a single transaction can grow to.
+          - Sets ``PRAGMA temp_store_directory`` to the DB's own directory before
+            touching any index (added 2026-08-01, found live during recovery):
+            ``CREATE INDEX`` on a table this large needs real external-sort temp
+            space, and SQLite's default temp location (typically ``/tmp``) can be
+            a small tmpfs on a NAS — unrelated to how much free space the data
+            volume itself has. A manual CLI rebuild hit exactly this
+            (``SQLITE_FULL`` on a 4.8 GB tmpfs `/tmp`) while recovering from this
+            same method having silently died earlier for what's now suspected to
+            be the identical reason. Same fix ``nightly_db_maintenance()``
+            already applies for VACUUM.
+
+        Returns:
+            A one-line summary string suitable for logging.
+        """
+        if not self.db_path:
+            return "[HIST-MIGRATE-FAST] Skipped — no db_path configured"
+
+        cutoff_date, cutoff_month = self._history_cutoff()
+        logging.info(
+            f"[HIST-MIGRATE-FAST] Starting fast bulk migration — cutoff_date={cutoff_date} "
+            f"(hot DB retains {cutoff_month} and later)"
+        )
+
+        _qbcore = None
+        try:
+            import QBcore as _qbcore  # type: ignore[no-redef]
+            _qbcore.db_maintenance_mode = True
+            logging.info("[HIST-MIGRATE-FAST] db_maintenance_mode=True — Discord commands blocked")
+        except ImportError:
+            pass
+
+        await self._ensure_connection()
+
+        # CREATE INDEX on a table this large needs real temp/sort space — SQLite's
+        # default temp location (typically /tmp) can be a small tmpfs on a NAS,
+        # unrelated to how much free space the data volume itself has. Same fix
+        # nightly_db_maintenance() already applies for VACUUM (see that method's
+        # comments for the matching historical incident — a mystery SIGKILL with
+        # no log entry, there from an OOM triggered by a large cache_size, here
+        # from SQLITE_FULL on a full temp tmpfs during this run's own index
+        # rebuild). Point temp storage at the DB's own directory instead — same
+        # volume, effectively unlimited headroom by comparison.
+        await self._conn.execute("PRAGMA temp_store=FILE")
+        _db_dir = os.path.dirname(str(self.db_path))
+        await self._conn.execute(f"PRAGMA temp_store_directory='{_db_dir}'")
+
+        logging.info("[HIST-MIGRATE-FAST] Dropping secondary indexes on main + history war_attacks...")
+        await self._drop_war_attacks_secondary_indexes()
+
+        t_start = _monotonic()
+        moved: Dict[str, int] = {}
+        result = "[HIST-MIGRATE-FAST] ERROR: unknown"
+        try:
+            await self._conn.execute("PRAGMA wal_autocheckpoint=0")
+            await self._conn.execute("PRAGMA history.wal_autocheckpoint=0")
+
+            wa_total = 0
+            while True:
+                chunk_moved, is_last = await self._bulk_move_chunk("war_attacks", cutoff_date, chunk_size)
+                wa_total += chunk_moved
+                logging.info(f"[HIST-MIGRATE-FAST] war_attacks: moved chunk of {chunk_moved} rows (total {wa_total})")
+                try:
+                    await self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except Exception as _ckpt_ex:
+                    logging.warning(f"[HIST-MIGRATE-FAST] Periodic checkpoint failed: {_ckpt_ex}")
+                if is_last:
+                    break
+            moved["war_attacks"] = wa_total
+
+            # war_summary/CWL tables: far smaller volume, the existing batched
+            # methods are plenty fast already — no index-dropping needed.
+            moved["war_summary"], _ = await self._migrate_table_batch_by_date("war_summary", cutoff_date, 5000)
+            moved["cwl_league_groups"], _ = await self._migrate_cwl_table_by_season("cwl_league_groups", cutoff_month)
+            moved["cwl_league_rounds"], _ = await self._migrate_cwl_table_by_season("cwl_league_rounds", cutoff_month)
+
+            elapsed = _monotonic() - t_start
+            summary = ", ".join(f"{k}={v}" for k, v in moved.items())
+            result = f"[HIST-MIGRATE-FAST] cutoff={cutoff_date} — {summary} rows moved — done in {elapsed:.1f}s"
+            logging.info(result)
+        except Exception as e:
+            result = f"[HIST-MIGRATE-FAST] ERROR: {e}"
+            logging.error(result)
+        finally:
+            logging.info("[HIST-MIGRATE-FAST] Rebuilding dropped indexes...")
+            await self._rebuild_war_attacks_secondary_indexes()
+            logging.info("[HIST-MIGRATE-FAST] Index rebuild complete.")
+            try:
+                await self._conn.execute("PRAGMA wal_autocheckpoint=1000")
+                await self._conn.execute("PRAGMA history.wal_autocheckpoint=1000")
+                await self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                await self._conn.execute("PRAGMA history.wal_checkpoint(PASSIVE)")
+            except Exception as _ckpt_ex:
+                logging.warning(f"[HIST-MIGRATE-FAST] Could not restore autocheckpoint/checkpoint: {_ckpt_ex}")
+            if _qbcore is not None:
+                _qbcore.db_maintenance_mode = False
+                logging.info("[HIST-MIGRATE-FAST] db_maintenance_mode=False — Discord commands unblocked")
+
+        if not result.startswith("[HIST-MIGRATE-FAST] ERROR"):
+            try:
+                import datetime as _dt2
+                await self.set_bot_metadata(
+                    "last_history_migration",
+                    _dt2.datetime.now(_dt2.timezone.utc).isoformat(),
+                )
+            except Exception as _meta_ex:
+                logging.warning(f"[HIST-MIGRATE-FAST] Could not persist migration timestamp: {_meta_ex}")
+
+        return result
+
     async def nightly_db_maintenance(self) -> str:
         """
         Run nightly DB maintenance in three steps:
