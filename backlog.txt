@@ -1,7 +1,6 @@
 Project Backlog, Improvement Ideas and General Remarks
 
 Immediate next steps:
-- Add: Maintenance duration to /status and/or /admin Check Logs: 2026-07-18 12:30:58,132 [INFO] [NIGHTLY-MAINTENANCE] END — total duration 239.4s
 - Known lower-priority follow-up (not fixed,
   admin-only/rarely invoked, no crash risk): the `/admin` CWL-group-backfill
   handler in qapbot/QBdiscocmdshelper_admin_command.py
@@ -10,7 +9,6 @@ Immediate next steps:
   which likely full-scans hot+history war_summary; low impact since it's a
   manually-triggered maintenance command, not user-facing.
 - Add to /whois player: clan history tab
-- Analyse and fix performance issues in update cycle
 - Monitor [PRE-SCAN-TIMING] archive_scan cost in PHASE-2 of update cycle through next CWL season (archive/
   can grow ~4x current ~320K files during CWL) — revisit incremental
   archive-filename index if it grows significantly above the current ~1s
@@ -25,17 +23,11 @@ Immediate next steps:
   whether Tier 2's in-memory metadata coverage needs extending if
   tier3_stat_calls/elapsed turn out high.
 - Wrap the war simulation in a small piece of C code to gain performance
-- Wie geht Cleanup Messages mit gelöschten Kanälen um?
-- Add /admin Backup Data command that mimics the BackupProd.bat behaviour and auto-moves excessive .\archive file numbers to .\archive_old with nightly maintenance auto-run
+- Add /admin Backup Data command that mimics the ArchiveOld.bat behaviour and auto-moves excessive .\archive file numbers to .\archive_old with nightly maintenance auto-run
 - log_time_gaps.py script anwenden und weitere blocking und langläufer operationen finden
-- Try to make the db fully in memory. This might also open-up the potential to improve the caching staregy and only cache temp war files since all other data is in-memory then anyway.
-- Fix the memory-leak. Remember to reactivate tracemalloc in QapBot.py! Either of these strategies: 1.) Run one cycle on prod and analyse the result-file, 2.) run some hours on dev and analyse the result-file
-- Beste Defenses der League Group, um die besten Layouts zu bekommen.
 - STAY Family enable auto-role takes very long check on DEV and add some kind of working symbol!
-- Feature Request Lucas: CWL Analyse mit prediction für alle Runden
 - /admin Cleanup Messages All takes VERY long. How can we speed this up? And maybe also improve logic top find more orphaned messages e.g. duplicate welcome-messages
 - Should probably be family: Posting leaderboard for clan #5053A40B67
-- Check /leaderboard modes with different time ranges!
 - Use custom emojis everywhere in the code
 - Update all channel messages when guild-language is switched
 - Create a Newsfeed-Channel (or Updates-Channel) that gets updates on what is going on
@@ -45,11 +37,3 @@ Immediate next steps:
 - Add on_message handler for DM so that bot can reply to direct chat input from users
 - /clan management: Regular users should be able to use the viewing functions but not the action buttons
 - New Feature: Add scores for "th-level difference" and "up-hits/drops" in CW/CWL
-
-Low prio changes:
-- Output der coc api prüfen und ggfs. weitere Daten verwenden.
-
-- Improve prediction algorithm, real confidence from gaussian distribution (improved on 2025-08-03 but still not perfect)
-  prediction of winner -> could be based on the real avarage stars value of each player!
-  assign_attacks_to_bases() can be optimized for selecting best choice bases for each attacker
-

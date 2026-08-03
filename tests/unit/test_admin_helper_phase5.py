@@ -6,10 +6,13 @@ from pathlib import Path
 from typing import Any, Dict
 
 from qapbot.QBdiscocmdshelper_admin_command import (
+    _fmt_duration,  # pyright: ignore[reportPrivateUsage]
     check_current_wars_in_temp,
     extract_war_id_from_json_data,
+    find_last_nightly_maintenance_duration,
     format_database_check_results,
     format_log_summary,
+    format_nightly_maintenance_stats,
     parse_log_line,
     scan_logs,
 )
@@ -109,6 +112,95 @@ def test_format_log_summary_reports_no_critical_issues() -> None:
     assert "Total Errors:** 0" in output
     assert "Total Warnings:** 0" in output
     assert "No critical issues detected" in output
+
+
+def test_format_log_summary_includes_nightly_maintenance_section_when_given() -> None:
+    scan_result: Dict[str, Any] = {
+        "errors": [],
+        "warnings": [],
+        "summary": [],
+        "admin_actions": [],
+        "notification_sent_count": 0,
+        "active_clan_updates": 0,
+        "inactive_clan_updates": 0,
+        "smart_timestamp_calcs": 0,
+        "wars_finalized": 0,
+        "wars_archived": 0,
+        "cwl_orphan_skips": 0,
+        "late_attack_checks": 0,
+        "duplicate_wars_skipped": 0,
+        "first_date": None,
+        "last_date": None,
+    }
+
+    output = format_log_summary(
+        scan_result, max_length=500, nightly_maint_section="Min: 10,0s | Avg: 20,0s | Max: 30,0s"
+    )
+
+    assert "Nightly Maintenance:" in output
+    assert "Min: 10,0s | Avg: 20,0s | Max: 30,0s" in output
+
+
+def test_find_last_nightly_maintenance_duration_missing_dir_returns_none(tmp_path: Path) -> None:
+    result = find_last_nightly_maintenance_duration(str(tmp_path / "does-not-exist"))
+
+    assert result is None
+
+
+def test_find_last_nightly_maintenance_duration_parses_most_recent_end_line(tmp_path: Path) -> None:
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "qapbot.log").write_text(
+        "\n".join(
+            [
+                "2026-07-17 03:00:01,000 [INFO] [NIGHTLY-MAINTENANCE] START",
+                "2026-07-17 03:04:00,000 [INFO] [NIGHTLY-MAINTENANCE] END — total duration 239.0s",
+                "2026-07-18 12:26:58,132 [INFO] [NIGHTLY-MAINTENANCE] START",
+                "2026-07-18 12:30:58,132 [INFO] [NIGHTLY-MAINTENANCE] END — total duration 239.4s",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    dt, seconds = find_last_nightly_maintenance_duration(str(logs_dir))  # type: ignore[misc]
+
+    assert dt == datetime(2026, 7, 18, 12, 30, 58, 132000)
+    assert seconds == 239.4
+
+
+def test_fmt_duration_formats_minutes_and_seconds() -> None:
+    assert _fmt_duration(783.8) == "13m 4s"
+    assert _fmt_duration(45.2) == "45s"
+    assert _fmt_duration(60.0) == "1m 0s"
+    assert _fmt_duration(0.0) == "0s"
+
+
+def test_format_nightly_maintenance_stats_reports_in_process_min_avg_max(tmp_path: Path) -> None:
+    output = format_nightly_maintenance_stats([10.0, 20.0, 30.0], str(tmp_path))
+
+    assert "Min: 10s" in output
+    assert "Avg: 20s" in output
+    assert "Max: 30s" in output
+
+
+def test_format_nightly_maintenance_stats_falls_back_to_log_file(tmp_path: Path) -> None:
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "qapbot.log").write_text(
+        "2026-07-18 12:30:58,132 [INFO] [NIGHTLY-MAINTENANCE] END — total duration 239.4s",
+        encoding="utf-8",
+    )
+
+    output = format_nightly_maintenance_stats([], str(logs_dir))
+
+    assert "No run yet this session" in output
+    assert "3m 59s" in output
+
+
+def test_format_nightly_maintenance_stats_no_data_at_all(tmp_path: Path) -> None:
+    output = format_nightly_maintenance_stats([], str(tmp_path / "no-logs-here"))
+
+    assert output == "No nightly maintenance run recorded yet"
 
 
 def test_extract_war_id_from_json_data_uses_datetime_string() -> None:

@@ -253,7 +253,7 @@
       "status": {
         "short": "Show bot status and statistics",
         "title": "📊 Status Command",
-        "detailed": "Display comprehensive bot status information including uptime, memory usage, and cache statistics.\n\n**Usage:**\n`/status [force_refresh]`\n\n**Parameters:**\n• `force_refresh` (optional, default False) - Bypass the cached database statistics (normally up to 25h stale) and recompute them now. Takes several extra seconds since it re-scans the full war history database.\n\n**Information Displayed:**\n• Bot uptime (how long since last restart)\n• Memory usage (RAM consumption)\n• Number of tracked clans and families\n• Registered Discord users and player accounts\n• Active subscriptions count\n• Cache statistics\n• Last update times\n\nUseful for monitoring bot health and performance."
+        "detailed": "Display comprehensive bot status information including uptime, memory usage, and cache statistics.\n\n**Usage:**\n`/status [force_refresh]`\n\n**Parameters:**\n• `force_refresh` (optional, default False) - Bypass the cached database statistics (normally up to 25h stale) and recompute them now. Takes several extra seconds since it re-scans the full war history database.\n\n**Information Displayed:**\n• Bot uptime (how long since last restart)\n• Memory usage (RAM consumption)\n• Number of tracked clans and families\n• Registered Discord users and player accounts\n• Active subscriptions count\n• Cache statistics\n• Last update times\n• Nightly maintenance duration (min/avg/max over the last 10 runs this session; falls back to the last logged run until the first run completes)\n\nUseful for monitoring bot health and performance."
       },
       "help": {
         "short": "Display help information",

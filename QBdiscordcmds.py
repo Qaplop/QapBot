@@ -1994,14 +1994,15 @@ async def admin(
             )
             return
         
-        from qapbot.QBdiscocmdshelper_admin_command import scan_logs, format_log_summary
+        from qapbot.QBdiscocmdshelper_admin_command import scan_logs, format_log_summary, format_nightly_maintenance_stats
         import os
-        
+
         log_dir = os.path.join(CONFIG.data_dir, "logs")
-        
+
         try:
             scan_result = scan_logs(log_dir)
-            summary_text = format_log_summary(scan_result, bot_version=QBcore.BOT_VERSION)
+            nightly_maint_section = format_nightly_maintenance_stats(QBcore.nightly_maintenance_durations, log_dir)
+            summary_text = format_log_summary(scan_result, bot_version=QBcore.BOT_VERSION, nightly_maint_section=nightly_maint_section)
             await interaction.followup.send(summary_text, ephemeral=True)
             logging.info(f"ADMIN ACTION: {interaction.user} CHECK_LOGS")
         except Exception as e:
@@ -3379,6 +3380,12 @@ async def status(interaction: discord.Interaction, force_refresh: bool = False):
     else:
         cycle_section = "No cycles completed yet\n"
     msg += f"\n**Update Cycle Stats (since last start)**\n{cycle_section}"
+
+    from qapbot.QBdiscocmdshelper_admin_command import format_nightly_maintenance_stats
+    nightly_maint_section = format_nightly_maintenance_stats(
+        QBcore.nightly_maintenance_durations, os.path.join(CONFIG.data_dir, "logs")
+    )
+    msg += f"\n**Nightly Maintenance**\n{nightly_maint_section}\n"
 
     _log_cmd_done(interaction, "status")
     await send_and_track(interaction, f"```{msg}```", 'status')

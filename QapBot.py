@@ -1753,9 +1753,11 @@ async def run_nightly_maintenance_routine(
         await _warm_global_db_stats_cache(force_refresh=True)
         return _result
     finally:
+        _elapsed = time.monotonic() - _maint_t0
+        QBcore.nightly_maintenance_durations.append(_elapsed)
         logging.info(
             "[NIGHTLY-MAINTENANCE] END — total duration %.1fs",
-            time.monotonic() - _maint_t0,
+            _elapsed,
         )
 
 
@@ -3082,13 +3084,20 @@ async def cleanup_stale_ui_messages() -> None:
         if not channel_id or not message_ids_str:
             continue
         
-        # Get channel
+        # Get channel. get_channel() is a local-cache lookup, not proof of deletion (a cache
+        # miss can happen on a startup gateway-chunking gap) — confirm via fetch_channel
+        # before purging the cache entry, and only purge on a confirmed discord.NotFound.
         channel = QBcore.bot.get_channel(int(channel_id))
         if not channel:
-            logging.debug(f"Channel {channel_id} not found for message cleanup (key: {key})")
-            # Remove from cache and database since channel is gone
-            await CACHE.delete_leaderboard_message(key)
-            continue
+            try:
+                channel = await QBcore.bot.fetch_channel(int(channel_id))
+            except discord.NotFound:
+                logging.debug(f"Channel {channel_id} confirmed deleted for message cleanup (key: {key})")
+                await CACHE.delete_leaderboard_message(key)
+                continue
+            except Exception as e:
+                logging.debug(f"Could not confirm channel {channel_id} is deleted ({e}); leaving cache entry for retry next restart (key: {key})")
+                continue
         
         # Type guard - only process messageable channels
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
@@ -3151,16 +3160,38 @@ async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False
             return None
         return None
 
-    async def _delete_message_from_channel(channel_id: int, message_id: str) -> None:
-        """Helper to safely delete a message from a channel."""
+    async def _delete_message_from_channel(channel_id: int, message_id: str) -> bool:
+        """Best-effort delete of a tracked registration message.
+
+        Returns True only when Discord has *confirmed* the message (or its channel) no
+        longer exists — i.e. it's safe for the caller to drop tracking. `bot.get_channel()`
+        is a local-cache lookup, not proof of deletion, so a cache miss falls back to a live
+        `fetch_channel()` call. Any inconclusive outcome (Forbidden, HTTPException, network
+        error) returns False so the caller keeps tracking and retries next cycle instead of
+        losing the message ID while a live message may still be sitting in the channel
+        (that's how the old/new message pair turns into a visible duplicate).
+        """
         try:
             channel = QBcore.bot.get_channel(channel_id)
-            if channel and isinstance(channel, (discord.TextChannel, discord.Thread)):
-                message = await channel.fetch_message(int(message_id))
-                await message.delete()
-                logging.debug(f"Deleted registration message {message_id} from channel {channel_id}")
+            if not channel:
+                try:
+                    channel = await QBcore.bot.fetch_channel(channel_id)
+                except discord.NotFound:
+                    return True  # Channel itself confirmed gone.
+                except Exception as e:
+                    logging.debug(f"Could not confirm channel {channel_id} is gone: {e}")
+                    return False
+            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                return False
+            message = await channel.fetch_message(int(message_id))
+            await message.delete()
+            logging.debug(f"Deleted registration message {message_id} from channel {channel_id}")
+            return True
+        except discord.NotFound:
+            return True  # Message (or its channel) already gone.
         except Exception as e:
             logging.debug(f"Could not delete registration message {message_id} from channel {channel_id}: {e}")
+            return False
 
     server_config = CACHE.server_config
     playerregistration_count = 0
@@ -3185,17 +3216,24 @@ async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False
             if tracked_message_id:
                 # Determine which channel to delete from (prefer current, fall back to old)
                 channel_to_delete_from = registration_channel_id if registration_channel_id else old_channel_id
-                
-                if channel_to_delete_from:
-                    await _delete_message_from_channel(int(channel_to_delete_from), tracked_message_id)
 
-                # Clear the message ID and tracking
-                config['registration_message_id'] = None
-                config['_old_registration_channel_id'] = None
-                server_config[guild_id_str] = config
-                CACHE.server_config = server_config
-                await CACHE.persist_server_config(guild_id_str)
-                logging.info(f"Deleted registration message from guild {guild_id_int} (disabled)")
+                deletion_confirmed = True
+                if channel_to_delete_from:
+                    deletion_confirmed = await _delete_message_from_channel(int(channel_to_delete_from), tracked_message_id)
+
+                if deletion_confirmed:
+                    # Clear the message ID and tracking
+                    config['registration_message_id'] = None
+                    config['_old_registration_channel_id'] = None
+                    server_config[guild_id_str] = config
+                    CACHE.server_config = server_config
+                    await CACHE.persist_server_config(guild_id_str)
+                    logging.info(f"Deleted registration message from guild {guild_id_int} (disabled)")
+                else:
+                    # Deletion outcome was inconclusive (rate limit/network/permissions) — keep
+                    # tracking so we retry next cycle instead of losing the message ID while a
+                    # live message may still be sitting in the channel.
+                    logging.warning(f"Could not confirm deletion of registration message for guild {guild_id_int}; will retry next cycle")
             continue
 
         # Case 2: Registration message enabled - post/update
@@ -3212,19 +3250,24 @@ async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False
                 if old_id_int != new_id_int:
                     # Channel was actually changed - delete from old channel
                     logging.debug(f"Channel mismatch confirmed: {old_id_int} != {new_id_int}")
+                    old_deletion_confirmed = True
                     if tracked_message_id:
-                        await _delete_message_from_channel(old_id_int, tracked_message_id)
-                        logging.info(f"Deleted registration message from old channel {old_channel_id} (guild {guild_id_int})")
-                    # Clear the old channel tracking
-                    config['_old_registration_channel_id'] = None
-                    # Clear message ID so it will be reposted to the new channel
-                    config['registration_message_id'] = None
-                    tracked_message_id = ""
-                    # Save config after clearing old tracking info
-                    server_config[guild_id_str] = config
-                    CACHE.server_config = server_config
-                    await CACHE.persist_server_config(guild_id_str)
-                    logging.debug(f"Cleared old channel tracking for guild {guild_id_int}")
+                        old_deletion_confirmed = await _delete_message_from_channel(old_id_int, tracked_message_id)
+                        if old_deletion_confirmed:
+                            logging.info(f"Deleted registration message from old channel {old_channel_id} (guild {guild_id_int})")
+                        else:
+                            logging.warning(f"Could not confirm deletion of registration message from old channel {old_channel_id} (guild {guild_id_int}); will retry next cycle")
+                    if old_deletion_confirmed:
+                        # Clear the old channel tracking
+                        config['_old_registration_channel_id'] = None
+                        # Clear message ID so it will be reposted to the new channel
+                        config['registration_message_id'] = None
+                        tracked_message_id = ""
+                        # Save config after clearing old tracking info
+                        server_config[guild_id_str] = config
+                        CACHE.server_config = server_config
+                        await CACHE.persist_server_config(guild_id_str)
+                        logging.debug(f"Cleared old channel tracking for guild {guild_id_int}")
             except (ValueError, TypeError) as e:
                 logging.warning(f"Failed to compare channel IDs for guild {guild_id_int}: {e}")
 
@@ -3266,15 +3309,22 @@ async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False
                     if last_id is not None and str(last_id) == tracked_message_id:
                         continue
 
-        # Delete old registration message if it exists (best-effort)
+        # Delete old registration message if it exists. Only proceed to post a new one once
+        # deletion is confirmed (discord.NotFound = already gone, fine) — an inconclusive
+        # failure (rate limit, network blip, permissions) must NOT fall through to posting a
+        # new message on top of a possibly-still-live old one, since that's exactly how the
+        # old+new pair shows up as a visible duplicate registration message.
         if tracked_message_id:
             try:
                 old_message = await channel.fetch_message(int(tracked_message_id))
                 await old_message.delete()
                 logging.debug(f"Deleted old registration message {tracked_message_id} in channel {registration_channel_id}")
-            except Exception:
-                # Message might already be deleted manually
+            except discord.NotFound:
+                # Message already gone (manually deleted, or never existed in this channel).
                 pass
+            except Exception as e:
+                logging.warning(f"Could not confirm deletion of old registration message {tracked_message_id} in channel {registration_channel_id} ({e}); skipping repost this cycle to avoid a duplicate.")
+                continue
 
         # Create new registration message - channel.guild is guaranteed safe after type guard above
         server_name = channel.guild.name

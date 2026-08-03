@@ -23,7 +23,7 @@ import re
 import logging
 from datetime import datetime
 from collections import defaultdict
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Sequence
 from qapbot.config import CONFIG
 
 
@@ -336,15 +336,104 @@ def scan_logs(log_dir: str) -> Dict[str, Any]:
     }
 
 
-def format_log_summary(scan_result: Dict[str, Any], max_length: int = 1900, bot_version: Optional[str] = None) -> str:
+_NIGHTLY_MAINT_END_RE = re.compile(r"\[NIGHTLY-MAINTENANCE\] END — total duration ([\d.]+)s")
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format a duration in whole minutes/seconds, e.g. 783.8 -> '13m 4s', 45.2 -> '45s'."""
+    total = round(seconds)
+    minutes, secs = divmod(total, 60)
+    return f"{minutes}m {secs}s" if minutes else f"{secs}s"
+
+
+def find_last_nightly_maintenance_duration(log_dir: str) -> Optional[Tuple[datetime, float]]:
+    """
+    Find the most recently completed nightly-maintenance run by scanning
+    qapbot.log* rotations newest-first, independent of this process's own
+    startup marker.
+
+    Unlike scan_logs() (which resets its counters at the last "QapBot started"
+    line, so only reflects the current process), nightly maintenance runs at
+    most once/night — the last completed run may well predate this process's
+    start (e.g. right after a restart, before 03:00 UTC comes around again).
+    This is the /status and /admin Check Logs fallback shown until
+    QBcore.nightly_maintenance_durations has its first in-process entry.
+
+    Returns:
+        (timestamp, duration_seconds) of the most recent match, or None if no
+        qapbot.log* files exist or none contain a "[NIGHTLY-MAINTENANCE] END" line.
+    """
+    if not os.path.exists(log_dir):
+        return None
+    all_log_files = [f for f in os.listdir(log_dir) if f.startswith("qapbot.log")]
+    log_files = sorted(
+        all_log_files,
+        key=lambda f: "9999-99-99" if f == "qapbot.log" else f[len("qapbot.log."):],
+        reverse=True,
+    )
+    for fname in log_files:
+        fpath = os.path.join(log_dir, fname)
+        try:
+            with open(fpath, encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            if "[NIGHTLY-MAINTENANCE] END" not in line:
+                continue
+            m = _NIGHTLY_MAINT_END_RE.search(line)
+            if not m:
+                continue
+            dt, _ = parse_log_line(line)
+            if dt is None:
+                continue
+            return dt, float(m.group(1))
+    return None
+
+
+def format_nightly_maintenance_stats(durations: Sequence[float], log_dir: str) -> str:
+    """
+    Build the nightly-maintenance duration line shown by /status and
+    /admin Check Logs: min/avg/max over up to the last 10 in-process runs
+    (QBcore.nightly_maintenance_durations), or — until this process has
+    completed its own first run — the most recent run read from the log
+    file via find_last_nightly_maintenance_duration().
+    """
+    n = len(durations)
+    if n > 0:
+        d_min, d_max = min(durations), max(durations)
+        d_avg = sum(durations) / n
+        return (
+            f"Last {n} run{'s' if n != 1 else ''} (this session) — "
+            f"Min: {_fmt_duration(d_min)} | Avg: {_fmt_duration(d_avg)} | Max: {_fmt_duration(d_max)}"
+        )
+    last = find_last_nightly_maintenance_duration(log_dir)
+    if last is None:
+        return "No nightly maintenance run recorded yet"
+    dt, secs = last
+    return (
+        f"No run yet this session — last recorded run: "
+        f"{dt.strftime('%Y-%m-%d %H:%M:%S')} ({_fmt_duration(secs)})"
+    )
+
+
+def format_log_summary(
+    scan_result: Dict[str, Any],
+    max_length: int = 1900,
+    bot_version: Optional[str] = None,
+    nightly_maint_section: Optional[str] = None,
+) -> str:
     """
     Format log scan results for Discord output with character limit.
-    
+
     Args:
         scan_result: Dict from scan_logs()
         max_length: Maximum characters for output (default 1900, safe for Discord 2000 limit)
         bot_version: Current bot version string (e.g. from QBcore.BOT_VERSION)
-        
+        nightly_maint_section: Pre-formatted nightly-maintenance duration line
+            (see format_nightly_maintenance_stats), shown near the top so it is
+            never dropped by the errors/warnings truncation below.
+
     Returns:
         Formatted string ready for Discord
     """
@@ -392,7 +481,11 @@ def format_log_summary(scan_result: Dict[str, Any], max_length: int = 1900, bot_
     
     lines.append(f"**Total Errors:** {_n(len(errors))}")
     lines.append(f"**Total Warnings:** {_n(len(warnings))}\n")
-    
+
+    if nightly_maint_section:
+        lines.append("**Nightly Maintenance:**")
+        lines.append(f"  {nightly_maint_section}\n")
+
     # War Update Metrics section (refactored format - 2026-01)
     cycle_count = scan_result.get('cycle_count', 0)
     cycle_min = scan_result.get('cycle_min')
@@ -1188,25 +1281,46 @@ async def handle_cleanup_messages_all(bot: Any, cache: Any, username: str) -> st
     _cleanup_sem = asyncio.Semaphore(5)
 
     async def _cleanup_one(channel_id: int) -> tuple[int, int]:
+        import discord
         from qapbot.config import CONFIG
+
         channel = bot.get_channel(channel_id)
-        if not channel:
-            if CONFIG.is_dev_mode:
-                # Dev bot is only in dev guilds; channels from prod guilds don't resolve here.
-                # Silently skip to avoid purging cache entries that are valid in prod.
-                logging.debug(f"Channel {channel_id} not found in DEV mode - skipping (may be prod channel)")
-                return 0, 0
-            else:
-                # In prod the bot is in all subscribed guilds; if a channel doesn't resolve
-                # it was deleted. Purge its stale cache entries.
+        if channel:
+            async with _cleanup_sem:
+                try:
+                    return await cleanup_channel_messages(channel, bot)
+                except Exception as e:
+                    logging.error(f"Error cleaning up channel {channel_id}: {e}")
+                    return 0, 0
+
+        if CONFIG.is_dev_mode:
+            # Dev bot is only in dev guilds; channels from prod guilds don't resolve here.
+            # Silently skip to avoid purging cache entries that are valid in prod.
+            logging.debug(f"Channel {channel_id} not found in DEV mode - skipping (may be prod channel)")
+            return 0, 0
+
+        # get_channel() is a local-cache lookup, not proof of deletion — a cache miss can also be
+        # a transient gateway/cache gap. Confirm with a live API call before purging anything;
+        # a false purge here drops the tracked message ID, which then causes a *new* message to be
+        # posted next time (e.g. duplicate registration messages) even though the old one is still live.
+        async with _cleanup_sem:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except discord.NotFound:
+                # Discord API confirms the channel no longer exists. Safe to purge.
                 stale_keys = [k for k, v in list(cache.leaderboard_messages.items())
                               if v.get('channel_id') == str(channel_id)]
                 for k in stale_keys:
                     await cache.delete_leaderboard_message(k)
                 if stale_keys:
-                    logging.info(f"Purged {len(stale_keys)} cache entries for deleted channel {channel_id}")
+                    logging.info(f"Purged {len(stale_keys)} cache entries for confirmed-deleted channel {channel_id}")
                 return 0, len(stale_keys)
-        async with _cleanup_sem:
+            except Exception as e:
+                # Forbidden (no access), HTTPException (API error/rate limit), network errors, etc.
+                # None of these confirm deletion — leave the cache untouched and retry next run.
+                logging.warning(f"Could not confirm channel {channel_id} is deleted ({e}); skipping this run.")
+                return 0, 0
+
             try:
                 return await cleanup_channel_messages(channel, bot)
             except Exception as e:

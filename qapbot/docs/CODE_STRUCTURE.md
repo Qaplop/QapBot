@@ -971,6 +971,16 @@ kept here only for functions not narrated elsewhere.
 ├── exit_code (int)                  # Set to EXIT_CODE_MAINTENANCE (42) for restart
 ├── EXIT_CODE_MAINTENANCE (int = 42) # Recognised by start.sh to trigger immediate restart
 ├── BOT_VERSION (str)                # Semantic version string, shown in /status and startup log
+├── nightly_maintenance_durations (deque[float], maxlen=10) # Rolling history of completed
+│                                    # run_nightly_maintenance_routine() durations (seconds), fed
+│                                    # by the scheduled 03:00 UTC task, /admin Execute Nightly
+│                                    # Maintenance, and the deferred-optimize path alike. Read by
+│                                    # /status and /admin Check Logs (min/avg/max) via
+│                                    # qapbot/QBdiscocmdshelper_admin_command.py's
+│                                    # format_nightly_maintenance_stats() — empty until this
+│                                    # process's own first run, before which those commands fall
+│                                    # back to the last run's duration parsed from the log file
+│                                    # (find_last_nightly_maintenance_duration()).
 └── _maintenance_interaction_check() # CommandTree.interaction_check — blocks commands during
                                      # startup (fully_initialized=False) and maintenance;
                                      # registered via direct assignment (NOT @decorator)

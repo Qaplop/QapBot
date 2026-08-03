@@ -1,6 +1,60 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-03 (7)
+- Fixed: The actual primary root cause of intermittent duplicate registration messages (audited all
+  11 `bot.get_channel()`/`guild.get_channel()` call sites after (6) below to look for more instances
+  of the same class of bug). `repost_playerregistration_messages()` in QapBot.py runs every main
+  loop cycle (bump/repost) and on channel-setting changes; in all three places it deleted the old
+  tracked message with a blanket `except Exception: pass` (or, for the disable/channel-change
+  cases, via a helper that silently did nothing on a `get_channel()` cache miss) and then
+  unconditionally proceeded — posting a brand-new message, or clearing the tracked message ID —
+  regardless of whether the old message was actually confirmed gone. Any transient failure
+  (rate limit, network blip, permissions hiccup, cache-miss) during the delete step therefore left
+  the old message alive while a new one got created/tracked on top of it — the visible "registration
+  message shows up a 2nd time" symptom. Fixed by only treating a delete/channel-lookup as confirmed
+  when Discord actually says so (`discord.NotFound`, or a `fetch_channel()` fallback confirming the
+  channel is gone); any other outcome now skips reposting / keeps the old tracking for a retry next
+  cycle instead of risking a duplicate. Also applied the same `get_channel()`-miss-≠-deleted fix to
+  `cleanup_stale_ui_messages()` (startup `/clan_management` panel cleanup) for consistency, though
+  that one leaks an orphaned panel rather than duplicating messages (no repost happens there).
+  Documented as Pitfall 15 in qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md.
+  Files: QapBot.py.
+
+2026-08-03 (6)
+- Fixed: Likely root cause of intermittent duplicate messages (e.g. registration messages
+  occasionally appearing a 2nd time). `/admin Cleanup Messages All`'s per-channel resolution used
+  `bot.get_channel()` (a local-cache lookup) and treated any miss as "channel deleted", purging that
+  channel's tracked message IDs from `CACHE.leaderboard_messages`. A cache miss isn't proof of
+  deletion though — it can also happen on a transient gateway/cache gap — so a still-live channel's
+  cache entry could get purged, causing the bot to post a brand-new message next time instead of
+  recognizing the old one still exists. `handle_cleanup_messages_all()`'s `_cleanup_one()` in
+  qapbot/QBdiscocmdshelper_admin_command.py now falls back to a live `bot.fetch_channel()` API call
+  on a cache miss (skipped in dev mode as before) and only purges the cache entries on a confirmed
+  `discord.NotFound`; any other outcome (`Forbidden`, `HTTPException`, network error, etc.) leaves
+  the cache untouched and retries on the next run.
+  Files: qapbot/QBdiscocmdshelper_admin_command.py.
+
+2026-08-03 (5)
+- Added: Nightly maintenance duration reporting in `/status` and `/admin Check Logs`. Every
+  completed `run_nightly_maintenance_routine()` run (scheduled 03:00 UTC task, `/admin Execute
+  Nightly Maintenance`, and the deferred-optimize path all share this one function) now appends
+  its duration to a new rolling `QBcore.nightly_maintenance_durations` deque (last 10 runs); both
+  commands show min/avg/max over that window via the new
+  `format_nightly_maintenance_stats()`/`find_last_nightly_maintenance_duration()` helpers in
+  qapbot/QBdiscocmdshelper_admin_command.py, formatted as minutes/seconds (e.g. "13m 4s", no
+  sub-second precision) via the new `_fmt_duration()` helper. Directly after bot startup and
+  until this process's own first run completes, both commands instead fall back to the most
+  recent "[NIGHTLY-MAINTENANCE] END — total duration Xs" line parsed from the log file (scanned
+  newest-rotation-first, independent of the current process's own startup marker, since
+  maintenance runs at most once/night and the last real run may predate a restart).
+  `/help status` and both translations updated. `qapbot/docs/CODE_STRUCTURE.md` documents the new
+  QBcore attribute.
+  Files: QBcore.py, QapBot.py, QBdiscordcmds.py, qapbot/QBdiscocmdshelper_admin_command.py,
+  qapbot/translations/en.json, qapbot/translations/de.json, qapbot/docs/CODE_STRUCTURE.md,
+  tests/unit/test_admin_helper_phase5.py, tests/unit/test_run_nightly_maintenance_routine.py.
+  1488 tests pass.
+
 2026-08-03 (4)
 - Added: `/status force_refresh:True` option. Bypasses the 25h database-statistics cache (added in
   (3) above) and recomputes it on demand, for the rare case someone wants an up-to-the-second count

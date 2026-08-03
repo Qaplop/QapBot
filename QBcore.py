@@ -44,6 +44,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import asyncio
+from collections import deque
 from datetime import datetime
 from typing import Optional, Any
 import coc  # type: ignore[import-untyped]
@@ -569,6 +570,22 @@ Runtime statistics for the periodic update cycle.
   min_s   – shortest cycle duration in seconds (None until first cycle).
   max_s   – longest cycle duration in seconds (None until first cycle).
   total_s – cumulative duration in seconds (used to compute avg).
+"""
+
+# Nightly maintenance duration history
+nightly_maintenance_durations: "deque[float]" = deque(maxlen=10)
+"""
+Rolling window of the last 10 completed nightly-maintenance run durations
+(seconds), oldest first. Populated by run_nightly_maintenance_routine() in
+QapBot.py after every run — the scheduled 03:00 UTC task, /admin Execute
+Nightly Maintenance, and the deferred-optimize path all share that one
+function, so all three feed this same history.
+Read by /status and /admin Check Logs (via
+qapbot.QBdiscocmdshelper_admin_command.format_nightly_maintenance_stats) to
+report min/avg/max. Empty until this process completes its own first run —
+until then those commands fall back to the last run's duration read from the
+log file (find_last_nightly_maintenance_duration), since maintenance runs at
+most once/night and the last real run may predate this process's start.
 """
 
 last_rate_limit: Optional[datetime] = None

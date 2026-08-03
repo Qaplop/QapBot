@@ -350,3 +350,47 @@ automatically by `_update_clan_metadata()` in qapbot/coc_cache.py on any success
 `GET /clans/{tag}`. Do NOT add `is_deleted` to `_ESSENTIAL_CLAN_FIELDS`.
 
 See also: ../qapbot/docs/CLAN_WAR_TRACKING.md § Clan Deletion Detection
+
+## Pitfall 15: `bot.get_channel()` returning `None` does NOT mean the channel was deleted
+
+Symptom: Code treats `bot.get_channel(channel_id) is None` as "channel was deleted" and purges
+related CACHE entries (e.g. tracked message IDs). This can fire on a transient gateway/cache gap
+even though the channel still exists, silently dropping the tracked message ID — the bot then
+posts a brand-new message next time instead of recognizing the old one is still there, producing
+duplicate messages (e.g. registration messages appearing a 2nd time). Root-caused in
+`handle_cleanup_messages_all()` in qapbot/QBdiscocmdshelper_admin_command.py (fixed 2026-08-03).
+
+Root cause: `Client.get_channel()` is a **local cache lookup only** — it never calls the Discord
+API. `None` can mean the channel was deleted, but can equally mean a cache gap (bot restart race,
+gateway hiccup, or in dev mode: a prod-guild channel the dev bot was never in).
+
+Fix: never treat a `get_channel()` miss as confirmed deletion. Fall back to an actual API call and
+gate on the specific exception:
+```python
+channel = bot.get_channel(channel_id)
+if not channel:
+    try:
+        channel = await bot.fetch_channel(channel_id)
+    except discord.NotFound:
+        # Discord API confirms the channel no longer exists — safe to treat as deleted.
+        ...purge cache entries...
+    except Exception:
+        # Forbidden (no access), HTTPException (API error/rate limit), network errors, etc.
+        # None of these confirm deletion — leave the cache untouched and retry next run.
+        ...skip, log, don't purge...
+```
+Only `discord.NotFound` (HTTP 404, "Invalid Channel ID") confirms deletion. `discord.Forbidden`
+(HTTP 403, e.g. bot not in that guild — relevant for the dev/prod split) and any other
+`HTTPException`/network error are inconclusive and must not trigger a purge.
+
+Sibling pattern — "delete old message, then unconditionally post new one": the same duplicate
+risk shows up without `get_channel()` at all. `repost_playerregistration_messages()` in QapBot.py
+(runs every main loop cycle) deleted the tracked message inside a blanket `except Exception: pass`
+and then *always* proceeded to post a replacement, regardless of whether the delete actually
+happened. A transient failure (rate limit, network blip, permissions) left the old message alive
+while a new one was created on top of it. Same fix shape: only treat the delete as done on
+`discord.NotFound` (or a confirmed-gone channel); any other exception must skip posting/clearing
+tracking this cycle rather than risk a duplicate. Fixed 2026-08-03.
+
+See also: qapbot/QBdiscocmdshelper_admin_command.py `handle_cleanup_messages_all()`,
+QapBot.py `repost_playerregistration_messages()` / `cleanup_stale_ui_messages()`
