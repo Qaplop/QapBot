@@ -156,6 +156,9 @@
       "title": "Clan-Bestenliste",
       "no_data": "Keine Kriegsdaten für diesen Clan verfügbar"
     },
+    "highlightme": {
+      "success": "✅ Dein Eintrag wurde in {count} Bestenliste(n) in diesem Kanal hervorgehoben. Die Hervorhebung wird beim nächsten automatischen Update wieder entfernt."
+    },
     "whois": {
       "player_report_no_data": "Keine Kriegsverlaufsdaten für Spieler-Tag `{tag}` gefunden. Der Spieler hat möglicherweise an keinen getrackten Kriegen teilgenommen.",
       "player_report_no_args": "Bitte gib einen Discord-Nutzer **oder** einen Spieler-Tag / -Namen an (z. B. `#ABC123` oder ein Name).",
@@ -206,6 +209,11 @@
         "title": "🏆 Leaderboard-Befehl",
         "detailed": "Zeige eine Bestenliste für einen bestimmten Clan oder Familie mit verschiedenen Statistik-Modi an.\n\n**Verwendung:**\n`/leaderboard clan:<clan_tag_oder_name> mode:<bestenlisten_modus> [month:<monat>] [year:<jahr>] [cwl_only:<true/false>] [season:<saison>] [scope:<all|own>]`\n\n**Parameter:**\n• `clan` - Clan-Tag, -Name oder Familien-Tag. Leer lassen, um die Abos dieses Kanals zu verwenden.\n• `mode` - Bestenlisten-Modus: attack, avgstars, avgstarsbyth, attackdefratio, defense, missedattacks, currentwar, cwlinfo, cwlinfo_comp, cwlgroup\n• `month` - Optional: ein einzelner Monat (6), ein Bereich (6-7), eine Liste (1;3;5), oder eine Anzahl (-2 = letzte 2 Monate, kann Jahresgrenze überschreiten)\n• `year` - Optional: Bestimmtes Jahr\n• `cwl_only` - Optional: Nur CWL-Kriege einschränken (true/false)\n• `season` - Optional: CWL-Saison (YYYY-MM, oder YYYY-MM-DD für unterjährige CWL). Überschreibt month/year und erzwingt CWL-Modus\n• `scope` - Optional: `all` (Standard) rechnet Statistiken eines aktuellen Mitglieds auch aus nicht mehr getrackten Clans an; `own` beschränkt auf die aktuellen Mitgliedsclans dieses Servers\n\n**Verfügbare Modi:**\n• `currentwar` - Aktueller Kriegsstatus mit Gewinnervorhersage\n• `attack` - Sortiert nach gesamten Kriegssternen (Standard)\n• `avgstars` - Sortiert nach durchschnittlichen Sternen pro Angriff\n• `avgstarsbyth` - Durchschnittliche Sterne pro Angriff, nach RH-Level gruppiert\n• `attackdefratio` - Verhältnis von gewonnenen zu erlittenen Verteidigungs-Sternen\n• `defense` - Wenigste erlittene Verteidigungssterne pro Verteidigung\n• `missedattacks` - Meiste verpasste Angriffe\n• `cwlinfo` - CWL-Saison: alle 7 Runden mit Aufstellungen, Ergebnissen und Vorhersagen\n• `cwlinfo_comp` - CWL-Übersicht: Standard- vs. fertigkeitsangepasste Vorhersagen\n• `cwlgroup` - CWL-Liga-Gruppen-Tabelle: Rang, Sterne und Zerstörung für alle 8 Clans\n\n**Beispiel:**\n`/leaderboard clan:#L2J0C0PY mode:attack month:12 year:2025`"
       },
+      "highlightme": {
+        "short": "Dich selbst in den Bestenlisten dieses Kanals hervorheben (einmalig)",
+        "title": "✨ Highlight-Me-Befehl",
+        "detailed": "Postet die abonnierten Bestenlisten dieses Kanals neu, mit deinem/deinen registrierten Spieler(n) fett/farbig hervorgehoben, damit du dich in einer langen Liste findest.\n\n**Verwendung:**\n`/highlightme`\n\n**Verhalten:**\n• Nur Bestenlisten, in denen du tatsächlich vorkommst, werden neu gepostet; andere bleiben unverändert\n• `cwlinfo`, `cwlinfo_comp` und `cwlgroup` Abos posten Embeds/Bilder statt Text-Tabellen und können nicht hervorgehoben werden\n• Einmalig: Beim nächsten automatischen Update wird die Bestenliste ohne Hervorhebung neu gepostet\n\n**Wenn nichts passiert:**\nDu erhältst eine kurze private Nachricht, falls dieser Kanal keine geeigneten Bestenlisten-Abos hat, oder du in keiner davon gelistet bist.\n\n**Beispiel:**\n`/highlightme`"
+      },
       "analyse cwl_league_group": {
         "short": "Alle Clans einer CWL-Gruppe analysieren",
         "title": "⚔️ Analyse League Group Befehl",
@@ -244,7 +252,7 @@
       "status": {
         "short": "Bot-Status und Statistiken anzeigen",
         "title": "📊 Status-Befehl",
-        "detailed": "Zeige umfassende Bot-Statusinformationen einschließlich Betriebszeit, Speichernutzung und Cache-Statistiken an.\n\n**Verwendung:**\n`/status`\n\n**Angezeigte Informationen:**\n• Bot-Betriebszeit (Zeit seit letztem Neustart)\n• Speichernutzung (RAM-Verbrauch)\n• Anzahl getrackter Clans und Familien\n• Registrierte Discord-Benutzer und Spielerkonten\n• Anzahl aktiver Abos\n• Cache-Statistiken\n• Letzte Aktualisierungszeiten\n\nNützlich zur Überwachung der Bot-Gesundheit und -Leistung."
+        "detailed": "Zeige umfassende Bot-Statusinformationen einschließlich Betriebszeit, Speichernutzung und Cache-Statistiken an.\n\n**Verwendung:**\n`/status [force_refresh]`\n\n**Parameter:**\n• `force_refresh` (optional, Standard False) - Umgeht die zwischengespeicherten Datenbankstatistiken (normalerweise bis zu 25h veraltet) und berechnet sie neu. Dauert einige Sekunden länger, da die komplette Kriegsverlaufsdatenbank neu gescannt wird.\n\n**Angezeigte Informationen:**\n• Bot-Betriebszeit (Zeit seit letztem Neustart)\n• Speichernutzung (RAM-Verbrauch)\n• Anzahl getrackter Clans und Familien\n• Registrierte Discord-Benutzer und Spielerkonten\n• Anzahl aktiver Abos\n• Cache-Statistiken\n• Letzte Aktualisierungszeiten\n\nNützlich zur Überwachung der Bot-Gesundheit und -Leistung."
       },
       "help": {
         "short": "Hilfeinformationen anzeigen",
@@ -284,6 +292,8 @@
       "unsubscribed_single_mode": "Dieser Kanal ist nicht mehr auf {display_name} für den Modus '{mode}' abonniert.",
       "unsubscribed_multiple_modes": "Dieser Kanal ist nicht mehr auf {display_name} für {mode_count} Modi abonniert: {modes}.",
       "nothing_to_do_no_subs": "Nichts zu tun! Es gibt keine Clan-Abos für diesen Kanal und kein Clan wurde angegeben.",
+      "highlightme_no_leaderboard": "Dieser Kanal hat keine Bestenlisten-Abos, die hervorgehoben werden können.",
+      "highlightme_not_listed": "Du bist in keiner der abonnierten Bestenlisten dieses Kanals gelistet.",
       "cwlgroup_no_data": "Für {clan_name} ({tag}) wurden in Saison {season} keine CWL-Daten in der Datenbank gefunden.",
       "cwlgroup_year_without_month": "Bitte gib zusätzlich einen Monat an, wenn du nach Jahr filterst (z.B. month=5 year=2026).",
       "invalid_month_spec": "Ungültiger Monatswert: {error}",

@@ -156,6 +156,9 @@
       "title": "Clan Leaderboard",
       "no_data": "No war data available for this clan"
     },
+    "highlightme": {
+      "success": "✅ Highlighted your entry in {count} leaderboard(s) in this channel. The highlight is cleared again on the next automatic update."
+    },
     "whois": {
       "player_report_no_data": "No war history data found for player tag `{tag}`. The player may not have participated in any tracked wars.",
       "player_report_no_args": "Please specify a Discord user **or** a player tag / name (e.g. `#ABC123` or a name).",
@@ -206,6 +209,11 @@
         "title": "🏆 Leaderboard Command",
         "detailed": "Display a leaderboard for a specific clan or family with various statistics modes.\n\n**Usage:**\n`/leaderboard clan:<clan_tag_or_name> mode:<leaderboard_mode> [month:<month>] [year:<year>] [cwl_only:<true/false>] [season:<season>] [scope:<all|own>]`\n\n**Parameters:**\n• `clan` - Clan tag, name, or family tag. Leave empty to use this channel's subscriptions.\n• `mode` - Leaderboard mode: attack, avgstars, avgstarsbyth, attackdefratio, defense, missedattacks, currentwar, cwlinfo, cwlinfo_comp, cwlgroup\n• `month` - Optional: a single month (6), a range (6-7), a list (1;3;5), or a trailing count (-2 = last 2 months, may cross a year boundary)\n• `year` - Optional: Specific year\n• `cwl_only` - Optional: Restrict to CWL wars only (true/false)\n• `season` - Optional: CWL season (YYYY-MM, or YYYY-MM-DD for mid-month CWL). Overrides month/year and forces CWL mode\n• `scope` - Optional: `all` (default) credits a current member's stats even from clans no longer tracked here; `own` restricts to this server's current member clans\n\n**Available Modes:**\n• `currentwar` - Ongoing war stats with win prediction\n• `attack` - Sort by total war stars won (default)\n• `avgstars` - Sort by average stars per attack\n• `avgstarsbyth` - Average stars per attack, grouped by TH level\n• `attackdefratio` - Ratio of stars won to defensive stars suffered\n• `defense` - Fewest defensive stars conceded per defense\n• `missedattacks` - Most missed attacks\n• `cwlinfo` - CWL season: all 7 rounds with rosters, scores, and win predictions\n• `cwlinfo_comp` - CWL overview: standard vs. skill-adjusted win predictions\n• `cwlgroup` - CWL league-group standings: rank, stars, and destruction for all 8 clans\n\n**Example:**\n`/leaderboard clan:#L2J0C0PY mode:attack month:12 year:2025`"
       },
+      "highlightme": {
+        "short": "Highlight yourself in this channel's leaderboards (one-time)",
+        "title": "✨ Highlight Me Command",
+        "detailed": "Re-post this channel's subscribed leaderboards with your own registered player(s) bolded/colored so you can spot yourself in a long list.\n\n**Usage:**\n`/highlightme`\n\n**Behavior:**\n• Only leaderboards you actually appear in are reposted; others are left untouched\n• `cwlinfo`, `cwlinfo_comp`, and `cwlgroup` subscriptions post embeds/images, not text tables, and can't be highlighted\n• One-time only: the next automatic update cycle reposts the leaderboard again without the highlight\n\n**If nothing happens:**\nYou'll get a small private message if this channel has no eligible leaderboard subscriptions, or if you're not listed in any of them.\n\n**Example:**\n`/highlightme`"
+      },
       "analyse cwl_league_group": {
         "short": "Analyse all clans in a CWL group",
         "title": "⚔️ Analyse League Group Command",
@@ -245,7 +253,7 @@
       "status": {
         "short": "Show bot status and statistics",
         "title": "📊 Status Command",
-        "detailed": "Display comprehensive bot status information including uptime, memory usage, and cache statistics.\n\n**Usage:**\n`/status`\n\n**Information Displayed:**\n• Bot uptime (how long since last restart)\n• Memory usage (RAM consumption)\n• Number of tracked clans and families\n• Registered Discord users and player accounts\n• Active subscriptions count\n• Cache statistics\n• Last update times\n\nUseful for monitoring bot health and performance."
+        "detailed": "Display comprehensive bot status information including uptime, memory usage, and cache statistics.\n\n**Usage:**\n`/status [force_refresh]`\n\n**Parameters:**\n• `force_refresh` (optional, default False) - Bypass the cached database statistics (normally up to 25h stale) and recompute them now. Takes several extra seconds since it re-scans the full war history database.\n\n**Information Displayed:**\n• Bot uptime (how long since last restart)\n• Memory usage (RAM consumption)\n• Number of tracked clans and families\n• Registered Discord users and player accounts\n• Active subscriptions count\n• Cache statistics\n• Last update times\n\nUseful for monitoring bot health and performance."
       },
       "help": {
         "short": "Display help information",
@@ -285,6 +293,8 @@
       "unsubscribed_single_mode": "Unsubscribed this channel from {display_name} for mode '{mode}'.",
       "unsubscribed_multiple_modes": "Unsubscribed this channel from {display_name} for {mode_count} modes: {modes}.",
       "nothing_to_do_no_subs": "Nothing to do! No clans are subscribed for this channel and no clan provided.",
+      "highlightme_no_leaderboard": "This channel has no leaderboard subscriptions that can be highlighted.",
+      "highlightme_not_listed": "You're not listed in any of this channel's subscribed leaderboards.",
       "cwlgroup_no_data": "No CWL data found in the database for {clan_name} ({tag}) in season {season}.",
       "cwlgroup_year_without_month": "Please also specify a month when filtering by year (e.g. month=5 year=2026).",
       "invalid_month_spec": "Invalid month value: {error}",

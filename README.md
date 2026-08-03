@@ -140,6 +140,7 @@ action. There is no separate `/clans`, `/list_families`, `/list_players`, `/list
 - `/subscribe` - Subscribe a channel to clan or clan family leaderboard updates
 - `/unsubscribe` - Unsubscribe a channel from clan or clan family leaderboard updates
 - `/leaderboard` - Display leaderboard(s) for subscribed clans or families with various modes
+- `/highlightme` - Re-post this channel's subscribed leaderboards with your own player(s) highlighted (one-time; cleared on the next automatic update)
 - `/subscriptions` - List clan/family subscriptions for the current channel or entire server
 - `/list` - Consolidated list command; pick an `action`:
   - **ACCOUNTS** - All Discord user accounts and their registered players

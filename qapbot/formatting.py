@@ -639,6 +639,15 @@ def _highlight_row(row_text: str, player_id: str, highlight_player_ids: Optional
         return f"{_ANSI_HIGHLIGHT}{row_text}{_ANSI_RESET}"
     return row_text
 
+def leaderboard_text_has_highlight(text: str) -> bool:
+    """True if render_leaderboard() actually highlighted a row in this text.
+
+    Used by callers (e.g. /highlightme) that need to know whether the
+    requested highlight_player_ids matched anyone in the rendered table,
+    without duplicating the ANSI escape sequence they wrap rows in.
+    """
+    return _ANSI_HIGHLIGHT in text
+
 def render_leaderboard(
     clan_tag: str,
     clan_name: str,

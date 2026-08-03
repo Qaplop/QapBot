@@ -51,7 +51,7 @@ from QBhelperfunctions import (
     generate_leaderboard_text, generate_cwlinfo_embeds, generate_cwlinfo_comp_embeds, post_discord_content_with_tracking, post_leaderboard_to_discord,
     update_clan_war_info_and_stats, generate_cwl_group_analysis_embeds,
     update_cwl_group_stats, generate_cwl_group_image,
-    build_cwl_opponent_embeds, parse_month_argument,
+    build_cwl_opponent_embeds, parse_month_argument, resolve_subscription_period,
 )
 from QapBot import GLOBAL_GUILD_ID, run_nightly_maintenance_routine, is_monthly_migration_due
 from qapbot.config import CONFIG
@@ -847,6 +847,111 @@ async def leaderboard_mode_autocomplete(interaction: discord.Interaction, curren
     """Autocomplete for mode from MODE_REGISTRY keys, excluding '_cwl' variants (redundant with cwl_only argument)."""
     return await get_mode_autocomplete_choices(current, include_cwl_variants=False)
 
+@app_commands.command(name="highlightme", description=dev_mode+"Re-post this channel's leaderboards with your own player(s) highlighted (one-time).")
+@app_commands.guild_only()
+@app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
+async def highlightme(interaction: discord.Interaction):
+    """
+    Re-post every leaderboard subscribed to this channel with the invoking user's
+    own registered player(s) highlighted (bold/color via ANSI codes — same
+    mechanism /leaderboard already uses for the auto-highlight-yourself feature).
+
+    Behavior:
+        - Only clan/family subscriptions whose mode renders as a per-row text
+          table are eligible; cwlinfo/cwlinfo_comp/cwlgroup post embeds/images
+          and have no per-row highlighting to apply.
+        - A leaderboard is only reposted if the invoking user's player(s)
+          actually appear in it; leaderboards they're not listed in are left
+          untouched.
+        - One-time by construction: the highlighted text's content hash never
+          matches the plain text the next automatic update cycle renders, so
+          that cycle always reposts (and thereby clears the highlight) even if
+          the underlying stats didn't change. No extra state is tracked.
+        - If the channel has no eligible subscriptions, or the user isn't
+          listed in any of them, nothing is reposted — just a small ephemeral
+          notice explaining why.
+        - A rolling (no explicit month/year) subscription accumulates a separate
+          tracked message per calendar month over time (05/2026, 06/2026, ...).
+          Only the latest (current month's) message is ever targeted here —
+          resolve_subscription_period() always resolves such a subscription to
+          "now" — so older months' messages are left untouched.
+    """
+    if not await _safe_defer(interaction, thinking=True, ephemeral=True):
+        return
+    _log_cmd(interaction, "highlightme")
+    guild_id = interaction.guild.id if interaction.guild else None
+
+    if not interaction.channel or not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        return
+    channel_id = str(interaction.channel.id)
+
+    subs = CACHE.get_all_subscriptions_flat()
+    # Only modes that go through render_leaderboard() (a per-row text table) can be
+    # highlighted — cwlinfo/cwlinfo_comp/cwlgroup post embeds/images instead.
+    subscribed = [
+        s for s in subs.get(channel_id, [])
+        if s.get('clan_tag') and s.get('clan_tag') != 'PLAYERREGISTRATION'
+        and s.get('subscription_type') not in ('cwlinfo', 'cwlinfo_comp', 'cwlgroup', 'playerregistration')
+    ]
+    if not subscribed:
+        await interaction.followup.send(t('commands.errors.highlightme_no_leaderboard', guild_id=guild_id), ephemeral=True)
+        return
+
+    highlight_player_ids: Set[str] = set()
+    user_entry = CACHE.user_accounts.get(str(interaction.user.id))
+    if user_entry:
+        for p in user_entry.get('players', []):
+            if isinstance(p, dict) and p.get('player_tag'):
+                highlight_player_ids.add(p['player_tag'])
+
+    from qapbot.formatting import DEFAULT_MODE, leaderboard_text_has_highlight  # type: ignore[attr-defined]
+
+    reposted = 0
+    if highlight_player_ids:
+        for sub in subscribed:
+            clan_tag = sub.get('clan_tag')
+            if not clan_tag:
+                continue
+            mode = sub.get('subscription_type', DEFAULT_MODE)
+            sub_month = sub.get('month')
+            sub_year = sub.get('year')
+            month, year, month_range = resolve_subscription_period(sub)
+
+            text = await asyncio.to_thread(
+                generate_leaderboard_text, clan_tag, month=month_range, year=year,
+                mode=mode, highlight_player_ids=highlight_player_ids,
+            )
+            # Mirror the automatic posting loop's "no data yet this month" fallback
+            # (post_leaderboards_to_subscribed_channels in QapBot.py) so the content
+            # rendered here matches whatever is actually posted right now. Note:
+            # month_range/year (the message's tracking key) intentionally stay as the
+            # current period — only the fallback TEXT comes from the previous month —
+            # so this still targets the latest message for a rolling subscription
+            # instead of spawning a stray duplicate on a past month's message.
+            if sub_month is None and sub_year is None and "no wars recorded for" in text.lower() and mode != "currentwar":
+                prev_month = month - 1
+                prev_year = year
+                if prev_month == 0:
+                    prev_month = 12
+                    prev_year -= 1
+                text = await asyncio.to_thread(
+                    generate_leaderboard_text, clan_tag, month=prev_month, year=prev_year,
+                    mode=mode, highlight_player_ids=highlight_player_ids,
+                )
+
+            if not leaderboard_text_has_highlight(text):
+                continue  # user isn't listed in this leaderboard — leave it untouched
+
+            await post_leaderboard_to_discord(text, clan_tag, month_range, year, interaction.channel, mode=mode)
+            reposted += 1
+
+    if reposted == 0:
+        await interaction.followup.send(t('commands.errors.highlightme_not_listed', guild_id=guild_id), ephemeral=True)
+        return
+
+    _log_cmd_done(interaction, "highlightme")
+    await interaction.followup.send(t('commands.highlightme.success', guild_id=guild_id, count=reposted), ephemeral=True)
+
 @app_commands.command(name="help", description=dev_mode+"Display help information about the available bot commands.")
 @app_commands.describe(
     command="Optional: Select a specific command to get detailed help"
@@ -864,7 +969,7 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
     
     # Command list for autocomplete and validation
     AVAILABLE_COMMANDS = [
-        "subscribe", "unsubscribe", "subscriptions", "leaderboard", "analyse cwl_league_group",
+        "subscribe", "unsubscribe", "subscriptions", "leaderboard", "highlightme", "analyse cwl_league_group",
         "analyse cwl_opponent", "clan management", "admin", "list", "whois", "ping", "status", "help"
     ]
     
@@ -941,7 +1046,7 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
     
     # Organize commands by category (reorganized per user request)
     categories = {
-        t('commands.help.category_leaderboards', user_id=user_id, guild_id=guild_id): ["subscribe", "unsubscribe", "subscriptions", "leaderboard"],
+        t('commands.help.category_leaderboards', user_id=user_id, guild_id=guild_id): ["subscribe", "unsubscribe", "subscriptions", "leaderboard", "highlightme"],
         t('commands.help.category_clan_player_info', user_id=user_id, guild_id=guild_id): ["analyse cwl_league_group", "analyse cwl_opponent", "whois"],
         t('commands.help.category_administration', user_id=user_id, guild_id=guild_id): ["clan management", "admin", "list"],
         t('commands.help.category_bot_info', user_id=user_id, guild_id=guild_id): ["ping", "status", "help"],
@@ -3077,15 +3182,28 @@ async def subscriptions(interaction: discord.Interaction, server_wide: bool = Fa
         await send_and_track(interaction, f"```{header}{table}```", 'subscriptions')
 
 @app_commands.command(name="status", description=dev_mode+"Show bot status including uptime, memory usage, and cache statistics.")
+@app_commands.describe(
+    force_refresh="If True, refresh the cached database statistics before showing status "
+                  "(default: False - use cached values, up to 25h stale; see /status output for freshness)"
+)
 @app_commands.guild_only()
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
-async def status(interaction: discord.Interaction):
+async def status(interaction: discord.Interaction, force_refresh: bool = False):
     """
     Show bot status including uptime, memory usage, and cache statistics.
+
+    Args:
+        interaction: Discord interaction object
+        force_refresh: If True, bypass the 25h database-statistics cache
+            (see get_global_db_statistics_sync) and recompute it now. This
+            re-runs the multi-GB full-table scan across the hot+history DBs,
+            so it can take several seconds — normal /status calls should
+            leave this False and rely on the cache warmed at startup /
+            refreshed nightly.
     """
     if not await _safe_defer(interaction, thinking=True):
         return
-    _log_cmd(interaction, "status")
+    _log_cmd(interaction, "status", force_refresh=force_refresh)
 
     def _n(v: int) -> str:
         """Integer with European thousand separator (period)."""
@@ -3180,7 +3298,7 @@ async def status(interaction: discord.Interaction):
     # Get global DB statistics and archive file count in parallel (both are I/O-bound)
     from qapbot.cache_manager import count_archive_files_sync
     db_stats, archive_file_count = await asyncio.gather(
-        asyncio.to_thread(CACHE.db_manager.get_global_db_statistics_sync),  # type: ignore[union-attr]
+        asyncio.to_thread(CACHE.db_manager.get_global_db_statistics_sync, force_refresh=force_refresh),  # type: ignore[union-attr]
         asyncio.to_thread(count_archive_files_sync, CONFIG.archive_dir),
     )
     # War file stats from in-memory cache only (zero I/O)

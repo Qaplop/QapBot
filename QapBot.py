@@ -99,6 +99,7 @@ from QBhelperfunctions import (
     post_leaderboard_to_discord, calculate_content_hash,
     fetch_clan_war_data, process_clan_war_data,
     generate_cwl_group_image, update_cwl_group_stats,
+    resolve_subscription_period,
 )
 
 # Sentinel returned by fetch_single_clan when the CoC API responded successfully
@@ -437,20 +438,7 @@ async def post_leaderboards_to_subscribed_channels() -> None:
                     clan_name = CACHE.get_clan_name(clan_tag, None)
                     if not clan_name:
                         clan_name = CACHE.clan_families.get(clan_tag, {}).get("name")
-                    now = datetime.now()
-                    # Default: current month/year
-                    month = now.month
-                    year = now.year
-                    month_range = month
-                    # YTD scope when year == "current"
-                    if sub_year == "current":
-                        year = now.year
-                        month_range = list(range(1, now.month + 1))
-                    elif isinstance(sub_year, int):
-                        year = sub_year
-                    if isinstance(sub_month, int):
-                        month = sub_month
-                        month_range = month
+                    month, year, month_range = resolve_subscription_period(sub)
                     logging.info(f"Preparing leaderboard for clan_tag: {clan_tag}, month: {month_range}, year: {year}, mode: {subscription_type}")
 
                     # --- cwlinfo: embed path (round-by-round CWL overview) ---
@@ -1678,6 +1666,30 @@ def _archive_move_nightly() -> None:
         _log.error(f"[ARCHIVE-MOVE] Failed: {_exc} — DB maintenance will still proceed")
 
 
+async def _warm_global_db_stats_cache(force_refresh: bool = False) -> None:
+    """
+    Populate (or refresh) CACHE.db_manager's /status global-DB-statistics
+    cache (see get_global_db_statistics_sync's docstring — it's a multi-GB
+    full-table-scan query, cached for 25h rather than recomputed per call).
+
+    Called fire-and-forget at startup so the first /status after a restart
+    never blocks on the cold scan, and again with force_refresh=True at the
+    end of nightly maintenance so the cache reflects post-VACUUM/ANALYZE
+    state and stays warm across the 25h window between /status calls.
+    Swallows all exceptions — a reporting-stat warm-up must never break
+    startup or nightly maintenance.
+    """
+    db_mgr = getattr(CACHE, "db_manager", None)
+    if db_mgr is None:
+        return
+    try:
+        _t0 = time.monotonic()
+        await asyncio.to_thread(db_mgr.get_global_db_statistics_sync, force_refresh=force_refresh)
+        logging.info(f"[DB-STATS-WARM] Global DB statistics cache warmed in {time.monotonic() - _t0:.1f}s")
+    except Exception as _exc:
+        logging.warning(f"[DB-STATS-WARM] Failed to warm global DB statistics cache: {_exc}")
+
+
 async def run_nightly_maintenance_routine(
     db_mgr: Any, run_migration: bool, migration_time_budget_seconds: Optional[float] = None
 ) -> str:
@@ -1734,7 +1746,12 @@ async def run_nightly_maintenance_routine(
             await db_mgr.monthly_history_migration(time_budget_seconds=_budget)
         # Steps 1-3: WAL checkpoint → REINDEX/VACUUM → ANALYZE (blocks
         # Discord commands internally via db_maintenance_mode).
-        return await db_mgr.nightly_db_maintenance()
+        _result = await db_mgr.nightly_db_maintenance()
+        # Step 4: refresh the /status global-DB-statistics cache now that
+        # maintenance is fully done, so it reflects post-VACUUM/ANALYZE state
+        # and stays warm for the full 25h TTL until the next nightly run.
+        await _warm_global_db_stats_cache(force_refresh=True)
+        return _result
     finally:
         logging.info(
             "[NIGHTLY-MAINTENANCE] END — total duration %.1fs",
@@ -2347,6 +2364,7 @@ async def _setup_hook():
         QBdiscordcmds.subscribe,  # type: ignore[misc]
         QBdiscordcmds.unsubscribe,  # type: ignore[misc]
         QBdiscordcmds.leaderboard,  # type: ignore[misc]
+        QBdiscordcmds.highlightme,  # type: ignore[misc]
         QBdiscordcmds.help,  # type: ignore[misc]
         QBdiscordcmds.subscriptions,  # type: ignore[misc]
         QBdiscordcmds.status,  # type: ignore[misc]
@@ -2808,6 +2826,12 @@ async def on_ready() -> None:
         # Step 9: Finalize initialization
         QBcore.bot.fully_initialized = True
         QBcore.bot.initialization_in_progress = False
+
+        # Warm the /status global-DB-statistics cache in the background (25h
+        # TTL — see get_global_db_statistics_sync) so the first /status call
+        # after a restart doesn't pay the multi-GB cold full-table-scan cost.
+        # Fire-and-forget: must not delay "fully_initialized" or on_ready.
+        asyncio.create_task(_warm_global_db_stats_cache())
 
         logging.info(f"🎉 Bot fully initialized and logged in as {QBcore.bot.user} ({mode_str} mode)")
         logging.info(f"🏠 Connected to {len(QBcore.bot.guilds)} guild(s)")

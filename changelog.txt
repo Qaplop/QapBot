@@ -1,6 +1,52 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-03 (4)
+- Added: `/status force_refresh:True` option. Bypasses the 25h database-statistics cache (added in
+  (3) above) and recomputes it on demand, for the rare case someone wants an up-to-the-second count
+  right now instead of waiting for the next nightly refresh. Defaults to False (cached, instant) so
+  normal `/status` calls are unaffected. `/help status` and both translations updated to document the
+  new parameter.
+  Files: QBdiscordcmds.py, qapbot/translations/en.json, qapbot/translations/de.json,
+  tests/discord/test_commands.py, tests/smoke_live/test_live_status_and_admin_checks.py. 1478 tests pass.
+
+2026-08-03 (3)
+- Fixed: `/status` took 9+ seconds on its first call after a restart (`get_global_db_statistics_sync()`
+  doing a cold full-table scan across the 14GB+27GB hot+history war_summary/war_attacks tables). The
+  existing 5-min TTL cache was useless in practice since `/status` is only called a few times a week —
+  every real-world call paid the full scan cost. TTL raised to 25h (`_GLOBAL_STATS_TTL`), the cache is
+  now warmed in the background right after bot startup (fire-and-forget, doesn't delay
+  `fully_initialized`), and force-refreshed at the very end of `run_nightly_maintenance_routine()`
+  (after REINDEX/VACUUM/ANALYZE) so it reflects post-maintenance state. `/status` should now always
+  hit a warm cache during normal operation.
+  Files: qapbot/db_manager.py, QapBot.py, qapbot/docs/CODE_STRUCTURE.md. 1478 tests pass.
+
+2026-08-03 (2)
+- Added: `/highlightme` command. Re-posts this channel's subscribed leaderboards with the
+  invoking user's own registered player(s) highlighted, reusing the ANSI-highlight rendering
+  already added to `/leaderboard`. Only leaderboards the user actually appears in are
+  reposted (checked via new `leaderboard_text_has_highlight()` in formatting.py); a channel
+  with no eligible subscriptions, or a user not listed in any of them, gets a small ephemeral
+  notice instead. The highlight is one-time by construction — no extra state is tracked: the
+  highlighted text's content hash never matches the plain text the next automatic update
+  cycle renders, so that cycle always reposts (and thereby clears the highlight) even if the
+  underlying stats are unchanged. Extracted `resolve_subscription_period()` in
+  QBhelperfunctions.py (shared by the new command and the existing auto-post loop in
+  QapBot.py) so the manually re-rendered period always matches what's currently posted.
+  For rolling (no explicit month/year) subscriptions, which accumulate a separate tracked
+  message per calendar month over time (05/2026, 06/2026, 07/2026, ...), only the latest
+  (current month's) message is ever targeted — older months' messages are left untouched,
+  since resolve_subscription_period() always resolves such a subscription to "now" and
+  post_leaderboard_to_discord()'s delete-before-post is scoped to that exact month's tracking
+  key. Matched an edge case in the "no wars yet this month" fallback: only the fallback TEXT
+  should come from the previous month, while the message's tracking key stays the current
+  month (matching QapBot.py's loop) — an earlier draft of this command incorrectly moved the
+  key too, which would have posted a stray duplicate onto last month's message instead of
+  updating the current one.
+  Files: QBdiscordcmds.py, QapBot.py, QBhelperfunctions.py, qapbot/formatting.py,
+  qapbot/translations/en.json, qapbot/translations/de.json, README.md,
+  qapbot/docs/CODE_STRUCTURE.md. 1478 tests pass.
+
 2026-08-03 (1)
 - Fixed: `/help` had drifted from the real command signatures. `/subscribe` and `/unsubscribe` help
   text documented `month`/`year` parameters that don't exist on those commands (they take

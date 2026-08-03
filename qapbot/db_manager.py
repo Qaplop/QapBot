@@ -407,7 +407,13 @@ class WarHistoryDB:
           asyncio.to_thread() workers share pre-configured connections
     """
 
-    _GLOBAL_STATS_TTL = 300.0  # seconds — see get_global_db_statistics_sync
+    # 25h, not a short TTL: /status is called maybe once every few days in
+    # practice, so a short TTL just means every call pays the full cold-scan
+    # cost anyway. These counts barely move within a day, so a long TTL is
+    # fine — the cache is explicitly warmed at startup and refreshed at the
+    # end of nightly maintenance (see QapBot.py), so /status should always
+    # hit a warm cache during normal operation. See get_global_db_statistics_sync.
+    _GLOBAL_STATS_TTL = 25 * 3600.0  # seconds
 
     def __init__(self):
         """Initialize database manager (connection created in initialize())."""
@@ -3764,9 +3770,16 @@ class WarHistoryDB:
             logging.error(f"[DB-QUERY-SYNC] Failed to get recent war summaries: {e}")
             return []
 
-    def get_global_db_statistics_sync(self) -> Dict[str, int]:
+    def get_global_db_statistics_sync(self, force_refresh: bool = False) -> Dict[str, int]:
         """
         Get comprehensive global DB statistics across all tables (synchronous).
+
+        Args:
+            force_refresh: Bypass the cache and recompute now, refreshing it.
+                Used by the end-of-nightly-maintenance refresh (see
+                QapBot.py's run_nightly_maintenance_routine) so /status always
+                serves an at-most-25h-stale value during normal operation
+                instead of ever paying the scan cost inline.
 
         Returns:
             Dict with keys:
@@ -3780,9 +3793,13 @@ class WarHistoryDB:
         (multi-million-row, hot+history) war_summary / war_attacks tables — there
         is no O(1) row-count shortcut for a UNION ALL of two attached schemas.
         On server-machine/slow storage this alone took 10+ seconds, making /status
-        unnecessarily slow every time it was called. Since this is a reporting
-        stat (not used for any business logic), the result is cached for
-        ``_GLOBAL_STATS_TTL`` seconds and served stale within that window.
+        unnecessarily slow every time it was called. /status is only used a few
+        times a week in practice, so a short TTL bought nothing — every call
+        still paid the cold-scan cost. Instead the result is cached for
+        ``_GLOBAL_STATS_TTL`` (25h) and the cache is proactively warmed at bot
+        startup and refreshed at the end of nightly maintenance (after
+        REINDEX/VACUUM/ANALYZE, so it reads post-maintenance state), so this
+        slow path should never actually run during normal /status calls.
         """
         import sqlite3
         import time
@@ -3792,7 +3809,8 @@ class WarHistoryDB:
 
         now = time.monotonic()
         if (
-            self._global_stats_cache is not None
+            not force_refresh
+            and self._global_stats_cache is not None
             and (now - self._global_stats_cache_ts) < self._GLOBAL_STATS_TTL
         ):
             return dict(self._global_stats_cache)

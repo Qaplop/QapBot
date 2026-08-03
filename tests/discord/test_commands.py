@@ -21,7 +21,7 @@ class _FakeDbManager:
     # letting the stub silently drift out of date.
     _STUBBED_METHODS = ("get_global_db_statistics_sync",)
 
-    def get_global_db_statistics_sync(self) -> Dict[str, int]:
+    def get_global_db_statistics_sync(self, force_refresh: bool = False) -> Dict[str, int]:
         return {"clans_count": 0, "wars_count": 0, "attacks_count": 0, "players_count": 0, "players_tracked_count": 0}
 
     def __getattr__(self, name: str) -> Any:

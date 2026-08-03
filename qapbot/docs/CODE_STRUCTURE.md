@@ -324,7 +324,11 @@ all rebuild/button-handler paths so the reference is never lost.
   · `search_players_by_name_sync(name_substring, limit=25)`: slow-fallback DB LIKE query (superseded by in-memory index at runtime)
 - Chart data methods (2026-05-17+):
   · `get_player_monthly_star_dist_sync(player_tag)`: per-month, per-type (CW/CWL) star distribution for Skill/Reliability /whois charts
-  · `get_global_db_statistics_sync()`: includes `players_tracked_count` (COUNT(*) FROM player_name_index)
+  · `get_global_db_statistics_sync(force_refresh=False)`: includes `players_tracked_count` (COUNT(*) FROM player_name_index).
+    Full scan across multi-GB hot+history war_summary/war_attacks tables — cached 25h (`_GLOBAL_STATS_TTL`, 2026-08-03) since
+    `/status` is only called a few times a week; cache is warmed at bot startup and refreshed (`force_refresh=True`) at the
+    end of `run_nightly_maintenance_routine()` in QapBot.py (after REINDEX/VACUUM/ANALYZE), so `/status` should never pay
+    the cold-scan cost during normal operation. See `QapBot._warm_global_db_stats_cache()`.
 - Never called directly from business logic - only via CACHE.db_manager
 - **Production Status**: Database-only mode (no feature flags), all data stored in SQLite
 📖 See: DATABASE_ARCHITECTURE.md for schema and architecture details
@@ -704,6 +708,31 @@ _split_and_post_leaderboard_helper()
         │   └── Returns list[dict] sorted by group_rank
         └── asyncio.to_thread(generate_cwl_group_image, standings, season) 🟫
             └── Renders dark-themed PNG (matplotlib Agg); returns bytes → discord.File
+    ├── /highlightme
+    │   ├── Iterates this channel's subscriptions (excludes cwlinfo/cwlinfo_comp/cwlgroup —
+    │   │   embed/image modes with no per-row table to highlight)
+    │   ├── resolve_subscription_period(sub) 🟩  (QBhelperfunctions.py — shared with the
+    │   │   automatic posting loop in QapBot.py so the rendered period always matches
+    │   │   whatever is currently posted for that subscription)
+    │   ├── generate_leaderboard_text(..., highlight_player_ids={invoking user's own tags})
+    │   ├── leaderboard_text_has_highlight(text) 🟫  (formatting.py — checks for
+    │   │   `_ANSI_HIGHLIGHT` in the rendered text) → skip this subscription (no repost)
+    │   │   if the invoking user isn't actually listed in it
+    │   └── post_leaderboard_to_discord() 🟩  for each subscription the user IS listed in
+    │       NOTE: one-time by construction, no extra state tracked — the highlighted
+    │       text's content_hash never matches the plain text the next auto-post cycle
+    │       renders (see post_leaderboards_to_subscribed_channels() above, under
+    │       Regular Update Cycle), so that cycle always reposts — and thereby clears
+    │       the highlight — even if the underlying stats didn't change.
+    │       NOTE: a rolling (no explicit month/year) subscription accumulates a separate
+    │       tracked message per calendar month over time (05/2026, 06/2026, 07/2026, ...) —
+    │       resolve_subscription_period() always resolves it to "now", so only the latest
+    │       (current month's) message is ever targeted here; older months' messages are
+    │       left untouched. The "no wars yet this month" fallback below only swaps the
+    │       rendered TEXT for the previous month's data — the tracking key (month_range/year
+    │       passed to post_leaderboard_to_discord) is deliberately left at the current
+    │       period, matching QapBot.py's loop, so the fallback still updates the latest
+    │       message instead of creating a stray duplicate on a past month's message.
     ├── /subscribe / /unsubscribe
     │   ├── Subscription management
     │   └── Cache update and persistence

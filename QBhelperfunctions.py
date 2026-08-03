@@ -4364,6 +4364,43 @@ def generate_leaderboard_text(
             logging.debug(f"PlayerID: {pid}, Name: {stats.get('Player','')}, Stars: {stats.get('Stars',0)}, Attacks: {stats.get('Attacks',0)}, Missed_Attacks: {stats.get('Missed_Attacks',0)}, Defensive_Stars: {stats.get('Defensive_Stars',0)}, Wars_Count: {stats.get('Wars_Count',0)}, Def_Stars_per_War: {stats.get('Def_Stars_per_War',0.0)}")
     return render_leaderboard(clan_tag, clan_name or "Unknown", month_label, war_info_line, stats_by_player, mode, style=style, highlight_player_ids=highlight_player_ids)
 
+def resolve_subscription_period(sub: Dict[str, Any], now: Optional[datetime] = None) -> Tuple[int, int, Union[int, List[int]]]:
+    """
+    Resolve the (month, year, month_range) a subscription targets "right now".
+
+    Mirrors the period logic used by the automatic per-cycle leaderboard posting
+    loop (post_leaderboards_to_subscribed_channels() in QapBot.py), so a manual
+    re-render of a subscription (e.g. /highlightme) matches what the next
+    automatic post would show.
+
+    Args:
+        sub: Subscription dict with optional 'month' (int) and 'year' (int or
+            the literal string "current" for year-to-date) keys.
+        now: Reference time; defaults to datetime.now().
+
+    Returns:
+        month: The current calendar month (used by callers for month-1 fallback
+            logic when a month has no recorded wars yet).
+        year: Target year.
+        month_range: What to pass as generate_leaderboard_text()'s `month` arg —
+            an int for a single month, or a list of ints for year-to-date.
+    """
+    now = now or datetime.now()
+    sub_month = sub.get('month')
+    sub_year = sub.get('year')
+    month = now.month
+    year = now.year
+    month_range: Union[int, List[int]] = month
+    if sub_year == "current":
+        year = now.year
+        month_range = list(range(1, now.month + 1))
+    elif isinstance(sub_year, int):
+        year = sub_year
+    if isinstance(sub_month, int):
+        month = sub_month
+        month_range = month
+    return month, year, month_range
+
 # --- Message key generation (single source of truth) ---
 
 def generate_message_key_timestamp() -> str:
