@@ -99,6 +99,7 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 ### 14) Keep docs current — a stale doc is a bug, not a formatting nit
 - DO: When a change touches something already documented (in this file or `../qapbot/docs/*.md`), update that documentation in the **same** change — not as a follow-up.
 - DO: When adding a significant feature or doing a significant refactor, add a new doc under `../qapbot/docs/` (or a new section in an existing one) if nothing already covers it.
+- DO: When adding, removing, or changing the behavior/options of a `/` slash command, update its `/help` entry (`help()` in `QBdiscordcmds.py`) in the same change, plus the command list in `../README.md` if it's listed there.
 - DON'T: Leave a doc referencing a file, convention, or location that the change just moved or renamed.
 - WHY: This file's own Changelog Management section pointed at `backlog.txt` long after that convention moved to `changelog.txt` — a leftover from when both lived in one file that was later split, and nobody updated the doc when the split happened. A stale doc actively misleads (worse than no doc), and any tool/model following it reproduces the mistake as project practice.
 📖 Where: cardinal rules/patterns → this file. Architecture deep-dives → `../qapbot/docs/*.md`.
