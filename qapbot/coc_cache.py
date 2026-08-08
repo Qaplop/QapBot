@@ -247,18 +247,45 @@ class CoCClanCache:
                             f"(promoted to {_new_wl})"
                         )
                     elif clan_data.get("track_war_updates") and _new_wl not in _WAR_UPDATE_LEAGUES:  # type: ignore[union-attr]
-                        # Demotion: previously tracked clan dropped below Master III.
-                        # Remove any ongoing temp war file first to prevent orphans,
-                        # then pull the clan out of the 22h polling pool.
-                        _removed = self._cleanup_temp_war_files(str(clan_obj.tag))  # type: ignore[attr-defined]
-                        clan_data["track_war_updates"] = False  # type: ignore[index]
-                        logging.info(
-                            "[WAR-LEAGUE-UPDATE] %s: track_war_updates → False "
-                            "(demoted to %s, no subscriptions%s)",
-                            clan_obj.tag,  # type: ignore[attr-defined]
-                            _new_wl,
-                            f", removed {_removed} temp war file(s)" if _removed else "",
-                        )
+                        # Demotion candidate: previously tracked clan dropped below
+                        # Master III. Defer if the clan already has archived data
+                        # for its current in-progress season — demoting now would
+                        # silence polling for the remaining rounds and permanently
+                        # freeze an incomplete season on record (see
+                        # CLAN_WAR_TRACKING.md write-path 7's mid-season guard;
+                        # this mirrors the same reasoning for this older, separate
+                        # demotion path).
+                        _in_progress = False
+                        if self.cache_manager and self.cache_manager.db_manager:
+                            try:
+                                _in_progress = await self.cache_manager.db_manager.clan_has_in_progress_cwl_data(
+                                    str(clan_obj.tag)  # type: ignore[attr-defined]
+                                )
+                            except Exception as _ip_ex:
+                                logging.warning(
+                                    "[WAR-LEAGUE-UPDATE] %s: clan_has_in_progress_cwl_data "
+                                    "check failed (%s) — proceeding with demotion",
+                                    clan_obj.tag, _ip_ex,  # type: ignore[attr-defined]
+                                )
+                        if _in_progress:
+                            logging.info(
+                                "[WAR-LEAGUE-UPDATE] %s: demotion deferred (demoted to %s) — "
+                                "already has in-progress-season CWL data; will re-evaluate "
+                                "once that season ends",
+                                clan_obj.tag, _new_wl,  # type: ignore[attr-defined]
+                            )
+                        else:
+                            # Remove any ongoing temp war file first to prevent orphans,
+                            # then pull the clan out of the 22h polling pool.
+                            _removed = self._cleanup_temp_war_files(str(clan_obj.tag))  # type: ignore[attr-defined]
+                            clan_data["track_war_updates"] = False  # type: ignore[index]
+                            logging.info(
+                                "[WAR-LEAGUE-UPDATE] %s: track_war_updates → False "
+                                "(demoted to %s, no subscriptions%s)",
+                                clan_obj.tag,  # type: ignore[attr-defined]
+                                _new_wl,
+                                f", removed {_removed} temp war file(s)" if _removed else "",
+                            )
         
         # Always update the in-memory timestamp (cheap), but only force a DB write
         # if it's been more than 1 hour since the last persisted value

@@ -50,6 +50,16 @@ the response's `clans` list:
   of a CWL group shares one league by construction. Without this, only the single clan
   `_process_league_group_response` may have queried live to resolve `league_rank` itself would get
   inserted, silently dropping the other (up to 7) never-before-seen group-mates.
+- **Mid-season guard (added 2026-08-08):** a demotion is deferred (only `war_league` corrected) if
+  `db_manager.clan_has_cwl_data_for_season(clan_tag, cwl_season)` is True — i.e. the clan already has
+  archived `war_summary` rows for *this* group's season. Without it, demoting mid-season would silence
+  polling for the clan's remaining rounds, permanently freezing an incomplete season on record. The
+  deferred demotion is not lost — it applies naturally at the next season's group discovery, by which
+  point the clan has zero rows for the new season so the guard no longer applies. Discovered when the
+  one-time backfill for this write-path (`qapbot/scripts/backfill_group_track_war_updates.py`, applied
+  to prod 2026-08-08) derived `track_war_updates` from the currently in-progress season and demoted
+  clans mid-way through it; remediated via `qapbot/scripts/repromote_mid_season_clans.py`. See path 5
+  above for the equivalent, separately-added guard on the older single-clan demotion path.
 
 This still cannot discover a "wholly foreign" group where **none** of the 8 members has ever been
 reachable from a subscribed clan (directly or transitively across past seasons) — every entry point into
@@ -120,6 +130,15 @@ and the clan is NOT subscribed (`has_active_subscriptions=False`):
   `_WAR_UPDATE_LEAGUES`, the flag is set to False — the clan's temp war files are removed first
   (`_cleanup_temp_war_files()`) to prevent orphans, then it leaves the 22h polling pool. Added
   2026-06-29; this is no longer a pure one-way ratchet (see Critical Constraints below).
+  **Mid-season guard (added 2026-08-08):** before applying the demotion, checks
+  `db_manager.clan_has_in_progress_cwl_data(clan_tag)` — if the clan's most recent
+  `cwl_league_groups` season is still active (`cwl_ended=0`) AND it already has an archived
+  `war_summary` row for that season, the demotion is deferred (only `war_league` is corrected)
+  so the season already in progress isn't abandoned mid-way. It re-evaluates and correctly
+  demotes once that season ends (next season's group discovery finds zero rows for the new
+  season, so the guard no longer applies). Discovered after a production incident where the
+  one-time backfill for write-path 7 stopped polling ~clans mid-season this way — see
+  `qapbot/scripts/repromote_mid_season_clans.py`.
 - Subscribed clans (`has_active_subscriptions=True`) are immune and bypass this block entirely —
   their `track_war_updates` stays True regardless of league movement.
 - Persisted via `persist_clan()`.

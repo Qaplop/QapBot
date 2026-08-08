@@ -506,6 +506,56 @@ class TestUpdateClanMetadataLeagueGate:
         assert cm.clan_name_cache["#T"]["track_war_updates"] is False
 
     @pytest.mark.asyncio
+    async def test_demotion_deferred_when_clan_has_in_progress_season_data(self):
+        """A clan that would otherwise be demoted must stay tracked if it
+        already has archived data for its current in-progress CWL season —
+        demoting now would silence polling for the remaining rounds and
+        permanently freeze an incomplete season on record (mirrors the
+        cache_manager._sync_group_track_war_updates mid-season guard for this
+        older, separate demotion path)."""
+        c, cm = self._make_cache()
+        cm.db_manager = AsyncMock()
+        cm.db_manager.clan_has_in_progress_cwl_data = AsyncMock(return_value=True)
+        cm.clan_name_cache = {
+            "#T": {
+                "name": "Clan", "has_active_subscriptions": False,
+                "warlog_is_public": True, "war_league": "Master League III",
+                "track_war_updates": True, "is_deleted": False,
+                "last_checked_via_api": datetime.now(timezone.utc).isoformat(),
+            }
+        }
+        clan = self._make_clan("#T", war_league="Crystal League I")
+        await c._update_clan_metadata(clan, datetime.now(timezone.utc))
+
+        cm.db_manager.clan_has_in_progress_cwl_data.assert_awaited_once_with("#T")
+        # war_league is still corrected...
+        assert cm.clan_name_cache["#T"]["war_league"] == "Crystal League I"
+        # ...but track_war_updates is deferred, not flipped.
+        assert cm.clan_name_cache["#T"]["track_war_updates"] is True
+
+    @pytest.mark.asyncio
+    async def test_demotion_proceeds_when_no_in_progress_season_data(self):
+        """Same shape as the deferral test above, but with no in-progress season
+        data on file — the ordinary demotion must proceed exactly as before
+        this guard existed."""
+        c, cm = self._make_cache()
+        cm.db_manager = AsyncMock()
+        cm.db_manager.clan_has_in_progress_cwl_data = AsyncMock(return_value=False)
+        cm.clan_name_cache = {
+            "#T": {
+                "name": "Clan", "has_active_subscriptions": False,
+                "warlog_is_public": True, "war_league": "Master League III",
+                "track_war_updates": True, "is_deleted": False,
+                "last_checked_via_api": datetime.now(timezone.utc).isoformat(),
+            }
+        }
+        clan = self._make_clan("#T", war_league="Crystal League I")
+        await c._update_clan_metadata(clan, datetime.now(timezone.utc))
+
+        cm.db_manager.clan_has_in_progress_cwl_data.assert_awaited_once_with("#T")
+        assert cm.clan_name_cache["#T"]["track_war_updates"] is False
+
+    @pytest.mark.asyncio
     async def test_subscribed_clan_immune_to_demotion(self):
         """Subscribed clan demoted to Crystal keeps track_war_updates = True."""
         c, cm = self._make_cache()

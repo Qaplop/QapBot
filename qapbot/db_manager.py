@@ -4244,6 +4244,35 @@ class WarHistoryDB:
         )
         return (await cursor.fetchone()) is not None
 
+    async def clan_has_cwl_data_for_season(self, clan_tag: str, cwl_season: str) -> bool:
+        """Return True if `clan_tag` already has at least one archived war_summary
+        row (is_cwl=1) for `cwl_season` — i.e. the bot already captured some of
+        this clan's rounds for the season currently in progress.
+
+        Used by cache_manager._sync_group_track_war_updates() to avoid demoting
+        (stopping polling for) a clan mid-season when doing so would abandon a
+        partially-captured CWL season — see CLAN_WAR_TRACKING.md write-path 7.
+        Checks both hot and history schemas: history.war_summary is always
+        attached on this connection (see initialize()), and while a season still
+        in progress is virtually always in the hot window, checking both is
+        cheap and avoids a subtle false-negative right at a monthly boundary.
+        """
+        await self._ensure_connection()
+        cursor = await self._conn.execute(
+            """
+            SELECT 1 FROM (
+                SELECT clan_tag FROM main.war_summary
+                WHERE  clan_tag = ? AND cwl_season = ? AND is_cwl = 1
+                UNION ALL
+                SELECT clan_tag FROM history.war_summary
+                WHERE  clan_tag = ? AND cwl_season = ? AND is_cwl = 1
+            )
+            LIMIT 1
+            """,
+            (clan_tag, cwl_season, clan_tag, cwl_season),
+        )
+        return (await cursor.fetchone()) is not None
+
     async def upsert_cwl_league_data(
         self,
         league_group_id: str,
@@ -4682,6 +4711,57 @@ class WarHistoryDB:
             )
             row = await cursor.fetchone()
             return bool(row["cwl_ended"]) if row else False
+        except Exception:
+            return False
+
+    async def clan_has_in_progress_cwl_data(self, clan_tag: str) -> bool:
+        """Return True if clan_tag's most recent cwl_league_groups season is
+        still active (cwl_ended=0) AND at least one war_summary row (is_cwl=1)
+        is already archived for that same season.
+
+        Season-agnostic (unlike clan_has_cwl_data_for_season, which requires the
+        caller to already know the exact season string) — reuses the same
+        "most recent season, cwl_ended flag" bookkeeping as
+        is_latest_cwl_season_ended_sync(), so it works from any call site that
+        only has a clan_tag in scope.
+
+        Used to guard against demoting (stopping polling for) a clan mid-season
+        when doing so would abandon a partially-captured CWL season — see
+        CLAN_WAR_TRACKING.md write-path 7 / write-path 5's demotion note.
+        Returns False on DB error or no cwl_league_groups row at all (safe
+        default — proceed with demotion as before this guard existed).
+        """
+        try:
+            await self._ensure_connection()
+            cursor = await self._conn.execute(
+                """
+                WITH clg AS (
+                    SELECT clan_tag, cwl_season, cwl_ended FROM main.cwl_league_groups
+                    UNION ALL
+                    SELECT clan_tag, cwl_season, cwl_ended FROM history.cwl_league_groups
+                ),
+                latest AS (
+                    SELECT cwl_season, cwl_ended,
+                           ROW_NUMBER() OVER (ORDER BY cwl_season DESC) AS rn
+                    FROM clg
+                    WHERE clan_tag = ?
+                )
+                SELECT 1
+                FROM   latest l
+                WHERE  l.rn = 1 AND l.cwl_ended = 0
+                  AND EXISTS (
+                        SELECT 1 FROM main.war_summary ws
+                        WHERE ws.clan_tag = ? AND ws.cwl_season = l.cwl_season AND ws.is_cwl = 1
+                        UNION ALL
+                        SELECT 1 FROM history.war_summary ws
+                        WHERE ws.clan_tag = ? AND ws.cwl_season = l.cwl_season AND ws.is_cwl = 1
+                  )
+                LIMIT 1
+                """,
+                (clan_tag, clan_tag, clan_tag),
+            )
+            row = await cursor.fetchone()
+            return row is not None
         except Exception:
             return False
 

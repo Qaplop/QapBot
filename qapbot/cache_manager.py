@@ -3169,7 +3169,7 @@ class CacheManager:
 
             if _league_rank:
                 await db.update_cwl_league_rank(cwl_season, _group_id, _league_rank)
-                await self._sync_group_track_war_updates(_clan_objs, _league_rank)
+                await self._sync_group_track_war_updates(_clan_objs, _league_rank, cwl_season)
 
             _log_msg = (
                 f"[CWL-ROUNDS] group {_group_id} season={cwl_season}: "
@@ -3183,7 +3183,7 @@ class CacheManager:
         except Exception as _ex:
             logging.warning(f"[CWL-ROUNDS] _process_league_group_response error: {_ex}")
 
-    async def _sync_group_track_war_updates(self, clan_objs: List[Any], league_rank: str) -> None:
+    async def _sync_group_track_war_updates(self, clan_objs: List[Any], league_rank: str, cwl_season: str) -> None:
         """Enforce the Master III+ tracking gate across a CWL group whose league is confirmed.
 
         This is the group-wide counterpart to ``_update_clan_metadata()``'s per-clan
@@ -3212,6 +3212,18 @@ class CacheManager:
 
         Subscribed clans are always tracked regardless of league movement and are
         left untouched.
+
+        Demotion is deferred (war_league still corrected, track_war_updates left
+        alone) for a clan that already has archived war_summary rows for
+        ``cwl_season`` — i.e. the bot already captured some of this clan's rounds
+        for the season in progress. Demoting mid-season would silence polling for
+        the clan's remaining rounds, leaving a permanently incomplete season on
+        record for no benefit (the demotion isn't lost — it naturally applies at
+        the next season's group discovery, by which point this clan has zero rows
+        for that new season, so the guard no longer applies). This mirrors the
+        one-time backfill remediation in
+        qapbot/scripts/repromote_mid_season_clans.py, written after discovering
+        the same gap in the retroactive backfill for this fix (2026-08-08).
         """
         should_track = league_rank in WAR_UPDATE_LEAGUES
         now_iso = datetime.now(_dt_timezone.utc).isoformat()
@@ -3248,21 +3260,43 @@ class CacheManager:
                 dirty = True
             if bool(clan_data.get("track_war_updates")) != should_track:
                 if not should_track:
-                    # Demotion: remove any ongoing temp war file first to prevent
-                    # orphans, mirroring _update_clan_metadata()'s demotion path.
-                    _removed = self.coc_clan_cache._cleanup_temp_war_files(tag)  # type: ignore[attr-defined]
-                    logging.info(
-                        "[CWL-GROUP-SYNC] %s: track_war_updates -> False (group league=%s, no subscriptions%s)",
-                        tag, league_rank,
-                        f", removed {_removed} temp war file(s)" if _removed else "",
-                    )
+                    # Demotion candidate — defer if the clan already has
+                    # in-progress data for THIS season (see docstring).
+                    _has_season_data = False
+                    if self.db_manager is not None:
+                        try:
+                            _has_season_data = await self.db_manager.clan_has_cwl_data_for_season(
+                                tag, cwl_season
+                            )
+                        except Exception as _hd_ex:
+                            logging.warning(
+                                "[CWL-GROUP-SYNC] %s: clan_has_cwl_data_for_season check "
+                                "failed (%s) — proceeding with demotion", tag, _hd_ex,
+                            )
+                    if _has_season_data:
+                        logging.info(
+                            "[CWL-GROUP-SYNC] %s: demotion deferred (group league=%s) — "
+                            "already has %s CWL data; will re-evaluate at next season's "
+                            "group discovery", tag, league_rank, cwl_season,
+                        )
+                    else:
+                        # Remove any ongoing temp war file first to prevent orphans,
+                        # mirroring _update_clan_metadata()'s demotion path.
+                        _removed = self.coc_clan_cache._cleanup_temp_war_files(tag)  # type: ignore[attr-defined]
+                        logging.info(
+                            "[CWL-GROUP-SYNC] %s: track_war_updates -> False (group league=%s, no subscriptions%s)",
+                            tag, league_rank,
+                            f", removed {_removed} temp war file(s)" if _removed else "",
+                        )
+                        clan_data["track_war_updates"] = False
+                        dirty = True
                 else:
                     logging.info(
                         "[CWL-GROUP-SYNC] %s: track_war_updates -> True (group league=%s)",
                         tag, league_rank,
                     )
-                clan_data["track_war_updates"] = should_track
-                dirty = True
+                    clan_data["track_war_updates"] = True
+                    dirty = True
 
             if dirty:
                 await self.persist_clan(tag)

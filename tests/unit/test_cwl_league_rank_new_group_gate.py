@@ -36,7 +36,7 @@ verified safe-rank cross-check, never a blind "any member" guess.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -60,14 +60,22 @@ class _FakeLeagueGroup:
         self._raw_data = None  # forces the clan_name_cache fallback path
 
 
-def _make_cm(clan_name_cache: dict, *, group_exists: bool) -> CacheManager:
+def _make_cm(clan_name_cache: dict, *, group_exists: bool, has_season_data: bool = False) -> CacheManager:
     cm = CacheManager()
     cm.clan_name_cache = clan_name_cache
     cm.db_manager = AsyncMock()
     cm.db_manager.cwl_group_exists = AsyncMock(return_value=group_exists)
     cm.db_manager.upsert_cwl_league_data = AsyncMock(return_value=0)
     cm.db_manager.update_cwl_league_rank = AsyncMock()
+    # Default False: a demotion candidate has no in-progress current-season data,
+    # so the ordinary demotion path in _sync_group_track_war_updates runs. Tests
+    # covering the mid-season-abandonment guard override this to True.
+    cm.db_manager.clan_has_cwl_data_for_season = AsyncMock(return_value=has_season_data)
     cm.coc_clan_cache = AsyncMock()
+    # _cleanup_temp_war_files is a plain sync method on the real CoCClanCache —
+    # override the auto-async child mock so the (unawaited, synchronous) call
+    # site in _sync_group_track_war_updates doesn't warn about a dangling coroutine.
+    cm.coc_clan_cache._cleanup_temp_war_files = MagicMock(return_value=0)
     return cm
 
 
@@ -308,3 +316,50 @@ class TestGroupTrackWarUpdatesSync:
         # subscribed clans are immune to the group-wide sync entirely.
         assert cm.clan_name_cache["#SUB"]["war_league"] == "Gold League I"
         assert cm.clan_name_cache["#SUB"]["track_war_updates"] is True
+
+    @pytest.mark.asyncio
+    async def test_demotion_deferred_when_clan_has_in_progress_season_data(self):
+        """A clan whose confirmed group league is below M3 would ordinarily be
+        demoted (track_war_updates -> False) — but if it already has archived
+        war_summary rows for the season being processed, demoting now would
+        silence polling for the clan's remaining rounds and permanently freeze
+        an incomplete season on record. track_war_updates must be left alone
+        (war_league still corrected) until the clan has zero rows for a season
+        (i.e. the next season's group discovery)."""
+        tags = ["#MIDSEASON", "#OTHER"]
+        cm = _make_cm(
+            {"#MIDSEASON": {"war_league": "Master League I", "track_war_updates": True,
+                             "has_active_subscriptions": False}},
+            group_exists=False,
+            has_season_data=True,
+        )
+        lg = _FakeLeagueGroup(tags)
+        lg._raw_data = {"clans": [{"tag": t, "warLeague": {"name": "Crystal League I"}} for t in tags]}
+
+        await cm._process_league_group_response(lg, "2026-08")
+
+        cm.db_manager.clan_has_cwl_data_for_season.assert_any_await("#MIDSEASON", "2026-08")
+        # war_league is still corrected to the confirmed group league...
+        assert cm.clan_name_cache["#MIDSEASON"]["war_league"] == "Crystal League I"
+        # ...but track_war_updates is deferred, not flipped, so the season finishes.
+        assert cm.clan_name_cache["#MIDSEASON"]["track_war_updates"] is True
+        cm.coc_clan_cache._cleanup_temp_war_files.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_demotion_proceeds_when_clan_has_no_season_data(self):
+        """Same shape as the deferral test, but with no in-progress season data —
+        the ordinary demotion must proceed exactly as before this guard existed."""
+        tags = ["#NODATA", "#OTHER"]
+        cm = _make_cm(
+            {"#NODATA": {"war_league": "Master League I", "track_war_updates": True,
+                         "has_active_subscriptions": False}},
+            group_exists=False,
+            has_season_data=False,
+        )
+        lg = _FakeLeagueGroup(tags)
+        lg._raw_data = {"clans": [{"tag": t, "warLeague": {"name": "Crystal League I"}} for t in tags]}
+
+        await cm._process_league_group_response(lg, "2026-08")
+
+        assert cm.clan_name_cache["#NODATA"]["track_war_updates"] is False
+        assert cm.clan_name_cache["#NODATA"]["war_league"] == "Crystal League I"

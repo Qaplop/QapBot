@@ -1,6 +1,36 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-08 (5)
+- Fixed: mid-season CWL tracking abandonment. User applied
+  `backfill_group_track_war_updates.py` (from (2)/(4) below) to prod and asked whether it could
+  have stopped polling clans partway through the currently in-progress season, abandoning
+  already-captured CWL data. Confirmed yes: the backfill (and, it turned out, the pre-existing
+  demotion path in `_update_clan_metadata()`, coc_cache.py — evidence: ~14,000 non-subscribed
+  clans on a dev DB snapshot already had `track_war_updates=0` alongside archived current-season
+  `war_summary` rows, predating today's other changes entirely) derive `track_war_updates` purely
+  from a clan's confirmed league, with no notion of "already mid-way through capturing this
+  season" — a demotion can fire after several rounds are already on file, silencing polling for
+  the rest of the season and freezing an incomplete record.
+  Fix: both demotion paths now defer (correcting `war_league` only, leaving `track_war_updates`
+  alone) when the clan already has an archived `war_summary` row for its current in-progress
+  season (`cwl_ended=0`) — `_sync_group_track_war_updates()` via the season it's already
+  processing, `_update_clan_metadata()` via a new season-agnostic
+  `db_manager.clan_has_in_progress_cwl_data()` (reuses the existing `cwl_ended` bookkeeping, no
+  season-string guessing needed). The deferred demotion isn't lost — it applies naturally next
+  season, once the clan has zero rows for the new season and the guard no longer applies.
+  New one-time remediation script (`qapbot/scripts/repromote_mid_season_clans.py`): re-promotes
+  clans the already-applied prod backfill demoted mid-season (track_war_updates=0 but with
+  archived data for the given `--season`), dry-run by default.
+  Also hardened `backfill_group_track_war_updates.py` itself with the same guard (a would-be
+  demotion is marked "deferred" instead, war_league still corrected) — safe to re-run at any
+  time going forward (e.g. for staged rollout) without ever reintroducing this exact bug.
+  Files: qapbot/cache_manager.py, qapbot/coc_cache.py, qapbot/db_manager.py,
+  qapbot/scripts/repromote_mid_season_clans.py, qapbot/scripts/backfill_group_track_war_updates.py.
+  Docs: CLAN_WAR_TRACKING.md (write-paths 5 and 7).
+  Added 4 tests (2 in test_cwl_league_rank_new_group_gate.py, 2 in test_coc_cache_coverage.py).
+  1501 tests pass (.\run_tests.ps1 -Full).
+
 2026-08-08 (4)
 - Fixed: `_sync_group_track_war_updates()` (added in (2) below) only corrected clans already
   present in `clan_name_cache` — a group's other never-before-seen members were silently skipped,
