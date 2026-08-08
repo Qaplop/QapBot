@@ -1,6 +1,54 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-08 (20)
+- Fixed: diagnosed a live prod incident (admin's /admin command got "The application did not
+  respond") to CPython's automatic (implicit) gen-2 garbage collector, not CoC API latency.
+  qapbot_PROD.log showed a 7.8s stretch with zero log output immediately followed by ~20
+  concurrently in-flight [COC-API-SLOW] get_clan() calls all reporting ~the same elapsed time —
+  the signature of the whole process (incl. event loop + Discord heartbeat) being frozen by a
+  single atomic C call, not 20 independent slow HTTPS calls finishing in sync. Confirmed systemic
+  (not one-off) via `qapbot/scripts/log_time_gaps.py --top 400` over the full day: dozens of
+  multi-second gaps recurring at varying positions across cycles. Root cause: the existing
+  Pitfall-16 fix (_post_cycle_cleanup's gc.collect(1) instead of a full collect) only scopes the
+  bot's own EXPLICIT end-of-cycle call — CPython's automatic collector is still enabled at default
+  thresholds and runs real gen-2 sweeps on its own schedule, including mid-Phase-1, walking the
+  entire long-lived CACHE graph (~420K clan_name_cache entries, ~6.4M player_name_index entries).
+  Fix (QapBot.py): (1) registered a gc.callbacks start/stop logger near the top of the file so any
+  future automatic collection ≥0.5s logs as "[GC-AUTO] Automatic gen-N collection paused the
+  process for X.XXXs" instead of masquerading as API latency; (2) after CACHE.load_all() completes
+  at startup, run one full gc.collect() then gc.freeze() to move the startup CACHE baseline into
+  gc's permanent generation, which automatic sweeps never scan — future automatic collections then
+  only walk genuinely new post-startup churn. Both offloaded via asyncio.to_thread (one-time
+  startup cost, before Phase-1/real traffic begins; per Pitfall 16 this keeps the heartbeat task
+  schedulable but doesn't make the calls themselves non-blocking). Documented as Pitfall 21 in
+  qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md and .github/copilot-instructions.md cardinal rule #20.
+  Full test suite (1523 tests) green after the change.
+
+2026-08-08 (19)
+- Fixed: API Verification button (ui_registration.py RegistrationView.api_verification_button) always
+  showed the "select an account to verify" dropdown, even when the user had only one unverified
+  player account linked. Now skips straight to the VerifyAccountModal when exactly one verifiable
+  account exists, matching the analogous single-account skip already done elsewhere in the
+  registration flow. Added tests covering both the single-account (modal opens directly) and
+  multi-account (selector still shown) cases; full discord test suite (107) still green.
+
+2026-08-08 (18)
+- Added: CODE_OPTIMIZATION_SUGGESTIONS.md (project root, replaces the earlier fully-actioned
+  file of the same name) — thorough main-bot-code inspection covering QapBot.py, QBcore.py,
+  QBdiscordcmds.py, QBhelperfunctions.py, cache_manager.py, db_manager.py, QBdiscocmdshelper.py,
+  war_notifications.py, coc_cache.py, guild_role_manager.py, formatting.py, ui_*.py.
+  25 findings grouped as correctness (on_ready re-entry race, partial-startup handling,
+  untracked fire-and-forget tasks), performance (per-war datetime re-parsing in the notification
+  loop, repeated league resolution per render, leaderboard width memoization), DRY (save_user
+  FK-retry SQL duplication, 4× war_attacks INSERT copies, Win/Loss/Draw classification copies,
+  view boilerplate → proposed TrackedView base before CWL roster views multiply), and hygiene
+  (dead stub buttons, silent except-pass sites, i18n label audit). Each finding tagged
+  [verified] vs [reported]; section E records inspection claims that did NOT hold up after
+  spot-checks (wrong schema-qualifier claim, overstated regex/scale claims) so they aren't
+  re-reported later; section F records verified-good areas. Docs-only change, no code touched;
+  no test run needed.
+
 2026-08-08 (17)
 - Fixed: entry (16)'s root-cause was INCOMPLETE — user compared prod DB against backup and
   confirmed the startup-window clicks did cause real data loss: exactly their own 5 user_players

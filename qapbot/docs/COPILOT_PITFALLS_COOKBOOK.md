@@ -554,3 +554,59 @@ reproduction of the exact incident path asserting the DB rows survive).
 Found-and-fixed instance (2026-07-25): `coc_cache.py`'s role-sync trigger only checked
 `member_clans`, so family-only guilds never got CoC-role/clan-role syncs triggered on
 clan-member cache updates.
+
+---
+
+## Pitfall 21: Automatic (implicit) `gc` gen-2 sweeps — Pitfall 16's fix only covers the *explicit* call
+
+Symptom (2026-08-08): an admin's `/admin` slash command got "The application did not respond" —
+Discord's interaction token expired before the bot's `defer()` call reached it. `qapbot_PROD.log`
+showed the command's `[CMD]` line landing *after* the 3s window, and — more tellingly — a burst of
+~20 concurrently in-flight `[COC-API-SLOW] get_clan(...)` log lines all reporting **the same**
+elapsed time (7.8–8.7s) within milliseconds of each other, immediately preceded by a 7.8s stretch
+of the log with **zero output at all** (no new `[COC-API-CALL]` dispatches, no `[WAR-LEAGUE-UPDATE]`
+lines — nothing). Independent concurrent HTTPS calls to 20 different endpoints do not finish in
+near-perfect sync; a shared atomic pause that blocks the entire process and releases everything at
+once when it ends does. Running `qapbot/scripts/log_time_gaps.py --top 400` over the full day
+confirmed this is systemic, not one-off: dozens of multi-second gaps recur throughout the day at
+*different* points in the cycle each time (inside Phase-1 fetch bursts, inside the
+`[NOTIFY-TIMING]` war-notification loop, right after `[CATEGORIZE-TIMING]`), which is the signature
+of an allocation-threshold-triggered pause, not a fixed code path.
+
+Root cause: Pitfall 16's fix (`_post_cycle_cleanup()` using `gc.collect(1)` instead of a full
+`gc.collect()`) only scopes the bot's own **explicit** end-of-cycle call. It deliberately leaves
+CPython's **automatic** generational collector enabled at default thresholds — see the comment
+above `_post_cycle_cleanup()` in QapBot.py, which already flagged this as an accepted gap: "Python's
+automatic generational GC ... continues to run real gen-2 sweeps on its own schedule". An automatic
+gen-2 sweep is triggered by allocation counters, not by any point in our code, so it can fire in the
+middle of Phase-1's concurrent API-response object churn (thousands of `coc.Clan`/`coc.War` objects
+created and freed). Being a single atomic C call (Pitfall 16), it holds the GIL for its whole
+duration — freezing every thread, including the event loop and the Discord gateway heartbeat — and
+because it's a *full* sweep it walks the entire long-lived `CACHE` graph (in PROD: ~420K
+`clan_name_cache` entries, ~6.4M `player_name_index` entries, subscriptions, user accounts, ...),
+which is what stretches it to multiple seconds.
+
+Fix (both applied near the top of QapBot.py / in the Step-3 cache-load block):
+1. **Make future pauses visible**: register a `gc.callbacks` start/stop logger at import time that
+   logs `[GC-AUTO] Automatic gen-N collection paused the process for X.XXXs` for any automatic
+   collection ≥0.5s. Without this, the failure mode is invisible — it masquerades as CoC API
+   latency, exactly as it did in this incident, and gets misdiagnosed as "not our bug" per the
+   Pitfall-16 diagnostic note above.
+2. **Shrink what gets swept**: after `CACHE.load_all()` completes at startup, run one full
+   `gc.collect()` (clean up startup-only garbage) then `gc.freeze()` — this moves everything
+   currently tracked into gc's permanent generation, which automatic collections never scan. Future
+   automatic sweeps then only walk genuinely new (post-startup) object churn — a small, bounded
+   working set — instead of the entire multi-million-object CACHE baseline. Both are atomic C calls
+   themselves, so they're `asyncio.to_thread()`-wrapped purely to keep the Discord heartbeat task
+   schedulable while they run (Pitfall 16: this does NOT make them non-blocking, it's a one-time
+   startup cost before real traffic/Phase-1 begins).
+
+Caveat: `gc.freeze()` permanently excludes the frozen objects from cyclic collection. If a genuine
+reference cycle later forms between a frozen (baseline) object and a new object, that cycle will
+never be collected. Acceptable here because `CACHE`'s frozen contents are plain dicts/lists/strings
+(no `__del__`, no custom classes prone to cycles) — the classic reference-cycle risk (e.g. `discord`
+objects, `aiohttp` responses) is all *post-freeze* churn, still tracked and collected normally.
+
+Diagnostic tool: same as Pitfall 16 — `qapbot/scripts/log_time_gaps.py --top 300-400`, looking for
+`[COC-API-SLOW]`/`[NOTIFY-TIMING]`/`[CATEGORIZE-TIMING]` gaps that recur at *varying* positions
+across cycles (vs. a fixed line, which would point to a specific blocking call instead).

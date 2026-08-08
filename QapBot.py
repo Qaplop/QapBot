@@ -60,6 +60,44 @@ class _DiscordReconnectFilter(logging.Filter):
 
 logging.getLogger('discord').addFilter(_DiscordReconnectFilter())
 
+# --- Automatic-GC pause visibility -----------------------------------------
+# The end of every update cycle already runs a scoped gc.collect(1) instead of
+# a full sweep (see Pitfall 16 / copilot-instructions.md) precisely because a
+# full generation-2 collection walks the entire long-lived CACHE object graph
+# (hundreds of thousands to millions of objects in PROD: clan_name_cache,
+# player_name_index, etc.) and, being a single atomic C call, freezes the
+# WHOLE process — every thread, including the event loop — for its duration.
+# That fix only covers the *explicit* end-of-cycle call. CPython's automatic
+# generational collector is never disabled in this codebase and still runs
+# gen-2 sweeps on its own allocation-threshold schedule, including in the
+# middle of Phase-1's concurrent API-response churn. Such a pause previously
+# produced zero log output during the freeze and then, once the GIL was
+# released, a burst of concurrently in-flight coc_retry() calls all logging
+# ~the same inflated elapsed time — indistinguishable from "the CoC API is
+# slow" (see [COC-API-SLOW] bursts in qapbot_PROD.log). Logging start/stop of
+# every automatic collection here makes that failure mode show up explicitly
+# instead of being misread as network latency.
+import gc
+import time as _gc_time
+_gc_pause_start: dict[int, float] = {}
+
+def _log_slow_gc(phase: str, info: dict) -> None:  # type: ignore[type-arg]
+    gen = info.get("generation", -1)
+    if phase == "start":
+        _gc_pause_start[gen] = _gc_time.perf_counter()
+        return
+    t0 = _gc_pause_start.pop(gen, None)
+    if t0 is None:
+        return
+    elapsed = _gc_time.perf_counter() - t0
+    if elapsed >= 0.5:  # gen-0 collections are frequent and normally sub-ms; only the rare slow ones matter
+        logging.warning(
+            "[GC-AUTO] Automatic gen-%d collection paused the process for %.3fs (collected=%d, uncollectable=%d)",
+            gen, elapsed, info.get("collected", 0), info.get("uncollectable", 0),
+        )
+
+gc.callbacks.append(_log_slow_gc)
+
 import platform
 import sys
 import asyncio
@@ -2815,6 +2853,30 @@ async def on_ready() -> None:
                 'messages': len(CACHE.leaderboard_messages)
             }
             logging.info(f"📊 Cache stats: {stats}")
+
+            # Freeze the just-loaded CACHE state into gc's permanent generation.
+            # CPython's automatic collector is never disabled in this codebase
+            # (see the [GC-AUTO] logger registered near the top of this file) and
+            # runs real gen-2 sweeps on its own allocation-threshold schedule —
+            # including mid-cycle, during Phase-1's concurrent API-response churn.
+            # A gen-2 sweep walks every tracked object; without freezing, that
+            # includes the hundreds of thousands to millions of long-lived CACHE
+            # objects (clan_name_cache, player_name_index, etc.) just loaded above,
+            # which is what turns an automatic collection into a multi-second
+            # process-wide freeze. gc.freeze() moves everything currently tracked
+            # into the permanent generation, which automatic collections skip
+            # entirely — so future sweeps only walk new (post-startup) churn, not
+            # this baseline. A one-time full gc.collect() first ensures we don't
+            # freeze in any startup-only garbage. Both are atomic C calls (see
+            # Pitfall 16), so they're offloaded to a thread purely to keep
+            # discord.py's heartbeat task schedulable while they run — not because
+            # that makes them non-blocking.
+            def _freeze_startup_heap() -> int:
+                gc.collect()
+                gc.freeze()
+                return gc.get_freeze_count()
+            _frozen_count = await asyncio.to_thread(_freeze_startup_heap)
+            logging.info(f"[GC-FREEZE] Froze {_frozen_count:,} startup object(s) into the permanent generation")
 
             # Load CWL war-tag recovery queue (if data/missing_cwl_war_tags.txt exists)
             try:

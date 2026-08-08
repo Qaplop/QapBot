@@ -161,6 +161,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 17) `normalize_clan_tag()` used as a first-resort classifier on freeform text → only prioritize it when input has an explicit leading `#`; otherwise try a name search first. See Pitfall 18.
 18) Guild-coverage checks ("is this clan covered by this guild") → must expand BOTH `member_clans` AND `member_families` (family IDs → `CACHE.clan_families`), never just the flat list. See Pitfall 19.
 19) `bot.add_view()`-registered views dispatch before `CACHE`/DB finish loading → a click in that window reads empty cache AND (via `update_user_metadata`'s skeleton-create + write-through) can hard-DELETE the user's real `user_players` rows (confirmed prod data loss 2026-08-08). Three-layer fix: view `interaction_check()` gates on `QBcore.bot.fully_initialized`; `CACHE.users_loaded` blocks all user write-through pre-load; `_save_user_impl` warns on empty-players wipes. See Pitfall 20.
+20) Multi-second freezes with zero log output, followed by a burst of concurrent `[COC-API-SLOW]` lines all reporting ~the same elapsed time → that's CPython's *automatic* gen-2 GC sweep (never disabled; Pitfall 16's `gc.collect(1)` fix only scopes the bot's own *explicit* end-of-cycle call), not real API latency. Startup now registers a `[GC-AUTO]` pause logger and calls `gc.freeze()` after `CACHE.load_all()` to shrink what automatic sweeps walk. See Pitfall 21.
 
 ---
 

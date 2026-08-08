@@ -110,3 +110,60 @@ async def test_api_verification_all_verified_sends_info(monkeypatch: pytest.Monk
     mock_interaction.response.send_message.assert_awaited_once()
     _, kwargs = mock_interaction.response.send_message.await_args
     assert kwargs.get("ephemeral") is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_api_verification_single_unverified_skips_selector_opens_modal(monkeypatch: pytest.MonkeyPatch, mock_interaction):
+    import qapbot.ui_registration as ui
+
+    monkeypatch.setattr(ui, "update_user_metadata_from_interaction", AsyncMock())
+
+    class _FakeCache:
+        user_accounts = {
+            str(mock_interaction.user.id): {
+                "players": [
+                    {"player_tag": "#P1", "player_name": "Alice", "verified": False}
+                ]
+            }
+        }
+
+    monkeypatch.setattr(ui, "CACHE", _FakeCache())
+
+    view = ui.RegistrationView(guild_id=mock_interaction.guild.id)
+    button = next(c for c in view.children if getattr(c, "custom_id", "") == "registration_api_verification")
+    await button.callback(mock_interaction)
+
+    mock_interaction.response.send_message.assert_not_awaited()
+    mock_interaction.response.send_modal.assert_awaited_once()
+    modal = mock_interaction.response.send_modal.await_args.args[0]
+    assert isinstance(modal, ui.VerifyAccountModal)
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_api_verification_multiple_unverified_shows_selector(monkeypatch: pytest.MonkeyPatch, mock_interaction):
+    import qapbot.ui_registration as ui
+
+    monkeypatch.setattr(ui, "update_user_metadata_from_interaction", AsyncMock())
+
+    class _FakeCache:
+        user_accounts = {
+            str(mock_interaction.user.id): {
+                "players": [
+                    {"player_tag": "#P1", "player_name": "Alice", "verified": False},
+                    {"player_tag": "#P2", "player_name": "Bob", "verified": False},
+                ]
+            }
+        }
+
+    monkeypatch.setattr(ui, "CACHE", _FakeCache())
+
+    view = ui.RegistrationView(guild_id=mock_interaction.guild.id)
+    button = next(c for c in view.children if getattr(c, "custom_id", "") == "registration_api_verification")
+    await button.callback(mock_interaction)
+
+    mock_interaction.response.send_modal.assert_not_awaited()
+    mock_interaction.response.send_message.assert_awaited_once()
+    _, kwargs = mock_interaction.response.send_message.await_args
+    assert isinstance(kwargs.get("view"), ui.GenericSelectView)

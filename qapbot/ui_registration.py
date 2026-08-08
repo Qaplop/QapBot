@@ -466,20 +466,25 @@ class RegistrationView(discord.ui.View):
             )
             return
         
+        # Filter out entries with no player_tag (can't be verified)
+        resolved_guild_id = self._resolve_guild_id(interaction)
+        verifiable_players = [p for p in unverified_players if p.get("player_tag", "")]
+
+        # Edge case: exactly one unverified account - skip the selector and open the modal directly
+        if len(verifiable_players) == 1:
+            modal = VerifyAccountModal(verifiable_players[0], action_view_interaction=interaction, guild_id=resolved_guild_id)
+            await interaction.response.send_modal(modal)
+            return
+
         # Show verification selector
         options = []
-        resolved_guild_id = self._resolve_guild_id(interaction)
-        for player in unverified_players[:25]:  # Discord limit
+        for player in verifiable_players[:25]:  # Discord limit
             player_tag = player.get("player_tag", "")
             player_name = player.get("player_name", "Unknown")
-            
-            # Skip if player_tag is empty
-            if not player_tag:
-                continue
-            
+
             label = t('playerregistration.verify_player', guild_id=resolved_guild_id, player_name=player_name, player_tag=player_tag)
             options.append(discord.SelectOption(label=label[:100], value=f"verify:{player_tag}"))  # type: ignore[arg-type]
-        
+
         view = GenericSelectView(
             options=options,  # type: ignore[arg-type]
             callback_fn=self._on_verify_select,
