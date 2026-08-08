@@ -23,6 +23,7 @@ All write paths that change `track_war_updates` and `has_active_subscriptions` o
 | `has_active_subscriptions` | qapbot/ui_clan_management.py | `MemberClansConfigurationView._on_apply()` | Guild member_clan added, clan not yet cached | Unconditional (both fetch-success and fetch-failure branches) | False |
 | `has_active_subscriptions` | qapbot/cache_manager.py | `_sync_group_track_war_updates()` | Group league_rank freshly resolved (`_process_league_group_response`) | New group member not yet in `clan_name_cache` | False (inserted) |
 | `track_war_updates` | qapbot/cache_manager.py | `_sync_group_track_war_updates()` | Group league_rank freshly resolved (`_process_league_group_response`) | Any non-subscribed member (new insert or existing, promotion or demotion) | Set to match the group's confirmed league (True for M3+, False otherwise) |
+| `track_war_updates` | QBhelperfunctions.py | `refresh_stale_passive_clans()` | Monthly passive-clan sweep (Phase 1.6, QapBot.py) | Passively-tracked clan's `get_clan()` ping reveals Master III+ | True (promotion, via the normal `_update_clan_metadata()` path this triggers) |
 
 ---
 
@@ -65,6 +66,48 @@ This still cannot discover a "wholly foreign" group where **none** of the 8 memb
 reachable from a subscribed clan (directly or transitively across past seasons) — every entry point into
 the discovery graph (`_upsert_enemy_clan_on_war_start`, `/cwlinfo`, and this sync) requires the querying
 clan to already be graph-reachable. See `CWL_ROUND_TRACKING_PLAN.md`'s coverage note for that residual gap.
+
+
+### 8. Passive clan monthly refresh (added 2026-08-08)
+
+File: QBhelperfunctions.py `refresh_stale_passive_clans()`, called from QapBot.py Phase 1.6
+
+Every other write path above only ever reaches a `track_war_updates=False` clan through the
+subscription-rooted discovery graph — a live `get_clan()`/`get_league_group()` call for *some* clan that
+happens to touch this one. A clan whose group is never rediscovered this season (no groupmate is ever
+polled) sits with a stale `war_league` forever, and if it gets promoted to Master III+ in the real game,
+the bot never finds out — promotion detection is itself gated by being polled in the first place.
+
+This closes that gap independently of the discovery graph: every update cycle (no interval gate — chosen
+to burn down the initial backlog in about a day instead of trickling it out over a month; see trade-off
+note below), QapBot.py's Phase 1.6 calls `refresh_stale_passive_clans()`, which:
+
+- Scans `clan_name_cache` for non-subscribed, non-deleted, `track_war_updates=False` clans whose
+  `last_checked_via_api` is missing or older than `qapbot.constants.PASSIVE_CLAN_REFRESH_INTERVAL_DAYS`
+  (30 days).
+- Takes the most-overdue (or never-checked) `_PASSIVE_REFRESH_BATCH_SIZE` (1000) of them and issues a
+  plain `get_clan()` call for each, bounded by a small semaphore (`_PASSIVE_REFRESH_CONCURRENCY`, 15) —
+  **not** the full `fetch_clan_war_data()` war-data pipeline, since no war tracking is wanted for these
+  clans, only a clan-info refresh.
+- Relies entirely on the existing `CoCClanCache.get_clan() -> _update_clan_metadata()` path (write-path 5
+  above) to do the actual promotion — no special-casing here; if the clan is now Master III+,
+  `track_war_updates` flips to True and it joins the normal 22h/12h polling pool from then on.
+
+At 1000/run × 288 cycles/day this clears a population in the hundreds of thousands within about a day.
+Sizing snapshot (2026-08-08, dev DB mirroring a recent prod backup): 275,405 passively-tracked clans,
+207,134 of them already >30 days stale.
+
+**Trade-off of running every cycle instead of on an interval gate:** API/DB load isn't the ongoing
+concern — once the initial backlog clears, few clans are newly overdue each cycle regardless of how high
+the cap is set, so actual `get_clan()` volume drops close to zero naturally. The full `clan_name_cache`
+scan (~400K entries) that runs every cycle to find candidates is **not** a meaningful cost either —
+benchmarked at ~0.20s against a synthetic cache at real dev-DB scale (416,815 entries), negligible
+against the 300s cycle interval. The real, dominant cost is the network-bound `get_clan()` batch itself:
+Phase 1.6 sits in the sequential critical path before Phase 2 (orphan/war processing), so up to 1000
+calls at concurrency 15 (tens of seconds while the backlog is being burned down, shrinking toward
+near-zero once caught up) delays the start of the core war-tracking phases that follow it, every cycle.
+`refresh_stale_passive_clans()` logs scan time, fetch time, ms/clan average, and the total on every run
+(`[PASSIVE-REFRESH]` log line) so the real, observed cost is directly visible rather than estimated.
 
 ## Detailed Assignment Locations
 

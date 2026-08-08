@@ -1,6 +1,48 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-08 (8)
+- Added: separate scan-vs-fetch timing to refresh_stale_passive_clans()'s [PASSIVE-REFRESH] log line
+  (QBhelperfunctions.py), to make the (7) below cost trade-off directly observable instead of guessed
+  at. Benchmarked the in-memory clan_name_cache scan in isolation first (synthetic data at real
+  dev-DB scale — 416,815 entries, 275,405 passive): ~0.20s, negligible against a 300s cycle — the
+  scan itself was NOT actually the considerable cost claimed in (7)'s note, correcting that. The
+  network-bound get_clan() batch is the real, unmeasured-until-now cost; the new log line reports
+  scan time, fetch time, ms/clan average, and the total every time Phase 1.6 runs, so the real prod
+  number replaces estimation once deployed.
+  Files: QBhelperfunctions.py. 1508 tests pass (.\run_tests.ps1 -Full).
+
+2026-08-08 (7)
+- Changed: tuned the passive-clan refresh from (6) below per user request — batch size 300 -> 1000,
+  and removed the once-per-hour interval gate entirely (now runs every update cycle) so the
+  207,134-clan initial backlog burns down in about a day instead of trickling out over a month.
+  Trade-off (assessed on request, documented in CLAN_WAR_TRACKING.md write-path 8): the added
+  API/DB load isn't the concern — once caught up, few clans are newly overdue each cycle regardless
+  of cap size, so actual get_clan() volume drops close to zero naturally. What does NOT taper is the
+  full clan_name_cache scan (~400K entries) needed every cycle to find candidates at all — Phase 1.6
+  sits before Phase 2 (orphan/war processing) in the sequential cycle, so this now adds latency to
+  every cycle indefinitely, up to tens of seconds while the backlog is still large.
+  Files: QBhelperfunctions.py, QapBot.py. Docs: CLAN_WAR_TRACKING.md. 1508 tests pass
+  (.\run_tests.ps1 -Full).
+
+2026-08-08 (6)
+- Added: monthly refresh for passively-tracked clans that the CWL discovery graph never revisits.
+  Every other track_war_updates write path ((2), (4), (5) below, plus the pre-existing ones) only
+  ever reaches a clan through a live get_clan()/get_league_group() call for SOME clan that happens
+  to touch it — a clan whose CWL group is never rediscovered this season sits with a stale
+  war_league forever, and a real-game promotion to Master III+ would never be detected (promotion
+  detection is itself gated by being polled in the first place). Sizing check on the dev DB: 275,405
+  passively-tracked clans total, 207,134 already >30 days stale.
+  New QBhelperfunctions.refresh_stale_passive_clans() (Phase 1.6 in QapBot.py's main loop, gated to
+  run at most once per hour): scans clan_name_cache for track_war_updates=False, non-subscribed,
+  non-deleted clans overdue by PASSIVE_CLAN_REFRESH_INTERVAL_DAYS (30, new constants.py constant),
+  and issues a plain get_clan() ping (NOT the full war-data fetch pipeline — no temp files, no war
+  processing) for the most-overdue 300 per run, capped concurrency 15. Promotion detection reuses
+  the existing _update_clan_metadata() path unchanged — no special-casing needed.
+  Files: QBhelperfunctions.py, QapBot.py, qapbot/constants.py. Docs: CLAN_WAR_TRACKING.md (new
+  write-path 8). Added 7 tests (tests/unit/test_passive_clan_refresh.py). 1508 tests pass
+  (.\run_tests.ps1 -Full).
+
 2026-08-08 (5)
 - Fixed: mid-season CWL tracking abandonment. User applied
   `backfill_group_track_war_updates.py` (from (2)/(4) below) to prod and asked whether it could

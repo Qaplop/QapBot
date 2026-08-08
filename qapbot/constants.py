@@ -89,6 +89,13 @@ active ``track_war_updates`` tracking (22h polling pool). Single source of
 truth — previously duplicated as ``_WAR_UPDATE_LEAGUES`` in coc_cache.py and
 cache_manager.py, and as ``_CWL_HARVEST_LEAGUES`` in QBhelperfunctions.py."""
 
+PASSIVE_CLAN_REFRESH_INTERVAL_DAYS = 30
+"""Days between opportunistic get_clan() refreshes for passively-tracked
+(track_war_updates=False) clans that the CWL-group discovery graph never
+revisits (QBhelperfunctions.refresh_stale_passive_clans). Catches a clan's
+promotion to Master III+ even when none of its groupmates are ever reachable
+this season — see CLAN_WAR_TRACKING.md write-path 8."""
+
 
 # ============================================================================
 # Cache and History Configuration

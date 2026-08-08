@@ -1056,6 +1056,29 @@ async def main() -> None:
         logging.info(f"[PHASE-1.5-TIMING] Completed in {time.monotonic() - _phase15_t0:.3f}s")
 
     # ============================================================================
+    # PHASE 1.6: PASSIVE CLAN REFRESH (lightweight get_clan() ping)
+    # ============================================================================
+    # Passively-tracked clans (track_war_updates=False) are excluded from the main
+    # polling loop entirely and only ever get refreshed as a side effect of their
+    # CWL group happening to be rediscovered this season (see
+    # CLAN_WAR_TRACKING.md write-path 8). This periodically pings the most-overdue
+    # ones so a real-game promotion to Master III+ is never missed indefinitely
+    # for a clan whose group nobody else ever touches.
+    # Runs every cycle (no interval gate) at _PASSIVE_REFRESH_BATCH_SIZE=1000/run
+    # (QBhelperfunctions.py) to burn down the initial backlog in about a day
+    # instead of trickling it out over a month. Once caught up, per-cycle
+    # get_clan() volume drops close to zero naturally (few clans newly overdue
+    # each cycle) — the ongoing cost that doesn't taper is the full
+    # clan_name_cache scan every cycle needs to find candidates at all.
+    _phase16_t0 = time.monotonic()
+    try:
+        from QBhelperfunctions import refresh_stale_passive_clans  # type: ignore[attr-defined]
+        await refresh_stale_passive_clans()
+    except Exception as e:
+        logging.error(f"[PHASE-1.6] Passive clan refresh error: {e}")
+    logging.info(f"[PHASE-1.6-TIMING] Completed in {time.monotonic() - _phase16_t0:.3f}s")
+
+    # ============================================================================
     # PHASE 2: PROCESS ORPHANED CWL WARS (async, before file processing)
     # ============================================================================
     # Collect clans that failed to fetch (None result)
