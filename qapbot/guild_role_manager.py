@@ -576,7 +576,7 @@ async def sync_roles_for_user(
     guild_id: str,
     discord_user_id: int,
     member: Optional[discord.Member] = None,
-) -> None:
+) -> bool:
     """
     Sync CoC in-game role and clan role(s) for a single Discord user.
 
@@ -594,14 +594,22 @@ async def sync_roles_for_user(
         discord_user_id: Discord user ID (int).
         member: Pre-fetched guild member, if available. When provided the
             Discord API is not called (fast path used by guild-wide sync).
+
+    Returns:
+        True if role sync actually ran for this user (they were confirmed a guild member
+        and the feature is enabled). False if skipped — not a member (confirmed via
+        discord.NotFound), a concurrent sync for the same user was already in flight, the
+        role feature is disabled, or membership couldn't be determined (Forbidden / a
+        persistent HTTPException, already logged internally in that case). All existing
+        callers ignore the return value, so this is purely additive.
     """
     _sync_key = (guild_id, discord_user_id)
     if _sync_key in _users_being_synced:
         logging.debug(f"[ROLE-SYNC] Skipping duplicate concurrent sync for user {discord_user_id} in guild {guild_id}")
-        return
+        return False
     _users_being_synced.add(_sync_key)
     try:
-        await _sync_roles_for_user_impl(guild, guild_id, discord_user_id, member)
+        return await _sync_roles_for_user_impl(guild, guild_id, discord_user_id, member)
     finally:
         _users_being_synced.discard(_sync_key)
 
@@ -611,8 +619,12 @@ async def _sync_roles_for_user_impl(
     guild_id: str,
     discord_user_id: int,
     member: Optional[discord.Member] = None,
-) -> None:
-    """Internal implementation of sync_roles_for_user (called after in-flight guard check)."""
+) -> bool:
+    """Internal implementation of sync_roles_for_user (called after in-flight guard check).
+
+    Returns True iff the user was confirmed a guild member and sync actually ran — see
+    sync_roles_for_user()'s docstring for the full contract.
+    """
     config = _get_config(guild_id)
     coc_role_enabled: bool = config.get("coc_role_enabled", False)
     clan_role_enabled: bool = config.get("clan_role_enabled", False)
@@ -620,7 +632,7 @@ async def _sync_roles_for_user_impl(
     member_role_strict: bool = config.get("member_role_strict", False)
 
     if not coc_role_enabled and not clan_role_enabled and not role_system_enabled:
-        return
+        return False
 
     # Fetch guild member (may not be in guild)
     if member is None:
@@ -637,10 +649,10 @@ async def _sync_roles_for_user_impl(
                 break
             except discord.NotFound:
                 logging.debug(f"[ROLE-SYNC] User {discord_user_id} not found in guild {guild.name} ({guild_id}), skipping")
-                return
+                return False
             except discord.Forbidden:
                 logging.debug(f"[ROLE-SYNC] No permission to fetch member {discord_user_id} in guild {guild.name} ({guild_id}), skipping")
-                return
+                return False
             except discord.HTTPException as e:
                 _transient = e.status >= 500 or e.status == 429
                 if _transient and _attempt < _retries - 1:
@@ -655,9 +667,9 @@ async def _sync_roles_for_user_impl(
                         f"[ROLE-SYNC] Cannot fetch member {discord_user_id} in guild {guild.name} ({guild_id}) "
                         f"after {_attempt + 1} attempt(s): {e}"
                     )
-                    return
+                    return False
         if member is None:
-            return
+            return False
 
     user_id_str = str(discord_user_id)
 
@@ -744,6 +756,8 @@ async def _sync_roles_for_user_impl(
                 # Remove newbie role whenever member role is present
                 if _has_member_role and _newbie_disc_role and _newbie_disc_role in member.roles:
                     await remove_role_from_member(member, _newbie_disc_role, reason="QapBot member role sync (newbie role removed)")
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -846,32 +860,46 @@ async def sync_all_roles_for_guild(
             continue
         seen_ids.add(member.id)
         try:
-            await sync_roles_for_user(guild, guild_id, member.id, member=member)
-            synced += 1
+            if await sync_roles_for_user(guild, guild_id, member.id, member=member):
+                synced += 1
         except Exception as e:
             errors += 1
             logging.warning(f"[ROLE-SYNC] Error syncing roles for user {member.id} in guild {guild.name} ({guild_id}): {e}")
 
     # An EXPECTED member (registered with a player currently in a clan this guild covers)
-    # missing from guild.members after chunk() was previously silently skipped — no role
-    # sync, no log line. Surface it: could be a transient cache gap (chunk() raced a member
-    # join, a Discord outage) or a genuinely stale registration (user left the guild). Only
-    # checked against expected_member_ids, not every bot-wide registered_ids — this bot
-    # serves multiple guilds from one shared registration pool, so most registered users
-    # simply aren't members of any given single guild at all; comparing against the full
-    # registered_ids here produced a "missing" count that was almost entirely that expected
-    # cross-guild population, not a real cache-gap signal (confirmed live in prod 2026-08-08:
-    # 89-96% of a guild's registered_ids reported "missing", which was actually just other
-    # guilds' users). Not auto-resolved via fetch_member() — that's a per-ID API call.
+    # not found in guild.members after chunk() is ambiguous from the cache alone: guild.chunked
+    # is a live count comparison (guild.member_count == len(guild._members)), not a "did we ever
+    # chunk" flag, so a cache miss here could mean the user genuinely left the guild (the common
+    # case — QapBot doesn't auto-unregister on leave, and this bot's registration pool is shared
+    # across multiple guilds so a user can be legitimately absent from any one of them) OR a
+    # transient gap (chunk() raced a member join, a brief Discord hiccup). Don't guess from the
+    # cache — let sync_roles_for_user's own get_member()-then-fetch_member() fallback (already
+    # used by the fast path above and by sync_roles_for_clan_members) make the authoritative call:
+    # discord.NotFound → confirmed not a member → silently skipped (DEBUG only, no warning —
+    # role sync for a non-member is meaningless, not an error); a successful fetch means the
+    # cache was stale and this self-heals by syncing them right here; only a persistent
+    # HTTPException (rate limit, outage — genuinely inconclusive) still logs a WARNING, from
+    # inside _sync_roles_for_user_impl itself.
+    # Capped so a pathologically large gap (e.g. real cache corruption) can't fire an unbounded
+    # burst of individual fetch_member() calls in one run — the remainder just gets picked up
+    # next cycle once guild.chunked naturally re-syncs the local cache.
     missing_ids = expected_member_ids - seen_ids
     if missing_ids:
-        _sample = sorted(missing_ids)[:20]
-        logging.warning(
-            f"[ROLE-SYNC] Guild {guild.name} ({guild_id}): {len(missing_ids)} user(s) registered "
-            f"to a clan this guild covers are not in guild.members cache after chunk() — role "
-            f"sync skipped for them this run (left the guild, or a cache gap): "
-            f"{_sample}{'...' if len(missing_ids) > 20 else ''}"
-        )
+        _to_verify = sorted(missing_ids)[:50]
+        if len(missing_ids) > len(_to_verify):
+            logging.info(
+                f"[ROLE-SYNC] Guild {guild.name} ({guild_id}): verifying only {len(_to_verify)} of "
+                f"{len(missing_ids)} expected-but-uncached member(s) this run; rest deferred to next cycle"
+            )
+        for _uid in _to_verify:
+            try:
+                if await sync_roles_for_user(guild, guild_id, _uid):
+                    synced += 1
+                # else: confirmed not a member (or otherwise skipped) — already logged
+                # at DEBUG (or WARNING, if genuinely inconclusive) inside sync_roles_for_user.
+            except Exception as e:
+                errors += 1
+                logging.warning(f"[ROLE-SYNC] Error syncing roles for user {_uid} in guild {guild.name} ({guild_id}): {e}")
 
     logging.info(f"[ROLE-SYNC] Guild {guild.name} ({guild_id}) role sync complete: {synced} synced, {errors} errors")
 

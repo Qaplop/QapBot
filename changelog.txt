@@ -1,6 +1,59 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-08 (29)
+- Fixed: /analyse league_group embeds ("Best Attackers · CWL Group" /
+  "Best Defenders · CWL Group") scrambled the display order of rows for
+  clans/players with Arabic (or other RTL-script) names — the RTL name would
+  visually swap position with, or absorb, neighboring LTR punctuation like
+  the "·" separator, "→", markdown link parens, and medal/TH emoji.
+  Root cause: qapbot/formatting.py normalize_player_name() wrapped detected
+  RTL text with plain LRM (U+200E) marks. LRM is only a weak directional
+  hint — it does not stop the bidi algorithm from letting the embedded RTL
+  run influence how *surrounding* neutral characters in the same line get
+  reordered, which is exactly what these embed lines are full of (multiple
+  markdown-linked names + symbols on one row).
+  Fix: wrap RTL runs with proper Unicode bidi isolates instead — FSI
+  (U+2068, First Strong Isolate) ... PDI (U+2069, Pop Directional Isolate).
+  Isolates make the wrapped run opaque to the outer LTR context (so it can't
+  perturb neighboring punctuation/emoji ordering) while still rendering the
+  RTL text in its own natural right-to-left order internally. Both marks are
+  Unicode category Cf (zero-width), so text_display_width()'s existing
+  ZERO_WIDTH_CATS handling already ignores them — no width/alignment impact
+  on the ASCII-table code paths that also call normalize_player_name().
+  Updated tests/unit/test_formatting_modes.py's two RTL-marker tests to
+  assert on FSI/PDI instead of the old LRM mark. Documented the convention
+  in qapbot/docs/CODE_STRUCTURE.md so future RTL-name embedding uses
+  isolates, not manual LRM wrapping (QBhelperfunctions.py still has several
+  pre-existing manual LRM-wrapped-name patterns for other embeds — those
+  weren't reported broken and were left alone, but carry the same
+  weak-LRM-mark limitation and are candidates for the same fix later).
+
+2026-08-08 (28)
+- Changed: qapbot/guild_role_manager.py sync_all_roles_for_guild() — the "not in guild.members
+  cache" WARNING (entry 25) was still guessing from an ambiguous cache miss. Replaced it: instead
+  of just logging a warning and moving on, each user in expected-but-uncached now gets routed
+  through sync_roles_for_user() (member=None) — which already had the correct
+  get_member()-then-fetch_member() fallback with discord.NotFound handling, just wasn't being
+  used for this path. A confirmed non-member (discord.NotFound) is now silently excluded (DEBUG
+  only) — role sync for someone who isn't a guild member is meaningless, not an error. A genuine
+  cache-gap (fetch succeeds) self-heals: they get synced right there in the same run. Only a
+  persistent HTTPException (rate limit, Discord outage — genuinely inconclusive) still logs a
+  WARNING, from inside sync_roles_for_user itself. Capped at 50 per-guild per-run to bound worst-
+  case fetch_member() calls if this set were ever pathologically large; the remainder just gets
+  picked up next cycle.
+  Also changed sync_roles_for_user()'s and _sync_roles_for_user_impl()'s return type from None to
+  bool (True = user confirmed a member and sync actually ran; False = skipped for any reason) —
+  pure-additive, since every existing caller (checked all 8 call sites across the codebase) already
+  ignored the return value. Used by both loops in sync_all_roles_for_guild() now to count "synced"
+  accurately instead of assuming every call actually synced someone.
+  Audited for other occurrences of the same "cache-miss = assume gone" pattern:
+  _sync_roles_for_user_impl and sync_roles_for_clan_members already did this correctly (that's
+  where the fallback used above came from); import_clashperk_userlist.py's guild.members
+  iteration and QBdiscordcmds.py's /whois-style get_member() lookup are structurally different
+  (name-fuzzy-matching an admin import command, and a display-name fallback with no warning path)
+  — not the same bug, nothing to change there.
+
 2026-08-08 (27)
 - Verified: A5's fix (entry 25) confirmed correct in prod — [ROLE-SYNC] "not in guild.members
   cache" now reports 1-5 users per guild (down from 73-125), and the same specific Discord IDs

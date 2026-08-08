@@ -343,18 +343,23 @@ class TestNormalizePlayerNameExtended:
         assert should_contain in result
 
     @pytest.mark.smoke
-    def test_normalize_rtl_text_gets_ltr_marks(self) -> None:
+    def test_normalize_rtl_text_gets_bidi_isolate_marks(self) -> None:
         from qapbot.formatting import normalize_player_name
 
         result = normalize_player_name("عربي")
-        assert "\u200E" in result  # LTR mark present
+        # FSI (First Strong Isolate) ... PDI (Pop Directional Isolate) wrap the
+        # RTL run so it cannot reorder surrounding LTR punctuation/emoji in
+        # embeds, while still rendering the text in its own natural direction.
+        assert "\u2068" in result
+        assert "\u2069" in result
 
     @pytest.mark.smoke
-    def test_normalize_pure_ascii_no_ltr_marks(self) -> None:
+    def test_normalize_pure_ascii_no_bidi_isolate_marks(self) -> None:
         from qapbot.formatting import normalize_player_name
 
         result = normalize_player_name("PureAscii")
-        assert "\u200E" not in result
+        assert "\u2068" not in result
+        assert "\u2069" not in result
 
     @pytest.mark.smoke
     def test_normalize_control_chars_removed(self) -> None:

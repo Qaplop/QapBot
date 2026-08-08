@@ -967,6 +967,16 @@ kept here only for functions not narrated elsewhere.
 ├── pad_player_cell_leaderboard()
 ├── pad_player_cell_terminal()
 ├── normalize_player_name()
+│   └── RTL names (Arabic/Hebrew/etc.) are wrapped in FSI (U+2068) / PDI
+│       (U+2069) bidi isolate marks, not plain LRM (U+200E). LRM is a weak
+│       hint and does not stop an embedded RTL run from reordering adjacent
+│       LTR neutrals (·, →, markdown link brackets/parens, medal/TH emoji) —
+│       this caused visibly scrambled CWL group-analyse embed rows. FSI/PDI
+│       makes the run opaque to the outer LTR context while the RTL text
+│       still renders in its own natural direction inside the isolate. Both
+│       are zero-width (Cf category) so text_display_width() ignores them.
+│       Prefer this pattern (not manual LRM-wrapped "{name}" strings) for
+│       any new code embedding untrusted/user-supplied names in Discord text.
 
 🟦 QBcore.py
 ├── bot (discord.commands.Bot)

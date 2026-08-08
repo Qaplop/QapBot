@@ -444,10 +444,19 @@ def normalize_player_name(raw: str) -> str:
             break
     
     if has_rtl:
-        # Wrap with LTR marks to force left-to-right display in tables
-        LRM = '\u200E'  # Left-to-Right Mark
-        return f"{LRM}{s}{LRM}"
-    
+        # Isolate the run with FSI/PDI (Unicode bidi isolates) rather than plain
+        # LRM marks. A bare LRM is a weak direction hint and does not stop the
+        # embedded RTL run from influencing neighboring neutral characters (dot
+        # separators, arrows, markdown link brackets/parens, medal/TH emoji) -
+        # in Discord embeds this caused surrounding punctuation to visually
+        # reorder around Arabic clan/player names (e.g. CWL group analyse
+        # embeds). FSI...PDI makes the whole run opaque to the outer LTR
+        # context while still rendering the RTL text in its own natural
+        # right-to-left word order internally.
+        FSI = '\u2068'  # First Strong Isolate
+        PDI = '\u2069'  # Pop Directional Isolate
+        return f"{FSI}{s}{PDI}"
+
     return s
 
 def text_display_width_float_special(s: str, original_name: str = "") -> float:
