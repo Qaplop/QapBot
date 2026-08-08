@@ -846,13 +846,20 @@ async def main() -> None:
         _categorize_clan_count, time.monotonic() - _categorize_t0,
     )
 
-    # Flush all backdated timestamp updates in a single DB transaction
+    # Flush all backdated timestamp updates in a single DB transaction.
+    # Merge in any timestamps that failed to persist at a previous call site (this cycle's
+    # Phase-3 flush, or an earlier cycle's) so a transient DB error gets a real retry here
+    # instead of silently waiting for a restart to self-heal — see QBcore.pending_clan_timestamp_retries.
+    if QBcore.pending_clan_timestamp_retries:
+        _timestamp_batch.extend(QBcore.pending_clan_timestamp_retries)
+        QBcore.pending_clan_timestamp_retries = []
     if _timestamp_batch:
         try:
             await CACHE.db_manager.bulk_update_clan_timestamps(_timestamp_batch)  # type: ignore[union-attr]
             logging.debug(f"[CATEGORIZE] Batch-persisted {len(_timestamp_batch)} backdated timestamps")
         except Exception as e:
-            logging.error(f"[CATEGORIZE] Failed to batch-persist timestamps: {e}")
+            logging.error(f"[CATEGORIZE] Failed to batch-persist timestamps: {e} — queued {len(_timestamp_batch)} for retry")
+            QBcore.pending_clan_timestamp_retries.extend(_timestamp_batch)
 
     # Count active and inactive for logging
     active_clans = [(ct, ia) for ct, ia in clans_to_update if ia]
@@ -1179,9 +1186,9 @@ async def main() -> None:
     # war_write_batch() skips the checkpoint (skip_checkpoint=True) to avoid
     # blocking here; this task runs it concurrently with Phase 3 processing.
     if CACHE.db_manager is not None:
-        asyncio.create_task(
+        QBcore.spawn_tracked(
+            "phase2-wal-checkpoint",
             asyncio.to_thread(CACHE.db_manager.run_passive_checkpoint),
-            name="phase2-wal-checkpoint",
         )
         logging.debug("[PHASE-2] WAL checkpoint dispatched as background task")
 
@@ -1606,12 +1613,18 @@ async def main() -> None:
         await asyncio.to_thread(_do_deferred_moves)
         logging.info(f"[PHASE-3] Deferred {len(_war_batch_file_moves)} file moves completed")
 
-    # Flush all Phase-3 timestamp updates in a single DB transaction
+    # Flush all Phase-3 timestamp updates in a single DB transaction.
+    # Merge in any timestamps that failed to persist at a previous call site — see
+    # QBcore.pending_clan_timestamp_retries.
+    if QBcore.pending_clan_timestamp_retries:
+        _phase3_ts_batch.extend(QBcore.pending_clan_timestamp_retries)
+        QBcore.pending_clan_timestamp_retries = []
     if _phase3_ts_batch:
         try:
             await CACHE.db_manager.bulk_update_clan_timestamps(_phase3_ts_batch)  # type: ignore[union-attr]
         except Exception as e:
-            logging.error(f"[PHASE-3] Failed to batch-persist timestamps: {e}")
+            logging.error(f"[PHASE-3] Failed to batch-persist timestamps: {e} — queued {len(_phase3_ts_batch)} for retry")
+            QBcore.pending_clan_timestamp_retries.extend(_phase3_ts_batch)
 
     # Fire a single background WAL checkpoint after all Phase-3 DB writes
     # (war data + timestamps) are complete.  Previous approach ran a
@@ -1619,9 +1632,9 @@ async def main() -> None:
     # subsequent timestamp flush to stall (419 timestamps in 4.75s vs 0.19s
     # when the WAL is clean).
     if CACHE.db_manager is not None:
-        asyncio.create_task(
+        QBcore.spawn_tracked(
+            "phase3-wal-checkpoint",
             asyncio.to_thread(CACHE.db_manager.run_passive_checkpoint),
-            name="phase3-wal-checkpoint",
         )
 
     logging.info(f"[PHASE-3] File processing completed")
@@ -1839,6 +1852,41 @@ async def run_nightly_maintenance_routine(
         # maintenance is fully done, so it reflects post-VACUUM/ANALYZE state
         # and stays warm for the full 25h TTL until the next nightly run.
         await _warm_global_db_stats_cache(force_refresh=True)
+
+        # Step 5: full GC sweep + re-freeze, so tomorrow's automatic gen-2 sweeps stay cheap.
+        # Nightly-only counterpart to the startup gc.freeze() (see [GC-FREEZE] near on_ready)
+        # and the per-cycle scoped gc.collect(1) (see the [GC-AUTO] pause logger registered
+        # near the top of this file / _post_cycle_cleanup). Every cycle promotes newly-created
+        # long-lived CACHE growth (new clans, new war metadata — substantial during a CWL
+        # season, e.g. 7000+ active wars) into gen-2, which the one-time startup freeze does
+        # NOT cover, so automatic gen-2 sweeps re-grow expensive over the following days
+        # (confirmed via prod [GC-AUTO] pauses recurring even after the startup freeze —
+        # Issue 3, 2026-08-08). Fix: (a) gc.unfreeze() + a real full gc.collect() here actually
+        # frees any genuine reference cycles that only a full sweep catches — the per-cycle
+        # gc.collect(1) intentionally skips gen-2 every time, so those need SOME real collection
+        # point or they'd become permanent floating garbage once re-frozen; then (b) re-freezing
+        # folds today's legitimate CACHE growth back into the permanent generation, shrinking
+        # what tomorrow's automatic sweeps need to walk. Runs during this maintenance window
+        # (db_maintenance_mode=True, Discord commands already blocked) since a real full collect
+        # over the whole heap costs the same multi-second price the per-cycle scoping exists to
+        # avoid during live cycles. asyncio.to_thread() here only keeps the Discord heartbeat
+        # *task* schedulable while it runs (Pitfall 16) — best-effort, never fails maintenance.
+        try:
+            def _nightly_gc_refresh() -> tuple[int, float]:
+                _gc_t0 = time.perf_counter()
+                gc.unfreeze()
+                collected = gc.collect()
+                gc.freeze()
+                return collected, time.perf_counter() - _gc_t0
+            _gc_collected, _gc_elapsed = await asyncio.to_thread(_nightly_gc_refresh)
+            logging.info(
+                "[NIGHTLY-MAINTENANCE] GC refresh: collected=%d unreachable object(s) in %.3fs, "
+                "re-froze %d object(s) into the permanent generation",
+                _gc_collected, _gc_elapsed, gc.get_freeze_count(),
+            )
+        except Exception as _gc_ex:
+            logging.warning(f"[NIGHTLY-MAINTENANCE] GC refresh failed (non-fatal): {_gc_ex}")
+
         return _result
     finally:
         _elapsed = time.monotonic() - _maint_t0
@@ -2088,8 +2136,11 @@ async def periodic_main() -> None:
                 try:
                     import ctypes as _ctypes
                     _ctypes.CDLL("libc.so.6").malloc_trim(0)
-                except Exception:
-                    pass
+                except Exception as _trim_ex:
+                    # Expected/routine on non-Linux (no libc.so.6, e.g. Windows dev env) —
+                    # DEBUG, not a real error. Logged (not silently swallowed) so a genuine
+                    # Linux-prod failure is still visible if malloc_trim itself starts erroring.
+                    logging.debug(f"[CYCLE-CLEANUP] malloc_trim(0) skipped: {_trim_ex}")
                 _t3 = time.perf_counter()
                 # Timing breakdown so future slowdowns can be pinpointed at a
                 # glance instead of re-instrumenting; cheap (one log call/cycle).
@@ -2231,7 +2282,7 @@ async def periodic_main() -> None:
                     finally:
                         QBcore.db_maintenance_idle_event.set()
 
-                asyncio.create_task(_deferred_optimize_task())
+                QBcore.spawn_tracked("deferred-optimize-db", _deferred_optimize_task())
 
             # If /admin Start Update Cycle was queued while this cycle was running,
             # skip the sleep phase and go straight into the next cycle.
@@ -2337,7 +2388,7 @@ async def periodic_main() -> None:
                         finally:
                             QBcore.db_maintenance_idle_event.set()  # signal: maintenance done
 
-                    asyncio.create_task(_nightly_maintenance_task())
+                    QBcore.spawn_tracked("nightly-db-maintenance", _nightly_maintenance_task())
                 elif (
                     _migration_due
                     and CACHE.db_manager is not None
@@ -2369,7 +2420,7 @@ async def periodic_main() -> None:
                         finally:
                             QBcore.db_maintenance_idle_event.set()
 
-                    asyncio.create_task(_cycle_migration_chunk_task())
+                    QBcore.spawn_tracked("cycle-migration-chunk", _cycle_migration_chunk_task())
 
                 # Subtract cycle duration from the configured interval so the
                 # wall-clock period between cycle starts stays constant.
@@ -2772,18 +2823,33 @@ async def on_ready() -> None:
         - Handles multiple invocations safely
     """
     logging.debug("on_ready: After first logging...")
-    # Prevent multiple initializations from rapid reconnections
-    if hasattr(QBcore.bot, "initialization_in_progress") and QBcore.bot.initialization_in_progress:
+    # Prevent multiple initializations from rapid reconnections. QBcore.on_ready_lock is the
+    # actual correctness guarantee (see its docstring) — this non-blocking peek only preserves
+    # the existing "skip duplicate, log and return" behavior instead of queuing the second
+    # invocation behind the first.
+    if QBcore.on_ready_lock.locked():
         logging.info("Bot initialization already in progress, skipping duplicate on_ready")
         return
-    
+
     logging.debug("on_ready: Checking fully_initialized...")
     if hasattr(QBcore.bot, "fully_initialized") and QBcore.bot.fully_initialized:
         logging.info("Bot already fully initialized, handling reconnection")
         # Just log the reconnection, don't reinitialize everything
         logging.info(f"Bot reconnected as {QBcore.bot.user}")
         return
-    
+
+    async with QBcore.on_ready_lock:
+        await _run_startup_initialization()
+
+
+async def _run_startup_initialization() -> None:
+    """The one-time startup sequence (Steps 1-9) run by on_ready() under QBcore.on_ready_lock.
+
+    Every early-return failure path below resets `initialization_in_progress` (or terminates the
+    bot outright, for fatal steps) — a failure that left it True forever would permanently block
+    all future on_ready() re-entry via the lock/flag check above, wedging the bot until a full
+    process restart even after a transient error (e.g. a momentary DB or CoC-API hiccup) recovers.
+    """
     logging.debug("on_ready: Setting initialization_in_progress...")
     QBcore.bot.initialization_in_progress = True
     logging.debug("on_ready: Getting CONFIG.is_dev_mode...")
@@ -2794,7 +2860,7 @@ async def on_ready() -> None:
     logging.debug(f"on_ready: guild_info={guild_info}")
     logging.debug("on_ready: About to log initialization start...")
     logging.info(f"=== Starting Discord bot initialization ({mode_str} mode - {guild_info}) ===")
-    
+
     try:
         # Step 1: Initialize shutdown coordination
         if QBcore.shutdown_event is None:  # type: ignore[misc]
@@ -2810,6 +2876,7 @@ async def on_ready() -> None:
             await initialize_database()
         except Exception as e:
             logging.error(f"❌ Error during database initialization: {e}")
+            QBcore.bot.initialization_in_progress = False
             return
 
         # Step 2: Authenticate with CoC API (database already initialized above)
@@ -2819,6 +2886,7 @@ async def on_ready() -> None:
                 await asyncio.wait_for(startup_login(), timeout=60.0)
             except Exception as e:
                 logging.error(f"❌ Error during startup: {e}")
+                QBcore.bot.initialization_in_progress = False
                 return
         else:
             logging.info("🔐 Authenticating with Clash of Clans API...")
@@ -2828,10 +2896,12 @@ async def on_ready() -> None:
             except asyncio.TimeoutError:
                 logging.error("❌ CoC API login timed out after 60 seconds")
                 logging.error("🛑 Cannot continue without CoC API access")
+                QBcore.bot.initialization_in_progress = False
                 return
             except Exception as e:
                 logging.error(f"❌ Error during CoC API login: {e}")
                 logging.error("🛑 Cannot continue without CoC API access")
+                QBcore.bot.initialization_in_progress = False
                 return
 
         # Step 3: Load cache data with timeout protection (database now initialized)
@@ -2914,7 +2984,16 @@ async def on_ready() -> None:
             QBcore.bot.periodic_task_started = True
             logging.info("✅ Periodic main task started successfully")
         except Exception as e:
-            logging.error(f"❌ Failed to start periodic task: {e}")
+            # Fatal, same as a Step-3 cache-load failure: without periodic_main() the bot can
+            # never fetch war data or run any update cycle, so there is nothing to recover into —
+            # a "success" reconnect that left the bot connected but running zero cycles would look
+            # healthy in Discord while being silently non-functional. Terminate the same way Step 3
+            # does rather than leaving a half-alive process for a process supervisor to notice late.
+            logging.critical(f"💥 Failed to start periodic task: {e} — bot cannot function")
+            logging.critical("🛑 Terminating bot due to failed periodic-task startup")
+            QBcore.bot.initialization_in_progress = False
+            await async_cleanup()
+            await QBcore.bot.close()
             return
         
         # Step 6: Clear global commands in DEV mode (guild commands already cleared before PROD startup)
@@ -2954,7 +3033,7 @@ async def on_ready() -> None:
         # TTL — see get_global_db_statistics_sync) so the first /status call
         # after a restart doesn't pay the multi-GB cold full-table-scan cost.
         # Fire-and-forget: must not delay "fully_initialized" or on_ready.
-        asyncio.create_task(_warm_global_db_stats_cache())
+        QBcore.spawn_tracked("warm-global-db-stats", _warm_global_db_stats_cache())
 
         logging.info(f"🎉 Bot fully initialized and logged in as {QBcore.bot.user} ({mode_str} mode)")
         logging.info(f"🏠 Connected to {len(QBcore.bot.guilds)} guild(s)")

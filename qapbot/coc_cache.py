@@ -409,7 +409,8 @@ class CoCClanCache:
             except Exception as _e:
                 logging.warning(f"[COC-CACHE] Role sync trigger failed for {clan_tag}: {_e}")
 
-        asyncio.create_task(_do_role_sync())
+        import QBcore as _qbcore_spawn
+        _qbcore_spawn.spawn_tracked(f"coc-cache-role-sync-{clan_tag}", _do_role_sync())
 
     def _schedule_background_refresh(self, clan_tag: str) -> None:
         """
@@ -445,8 +446,9 @@ class CoCClanCache:
                 logging.warning(f"[COC-CACHE-REFRESH] Background refresh failed for {clan_tag}: {e}")
             finally:
                 self._refreshing.discard(clan_tag)
-        
-        asyncio.create_task(_do_refresh())
+
+        import QBcore as _qbcore_spawn
+        _qbcore_spawn.spawn_tracked(f"coc-cache-refresh-{clan_tag}", _do_refresh())
     
     async def _update_warlog_status(self, clan_obj: 'coc.Clan') -> None:
         """

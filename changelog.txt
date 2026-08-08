@@ -1,6 +1,190 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-08 (24)
+- Fixed/Added: implemented the remaining items from CODE_OPTIMIZATION_SUGGESTIONS.md that weren't
+  explicitly marked "opportunistic only, don't do this standalone" in their own Fix note (skipped
+  A6, B4, B7, D5 for that reason). Full test suite (1523 tests) green after each step.
+  · A4 (QapBot.py): bulk_update_clan_timestamps() failures were previously only logged, leaving
+    clans updated in-memory but not in DB until a restart's self-heal re-polled them. Added
+    QBcore.pending_clan_timestamp_retries — a failed batch is queued there and merged into
+    whichever of the two flush call sites (categorization-loop batch, Phase-3 batch) runs next,
+    so a transient DB error gets a real retry instead of silently waiting for a restart.
+  · A5 (qapbot/guild_role_manager.py sync_roles_for_guild): a registered user missing from
+    guild.members after chunk() was silently skipped (no role sync, no log — indistinguishable
+    from "not a member"). Now logs a warning with the count and a sample of missing IDs. Did not
+    add the report's optional fetch_member() fallback (would add real per-ID API/rate-limit load
+    for what's normally just left-guild users, not a cache gap).
+  · B2 (qapbot/cache_manager.py fetch_and_update_player_info): removed the second full O(users×players)
+    scan over user_accounts — now collects changed_uids in the same pass that mutates player data,
+    persisting directly from that set.
+  · B3 (QBhelperfunctions.py): _generate_cwlinfo_archive_embeds()'s per-round _resolve_war_league()
+    calls now go through a local per-render memo dict (opponent tags can repeat across rounds in
+    irregular CWL group histories). generate_war_info_text()'s share of this finding didn't hold
+    up — it resolves exactly 2 distinct tags (clan + opponent), never repeats one — left unchanged;
+    disposition recorded in CODE_OPTIMIZATION_SUGGESTIONS.md section E.
+  · B5 (qapbot/formatting.py text_display_width): added @functools.lru_cache(maxsize=4096) —
+    called repeatedly per player row per render, and per-character wcwidth/emoji-range logic in
+    text_display_width_float() was re-run for the same already-normalized names on every call,
+    including across the same leaderboard being posted to multiple subscribed channels.
+  · B6 (qapbot/formatting.py _find_optimal_space_combination): the space-replacement search's
+    replace-loop bounds scaled with trailing_spaces with no upstream cap — hard-capped both
+    (_MAX_REPLACE_SEARCH=10) and added an early-exit once a candidate lands within 0.02 of the
+    target width at every loop level, so a pathologically over-padded cell can no longer blow up
+    the search to O(trailing_spaces^2) iterations.
+  · B8: investigated and found no match for the reported "per-clan Processing/Skipping lines" —
+    audited every logging call in the cited QapBot.py Phase-3 loop plus manage_war_files()/
+    process_clan_war_data(): exactly one bounded, event-triggered INFO line exists per clan;
+    everything else is already DEBUG. Not fixed — nothing to fix; recorded in section E.
+  · C3 (QBhelperfunctions.py): extracted classify_war_result(my_stars, opp_stars, my_dest,
+    opp_dest) -> str — the stars-then-destruction Win/Loss/Draw tiebreak was duplicated
+    byte-for-byte across 3 real sites (_generate_cwlinfo_archive_embeds, the DB-past-round
+    renderer, the live-round renderer). The report's cited 4th site (_build_standings_result)
+    doesn't contain this logic at all — it's a group-standings ranker, not a per-war classifier;
+    recorded in section E.
+  · C5 (qapbot/war_notifications.py + QBhelperfunctions.py): promoted _get_hours_until_war_end()'s
+    inline Timestamp-string regex parsing to a new public parse_war_timestamp_field() and had
+    generate_war_info_text() import it instead of defining its own function-local, slightly
+    stricter/naive-datetime copy. The datetime object it returns turned out to be entirely unused
+    at that call site (only the seconds_until int is consumed) — found while verifying the two
+    implementations were safe to unify, left as pre-existing dead code rather than touched (out
+    of C5's scope). Also found a 3rd near-duplicate (QapBot.py's _DT_RE) — narrower single-purpose
+    regex for timestamp backdating, left alone as a different shape/purpose.
+  · D1 (qapbot/ui_clan_management.py): removed _on_set_newbie_role/_on_set_member_role entirely —
+    turned out to be fully unreferenced dead methods (never assigned as any button's .callback
+    anywhere in the file), not "wired to visible buttons" as the report described. backlog.txt has
+    no plan for this feature, and a full working newbie/member-role configuration view already
+    exists elsewhere in the same file — these were leftover stubs predating that real feature.
+  · D2: added debug-level logging to both explicitly-cited silent except-pass sites (QBcore.py's
+    startup-block interaction-response send, QapBot.py's malloc_trim) plus 2 sibling occurrences
+    of the exact same try/send_message/except-pass pattern found in the same QBcore.py function
+    (_maintenance_interaction_check) while fixing the cited one — all 3 kept as best-effort
+    swallows per the report's instruction, just no longer silent.
+  · D3: audited every @discord.ui.button(label=...) decorator site codebase-wide (8 real sites
+    across ui_registration.py and ui_notifications.py) — all already correctly re-translate their
+    label in __init__. Zero gaps in the pattern this item describes. Noted but did not fix a
+    different, narrower gap spotted during the audit: a couple of dynamically-constructed
+    confirmation buttons (e.g. "Delete Family"/"Cancel" in ui_clan_management.py) skip t() even
+    though built at call-time with full context — outside D3's stated scope (decorator
+    re-translation, not general i18n coverage) and would need new translation keys.
+  Updated CODE_OPTIMIZATION_SUGGESTIONS.md's status table and section E to record every
+  disposition above (done / false-positive-with-evidence / intentionally skipped).
+
+2026-08-08 (23)
+- Changed: CODE_OPTIMIZATION_SUGGESTIONS.md — B1 ("per-war datetime re-parsing in the
+  notification loop", tagged [reported]) confirmed a FALSE POSITIVE after two independent
+  re-checks: another agent's git-log-L blame showed the proposed hours_remaining caching was
+  already implemented in commit 17b0b67 (2026-07-20, weeks before the inspection), and direct
+  re-verification against qapbot/war_notifications.py confirmed all of it — _get_active_wars()
+  parses once per war per cycle and caches hours_remaining in war_data (with an explicit
+  "downstream functions must not re-parse" comment); all three consumers read the cached value
+  first; the claimed mechanism (datetime.fromisoformat) has zero occurrences in the file (the
+  real parser regexes the Timestamp repr). B1 struck through in place (section numbering kept
+  stable), full disposition added to section E with the lesson that [reported] findings citing
+  a specific API must be grepped for that exact API before being acted on; order-of-attack list
+  updated. Docs-only change; no code touched; no test run needed.
+
+2026-08-08 (22)
+- Fixed: qapbot/ui_registration.py VerifyAccountModal — two issues reported live from prod.
+  (1) The modal ("Verify Account") gave no indication of which of the user's linked accounts
+  was about to be verified when they had more than one unverified account. Fixed by overriding
+  the per-instance modal title (discord.py's Modal.__init__ DOES support this despite the
+  class-level `title="Verify Account"` kwarg — passing title= explicitly sets self.title on the
+  instance) to "Verify: {player_name} ({player_tag})", reusing the existing
+  playerregistration.verify_player i18n key, truncated to Discord's 45-char modal title limit.
+  (2) on_submit() intermittently logged `discord.errors.NotFound 404 (code 10062: Unknown
+  interaction)` from inside check_and_prompt_war_notifications' interaction.response.send_message()
+  even though verification itself had already succeeded — confusing since the error looked like
+  the whole operation failed. Root cause: on_submit never deferred, so the FIRST response to the
+  interaction was whatever came after verify_and_update_player() (CoC API round-trip) +
+  assign_member_role() + sync_roles_for_user() (Discord role sync) — routinely exceeding
+  Discord's 3-second interaction-response window before any response was sent. Fixed by deferring
+  immediately after the fast validation checks (empty token / corrupted user data / player not
+  found) and before the slow verify+role-sync work, then using followup.send() for every
+  subsequent reply (success-with-notifications-check, success-into-AccountManagementView-refresh,
+  and verification-failed) instead of response.send_message(). Updated
+  tests/discord/test_ui_registration_phase13.py's two VerifyAccountModal tests to match the new
+  deferred/followup behavior.
+- Fixed: diagnosed why [GC-AUTO] gen-2 pauses (added in changelog (20)'s diagnostic logger) were
+  still firing in prod (5.45s pauses, collected=6162) despite the startup gc.freeze() from that
+  same fix. Root cause: gc.freeze() only froze the CACHE baseline that existed at startup; every
+  cycle since then has promoted new long-lived growth (new clans, new war metadata — substantial
+  during the current CWL season, e.g. 7000+ active wars) into gen-2, which automatic sweeps still
+  have to walk in full since it was never frozen. Fix (QapBot.py run_nightly_maintenance_routine,
+  new Step 5): during the nightly maintenance window (Discord commands already blocked via
+  db_maintenance_mode) — gc.unfreeze() + a real, unscoped gc.collect() (catches any genuine
+  reference cycles that the per-cycle scoped gc.collect(1) intentionally skips every single time,
+  so they need SOME real collection point or they'd become permanent floating garbage once
+  re-frozen) + gc.freeze() again, folding that day's legitimate CACHE growth back into the
+  permanent generation so tomorrow's automatic sweeps stay cheap. Offloaded via asyncio.to_thread
+  (heartbeat-safety only, per Pitfall 16 — not a claim that gc.collect() itself is non-blocking);
+  best-effort, logged but never fails the maintenance run. Also examined the reported single
+  18.88s [COC-API-SLOW] get_clan() pause (no burst of concurrent calls this time, unlike the
+  original incident) — evidence is consistent with the same automatic-gen-2-sweep phenomenon, though
+  unconfirmed since the dev machine has no access to the live prod log to check for a co-occurring
+  [GC-AUTO] line. By contrast, the per-cycle NOTIFY-TIMING gap reported alongside it is NOT a
+  hidden block — its total=3.108s exactly accounts for the full wall-clock gap between the
+  surrounding log lines, reflecting real work at CWL scale (7108 active wars) that was already
+  fixed to yield/run in a thread in prior sessions.
+- Updated: CODE_OPTIMIZATION_SUGGESTIONS.md now has a Status table marking which items from the
+  2026-08-08 inspection are done (the "suggested order of attack" top 5, changelog entry (21)) vs.
+  still open, so it doesn't read as a stale unfiled report.
+
+2026-08-08 (21)
+- Fixed/Added: worked through the top 5 items of CODE_OPTIMIZATION_SUGGESTIONS.md's "suggested
+  order of attack" (A1+A2, B1, C1+C2, A3+D4, C4). Full test suite (1523 tests) green after each
+  step.
+  · A1/A2 (QapBot.py on_ready): added QBcore.on_ready_lock (asyncio.Lock) so the initialization
+    body is provably serialized against concurrent re-entry instead of relying on an implicit
+    "no await between check and set" invariant that a future edit could silently break; extracted
+    the body into _run_startup_initialization(). Found and fixed a real bug while verifying A1:
+    every early-return failure path (Step 1 DB init, Step 2 CoC login, Step 5 periodic-task start)
+    left initialization_in_progress=True forever without resetting it, permanently blocking all
+    future on_ready() retries within that process even after a transient error recovered — Step 5
+    now terminates the same way Step 3's cache-load failure already does (log CRITICAL,
+    async_cleanup(), bot.close()) since a bot with no periodic_main() task can't function; Steps 1
+    and 2 now reset the flag so a later reconnect can retry.
+  · B1 (war_notifications.py hours_remaining re-parsing): already fully fixed by the prior
+    "Fixes after Fable-5 code inspection" commit — no action needed, report was stale on this item.
+  · C1 (db_manager.py _save_user_impl FK-recovery duplication): extracted _upsert_users_row() and
+    _replace_user_players_rows(null_clan_tags: bool) shared by both the primary save path and the
+    FK-recovery retry path, so the users/user_players INSERT SQL only needs to be edited once.
+  · C2 (db_manager.py war_attacks INSERT duplicated ~6x, not just the reported ~4): added
+    _WAR_ATTACKS_COLUMNS/_WAR_ATTACKS_INSERT_SQL/_WAR_ATTACKS_INSERT_OR_IGNORE_SQL class constants
+    and a shared _build_war_attack_params() static method; converted _flush_pending_war_writes()'s
+    APPENDS+UPDATES batch loops, add_war_attack_records_sync(), add_war_data_sync(),
+    update_war_data_sync(), and update_war_attack_records_sync() to use them. Kept the OR-IGNORE
+    vs plain-INSERT distinction (the two DELETE-then-INSERT paths intentionally use plain INSERT
+    so a bug in the preceding DELETE isn't silently masked). war_summary INSERT left alone —
+    add_war_summary_sync()'s column list genuinely lacks round_number, so it isn't a true
+    duplicate of the other 3 summary-INSERT sites.
+  · A3 (untracked fire-and-forget tasks): added QBcore.spawn_tracked(name, coro) — stores the
+    Task in a module-level set (add on create, discard on done-callback) so CPython's GC can't
+    silently collect and cancel an in-flight background task whose only reference was discarded.
+    Adopted at all 9 discard-the-return-value asyncio.create_task() call sites found (QapBot.py
+    WAL checkpoints ×2, deferred optimize-DB, nightly maintenance, cycle migration chunk, DB-stats
+    warm; qapbot/coc_cache.py role-sync + background refresh; qapbot/ui_clan_management.py
+    registration-repost ×3; QBdiscordcmds.py admin optimize-DB).
+  · D4 (ui_registration.py): moved update_user_metadata_from_interaction() out of all 4
+    RegistrationView button handlers into interaction_check() (called once, after the
+    fully_initialized and maintenance gates pass) — same behavior, one copy instead of four, and
+    now provably can't run before those gates.
+  · C4 (qapbot/ui_common.py): added TrackedView(discord.ui.View) — unifies the ~4-line
+    on_timeout-deletes-self.message pattern plus 10062 (expired-interaction-token) on_error
+    suppression that was previously copy-pasted across 8 views with inconsistent coverage (only
+    RegistrationView and ui_clan_management.py's ClanManagementView had the 10062 suppression;
+    the rest let it propagate noisily). Adopted in GenericSelectView, LanguageSelectView
+    (ui_common.py), RegistrationView, AccountActionView (ui_registration.py), and
+    WarNotificationPromptView, UnifiedNotificationView, LanguageSelectionView,
+    BuddyPlayerSelectView, RemoveBuddyView (ui_notifications.py) — 8 duplicate on_timeout methods
+    removed, 6 views gained 10062 suppression they didn't have before. ui_clan_management.py's
+    ClanManagementView and QBdiscordcmds.py's two ad-hoc views left as-is per the report's
+    "adopt incrementally" note — their on_timeout does extra work (CACHE-tracking removal, a
+    second tracked message) and uses self.sent_message instead of self.message, so folding them
+    in isn't a same-risk mechanical change. Documented in qapbot/docs/CODE_STRUCTURE.md so new
+    views (e.g. the planned CWL roster views) use TrackedView from day one instead of copying the
+    pattern again.
+
 2026-08-08 (20)
 - Fixed: diagnosed a live prod incident (admin's /admin command got "The application did not
   respond") to CPython's automatic (implicit) gen-2 garbage collector, not CoC API latency.

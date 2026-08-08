@@ -295,7 +295,12 @@ async def test_psm_no_match_own_player_calls_complete_linking(monkeypatch: pytes
 @pytest.mark.discord
 @pytest.mark.asyncio
 async def test_verify_modal_happy_path_calls_war_notifications_check(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Valid token + successful verification → persist_user + check_and_prompt_war_notifications(use_followup=False)."""
+    """Valid token + successful verification → persist_user + check_and_prompt_war_notifications(use_followup=True).
+
+    use_followup=True because on_submit defers before the slow verify/role-sync work (Issue 1,
+    2026-08-08: undeferred response.send_message() intermittently raised 10062 Unknown
+    Interaction after that work ate into Discord's 3-second response window).
+    """
     import qapbot.ui_registration as ui
     import qapbot.QBdiscocmdshelper as helper
 
@@ -320,14 +325,15 @@ async def test_verify_modal_happy_path_calls_war_notifications_check(monkeypatch
     await modal.on_submit(interaction)
 
     cache.persist_user.assert_awaited_once_with(user_id)
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
     check_notifications.assert_awaited_once()
-    assert check_notifications.call_args.kwargs.get("use_followup") is False
+    assert check_notifications.call_args.kwargs.get("use_followup") is True
 
 
 @pytest.mark.discord
 @pytest.mark.asyncio
 async def test_verify_modal_verification_failed_sends_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Valid token provided but verification fails → response.send_message with error, no persist."""
+    """Valid token provided but verification fails → deferred response, then followup.send with error, no persist."""
     import qapbot.ui_registration as ui
     import qapbot.QBdiscocmdshelper as helper
 
@@ -349,7 +355,8 @@ async def test_verify_modal_verification_failed_sends_error(monkeypatch: pytest.
     await modal.on_submit(interaction)
 
     cache.persist_user.assert_not_called()
-    interaction.response.send_message.assert_awaited_once()
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.followup.send.assert_awaited_once()
 
 
 # ===========================================================================

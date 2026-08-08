@@ -1499,8 +1499,11 @@ class CacheManager:
             clan_tag = player_obj.clan.tag if player_obj.clan else None
             clan_name = player_obj.clan.name if player_obj.clan else None
             
-            # Update user_accounts for all users who have this player
-            changes_made = False
+            # Update user_accounts for all users who have this player.
+            # Collect the actually-changed user IDs here instead of a bool flag, so the
+            # write-through persist below doesn't need its own second full scan of
+            # user_accounts (previously O(users×players) twice per fetched player).
+            changed_uids: set[str] = set()
             for user_id, user_data in self.user_accounts.items():
                 # Skip UNASSIGNED pseudo-user
                 if user_id == "UNASSIGNED":
@@ -1508,37 +1511,32 @@ class CacheManager:
                 # Skip invalid entries (defensive programming)
                 if not isinstance(user_data, dict):  # type: ignore[misc]
                     continue
-                
+
                 players = user_data.get("players", [])
                 for player in players:
                     if not isinstance(player, dict):
                         continue
-                    
+
                     current_tag = player.get("player_tag")  # type: ignore[union-attr]
                     if current_tag == player_tag:
                         # Update TH level
                         old_th = player.get("th_level")  # type: ignore[union-attr]
                         if old_th != th_level:
                             player["th_level"] = th_level
-                            changes_made = True
+                            changed_uids.add(user_id)
                             logging.info(f"[PLAYER-INFO-UPDATE] {player_tag}: TH {old_th} -> {th_level}")
-                        
+
                         # Update current clan tag
                         old_clan_tag = player.get("current_clan_tag")  # type: ignore[union-attr]
                         if old_clan_tag != clan_tag:
                             player["current_clan_tag"] = clan_tag
-                            changes_made = True
+                            changed_uids.add(user_id)
                             logging.info(f"[PLAYER-INFO-UPDATE] {player_tag}: Clan {old_clan_tag} -> {clan_tag}")
-            
+
             # Save affected user accounts (write-through: persist only changed users)
-            if changes_made:
-                for uid, udata in self.user_accounts.items():
-                    if uid == "UNASSIGNED" or not isinstance(udata, dict):  # type: ignore[misc]
-                        continue
-                    for p in udata.get("players", []):
-                        if isinstance(p, dict) and p.get("player_tag") == player_tag:  # type: ignore[misc, union-attr]
-                            await self.persist_user(uid)
-                            break
+            if changed_uids:
+                for uid in changed_uids:
+                    await self.persist_user(uid)
                 logging.debug(f"[USER-ACCOUNTS-SAVE] Saved player info updates for {player_tag}")
             
             # Update clan_name_cache if player is in a clan

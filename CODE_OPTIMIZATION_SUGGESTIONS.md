@@ -4,6 +4,47 @@ Scope: QapBot.py, QBcore.py, QBdiscordcmds.py, QBhelperfunctions.py, qapbot/cach
 qapbot/db_manager.py, qapbot/QBdiscocmdshelper.py, qapbot/war_notifications.py,
 qapbot/coc_cache.py, qapbot/guild_role_manager.py, qapbot/formatting.py, qapbot/ui_*.py.
 
+## Status (updated 2026-08-08)
+
+Every item is now **DONE** or has a recorded, verified reason it wasn't changed (a handful turned
+out to be false positives on closer inspection — same disposition as B1, see section E). Only the
+explicitly-opportunistic items (A6, B4, B7, D5 — each says "don't do this standalone" in its own
+**Fix** note) remain genuinely open, by design.
+
+| Item | Status |
+|---|---|
+| A1 (on_ready re-entry lock) | ✅ DONE — `QBcore.on_ready_lock`; also fixed a related bug found while implementing it: `initialization_in_progress` wasn't reset on early-return failure paths, permanently blocking retry |
+| A2 (Step-5 partial-startup failure) | ✅ DONE — terminates the same way Step 3 does |
+| A3 (untracked fire-and-forget tasks) | ✅ DONE — `QBcore.spawn_tracked()`, adopted at 9 call sites |
+| A4 (`bulk_update_clan_timestamps` not re-queued) | ✅ DONE — `QBcore.pending_clan_timestamp_retries`, merged into the next flush at either call site |
+| A5 (`guild.chunk()` result not defended) | ✅ DONE — logs registered users missing from `guild.members` after chunk |
+| A6 (QBcore global state sprawl) | OPEN (opportunistic only, by its own Fix note) |
+| B1 (war-notification datetime re-parsing) | ❌ FALSE POSITIVE — see section E |
+| B2 (`fetch_and_update_player_info` double-scan) | ✅ DONE — `changed_uids` collected in one pass |
+| B3 (`_resolve_war_league` re-resolved per render) | ✅ PARTIAL — real redundancy only existed in `_generate_cwlinfo_archive_embeds`'s round loop (fixed with a local memo dict); `generate_war_info_text`'s claim didn't hold up (only 2 distinct tags, each resolved once — see section E) |
+| B4 (`compute_roster_stats_sync` 3 queries) | OPEN (opportunistic only, by its own Fix note) |
+| B5 (`text_display_width` per-row cost) | ✅ DONE — `@functools.lru_cache(maxsize=4096)` |
+| B6 (`_find_optimal_space_combination` blowup) | ✅ DONE — hard-capped replace-search bound + early-exit once a good-enough candidate is found |
+| B7 (`save_user` per-row execute) | OPEN (opportunistic only, by its own Fix note) |
+| B8 (Phase-3 per-clan log volume) | ❌ FALSE POSITIVE — see section E |
+| C1 (`_save_user_impl` FK-recovery duplication) | ✅ DONE — `_upsert_users_row()` + `_replace_user_players_rows()` |
+| C2 (`war_attacks` INSERT duplication) | ✅ DONE — turned out to be ~6 sites, not ~4; shared SQL constants + `_build_war_attack_params()` |
+| C3 (Win/Loss/Draw classification duplication) | ✅ DONE — `classify_war_result()`, 3 real sites converted (report cited a 4th, `_build_standings_result`, that doesn't contain this logic) |
+| C4 (`TrackedView` base for on_timeout/on_error) | ✅ DONE — adopted in 9 views (ui_common.py ×2, ui_registration.py ×2, ui_notifications.py ×5); ui_clan_management.py's `ClanManagementView` and QBdiscordcmds.py's ad-hoc views intentionally left as-is (extra timeout logic, `self.sent_message` naming) per this item's own "adopt incrementally" note |
+| C5 (timestamp-parser dedup) | ✅ DONE — `war_notifications.parse_war_timestamp_field()`, shared by both call sites this item names. Found a 3rd near-duplicate too (QapBot.py's `_DT_RE`, a narrower single-purpose regex for backdating timestamps) — left as-is, different shape/purpose and outside this item's stated scope |
+| D1 (dead stub buttons) | ✅ DONE — removed entirely (`backlog.txt` has no plan for this feature, and they turned out to be fully unreferenced dead code, not "wired to visible buttons" as reported — see section E) |
+| D2 (silent except-pass sites) | ✅ DONE — debug-level logging added to both cited sites, plus 2 sibling occurrences of the exact same pattern in the same function |
+| D3 (decorator-label audit) | ✅ DONE — audited all 8 real `@discord.ui.button(label=...)` sites codebase-wide; all already correctly re-translated in `__init__`, zero gaps found |
+| D4 (redundant `update_user_metadata_from_interaction`) | ✅ DONE — moved into `RegistrationView.interaction_check()` |
+| D5 (oversized functions) | OPEN (opportunistic only, by design — don't refactor standalone) |
+
+Also fixed the same day, found via live prod-log diagnosis rather than this static inspection (not
+in the list above — see qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md Pitfall 21 and changelog entries
+(20)-(22)+): automatic (implicit) gc gen-2 sweeps freezing the whole process for multi-second
+stretches during live cycles (plus a nightly re-freeze fix once the startup-only freeze proved
+insufficient during CWL), a modal not showing which account it verifies, and a modal
+interaction-token-expiry bug in the verify-account flow.
+
 Method: four parallel deep inspections (orchestration, data layer, command/UI layer,
 helpers/notifications), findings cross-checked against the code where impact claims were high.
 Items already fixed earlier today (deep-link helper, repost extraction, ChannelConfigurationView
@@ -63,13 +104,16 @@ would be added — not worth a big-bang refactor on its own.
 
 ## B. Performance
 
-### B1. Per-war datetime re-parsing in the notification loop — [reported, medium]
-war_notifications.py ~334-360: `_get_hours_until_war_end()` runs `datetime.fromisoformat()` on
-each war's `end_time` string, every notification cycle, for every active war (17K+ during CWL —
-this loop is inside the same `check_wars_for_notifications()` that just got the
-`_get_active_wars` to_thread fix; parsing is a meaningful share of the remaining `war_loop=3.6s`
-prod timing). **Fix**: parse once when the war dict is built (store the datetime/epoch alongside
-the string) and compare numbers in the loop.
+### B1. ~~Per-war datetime re-parsing in the notification loop~~ — ❌ FALSE POSITIVE (confirmed 2026-08-08, see section E)
+Withdrawn after independent re-verification: the caching this finding proposed already exists
+(since commit 17b0b67, 2026-07-20) — `_get_active_wars()` parses each war's end time once per
+cycle and stores `hours_remaining` in war_data (with an explicit "downstream functions must not
+re-parse" comment); all three consumers check the cached value first. The claimed mechanism
+(`datetime.fromisoformat`) doesn't even appear in the file. Do not "fix". Full disposition in
+section E. (Optional micro-item, NOT the original claim: the one-per-war-per-cycle regex parse
+in `_get_active_wars()` could be eliminated by caching a parsed `end_epoch` in
+`temp_war_metadata` at save time — but it already runs inside the `to_thread` worker, so this is
+low value.)
 
 ### B2. `fetch_and_update_player_info` scans all users twice per player — [verified, low-medium]
 cache_manager.py ~1504-1543: one full pass over `user_accounts` to mutate, then a second full
@@ -195,6 +239,16 @@ need when a change lands inside one.
 
 ## E. Claims from the inspection that did NOT hold up (recorded so they aren't re-reported)
 
+- **B1 "per-war datetime re-parsing in the notification loop" — false positive**, confirmed by
+  two independent re-checks (a second agent via `git log -L` blame, then re-verified directly
+  against the code). The proposed fix was already implemented in commit 17b0b67 (2026-07-20):
+  `_get_active_wars()` parses once per war per cycle and caches `hours_remaining` in war_data;
+  consumers (`_get_players_needing_reminders`, `_get_players_with_attacks_remaining`,
+  `_send_channel_war_notification`) all read the cached value and only re-parse on a `None`
+  fallback. The finding also misidentified the mechanism (`datetime.fromisoformat` — zero
+  occurrences; the real parser regexes the `<Timestamp ...>` repr). Lesson for future
+  inspections: `[reported]` findings that cite a specific API must be grepped for that exact
+  API before being acted on.
 - "Missing hot/history schema qualifiers at db_manager.py ~3169" — the code there is the
   **correct** post-materialize-fix pattern (UNION ALL CTE for the INNER side + split ws_h/ws_a
   LEFT JOINs). Any future audit should classify bare `FROM war_summary` hits per the repo rule:
@@ -206,6 +260,22 @@ need when a change lands inside one.
 - "10K users × N players" scale claims for user-account loops — prod maindata is low hundreds of
   rows (see DATABASE_ARCHITECTURE.md § Database Size); those loops are cheap today (B2 kept at
   low-medium for structural reasons, not measured cost).
+- **B3 "generate_war_info_text resolves the same clan/opponent league 2-3 times"** — false for
+  this function specifically: it calls `_resolve_war_league()` exactly twice, once each for
+  `clan_tag` and `opp_tag` — two different tags, not a repeat. `_generate_cwlinfo_archive_embeds`'s
+  claim held up (opponent tags genuinely can repeat across a season's rounds) and was fixed.
+- **B8 "per-clan Processing/Skipping lines balloon the log"** — no `logging.info()` call with that
+  text exists in the cited range (QapBot.py Phase-3 loop) or in `manage_war_files()` /
+  `process_clan_war_data()` (the functions it calls). Audited every `logging.info`/`logging.debug`
+  call in all three: exactly one per-clan `INFO` line exists (`[INACTIVE] ... Smart timestamp
+  set...`), gated to a bounded subset (inactive clans whose war just ended), not "every clan every
+  cycle." Everything else is already `DEBUG`. Not fixed — nothing to fix.
+- **D1 "wired to visible buttons"** — false: `_on_set_newbie_role`/`_on_set_member_role` in
+  ui_clan_management.py were never assigned as any button's `.callback` anywhere in the file —
+  fully orphaned dead methods, not reachable from any UI element. Removed entirely rather than
+  adding `disabled=True` to a button that doesn't exist. The real newbie/member-role configuration
+  feature already exists elsewhere in the same file (the role-selection view around line ~2986),
+  so these were leftover stubs from before that feature was built, not an in-progress placeholder.
 
 ## F. Verified-good (no action)
 
@@ -221,10 +291,10 @@ need when a change lands inside one.
 ## Suggested order of attack
 
 1. **A1 + A2** (startup races — small, high value, easy to test)
-2. **B1** (notification-loop parse caching — directly reduces the remaining prod `war_loop` time)
+2. ~~B1~~ (withdrawn — false positive, see section E)
 3. **C1 + C2** (SQL dedup — do together, one review pass over all war-write paths)
 4. **A3** (tracked-task helper) and **D4** (metadata call consolidation)
 5. **C4** (`TrackedView` base) — ideally *before* the CWL roster feature adds 5+ new views
 6. Everything else opportunistically, per D5's rule of thumb.
 
-Run `.\run_tests.ps1` after each item; A1/A2/B1 additionally deserve a dev-guild restart test.
+Run `.\run_tests.ps1` after each item; A1/A2 additionally deserve a dev-guild restart test.

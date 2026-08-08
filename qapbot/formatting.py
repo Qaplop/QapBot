@@ -26,6 +26,7 @@ Integration:
 
 import unicodedata
 import math
+import functools
 from wcwidth import wcwidth, wcswidth  # type: ignore[import-untyped]
 from typing import List, Dict, Any, Union, Callable, Optional, Set, cast
 import logging
@@ -279,11 +280,19 @@ def text_display_width_float(s: str) -> float:
     # logging.debug(f"Total length of {s}: {total}")
     return total
 
+@functools.lru_cache(maxsize=4096)
 def text_display_width(s: str) -> int:
     """
     Estimate display width for Discord, rounding up the float value from text_display_width_float.
+
+    Memoized: called repeatedly per player row per render (multiple columns), and the same
+    already-normalized names recur across leaderboard postings to every subscribed channel —
+    caching on the string avoids re-running the per-character wcwidth/emoji-range logic in
+    text_display_width_float() for names already seen this process. maxsize=4096 comfortably
+    covers realistic active-player-name churn without unbounded growth.
+
     Args:
-        s (str): Input string
+        s (str): Input string (expected already-normalized, e.g. via normalize_player_name)
     Returns:
         int: Integer display width for Discord monospace font
     """
@@ -507,29 +516,49 @@ def _find_optimal_space_combination(cell: str, gap: float, target_width: int, wi
     
     best_cell = cell
     best_diff = abs(gap)
-    
-    # Limit search space for efficiency
-    max_ideo_replace = min(trailing_spaces, int(gap / IDEO_GAIN) + 2)
-    max_braille_replace = min(trailing_spaces, int(gap / BRAILLE_GAIN) + 3)
+
+    # Limit search space for efficiency. The replace-loop bounds scale with
+    # trailing_spaces, which nothing upstream caps \u2014 a pathologically over-padded
+    # cell could otherwise blow this up to O(trailing_spaces^2) iterations for a
+    # single cell. Hard-cap both replace bounds regardless of trailing_spaces/gap:
+    # replacing more than a handful of trailing spaces can never usefully improve
+    # alignment (each replacement only gains a fraction of a character width), so
+    # searching further is pure waste.
+    _MAX_REPLACE_SEARCH = 10
+    max_ideo_replace = min(trailing_spaces, int(gap / IDEO_GAIN) + 2, _MAX_REPLACE_SEARCH)
+    max_braille_replace = min(trailing_spaces, int(gap / BRAILLE_GAIN) + 3, _MAX_REPLACE_SEARCH)
     max_ideo_append = min(2, int(gap / IDEOGRAPHIC) + 1)
     max_braille_append = min(3, int(gap / BRAILLE) + 1)
     max_space_append = min(4, int(gap) + 1)
-    
+
+    # Early-exit threshold: once a candidate lands this close to the target width,
+    # no further search can meaningfully improve alignment \u2014 stop immediately
+    # instead of exhausting the remaining combinations.
+    _GOOD_ENOUGH_DIFF = 0.02
+
     # Try combinations: replacements + appends
     for n_ideo_replace in range(max_ideo_replace + 1):
+        if best_diff <= _GOOD_ENOUGH_DIFF:
+            break
         for n_braille_replace in range(min(trailing_spaces - n_ideo_replace + 1, max_braille_replace + 1)):
+            if best_diff <= _GOOD_ENOUGH_DIFF:
+                break
             # Calculate remaining regular spaces after replacements
             remaining_spaces = trailing_spaces - n_ideo_replace - n_braille_replace
             if remaining_spaces < 0:
                 continue
-            
+
             # Width gained from replacements
             replace_gain = n_ideo_replace * IDEO_GAIN + n_braille_replace * BRAILLE_GAIN
             # remaining_gap = gap - replace_gain  # Calculated but not used; gap is used directly below
-            
+
             # Try appending spaces
             for n_ideo_append in range(max_ideo_append + 1):
+                if best_diff <= _GOOD_ENOUGH_DIFF:
+                    break
                 for n_braille_append in range(max_braille_append + 1):
+                    if best_diff <= _GOOD_ENOUGH_DIFF:
+                        break
                     for n_space_append in range(max_space_append + 1):
                         # Calculate total width added
                         append_gain = (
@@ -538,11 +567,11 @@ def _find_optimal_space_combination(cell: str, gap: float, target_width: int, wi
                             n_space_append * SPACE
                         )
                         total_gain = replace_gain + append_gain
-                        
+
                         # Check if this is better (closer to gap without much overshoot)
                         diff = abs(gap - total_gain)
                         overshoot = total_gain - gap
-                        
+
                         # Prefer solutions that don't overshoot or have minimal overshoot
                         if diff < best_diff and overshoot < 0.5:
                             # Build candidate cell
@@ -555,15 +584,17 @@ def _find_optimal_space_combination(cell: str, gap: float, target_width: int, wi
                                 '\u2800' * n_braille_append +
                                 ' ' * n_space_append
                             )
-                            
+
                             # Verify width (sanity check)
                             actual_width = width_float_func(candidate)
                             actual_diff = abs(actual_width - target_width)
-                            
+
                             if actual_diff < abs(width_float_func(best_cell) - target_width):
                                 best_diff = diff
                                 best_cell = candidate
-    
+                                if best_diff <= _GOOD_ENOUGH_DIFF:
+                                    break  # innermost early exit \u2014 good enough, stop searching
+
     return best_cell
 
 # Best-practice player cell padding strategy with custom-built width measurement:

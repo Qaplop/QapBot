@@ -331,24 +331,65 @@ def _get_active_wars() -> List[Tuple[str, str, Dict[str, Any]]]:
     return active_wars
 
 
+def parse_war_timestamp_field(ts_str: str) -> Tuple[Optional[datetime], Optional[int]]:
+    """
+    Parse a QapBot war-JSON Timestamp string, e.g.:
+    "<Timestamp time=datetime.datetime(2025, 8, 29, 13, 20, 53) seconds_until=-72658>"
+
+    Shared parser for the embedded datetime plus the stale seconds_until snapshot —
+    previously duplicated (with slightly different strictness) between this module
+    and QBhelperfunctions.generate_war_info_text()'s function-local copy.
+
+    Args:
+        ts_str: Raw Timestamp repr string (or any string containing one).
+
+    Returns:
+        (end_dt, seconds_until) tuple:
+        - end_dt: timezone-aware (UTC) datetime parsed from the embedded
+          datetime.datetime(...) call, or None if that portion is missing/malformed.
+          Seconds default to 0 if the source only provides (year, month, day, hour, minute).
+        - seconds_until: the stale seconds_until snapshot from the string (accurate only
+          at serialization time), or None if absent.
+    """
+    if not isinstance(ts_str, str) or not ts_str:
+        return None, None
+
+    dt_obj: Optional[datetime] = None
+    m = re.search(
+        r"datetime\.datetime\((\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?\)",
+        ts_str,
+    )
+    if m:
+        year, month, day, hour, minute = (int(m.group(i)) for i in range(1, 6))
+        second = int(m.group(6)) if m.group(6) else 0
+        dt_obj = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+
+    seconds_until: Optional[int] = None
+    m2 = re.search(r"seconds_until=([-\d]+)", ts_str)
+    if m2:
+        seconds_until = int(m2.group(1))
+
+    return dt_obj, seconds_until
+
+
 def _get_hours_until_war_end(war_data: Dict[str, Any]) -> Optional[float]:
     """
     Calculate hours remaining until war end.
-    
+
     Args:
         war_data: War data dictionary from CACHE.war_info
-    
+
     Returns:
         Hours remaining as float, or None if unable to parse.
         Returns a negative value when the war has already ended.
-    
+
     Note:
         Parses the actual UTC datetime from the coc.py Timestamp string so the result
         is accurate at any query time — independent of when the file was last written.
         Format: "<Timestamp time=datetime.datetime(Y, M, D, H, Mm[, S]) seconds_until=N>"
         The 'seconds_until' field in the string is stale (recorded at serialization time)
         and is only used as a fallback when the datetime component is absent.
-    
+
     Example:
         hours = _get_hours_until_war_end(war_data)
         # Returns: 4.5 (if 4.5 hours remaining), or -1.2 (if war ended 1.2 h ago)
@@ -362,20 +403,13 @@ def _get_hours_until_war_end(war_data: Dict[str, Any]) -> Optional[float]:
         # 'seconds_until' in the stored string was accurate only at serialization time;
         # using the real datetime avoids false positives for wars that ended long ago
         # but whose temp files haven't been archived yet (stale between bot cycles).
-        m = re.search(
-            r"datetime\.datetime\((\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?\)",
-            end_time_str,
-        )
-        if m:
-            year, month, day, hour, minute = (int(m.group(i)) for i in range(1, 6))
-            second = int(m.group(6)) if m.group(6) else 0
-            end_dt = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+        end_dt, seconds_until = parse_war_timestamp_field(end_time_str)
+        if end_dt is not None:
             return (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
 
         # Fallback: use seconds_until (only accurate right after serialization).
-        if "seconds_until=" in end_time_str:
-            seconds_str = end_time_str.split("seconds_until=")[1].rstrip(">")
-            return int(seconds_str) / 3600
+        if seconds_until is not None:
+            return seconds_until / 3600
 
         return None
     except (ValueError, AttributeError, IndexError) as e:

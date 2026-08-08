@@ -369,6 +369,13 @@ all rebuild/button-handler paths so the reference is never lost.
 - shutdown_sim_pool(): no-op kept for API compatibility with cleanup callers
 
 🟩 qapbot/ui_common.py (~220 lines)
+- TrackedView: Base class for the "tracked temporary message" pattern — self.message
+  attribute + on_timeout() deletes it + on_error() suppresses 10062 (expired interaction
+  token). Use for any new View that posts a message it should clean up on timeout;
+  override on_timeout()/on_error() and call super() if extra behavior is needed. Adopted
+  by GenericSelectView, LanguageSelectView, RegistrationView, AccountActionView, and 5
+  views in ui_notifications.py — use it for new views (e.g. CWL roster) instead of
+  copy-pasting the pattern again.
 - GenericSelectView: Reusable dropdown selection view
 - LanguageSelectView: Standalone language selection for /language command
 - update_user_metadata_from_interaction: Utility for user metadata updates

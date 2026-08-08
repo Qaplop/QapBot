@@ -66,11 +66,54 @@ async def update_user_metadata_from_interaction(interaction: discord.Interaction
         logging.debug(f"Failed to update user metadata from interaction: {e}")
 
 
-class GenericSelectView(discord.ui.View):
+class TrackedView(discord.ui.View):
+    """Base View for the common "tracked temporary message" pattern.
+
+    Consolidates two behaviors that were previously copy-pasted across 7+ views in
+    ui_common.py, ui_notifications.py, ui_registration.py, ui_clan_management.py, and
+    QBdiscordcmds.py — with the message-tracking attribute inconsistently named
+    `self.message` in some views and `self.sent_message` in others, and 10062
+    (expired-interaction-token) suppression present in only 2 of them, so the rest let
+    that error propagate noisily:
+
+    1. `self.message`: set this to the sent `discord.Message` after posting the view.
+       `on_timeout()` deletes it automatically — best-effort, any delete failure
+       (already deleted, missing permissions, etc.) is swallowed.
+    2. `on_error()`: suppresses `discord.NotFound` code 10062 ("Unknown interaction" —
+       the token expired, typically because the user clicked after Discord's 3-second
+       response window) as an INFO log instead of letting it propagate as an error;
+       everything else still propagates via `super().on_error()`.
+
+    Subclasses needing extra timeout/error behavior should override and call `super()`
+    to keep this shared cleanup/suppression rather than re-implementing it inline.
+    See C4, CODE_OPTIMIZATION_SUGGESTIONS.md.
+    """
+    message: Optional[discord.Message] = None
+
+    async def on_timeout(self) -> None:
+        """Delete the tracked message when the view times out."""
+        if self.message is not None:
+            try:
+                await self.message.delete()
+            except Exception:
+                pass
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:  # type: ignore[type-arg, override]
+        """Suppress 'Unknown interaction' (10062) errors from expired tokens; re-raise anything else."""
+        if isinstance(error, discord.NotFound) and error.code == 10062:
+            logging.info(
+                f"[{type(self).__name__}] Expired interaction for '{getattr(item, 'label', item)}' "
+                f"(10062) — user likely clicked after the 3-second window"
+            )
+            return
+        await super().on_error(interaction, error, item)
+
+
+class GenericSelectView(TrackedView):
     """
     Unified generic selector for clans, players, or any list of options.
     Supports both sync and async callback functions with flexible parameters.
-    
+
     This replaces the need for separate ClanSelectView, PlayerSelectView,
     AdminClanSelectView, and AdminPlayerSelectView classes.
     """
@@ -119,17 +162,8 @@ class GenericSelectView(discord.ui.View):
         selected_value = self.select.values[0]
         await self.callback_fn(interaction, selected_value, **self.callback_kwargs)
 
-    async def on_timeout(self) -> None:
-        """Delete the message when the view times out."""
-        if self.message is not None:
-            try:
-                await self.message.delete()
-            except Exception:
-                pass
 
-
-
-class LanguageSelectView(discord.ui.View):
+class LanguageSelectView(TrackedView):
     """
     Language selection view for /admin set_language command.
     
@@ -170,14 +204,6 @@ class LanguageSelectView(discord.ui.View):
         self.add_item(self.select)  # type: ignore[arg-type]
         self.message: Optional[discord.Message] = None
 
-    async def on_timeout(self) -> None:
-        """Delete the message when the view times out."""
-        if self.message is not None:
-            try:
-                await self.message.delete()
-            except Exception:
-                pass
-    
     async def _on_select(self, interaction: discord.Interaction) -> None:
         """Handle language selection."""
         from qapbot.i18n import set_guild_language, t

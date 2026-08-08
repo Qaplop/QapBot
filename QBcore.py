@@ -122,6 +122,8 @@ async def _maintenance_interaction_check(interaction: discord.Interaction) -> bo
     as a decorator merely calls the method with the function as the interaction argument
     and discards the result, so the check would never fire.
     """
+    import logging
+
     # Block commands during startup (before on_ready finishes initializing)
     if not getattr(bot, 'fully_initialized', False):
         from qapbot.i18n import t as _t
@@ -129,8 +131,12 @@ async def _maintenance_interaction_check(interaction: discord.Interaction) -> bo
         msg = _t('commands.errors.startup_in_progress', guild_id=guild_id)
         try:
             await interaction.response.send_message(msg, ephemeral=True)
-        except Exception:
-            pass
+        except Exception as _send_ex:
+            # Best-effort notice — interaction may have already expired (10062) or been
+            # responded to elsewhere. Logged (not silently swallowed) so a spike in these
+            # is visible during diagnosis instead of only showing up as "startup gate blocked
+            # the command but the user saw nothing" reports with no forensic trail.
+            logging.debug(f"[MAINTENANCE-GUARD] Could not send startup-in-progress notice: {_send_ex}")
         return False
 
     if not maintenance_mode and not db_maintenance_mode:
@@ -144,8 +150,8 @@ async def _maintenance_interaction_check(interaction: discord.Interaction) -> bo
         msg = _t('commands.errors.db_maintenance_active', guild_id=guild_id)
         try:
             await interaction.response.send_message(msg, ephemeral=True)
-        except Exception:
-            pass
+        except Exception as _send_ex:
+            logging.debug(f"[MAINTENANCE-GUARD] Could not send db-maintenance-active notice: {_send_ex}")
         return False
 
     # Full maintenance mode — allow only /admin MAINTENANCE_END through
@@ -161,8 +167,8 @@ async def _maintenance_interaction_check(interaction: discord.Interaction) -> bo
     msg = _t('commands.errors.maintenance_mode_active', guild_id=guild_id)
     try:
         await interaction.response.send_message(msg, ephemeral=True)
-    except Exception:
-        pass
+    except Exception as _send_ex:
+        logging.debug(f"[MAINTENANCE-GUARD] Could not send maintenance-mode-active notice: {_send_ex}")
     return False
 
 # Register via direct assignment — NOT as a decorator (see docstring above)
@@ -384,6 +390,60 @@ Integration:
     - Ensures all business logic modules coordinate shutdown
 """
 
+on_ready_lock: asyncio.Lock = asyncio.Lock()
+"""
+Serializes on_ready()'s initialization body against concurrent re-entry.
+
+discord.py dispatches every on_ready event as a new asyncio.Task, so two rapid gateway
+reconnects (or a READY immediately followed by a RESUMED) can each spawn a task that starts
+running on_ready() from the top. The `initialization_in_progress` bool check alone happens to
+be race-free today only because there is no `await` between reading it and setting it True —
+a fragile, easy-to-break invariant (an incidental `await` added anywhere in that stretch would
+silently reopen the race, e.g. double-running CACHE.load_all() / initialize_database()). This
+lock makes that guarantee explicit and enforced instead of implicit: on_ready() checks
+`on_ready_lock.locked()` first (cheap, non-blocking) to preserve the existing "skip duplicate,
+log and return" behavior, then wraps the actual initialization body in `async with on_ready_lock`
+so only one invocation can ever run it at a time even if that invariant changes later.
+See Pitfall A1, CODE_OPTIMIZATION_SUGGESTIONS.md.
+"""
+
+_background_tasks: set[asyncio.Task[Any]] = set()
+"""Live references for every task spawned via spawn_tracked() — see its docstring."""
+
+
+def spawn_tracked(name: str, coro: Any) -> "asyncio.Task[Any]":
+    """Fire-and-forget *coro* as an asyncio.Task while keeping a live reference to it.
+
+    ``asyncio.create_task()`` only holds a *weak* reference to the task via the event
+    loop internals; if the caller doesn't keep the returned Task object anywhere, nothing
+    else does either, and CPython's garbage collector is free to collect it mid-run —
+    silently cancelling the coroutine with no error, no log line, just work that never
+    finished. This bit real fire-and-forget call sites in this codebase (WAL checkpoint,
+    deferred optimize-DB, `_warm_global_db_stats_cache`, registration-message reposts):
+    each one calls `asyncio.create_task(...)` and discards the return value, so a GC pass
+    at just the wrong moment could drop them, and there was no single place to see or
+    cancel whatever background work is currently in flight.
+
+    This helper stores the Task in a module-level set (so it can't be GC'd while running)
+    and registers a done-callback that discards it from the set once it finishes (so the
+    set doesn't grow unbounded). *name* is passed through to `asyncio.create_task(name=...)`
+    so the task shows up under that name in `asyncio.all_tasks()` — useful for admin/status
+    tooling.
+
+    Args:
+        name: Task name for `asyncio.create_task(name=...)` (diagnostics, not deduplication —
+            multiple in-flight tasks may share the same name).
+        coro: The coroutine to run.
+
+    Example:
+        QBcore.spawn_tracked("warm-db-stats", _warm_global_db_stats_cache())
+    """
+    task: "asyncio.Task[Any]" = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 cleaned_up: bool = False
 """
 Flag indicating whether cleanup operations have been completed.
@@ -514,6 +574,19 @@ optimize_db_pending_interaction: Any = None
 Stores the discord.Interaction from /admin Optimize DB when the run was deferred
 (cycle was running). Used to send the final result once the task completes.
 Cleared (set to None) after use.
+"""
+
+pending_clan_timestamp_retries: list[tuple[str, str]] = []
+"""
+(timestamp_iso, clan_tag) pairs from a bulk_update_clan_timestamps() call that failed
+mid-cycle (both QapBot.py call sites — the categorization-loop batch and the Phase-3
+batch — share this single queue). Without this, a failed batch write was previously
+only logged: the in-memory clan_name_cache already had the new last_war_update, but the
+DB row didn't, so after a restart those clans looked overdue and got needlessly re-polled
+(self-healing but wasteful, and completely silent about the DB having gone stale).
+Each call site now merges this queue into its own batch before writing and clears it on
+success, so a failed write gets a real retry at the very next opportunity (either call
+site, whichever runs next) instead of silently waiting for a restart to self-heal.
 """
 
 EXIT_CODE_MAINTENANCE: int = 42

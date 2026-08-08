@@ -1614,30 +1614,6 @@ class ClanManagementView(discord.ui.View):
         await CACHE.persist_server_config(guild_id)
         await self._refresh_roles_view(interaction)
 
-    async def _on_set_newbie_role(self, interaction: discord.Interaction) -> None:
-        """Handle Newbie Role button - configure newbie role assignment. Admin-only."""
-        # Check admin permission first
-        if not await self._check_admin_permission(interaction):
-            return
-        
-        from qapbot.i18n import t
-        user_id = str(interaction.user.id)
-        guild_id = interaction.guild.id if interaction.guild else None
-        msg = t('ui_components.feature_coming_soon.newbie_role', user_id=user_id, guild_id=guild_id)
-        await interaction.response.send_message(msg, ephemeral=True)
-    
-    async def _on_set_member_role(self, interaction: discord.Interaction) -> None:
-        """Handle Member Role button - configure member role assignment. Admin-only."""
-        # Check admin permission first
-        if not await self._check_admin_permission(interaction):
-            return
-        
-        from qapbot.i18n import t
-        user_id = str(interaction.user.id)
-        guild_id = interaction.guild.id if interaction.guild else None
-        msg = t('ui_components.feature_coming_soon.member_role', user_id=user_id, guild_id=guild_id)
-        await interaction.response.send_message(msg, ephemeral=True)
-    
     async def _on_create_family(self, interaction: discord.Interaction) -> None:
         """Handle Create Family button - create a new clan family. Admin-only."""
         # Check admin permission first
@@ -2158,13 +2134,13 @@ class ClanManagementView(discord.ui.View):
         # Trigger immediate action based on new state
         try:
             from QapBot import repost_playerregistration_messages
-            import asyncio
+            import QBcore
             if current_enabled == False:  # Was disabled, now enabling
                 # Post the registration message immediately
-                asyncio.create_task(repost_playerregistration_messages(only_if_not_bottom=False))
+                QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False))
             else:  # Was enabled, now disabling
                 # Delete the registration message immediately
-                asyncio.create_task(repost_playerregistration_messages(only_if_not_bottom=False))
+                QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False))
         except Exception as e:
             logging.warning(f"Could not update registration message immediately: {e}")
         
@@ -2759,8 +2735,8 @@ class ChannelConfigurationView(discord.ui.View):
             logging.debug(f"Registration message enabled, triggering repost after apply")
             try:
                 from QapBot import repost_playerregistration_messages
-                import asyncio
-                asyncio.create_task(repost_playerregistration_messages(only_if_not_bottom=False))
+                import QBcore
+                QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False))
                 logging.debug(f"Repost task created after apply")
             except Exception as e:
                 logging.warning(f"Could not trigger repost after channel config apply: {e}")
@@ -2849,9 +2825,9 @@ class LanguageConfigurationView(discord.ui.View):
         # Repost welcome messages with new language immediately
         try:
             from QapBot import repost_playerregistration_messages
-            import asyncio
+            import QBcore
             # Delete old and post new with updated language immediately
-            asyncio.create_task(repost_playerregistration_messages(only_if_not_bottom=False))
+            QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False))
             logging.info(f"Triggered welcome message repost with language '{self.selected_language}' for guild {interaction.guild.id}")
         except Exception as e:
             logging.warning(f"Could not trigger welcome message repost after language change: {e}")

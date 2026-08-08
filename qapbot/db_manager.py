@@ -46,7 +46,7 @@ from contextlib import contextmanager
 # module-level name is a plain function reference; rebinding it in a test only
 # affects this file's deadline checks, nothing in asyncio.
 _monotonic = _time.monotonic
-from typing import List, Dict, Any, Optional, Tuple, Set, TYPE_CHECKING, Callable, Awaitable, cast
+from typing import List, Dict, Any, Optional, Tuple, Set, TYPE_CHECKING, Callable, Awaitable, cast, Iterable
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -700,16 +700,7 @@ class WarHistoryDB:
                         all_attack_params: List[Tuple[Any, ...]] = []
                         all_summary_params: List[Tuple[Any, ...]] = []
                         for clan_tag, attack_rows, summary in batch:
-                            for r in attack_rows:
-                                all_attack_params.append((
-                                    r["WarID"], clan_tag, r["Date"], r["Player"], r["PlayerID"],
-                                    r["TH_lvl"], r.get("map_position", 0), r["attack_order"],
-                                    r["stars"], r["destruction"], r["defender_tag"],
-                                    r.get("defender_th", 0), r.get("defender_map_position", 0),
-                                    r.get("duration", 0), r.get("is_fresh", -1),
-                                    r.get("times_defended", 0), r.get("best_def_destruction", 0.0),
-                                    r["Max_Attacks"], r["Missed_Attacks"], r["Defensive_Stars"]
-                                ))
+                            all_attack_params.extend(self._build_war_attack_params(clan_tag, attack_rows))
                             if summary:
                                 all_summary_params.append((
                                     summary["war_id"], clan_tag,
@@ -737,15 +728,7 @@ class WarHistoryDB:
                                 ))
 
                         if all_attack_params:
-                            conn.executemany("""
-                                INSERT OR IGNORE INTO war_attacks
-                                (war_id, clan_tag, date, player_name, player_tag, th_level,
-                                 map_position, attack_order, stars, destruction, defender_tag,
-                                 defender_th, defender_map_position, duration, is_fresh,
-                                 times_defended, best_def_destruction,
-                                 max_attacks, missed_attacks, defensive_stars)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, all_attack_params)
+                            conn.executemany(self._WAR_ATTACKS_INSERT_OR_IGNORE_SQL, all_attack_params)
                             self._upsert_player_name_index_in_conn(conn, all_attack_params)
                         if all_summary_params:
                             conn.executemany("""
@@ -806,16 +789,7 @@ class WarHistoryDB:
                         for clan_tag, war_id, attack_rows, summary in batch:
                             if attack_rows:
                                 delete_keys.append((war_id, clan_tag))
-                                for r in attack_rows:
-                                    all_attack_params.append((
-                                        r["WarID"], clan_tag, r["Date"], r["Player"], r["PlayerID"],
-                                        r["TH_lvl"], r.get("map_position", 0), r["attack_order"],
-                                        r["stars"], r["destruction"], r["defender_tag"],
-                                        r.get("defender_th", 0), r.get("defender_map_position", 0),
-                                        r.get("duration", 0), r.get("is_fresh", -1),
-                                        r.get("times_defended", 0), r.get("best_def_destruction", 0.0),
-                                        r["Max_Attacks"], r["Missed_Attacks"], r["Defensive_Stars"]
-                                    ))
+                                all_attack_params.extend(self._build_war_attack_params(clan_tag, attack_rows))
                             if summary:
                                 all_summary_params.append((
                                     summary["war_id"], clan_tag,
@@ -855,15 +829,7 @@ class WarHistoryDB:
                             # for the same war trigger ARCHIVE-DIFFERS in one cycle).
                             # The second set of identical rows is silently dropped, which
                             # is correct since both sets contain the same attack data.
-                            conn.executemany("""
-                                INSERT OR IGNORE INTO war_attacks
-                                (war_id, clan_tag, date, player_name, player_tag, th_level,
-                                 map_position, attack_order, stars, destruction, defender_tag,
-                                 defender_th, defender_map_position, duration, is_fresh,
-                                 times_defended, best_def_destruction,
-                                 max_attacks, missed_attacks, defensive_stars)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, all_attack_params)
+                            conn.executemany(self._WAR_ATTACKS_INSERT_OR_IGNORE_SQL, all_attack_params)
                             self._upsert_player_name_index_in_conn(conn, all_attack_params)
                         if all_summary_params:
                             conn.executemany("""
@@ -2025,6 +1991,56 @@ class WarHistoryDB:
 
     # ==================== war_attacks + war_summary methods ====================
 
+    # Column list + param-tuple mapping for war_attacks shared by every write path below
+    # (sync single-clan add, sync single-clan update, and both branches of the batch
+    # flush). Previously each site re-stated its own copy of both the SQL and the tuple
+    # construction; any future schema change had to be applied identically N times with
+    # no compiler/test signal if one copy was missed. `_WAR_ATTACKS_INSERT_SQL` is used
+    # by the two DELETE-then-INSERT paths (update_war_data_sync, update_war_attack_records_sync)
+    # where a plain INSERT is correct — OR IGNORE there would silently mask a bug in the
+    # preceding DELETE instead of raising on an unexpected duplicate.
+    _WAR_ATTACKS_COLUMNS = (
+        "war_id, clan_tag, date, player_name, player_tag, th_level, "
+        "map_position, attack_order, stars, destruction, defender_tag, "
+        "defender_th, defender_map_position, duration, is_fresh, "
+        "times_defended, best_def_destruction, "
+        "max_attacks, missed_attacks, defensive_stars"
+    )
+    _WAR_ATTACKS_PLACEHOLDERS = ", ".join("?" * 20)
+    _WAR_ATTACKS_INSERT_OR_IGNORE_SQL = (
+        f"INSERT OR IGNORE INTO war_attacks ({_WAR_ATTACKS_COLUMNS}) "
+        f"VALUES ({_WAR_ATTACKS_PLACEHOLDERS})"
+    )
+    _WAR_ATTACKS_INSERT_SQL = (
+        f"INSERT INTO war_attacks ({_WAR_ATTACKS_COLUMNS}) "
+        f"VALUES ({_WAR_ATTACKS_PLACEHOLDERS})"
+    )
+
+    @staticmethod
+    def _build_war_attack_params(
+        clan_tag: str, attack_rows: Iterable[Dict[str, Any]]
+    ) -> List[Tuple[Any, ...]]:
+        """Build war_attacks INSERT param tuples for *clan_tag*, in `_WAR_ATTACKS_COLUMNS` order.
+
+        Each dict in *attack_rows* must have: WarID, Date, Player, PlayerID, TH_lvl,
+        attack_order, stars, destruction, defender_tag, Max_Attacks, Missed_Attacks,
+        Defensive_Stars. Optional keys default to 0 / -1 / 0.0 if absent: map_position,
+        defender_th, defender_map_position, duration, is_fresh, times_defended,
+        best_def_destruction.
+        """
+        return [
+            (
+                r["WarID"], clan_tag, r["Date"], r["Player"], r["PlayerID"],
+                r["TH_lvl"], r.get("map_position", 0), r["attack_order"],
+                r["stars"], r["destruction"], r["defender_tag"],
+                r.get("defender_th", 0), r.get("defender_map_position", 0),
+                r.get("duration", 0), r.get("is_fresh", -1),
+                r.get("times_defended", 0), r.get("best_def_destruction", 0.0),
+                r["Max_Attacks"], r["Missed_Attacks"], r["Defensive_Stars"]
+            )
+            for r in attack_rows
+        ]
+
     def add_war_attack_records_sync(
         self, clan_tag: str, attack_rows: List[Dict[str, Any]]
     ) -> int:
@@ -2048,26 +2064,10 @@ class WarHistoryDB:
         with self._sync_conn() as conn:
             try:
                 with self._sync_write_lock:
-                    conn.executemany("""
-                        INSERT OR IGNORE INTO war_attacks
-                        (war_id, clan_tag, date, player_name, player_tag, th_level,
-                         map_position, attack_order, stars, destruction, defender_tag,
-                         defender_th, defender_map_position, duration, is_fresh,
-                         times_defended, best_def_destruction,
-                         max_attacks, missed_attacks, defensive_stars)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        (
-                            r["WarID"], clan_tag, r["Date"], r["Player"], r["PlayerID"],
-                            r["TH_lvl"], r.get("map_position", 0), r["attack_order"],
-                            r["stars"], r["destruction"], r["defender_tag"],
-                            r.get("defender_th", 0), r.get("defender_map_position", 0),
-                            r.get("duration", 0), r.get("is_fresh", -1),
-                            r.get("times_defended", 0), r.get("best_def_destruction", 0.0),
-                            r["Max_Attacks"], r["Missed_Attacks"], r["Defensive_Stars"]
-                        )
-                        for r in attack_rows
-                    ])
+                    conn.executemany(
+                        self._WAR_ATTACKS_INSERT_OR_IGNORE_SQL,
+                        self._build_war_attack_params(clan_tag, attack_rows),
+                    )
                     inserted = conn.total_changes  # approximate
                     if self._should_commit():
                         conn.commit()
@@ -2174,26 +2174,10 @@ class WarHistoryDB:
             try:
                 with self._sync_write_lock:
                     if attack_rows:
-                        conn.executemany("""
-                            INSERT OR IGNORE INTO war_attacks
-                            (war_id, clan_tag, date, player_name, player_tag, th_level,
-                             map_position, attack_order, stars, destruction, defender_tag,
-                             defender_th, defender_map_position, duration, is_fresh,
-                             times_defended, best_def_destruction,
-                             max_attacks, missed_attacks, defensive_stars)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, [
-                            (
-                                r["WarID"], clan_tag, r["Date"], r["Player"], r["PlayerID"],
-                                r["TH_lvl"], r.get("map_position", 0), r["attack_order"],
-                                r["stars"], r["destruction"], r["defender_tag"],
-                                r.get("defender_th", 0), r.get("defender_map_position", 0),
-                                r.get("duration", 0), r.get("is_fresh", -1),
-                                r.get("times_defended", 0), r.get("best_def_destruction", 0.0),
-                                r["Max_Attacks"], r["Missed_Attacks"], r["Defensive_Stars"]
-                            )
-                            for r in attack_rows
-                        ])
+                        conn.executemany(
+                            self._WAR_ATTACKS_INSERT_OR_IGNORE_SQL,
+                            self._build_war_attack_params(clan_tag, attack_rows),
+                        )
                         self._upsert_player_name_index_in_conn(conn, attack_rows)
                     if summary:
                         conn.execute("""
@@ -2273,26 +2257,10 @@ class WarHistoryDB:
                             "DELETE FROM war_attacks WHERE war_id = ? AND clan_tag = ?",
                             (war_id, clan_tag),
                         )
-                        conn.executemany("""
-                            INSERT INTO war_attacks
-                            (war_id, clan_tag, date, player_name, player_tag, th_level,
-                             map_position, attack_order, stars, destruction, defender_tag,
-                             defender_th, defender_map_position, duration, is_fresh,
-                             times_defended, best_def_destruction,
-                             max_attacks, missed_attacks, defensive_stars)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, [
-                            (
-                                r["WarID"], clan_tag, r["Date"], r["Player"], r["PlayerID"],
-                                r["TH_lvl"], r.get("map_position", 0), r["attack_order"],
-                                r["stars"], r["destruction"], r["defender_tag"],
-                                r.get("defender_th", 0), r.get("defender_map_position", 0),
-                                r.get("duration", 0), r.get("is_fresh", -1),
-                                r.get("times_defended", 0), r.get("best_def_destruction", 0.0),
-                                r["Max_Attacks"], r["Missed_Attacks"], r["Defensive_Stars"]
-                            )
-                            for r in attack_rows
-                        ])
+                        conn.executemany(
+                            self._WAR_ATTACKS_INSERT_SQL,
+                            self._build_war_attack_params(clan_tag, attack_rows),
+                        )
                         self._upsert_player_name_index_in_conn(conn, attack_rows)
                     if summary:
                         conn.execute("""
@@ -2360,26 +2328,10 @@ class WarHistoryDB:
                         "DELETE FROM war_attacks WHERE war_id = ? AND clan_tag = ?",
                         (war_id, clan_tag),
                     )
-                    conn.executemany("""
-                        INSERT INTO war_attacks
-                        (war_id, clan_tag, date, player_name, player_tag, th_level,
-                         map_position, attack_order, stars, destruction, defender_tag,
-                         defender_th, defender_map_position, duration, is_fresh,
-                         times_defended, best_def_destruction,
-                         max_attacks, missed_attacks, defensive_stars)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        (
-                            r["WarID"], clan_tag, r["Date"], r["Player"], r["PlayerID"],
-                            r["TH_lvl"], r.get("map_position", 0), r["attack_order"],
-                            r["stars"], r["destruction"], r["defender_tag"],
-                            r.get("defender_th", 0), r.get("defender_map_position", 0),
-                            r.get("duration", 0), r.get("is_fresh", -1),
-                            r.get("times_defended", 0), r.get("best_def_destruction", 0.0),
-                            r["Max_Attacks"], r["Missed_Attacks"], r["Defensive_Stars"]
-                        )
-                        for r in attack_rows
-                    ])
+                    conn.executemany(
+                        self._WAR_ATTACKS_INSERT_SQL,
+                        self._build_war_attack_params(clan_tag, attack_rows),
+                    )
                     if self._should_commit():
                         conn.commit()
                 logging.info(
@@ -4870,6 +4822,62 @@ class WarHistoryDB:
             lambda: self._save_user_impl(discord_id, user_data)
         )
 
+    async def _upsert_users_row(self, discord_id: str, user_data: Dict[str, Any]) -> None:
+        """Shared `users` table UPSERT for `_save_user_impl`'s primary and FK-recovery paths.
+
+        Extracted so a future schema change to this INSERT only needs to be made once instead
+        of twice in near-identical, easy-to-drift-apart copies.
+        """
+        notif = user_data.get("notification_settings", {})
+        await self._conn.execute("""
+            INSERT INTO users
+            (discord_id, display_name, notification_mode, notification_type, hours_before_end,
+             war_reminders_enabled, user_language, user_language_locked)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(discord_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                notification_mode = excluded.notification_mode,
+                notification_type = excluded.notification_type,
+                hours_before_end = excluded.hours_before_end,
+                war_reminders_enabled = excluded.war_reminders_enabled,
+                user_language = excluded.user_language,
+                user_language_locked = excluded.user_language_locked
+        """, (
+            discord_id,
+            user_data.get("display_name", "Unknown"),
+            notif.get("notification_mode", "repeated"),
+            notif.get("notification_type", "all_wars"),
+            notif.get("hours_before_end", 4),
+            1 if notif.get("war_reminders", True) else 0,
+            user_data.get("user_language"),
+            1 if user_data.get("user_language_locked", False) else 0
+        ))
+
+    async def _replace_user_players_rows(
+        self, discord_id: str, players: List[Dict[str, Any]], null_clan_tags: bool
+    ) -> None:
+        """Shared `user_players` DELETE+reinsert for `_save_user_impl`'s primary and FK-recovery paths.
+
+        Args:
+            null_clan_tags: True for the FK-recovery retry — a referenced clan row doesn't
+                exist, so current_clan_tag is cleared for every player instead of failing again.
+        """
+        await self._conn.execute("DELETE FROM user_players WHERE discord_id = ?", (discord_id,))
+        for player in players:
+            await self._conn.execute("""
+                INSERT INTO user_players
+                (discord_id, player_tag, player_name, verified, th_level, current_clan_tag, is_primary)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                discord_id,
+                player["player_tag"],
+                player["player_name"],
+                1 if player.get("verified", False) else 0,
+                player.get("th_level"),
+                None if null_clan_tags else player.get("current_clan_tag"),
+                1 if player.get("is_primary", False) else 0
+            ))
+
     async def _save_user_impl(self, discord_id: str, user_data: Dict[str, Any]) -> None:
         """Inner implementation of save_user (retry-wrapped by caller)."""
         await self._ensure_connection()
@@ -4891,35 +4899,9 @@ class WarHistoryDB:
                     await self._ensure_clan_exists(clan_tag)
             
             await self._conn.execute("BEGIN")
-            
-            notif = user_data.get("notification_settings", {})
-            notification_mode = notif.get("notification_mode", "repeated")
-            notification_type = notif.get("notification_type", "all_wars")
-            
-            await self._conn.execute("""
-                INSERT INTO users 
-                (discord_id, display_name, notification_mode, notification_type, hours_before_end,
-                 war_reminders_enabled, user_language, user_language_locked)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(discord_id) DO UPDATE SET
-                    display_name = excluded.display_name,
-                    notification_mode = excluded.notification_mode,
-                    notification_type = excluded.notification_type,
-                    hours_before_end = excluded.hours_before_end,
-                    war_reminders_enabled = excluded.war_reminders_enabled,
-                    user_language = excluded.user_language,
-                    user_language_locked = excluded.user_language_locked
-            """, (
-                discord_id,
-                user_data.get("display_name", "Unknown"),
-                notification_mode,
-                notification_type,
-                notif.get("hours_before_end", 4),
-                1 if notif.get("war_reminders", True) else 0,
-                user_data.get("user_language"),
-                1 if user_data.get("user_language_locked", False) else 0
-            ))
-            
+
+            await self._upsert_users_row(discord_id, user_data)
+
             # Delete existing players
             # Forensic guard: this DELETE+reinsert replaces the user's entire players
             # list with whatever the caller passed. A shrink to zero is legitimate only
@@ -4938,23 +4920,7 @@ class WarHistoryDB:
                         f"user_players row(s) with an EMPTY players list — legitimate only for an "
                         f"explicit unlink of the last account"
                     )
-            await self._conn.execute("DELETE FROM user_players WHERE discord_id = ?", (discord_id,))
-
-            # Insert players
-            for player in user_data.get("players", []):
-                await self._conn.execute("""
-                    INSERT INTO user_players
-                    (discord_id, player_tag, player_name, verified, th_level, current_clan_tag, is_primary)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    discord_id,
-                    player["player_tag"],
-                    player["player_name"],
-                    1 if player.get("verified", False) else 0,
-                    player.get("th_level"),
-                    player.get("current_clan_tag"),
-                    1 if player.get("is_primary", False) else 0
-                ))
+            await self._replace_user_players_rows(discord_id, user_data.get("players", []), null_clan_tags=False)
 
             # Delete existing buddies (Save-your-Buddy)
             await self._conn.execute("DELETE FROM user_buddies WHERE discord_id = ?", (discord_id,))
@@ -4981,44 +4947,8 @@ class WarHistoryDB:
                 logging.warning(f"[DB-WRITE] Retrying save_user({discord_id}) with current_clan_tag=NULL (FK recovery)")
                 try:
                     await self._conn.execute("BEGIN")
-                    notif2 = user_data.get("notification_settings", {})
-                    await self._conn.execute("""
-                        INSERT INTO users
-                        (discord_id, display_name, notification_mode, notification_type, hours_before_end,
-                         war_reminders_enabled, user_language, user_language_locked)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(discord_id) DO UPDATE SET
-                            display_name = excluded.display_name,
-                            notification_mode = excluded.notification_mode,
-                            notification_type = excluded.notification_type,
-                            hours_before_end = excluded.hours_before_end,
-                            war_reminders_enabled = excluded.war_reminders_enabled,
-                            user_language = excluded.user_language,
-                            user_language_locked = excluded.user_language_locked
-                    """, (
-                        discord_id,
-                        user_data.get("display_name", "Unknown"),
-                        notif2.get("notification_mode", "repeated"),
-                        notif2.get("notification_type", "all_wars"),
-                        notif2.get("hours_before_end", 4),
-                        1 if notif2.get("war_reminders", True) else 0,
-                        user_data.get("user_language"),
-                        1 if user_data.get("user_language_locked", False) else 0
-                    ))
-                    await self._conn.execute("DELETE FROM user_players WHERE discord_id = ?", (discord_id,))
-                    for player in user_data.get("players", []):
-                        await self._conn.execute("""
-                            INSERT INTO user_players
-                            (discord_id, player_tag, player_name, verified, th_level, current_clan_tag, is_primary)
-                            VALUES (?, ?, ?, ?, ?, NULL, ?)
-                        """, (
-                            discord_id,
-                            player["player_tag"],
-                            player["player_name"],
-                            1 if player.get("verified", False) else 0,
-                            player.get("th_level"),
-                            1 if player.get("is_primary", False) else 0
-                        ))
+                    await self._upsert_users_row(discord_id, user_data)
+                    await self._replace_user_players_rows(discord_id, user_data.get("players", []), null_clan_tags=True)
                     await self._conn.commit()
                     logging.info(f"[DB-WRITE] FK recovery succeeded for save_user({discord_id}) — current_clan_tag cleared")
                     return  # recovered successfully, don't re-raise

@@ -13,9 +13,10 @@ from typing import List, Dict, Any, Optional
 from qapbot.i18n import t
 from qapbot.cache_manager import CACHE
 from qapbot.emojis import BotEmojis
+from qapbot.ui_common import TrackedView
 
 
-class WarNotificationPromptView(discord.ui.View):
+class WarNotificationPromptView(TrackedView):
     """
     View for prompting user to activate war notifications after account linking.
     Shows two buttons: "Activate Notifications" and "Skip".
@@ -38,14 +39,6 @@ class WarNotificationPromptView(discord.ui.View):
             self.children[0].label = t('warnotifications.button_activate', guild_id=guild_id)
         if len(self.children) >= 2 and isinstance(self.children[1], discord.ui.Button):
             self.children[1].label = t('warnotifications.button_disable', guild_id=guild_id).replace('🔕', '⏭️').replace('Disable', 'Skip')
-    
-    async def on_timeout(self) -> None:
-        """Delete the message when the view times out."""
-        if self.message is not None:
-            try:
-                await self.message.delete()
-            except Exception:
-                pass
 
     @discord.ui.button(label="🔔 Activate Notifications", style=discord.ButtonStyle.primary)
     async def activate_button(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[type-arg]
@@ -103,7 +96,7 @@ class WarNotificationPromptView(discord.ui.View):
 
 
 
-class UnifiedNotificationView(discord.ui.View):
+class UnifiedNotificationView(TrackedView):
     """
     Unified view for all notification management.
     
@@ -201,14 +194,6 @@ class UnifiedNotificationView(discord.ui.View):
             )
             remove_buddy_button.callback = self.remove_buddy_button_callback
             self.add_item(remove_buddy_button)  # type: ignore[arg-type]
-    
-    async def on_timeout(self) -> None:
-        """Delete the message when the view times out."""
-        if self.message is not None:
-            try:
-                await self.message.delete()
-            except Exception:
-                pass
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Ensure only the owner can interact (and maintenance guard via super)."""
@@ -444,7 +429,7 @@ class UnifiedNotificationView(discord.ui.View):
         )
 
 
-class LanguageSelectionView(discord.ui.View):
+class LanguageSelectionView(TrackedView):
     """View for selecting notification language preference."""
     
     def __init__(self, user_id: str, parent_view: UnifiedNotificationView, original_interaction: Optional[discord.Interaction], timeout: int = 180):
@@ -493,14 +478,6 @@ class LanguageSelectionView(discord.ui.View):
         language_select.callback = self.language_selected
         self.add_item(language_select)  # type: ignore[arg-type]
 
-    async def on_timeout(self) -> None:
-        """Delete the message when the view times out."""
-        if self.message is not None:
-            try:
-                await self.message.delete()
-            except Exception:
-                pass
-    
     async def language_selected(self, interaction: discord.Interaction):
         """Handle language selection."""
         from qapbot.cache_manager import CACHE
@@ -588,7 +565,7 @@ class LanguageSelectionView(discord.ui.View):
 # ============================================================================
 
 
-class BuddyPlayerSelectView(discord.ui.View):
+class BuddyPlayerSelectView(TrackedView):
     """View with a select dropdown to pick a player from multiple search matches when adding a buddy."""
 
     def __init__(self, user_id: str, guild_id: Optional[int], matches: List[Dict[str, Any]],
@@ -626,14 +603,6 @@ class BuddyPlayerSelectView(discord.ui.View):
         )
         select.callback = self.player_selected
         self.add_item(select)  # type: ignore[arg-type]
-
-    async def on_timeout(self) -> None:
-        """Delete the message when the view times out."""
-        if self.message is not None:
-            try:
-                await self.message.delete()
-            except Exception:
-                pass
 
     async def player_selected(self, interaction: discord.Interaction):
         """Handle player selection — resolve via CoC API, add as buddy, and remove the dropdown message."""
@@ -865,7 +834,7 @@ class LinkBuddyModal(discord.ui.Modal, title="Link Buddy Account"):
                 logging.warning(f"Failed to update notification settings message after buddy add: {e}")
 
 
-class RemoveBuddyView(discord.ui.View):
+class RemoveBuddyView(TrackedView):
     """View with a select dropdown to remove a buddy from the watch list."""
 
     def __init__(self, user_id: str, watched_players: List[Dict[str, Any]], parent_view: 'UnifiedNotificationView', original_interaction: Optional[discord.Interaction], timeout: int = 180):
@@ -906,14 +875,6 @@ class RemoveBuddyView(discord.ui.View):
         )
         select.callback = self.buddy_selected
         self.add_item(select)  # type: ignore[arg-type]
-
-    async def on_timeout(self) -> None:
-        """Delete the message when the view times out."""
-        if self.message is not None:
-            try:
-                await self.message.delete()
-            except Exception:
-                pass
 
     async def buddy_selected(self, interaction: discord.Interaction):
         """Handle buddy selection for removal."""

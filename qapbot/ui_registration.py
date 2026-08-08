@@ -13,7 +13,7 @@ from typing import List, Dict, Callable, Any, Optional, Set
 
 from qapbot.i18n import t  # type: ignore[reportUnusedImport]  # tests monkeypatch ui_registration.t
 from qapbot.cache_manager import CACHE
-from qapbot.ui_common import GenericSelectView, update_user_metadata_from_interaction
+from qapbot.ui_common import GenericSelectView, TrackedView, update_user_metadata_from_interaction
 from qapbot.ui_notifications import WarNotificationPromptView
 
 
@@ -265,7 +265,7 @@ async def _show_player_search_modal(interaction: discord.Interaction, guild_id: 
     )
 
 
-class RegistrationView(discord.ui.View):
+class RegistrationView(TrackedView):
     """
     Persistent registration message view with account linking button.
     Button stays active indefinitely and triggers clan selection flow.
@@ -317,6 +317,12 @@ class RegistrationView(discord.ui.View):
         (and the user's registration) is completely intact — not a data-loss bug, just a
         premature read. Delegates to the maintenance-mode check (monkey-patched onto
         discord.ui.View in QBcore.py) once startup is confirmed complete.
+
+        Also runs update_user_metadata_from_interaction() once here (after both gates
+        pass) instead of each button handler repeating the same call first thing — this
+        guarantees it can never run pre-load (the fully_initialized gate above already
+        blocks that path) and removes 4 identical copies. See D4,
+        CODE_OPTIMIZATION_SUGGESTIONS.md.
         """
         import QBcore as _qbcore
         if not getattr(_qbcore.bot, 'fully_initialized', False):
@@ -331,14 +337,15 @@ class RegistrationView(discord.ui.View):
             except Exception:
                 pass
             return False
-        return bool(await super().interaction_check(interaction))
+        if not bool(await super().interaction_check(interaction)):
+            return False
+        await update_user_metadata_from_interaction(interaction)
+        return True
     
     @discord.ui.button(label="🔗 Link Account", style=discord.ButtonStyle.primary, row=0, custom_id="registration_link_account")
     async def link_account_button(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[type-arg]
         """Handle the Link account button click - check for unverified accounts first."""
-        # Update user metadata from interaction
-        await update_user_metadata_from_interaction(interaction)
-        
+        # update_user_metadata_from_interaction() already ran in interaction_check() (D4)
         # AccountActionView is defined in this module
         from qapbot.i18n import t
         
@@ -371,9 +378,7 @@ class RegistrationView(discord.ui.View):
     @discord.ui.button(label="⚙️ War Notifications", style=discord.ButtonStyle.primary, row=0, custom_id="registration_war_notifications")
     async def war_notifications_button(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[type-arg]
         """Handle War Notifications button click - opens notification settings dialog."""
-        # Update user metadata from interaction
-        await update_user_metadata_from_interaction(interaction)
-        
+        # update_user_metadata_from_interaction() already ran in interaction_check() (D4)
         from qapbot.i18n import t
         
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -429,11 +434,9 @@ class RegistrationView(discord.ui.View):
     @discord.ui.button(label="🔑 API Verification", style=discord.ButtonStyle.primary, row=0, custom_id="registration_api_verification")
     async def api_verification_button(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[type-arg]
         """Handle API Verification button click - shows unverified accounts for verification."""
-        # Update user metadata from interaction
-        await update_user_metadata_from_interaction(interaction)
-        
+        # update_user_metadata_from_interaction() already ran in interaction_check() (D4)
         from qapbot.i18n import t
-        
+
         user_id = str(interaction.user.id)
         user_entry = CACHE.user_accounts.get(user_id, {"players": []})
         user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
@@ -541,9 +544,7 @@ class RegistrationView(discord.ui.View):
     @discord.ui.button(label="📋 My Accounts", style=discord.ButtonStyle.secondary, row=0, custom_id="registration_my_accounts")
     async def my_accounts_button(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[type-arg]
         """Handle My Accounts button click - show account management view."""
-        # Update user metadata from interaction
-        await update_user_metadata_from_interaction(interaction)
-        
+        # update_user_metadata_from_interaction() already ran in interaction_check() (D4)
         # AccountManagementView is defined in this module
         from qapbot.i18n import t
         
@@ -563,15 +564,12 @@ class RegistrationView(discord.ui.View):
         view = AccountManagementView(user_id, self._resolve_guild_id(interaction), interaction.user.display_name)
         await view.show_overview(interaction)
 
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:  # type: ignore[type-arg, override]
-        """Suppress 'Unknown interaction' (10062) errors caused by expired tokens; re-raise anything else."""
-        if isinstance(error, discord.NotFound) and error.code == 10062:
-            logging.info(f"[REGISTRATION] Expired interaction for '{getattr(item, 'label', item)}' (10062) — user likely clicked after 3-second window")
-            return
-        await super().on_error(interaction, error, item)
+    # on_timeout/on_error come from TrackedView. on_timeout is a no-op here since this view
+    # is persistent (timeout=None, no self.message ever set) — only on_error's 10062
+    # suppression is actually exercised.
 
 
-class AccountActionView(discord.ui.View):
+class AccountActionView(TrackedView):
     """
     View for selecting between verifying existing account or linking new account.
     Shows unverified players and a "Link new account" option.
@@ -621,14 +619,6 @@ class AccountActionView(discord.ui.View):
         self.select.callback = self._on_select  # type: ignore[assignment]
         self.add_item(self.select)  # type: ignore[arg-type]
 
-    async def on_timeout(self) -> None:
-        """Delete the message when the view times out."""
-        if self.message is not None:
-            try:
-                await self.message.delete()
-            except Exception:
-                pass
-    
     async def _on_select(self, interaction: discord.Interaction) -> None:
         """Handle action selection."""
         from qapbot.i18n import t
@@ -695,15 +685,22 @@ class VerifyAccountModal(discord.ui.Modal, title="Verify Account"):
             parent_view: Optional AccountManagementView to refresh after successful verification
         """
         from qapbot.i18n import t
-        
-        # NOTE: super().__init__() must be called WITHOUT title parameter
-        # Title is already set in class definition above
-        super().__init__()
-        
+
+        # Per-instance title override so the modal names which account is being verified
+        # (otherwise, with multiple linked-but-unverified accounts, the user has no way to
+        # tell which one they're about to submit an API token for — see Issue 1, 2026-08-08).
+        # discord.py's Modal.__init__ DOES support this despite the class-level
+        # `title="Verify Account"` kwarg above: passing title= here sets self.title on the
+        # instance, overriding the class default (see discord/ui/modal.py Modal.__init__).
+        player_name = player_data.get("player_name", "Unknown")
+        player_tag = player_data.get("player_tag", "")
+        title = t('playerregistration.verify_player', guild_id=guild_id, player_name=player_name, player_tag=player_tag)
+        super().__init__(title=title[:45])  # Discord modal title hard limit
+
         # Translate TextInput placeholder after instantiation
         # (Label remains in English due to discord.py Modal lifecycle requirements)
         self.coc_api_token.placeholder = t('ui_components.modals.placeholder_api_token', guild_id=guild_id)
-        
+
         self.guild_id = guild_id
         self.player_data = player_data
         self.action_view_interaction = action_view_interaction
@@ -749,13 +746,23 @@ class VerifyAccountModal(discord.ui.Modal, title="Verify Account"):
             message = t('playerregistration.player_not_in_account', user_id=user_id, guild_id=guild_id, player_name=player_name, player_tag=player_id)
             await interaction.response.send_message(message, ephemeral=True)
             return
-        
+
+        # Defer now, before the slow work below: verify_and_update_player() round-trips to the
+        # CoC API, and a successful verification additionally does a Discord role assignment
+        # plus a full guild role sync. Combined, those routinely exceed Discord's 3-second
+        # interaction-response window, so the FIRST response to this interaction must happen
+        # now — leaving it for check_and_prompt_war_notifications()/the branches below to call
+        # interaction.response.send_message() intermittently raised discord.NotFound (10062
+        # Unknown Interaction) even though verification itself had already succeeded (Issue 1,
+        # 2026-08-08). Every reply below now goes through followup.send() instead.
+        await interaction.response.defer(ephemeral=True)
+
         # Attempt verification
         guild_id = interaction.guild.id if interaction.guild else None
         verified, verify_msg = await verify_and_update_player(
             existing_player, player_id, api_token, guild_id=guild_id
         )
-        
+
         if verified:
             await CACHE.persist_user(user_id)
             logging.info(f"USER ACTION: {interaction.user} verified player {player_name} ({player_id}) via welcome screen")
@@ -780,16 +787,14 @@ class VerifyAccountModal(discord.ui.Modal, title="Verify Account"):
 
             # If called from AccountManagementView, refresh it after verification
             if self.parent_view and self.parent_view.original_interaction:
-                # Defer the modal response first
-                await interaction.response.defer(ephemeral=True)
-                
+                # Already deferred above
                 # Update parent view's data and refresh the message
                 overview_text = self.parent_view._build_message_content()  # type: ignore[attr-defined]
                 await self.parent_view.original_interaction.edit_original_response(
                     content=overview_text,
                     view=self.parent_view
                 )
-                
+
                 # Send success message as followup
                 from qapbot.i18n import t
                 guild_id = interaction.guild.id if interaction.guild else None
@@ -805,13 +810,13 @@ class VerifyAccountModal(discord.ui.Modal, title="Verify Account"):
                     user_id=user_id,
                     interaction=interaction,
                     success_message=t('playerregistration.player_verified_success', user_id=user_id, guild_id=guild_id, message=verify_msg),
-                    use_followup=False,
+                    use_followup=True,  # already deferred above
                     player_selection_interaction=None  # Keep welcome message - never delete it
                 )
         else:
-            # Verification failed - respond to modal submission with error
+            # Verification failed - respond via followup since we already deferred above
             # Welcome message is kept so user can try again
-            await interaction.response.send_message(verify_msg, ephemeral=True)
+            await interaction.followup.send(verify_msg, ephemeral=True)
 
 
 class ApiTokenOwnershipModal(discord.ui.Modal, title="Prove Account Ownership"):

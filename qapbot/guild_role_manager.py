@@ -825,15 +825,32 @@ async def sync_all_roles_for_guild(
 
     synced = 0
     errors = 0
+    seen_ids: set[int] = set()
     for member in guild.members:
         if member.id not in registered_ids:
             continue
+        seen_ids.add(member.id)
         try:
             await sync_roles_for_user(guild, guild_id, member.id, member=member)
             synced += 1
         except Exception as e:
             errors += 1
             logging.warning(f"[ROLE-SYNC] Error syncing roles for user {member.id} in guild {guild.name} ({guild_id}): {e}")
+
+    # A registered user missing from guild.members after chunk() was previously silently
+    # skipped — no role sync, no log line, indistinguishable from "not a member of this
+    # guild". Surface it: could be a transient cache gap (chunk() raced a member join,
+    # a Discord outage) or a genuinely stale registration (user left the guild). Not
+    # auto-resolved via fetch_member() here — that's a per-ID API call, and this set can
+    # legitimately be large/expected (most "missing" entries are just left-guild users).
+    missing_ids = registered_ids - seen_ids
+    if missing_ids:
+        _sample = sorted(missing_ids)[:20]
+        logging.warning(
+            f"[ROLE-SYNC] Guild {guild.name} ({guild_id}): {len(missing_ids)} registered user(s) "
+            f"not in guild.members cache after chunk() — role sync skipped for them this run "
+            f"(left the guild, or a cache gap): {_sample}{'...' if len(missing_ids) > 20 else ''}"
+        )
 
     logging.info(f"[ROLE-SYNC] Guild {guild.name} ({guild_id}) role sync complete: {synced} synced, {errors} errors")
 

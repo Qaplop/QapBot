@@ -723,31 +723,9 @@ def _resolve_war_league(tag: str, opponent_tag: Optional[str] = None) -> str:
 
 
 def generate_war_info_text(clan_tag: str) -> str:
-    import re
-    def _parse_timestamp_field(ts_str: str) -> Tuple[Optional[datetime], Optional[int]]:
-        """
-        Parse QapBot war JSON timestamp string, e.g.:
-        "<Timestamp time=datetime.datetime(2025, 8, 29, 13, 20, 53) seconds_until=-72658>"
-        Returns (datetime, seconds_until)
-        """
-        if not isinstance(ts_str, str):  # type: ignore[misc]
-            return None, None
-        # Extract seconds_until
-        m = re.search(r'seconds_until=([-\d]+)', ts_str)
-        seconds_until = int(m.group(1)) if m else None
-        # Extract datetime
-        m2 = re.search(r'datetime\.datetime\(([^)]+)\)', ts_str)
-        dt_obj = None
-        if m2:
-            dt_args_str = [x.strip() for x in m2.group(1).split(',')]
-            if len(dt_args_str) >= 6:
-                # datetime() expects (year, month, day, hour, minute, second, microsecond=0, tzinfo=None)
-                # Only convert first 6 to int, rest might be tzinfo
-                dt_obj = datetime(
-                    int(dt_args_str[0]), int(dt_args_str[1]), int(dt_args_str[2]),
-                    int(dt_args_str[3]), int(dt_args_str[4]), int(dt_args_str[5])
-                )
-        return dt_obj, seconds_until
+    # Shared with war_notifications.py — was a function-local duplicate here until C5
+    # (2026-08-08); see parse_war_timestamp_field()'s docstring for the format parsed.
+    from qapbot.war_notifications import parse_war_timestamp_field as _parse_timestamp_field
 
     def _fmt_delta_from_secs(secs: Optional[int]) -> str:
         if secs is None:
@@ -1055,6 +1033,23 @@ def _desc_lines_to_embeds(
     return embeds or [discord.Embed(title=title, url=url, description=full_text[:_EMBED_DESC_LIMIT], color=color)]
 
 
+def classify_war_result(my_stars: int, opp_stars: int, my_dest: float, opp_dest: float) -> str:
+    """Classify a finished war as Win/Loss/Draw: stars decide first, destruction % breaks ties.
+
+    Shared by every "war ended" CWL embed renderer so the tiebreak rule (and its emoji label)
+    is defined once instead of being copy-pasted identically across each one.
+    """
+    if my_stars > opp_stars:
+        return "✅ Win"
+    if opp_stars > my_stars:
+        return "❌ Loss"
+    if my_dest > opp_dest:
+        return "✅ Win"
+    if opp_dest > my_dest:
+        return "❌ Loss"
+    return "🤝 Draw"
+
+
 def _generate_cwlinfo_archive_embeds(clan_tag: str) -> List[discord.Embed]:
     """
     Build a single CWL season overview embed from the war_summary DB table.
@@ -1089,7 +1084,15 @@ def _generate_cwlinfo_archive_embeds(clan_tag: str) -> List[discord.Embed]:
     season_wars: List[Dict[str, Any]] = by_season[latest_season]
 
     clan_name: str = CACHE.get_clan_name(clan_tag, clan_tag) or clan_tag
-    my_league: str = _resolve_war_league(clan_tag)
+    # Local per-render memo: opponent tags can repeat across rounds in irregular CWL
+    # group histories (mid-season bonus CWL, rescheduled wars), so cache each tag's
+    # resolved league here instead of re-resolving it on every repeat within this render.
+    _league_cache: Dict[str, str] = {}
+    def _league_for(tag: str) -> str:
+        if tag not in _league_cache:
+            _league_cache[tag] = _resolve_war_league(tag)
+        return _league_cache[tag]
+    my_league: str = _league_for(clan_tag)
     league_hdr: str = f" \u00b7 {my_league}" if my_league else ""
 
     my_clan_url: str = coc_clan_profile_url(clan_tag)
@@ -1102,20 +1105,11 @@ def _generate_cwlinfo_archive_embeds(clan_tag: str) -> List[discord.Embed]:
         opp_stars_a: int = int(row.get('opponent_stars', 0) or 0)
         opp_tag_a: str = str(row.get('opponent_tag', '') or '')
         opp_name_a: str = normalize_player_name(str(row.get('opponent_name', 'Opponent') or 'Opponent'))
-        opp_league_a: str = _resolve_war_league(opp_tag_a) if opp_tag_a else ""
+        opp_league_a: str = _league_for(opp_tag_a) if opp_tag_a else ""
         opp_league_str_a: str = f"  \u00b7  {opp_league_a}" if opp_league_a else ""
         my_dest_a: float = float(row.get('clan_destruction', 0.0) or 0.0)
         opp_dest_a: float = float(row.get('opp_destruction', 0.0) or 0.0)
-        if my_stars_a > opp_stars_a:
-            result_lbl_a = "\u2705 Win"
-        elif opp_stars_a > my_stars_a:
-            result_lbl_a = "\u274c Loss"
-        elif my_dest_a > opp_dest_a:
-            result_lbl_a = "\u2705 Win"
-        elif opp_dest_a > my_dest_a:
-            result_lbl_a = "\u274c Loss"
-        else:
-            result_lbl_a = "\U0001f91d Draw"
+        result_lbl_a = classify_war_result(my_stars_a, opp_stars_a, my_dest_a, opp_dest_a)
         n_my_a = normalize_player_name(clan_name)
         opp_url_a = coc_clan_profile_url(opp_tag_a) if opp_tag_a else ""
         my_lineup_asc_a = _lineup_from_json_r(str(row.get('clan_lineup_json') or '[]'), ascending=True)
@@ -2026,16 +2020,7 @@ async def generate_cwlinfo_embeds(clan_tag: str, comp_mode: bool = False) -> Lis
             _r_my_dest: float = float(_db_past_row.get('clan_destruction', 0.0) or 0.0)
             _r_opp_dest: float = float(_db_past_row.get('opp_destruction', 0.0) or 0.0)
             _r_opp_url: str = coc_clan_profile_url(_r_opp_tag) if _r_opp_tag else ""
-            if _r_my_stars > _r_opp_stars:
-                _r_result_lbl = "\u2705 Win"
-            elif _r_opp_stars > _r_my_stars:
-                _r_result_lbl = "\u274c Loss"
-            elif _r_my_dest > _r_opp_dest:
-                _r_result_lbl = "\u2705 Win"
-            elif _r_opp_dest > _r_my_dest:
-                _r_result_lbl = "\u274c Loss"
-            else:
-                _r_result_lbl = "\U0001f91d Draw"
+            _r_result_lbl = classify_war_result(_r_my_stars, _r_opp_stars, _r_my_dest, _r_opp_dest)
             desc_lines.append(f"**Round {round_idx}**  \u00b7  {_r_result_lbl}  `{_r_my_stars}\u2b50 \u2013 {_r_opp_stars}\u2b50 \u00b7 {_r_my_dest:.1f}% \u2013 {_r_opp_dest:.1f}%`")
             if _r_opp_url:
                 desc_lines.append(f"vs. [\u200e{_r_opp_name}\u200e]({_r_opp_url})  \u200e`{_r_opp_tag}`")
@@ -2105,16 +2090,7 @@ async def generate_cwlinfo_embeds(clan_tag: str, comp_mode: bool = False) -> Lis
         opp_lineup = _build_cwl_lineup(opp_war_mems, team_size_r)
 
         if state_str_e == 'warended':
-            if my_stars_r > opp_stars_r:
-                result_lbl = "\u2705 Win"
-            elif opp_stars_r > my_stars_r:
-                result_lbl = "\u274c Loss"
-            elif my_dest_r > opp_dest_r:
-                result_lbl = "\u2705 Win"
-            elif opp_dest_r > my_dest_r:
-                result_lbl = "\u274c Loss"
-            else:
-                result_lbl = "\U0001f91d Draw"
+            result_lbl = classify_war_result(my_stars_r, opp_stars_r, my_dest_r, opp_dest_r)
             desc_lines.append(f"**Round {round_idx}**  \u00b7  {result_lbl}  `{my_stars_r}\u2b50 – {opp_stars_r}\u2b50 \u00b7 {my_dest_r:.1f}% – {opp_dest_r:.1f}%`")
             desc_lines.append(f"vs. [\u200e{opp_name_r}\u200e]({opp_url_r})  \u200e`{opp_tag_r}`" if opp_url_r else f"vs. \u200e{opp_name_r}\u200e  \u200e`{opp_tag_r}`")
             if my_lineup or opp_lineup:

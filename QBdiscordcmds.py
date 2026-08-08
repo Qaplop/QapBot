@@ -2355,7 +2355,7 @@ async def admin(
             finally:
                 QBcore.db_maintenance_idle_event.set()
 
-        asyncio.create_task(_run_optimize_and_reply())
+        QBcore.spawn_tracked("admin-optimize-db", _run_optimize_and_reply())
         return
 
     # Handle MEMORY_PROFILE action (bot admin only)
