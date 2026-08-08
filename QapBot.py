@@ -91,12 +91,35 @@ def _log_slow_gc(phase: str, info: dict) -> None:  # type: ignore[type-arg]
         return
     elapsed = _gc_time.perf_counter() - t0
     if elapsed >= 0.5:  # gen-0 collections are frequent and normally sub-ms; only the rare slow ones matter
-        logging.warning(
+        # INFO, not WARNING: expected/monitored background behavior (mitigated by the
+        # startup gc.freeze() + nightly re-freeze), not an actionable error on its own.
+        logging.info(
             "[GC-AUTO] Automatic gen-%d collection paused the process for %.3fs (collected=%d, uncollectable=%d)",
             gen, elapsed, info.get("collected", 0), info.get("uncollectable", 0),
         )
 
-gc.callbacks.append(_log_slow_gc)
+if not any(getattr(_cb, "__name__", None) == "_log_slow_gc" for _cb in gc.callbacks):
+    # Name-based (not identity-based) dedup guard: QBdiscordcmds.py does
+    # `from QapBot import GLOBAL_GUILD_ID, run_nightly_maintenance_routine,
+    # is_monthly_migration_due` at module level. Since this file runs as
+    # `__main__`, that import makes Python load it a SECOND time under the
+    # module name "QapBot" (sys.modules has no entry for "QapBot", only
+    # "__main__", so it doesn't recognize this as already-loaded) — re-running
+    # every top-level statement in this file a second time. The
+    # `if __name__ == "__main__":` guard at the bottom correctly stops that
+    # second execution from starting a second bot connection, but a bare
+    # `gc.callbacks.append(...)` isn't idempotent: each execution creates a new
+    # closure object, so the list ends up with two separate entries and every
+    # real GC pause gets logged twice (confirmed live in prod 2026-08-08 —
+    # every [GC-AUTO] line appeared as an exact near-duplicate pair). Checking
+    # by `__name__` instead of object identity catches the duplicate across
+    # separate executions, where identity checks (`is`/`in` on the function
+    # object) can't. The root cause (the circular import itself) is left
+    # alone — fixing that is a larger, separate change — but ANY future
+    # module-level code here that mutates shared/global state (not just
+    # simple def/class/import) needs the same kind of guard, or it will
+    # silently double up too.
+    gc.callbacks.append(_log_slow_gc)
 
 import platform
 import sys

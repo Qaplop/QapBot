@@ -802,15 +802,30 @@ async def sync_all_roles_for_guild(
                 if _ok:
                     _coc_role_refreshed_clans.add(_ctag_r)
 
+    # This bot serves multiple Discord guilds from one shared registration pool, so
+    # CACHE.user_accounts is bot-wide — most registered users belong to a *different*
+    # guild than this one. Track which of them we'd actually EXPECT to find as members
+    # here (their linked player's current_clan_tag is in a clan this guild covers) so the
+    # missing-from-cache check below compares against the right population instead of
+    # flagging the (large, expected) set of users who simply aren't in this guild at all.
+    _guild_clans: set[str] = set(config.get("member_clans", []))
+    for _fid in config.get("member_families", []):
+        _fdata = CACHE.clan_families.get(_fid, {})
+        _guild_clans.update(_fdata.get("clans", []))
+
     # Collect all Discord user IDs with registered accounts
     user_ids: List[int] = []
+    expected_member_ids: set[int] = set()
     for user_id_str, user_data in CACHE.user_accounts.items():
         if user_id_str == "UNASSIGNED" or not user_data:
             continue
         try:
-            user_ids.append(int(user_id_str))
+            _uid = int(user_id_str)
         except ValueError:
             continue
+        user_ids.append(_uid)
+        if _guild_clans and set(_get_clan_tags_for_user(user_id_str)) & _guild_clans:
+            expected_member_ids.add(_uid)
 
     logging.info(f"[ROLE-SYNC] Starting guild-wide role sync for guild {guild.name} ({guild_id}): {len(user_ids)} users")
 
@@ -837,19 +852,25 @@ async def sync_all_roles_for_guild(
             errors += 1
             logging.warning(f"[ROLE-SYNC] Error syncing roles for user {member.id} in guild {guild.name} ({guild_id}): {e}")
 
-    # A registered user missing from guild.members after chunk() was previously silently
-    # skipped — no role sync, no log line, indistinguishable from "not a member of this
-    # guild". Surface it: could be a transient cache gap (chunk() raced a member join,
-    # a Discord outage) or a genuinely stale registration (user left the guild). Not
-    # auto-resolved via fetch_member() here — that's a per-ID API call, and this set can
-    # legitimately be large/expected (most "missing" entries are just left-guild users).
-    missing_ids = registered_ids - seen_ids
+    # An EXPECTED member (registered with a player currently in a clan this guild covers)
+    # missing from guild.members after chunk() was previously silently skipped — no role
+    # sync, no log line. Surface it: could be a transient cache gap (chunk() raced a member
+    # join, a Discord outage) or a genuinely stale registration (user left the guild). Only
+    # checked against expected_member_ids, not every bot-wide registered_ids — this bot
+    # serves multiple guilds from one shared registration pool, so most registered users
+    # simply aren't members of any given single guild at all; comparing against the full
+    # registered_ids here produced a "missing" count that was almost entirely that expected
+    # cross-guild population, not a real cache-gap signal (confirmed live in prod 2026-08-08:
+    # 89-96% of a guild's registered_ids reported "missing", which was actually just other
+    # guilds' users). Not auto-resolved via fetch_member() — that's a per-ID API call.
+    missing_ids = expected_member_ids - seen_ids
     if missing_ids:
         _sample = sorted(missing_ids)[:20]
         logging.warning(
-            f"[ROLE-SYNC] Guild {guild.name} ({guild_id}): {len(missing_ids)} registered user(s) "
-            f"not in guild.members cache after chunk() — role sync skipped for them this run "
-            f"(left the guild, or a cache gap): {_sample}{'...' if len(missing_ids) > 20 else ''}"
+            f"[ROLE-SYNC] Guild {guild.name} ({guild_id}): {len(missing_ids)} user(s) registered "
+            f"to a clan this guild covers are not in guild.members cache after chunk() — role "
+            f"sync skipped for them this run (left the guild, or a cache gap): "
+            f"{_sample}{'...' if len(missing_ids) > 20 else ''}"
         )
 
     logging.info(f"[ROLE-SYNC] Guild {guild.name} ({guild_id}) role sync complete: {synced} synced, {errors} errors")

@@ -162,6 +162,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 18) Guild-coverage checks ("is this clan covered by this guild") → must expand BOTH `member_clans` AND `member_families` (family IDs → `CACHE.clan_families`), never just the flat list. See Pitfall 19.
 19) `bot.add_view()`-registered views dispatch before `CACHE`/DB finish loading → a click in that window reads empty cache AND (via `update_user_metadata`'s skeleton-create + write-through) can hard-DELETE the user's real `user_players` rows (confirmed prod data loss 2026-08-08). Three-layer fix: view `interaction_check()` gates on `QBcore.bot.fully_initialized`; `CACHE.users_loaded` blocks all user write-through pre-load; `_save_user_impl` warns on empty-players wipes. See Pitfall 20.
 20) Multi-second freezes with zero log output, followed by a burst of concurrent `[COC-API-SLOW]` lines all reporting ~the same elapsed time → that's CPython's *automatic* gen-2 GC sweep (never disabled; Pitfall 16's `gc.collect(1)` fix only scopes the bot's own *explicit* end-of-cycle call), not real API latency. Startup now registers a `[GC-AUTO]` pause logger and calls `gc.freeze()` after `CACHE.load_all()` to shrink what automatic sweeps walk. See Pitfall 21.
+21) Adding module-level code near the top of `QapBot.py` that mutates a shared collection (`list.append`, `set.add`, registering a callback) → guard it by name, not identity (`if not any(getattr(cb, "__name__", None) == "my_fn" ...)`). `QBdiscordcmds.py` imports back from `QapBot.py`, which loads the whole file a second time under the module name `"QapBot"` (separate from the `__main__` execution) — a bare `.append()` silently ends up with two entries and double-fires. `def`/`class`/`import`/plain assignment are safe; anything that appends/registers into pre-existing shared state is not. See Pitfall 22.
 
 ---
 
@@ -173,6 +174,13 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 3. **Identify data flow** (what CACHE properties are involved?)
 4. **Check environment** (dev vs prod paths if file operations)
 5. **Plan rollback** (what to revert if change fails?)
+6. **Check `../backlog.txt` for opportunistic items in the file/function you're about to touch** —
+   several entries there are deliberately-deferred fixes tagged "do this next time this code is
+   touched anyway" (e.g. "switch to `executemany()` opportunistically next time the function is
+   edited"). If your change already lands inside that file/function, fold the matching backlog
+   item into the same change and remove it from `backlog.txt`; otherwise leave it. This is how
+   those items get picked up instead of sitting there indefinitely — nobody re-reads the whole
+   backlog before every edit, but this step only requires noticing when a match applies.
 
 ### While Writing Code
 - Follow Cardinal Rules 1, 2, 5, 9 (account protection, CACHE, i18n, modal pattern)

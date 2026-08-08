@@ -610,3 +610,55 @@ objects, `aiohttp` responses) is all *post-freeze* churn, still tracked and coll
 Diagnostic tool: same as Pitfall 16 — `qapbot/scripts/log_time_gaps.py --top 300-400`, looking for
 `[COC-API-SLOW]`/`[NOTIFY-TIMING]`/`[CATEGORIZE-TIMING]` gaps that recur at *varying* positions
 across cycles (vs. a fixed line, which would point to a specific blocking call instead).
+
+---
+
+## Pitfall 22: `QapBot.py`'s top-level code runs TWICE in one process — `QBdiscordcmds.py` imports back from it
+
+Symptom (2026-08-08): every `[GC-AUTO]` log line appeared as an exact near-duplicate pair —
+identical `collected=`/`uncollectable=` values, timestamps a few milliseconds apart, durations
+differing only in the 3rd decimal. Looked at first like the automatic collector itself was
+double-firing; it wasn't — the *logger* was registered twice.
+
+Root cause: `QBdiscordcmds.py` has a module-level `from QapBot import GLOBAL_GUILD_ID,
+run_nightly_maintenance_routine, is_monthly_migration_due`. `QapBot.py` is run as `python
+QapBot.py`, so Python loads it into `sys.modules['__main__']` — there is no `sys.modules['QapBot']`
+entry. When execution reaches (directly or transitively) an import of `QBdiscordcmds`, that
+module's `from QapBot import ...` line doesn't find a `'QapBot'` key in `sys.modules`, so Python
+does NOT recognize the running script as already loaded — it opens `QapBot.py` again and executes
+**every top-level statement in the file a second time**, this time under the module name
+`"QapBot"`, completely independent of the `__main__` execution already in progress.
+
+Why this doesn't start a second bot: the actual `bot.run()` call is correctly gated behind `if
+__name__ == "__main__":` at the bottom of the file, and the second execution's `__name__` is
+`"QapBot"`, not `"__main__"`, so that block is skipped there. `@QBcore.bot.event` decorators
+(`on_ready`, `on_disconnect`, etc.) are also safe by accident: `discord.Client.event()` just does
+`setattr(bot, coro.__name__, coro)`, so re-running the decorator on the second execution simply
+overwrites the attribute with an identical redefinition — not a second registration.
+
+What ISN'T safe: any module-level statement that **mutates a shared, already-existing collection**
+instead of plain `def`/`class`/`import`/assignment-to-a-fresh-name. `gc.callbacks.append(fn)` is
+exactly that — each execution creates a *new* closure object and appends it, so `gc.callbacks` ends
+up with two separate entries that both fire on every real collection event. (`logging.basicConfig()`
+happens to be safe too, but only because it's documented to no-op if the root logger already has
+handlers — not because module-level code is inherently safe to duplicate.)
+
+Fix applied: a name-based (not identity-based) dedup guard before the `append()` — identity
+(`is`/`in` on the function object) can't catch this, since the second execution's function object
+is a different object with the same `__name__`:
+```python
+if not any(getattr(cb, "__name__", None) == "_log_slow_gc" for cb in gc.callbacks):
+    gc.callbacks.append(_log_slow_gc)
+```
+
+Not fixed (deliberately, out of scope for the immediate bug): the circular import itself.
+`GLOBAL_GUILD_ID`/`run_nightly_maintenance_routine`/`is_monthly_migration_due` would need to move
+to a neutral module (e.g. `QBcore.py` or a new small module) both files can import from, breaking
+the `QapBot.py` → `QBdiscordcmds.py` → `QapBot.py` cycle — a real fix, but a bigger one that needs
+its own review of every consumer.
+
+Rule going forward: any new module-level code added near the top of `QapBot.py` that does more than
+`def`/`class`/`import`/plain assignment (registers a callback, starts a task, opens a resource,
+appends to a shared list) needs a dedup guard exactly like the one above, or it will silently
+double up the same way. Check with `python -c "import ast; ..."` or simply grep
+`^[A-Za-z_].*\.(append|add|register)\(` at column 0 in `QapBot.py` to audit for more of these.

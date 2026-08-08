@@ -1,6 +1,7 @@
 Project Backlog, Improvement Ideas and General Remarks
 
 Immediate next steps:
+- Check the WARNINGs related to auto role system for missing users (see log file)
 - Known lower-priority follow-up (not fixed,
   admin-only/rarely invoked, no crash risk): the `/admin` CWL-group-backfill
   handler in qapbot/QBdiscocmdshelper_admin_command.py
@@ -37,3 +38,33 @@ Immediate next steps:
 - Add on_message handler for DM so that bot can reply to direct chat input from users
 - /clan management: Regular users should be able to use the viewing functions but not the action buttons
 - New Feature: Add scores for "th-level difference" and "up-hits/drops" in CW/CWL
+
+### A6. Global mutable state sprawl in QBcore — [verified, low (works today, risk grows)]
+15+ module-level flags/events (`maintenance_mode`, `db_maintenance_mode`, `maintenance_pending`,
+`optimize_db_pending`, `cycle_idle_event`, `force_cycle_event`, ...). Each is individually fine;
+collectively the implicit state machine has no single owner and every new flag multiplies
+interactions. **Fix (opportunistic)**: group into one dataclass (`BotState`) next time a new flag
+would be added — not worth a big-bang refactor on its own.
+
+### B4. `compute_roster_stats_sync` — 3 sequential aggregate queries — [verified, low]
+QBhelperfunctions.py ~3641-3723: three separate full aggregate queries over hot+history per
+invocation. Each is index-supported and correct (post-materialize-fix); merging them is possible
+but the join/GROUP BY shapes differ. **Fix**: only worth touching when the CWL Phase-3 extension
+(attack counts) lands anyway — fold the count into an existing query instead of adding a 4th.
+
+### B7. `save_user`/bulk user writes use per-row execute — [verified, low]
+db_manager.py ~4944+: per-player `INSERT` in a loop inside the transaction. Correct and atomic;
+at current maindata scale (a few hundred players total) not a bottleneck. **Fix**: switch to
+`executemany()` opportunistically next time the function is edited — don't ship a standalone
+change for this.
+
+### D5. Oversized functions (structural debt, refactor only with a reason) — [verified]
+The worst offenders, for when a feature touches them anyway:
+- `main()` QapBot.py ~579-1640 (~1060 lines, Phases 1-3 inline)
+- `admin()` QBdiscordcmds.py ~1176+ (~1200 lines incl. inline modal classes)
+- `periodic_main()` QapBot.py ~1883-2380 (~500 lines)
+- `generate_cwlinfo_embeds()` QBhelperfunctions.py ~1786-2264 (~478 lines)
+- `save_war_object()` cache_manager.py ~2255-2633 (~378 lines)
+Rule of thumb per project convention: don't refactor these standalone (huge diff, high regression
+risk, 1517-test suite has good but not perfect coverage of their branches); extract the piece you
+need when a change lands inside one.

@@ -404,7 +404,7 @@ lock makes that guarantee explicit and enforced instead of implicit: on_ready() 
 `on_ready_lock.locked()` first (cheap, non-blocking) to preserve the existing "skip duplicate,
 log and return" behavior, then wraps the actual initialization body in `async with on_ready_lock`
 so only one invocation can ever run it at a time even if that invariant changes later.
-See Pitfall A1, CODE_OPTIMIZATION_SUGGESTIONS.md.
+See changelog.txt 2026-08-08 (21).
 """
 
 _background_tasks: set[asyncio.Task[Any]] = set()

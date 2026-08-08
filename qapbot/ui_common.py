@@ -86,7 +86,7 @@ class TrackedView(discord.ui.View):
 
     Subclasses needing extra timeout/error behavior should override and call `super()`
     to keep this shared cleanup/suppression rather than re-implementing it inline.
-    See C4, CODE_OPTIMIZATION_SUGGESTIONS.md.
+    See changelog.txt 2026-08-08 (21).
     """
     message: Optional[discord.Message] = None
 

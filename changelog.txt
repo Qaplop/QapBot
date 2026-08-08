@@ -1,6 +1,88 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-08 (27)
+- Verified: A5's fix (entry 25) confirmed correct in prod — [ROLE-SYNC] "not in guild.members
+  cache" now reports 1-5 users per guild (down from 73-125), and the same specific Discord IDs
+  recur identically across all 3 cycles observed, consistent with genuine left-guild registrations
+  rather than a transient chunk() cache race. [GC-AUTO] confirmed logging at INFO (0 WARNING-level
+  occurrences). The new nightly-maintenance GC refresh (entry 22) executed successfully for the
+  first time: "collected=354991 unreachable object(s) in 4.008s, re-froze 1724213 object(s)" —
+  confirms the design reasoning (the per-cycle scoped gc.collect(1) really does leave real garbage
+  for a full sweep to eventually catch). However, [GC-AUTO] pause frequency/cost in the 2 cycles
+  immediately following the refresh did NOT show a clear improvement vs. before it (workload-
+  normalized: ~2.3s/1000 API calls before vs. ~2.7-3.8s/1000 after) — one of those cycles had ~2x
+  normal clan/API volume from a maintenance-window backlog (confounding the comparison), and the
+  sample is too small (single nightly run) to conclude either way. Needs observation across
+  several more nightly cycles before judging whether the refresh actually flattens the trend.
+- Fixed: found and fixed a real bug while investigating the above — every single [GC-AUTO] log line
+  in prod appeared as an exact near-duplicate pair (same collected= count, timestamps a few ms
+  apart). Root cause: QBdiscordcmds.py has a module-level `from QapBot import GLOBAL_GUILD_ID,
+  run_nightly_maintenance_routine, is_monthly_migration_due`. Since QapBot.py runs as `__main__`
+  (not under the module name "QapBot"), that import causes Python to load and fully re-execute
+  QapBot.py a SECOND time under the name "QapBot" — running every top-level statement (imports,
+  logging setup, the gc.callbacks.append(...) call) twice. The `if __name__ == "__main__":` guard
+  correctly stops the second execution from starting a second bot connection, and `@QBcore.bot.event`
+  decorators are safe by accident (setattr-overwrite semantics), but `gc.callbacks.append(...)`
+  isn't idempotent — each execution's closure is a distinct object, so the list ends up with two
+  entries that both fire on every real automatic collection. Fixed with a name-based (not
+  identity-based) dedup guard before the append. Root cause (the circular import) left alone —
+  a real fix needs moving those 3 names to a neutral shared module, which is a bigger, separate
+  change. Documented as Pitfall 22 in qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md and cardinal-rules
+  item 21 in .github/copilot-instructions.md, since any future module-level code near the top of
+  QapBot.py that mutates shared state (not just def/class/import) needs the same guard.
+- Verified: zero ERROR/CRITICAL/Traceback/10062 entries across the full ~26,300-line session
+  (last restart through nightly maintenance through 3 update cycles). Both post-maintenance
+  cycles completed normally; RSS memory stayed in a normal ~3.1-3.3GB range.
+
+2026-08-08 (26)
+- Removed: CODE_OPTIMIZATION_SUGGESTIONS.md (project root) — validated every item was DONE, a
+  documented false positive, or one of the 4 explicitly-opportunistic items (A6, B4, B7, D5),
+  which the user had already copied verbatim into backlog.txt. Nothing left to action, so removed
+  the report rather than leave a stale "still open?" doc sitting at the repo root. Fixed 3 dangling
+  code-comment references to the now-deleted file (QBcore.py on_ready_lock docstring, ui_common.py
+  TrackedView docstring, ui_registration.py RegistrationView.interaction_check docstring) — all
+  now point to "changelog.txt 2026-08-08 (21)" instead, per Rule 14 (don't leave a doc/comment
+  referencing a file the change just removed).
+- Added: .github/copilot-instructions.md "Before Writing Code" step 6 — check backlog.txt for
+  opportunistic-fix items scoped to the file/function about to be touched, and fold matching ones
+  into the same change (removing them from backlog.txt) instead of leaving them to be forgotten.
+  This is how the 4 items just moved into backlog.txt (and any future ones added the same way) are
+  meant to get picked up going forward — noticed opportunistically while already in the area,
+  rather than requiring anyone to re-read the whole backlog before every edit.
+
+2026-08-08 (25)
+- Fixed: A5's [ROLE-SYNC] "not in guild.members cache" warning (changelog entry 24) was comparing
+  against the wrong population. Confirmed live in prod: guilds reported 73-125 (56-96%) of their
+  "registered users" missing from guild.members, which looked alarming but wasn't a bug — this
+  bot serves 4 Discord guilds from one shared CACHE.user_accounts pool, and the warning compared
+  each guild's member list against ALL bot-wide registered users instead of only the ones actually
+  expected to be members of that specific guild (i.e. whose linked player's current_clan_tag is
+  in a clan that guild covers). Most registered users simply belong to a different one of the 4
+  guilds — expected, not a cache gap. Fixed qapbot/guild_role_manager.py
+  sync_all_roles_for_guild(): now cross-references each user's clan tags (reusing the existing
+  _get_clan_tags_for_user() helper) against the guild's configured member_clans/member_families to
+  build expected_member_ids, and only warns about THAT (much smaller, meaningful) set being
+  missing from guild.members. registered_ids (the full bot-wide set) is still used for the
+  main per-member lookup loop, which was already correct — only the missing-check's comparison
+  set was wrong.
+- Changed: [GC-AUTO] automatic-collection-pause log lines (changelog entry 20) downgraded from
+  WARNING to INFO — expected/monitored background behavior now that startup gc.freeze() + the
+  nightly re-freeze (entry 22) mitigate it, not an actionable error on its own.
+- Verified: read through the full startup + two update-cycle session in qapbot_PROD.log following
+  the 18:44 restart that picked up entries (24)'s fixes. Zero ERROR/CRITICAL/Traceback/10062
+  entries in ~11,400 log lines. Both cycles completed normally (133.0s, 100.3s). CYCLE-CLEANUP's
+  scoped gc.collect(1) confirmed fast (0.002s-0.045s, vs. the multi-second cost of an unscoped
+  full collect) — the original Pitfall-16 fix is holding up correctly under live CWL-season load.
+  No A4 retry-queue activity (no DB write failures this session). GC-AUTO pauses still recur
+  several times per cycle (0.5-3.5s each) as expected — the nightly GC-refresh mitigation (entry
+  22) hasn't been exercised yet in prod (the one nightly maintenance run today was at 05:04, hours
+  before that fix was deployed); its effect won't be observable until tonight's 03:00 UTC run or a
+  manually-triggered /admin Execute Nightly Maintenance. RSS memory oscillates ~3-4GB across the
+  day with drops after each restart — a normal-looking fluctuating pattern given today's frequent
+  test restarts, not clearly a leak, but worth continued observation once the nightly refresh
+  starts actually running.
+
 2026-08-08 (24)
 - Fixed/Added: implemented the remaining items from CODE_OPTIMIZATION_SUGGESTIONS.md that weren't
   explicitly marked "opportunistic only, don't do this standalone" in their own Fix note (skipped

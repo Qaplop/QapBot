@@ -321,8 +321,7 @@ class RegistrationView(TrackedView):
         Also runs update_user_metadata_from_interaction() once here (after both gates
         pass) instead of each button handler repeating the same call first thing — this
         guarantees it can never run pre-load (the fully_initialized gate above already
-        blocks that path) and removes 4 identical copies. See D4,
-        CODE_OPTIMIZATION_SUGGESTIONS.md.
+        blocks that path) and removes 4 identical copies. See changelog.txt 2026-08-08 (21).
         """
         import QBcore as _qbcore
         if not getattr(_qbcore.bot, 'fully_initialized', False):
