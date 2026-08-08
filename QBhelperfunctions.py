@@ -94,6 +94,25 @@ _LEAGUE_ICON_MAP: Dict[str, str] = {
     "Champion League I":   "Icon_HV_CWL_Champion_1.png",
 }
 
+def coc_deep_link(action: str, tag: str) -> str:
+    """Build a CoC in-game deep link (https://link.clashofclans.com/...) for the given action/tag.
+
+    Centralizes the URL format so every call site stays consistent (previously built inline
+    in several places with a subtly inconsistent '#' encoding).
+    """
+    return f"https://link.clashofclans.com/en?action={action}&tag=%23{tag.lstrip('#')}"
+
+
+def coc_clan_profile_url(clan_tag: str) -> str:
+    """Deep link that opens a clan's profile in the CoC app."""
+    return coc_deep_link("OpenClanProfile", clan_tag)
+
+
+def coc_player_profile_url(player_tag: str) -> str:
+    """Deep link that opens a player's profile in the CoC app."""
+    return coc_deep_link("OpenPlayerProfile", player_tag)
+
+
 def calculate_content_hash(content: str) -> str:
     """
     Calculate a SHA-256 hash of normalized leaderboard content for change detection.
@@ -1073,7 +1092,7 @@ def _generate_cwlinfo_archive_embeds(clan_tag: str) -> List[discord.Embed]:
     my_league: str = _resolve_war_league(clan_tag)
     league_hdr: str = f" \u00b7 {my_league}" if my_league else ""
 
-    my_clan_url: str = f"https://link.clashofclans.com/en?action=OpenClanProfile&tag=%23{clan_tag.lstrip('#')}"
+    my_clan_url: str = coc_clan_profile_url(clan_tag)
     desc_lines: List[str] = [
         f"CWL Season **{latest_season}**{league_hdr}\n"
     ]
@@ -1098,10 +1117,7 @@ def _generate_cwlinfo_archive_embeds(clan_tag: str) -> List[discord.Embed]:
         else:
             result_lbl_a = "\U0001f91d Draw"
         n_my_a = normalize_player_name(clan_name)
-        opp_url_a = (
-            f"https://link.clashofclans.com/en?action=OpenClanProfile&tag=%23{opp_tag_a.lstrip('#')}"
-            if opp_tag_a else ""
-        )
+        opp_url_a = coc_clan_profile_url(opp_tag_a) if opp_tag_a else ""
         my_lineup_asc_a = _lineup_from_json_r(str(row.get('clan_lineup_json') or '[]'), ascending=True)
         opp_lineup_a = _lineup_from_json_r(str(row.get('opp_lineup_json') or '[]'), ascending=False)
 
@@ -1806,7 +1822,7 @@ async def generate_cwlinfo_embeds(clan_tag: str, comp_mode: bool = False) -> Lis
         return _generate_cwlinfo_archive_embeds(clan_tag)
 
     clan_name: str = CACHE.get_clan_name(clan_tag, clan_tag) or clan_tag
-    my_clan_url: str = f"https://link.clashofclans.com/en?action=OpenClanProfile&tag=%23{clan_tag.lstrip('#')}"
+    my_clan_url: str = coc_clan_profile_url(clan_tag)
     season: str = str(getattr(league_group, 'season', '?') or '?')
     my_league: str = _resolve_war_league(clan_tag)
     league_hdr: str = f" \u00b7 {my_league}" if my_league else ""
@@ -1951,10 +1967,7 @@ async def generate_cwlinfo_embeds(clan_tag: str, comp_mode: bool = False) -> Lis
                 pred_opp_name: str = normalize_player_name(
                     getattr(pred_opp_obj, 'name', pred_opp_tag) or pred_opp_tag
                 )
-                pred_opp_url: str = (
-                    f"https://link.clashofclans.com/en?action=OpenClanProfile&tag=%23{pred_opp_tag.lstrip('#')}"
-                    if pred_opp_tag else ""
-                )
+                pred_opp_url: str = coc_clan_profile_url(pred_opp_tag) if pred_opp_tag else ""
                 pred_apm: int = 1  # CWL always 1 attack per member
                 pred_n: int = real_team_size
                 # Use last known real roster if available — best predictor for future rounds.
@@ -2012,7 +2025,7 @@ async def generate_cwlinfo_embeds(clan_tag: str, comp_mode: bool = False) -> Lis
             _r_opp_name: str = normalize_player_name(str(_db_past_row.get('opponent_name', 'Opponent') or 'Opponent'))
             _r_my_dest: float = float(_db_past_row.get('clan_destruction', 0.0) or 0.0)
             _r_opp_dest: float = float(_db_past_row.get('opp_destruction', 0.0) or 0.0)
-            _r_opp_url: str = f"https://link.clashofclans.com/en?action=OpenClanProfile&tag=%23{_r_opp_tag.lstrip('#')}" if _r_opp_tag else ""
+            _r_opp_url: str = coc_clan_profile_url(_r_opp_tag) if _r_opp_tag else ""
             if _r_my_stars > _r_opp_stars:
                 _r_result_lbl = "\u2705 Win"
             elif _r_opp_stars > _r_my_stars:
@@ -2085,7 +2098,7 @@ async def generate_cwlinfo_embeds(clan_tag: str, comp_mode: bool = False) -> Lis
         my_war_mems: List[Any] = list(getattr(our_war_my_side, 'members', []) or [])
         opp_war_mems: List[Any] = list(getattr(our_war_opp_side, 'members', []) or [])
         my_name_disp: str = normalize_player_name(clan_name)
-        opp_url_r: str = f"https://link.clashofclans.com/en?action=OpenClanProfile&tag=%23{opp_tag_r.lstrip('#')}" if opp_tag_r else ""
+        opp_url_r: str = coc_clan_profile_url(opp_tag_r) if opp_tag_r else ""
         my_dest_r: float = float(getattr(our_war_my_side, 'destruction', 0.0) or 0.0)
         opp_dest_r: float = float(getattr(our_war_opp_side, 'destruction', 0.0) or 0.0)
         my_lineup = _build_cwl_lineup(my_war_mems, team_size_r, ascending=True)
@@ -3492,10 +3505,10 @@ async def generate_cwl_group_analysis_embeds(clan_tag: str) -> List[discord.Embe
     group_summary = f"{n_group_clans} clans · {wars_with_data} wars · Season **{season}**{_data_note}"
 
     def _player_url(ptag: str) -> str:
-        return f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag=%23{ptag.lstrip('#')}"
+        return coc_player_profile_url(ptag)
 
     def _clan_url(ctag: str) -> str:
-        return f"https://link.clashofclans.com/en?action=OpenClanProfile&tag=%23{ctag.lstrip('#')}"
+        return coc_clan_profile_url(ctag)
 
     def _rank_label(rank: int) -> str:
         #c1 = '\u3000'  # Ideographic Space (full-width space) — 1.665
@@ -3878,7 +3891,7 @@ async def build_cwl_opponent_embeds(
     # ── Shared metadata ───────────────────────────────────────────────────────
     opp_display  = normalize_player_name(opp_clan_name)
     my_display   = normalize_player_name(my_clan_name)
-    opp_url      = f"https://link.clashofclans.com/en?action=OpenClanProfile&tag=%23{opp_clan_tag.lstrip('#')}"
+    opp_url      = coc_clan_profile_url(opp_clan_tag)
     clan_header  = (
         f"[{opp_display}]({opp_url})  ({opp_clan_tag})"
         f" — {len(roster)} players"

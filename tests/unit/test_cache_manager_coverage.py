@@ -43,6 +43,7 @@ def _cm_with_db() -> CacheManager:
     cm.db_manager.save_clan = AsyncMock()
     cm.db_manager.bulk_update_clan_subscription_statuses = AsyncMock()
     cm.db_manager.bulk_update_clan_track_war_updates = AsyncMock()
+    cm.users_loaded = True  # tests exercise post-startup behavior; pre-load gate tested in test_cache_manager.py
     return cm
 
 

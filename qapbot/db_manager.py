@@ -66,6 +66,46 @@ def derive_history_db_path(db_path: str) -> str:
     return f"{base}_history{ext or '.db'}"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Registry of every table/column that references clans.clan_tag — the single
+# source of truth iterated by is_clan_tag_referenced() (orphan-purge guard).
+#
+# ⚠️ Any NEW table with a `REFERENCES clans` FK (or a non-FK column that
+# conceptually depends on a clan being real) MUST be added here, or the orphan
+# purge (delete_clan_if_unreferenced) can hard-delete a clans row that table
+# still needs — with FK CASCADE, silently wiping its rows.
+# tests/unit/test_clan_tag_reference_registry.py asserts every DDL
+# `REFERENCES clans` clause has a matching entry, turning that silent
+# data-loss bug into a test failure.
+#
+# Format: (schema, table, column, extra_where).
+# extra_where handles deliberately-overloaded columns: leaderboard_messages
+# stores clan tags, family tags, AND (mode='whois_player') player tags in the
+# same column — a whois_player row matching a tag is NOT evidence of a real
+# clan and must not "protect" the very bogus placeholder rows the purge
+# targets (see qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md Pitfall 17). Any
+# future overloaded column needs its discriminator filtered here the same way.
+CLAN_TAG_REFERENCING_TABLES: Tuple[Tuple[str, str, str, str], ...] = (
+    # FK-enforced (REFERENCES clans in the DDL):
+    ("main", "clan_family_members", "clan_tag", ""),
+    ("main", "user_players", "current_clan_tag", ""),
+    ("main", "guild_member_clans", "clan_tag", ""),
+    ("main", "guild_welcome_clans", "clan_tag", ""),
+    # Non-FK columns that conceptually depend on a real clan:
+    ("main", "guild_clan_roles", "clan_tag", ""),
+    ("main", "subscriptions", "clan_tag", ""),  # also stores family tags — matching a clan tag still counts
+    ("main", "leaderboard_messages", "clan_tag", "AND mode != 'whois_player'"),
+    ("main", "guild_config", "welcome_clan_tag", ""),  # legacy single-clan welcome config, still read for backward-compat
+    # Historical time-series data (hot + history schemas):
+    ("main", "war_summary", "clan_tag", ""),
+    ("main", "war_attacks", "clan_tag", ""),
+    ("main", "cwl_league_groups", "clan_tag", ""),
+    ("history", "war_summary", "clan_tag", ""),
+    ("history", "war_attacks", "clan_tag", ""),
+    ("history", "cwl_league_groups", "clan_tag", ""),
+)
+
+
 def _create_history_schema_sync(conn: Any, build_expensive_indexes: bool = True) -> None:
     """Create the 4 history.* time-series tables on a plain ``sqlite3`` connection (idempotent).
 
@@ -4070,12 +4110,14 @@ class WarHistoryDB:
         """
         Check whether *clan_tag* is still referenced anywhere else in the database.
 
-        Covers both FK-enforced tables (clan_family_members, user_players,
-        guild_member_clans) and non-FK tag-storage tables that conceptually
-        depend on a clan being real (guild_clan_roles, subscriptions,
-        leaderboard_messages — excluding mode='whois_player' rows, see below),
-        plus historical war data in BOTH the hot ('main') and 'history'
-        attached schemas.
+        Iterates the module-level CLAN_TAG_REFERENCING_TABLES registry — the
+        single source of truth covering FK-enforced tables, non-FK tag-storage
+        tables that conceptually depend on a clan being real (with per-table
+        discriminator filters for overloaded columns like
+        leaderboard_messages.clan_tag), and historical war/CWL data in BOTH
+        the hot ('main') and 'history' attached schemas. New clans-referencing
+        tables are added to the registry, not here (enforced by
+        tests/unit/test_clan_tag_reference_registry.py).
 
         Used by `delete_clan_if_unreferenced()` (self-healing cleanup) to make
         sure a clan row is only hard-deleted when nothing else in the DB
@@ -4090,41 +4132,14 @@ class WarHistoryDB:
         """
         await self._ensure_connection()
 
-        # Simple single-schema checks (constants only — no injection risk)
-        for table, column in (
-            ("clan_family_members", "clan_tag"),
-            ("user_players", "current_clan_tag"),
-            ("guild_member_clans", "clan_tag"),
-            ("guild_clan_roles", "clan_tag"),
-            ("subscriptions", "clan_tag"),
-        ):
+        # Registry entries are constants only — no injection risk.
+        for schema, table, column, extra_where in CLAN_TAG_REFERENCING_TABLES:
             cursor = await self._conn.execute(
-                f"SELECT 1 FROM {table} WHERE {column} = ? LIMIT 1", (clan_tag,)
+                f"SELECT 1 FROM {schema}.{table} WHERE {column} = ? {extra_where} LIMIT 1",
+                (clan_tag,)
             )
             if await cursor.fetchone():
                 return True
-
-        # leaderboard_messages.clan_tag also stores PLAYER tags for
-        # mode='whois_player' rows (that's the exact bug this cleanup targets —
-        # a player tag mistakenly inserted into `clans`). A whois_player row
-        # matching this tag is therefore NOT evidence of a real clan and must
-        # be excluded here, otherwise every bogus clan row would be "protected"
-        # forever by the very whois_player report that caused it to exist.
-        cursor = await self._conn.execute(
-            "SELECT 1 FROM leaderboard_messages WHERE clan_tag = ? AND mode != 'whois_player' LIMIT 1",
-            (clan_tag,)
-        )
-        if await cursor.fetchone():
-            return True
-
-        # Historical war data — check both hot ('main') and 'history' schemas
-        for schema in ("main", "history"):
-            for table in ("war_summary", "war_attacks"):
-                cursor = await self._conn.execute(
-                    f"SELECT 1 FROM {schema}.{table} WHERE clan_tag = ? LIMIT 1", (clan_tag,)
-                )
-                if await cursor.fetchone():
-                    return True
 
         return False
 
@@ -4906,6 +4921,23 @@ class WarHistoryDB:
             ))
             
             # Delete existing players
+            # Forensic guard: this DELETE+reinsert replaces the user's entire players
+            # list with whatever the caller passed. A shrink to zero is legitimate only
+            # when deliberately unlinking the last account — log it loudly so an
+            # accidental cache-blind wipe (see CacheManager.users_loaded) is visible
+            # in the log the moment it happens instead of weeks later.
+            if not user_data.get("players"):
+                _existing_cursor = await self._conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM user_players WHERE discord_id = ?", (discord_id,)
+                )
+                _existing_row = await _existing_cursor.fetchone()
+                _existing_count = int(_existing_row["cnt"]) if _existing_row else 0
+                if _existing_count > 0:
+                    logging.warning(
+                        f"[DB-WRITE] save_user({discord_id}) is replacing {_existing_count} existing "
+                        f"user_players row(s) with an EMPTY players list — legitimate only for an "
+                        f"explicit unlink of the last account"
+                    )
             await self._conn.execute("DELETE FROM user_players WHERE discord_id = ?", (discord_id,))
 
             # Insert players

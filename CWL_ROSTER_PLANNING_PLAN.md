@@ -1,0 +1,333 @@
+# CWL Roster Planning — Implementation Plan
+
+## Context
+
+QapBot is a multi-clan-family CoC Discord bot. Clan leadership currently plans each CWL season's roster manually outside the bot — deciding which member-clans participate, collecting player sign-ups, deciding who plays in which clan (by skill/league tier), and telling everyone when/where to switch, all by hand in chat. The project owner wants the bot to own this whole workflow end-to-end: pick participating clans + start time → carry over last season's roster as a template with DM confirm/opt-out buttons → let members self-register with a league-tier preference → auto-suggest a player→clan assignment based on existing skill/reliability stats → give leadership an editable management screen → send a final DM blast with date/time/join-link once everything is locked in.
+
+No schema or code for this exists today — it's a genuinely new subsystem. Research confirmed strong precedents to reuse (`MemberClansConfigurationView`, `ClanManagementView`, `get_cwl_roster_sync`, the reliability/skill formulas from `/whois`) but also surfaced one real gap: nothing in the codebase registers persistent Discord views (`bot.add_view()`/`add_dynamic_items()` appears nowhere), which matters because DM buttons must survive bot restarts without re-spamming users.
+
+Twelve design decisions were confirmed with the project owner and are baked into this plan:
+- **Silence after the template DM = not confirmed.** A carried-over roster row stays `pending` until the member responds (click or `/cwl signup`); the auto-assignment engine only ever considers `confirmed` signups.
+- **League-tier preference is a fixed dropdown** of the real CoC league ladder (plus "no preference"), not free text — keeps it typo-proof and directly comparable to clans' target tiers.
+- **CWL start time is optional at event creation**, fillable/editable later; it only becomes required before the Phase 5 DM blast can fire.
+- **Kicking a player from a clan's roster only unassigns them** (they stay "confirmed" and can be placed elsewhere); cancelling their sign-up entirely is a separate, explicit action.
+- **Members may sign up more than one linked account** for the same season (e.g. a main for the top clan, an alt for a lower tier) — no one-account-per-person restriction.
+- **Data retention is configurable per guild**: a `cwl_retention_months` setting where `0` = keep CWL planning history indefinitely (the default), and any value `> 0` auto-deletes completed/cancelled events older than that many months.
+- **Personal CWL status/preferences get a dedicated anchored message**, separate from the account-registration message — the registration message is about account identity (linking/verifying), CWL participation is a distinct, growing concern that deserves its own home (mirrors the same channel_id/message_id/repost pattern already used for registration).
+- **Permanent CWL opt-out and preferred-league default are per CoC account** (stored on `user_players`, not `users`), since a member with multiple linked accounts may want different settings per account (e.g. opt out an inactive alt while their main still gets drafted normally) — consistent with league preference already needing to be per-account.
+- **A bulk "apply to all my accounts" convenience action exists** for opt-out, so a member with several accounts isn't forced to toggle each one individually when they really do want a blanket opt-out — a UI affordance, not a schema change.
+- **Permanent opt-out only suppresses the template-copy DM step** (Phase 2's "carry over last season, confirm/decline" prompt) for that account; it never blocks an explicit `/cwl signup` for that account — current explicit intent always overrides a stale "don't ask me" default.
+- **All admin-facing CWL functionality lives inside the existing `/clan management` command**, not as standalone `/cwl setup`/`/cwl manage` slash commands. Confirmed by inspecting `ClanManagementView` (`qapbot/ui_clan_management.py:270`): mode switching is a `discord.ui.Select` dropdown inside the view (`_add_mode_select()`, line 421) dispatched by an if/elif chain keyed by a `mode` string (`"config"`, `"roles"`, `"families"`, `"registrations"`, `"notifications"`) — "Manage Registrations" is literally `mode="registrations"` on this same view, not a separate view class. Two new mode values are added to this same dispatch: `"cwl_settings"` (guild-level preferences, rarely touched) and `"cwl_management"` (the season-by-season operational screen). Only the member-facing self-service commands (`/cwl signup`, `/cwl withdraw`) remain as standalone slash commands under `cwl_group`, mirroring how e.g. `/subscribe` stands alone today.
+- **Participating-clan configuration for a new season defaults to a carry-over of the previous season's `cwl_event_clans`** (clan_tag, target_league_rank, roster_size, tier_order all copied), shown as the pre-selected/toggled working state the moment the admin opens the "Configure Participating Clans" sub-screen — not a separate explicit "copy" click — matching the existing toggle-button UX already used by `MemberClansConfigurationView`. A clan newly added this season (no prior-season row to carry over) falls back to inferring its `target_league_rank` from that clan's most recent `cwl_league_groups.league_rank`, per the schema comment.
+- **"Start Enrollment" is a single, explicitly-confirmed admin action** that merges three previously-separate steps into one: transitioning `cwl_events.status: draft → signup_open`, running the template-copy that seeds `cwl_signups` from last season's roster, and sending the confirm/opt-out DM blast — because from the admin's perspective these are one decision ("kick off sign-ups now"), not three.
+- **Admin CWL functionality has two entry points sharing one implementation.** Beyond the `cwl_settings`/`cwl_management` modes inside `/clan management`, there's also a dedicated, permanently-anchored **CWL Management Hub** message (own configurable channel, own tracked message, reposted like the registration message) — because season prep is a recurring, multi-day workflow that benefits from being persistently visible, not just reachable via a command + dropdown, exactly like registration already is. The embed-building and button-adding logic for both `cwl_settings` and `cwl_management` content is written **once** and called from both shells (the `ClanManagementView` mode dispatch and the standalone Hub view) — never duplicated.
+- **The CWL Management Hub's channel is configured in the same `cwl_settings` screen** as the player-facing Personal CWL Hub's channel — one settings surface (reachable via either entry point, since `cwl_settings` is itself one of the two shared modes) with two independent channel slots.
+
+The plan below ships in 5 independently testable phases, each building on the last, using the discord.py 2.7.1 `DynamicItem` API (confirmed available) for the restart-safe DM buttons.
+
+---
+
+## Data Model (new tables, hot DB only)
+
+Add to `qapbot/db_manager.py`'s existing `CREATE TABLE IF NOT EXISTS` schema-creation block (same method that creates `clans`/`clan_families`/`guild_member_clans`, ~line 1538 area), so tables are created idempotently on `initialize()` like everything else. **Hot DB only** — no history-DB mirroring (per `qapbot/docs/DATABASE_ARCHITECTURE.md`, only `war_attacks`/`war_summary`/`cwl_league_groups`/`cwl_league_rounds` get mirrored). This is short-lived per-season operational data with a configurable retention policy (see Cross-Cutting Work below), so no history-split is needed even for long-retained guilds — deletion, not archival, is the mechanism.
+
+### `cwl_events` — one row per guild × season planning campaign
+```sql
+CREATE TABLE IF NOT EXISTS cwl_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id              TEXT    NOT NULL,
+    cwl_season            TEXT    NOT NULL,   -- normalize_cwl_season() output
+    status                TEXT    NOT NULL DEFAULT 'draft',
+                          -- draft -> signup_open -> finalized -> announced (+ cancelled)
+                          -- (an earlier draft had an 'assigning' status between signup_open and
+                          --  finalized; dropped — no code path ever set it: Phase 4's suggestion
+                          --  runs happen while 'signup_open' and Finalize goes straight to 'finalized')
+    cwl_start_at          TEXT,               -- ISO-8601 UTC; NULL allowed until Phase 5 requires it
+    signup_deadline_at    TEXT,
+    template_season       TEXT,               -- source season copied as template, NULL if none used
+    created_by_discord_id TEXT    NOT NULL,
+    created_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+                          -- ⚠️ SQLite DEFAULT applies at INSERT only; every status-transition
+                          -- write MUST set updated_at = datetime('now') explicitly — the
+                          -- retention purge (Cross-Cutting) keys off this column.
+    FOREIGN KEY (guild_id) REFERENCES guild_config(guild_id) ON DELETE CASCADE,
+    UNIQUE (guild_id, cwl_season)
+);
+CREATE INDEX IF NOT EXISTS idx_cwl_events_guild_status ON cwl_events(guild_id, status);
+```
+
+### `cwl_event_clans` — which member-clans participate + their tier/roster size
+```sql
+CREATE TABLE IF NOT EXISTS cwl_event_clans (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id            INTEGER NOT NULL,
+    clan_tag            TEXT    NOT NULL,
+    target_league_rank  TEXT,               -- e.g. 'Champion League III'; NULL = infer from last season's cwl_league_groups.league_rank
+    roster_size         INTEGER NOT NULL DEFAULT 15,
+    tier_order           INTEGER NOT NULL DEFAULT 0,  -- 0 = highest tier; drives assignment priority
+    created_at          TEXT    NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (event_id) REFERENCES cwl_events(id) ON DELETE CASCADE,
+    FOREIGN KEY (clan_tag) REFERENCES clans(clan_tag) ON DELETE CASCADE,
+    UNIQUE (event_id, clan_tag)
+);
+CREATE INDEX IF NOT EXISTS idx_cwl_event_clans_event ON cwl_event_clans(event_id);
+```
+
+### `cwl_signups` — one row per player per event
+```sql
+CREATE TABLE IF NOT EXISTS cwl_signups (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id              INTEGER NOT NULL,
+    player_tag            TEXT    NOT NULL,
+    player_name           TEXT,               -- display snapshot only
+    discord_id            TEXT,               -- NULL if leadership added an unlinked account manually
+    preferred_league_rank TEXT,               -- from the fixed-dropdown sign-up mask; NULL = no preference
+    source                TEXT    NOT NULL,   -- template_confirm | template_optout | self_signup | admin_added
+    status                TEXT    NOT NULL DEFAULT 'pending',
+                          -- pending | confirmed | declined | withdrawn
+    responded_at          TEXT,
+    created_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (event_id) REFERENCES cwl_events(id) ON DELETE CASCADE,
+    UNIQUE (event_id, player_tag)
+);
+CREATE INDEX IF NOT EXISTS idx_cwl_signups_event ON cwl_signups(event_id);
+CREATE INDEX IF NOT EXISTS idx_cwl_signups_discord ON cwl_signups(discord_id);
+```
+Template rows are inserted as `source='template_confirm' candidate` with `status='pending'` (per the confirmed silence-default decision) — they only become `confirmed`/`declined` via an actual response. Declined rows are kept (not deleted) for audit/history.
+
+### `cwl_assignments` — the actual/suggested player→clan mapping
+```sql
+CREATE TABLE IF NOT EXISTS cwl_assignments (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id              INTEGER NOT NULL,
+    player_tag            TEXT    NOT NULL,
+    assigned_clan_tag     TEXT    NOT NULL,
+    suggested_clan_tag    TEXT,               -- original algorithm output, kept even after override (for diff display)
+    assignment_source     TEXT    NOT NULL DEFAULT 'suggested',  -- suggested | admin_override
+    score                 REAL,
+    score_breakdown_json  TEXT,               -- {"skill":.., "reliability":.., "data_confidence":.., "preference_override":bool}
+    locked                BOOLEAN NOT NULL DEFAULT 0,  -- admin pin: re-suggesting won't move this player
+    notified              BOOLEAN NOT NULL DEFAULT 0,  -- Phase 5 blast sent for this row
+    updated_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (event_id) REFERENCES cwl_events(id) ON DELETE CASCADE,
+    FOREIGN KEY (assigned_clan_tag) REFERENCES clans(clan_tag) ON DELETE CASCADE,
+    UNIQUE (event_id, player_tag)
+);
+CREATE INDEX IF NOT EXISTS idx_cwl_assignments_event ON cwl_assignments(event_id);
+CREATE INDEX IF NOT EXISTS idx_cwl_assignments_clan ON cwl_assignments(event_id, assigned_clan_tag);
+```
+All 4 tables cascade-delete from `cwl_events` (matches the `clan_family_members` `ON DELETE CASCADE` convention). FK enforcement is real: `PRAGMA foreign_keys=ON` is set on every connection (db_manager.py lines 480/1064/1177), so cascades actually fire.
+
+**⚠️ Required companion change — clan-orphan purge**: `cwl_event_clans` and `cwl_assignments` introduce new `FOREIGN KEY ... REFERENCES clans(clan_tag)` references. Add both to the `CLAN_TAG_REFERENCING_TABLES` registry in db_manager.py (the module-level constant `is_clan_tag_referenced()` iterates since 2026-08-08; `tests/unit/test_clan_tag_reference_registry.py` will fail until this is done). Without this, a clan referenced only by CWL planning data would be judged unreferenced, hard-deleted from `clans`, and the FK cascade would silently wipe its `cwl_event_clans`/`cwl_assignments` rows mid-season.
+
+### Extensions to existing tables (persistent, non-event-scoped preferences)
+
+Distinct from the 4 new event-scoped tables above: `user_players` gains two columns holding a member's **standing default preferences**, independent of any specific `cwl_events` row:
+
+```sql
+ALTER TABLE user_players ADD COLUMN cwl_permanent_optout INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE user_players ADD COLUMN cwl_default_preferred_league_rank TEXT;
+```
+
+- `cwl_permanent_optout` — per CoC account (per row, i.e. per `player_tag`), not per Discord user. When `1`, Phase 2's template-copy step skips creating a `cwl_signups` row (and skips the confirm/decline DM) for that account entirely. Does **not** block that account from an explicit `/cwl signup` — explicit action always overrides this default.
+- `cwl_default_preferred_league_rank` — pre-fills `cwl_signups.preferred_league_rank` when this account is added to an event (via template copy or self-signup), from the same fixed CoC league-tier list used everywhere else in this feature. The member can still pick something different per-event; this is only the starting default.
+
+**Migration mechanics note** (corrected against the actual codebase convention): the repo deliberately carries **no** standing ALTER TABLE migration code — all one-time migrations were removed once dev+prod completed them (changelog 2026-06: "Removed all one-time migration code from db_manager.py startup routines"; schema is pure `CREATE TABLE IF NOT EXISTS` with all current columns baked in). Follow the same lifecycle here:
+1. **Bake the new columns into the `CREATE TABLE IF NOT EXISTS user_players` / `guild_config` definitions** in `_create_maindata_schema()` (db_manager.py:1531) — covers fresh installs.
+2. **Ship a temporary idempotent ALTER TABLE block for existing DBs** — check-first via `PRAGMA table_info(...)` (SQLite has no `ADD COLUMN IF NOT EXISTS`; there is currently zero `PRAGMA table_info` usage in the repo, so this is new but trivial — the historical `_guild_config_migrations` pattern used try/except-duplicate-column, either is acceptable).
+3. **Remove the ALTER block** once dev and prod are both migrated, per the established convention.
+
+Cardinal Rule 13 reminder applies: any reader of these tables must use named column access (`row["cwl_permanent_optout"]`), never positional.
+
+`guild_config` gains **two** channel/message-tracking triplets, mirroring the existing `registration_channel_id`/`registration_message_id`/`registration_message_enabled` fields exactly — one for the player-facing Personal CWL Hub (Phase 2), one for the admin-facing CWL Management Hub (Phase 1, see below):
+
+```sql
+ALTER TABLE guild_config ADD COLUMN cwl_hub_channel_id TEXT;
+ALTER TABLE guild_config ADD COLUMN cwl_hub_message_id TEXT;
+ALTER TABLE guild_config ADD COLUMN cwl_hub_message_enabled INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE guild_config ADD COLUMN cwl_management_channel_id TEXT;
+ALTER TABLE guild_config ADD COLUMN cwl_management_message_id TEXT;
+ALTER TABLE guild_config ADD COLUMN cwl_management_message_enabled INTEGER NOT NULL DEFAULT 0;
+```
+(Same migration mechanics as above.)
+
+**⚠️ guild_config columns are not free-standing** — verified against the code: guild config flows through an explicit column pipeline, and a new column that isn't added at **every** stage silently never persists or loads:
+1. `_save_guild_config_impl()`'s `INSERT ... ON CONFLICT(guild_id) DO UPDATE SET` — every column is named explicitly (db_manager.py ~5115+).
+2. `get_guild_config()`'s row→dict mapping (db_manager.py ~5030).
+3. The startup load into `CACHE.server_config` (cache_manager.py ~2021).
+
+**Runtime access pattern (Cardinal Rule 2)**: all reads/writes of these guild-level settings go through `CACHE.server_config[guild_id][key]` + `await CACHE.persist_server_config(guild_id)` — exactly like every existing toggle (reference implementation: `_on_toggle_registration`, ui_clan_management.py:2122). **No bespoke per-column db_manager setters** (`set_cwl_hub_message_sync()` etc. from earlier drafts are dropped throughout this plan) — that would create a second write path bypassing CACHE and diverge from how `registration_message_id` is already tracked.
+
+---
+
+## Phase 1 — CWL Settings & Season Setup (inside `/clan management` AND the CWL Management Hub)
+
+**Ships:** the guild-preferences and season-setup screens, reachable through **two entry points that share one implementation**: (a) two new modes on the existing `ClanManagementView` (`"cwl_settings"`, `"cwl_management"`), and (b) a new dedicated, permanently-anchored **CWL Management Hub** message showing the same two screens. No player-facing behavior yet. Both modes/screens are guild-scoped, not clan-scoped (an event spans multiple clans).
+
+### Shared content layer (used by both entry points)
+To honor "written once, shown in two places," the actual screen-building logic is **not** methods on `ClanManagementView` — it's free functions/helpers in `qapbot/QBdiscocmdshelper_cwl.py` and `qapbot/ui_cwl_roster.py` that both shells call into:
+- `_format_clan_management_cwl_settings(guild)` / `_format_clan_management_cwl_management(guild)` (embed builders, `QBdiscocmdshelper_cwl.py`) — called from `format_clan_management_message()`'s dispatch for the `/clan management` path, and directly from the Hub view's own render step for the anchored-message path.
+- `add_cwl_settings_components(view, guild_id)` / `add_cwl_management_components(view, guild_id)` (button-row builders, `ui_cwl_roster.py`) — take the *view instance* being built (either a `ClanManagementView` or the new `CwlManagementHubView`) and attach the same buttons/selects to it, rather than being private methods locked to one class. This is a deliberate deviation from `ClanManagementView`'s existing per-mode methods (e.g. `_add_basic_config_components()`), which are private instance methods — CWL's version needs to be shared across two view classes from day one, so it's written as a shared helper instead of being copy-pasted into both.
+- Sub-screens opened from these buttons (`CwlEventSetupView`, `CwlAssignmentManagementView` in Phase 4) accept a generic `parent_view` reference (duck-typed: whatever it is must support a `refresh()`-style call after the sub-screen closes) rather than being typed to `clan_management_view: ClanManagementView` specifically — this is what lets the same "Configure Participating Clans" button work identically whether it was clicked from `/clan management` or from the CWL Management Hub.
+
+### Entry point (a): `/clan management` modes
+- **`ui_clan_management.py`**: add two `discord.SelectOption`s to `_add_mode_select()` (lines 421-470): `value="cwl_settings"`, `value="cwl_management"`. Add both to the no-clan-select exclusion check — it's the hardcoded literal `if mode not in ["roles", "families", "config"]:` at line 327, so both new mode strings go into that list. Add dispatch branches in `__init__` (dispatch chain at lines 340-365, mirroring the existing `elif mode == "config": self._add_basic_config_components()` at line 357): `elif mode == "cwl_settings": add_cwl_settings_components(self, guild_id)` and `elif mode == "cwl_management": add_cwl_management_components(self, guild_id)` — calling the shared helpers above, not new private methods.
+- **`QBdiscocmdshelper.py`**: matching branches in `format_clan_management_message()`'s dispatch (function starts at line 3752; if/elif chain at 3791-3800). **Caution**: the chain ends in a bare `else` that defaults to the registrations embed — the two new modes must be added as explicit `elif` branches *before* that `else`, or a wiring mistake silently renders the wrong screen instead of erroring.
+
+### Entry point (b): CWL Management Hub — dedicated anchored admin message
+Structurally parallel to Phase 2's player-facing Personal CWL Hub, but admin-only and covering the `cwl_settings`/`cwl_management` content instead.
+- **`qapbot/ui_cwl_roster.py`**: `CwlManagementHubView(discord.ui.View)` — persistent, `timeout=None`, registered via `QBcore.bot.add_view(CwlManagementHubView())` in `_setup_hook()` (static/generic, no per-invocation dynamic data, same reasoning as `CwlHubView` in Phase 2; every component needs an explicit stable `custom_id` for `add_view()` to route restarts-spanning clicks — see the Phase 2 note on how this deliberately *improves on* the registration message's repost-reattach survival mechanism). Internally toggles between the two shared screens ("Settings" / "Season Management" — two buttons rather than a full 5-option mode dropdown, since only these two are relevant here), rendering via the exact same `_format_clan_management_cwl_settings`/`_format_clan_management_cwl_management` + `add_cwl_settings_components`/`add_cwl_management_components` calls as entry point (a). Admin-permission re-check on every callback, same as `ClanManagementView`.
+- **Message tracking**: `guild_config.cwl_management_*` columns, read/written via `CACHE.server_config` + `persist_server_config()` exactly like `registration_message_id` — no bespoke db_manager accessors (see Data Model section).
+- New function `repost_cwl_management_messages()`, same "confirmed-deletion-only" discipline as `repost_cwl_hub_messages()` (Phase 2) and `repost_playerregistration_messages()` (`QapBot.py:3186`). **Already done (2026-08-08)**: `repost_playerregistration_messages()` was refactored into a thin wrapper around a generic `repost_anchored_message()` driver (plus module-level `_confirm_delete_message_from_channel()`/`_get_channel_last_message_id()` helpers), precisely so this and the Phase 2 CWL Hub repost call it directly instead of writing a 2nd/3rd near-identical copy — no extraction work remains here, just supply this feature's config keys + a content/view callback.
+- **Channel config**: the "CWL Management Hub channel" is configured as a **second** channel slot in `cwl_settings` mode's channel sub-screen, alongside the Personal CWL Hub channel from Phase 2 — same `ChannelConfigurationView`-style sub-screen, now handling up to 4 channel slots total (registration, war-notifications, CWL player hub, CWL management hub) once Phase 2 lands. **Implementation note**: worth checking at that point whether `ChannelConfigurationView` should be generalized to accept a list of channel-slot definitions rather than growing a 4th near-identical hardcoded field.
+
+### `cwl_settings` — guild preferences (content shared by both entry points)
+Modeled directly on the existing `"config"` mode (`_add_basic_config_components()`, `ui_clan_management.py:747-841`) — same row-3/row-4 button conventions, same `_get_guild_config(guild_id)` state-read helper (line 843).
+- **Hub channels**: a button opening the `ChannelConfigurationView`-style sub-screen described above (player Hub channel lands here in Phase 2; the Management Hub channel slot is added in this phase).
+- **Message toggles**: row-4 "Activate/Deactivate CWL Management Hub Message" button (this phase) and "Activate/Deactivate Personal CWL Hub Message" button (Phase 2), styled `success`/`secondary` from the respective `guild_config` flags, following the exact pattern of the existing "Activate/Deactivate Registration Message" toggle.
+- **Retention**: a `discord.ui.Select` with preset options (Never / 3 / 6 / 12 / 24 months), `default=True` on the currently-configured value per Cardinal Rule 7, writing `guild_config.cwl_retention_months`.
+- **Persistence**: all of the above write through `CACHE.server_config[guild_id][...]` + `await CACHE.persist_server_config(guild_id)` (Cardinal Rule 2, reference: `_on_toggle_registration` at ui_clan_management.py:2122). The only db_manager change for these settings is extending `save_guild_config()`/`get_guild_config()`'s column lists for the new columns (see Data Model section) — no new accessor functions.
+
+### `cwl_management` — season operations (content shared by both entry points)
+This is the recurring, season-by-season screen leadership actually works in.
+- **Embed** (`_format_clan_management_cwl_management(guild)`): styled like the registrations embed (`_format_clan_management_registrations`, `QBdiscocmdshelper.py:3803`) — header with the current `cwl_events` row's season/status, a per-clan breakdown of participating clans (target tier, roster size), and signed-up counts by status (pending/confirmed/declined/withdrawn), reusing the same column-alignment approach (`best_practice_player_cell`-style formatting) rather than inventing new layout primitives. This is a snapshot rendered on open/refresh, not auto-live-updating — same convention as the existing registrations embed, which also requires an explicit Refresh click rather than pushing updates.
+- **"Configure Participating Clans" button** → opens `CwlEventSetupView(discord.ui.View)` (new, in `qapbot/ui_cwl_roster.py`) as an ephemeral follow-up holding a `parent_view=self` back-reference (see Shared content layer above), exactly matching how `_on_config_manage_member_clans` (ui_clan_management.py:2468) opens `MemberClansConfigurationView` (view class at ui_clan_management.py:3725). Structurally = `MemberClansConfigurationView`'s toggle-button working-copy pattern, but the **working-copy seed** is `get_previous_cwl_event_clans_sync(guild_id)` (new `db_manager.py` method — returns the most recent prior season's `cwl_event_clans` rows) when the current season has no `cwl_event_clans` rows yet, rather than an empty selection — this is what implements the confirmed "carry over from previous season" decision as the *default* state, not a separate copy action. Uses the **paged select-menu helper** (see Cross-Cutting) for the clan picker since member-clans can exceed 25. "Set CWL Start Time" button opens `CwlStartTimeModal` (single `TextInput`, optional/skippable, parsed to UTC ISO). "Apply" persists via `create_cwl_event_sync()` + `set_cwl_event_clans_sync()`, then refreshes the parent screen via `parent_view.refresh()`.
+- **"Start Enrollment" button** — see Phase 2 (owns the actual transition + template-copy + DM-send logic); this button lives here but its behavior is documented in Phase 2 since it's the seam between the two. Only shown/enabled when `cwl_events.status == 'draft'` and `cwl_event_clans` is non-empty.
+- **"Manage Assignments" button** — opens `CwlAssignmentManagementView` (Phase 4), only shown/enabled once `status` is `signup_open` or later. Same ephemeral-follow-up-with-`parent_view`-back-reference pattern.
+- Refresh button (`row=0`), standard pattern.
+- **`db_manager.py`**: the 4 `CREATE TABLE` statements from the Data Model section above; sync CRUD (matches `get_cwl_roster_sync`'s sync style since it's called from UI callbacks, not the async polling loop): `create_cwl_event_sync()`, `get_cwl_event_sync(guild_id, cwl_season)`, `list_cwl_events_sync(guild_id, status=None)`, `update_cwl_event_status_sync()`, `set_cwl_event_clans_sync(event_id, clan_configs)`, `get_cwl_event_clans_sync(event_id)`, `get_previous_cwl_event_clans_sync(guild_id, exclude_event_id=None)`.
+- **New file `qapbot/ui_cwl_roster.py`** — new subsystem module, all CWL-roster views across all 5 phases live here (mirrors `ui_clan_management.py` holding many related views in one file): `CwlManagementHubView`, `CwlEventSetupView`, `CwlStartTimeModal`, and later phases' views.
+- **New file `qapbot/QBdiscocmdshelper_cwl.py`** — command-logic helpers and the shared embed-builder functions above, justified the same way `QBdiscocmdshelper_admin_command.py` was split out of the main helper file — keeps an already-4700-line file from growing further with an unrelated concern.
+- **`QBdiscordcmds.py`**: `cwl_group = app_commands.Group(name="cwl", ...)` still created here (mirrors `clan_group`/`analyse_group`, lines 2385/2537), but scoped to member-facing self-service only (`/cwl signup`, `/cwl withdraw` — see Phase 2); no admin subcommands are added to it.
+- **`QapBot.py`**: add `QBdiscordcmds.cwl_group` to the `COMMAND_GROUPS` list in `_setup_hook()` (confirmed exact location: line 2430-2433); add `QBcore.bot.add_view(CwlManagementHubView())` alongside the other `add_view()`/`add_dynamic_items()` registrations introduced by this feature.
+
+**Tests:** `tests/unit/test_db_manager_cwl_roster.py` (CRUD roundtrip, UNIQUE constraints, cascade-delete, `get_previous_cwl_event_clans_sync` carry-over query), `tests/integration/test_cwl_roster_setup.py` (mode-select navigation to both new modes, clan-selection persistence including carry-over seeding, per-clan settings editing, non-admin rejection on every callback, **and a test asserting both entry points render identical content/state for the same guild** — the whole point of the shared-logic design). Run via `.\run_tests.ps1`.
+
+---
+
+## Phase 2 — Previous-Lineup Template, Sign-Up Mask & Personal CWL Hub
+
+**Ships:** (a) copy-last-season-as-template action seeding `cwl_signups` + DM confirm/opt-out buttons; (b) self-service `/cwl signup` with fixed-dropdown league-tier preference; (c) the dedicated **Personal CWL Hub** message where members see their status and manage their persistent opt-out/preferred-league defaults (distinct from Phase 1's admin-only **CWL Management Hub**).
+
+### Personal CWL Hub message
+A new anchored message, structurally identical to the registration message's lifecycle (own channel, own tracked `message_id`, reposted on the same cycle) but functionally its own thing — this is deliberately **not** a 5th button bolted onto `RegistrationView`, per the confirmed decision to keep account-identity concerns (registration) separate from clan-participation concerns (CWL).
+- **Message tracking**: the new `guild_config.cwl_hub_*` columns, read/written via `CACHE.server_config` + `persist_server_config()` — the exact path `registration_channel_id`/`registration_message_id` already use (verified: registration tracking has no per-column db accessors either; it flows entirely through `save_guild_config()`'s column list). No new db_manager functions beyond the column-list extension from the Data Model section.
+- **`qapbot/ui_cwl_roster.py`**: `CwlHubView(discord.ui.View)` — the persistent, `timeout=None` view attached to the anchored message (parallel to `RegistrationView`). Two buttons: **"My CWL Status"** and **"My Preferences"**, both handled as ephemeral follow-ups scoped to the clicking user (never edits the shared anchored message itself, same as how registration's buttons open per-user ephemeral flows).
+  - **My CWL Status**: for each of the caller's linked `user_players` rows, shows (per account) whether they're on the guild's current CWL event's roster and their `cwl_signups.status` (pending/confirmed/declined/withdrawn/not signed up), plus their `cwl_assignments.assigned_clan_tag` once Phase 4 has set one. Read-only.
+  - **My Preferences**: for each linked account, an opt-out toggle button + a `Select` of the fixed league-tier list (writing to `user_players.cwl_permanent_optout`/`cwl_default_preferred_league_rank`), plus one extra **"Opt out ALL my accounts"** / **"Opt back in ALL my accounts"** button pair that bulk-applies the toggle across every linked account in a single click (confirmed UX affordance — no new schema, just a loop over the caller's `user_players` rows).
+- **`QapBot.py`**: register `CwlHubView` via `QBcore.bot.add_view(CwlHubView())` in `_setup_hook()` alongside the `add_dynamic_items()` registration from Phase 2's DM buttons below — this view's buttons are static/generic (no per-invocation dynamic data embedded in their `custom_id`, unlike the DM confirm/opt-out buttons), so the simpler `add_view()` API applies here, not `DynamicItem`. Every button needs an explicit stable `custom_id` for this to work. `RegistrationView` itself was retrofitted to `add_view()` the same way on 2026-08-08 (guild context is now resolved per-click via `_resolve_guild_id(interaction)` rather than baked in at construction time, since the generic dispatch instance has none) — this is the first `add_view()` usage in the codebase and the direct precedent these two new hub views follow.
+- New function `repost_cwl_hub_messages()` in **`QapBot.py`** (alongside `repost_playerregistration_messages()` at QapBot.py:3186), mirroring its "only drop tracking on Discord-confirmed deletion" discipline via the `repost_anchored_message()` driver (extracted 2026-08-08 — see Phase 1). Hooked into the same per-cycle maintenance pass as the registration repost (call sites: QapBot.py:599 startup, ~1669 and ~2870 periodic).
+- **Admin config step — resolved**: `cwl_hub_channel_id` is set via Phase 1's new `cwl_settings` mode (see Phase 1), not a placeholder — confirmed entry point, following the same `ChannelConfigurationView`/`ChannelSelect` pattern already used for `registration_channel_id`.
+
+### "Start Enrollment" — the trigger button (lives in `cwl_management` mode, Phase 1)
+This is the single admin action described in the confirmed design decisions: one button, one confirmation prompt, three effects. New function `start_cwl_enrollment(event_id)` in `qapbot/QBdiscocmdshelper_cwl.py`:
+1. Validates `cwl_event_clans` is non-empty for this event (reject with an ephemeral error otherwise — button should already be disabled in this case per Phase 1, this is the defensive re-check).
+2. Runs the template copy (below) to seed `cwl_signups`.
+3. Sends the confirm/opt-out DM blast (below) to every resolved `discord_id` from that copy.
+4. Transitions `cwl_events.status: draft → signup_open`.
+5. Returns a summary (contacted / skipped-by-opt-out / no-linked-account counts) rendered back to the admin in the `cwl_management` mode embed after the button click.
+
+Gated behind a Yes/No confirmation view first (precedent: `UnlinkConfirmView`) since it sends real DMs to real members — not silently reversible.
+
+### Template copy
+- **`db_manager.py`**: `get_previous_cwl_participants_sync(clan_tags, template_season)` — reuses the **existing** `get_cwl_roster_sync(clan_tag, template_season)` (db_manager.py:2460) per clan, cross-referenced against `user_players` to resolve `discord_id`. Unlinked players are still added (`discord_id=NULL`) but skipped in the DM blast and flagged in Phase 4 as "needs manual follow-up." Accounts with `user_players.cwl_permanent_optout=1` are **excluded entirely** from this step — no `cwl_signups` row is created and no DM is sent for them, per the confirmed opt-out semantics.
+- Bulk-insert into `cwl_signups` with `source='template_confirm'`, `status='pending'`, `preferred_league_rank` pre-filled from `user_players.cwl_default_preferred_league_rank` where set — per the confirmed silence-default decision, nothing is auto-confirmed.
+
+### DM confirm/opt-out buttons — persistent-view gap, resolved
+- Use `discord.ui.DynamicItem` (confirmed available: `discord.py==2.7.1` in `requirements.txt`, feature since 2.4). Define `CwlSignupConfirmButton`/`CwlSignupOptOutButton` with a regex `custom_id` template embedding `event_id`+`player_tag`, e.g. `r'cwl:signup:(?P<action>confirm|optout):(?P<event_id>\d+):(?P<player_tag>[A-Z0-9]+)'`.
+- Register once via `QBcore.bot.add_dynamic_items(CwlSignupConfirmButton, CwlSignupOptOutButton)` in `QapBot.py`'s `_setup_hook()` (~line 2385) — confirmed via repo-wide search that **no** `add_view()`/`add_dynamic_items()` call exists anywhere today, so this is a new pattern being introduced, not an extension of one.
+- Why `DynamicItem` over alternatives: static `bot.add_view()` views don't carry per-invocation dynamic data (player_tag) without an extra message_id lookup table; treating DM buttons as best-effort/session-scoped would mean a bot restart mid-signup-window silently breaks already-sent DMs with no visible symptom until clicked — bad UX for a multi-day window. `DynamicItem` is purpose-built for exactly this.
+- Callback re-reads current `cwl_signups`/`cwl_events` state from the DB on click (never trusts closure state — defends against the event having since moved to `finalized`/`cancelled`), writes `status='confirmed'`/`'declined'`, `responded_at=now`, edits the DM message in place, disables both buttons. Wrap in the same 10062-expired-token suppression pattern as `ClanManagementView.on_error` (~line 390).
+- **`cache_manager.py`**: extend `send_user_dm()` (confirmed text-only today, line 1221) with optional `view: Optional[discord.ui.View] = None` and `embed: Optional[discord.Embed] = None` kwargs, passed through to `discord.User.send()`. Backward-compatible signature extension, not a parallel new method.
+- **Durable fallback**: `/cwl signup` always works regardless of DM deliverability/restart timing; Phase 4's screen must visibly distinguish "template row, never responded" from confirmed/declined so leadership can manually chase stragglers.
+
+### Sign-up mask
+- `cwl_group.command(name="signup")` sends an ephemeral message with a `discord.ui.Select` populated from the fixed CoC league-tier ladder (per the confirmed decision) plus "No preference," pre-selected (`default=True`, per Cardinal Rule 7) to whatever `user_players.cwl_default_preferred_league_rank` already holds for that account, if set. Player resolved from the caller's linked `user_players` row(s); if multiple linked accounts, prompt a picker first (mirrors `/whois` multi-account handling). Per the confirmed decision, a member may call this command again to sign up a second (or further) linked account for the same event — `cwl_signups`' `UNIQUE(event_id, player_tag)` constraint already allows multiple rows per `discord_id` as long as `player_tag` differs, so no schema change is needed for this. Requires the resolved `user_players` row to be `verified=1` before allowing self-signup (guards against unverified/disputed-ownership accounts signing up). Note: `/cwl signup` is always available regardless of `cwl_permanent_optout`, per the confirmed "explicit action overrides stale default" rule.
+- Upserts `cwl_signups` with `source='self_signup'`, `status='confirmed'` immediately (explicit self-registration needs no separate confirm step).
+- `cwl_group.command(name="withdraw")` — self-service opt-out after signing up (`status='withdrawn'`).
+- Both commands check `cwl_events.status == 'signup_open'` and reject with an ephemeral "sign-up isn't open" message otherwise.
+
+### i18n
+New `cwl.*` namespace in `qapbot/translations/en.json` and `de.json`: `cwl.setup.*`, `cwl.signup.*` (including the league-tier option labels), `cwl.template.dm_title/dm_body/confirm_button/optout_button/confirmed_msg/declined_msg`, `cwl.hub.*` (status/preferences button labels, per-account status lines, opt-out toggle labels, "apply to all accounts" confirmation prompt). DM-context `t()` calls need `user_id`+`guild_id`; guild-command calls need `guild_id` only. Modal `TextInput.label` stays hardcoded English; `placeholder` and button/select labels are translated.
+
+**Tests:** unit test for `get_previous_cwl_participants_sync` (no dedicated CWL fixtures exist — verified; follow the existing convention of inline builders from `tests/builders.py` plus the seeding style of `TestCwlGroupExpansion` in `tests/integration/test_db_manager.py`) and for `DynamicItem` custom_id regex parsing (valid/malformed); integration test for template-copy → simulated button click → status transition, sign-up happy path, duplicate-signup (UNIQUE) handling, unverified-account rejection. Additional Hub-specific tests: per-account opt-out toggle persists and is correctly excluded by the next template-copy run; "apply to all accounts" bulk action updates every linked `user_players` row for that `discord_id` and no others; explicit `/cwl signup` succeeds even when `cwl_permanent_optout=1` for that account; hub message repost preserves the "confirmed deletion only" tracking discipline (mirror whatever test already exists for `repost_playerregistration_messages()`).
+
+---
+
+## Phase 3 — Auto-Assignment Suggestion Engine
+
+**Ships:** pure computation — reads `cwl_signups` where `status='confirmed'`, scores each player, writes `cwl_assignments` rows (`assignment_source='suggested'`). No player/clan-visible change yet.
+
+### Scoring — reuses existing formulas, doesn't reinvent them
+Pulls per-player stats via the **existing bulk helper `compute_roster_stats_sync(player_tags)`** (`QBhelperfunctions.py:3581`) — this is a strictly better fit than the per-player `get_player_attack_summary_sync()` route an earlier draft proposed, for three verified reasons: (1) it already computes exactly the metrics this engine needs per player — `cwl_skill` ((3★−1★)/n×100), `cw_skill`, `reliability` (used/max×100), `activity` — with `None` signalling insufficient data; (2) it does so in **3 aggregate SQL queries for the whole roster** instead of N×per-player calls; (3) it is already hot/history-split-aware (it was explicitly audited and fixed for the 2026-07 DB split — see `qapbot/docs/DATABASE_ARCHITECTURE.md`'s query anti-patterns / `/cwlinfo` opponent preview, its existing caller). **`compute_roster_stats_sync()` is the one and only roster-scoring workhorse — keep it that way**: any future per-player-stats need here (or elsewhere) must extend this function's returned dict rather than adding a parallel stat query, since per `DATABASE_ARCHITECTURE.md`'s hot/history query anti-patterns, parallel stat implementations are exactly where the 2026-07 hot/history-split correctness bugs hid. **Small extension needed**: it must additionally return the underlying per-player CWL/CW attack *counts* (for the `data_confidence` weighting below) — add those keys to its returned dicts rather than issuing any separate query. The formulas below are therefore consumed pre-computed, not re-derived:
+
+```
+skill        = stats["cwl_skill"]              # already (3★−1★)/n×100 from compute_roster_stats_sync
+reliability  = stats["reliability"]            # already used/max×100 from compute_roster_stats_sync
+data_confidence = min(cwl_attack_count / CONFIDENCE_FLOOR, 1.0)  # e.g. CONFIDENCE_FLOOR = 6 CWL attacks; count from the extension above
+composite    = data_confidence * (0.6*skill + 0.4*reliability)
+             + (1 - data_confidence) * FAMILY_BASELINE            # median composite of data-sufficient peers in this event
+```
+- **Sparse-data tolerance**: `data_confidence` down-weights new players / clans with thin history (below-Master-III clans may have gaps per `CLAN_WAR_TRACKING.md`). If `cwl_skill is None` (no CWL attacks on record), fall back to `cw_skill` (regular-CW stats — already returned by the same `compute_roster_stats_sync` call, no extra query) with the same weighting one level down; if that's also `None`, `composite = FAMILY_BASELINE` and the row is tagged `"fallback": "family_baseline_no_history"` in `score_breakdown_json` — surfaced in Phase 4 as "no history — review."
+- **Tier fit**: sort `cwl_event_clans` by `tier_order` (0 = highest). Players with a stated `preferred_league_rank` are placed per that preference first (member intent wins over the algorithm) but flagged `"preference_override": true` if it doesn't match their score-implied tier — visible badge in Phase 4, never a silent decision. Remaining "no preference" players are greedily filled top-score-first into the highest open-slot tier, then the next.
+- **Overflow**: if confirmed signups exceed total `roster_size`, lowest-composite players get no `cwl_assignments` row — surfaced in Phase 4 as an explicit bench/unassigned list, never silently dropped.
+- **Never a black box**: every row stores `score` + `score_breakdown_json` so Phase 4 can show "why," and `locked` rows are always preserved on re-run so manual overrides survive re-suggestion.
+
+- **New function `suggest_cwl_assignments(event_id)` in `qapbot/QBdiscocmdshelper_cwl.py`** — takes the pre-fetched `compute_roster_stats_sync()` output dicts as input (not calling `db_manager`/helpers inline) so it's a pure, cheaply unit-testable function.
+- **`db_manager.py`**: `upsert_cwl_assignments_sync(event_id, assignments)` (skips/preserves `locked=1` rows), `get_cwl_assignments_sync(event_id)`.
+- No new slash command — triggered by a "Generate/Refresh Suggestions" button inside Phase 4's management view (a standalone preview command is optional/cuttable scope, not required for MVP).
+
+**Tests:** `tests/unit/test_cwl_assignment_scoring.py` — pure-function tests over synthetic stats dicts: full-data players, zero-history players, tier-preference override, overflow/bench case, deterministic tie-breaking (stable sort — leadership may reopen the screen multiple times before finalizing, output must not shuffle without new data).
+
+---
+
+## Phase 4 — Leadership Management/Override Screen
+
+**Ships:** admin screen showing all signups + current assignments for an event, with move/kick/bring-in controls and the finalize gate.
+
+- **Entry point**: the "Manage Assignments" button inside Phase 1's `cwl_management` screen, reachable from **either** shell (`/clan management` or the CWL Management Hub) — same ephemeral-follow-up-with-`parent_view`-back-reference pattern as `MemberClansConfigurationView` (generalized per Phase 1's Shared content layer note), so closing/finalizing this screen refreshes whichever parent screen opened it.
+- **`qapbot/ui_cwl_roster.py`**: `CwlAssignmentManagementView(discord.ui.View)`, structurally = `ClanManagementView` (holds `sent_message`, `event_id`, `all_embeds`/`current_page` — one page per participating clan's roster plus a bench/unassigned page, `_add_pagination_buttons()`-style Prev/Next, `_add_refresh_button()`, `on_timeout()`/`on_error()` cleanup, and **admin-permission re-check on every single callback**, not just on open — matters here since the view can stay open across a multi-day window, matching `ClanManagementView._check_admin_permission()` ~line 397).
+- Per-player controls: **Move to clan** (Select of participating clans), **Kick** (unassign only, per the confirmed decision — removes the `cwl_assignments` row but leaves `cwl_signups.status='confirmed'` so they can be reassigned; a separate explicit "remove signup entirely" action handles full withdrawal), **Bring in** (Select/search over `confirmed` signups with no current assignment — covers both bench overflow and manual additions). All mutations set `assignment_source='admin_override'`, `locked=1`.
+- **Generate/Refresh Suggestions** button calls Phase 3's `suggest_cwl_assignments(event_id)`; safe to click repeatedly since locked rows are preserved.
+- **Finalize** button transitions `cwl_events.status → finalized`, closing further sign-up-mask/DM-button writes (Phase 2 paths check `status == 'signup_open'`) and gating Phase 5's DM-blast button. Requires `cwl_start_at` to be set (per the confirmed "optional at creation, required before the blast" decision) — if not yet set, the Finalize flow prompts for it inline via the same `CwlStartTimeModal` from Phase 1.
+
+**Tests:** integration tests for move/kick/bring-in mutating `cwl_assignments` correctly and setting `locked=1`; refresh-suggestions preserving locked rows; finalize blocking further Phase 2 writes and requiring a start time; permission re-check rejecting a user whose admin role changes mid-session.
+
+---
+
+## Phase 5 — Final DM Notification Blast
+
+**Ships:** "press a button, DM every finalized participant with date/time + join link."
+
+- **Join link**: CoC's native clan-profile deep link. **Already centralized (2026-08-08)**: `coc_deep_link(action, tag)` / `coc_clan_profile_url()` / `coc_player_profile_url()` in `QBhelperfunctions.py` replaced all inline construction across the repo (previously 3 inconsistent inline sites, one of them — `QapBot.py:3064` — missing the `%23` encoding the others used; normalized to the working `%23`-encoded form). Use `coc_clan_profile_url(clan_tag)` here rather than re-inlining the URL. Derived at send-time from `clans.clan_tag` — no new storage needed, no invite-link infra exists in the repo today, and CoC's API has no auto-move capability, so this is the practical ceiling (opens the clan profile in-game; the player still taps Join/Request themselves).
+- **`ui_cwl_roster.py`**: "Send Final Notifications" button on `CwlAssignmentManagementView`, enabled only when `status == 'finalized'`. Confirmation step first (Yes/No view, precedent: `UnlinkConfirmView`) since this is an irreversible mass-DM.
+- **New function `send_cwl_final_notifications(event_id)` in `QBdiscocmdshelper_cwl.py`** — iterates `cwl_assignments` joined to `cwl_signups.discord_id`, skips `notified=1` rows (idempotent — safe to re-run for stragglers), calls the Phase 2-extended `send_user_dm(..., embed=...)` with clan name, join link, and start time. **Start-time rendering (research-corrected)**: `war_notifications.py` has *no* per-user-locale date formatter to reuse (verified — it uses relative-time `t()` keys plus hardcoded `strftime("%Y-%m-%d %H:%M:%S")`). Use Discord's native timestamp markup instead: `<t:{unix_ts}:F>` (full date) plus `<t:{unix_ts}:R>` (relative countdown) — the Discord client renders these in each viewer's own locale *and timezone* automatically, which is strictly better than any server-side formatting and needs zero i18n keys. (`<t:` markup is currently unused anywhere in the repo, so this introduces it — trivially, it's just string formatting of `cwl_start_at` parsed to a unix timestamp.) Marks `notified=1` on success. Rows with `discord_id IS NULL` are collected into a summary returned to the admin ("N players could not be notified — no linked account") rather than silently skipped.
+- Transitions `cwl_events.status → announced` after the blast completes (regardless of individual DM failures, consistent with `send_user_dm`'s existing best-effort `bool` contract).
+
+**Tests:** idempotency (re-run skips `notified=1`), unlinked-account summary counting; and one end-to-end lifecycle test (`tests/integration/test_cwl_roster_lifecycle.py`) covering create → template copy → simulated confirms → generate suggestions → manual override → finalize → notify → verify final DB state — the single highest-value test in the feature since it exercises every table's write path in sequence.
+
+---
+
+## Cross-Cutting Work
+
+**Retention (configurable auto-cleanup)**: add `cwl_retention_months INTEGER NOT NULL DEFAULT 0` to `guild_config` (0 = keep indefinitely, matching current behavior for guilds that don't opt in), settable via the Retention `Select` in Phase 1's `cwl_settings` mode. Hook a `purge_old_cwl_events()` step into the existing `db_manager.nightly_db_maintenance()` (confirmed entry point, db_manager.py:6428 — note it currently has **no** per-guild cleanup steps at all, only global WAL-checkpoint/VACUUM-or-REINDEX/ANALYZE, so this is a genuinely new step appended after the existing three, not an extension of an existing pattern) — for each guild with `cwl_retention_months > 0`, delete `cwl_events` rows with `status IN ('announced', 'cancelled')` and `updated_at` older than that many months; cascade deletes handle the 3 child tables automatically. Non-terminal-status events (still `draft`/`signup_open`/`finalized`) are never auto-deleted regardless of age, so an in-progress planning cycle can't be swept accidentally.
+
+**Paged select-menu helper** (needed by Phase 1's clan picker and Phase 4's move/bring-in pickers, since neither guild clan counts nor per-clan rosters are capped at 25): no existing "paged select that swaps its 25 options via Prev/Next while preserving selection state" exists in the repo (only whole-embed pagination and simple `options[:25]` truncation do). Build once as a small reusable helper in `qapbot/ui_common.py` (alongside the existing `GenericSelectView`, line 69) with server-side draft state — never encode selections in `custom_id` (100-char cap) — and consume from `ui_cwl_roster.py`.
+
+**Docs**: new `qapbot/docs/CWL_ROSTER_PLANNING.md` (structured like `CWL_ROUND_TRACKING_PLAN.md`: schema, flow diagrams, the event status state machine `draft → signup_open → finalized → announced` / `cancelled`, the `cwl_settings`/`cwl_management` mode additions to `ClanManagementView`, the dual-entry-point/shared-content-layer design behind the CWL Management Hub, and explicit documentation of the `DynamicItem` persistent-DM-button mechanism since it's a genuinely new pattern for the codebase). Update `README.md`'s doc index. Update `/help` in `QBdiscordcmds.py` (the `categories` dict is *dynamically built with `t()` calls* at ~lines 1043-1050, not a static dict; autocomplete at ~line 1084) — only for the two member-facing commands, `/cwl signup` and `/cwl withdraw`; the admin functionality has no `/help` entries of its own since it's discovered via `/clan management`'s existing mode dropdown, same as "Manage Registrations" today. Matching `commands.help."cwl signup"`/`"cwl withdraw"` blocks in `en.json`/`de.json` (mirror the existing `"analyse cwl_opponent"` block, en.json:222). Note: no top-level `cwl.*` translation namespace exists yet (current CWL-related keys are scattered, e.g. `wartype_cwl`) — this feature introduces it.
+
+**Changelog**: one `changelog.txt` entry per phase at ship time (not one giant entry at the end), per the project's convention.
+
+**i18n**: every new key added to both `en.json` and `de.json` in the same commit as the code using it.
+
+---
+
+## Verification
+
+- Run `.\run_tests.ps1` after each phase; new test files per phase as listed above, plus the Phase 5 end-to-end lifecycle test as the final gate before considering the feature complete.
+- Manual verification per phase in a dev Discord guild: Phase 1 — open `/clan management`, confirm `cwl_settings` and `cwl_management` appear in the mode dropdown, configure both Hub channels/retention, open "Configure Participating Clans" on a guild with a prior season's data and confirm the carry-over pre-selection is correct, confirm clan multi-select persists and re-opens correctly, then post the CWL Management Hub message and confirm it renders **identical** content/buttons to the `/clan management` path for the same guild state (the core claim of the shared-content-layer design), confirm both entry points' "Configure Participating Clans"/"Manage Assignments" buttons correctly refresh whichever screen opened them; Phase 2 — trigger template copy, click DM buttons from a test account, confirm `/cwl signup` dropdown and duplicate handling, post the Hub message and confirm "My Status"/"My Preferences" render correctly for an account with multiple linked players, confirm the opt-out toggle (single and "apply to all") actually suppresses that account from the next template-copy run; Phase 3 — inspect generated `cwl_assignments` rows/scores directly in the dev DB for a seeded roster; Phase 4 — move/kick/bring-in players, confirm re-suggestion preserves manual edits, confirm non-admin is rejected mid-session; Phase 5 — confirm the DM content renders correctly (clan name, join link, localized date) and `notified`/`status` flags update as expected.
+- Confirm a bot restart between sending template DMs and a member clicking them still resolves correctly (the specific scenario `DynamicItem` is meant to fix) — test this explicitly in dev before considering Phase 2 done.
+
+All open design questions from the initial draft (kick semantics, multi-account sign-up, retention policy) have been resolved with the project owner and are reflected inline above.

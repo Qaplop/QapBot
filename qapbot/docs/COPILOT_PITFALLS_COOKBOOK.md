@@ -394,3 +394,163 @@ tracking this cycle rather than risk a duplicate. Fixed 2026-08-03.
 
 See also: qapbot/QBdiscocmdshelper_admin_command.py `handle_cleanup_messages_all()`,
 QapBot.py `repost_playerregistration_messages()` / `cleanup_stale_ui_messages()`
+
+---
+
+## Pitfall 16: `asyncio.to_thread()` does NOT make an atomic C call non-blocking
+
+Symptom: a slow C-level call (`gc.collect()`, hashlib, most C-accelerated stdlib) is wrapped in
+`asyncio.to_thread()` expecting it to stop blocking the event loop, but the bot still freezes for
+its full duration.
+
+Root cause: CPython only releases the GIL / checks the "eval breaker" at Python bytecode-execution
+boundaries. A single atomic C-level call does not hit such a boundary mid-call, so running it on a
+worker thread only avoids blocking *other* code that happens to run on other worker threads (rare
+in this bot) — it does not free the main event loop.
+
+Fix: reduce the actual scope/cost of the C call instead of wrapping it. Example (2026-07-18):
+`_post_cycle_cleanup()`'s full `gc.collect()` (gen-2, ~1s+) blocked the whole bot despite running
+via `asyncio.to_thread()`; fixed with `gc.collect(1)` (gen-0+1 only, skips the huge long-lived
+`CACHE` object graph in gen-2).
+
+By contrast, a plain **Python-level loop** (dict iteration, string ops) DOES get preempted at
+bytecode boundaries, so for that case both `await asyncio.sleep(0)` every N iterations, or
+`asyncio.to_thread()`-wrapping the whole loop, are valid fixes. Example: the clan-categorization
+loop in `main()` (QapBot.py) iterating `CACHE.clan_name_cache` (~380K entries in PROD) cost
+~4.1-4.2s of frozen event-loop time every cycle; fixed with `await asyncio.sleep(0)` every 2000
+iterations (simpler than `to_thread()`-wrapping the whole loop).
+
+Diagnostic tool: `qapbot/scripts/log_time_gaps.py --log data/logs/qapbot.log --top N` finds the
+biggest gaps between consecutive timestamped log lines — the fastest way to find blocking/slow
+segments in the update cycle. On Windows, pipe through
+`$env:PYTHONIOENCODING="utf-8"; ... | Out-File -Encoding utf8` (emoji in log lines crash the
+default cp1252 console encoding otherwise). Exclude "Sleeping for" and nightly-maintenance
+(DB-MAINT/REINDEX/VACUUM) lines as expected noise. A large `--top` (300-400) that shows the SAME
+gap recurring on every cycle is the signal of a systemic blocking issue, vs. a one-off external
+`[COC-API-SLOW]` response (not our bug).
+
+---
+
+## Pitfall 17: `_ensure_clan_exists()` / similar FK-integrity helpers called on a non-FK `clan_tag` column
+
+Symptom: a `/whois player` (or similar) report silently inserts a bogus placeholder row
+(`name='Unknown'`) into `clans` for a **player** tag, because some column named `clan_tag` by
+convention doesn't actually hold a clan tag in that row.
+
+Root cause: `leaderboard_messages.clan_tag` has no FK constraint — it's intentionally reused to
+store clan tags, family tags, or (for `mode == "whois_player"`) a player tag. Calling
+`_ensure_clan_exists(clan_tag)` unconditionally whenever the column is truthy can't tell which
+kind of tag it holds.
+
+Fix: before calling `_ensure_clan_exists()`/similar FK-integrity helpers on any `clan_tag`-named
+column, check the `CREATE TABLE` for an actual `FOREIGN KEY ... REFERENCES clans`. Several columns
+are named `clan_tag` by convention but deliberately hold non-clan tags too (`subscriptions`,
+`leaderboard_messages` both have "Note: No FK constraint" schema comments).
+
+Self-healing companion (added alongside the 2026-07-18 fix): `db_manager.is_clan_tag_referenced()`
+/ `delete_clan_if_unreferenced()` (+ `CACHE.purge_clan_if_orphaned()` wrapper) hard-delete a
+`clans` row once `_mark_clan_deleted()` confirms it's gone via CoC API 404, but only if no other
+table still references it. Since 2026-08-08 the referencing tables live in one module-level
+registry, `CLAN_TAG_REFERENCING_TABLES` in db_manager.py — **any new table with a real `clans`
+FK (or a non-FK column that conceptually depends on a clan being real) must be added there**,
+or the orphan purge can cascade-delete rows that table still needs.
+tests/unit/test_clan_tag_reference_registry.py asserts every `REFERENCES clans` clause in the
+live DDL has a registry entry, so forgetting one is a test failure, not silent data loss.
+(The registry conversion itself caught a real instance: `guild_welcome_clans` has a
+`REFERENCES clans ... ON DELETE CASCADE` FK but was missing from the old hand-enumerated list.)
+
+Related same-day gotcha: `is_clan_tag_referenced()` initially checked `leaderboard_messages.clan_tag`
+unconditionally — the exact overloaded-column trap above — which circularly "protected" the bogus
+`whois_player` rows the check should have deleted (2 of 9 PROD candidates wrongly kept). Fix:
+exclude `mode = 'whois_player'` rows (`AND mode != 'whois_player'`). General lesson: when a column
+is deliberately overloaded to store different tag *kinds* behind a `mode`/`type` discriminator,
+any "is this tag referenced" check MUST filter by that discriminator, not just match the tag value.
+
+One-off cleanup script for existing bad PROD rows: `qapbot/scripts/cleanup_orphaned_clans.py`
+(dry-run by default; candidates = `name='Unknown' AND last_checked_via_api IS NULL`).
+
+---
+
+## Pitfall 18: `normalize_clan_tag()` over-matches plain player names as "valid tags"
+
+Symptom: a user types a plain player name (no leading `#`) into a search field, and it gets
+misinterpreted as a raw clan/player tag, producing a bogus "tag not found" error instead of
+running a name search.
+
+Root cause: `normalize_clan_tag()`'s regex (5-10 alphanumeric chars after `#`,
+QBdiscocmdshelper.py) can't distinguish a real CoC tag typed without `#` from a short all-letter
+player name (e.g. "Killer" → 6 letters → passes the regex).
+
+Fix pattern (2026-07-25): only prioritize the direct-tag interpretation when the user input has an
+explicit leading `#` (unambiguous intent). Otherwise try the name search first and only fall back
+to raw-tag interpretation if that search finds nothing. Confirmed instance:
+`PlayerSubstringModal.on_submit()` (qapbot/ui_registration.py). Check for this same ordering bug
+anywhere else `normalize_clan_tag()` is used as a first-resort classifier on freeform user text.
+
+---
+
+## Pitfall 19: Auditing `member_clans`/`member_families` coverage checks for family-blind bugs
+
+Symptom: a guild configured with ONLY a clan family (no individual clans listed) silently loses
+coverage for some feature — e.g. role syncs never trigger for its members.
+
+Root cause: guild config stores clan coverage as TWO separate lists: `member_clans` (individual
+tags) and `member_families` (family IDs, each expanding to a `clans` list via
+`CACHE.clan_families`). Any "is this clan covered by this guild" check that only inspects
+`member_clans` misses family-only guilds entirely.
+
+Fix: grep for `.get("member_clans"` / `.get("member_families")` after any change in this area —
+every coverage check MUST expand `member_families` too. Confirmed-correct reference
+implementations: `get_guild_clans_including_member_config()`, `is_player_in_member_clans()`
+(QBdiscocmdshelper.py), `guild_role_manager.sync_roles_for_user()`, `cache_manager._is_clan_tracked()`.
+
+---
+
+## Pitfall 20: `bot.add_view()` dispatch is live before `CACHE`/DB finish loading — false "no data" reports AND real data loss
+
+Symptom: a button click on a persistent view immediately after a bot restart reports "you have no
+X" (no linked accounts, no registered players, etc.) for a user/guild whose data was intact in the
+DB before the click. Worse (confirmed in prod 2026-08-08): the click itself can DESTROY that data —
+the reporter's 5 linked accounts were hard-deleted from `user_players` by nothing more than
+clicking "My Accounts" during the startup window.
+
+Root cause — two stacked problems:
+1. **Dispatch-before-load**: `bot.add_view(view)` (called in `_setup_hook()`, which runs BEFORE
+   the gateway connects) registers a view's `custom_id`s for interaction dispatch immediately —
+   independent of `on_ready()`, which is where `CACHE` actually gets populated from the DB and
+   `QBcore.bot.fully_initialized` is finally set `True` (Step 9, near the end). Component
+   (button/select) interactions are NOT covered by the `CommandTree.interaction_check` guard that
+   blocks slash commands until `fully_initialized` — that only fires for slash commands/context
+   menus. So a click in the gap reads an empty, not-yet-loaded `CACHE`.
+2. **Read-path click triggers a cache-blind write**: every registration button starts with
+   `update_user_metadata_from_interaction()` → `CACHE.update_user_metadata()`, which (pre-guard)
+   would CREATE a skeleton entry `{"display_name": ..., "players": []}` for any user missing from
+   the cache and write-through persist it. `save_user()`/`_save_user_impl()` implements persistence
+   as `DELETE FROM user_players WHERE discord_id = ?` + reinsert-from-payload — so persisting that
+   fabricated `players=[]` skeleton hard-deleted every real `user_players` row for that user. The
+   "no linked accounts" message wasn't just a stale read; it was the after-image of the wipe.
+
+Fixes (all three layers required, defense in depth):
+1. **View-level gate**: any `discord.ui.View` registered via `bot.add_view()` must override
+   `interaction_check()` to check `QBcore.bot.fully_initialized` first, responding with
+   `t('commands.errors.startup_in_progress', ...)` (ephemeral) and returning `False` if not ready —
+   then delegate to `await super().interaction_check(interaction)` to preserve the maintenance-mode
+   guard (monkey-patched onto `discord.ui.View` in QBcore.py). Reference:
+   `RegistrationView.interaction_check()` (qapbot/ui_registration.py). NOT automatic for future
+   `add_view()`-registered views (e.g. planned CWL hubs) — each needs the override.
+2. **Cache-level gate** (`CacheManager.users_loaded`, qapbot/cache_manager.py): `False` until
+   `load_user_accounts()` succeeds. While `False`: `update_user_metadata()` skips entirely (logs
+   `[STARTUP-GUARD]`, never fabricates a skeleton), and `set_user_account()` / `persist_user()` /
+   `delete_user_account()` raise `RuntimeError` instead of writing — no user write-through can
+   ever run against an unloaded cache, regardless of which view/command forgot layer 1. Class-level
+   default is `False` so even `__new__`-created instances fail safe.
+3. **DB-level forensics**: `_save_user_impl()` logs a WARNING whenever a save replaces N>0 existing
+   `user_players` rows with an EMPTY players list (legitimate only for an explicit last-account
+   unlink) — so any future wipe is visible in the log at the moment it happens.
+
+Test coverage: tests/discord/test_ui_registration.py (view gate),
+tests/integration/test_cache_manager.py `TestUsersLoadedDataLossGuard` (cache gate, including a
+reproduction of the exact incident path asserting the DB rows survive).
+Found-and-fixed instance (2026-07-25): `coc_cache.py`'s role-sync trigger only checked
+`member_clans`, so family-only guilds never got CoC-role/clan-role syncs triggered on
+clan-member cache updates.

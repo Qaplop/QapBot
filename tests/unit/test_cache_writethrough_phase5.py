@@ -31,6 +31,7 @@ def cache():
     cm.clan_families = {}
     cm.user_accounts = {}
     cm.clan_name_cache = {}
+    cm.users_loaded = True  # tests exercise post-startup behavior; pre-load gate tested in test_cache_manager.py
     cm.db_manager = AsyncMock()
     return cm
 

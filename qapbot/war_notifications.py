@@ -141,16 +141,28 @@ async def check_wars_for_notifications() -> None:
         # several seconds, starving the event loop of Discord interactions.
         await asyncio.sleep(0)
 
-        # Get all active wars — zero I/O, purely in-memory
+        # Get all active wars — zero file I/O, but CPU-bound: regex parsing +
+        # dict/list building per in-war clan, with no yield points inside the
+        # loop. At normal scale this is negligible; during CWL, active_wars
+        # can reach 15k+ and this becomes a genuine multi-second synchronous
+        # block — confirmed via prod [NOTIFY-TIMING] logs
+        # (get_active_wars=15.680s for active_wars=17302 on the server-machine
+        # Celeron CPU), which froze the event loop for that whole duration
+        # (no Discord heartbeat/interactions processed). Run in a worker
+        # thread so the event loop stays responsive while this runs.
+        # (This exact asyncio.to_thread() wrapping existed here before and was
+        # removed once _get_active_wars() became zero-I/O, on the assumption
+        # that "zero I/O" also meant "fast enough to stay synchronous" — true
+        # at the scale measured then, not at current CWL-season scale.)
         _t0 = time.monotonic()
-        active_wars = _get_active_wars()
+        active_wars = await asyncio.to_thread(_get_active_wars)
         _get_wars_elapsed = time.monotonic() - _t0
         logging.debug(f"[NOTIFY] wars loaded in {_get_wars_elapsed:.3f}s, {len(active_wars)} active war(s)")
 
-        # Yield after the synchronous _get_active_wars() call.  It builds
-        # war dicts with regex parsing for every in-war clan; with tracemalloc
-        # active on ARM/Celeron server-machine CPUs this can block 200ms+, enough to delay the
-        # discord.py heartbeat if the previous yield was already ~40s ago.
+        # Extra defensive yield — asyncio.to_thread() above already lets the
+        # event loop run other coroutines while _get_active_wars() executes
+        # in its worker thread, but this costs nothing and adds one more
+        # scheduling opportunity before the war_loop below starts.
         await asyncio.sleep(0)
         
         if not active_wars:

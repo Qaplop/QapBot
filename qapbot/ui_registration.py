@@ -269,23 +269,69 @@ class RegistrationView(discord.ui.View):
     """
     Persistent registration message view with account linking button.
     Button stays active indefinitely and triggers clan selection flow.
+
+    Two instantiation modes:
+    - RegistrationView(guild_id): posted/reposted messages — labels translated for that guild.
+    - RegistrationView(): the generic instance registered once via bot.add_view() in
+      _setup_hook(), which routes clicks on messages posted BEFORE the current process
+      started (otherwise those buttons are dead until the next repost cycle). It carries
+      no guild state — callbacks resolve the guild from the interaction itself — and its
+      (untranslated) labels are irrelevant: Discord renders whatever labels the message
+      was posted with and dispatches purely by custom_id.
     """
-    def __init__(self, guild_id: int):
+    def __init__(self, guild_id: Optional[int] = None):
         """
         Initialize registration view.
 
         Args:
-            guild_id: Discord guild ID where this view is posted
+            guild_id: Discord guild ID where this view is posted, or None for the
+                generic bot.add_view() dispatch instance.
         """
         super().__init__(timeout=None)  # No timeout - button stays active indefinitely
         self.guild_id = guild_id
-        
-        # Update button labels with translations
-        from qapbot.i18n import t
-        self.link_account_button.label = t("playerregistration.button_link_account", guild_id=guild_id)
-        self.war_notifications_button.label = t("playerregistration.button_war_notifications", guild_id=guild_id)
-        self.api_verification_button.label = t("playerregistration.button_api_verification", guild_id=guild_id)
-        self.my_accounts_button.label = t("playerregistration.button_my_accounts", guild_id=guild_id)
+
+        # Update button labels with translations (skip for the generic dispatch instance)
+        if guild_id is not None:
+            from qapbot.i18n import t
+            self.link_account_button.label = t("playerregistration.button_link_account", guild_id=guild_id)
+            self.war_notifications_button.label = t("playerregistration.button_war_notifications", guild_id=guild_id)
+            self.api_verification_button.label = t("playerregistration.button_api_verification", guild_id=guild_id)
+            self.my_accounts_button.label = t("playerregistration.button_my_accounts", guild_id=guild_id)
+
+    def _resolve_guild_id(self, interaction: discord.Interaction) -> int:
+        """Guild ID for this click — from the interaction when this is the generic
+        add_view() instance (self.guild_id is None). Registration messages only live
+        in guild channels, so interaction.guild is always set for real clicks."""
+        if self.guild_id is not None:
+            return self.guild_id
+        return interaction.guild.id if interaction.guild else 0
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Block every button until CACHE is fully loaded from the DB.
+
+        add_view() (in _setup_hook(), see class docstring) registers this view for
+        dispatch before the gateway connects — well before on_ready() finishes loading
+        CACHE.user_accounts and sets bot.fully_initialized = True. Without this guard, a
+        click on a pre-restart message during that window would read an empty/stale
+        CACHE.user_accounts and falsely report "no linked accounts" even though the DB
+        (and the user's registration) is completely intact — not a data-loss bug, just a
+        premature read. Delegates to the maintenance-mode check (monkey-patched onto
+        discord.ui.View in QBcore.py) once startup is confirmed complete.
+        """
+        import QBcore as _qbcore
+        if not getattr(_qbcore.bot, 'fully_initialized', False):
+            from qapbot.i18n import t
+            guild_id = interaction.guild.id if interaction.guild else None
+            msg = t('commands.errors.startup_in_progress', guild_id=guild_id)
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(msg, ephemeral=True)
+                else:
+                    await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return bool(await super().interaction_check(interaction))
     
     @discord.ui.button(label="🔗 Link Account", style=discord.ButtonStyle.primary, row=0, custom_id="registration_link_account")
     async def link_account_button(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[type-arg]
@@ -298,6 +344,7 @@ class RegistrationView(discord.ui.View):
         
         # Check if user has unverified accounts
         user_id = str(interaction.user.id)
+        guild_id = self._resolve_guild_id(interaction)
         user_entry = CACHE.user_accounts.get(user_id, {"players": []})
         user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
         
@@ -308,8 +355,8 @@ class RegistrationView(discord.ui.View):
         
         # If user has unverified accounts, show action selection
         if unverified_players:
-            view = AccountActionView(unverified_players, self.guild_id, interaction)  # type: ignore[arg-type]
-            message = f"⠀\n{interaction.user.mention} {t('playerregistration.action_prompt', guild_id=self.guild_id)}\n⠀"
+            view = AccountActionView(unverified_players, guild_id, interaction)  # type: ignore[arg-type]
+            message = f"⠀\n{interaction.user.mention} {t('playerregistration.action_prompt', guild_id=guild_id)}\n⠀"
             await interaction.response.send_message(
                 message,
                 view=view,
@@ -319,7 +366,7 @@ class RegistrationView(discord.ui.View):
             return
         
         # Otherwise, proceed with player search modal
-        await _show_player_search_modal(interaction, self.guild_id, user_mentioned=False)
+        await _show_player_search_modal(interaction, guild_id, user_mentioned=False)
     
     @discord.ui.button(label="⚙️ War Notifications", style=discord.ButtonStyle.primary, row=0, custom_id="registration_war_notifications")
     async def war_notifications_button(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore[type-arg]
@@ -421,6 +468,7 @@ class RegistrationView(discord.ui.View):
         
         # Show verification selector
         options = []
+        resolved_guild_id = self._resolve_guild_id(interaction)
         for player in unverified_players[:25]:  # Discord limit
             player_tag = player.get("player_tag", "")
             player_name = player.get("player_name", "Unknown")
@@ -429,13 +477,13 @@ class RegistrationView(discord.ui.View):
             if not player_tag:
                 continue
             
-            label = t('playerregistration.verify_player', guild_id=self.guild_id, player_name=player_name, player_tag=player_tag)
+            label = t('playerregistration.verify_player', guild_id=resolved_guild_id, player_name=player_name, player_tag=player_tag)
             options.append(discord.SelectOption(label=label[:100], value=f"verify:{player_tag}"))  # type: ignore[arg-type]
         
         view = GenericSelectView(
             options=options,  # type: ignore[arg-type]
             callback_fn=self._on_verify_select,
-            placeholder=t('playerregistration.select_account_verify', guild_id=self.guild_id),
+            placeholder=t('playerregistration.select_account_verify', guild_id=resolved_guild_id),
             timeout=600
         )
         
@@ -482,7 +530,7 @@ class RegistrationView(discord.ui.View):
             return
         
         # Show verification modal (VerifyAccountModal is defined in this module)
-        modal = VerifyAccountModal(player_data, action_view_interaction=interaction, guild_id=self.guild_id)
+        modal = VerifyAccountModal(player_data, action_view_interaction=interaction, guild_id=self._resolve_guild_id(interaction))
         await interaction.response.send_modal(modal)
     
     @discord.ui.button(label="📋 My Accounts", style=discord.ButtonStyle.secondary, row=0, custom_id="registration_my_accounts")
@@ -507,7 +555,7 @@ class RegistrationView(discord.ui.View):
             return
         
         # Show account management view
-        view = AccountManagementView(user_id, self.guild_id, interaction.user.display_name)
+        view = AccountManagementView(user_id, self._resolve_guild_id(interaction), interaction.user.display_name)
         await view.show_overview(interaction)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:  # type: ignore[type-arg, override]

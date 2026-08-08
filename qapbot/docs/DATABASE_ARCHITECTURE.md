@@ -80,6 +80,33 @@ Queries that need the full time range (e.g. `/whois`, full-history reports)
 Code: `qapbot/db_manager.py` — `initialize()`, `_create_history_schema()`,
 `attach_history_db()`, `_history_cutoff()`, `nightly_db_maintenance()`.
 
+### Gotcha: pragmas are schema-scoped, not connection-scoped
+
+`PRAGMA journal_mode=WAL` (and `synchronous`) apply only to the schema they're run against.
+Running the unqualified pragma on `main` BEFORE `ATTACH DATABASE ... AS history` does **not**
+affect the newly attached `history` schema — it silently stays on SQLite's default rollback
+journal mode, which does an fsync-heavy journal-file create/delete per commit. Barely noticeable
+on fast local NVMe, catastrophic on NAS/external-SATA storage (2026-07 incident: a migration ran
+at ~2MB/s on the PROD NAS vs ~2GB/hr on a fast Windows dev box).
+
+Fix: after every `ATTACH DATABASE ? AS history`, explicitly run
+`PRAGMA history.journal_mode=WAL` and `PRAGMA history.synchronous=NORMAL`. This must be repeated
+at EVERY attach site — there is no single global place. As of 2026-07 the 5 sites are:
+`initialize()`, `_reconnect()`, `_SyncConnectionPool._create_conn()`, the `_sync_conn()` fallback
+path, and the shared `attach_history_db()` helper (used by all `qapbot/scripts/*.py` maintenance
+scripts). If a 6th attach site is ever added, it needs the same two lines.
+
+Verification trick: after the fix, a `<historydb>.db-wal` file should appear and grow during
+writes. Its ABSENCE while writes are happening is the tell-tale sign the schema is still on
+rollback-journal mode.
+
+### On-demand ops scripts
+
+`qapbot/scripts/run_history_migration_now.py` and `qapbot/scripts/run_db_maintenance_now.py` let
+you trigger the monthly hot→history migration / nightly VACUUM+ANALYZE maintenance immediately
+via CLI (bot must be stopped first) instead of waiting for the scheduled window. Both are
+idempotent and safe to interrupt/rerun.
+
 ---
 
 ## Database Schema
@@ -473,6 +500,39 @@ re-check) rather than trusting them long-term.
   fallbacks (`COALESCE(NULLIF(wa.defender_th, 0), wa.th_level)`) instead.
 - **Missing index on JOIN target**: always verify that the right-hand side of a JOIN has
   an index on the join column; SQLite will silently full-scan the target table otherwise.
+- **Never `LEFT JOIN` a `UNION ALL` CTE** (e.g. `ws AS (SELECT * FROM main.war_summary UNION ALL
+  SELECT * FROM history.war_summary)` joined via `FROM wa LEFT JOIN ws ON ...`): SQLite cannot use
+  a co-routine for the right-hand side of a LEFT JOIN, so it MATERIALIZEs the compound subquery in
+  full BEFORE the join — scanning every row of both underlying tables (multi-million rows on prod)
+  on every call, regardless of how selective the outer query is. This caused `/whois player` to
+  take 59s+ (and OOM under load) after the 2026-07-11 hot/history split introduced the pattern.
+  Confirm via `EXPLAIN QUERY PLAN` ("MATERIALIZE ws" + "SCAN main.X"/"SCAN history.X"). Fix:
+  `LEFT JOIN` each physical table directly (`LEFT JOIN main.war_summary ws_h ... LEFT JOIN
+  history.war_summary ws_a ...`) and `COALESCE(ws_h.col, ws_a.col, ...)` the columns — each table
+  keeps its own index usable for a cheap per-row SEARCH instead of a full scan (verified: 59s →
+  0.02s on the same DB). `INNER JOIN`s and scalar subqueries against a `UNION ALL` CTE do **not**
+  have this problem — only `LEFT JOIN` triggers forced materialization. Fixed functions
+  (2026-07-16): `get_player_war_history_sync`, `get_player_attack_summary_sync`,
+  `get_player_monthly_star_dist_sync`. Check `EXPLAIN QUERY PLAN` for "MATERIALIZE" before
+  shipping any NEW query joining hot+history data.
+- **Ambiguous column name after splitting one UNION-ALL CTE into two direct joins**: when
+  rewriting `LEFT JOIN ws` (single CTE) into `LEFT JOIN main.X ws_h ... LEFT JOIN history.X ws_a`
+  (the fix above), watch for any `GROUP BY`/`ORDER BY` that reuses a column name which is a REAL
+  column on the underlying table (e.g. `is_cwl`, `cwl_season`). With one merged CTE only one
+  source exposed that column name, so SQLite resolved it unambiguously. With two separately
+  joined tables BOTH now expose it, so a bare `GROUP BY is_cwl` becomes genuinely ambiguous even
+  though the SELECT list defines an `is_cwl` alias via `COALESCE`. Fix: `GROUP BY`/`ORDER BY` the
+  full expression (`COALESCE(ws_h.is_cwl, ws_a.is_cwl, ...)`), not the bare alias. Bit
+  `get_player_monthly_star_dist_sync` and `compute_roster_stats_sync` after the 2026-07-16 fix —
+  check every `GROUP BY`/`ORDER BY`, not just the SELECT list, when doing this kind of rewrite.
+- **`COUNT(*)`/`COUNT(DISTINCT)` over hot+history has no O(1) shortcut**: `wars_count`/
+  `attacks_count` in `get_global_db_statistics_sync()` require a full index scan across BOTH hot
+  and history `war_summary`/`war_attacks` (5M+ and 94M+ rows) — SQLite cannot know these counts
+  without scanning, even across a `UNION ALL` of two attached schemas. Direct cause of `/status`
+  being slow (~3s fast local SSD, 20+s prod NAS). Since it's a reporting stat with no
+  business-logic dependency, fixed with a simple 5-minute TTL cache on the `WarHistoryDB` instance
+  (`_global_stats_cache` / `_GLOBAL_STATS_TTL`) rather than incremental counters (which would
+  require touching every insert/delete site — much higher risk for a cosmetic stat).
 
 ---
 
@@ -1184,6 +1244,23 @@ re-check) rather than trusting them long-term.
 - Run integrity check
 - Restore from most recent backup
 - Review server-machine stability (if on network storage)
+
+### `VACUUM INTO` swap: Windows vs Linux file-handle semantics
+`nightly_db_maintenance()`'s VACUUM path does `VACUUM INTO 'x.vacuumed'` then swaps it into place
+with `os.remove(-wal/-shm)` + `os.replace()`. Closing the sqlite3 connection AFTER this swap works
+on Linux (unlink/rename on an open file just detaches the directory entry) but fails on Windows
+with WinError 5/32 (can't delete/rename a file with an open handle). Fix: close the connection
+FIRST, then remove/replace, then reopen. Bit DEV testing on Windows; PROD (Linux) was unaffected,
+but the ordering is now correct on both.
+
+### Random pre-existing index corruption — always run a quick_check after big DB ops
+After a migration+VACUUM on the DEV DB (2026-07-12), `PRAGMA integrity_check` found
+"wrong # of entries in index sqlite_autoindex_clans_1" — not caused by the migration itself
+(confirmed: no actual duplicate `clan_tag` rows; `COUNT(*)` was correct, only
+`COUNT(DISTINCT clan_tag)` was inflated by stale index entries). Fixed instantly with
+`REINDEX clans`. Run `PRAGMA integrity_check`/`quick_check` after any big VACUUM/migration op on a
+DB whose provenance includes raw file copies (vs. proper backup/restore tooling) — cheap
+insurance, and `REINDEX` is a safe, non-destructive fix for this class of issue.
 
 ---
 

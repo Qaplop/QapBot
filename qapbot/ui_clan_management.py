@@ -10,7 +10,7 @@ and data import/export views.
 import asyncio
 import discord
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable, Tuple
 
 from qapbot.i18n import t
 from qapbot.cache_manager import CACHE
@@ -2314,48 +2314,30 @@ class ClanManagementView(discord.ui.View):
         guild_id_str = str(interaction.guild.id)
         config = CACHE.server_config.get(guild_id_str, {})
         
-        # Get current channel settings
-        registration_channel_id = config.get("registration_channel_id")
-        war_notification_channel_id = config.get("war_notification_channel_id")
-        
-        # Get channel objects for display
-        registration_channel = None
-        war_channel = None
-        
-        if registration_channel_id:
-            try:
-                channel = interaction.guild.get_channel(int(registration_channel_id))
-                if channel and isinstance(channel, discord.TextChannel):
-                    registration_channel = channel
-            except Exception:
-                pass
-        
-        if war_notification_channel_id:
-            try:
-                channel = interaction.guild.get_channel(int(war_notification_channel_id))
-                if channel and isinstance(channel, discord.TextChannel):
-                    war_channel = channel
-            except Exception:
-                pass
-        
-        if not interaction.guild:
-            return
+        # Resolve the current channel object (if any) for every configured slot
+        current_channels: Dict[str, Optional[discord.TextChannel]] = {}
+        for slot in DEFAULT_CHANNEL_SLOTS:
+            channel_id = config.get(slot.config_key)
+            channel_obj: Optional[discord.TextChannel] = None
+            if channel_id:
+                try:
+                    channel = interaction.guild.get_channel(int(channel_id))
+                    if channel and isinstance(channel, discord.TextChannel):
+                        channel_obj = channel
+                except Exception:
+                    pass
+            current_channels[slot.key] = channel_obj
         
         # Create channel configuration view
         channel_config_view = ChannelConfigurationView(
             guild=interaction.guild,
             clan_management_view=self,
             original_interaction=interaction,
-            current_registration_channel=registration_channel,
-            current_war_channel=war_channel,
+            current_channels=current_channels,
             timeout=300
         )
         
-        # Build current settings display
-        registration_display = registration_channel.mention if registration_channel else "❌ Not set"
-        war_display = war_channel.mention if war_channel else "❌ Not set"
-        
-        header_msg = f"🌐 **Channel Configuration**\n\nRegistration Channel: {registration_display}\nWar Channel: {war_display}"
+        header_msg = channel_config_view._format_header()
         
         # Use followup.send() to get a proper discord.Message object
         msg = await interaction.followup.send(
@@ -2590,182 +2572,190 @@ class ClanManagementView(discord.ui.View):
 # Channel Configuration View
 # ============================================================================
 
+class ChannelSlotConfig:
+    """Definition for one configurable channel slot in ChannelConfigurationView.
+
+    Adding a new channel slot (e.g. a future CWL hub channel) is a new instance
+    in DEFAULT_CHANNEL_SLOTS below — no new select/button/handler code needed.
+    """
+    __slots__ = ("key", "label", "config_key", "disable_flag_keys", "on_apply")
+
+    def __init__(
+        self,
+        key: str,
+        label: str,
+        config_key: str,
+        disable_flag_keys: Tuple[str, ...] = (),
+        on_apply: Optional[Callable[[str, Optional[str], Optional[str]], None]] = None,
+    ):
+        self.key = key
+        self.label = label
+        self.config_key = config_key
+        self.disable_flag_keys = disable_flag_keys
+        # Called as on_apply(guild_id_str, old_channel_id, new_channel_id) right after this
+        # slot's config_key is written, for slot-specific side effects (e.g. change tracking).
+        self.on_apply = on_apply
+
+
+def _track_registration_channel_change(guild_id_str: str, old_channel_id: Optional[str], new_channel_id: Optional[str]) -> None:
+    """Record the previous registration channel so the next repost can clean up the old message."""
+    if old_channel_id and new_channel_id and old_channel_id != new_channel_id:
+        CACHE.server_config[guild_id_str]["_old_registration_channel_id"] = old_channel_id
+        logging.debug(f"Channel change tracked during apply: old={old_channel_id}, new={new_channel_id}")
+
+
+DEFAULT_CHANNEL_SLOTS: Tuple[ChannelSlotConfig, ...] = (
+    ChannelSlotConfig(
+        key="registration",
+        label="Registration",
+        config_key="registration_channel_id",
+        disable_flag_keys=("registration_message_enabled",),
+        on_apply=_track_registration_channel_change,
+    ),
+    ChannelSlotConfig(
+        key="war",
+        label="War",
+        config_key="war_notification_channel_id",
+        disable_flag_keys=("channel_war_notifications_enabled",),
+    ),
+)
+
+
 class ChannelConfigurationView(discord.ui.View):
-    """View for configuring registration and war notification channels."""
+    """Generic view for configuring an arbitrary set of guild notification channels.
+
+    Driven by a list of `ChannelSlotConfig` (default: registration + war notifications) —
+    adding a new channel slot is a data change, not a new select/button/handler.
+    """
     def __init__(
         self,
         guild: discord.Guild,
         clan_management_view: 'ClanManagementView',
         original_interaction: discord.Interaction,
-        current_registration_channel: Optional[discord.TextChannel] = None,
-        current_war_channel: Optional[discord.TextChannel] = None,
+        current_channels: Optional[Dict[str, Optional[discord.TextChannel]]] = None,
+        slots: Tuple[ChannelSlotConfig, ...] = DEFAULT_CHANNEL_SLOTS,
         timeout: int = 300
     ):
         super().__init__(timeout=timeout)
         self.guild = guild
         self.clan_management_view = clan_management_view
         self.original_interaction = original_interaction
-        
-        # Selected channels
-        self.registration_channel: Optional[discord.TextChannel] = current_registration_channel
-        self.war_channel: Optional[discord.TextChannel] = current_war_channel
-        
+        self.slots = slots
+        self.selected_channels: Dict[str, Optional[discord.TextChannel]] = dict(current_channels or {})
+
         # Store config message for later deletion
         self.config_message: Optional[discord.Message] = None
-        
-        # Add UI components
-        self._add_registration_channel_select()
-        self._add_war_channel_select()
-        self._add_apply_button()
-        self._add_clear_buttons()
-    
-    def _add_registration_channel_select(self):
-        """Add selector for registration channel."""
-        registration_select = discord.ui.ChannelSelect(
-            placeholder="Select registration channel...",
+
+        # Add UI components: one select row per slot, then apply + one clear button per slot
+        for row, slot in enumerate(self.slots):
+            self._add_channel_select(slot, row)
+        button_row = len(self.slots)
+        self._add_apply_button(button_row)
+        self._add_clear_buttons(button_row)
+
+    def _add_channel_select(self, slot: ChannelSlotConfig, row: int) -> None:
+        """Add a channel selector for one slot."""
+        select = discord.ui.ChannelSelect(
+            placeholder=f"Select {slot.label.lower()} channel...",
             min_values=1,
             max_values=1,
             channel_types=[discord.ChannelType.text],
-            custom_id="config_registration_channel_select",
-            row=0
+            custom_id=f"config_channel_select_{slot.key}",
+            row=row
         )
-        registration_select.callback = self._on_registration_channel_select  # type: ignore[assignment]
-        self.add_item(registration_select)  # type: ignore[arg-type]
-    
-    def _add_war_channel_select(self):
-        """Add selector for war notification channel."""
-        war_select = discord.ui.ChannelSelect(
-            placeholder="Select war notification channel...",
-            min_values=1,
-            max_values=1,
-            channel_types=[discord.ChannelType.text],
-            custom_id="config_war_channel_select",
-            row=1
-        )
-        war_select.callback = self._on_war_channel_select  # type: ignore[assignment]
-        self.add_item(war_select)  # type: ignore[arg-type]
-    
-    def _add_apply_button(self):
+        select.callback = self._make_select_callback(slot)  # type: ignore[assignment]
+        self.add_item(select)  # type: ignore[arg-type]
+
+    def _make_select_callback(self, slot: ChannelSlotConfig) -> Callable[[discord.Interaction], Any]:
+        async def _callback(interaction: discord.Interaction) -> None:
+            logging.debug(f"ChannelConfigurationView select callback for slot '{slot.key}'")
+            await interaction.response.defer(thinking=False, ephemeral=False)
+            selected_channel = interaction.data['resolved']['channels'][interaction.data['values'][0]]  # type: ignore[index]
+            channel = discord.utils.get(self.guild.text_channels, id=int(selected_channel['id']))  # type: ignore[arg-type]
+            self.selected_channels[slot.key] = channel  # type: ignore[assignment]
+            logging.debug(f"{slot.label} channel selected: {channel.name if channel else 'None'}")
+        return _callback
+
+    def _add_apply_button(self, row: int) -> None:
         """Add apply button to save changes."""
         apply_button = discord.ui.Button(
             label="Apply Changes",
             style=discord.ButtonStyle.success,
             custom_id="apply_channel_config",
-            row=2
+            row=row
         )
         apply_button.callback = self._on_apply  # type: ignore[assignment]
         self.add_item(apply_button)  # type: ignore[arg-type]
-    
-    def _add_clear_buttons(self):
-        """Add clear buttons for each channel."""
-        clear_registration_button = discord.ui.Button(
-            label="Clear Registration",
-            style=discord.ButtonStyle.danger,
-            custom_id="clear_registration_channel",
-            row=2
-        )
-        clear_registration_button.callback = self._on_clear_registration  # type: ignore[assignment]
-        self.add_item(clear_registration_button)  # type: ignore[arg-type]
-        
-        clear_war_button = discord.ui.Button(
-            label="Clear War",
-            style=discord.ButtonStyle.danger,
-            custom_id="clear_war_channel",
-            row=2
-        )
-        clear_war_button.callback = self._on_clear_war  # type: ignore[assignment]
-        self.add_item(clear_war_button)  # type: ignore[arg-type]
-    
-    async def _on_registration_channel_select(self, interaction: discord.Interaction) -> None:
-        """Handle registration channel selection - store for later apply."""
-        logging.debug(f"ChannelConfigurationView._on_registration_channel_select called")
-        await interaction.response.defer(thinking=False, ephemeral=False)
-        
-        selected_channel = interaction.data['resolved']['channels'][interaction.data['values'][0]]  # type: ignore[index]
-        self.registration_channel = discord.utils.get(self.guild.text_channels, id=int(selected_channel['id']))  # type: ignore[arg-type]
-        logging.debug(f"Registration channel selected: {self.registration_channel.name if self.registration_channel else 'None'}")
-    
-    async def _on_war_channel_select(self, interaction: discord.Interaction) -> None:
-        """Handle war channel selection."""
-        await interaction.response.defer(thinking=False, ephemeral=False)
-        selected_channel = interaction.data['resolved']['channels'][interaction.data['values'][0]]  # type: ignore[index]
-        self.war_channel = discord.utils.get(self.guild.text_channels, id=int(selected_channel['id']))  # type: ignore[arg-type]
-    
-    async def _on_clear_registration(self, interaction: discord.Interaction) -> None:
-        """Clear the registration channel selection."""
-        await interaction.response.defer(thinking=False, ephemeral=False)
-        self.registration_channel = None
-        
-        # Update the header message to show cleared status
-        registration_display = "❌ Not set"
-        war_display = self.war_channel.mention if self.war_channel else "❌ Not set"
-        updated_msg = f"🌐 **Channel Configuration**\n\nRegistration Channel: {registration_display}\nWar Channel: {war_display}"
-        
+
+    def _add_clear_buttons(self, row: int) -> None:
+        """Add one clear button per slot."""
+        for slot in self.slots:
+            clear_button = discord.ui.Button(
+                label=f"Clear {slot.label}",
+                style=discord.ButtonStyle.danger,
+                custom_id=f"clear_channel_{slot.key}",
+                row=row
+            )
+            clear_button.callback = self._make_clear_callback(slot)  # type: ignore[assignment]
+            self.add_item(clear_button)  # type: ignore[arg-type]
+
+    def _make_clear_callback(self, slot: ChannelSlotConfig) -> Callable[[discord.Interaction], Any]:
+        async def _callback(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(thinking=False, ephemeral=False)
+            self.selected_channels[slot.key] = None
+            await self._refresh_header_message()
+        return _callback
+
+    def _format_header(self) -> str:
+        """Build the header message text reflecting the currently selected channels."""
+        lines = [
+            f"{slot.label} Channel: {channel.mention if (channel := self.selected_channels.get(slot.key)) else '❌ Not set'}"
+            for slot in self.slots
+        ]
+        return "🌐 **Channel Configuration**\n\n" + "\n".join(lines)
+
+    async def _refresh_header_message(self) -> None:
         if self.config_message:
             try:
-                await self.config_message.edit(content=updated_msg, view=self)
+                await self.config_message.edit(content=self._format_header(), view=self)
             except Exception as e:
                 logging.error(f"Failed to update config message: {e}")
-    
-    async def _on_clear_war(self, interaction: discord.Interaction) -> None:
-        """Clear the war notification channel selection."""
-        await interaction.response.defer(thinking=False, ephemeral=False)
-        self.war_channel = None
-        
-        # Update the header message to show cleared status
-        registration_display = self.registration_channel.mention if self.registration_channel else "❌ Not set"
-        war_display = "❌ Not set"
-        updated_msg = f"🌐 **Channel Configuration**\n\nRegistration Channel: {registration_display}\nWar Channel: {war_display}"
-        
-        if self.config_message:
-            try:
-                await self.config_message.edit(content=updated_msg, view=self)
-            except Exception as e:
-                logging.error(f"Failed to update config message: {e}")
-    
+
     async def _on_apply(self, interaction: discord.Interaction) -> None:
-        """Apply channel configuration changes."""
+        """Apply channel configuration changes for every slot."""
         await interaction.response.defer(thinking=False, ephemeral=False)
-        
+
         from qapbot.cache_manager import CACHE
-        
+
         # Ensure we have a guild
         if not interaction.guild:
             await interaction.response.send_message("This command must be used in a guild.", ephemeral=True)
             return
-        
+
         guild_id_str = str(interaction.guild.id)
-        
+
         if guild_id_str not in CACHE.server_config:
             CACHE.server_config[guild_id_str] = {}
-        
-        # Track if registration channel changed
-        old_registration_channel_id = CACHE.server_config[guild_id_str].get("registration_channel_id")
-        
-        if self.registration_channel:
-            new_registration_channel_id = str(self.registration_channel.id)
-            CACHE.server_config[guild_id_str]["registration_channel_id"] = new_registration_channel_id
-            
-            # Track old channel for deletion if it changed
-            if old_registration_channel_id and old_registration_channel_id != new_registration_channel_id:
-                CACHE.server_config[guild_id_str]["_old_registration_channel_id"] = old_registration_channel_id
-                logging.debug(f"Channel change tracked during apply: old={old_registration_channel_id}, new={new_registration_channel_id}")
-        elif "registration_channel_id" in CACHE.server_config[guild_id_str]:
-            # If cleared, remove from config and disable the feature
-            del CACHE.server_config[guild_id_str]["registration_channel_id"]
-            CACHE.server_config[guild_id_str]["registration_message_enabled"] = False
-        
-        if self.war_channel:
-            CACHE.server_config[guild_id_str]["war_notification_channel_id"] = str(self.war_channel.id)
-        elif "war_notification_channel_id" in CACHE.server_config[guild_id_str]:
-            # If cleared, remove from config and disable the feature
-            del CACHE.server_config[guild_id_str]["war_notification_channel_id"]
-            CACHE.server_config[guild_id_str]["channel_war_notifications_enabled"] = False
-        
+        guild_config = CACHE.server_config[guild_id_str]
+
+        for slot in self.slots:
+            old_channel_id = guild_config.get(slot.config_key)
+            selected_channel = self.selected_channels.get(slot.key)
+            if selected_channel:
+                new_channel_id = str(selected_channel.id)
+                guild_config[slot.config_key] = new_channel_id
+                if slot.on_apply:
+                    slot.on_apply(guild_id_str, old_channel_id, new_channel_id)
+            elif slot.config_key in guild_config:
+                # If cleared, remove from config and disable the dependent feature(s)
+                del guild_config[slot.config_key]
+                for flag_key in slot.disable_flag_keys:
+                    guild_config[flag_key] = False
+
         await CACHE.persist_server_config(guild_id_str)
-        
+
         # Trigger repost if registration message is enabled (handles channel change or other updates)
-        if CACHE.server_config[guild_id_str].get("registration_message_enabled", False):
+        if guild_config.get("registration_message_enabled", False):
             logging.debug(f"Registration message enabled, triggering repost after apply")
             try:
                 from QapBot import repost_playerregistration_messages
@@ -2774,10 +2764,10 @@ class ChannelConfigurationView(discord.ui.View):
                 logging.debug(f"Repost task created after apply")
             except Exception as e:
                 logging.warning(f"Could not trigger repost after channel config apply: {e}")
-        
+
         # Refresh management view
         await self.clan_management_view._refresh_config_view(interaction)  # type: ignore[attr-defined]
-        
+
         # Delete the configuration message after a short delay to ensure main view is updated
         if self.config_message:
             try:

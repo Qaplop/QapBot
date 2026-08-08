@@ -25,6 +25,9 @@ def cache(db, monkeypatch: pytest.MonkeyPatch):
 
     manager = CacheManager()
     manager.db_manager = db
+    # Tests exercise post-startup behavior; the users_loaded gate (data-loss guard
+    # against write-through on an unloaded cache) is tested separately below.
+    manager.users_loaded = True
 
     # Avoid any filesystem reads from data/temp during integration tests
     monkeypatch.setattr(manager, "load_all_temp_war_stats", lambda: None)
@@ -80,6 +83,78 @@ class TestCacheLoad:
         await cache.load_user_accounts()
         assert cache.user_accounts["999"]["display_name"] == "FromDB"
         assert cache.user_accounts["999"]["user_language"] == "de"
+
+
+class TestUsersLoadedDataLossGuard:
+    """Write-through on an unloaded cache must be refused — a cache-blind save_user()
+    replaces the whole players list, so a skeleton entry with players=[] hard-deletes
+    every linked account (2026-08-08 prod incident: a button click during startup
+    wiped a user's 5 account links)."""
+
+    @pytest.mark.integration
+    async def test_persist_user_refused_before_load(self, cache, db):
+        cache.users_loaded = False
+        await db.save_user(
+            "555",
+            {
+                "display_name": "Victim",
+                "notification_settings": {"war_reminders": True},
+                "players": [{"player_tag": "#V1", "player_name": "Main"}],
+                "user_language": "en",
+            },
+        )
+        # Simulate the incident: pre-load skeleton entry in an otherwise empty cache
+        cache.user_accounts["555"] = {"display_name": "Victim", "players": []}
+
+        with pytest.raises(RuntimeError, match="before user accounts are loaded"):
+            await cache.persist_user("555")
+
+        # The DB rows must be untouched
+        loaded = await db.get_user("555")
+        assert loaded is not None
+        assert len(loaded["players"]) == 1
+
+    @pytest.mark.integration
+    async def test_set_user_account_refused_before_load(self, cache):
+        cache.users_loaded = False
+        with pytest.raises(RuntimeError, match="before user accounts are loaded"):
+            await cache.set_user_account("555", {"display_name": "X", "players": []})
+
+    @pytest.mark.integration
+    async def test_delete_user_account_refused_before_load(self, cache):
+        cache.users_loaded = False
+        with pytest.raises(RuntimeError, match="before user accounts are loaded"):
+            await cache.delete_user_account("555")
+
+    @pytest.mark.integration
+    async def test_update_user_metadata_skips_before_load(self, cache, db):
+        """The exact incident path: update_user_metadata (called by every registration
+        button) must NOT fabricate a players=[] skeleton and persist it pre-load."""
+        cache.users_loaded = False
+        await db.save_user(
+            "666",
+            {
+                "display_name": "Victim2",
+                "notification_settings": {"war_reminders": True},
+                "players": [{"player_tag": "#V2", "player_name": "Alt"}],
+                "user_language": "en",
+            },
+        )
+        cache.user_accounts = {}  # startup state: nothing loaded yet
+
+        result = await cache.update_user_metadata("666")
+
+        assert result is False
+        assert "666" not in cache.user_accounts  # no skeleton fabricated
+        loaded = await db.get_user("666")
+        assert loaded is not None
+        assert len(loaded["players"]) == 1  # DB rows untouched
+
+    @pytest.mark.integration
+    async def test_load_user_accounts_sets_users_loaded(self, cache):
+        cache.users_loaded = False
+        await cache.load_user_accounts()
+        assert cache.users_loaded is True
 
 
 class TestCachePreserveUnknownKeys:

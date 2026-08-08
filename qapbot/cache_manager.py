@@ -127,6 +127,11 @@ class CacheManager:
         await CACHE.persist_user(user_id)  # Write-through to database
     """
 
+    # Class-level default for the data-loss guard (see __init__) — ensures even
+    # instances created without __init__ (e.g. test fixtures using __new__) fail
+    # safe (writes refused) instead of raising AttributeError.
+    users_loaded: bool = False
+
     def __init__(self) -> None:
         """
         Initialize cache manager with empty data structures.
@@ -145,6 +150,13 @@ class CacheManager:
         self.clan_families: Dict[str, Dict[str, Any]] = {}  # family_tag -> {"name": str, "clans": List[str]}
         # User accounts with discord user_id to dict with display_name and players list
         self.user_accounts: Dict[str, Dict[str, Any]] = {}  # user_id -> {"display_name": str, "notification_settings": {...}, "players": List[{"player_tag": str, "player_name": str, "verified": bool}]}
+        # Data-loss guard: False until load_user_accounts() has successfully populated
+        # user_accounts from the DB. All user write-through paths refuse to run while
+        # False — a write based on a not-yet-loaded cache would persist an empty/partial
+        # entry over real DB rows (save_user() replaces the whole players list, so a
+        # skeleton entry with players=[] hard-deletes every linked account — exactly the
+        # 2026-08-08 prod incident where a button click during startup wiped 5 links).
+        self.users_loaded: bool = False
         # Notification state tracking to prevent duplicate war reminders
         self.notification_state: Dict[str, Dict[str, Any]] = {}  # war_id -> {"notified_players": {player_tag: {...}}}
         # Server configuration for role management, welcome message, and war notifications (guild_id -> config)
@@ -944,6 +956,7 @@ class CacheManager:
         
         try:
             self.user_accounts = await self.db_manager.get_all_users_dict()
+            self.users_loaded = True
             logging.info(f"[DB-READ] Loaded {len(self.user_accounts)} user accounts from database")
             return
         except Exception as e:
@@ -964,6 +977,13 @@ class CacheManager:
         Raises:
             Exception: If database write fails
         """
+        if not self.users_loaded:
+            # Writing before the DB load completes would persist this (necessarily
+            # cache-blind) entry over the user's real DB rows — see users_loaded.
+            raise RuntimeError(
+                f"Refusing set_user_account({discord_id}) before user accounts are loaded from DB "
+                "(write-through on an unloaded cache would overwrite real data)"
+            )
         try:
             # Preserve unknown fields from existing data (Pitfall 7)
             if discord_id in self.user_accounts:
@@ -995,6 +1015,11 @@ class CacheManager:
         Raises:
             Exception: If database write fails or user not found in cache
         """
+        if not self.users_loaded:
+            raise RuntimeError(
+                f"Refusing persist_user({discord_id}) before user accounts are loaded from DB "
+                "(write-through on an unloaded cache would overwrite real data)"
+            )
         try:
             user_data = self.user_accounts.get(discord_id)
             if user_data is None:
@@ -1021,6 +1046,10 @@ class CacheManager:
         Raises:
             Exception: If database delete fails
         """
+        if not self.users_loaded:
+            raise RuntimeError(
+                f"Refusing delete_user_account({discord_id}) before user accounts are loaded from DB"
+            )
         try:
             # Remove from in-memory cache
             if discord_id in self.user_accounts:
@@ -1061,6 +1090,16 @@ class CacheManager:
         try:
             # Ensure user_id is string
             user_id = str(user_id)
+
+            if not self.users_loaded:
+                # Before the DB load completes the cache is empty — the skeleton-creation
+                # below would fabricate a players=[] entry for an existing user and the
+                # write-through would hard-delete their real user_players rows (2026-08-08
+                # prod incident). Metadata refresh is cosmetic; skip it entirely pre-load.
+                logging.warning(
+                    f"[STARTUP-GUARD] Skipping update_user_metadata({user_id}) — user accounts not yet loaded from DB"
+                )
+                return False
 
             updated = False
             

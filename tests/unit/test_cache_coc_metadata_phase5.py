@@ -23,6 +23,7 @@ class TestUpdateUserMetadata:
         from qapbot.cache_manager import CacheManager
         cm = CacheManager()
         cm.user_accounts = {}
+        cm.users_loaded = True  # tests exercise post-startup behavior; pre-load gate tested in test_cache_manager.py
         cm.persist_user = AsyncMock()
         return cm
 

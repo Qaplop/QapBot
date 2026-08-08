@@ -52,6 +52,7 @@ from QBhelperfunctions import (
     update_clan_war_info_and_stats, generate_cwl_group_analysis_embeds,
     update_cwl_group_stats, generate_cwl_group_image,
     build_cwl_opponent_embeds, parse_month_argument, resolve_subscription_period,
+    coc_clan_profile_url, coc_player_profile_url,
 )
 from QapBot import GLOBAL_GUILD_ID, run_nightly_maintenance_routine, is_monthly_migration_due
 from qapbot.config import CONFIG
@@ -4040,9 +4041,9 @@ async def _player_report_logic(
     if cw_no_result:
         cw_record_str += f"  *({cw_no_result} no data)*"
 
-    profile_url = f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag=%23{tag_clean}"
+    profile_url = coc_player_profile_url(tag_clean)
     clan_tag_clean = last_war_clan_tag.lstrip('#')
-    clan_url = f"https://link.clashofclans.com/en?action=OpenClanProfile&tag=%23{clan_tag_clean}"
+    clan_url = coc_clan_profile_url(clan_tag_clean)
     embed = discord.Embed(
         description=(
             f"## Player: {th_emoji} {th_level}  [{player_name}]({profile_url})  ({tag})\n"
@@ -4261,7 +4262,7 @@ async def _whois_logic(interaction: discord.Interaction, user: Union[discord.Use
             default_text = " ✓ (Default)" if is_primary else ""
             
             # Line 1: TH-Icon, Player-Name, (#player-tag), Link-status
-            profile_url = f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag=%23{player_tag.replace('#', '')}"  # type: ignore[union-attr]
+            profile_url = coc_player_profile_url(player_tag)  # type: ignore[union-attr]
             # Use custom TH emoji instead of text
             th_emoji = getattr(BotEmojis, f'TH{th_level:02d}', f'TH{th_level}')
             line1 = f"{th_emoji} {th_level}\u2003•\u2003**[{player_name}]({profile_url})** ({player_tag}) {status_icon}{default_text}"

@@ -100,7 +100,7 @@ from QBhelperfunctions import (
     post_leaderboard_to_discord, calculate_content_hash,
     fetch_clan_war_data, process_clan_war_data,
     generate_cwl_group_image, update_cwl_group_stats,
-    resolve_subscription_period,
+    resolve_subscription_period, coc_clan_profile_url,
 )
 
 # Sentinel returned by fetch_single_clan when the CoC API responded successfully
@@ -2479,6 +2479,15 @@ async def _setup_hook():
         )
         logging.info(f"[SETUP_HOOK] Successfully registered {len(COMMANDS)} commands, {len(COMMAND_GROUPS)} command groups, and {len(CONTEXT_MENUS)} context menus globally")
     
+    # Register the generic RegistrationView so buttons on registration messages posted
+    # BEFORE this process started keep working immediately after a restart, instead of
+    # being dead until the next repost cycle re-attaches a fresh view. Requires
+    # timeout=None + stable custom_ids on every button (both already the case); the
+    # guild-less instance resolves guild context per-click from the interaction.
+    from qapbot.ui_registration import RegistrationView
+    QBcore.bot.add_view(RegistrationView())
+    logging.info("[SETUP_HOOK] Registered persistent RegistrationView for restart-surviving buttons")
+
     logging.info("[SETUP_HOOK] Setup hook completed successfully")
 
 async def _clear_global_commands_after_ready():
@@ -3061,7 +3070,7 @@ async def on_member_join(member: discord.Member) -> None:
 
             if resolved_clan_tags:
                 clan_link_lines = [
-                    f"**{CACHE.get_clan_name(tag, tag)}**: <https://link.clashofclans.com/en?action=OpenClanProfile&tag={tag.replace('#', '')}>"
+                    f"**{CACHE.get_clan_name(tag, tag)}**: <{coc_clan_profile_url(tag)}>"
                     for tag in resolved_clan_tags
                 ]
                 if len(resolved_clan_tags) == 1:
@@ -3183,6 +3192,248 @@ async def cleanup_stale_ui_messages() -> None:
     if failed_count > 0:
         logging.warning(f"⚠️ Failed to delete {failed_count} messages (permission or other errors)")
 
+async def _get_channel_last_message_id(channel: discord.TextChannel) -> Optional[int]:
+    """Return the newest message ID in `channel`, or None on failure/empty channel."""
+    try:
+        async for msg in channel.history(limit=1, oldest_first=False):
+            return msg.id
+    except Exception:
+        return None
+    return None
+
+
+async def _confirm_delete_message_from_channel(channel_id: int, message_id: str, *, log_label: str = "anchored") -> bool:
+    """Best-effort delete of a tracked anchored message (registration, future CWL hubs, etc.).
+
+    Returns True only when Discord has *confirmed* the message (or its channel) no
+    longer exists — i.e. it's safe for the caller to drop tracking. `bot.get_channel()`
+    is a local-cache lookup, not proof of deletion, so a cache miss falls back to a live
+    `fetch_channel()` call. Any inconclusive outcome (Forbidden, HTTPException, network
+    error) returns False so the caller keeps tracking and retries next cycle instead of
+    losing the message ID while a live message may still be sitting in the channel
+    (that's how the old/new message pair turns into a visible duplicate — see
+    qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md Pitfall 15).
+    """
+    try:
+        channel = QBcore.bot.get_channel(channel_id)
+        if not channel:
+            try:
+                channel = await QBcore.bot.fetch_channel(channel_id)
+            except discord.NotFound:
+                return True  # Channel itself confirmed gone.
+            except Exception as e:
+                logging.debug(f"Could not confirm channel {channel_id} is gone: {e}")
+                return False
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return False
+        message = await channel.fetch_message(int(message_id))
+        await message.delete()
+        logging.debug(f"Deleted {log_label} message {message_id} from channel {channel_id}")
+        return True
+    except discord.NotFound:
+        return True  # Message (or its channel) already gone.
+    except Exception as e:
+        logging.debug(f"Could not delete {log_label} message {message_id} from channel {channel_id}: {e}")
+        return False
+
+
+async def repost_anchored_message(
+    *,
+    log_label: str,
+    enabled_key: str,
+    channel_key: str,
+    message_id_key: str,
+    old_channel_key: str,
+    last_bump_key: str,
+    build_content_and_view: Callable[[Any, int], Any],
+    dev_mode_allowed_channel_id: Optional[int] = None,
+    only_if_not_bottom: bool = False,
+    bump_cooldown_seconds: int = 300,
+) -> Tuple[int, int]:
+    """
+    Generic anchored-message lifecycle shared by every persistent, per-guild tracked message
+    (currently registration; future callers e.g. CWL hub messages reuse this instead of a copy).
+
+    Handles: posting/reposting, deleting when disabled, following a channel change, and never
+    risking a duplicate on an inconclusive delete (see COPILOT_PITFALLS_COOKBOOK.md Pitfall 15).
+    All per-feature specifics (which config keys, what content/view to post) are passed in —
+    this function itself has no registration-specific knowledge.
+
+    Args:
+        log_label: short name used in log lines (e.g. "registration").
+        enabled_key/channel_key/message_id_key/old_channel_key/last_bump_key: the
+            CACHE.server_config[guild_id] keys this feature uses for its anchored message.
+        build_content_and_view: async callback (channel, guild_id_int) -> (content, view)
+            returning what to post/repost.
+        dev_mode_allowed_channel_id: in DEV mode, skip all channels except this one
+            (None/0 = no DEV-mode filtering).
+        only_if_not_bottom: if True, only repost when the tracked message is NOT the newest
+            message in the channel (rate-limited by bump_cooldown_seconds).
+
+    Returns:
+        (posted_count, filtered_count) — filtered_count only ever increments in DEV mode.
+    """
+    server_config = CACHE.server_config
+    now_utc = datetime.now(timezone.utc)
+    posted_count = 0
+    filtered_count = 0
+
+    logging.debug(f"repost_anchored_message({log_label}) called, processing {len(server_config)} guilds")
+
+    for guild_id_str, config in server_config.items():
+        try:
+            guild_id_int = int(guild_id_str)
+        except (ValueError, TypeError):
+            continue
+
+        message_enabled = config.get(enabled_key, False)
+        channel_id = config.get(channel_key)
+        tracked_message_id = str(config.get(message_id_key) or "").strip()
+        old_channel_id = config.get(old_channel_key)  # Track if channel changed
+
+        # Case 1: message disabled - delete if it exists
+        if not message_enabled:
+            if tracked_message_id:
+                # Determine which channel to delete from (prefer current, fall back to old)
+                channel_to_delete_from = channel_id if channel_id else old_channel_id
+
+                deletion_confirmed = True
+                if channel_to_delete_from:
+                    deletion_confirmed = await _confirm_delete_message_from_channel(
+                        int(channel_to_delete_from), tracked_message_id, log_label=log_label
+                    )
+
+                if deletion_confirmed:
+                    # Clear the message ID and tracking
+                    config[message_id_key] = None
+                    config[old_channel_key] = None
+                    server_config[guild_id_str] = config
+                    CACHE.server_config = server_config
+                    await CACHE.persist_server_config(guild_id_str)
+                    logging.info(f"Deleted {log_label} message from guild {guild_id_int} (disabled)")
+                else:
+                    # Deletion outcome was inconclusive (rate limit/network/permissions) — keep
+                    # tracking so we retry next cycle instead of losing the message ID while a
+                    # live message may still be sitting in the channel.
+                    logging.warning(f"Could not confirm deletion of {log_label} message for guild {guild_id_int}; will retry next cycle")
+            continue
+
+        # Case 2: message enabled - post/update
+        if not channel_id:
+            continue
+
+        # Check if channel ID changed
+        if old_channel_id:
+            logging.debug(f"Channel change detected for {log_label}: old={old_channel_id}, new={channel_id}")
+            try:
+                old_id_int = int(old_channel_id) if isinstance(old_channel_id, str) else old_channel_id
+                new_id_int = int(channel_id) if isinstance(channel_id, str) else channel_id
+
+                if old_id_int != new_id_int:
+                    # Channel was actually changed - delete from old channel
+                    logging.debug(f"Channel mismatch confirmed: {old_id_int} != {new_id_int}")
+                    old_deletion_confirmed = True
+                    if tracked_message_id:
+                        old_deletion_confirmed = await _confirm_delete_message_from_channel(
+                            old_id_int, tracked_message_id, log_label=log_label
+                        )
+                        if old_deletion_confirmed:
+                            logging.info(f"Deleted {log_label} message from old channel {old_channel_id} (guild {guild_id_int})")
+                        else:
+                            logging.warning(f"Could not confirm deletion of {log_label} message from old channel {old_channel_id} (guild {guild_id_int}); will retry next cycle")
+                    if old_deletion_confirmed:
+                        # Clear the old channel tracking
+                        config[old_channel_key] = None
+                        # Clear message ID so it will be reposted to the new channel
+                        config[message_id_key] = None
+                        tracked_message_id = ""
+                        # Save config after clearing old tracking info
+                        server_config[guild_id_str] = config
+                        CACHE.server_config = server_config
+                        await CACHE.persist_server_config(guild_id_str)
+                        logging.debug(f"Cleared old channel tracking for guild {guild_id_int} ({log_label})")
+            except (ValueError, TypeError) as e:
+                logging.warning(f"Failed to compare channel IDs for guild {guild_id_int} ({log_label}): {e}")
+
+        # DEV MODE OVERRIDE:
+        # In DEV mode, skip all channels except the explicitly allowed one.
+        # Filter BEFORE trying to fetch channel to avoid "Could not find channel" warnings for other guilds.
+        # If dev_mode_allowed_channel_id is 0/None (not configured), allow all channels in the DEV guild.
+        if CONFIG.is_dev_mode and dev_mode_allowed_channel_id and int(channel_id) != dev_mode_allowed_channel_id:
+            filtered_count += 1
+            continue
+
+        # Get the Discord channel
+        channel = QBcore.bot.get_channel(int(channel_id))
+        if not channel:
+            logging.warning(f"Could not find {log_label} channel {channel_id} for guild {guild_id_int}")
+            continue
+
+        # Type guard - only process text-based channels that support views
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            logging.warning(f"{log_label.capitalize()} channel {channel_id} for guild {guild_id_int} is not a text-based channel")
+            continue
+
+        if only_if_not_bottom:
+            # Cooldown gate (stored in the config)
+            last_bump_iso = config.get(last_bump_key)
+            if isinstance(last_bump_iso, str) and last_bump_iso:
+                try:
+                    last_bump_dt = datetime.fromisoformat(last_bump_iso.replace("Z", "+00:00"))
+                    if (now_utc - last_bump_dt).total_seconds() < bump_cooldown_seconds:
+                        continue
+                except Exception:
+                    pass
+
+            # Bottom-most check: if tracked message is newest, do nothing
+            if tracked_message_id:
+                # Type guard for _get_channel_last_message_id (requires TextChannel)
+                if isinstance(channel, discord.TextChannel):
+                    last_id = await _get_channel_last_message_id(channel)
+                    if last_id is not None and str(last_id) == tracked_message_id:
+                        continue
+
+        # Delete old anchored message if it exists. Only proceed to post a new one once
+        # deletion is confirmed (discord.NotFound = already gone, fine) — an inconclusive
+        # failure (rate limit, network blip, permissions) must NOT fall through to posting a
+        # new message on top of a possibly-still-live old one, since that's exactly how the
+        # old+new pair shows up as a visible duplicate message.
+        if tracked_message_id:
+            try:
+                old_message = await channel.fetch_message(int(tracked_message_id))
+                await old_message.delete()
+                logging.debug(f"Deleted old {log_label} message {tracked_message_id} in channel {channel_id}")
+            except discord.NotFound:
+                # Message already gone (manually deleted, or never existed in this channel).
+                pass
+            except Exception as e:
+                logging.warning(f"Could not confirm deletion of old {log_label} message {tracked_message_id} in channel {channel_id} ({e}); skipping repost this cycle to avoid a duplicate.")
+                continue
+
+        content, view = await build_content_and_view(channel, guild_id_int)
+
+        try:
+            # Post new anchored message
+            new_message = await channel.send(content, view=view)
+
+            # Update server config with new message ID
+            config[message_id_key] = str(new_message.id)
+            config[last_bump_key] = now_utc.isoformat().replace("+00:00", "Z")
+            config[old_channel_key] = None  # Clear old channel tracking after successful post
+            server_config[guild_id_str] = config
+            CACHE.server_config = server_config
+            await CACHE.persist_server_config(guild_id_str)
+            posted_count += 1
+
+            channel_name = getattr(channel, 'name', 'Unknown')
+            logging.info(f"Reposted {log_label} message in {channel.guild.name}#{channel_name} (new message ID: {new_message.id})")
+
+        except Exception as e:
+            logging.error(f"Failed to repost {log_label} message in channel {channel_id}: {e}")
+
+    return posted_count, filtered_count
+
+
 async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False, bump_cooldown_seconds: int = PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS) -> None:
     """
     Repost player registration messages on bot startup for guilds with registration messages enabled.
@@ -3199,213 +3450,33 @@ async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False
         bump_cooldown_seconds: Minimum seconds between bumps per channel when only_if_not_bottom=True.
 
     In DEV mode, only processes the configured DISCORD_GUILD_ID.
+
+    Thin registration-specific wrapper around the generic repost_anchored_message() driver —
+    only the config keys and message content/view differ per anchored-message feature.
     """
     from qapbot.ui_registration import RegistrationView
+    from qapbot.QBdiscocmdshelper import get_playerregistration_message
 
-    async def _get_last_message_id(channel: discord.TextChannel) -> Optional[int]:
-        try:
-            async for msg in channel.history(limit=1, oldest_first=False):
-                return msg.id
-        except Exception:
-            return None
-        return None
-
-    async def _delete_message_from_channel(channel_id: int, message_id: str) -> bool:
-        """Best-effort delete of a tracked registration message.
-
-        Returns True only when Discord has *confirmed* the message (or its channel) no
-        longer exists — i.e. it's safe for the caller to drop tracking. `bot.get_channel()`
-        is a local-cache lookup, not proof of deletion, so a cache miss falls back to a live
-        `fetch_channel()` call. Any inconclusive outcome (Forbidden, HTTPException, network
-        error) returns False so the caller keeps tracking and retries next cycle instead of
-        losing the message ID while a live message may still be sitting in the channel
-        (that's how the old/new message pair turns into a visible duplicate).
-        """
-        try:
-            channel = QBcore.bot.get_channel(channel_id)
-            if not channel:
-                try:
-                    channel = await QBcore.bot.fetch_channel(channel_id)
-                except discord.NotFound:
-                    return True  # Channel itself confirmed gone.
-                except Exception as e:
-                    logging.debug(f"Could not confirm channel {channel_id} is gone: {e}")
-                    return False
-            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-                return False
-            message = await channel.fetch_message(int(message_id))
-            await message.delete()
-            logging.debug(f"Deleted registration message {message_id} from channel {channel_id}")
-            return True
-        except discord.NotFound:
-            return True  # Message (or its channel) already gone.
-        except Exception as e:
-            logging.debug(f"Could not delete registration message {message_id} from channel {channel_id}: {e}")
-            return False
-
-    server_config = CACHE.server_config
-    playerregistration_count = 0
-    filtered_count = 0
-    now_utc = datetime.now(timezone.utc)
-    
-    logging.debug(f"repost_playerregistration_messages called, processing {len(server_config)} guilds")
-
-    for guild_id_str, config in server_config.items():
-        try:
-            guild_id_int = int(guild_id_str)
-        except (ValueError, TypeError):
-            continue
-
-        registration_message_enabled = config.get('registration_message_enabled', False)
-        registration_channel_id = config.get('registration_channel_id')
-        tracked_message_id = str(config.get('registration_message_id') or "").strip()
-        old_channel_id = config.get('_old_registration_channel_id')  # Track if channel changed
-
-        # Case 1: Registration message disabled - delete if it exists
-        if not registration_message_enabled:
-            if tracked_message_id:
-                # Determine which channel to delete from (prefer current, fall back to old)
-                channel_to_delete_from = registration_channel_id if registration_channel_id else old_channel_id
-
-                deletion_confirmed = True
-                if channel_to_delete_from:
-                    deletion_confirmed = await _delete_message_from_channel(int(channel_to_delete_from), tracked_message_id)
-
-                if deletion_confirmed:
-                    # Clear the message ID and tracking
-                    config['registration_message_id'] = None
-                    config['_old_registration_channel_id'] = None
-                    server_config[guild_id_str] = config
-                    CACHE.server_config = server_config
-                    await CACHE.persist_server_config(guild_id_str)
-                    logging.info(f"Deleted registration message from guild {guild_id_int} (disabled)")
-                else:
-                    # Deletion outcome was inconclusive (rate limit/network/permissions) — keep
-                    # tracking so we retry next cycle instead of losing the message ID while a
-                    # live message may still be sitting in the channel.
-                    logging.warning(f"Could not confirm deletion of registration message for guild {guild_id_int}; will retry next cycle")
-            continue
-
-        # Case 2: Registration message enabled - post/update
-        if not registration_channel_id:
-            continue
-
-        # Check if channel ID changed
-        if old_channel_id:
-            logging.debug(f"Channel change detected: old={old_channel_id}, new={registration_channel_id}")
-            try:
-                old_id_int = int(old_channel_id) if isinstance(old_channel_id, str) else old_channel_id
-                new_id_int = int(registration_channel_id) if isinstance(registration_channel_id, str) else registration_channel_id
-                
-                if old_id_int != new_id_int:
-                    # Channel was actually changed - delete from old channel
-                    logging.debug(f"Channel mismatch confirmed: {old_id_int} != {new_id_int}")
-                    old_deletion_confirmed = True
-                    if tracked_message_id:
-                        old_deletion_confirmed = await _delete_message_from_channel(old_id_int, tracked_message_id)
-                        if old_deletion_confirmed:
-                            logging.info(f"Deleted registration message from old channel {old_channel_id} (guild {guild_id_int})")
-                        else:
-                            logging.warning(f"Could not confirm deletion of registration message from old channel {old_channel_id} (guild {guild_id_int}); will retry next cycle")
-                    if old_deletion_confirmed:
-                        # Clear the old channel tracking
-                        config['_old_registration_channel_id'] = None
-                        # Clear message ID so it will be reposted to the new channel
-                        config['registration_message_id'] = None
-                        tracked_message_id = ""
-                        # Save config after clearing old tracking info
-                        server_config[guild_id_str] = config
-                        CACHE.server_config = server_config
-                        await CACHE.persist_server_config(guild_id_str)
-                        logging.debug(f"Cleared old channel tracking for guild {guild_id_int}")
-            except (ValueError, TypeError) as e:
-                logging.warning(f"Failed to compare channel IDs for guild {guild_id_int}: {e}")
-
-        # DEV MODE OVERRIDE:
-        # In DEV mode, skip all channels except the explicitly allowed dev_playerregistration_channel_id.
-        # Filter BEFORE trying to fetch channel to avoid "Could not find channel" warnings for other guilds
-        # If dev_playerregistration_channel_id is 0 (not configured), allow all channels in the DEV guild
-        if CONFIG.is_dev_mode and CONFIG.dev_playerregistration_channel_id > 0 and int(registration_channel_id) != CONFIG.dev_playerregistration_channel_id:
-            filtered_count += 1
-            continue
-
-        # Get the Discord channel
-        channel = QBcore.bot.get_channel(int(registration_channel_id))
-        if not channel:
-            logging.warning(f"Could not find registration channel {registration_channel_id} for guild {guild_id_int}")
-            continue
-        
-        # Type guard - only process text-based channels that support views
-        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-            logging.warning(f"Registration channel {registration_channel_id} for guild {guild_id_int} is not a text-based channel")
-            continue
-
-        if only_if_not_bottom:
-            # Cooldown gate (stored in the config)
-            last_bump_iso = config.get("registration_message_last_bump_iso")
-            if isinstance(last_bump_iso, str) and last_bump_iso:
-                try:
-                    last_bump_dt = datetime.fromisoformat(last_bump_iso.replace("Z", "+00:00"))
-                    if (now_utc - last_bump_dt).total_seconds() < bump_cooldown_seconds:
-                        continue
-                except Exception:
-                    pass
-
-            # Bottom-most check: if tracked message is newest, do nothing
-            if tracked_message_id:
-                # Type guard for _get_last_message_id (requires TextChannel)
-                if isinstance(channel, discord.TextChannel):
-                    last_id = await _get_last_message_id(channel)
-                    if last_id is not None and str(last_id) == tracked_message_id:
-                        continue
-
-        # Delete old registration message if it exists. Only proceed to post a new one once
-        # deletion is confirmed (discord.NotFound = already gone, fine) — an inconclusive
-        # failure (rate limit, network blip, permissions) must NOT fall through to posting a
-        # new message on top of a possibly-still-live old one, since that's exactly how the
-        # old+new pair shows up as a visible duplicate registration message.
-        if tracked_message_id:
-            try:
-                old_message = await channel.fetch_message(int(tracked_message_id))
-                await old_message.delete()
-                logging.debug(f"Deleted old registration message {tracked_message_id} in channel {registration_channel_id}")
-            except discord.NotFound:
-                # Message already gone (manually deleted, or never existed in this channel).
-                pass
-            except Exception as e:
-                logging.warning(f"Could not confirm deletion of old registration message {tracked_message_id} in channel {registration_channel_id} ({e}); skipping repost this cycle to avoid a duplicate.")
-                continue
-
-        # Create new registration message - channel.guild is guaranteed safe after type guard above
+    async def _build_registration_content_and_view(channel: Any, guild_id_int: int) -> Tuple[str, discord.ui.View]:
         server_name = channel.guild.name
-        from qapbot.QBdiscocmdshelper import get_playerregistration_message
         logging.debug(f"Generating registration message:")
-        logging.debug(f"  - Channel: {registration_channel_id}")
         logging.debug(f"  - Guild: {guild_id_int} ({server_name})")
-        logging.debug(f"  - About to call get_playerregistration_message('{server_name}', guild_id={guild_id_int})")
         registration_msg = get_playerregistration_message(server_name, guild_id=guild_id_int)
         logging.debug(f"Generated registration message (first 200 chars):\n{registration_msg[:200]}...")
+        return registration_msg, RegistrationView(guild_id_int)
 
-        view = RegistrationView(guild_id_int)
-
-        try:
-            # Post new registration message
-            new_message = await channel.send(registration_msg, view=view)
-
-            # Update server config with new message ID
-            config['registration_message_id'] = str(new_message.id)
-            config['registration_message_last_bump_iso'] = now_utc.isoformat().replace("+00:00", "Z")
-            config['_old_registration_channel_id'] = None  # Clear old channel tracking after successful post
-            server_config[guild_id_str] = config
-            CACHE.server_config = server_config
-            await CACHE.persist_server_config(guild_id_str)
-            playerregistration_count += 1
-
-            channel_name = getattr(channel, 'name', 'Unknown')
-            logging.info(f"Reposted registration message in {channel.guild.name}#{channel_name} (new message ID: {new_message.id})")
-
-        except Exception as e:
-            logging.error(f"Failed to repost registration message in channel {registration_channel_id}: {e}")
+    playerregistration_count, filtered_count = await repost_anchored_message(
+        log_label="registration",
+        enabled_key="registration_message_enabled",
+        channel_key="registration_channel_id",
+        message_id_key="registration_message_id",
+        old_channel_key="_old_registration_channel_id",
+        last_bump_key="registration_message_last_bump_iso",
+        build_content_and_view=_build_registration_content_and_view,
+        dev_mode_allowed_channel_id=CONFIG.dev_playerregistration_channel_id or None,
+        only_if_not_bottom=only_if_not_bottom,
+        bump_cooldown_seconds=bump_cooldown_seconds,
+    )
 
     # Update logging to include filtered count in DEV mode
     if playerregistration_count > 0:

@@ -285,6 +285,7 @@ class TestSetUserAccountError:
         from qapbot.cache_manager import CacheManager
         cm = CacheManager.__new__(CacheManager)
         cm.user_accounts = {}
+        cm.users_loaded = True  # post-startup state; pre-load gate tested in test_cache_manager.py
         cm.db_manager = AsyncMock()
         cm.db_manager.save_user.side_effect = RuntimeError("fail")
         with pytest.raises(RuntimeError):
@@ -295,6 +296,7 @@ class TestSetUserAccountError:
         from qapbot.cache_manager import CacheManager
         cm = CacheManager.__new__(CacheManager)
         cm.user_accounts = {"U2": {"display_name": "X"}}
+        cm.users_loaded = True  # post-startup state; pre-load gate tested in test_cache_manager.py
         cm.db_manager = AsyncMock()
         cm.db_manager.save_user.side_effect = RuntimeError("fail")
         with pytest.raises(RuntimeError):

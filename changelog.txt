@@ -1,6 +1,174 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-08 (17)
+- Fixed: entry (16)'s root-cause was INCOMPLETE — user compared prod DB against backup and
+  confirmed the startup-window clicks did cause real data loss: exactly their own 5 user_players
+  rows (the accounts linked to the clicking Discord user) were deleted. Corrected mechanism:
+  every registration button starts with update_user_metadata_from_interaction() →
+  CACHE.update_user_metadata(), which CREATED a skeleton entry {"players": []} for any user
+  missing from the (not-yet-loaded) cache and write-through persisted it; save_user()/
+  _save_user_impl() implements persistence as DELETE FROM user_players + reinsert-from-payload,
+  so persisting the fabricated empty skeleton hard-deleted the user's real rows. The "no linked
+  accounts" window the user saw was the after-image of the wipe, not a stale read.
+  Hardened with three layers (entry 16's view-level fully_initialized gate remains layer 1):
+  Layer 2 — new CacheManager.users_loaded flag (False until load_user_accounts() succeeds;
+  class-level default False so even __init__-bypassing instances fail safe):
+  update_user_metadata() now skips entirely pre-load (logs [STARTUP-GUARD], never fabricates a
+  skeleton); set_user_account()/persist_user()/delete_user_account() raise RuntimeError pre-load
+  — no user write-through can ever run against an unloaded cache, regardless of which future
+  view/command forgets a layer-1 guard.
+  Layer 3 — _save_user_impl() (db_manager.py) logs a WARNING whenever a save would replace N>0
+  existing user_players rows with an EMPTY players list (legitimate only for an explicit
+  last-account unlink), so any future wipe is visible in the log the moment it happens.
+  New tests: tests/integration/test_cache_manager.py TestUsersLoadedDataLossGuard (5 tests,
+  including a reproduction of the exact incident path asserting the DB rows survive).
+  Test fixtures exercising post-startup behavior now set users_loaded=True explicitly
+  (test_cache_manager.py, test_cache_coc_metadata_phase5.py, test_cache_manager_coverage.py,
+  test_cache_writethrough_phase5.py, test_db_errors_phase5.py).
+  Docs: Pitfall 20 rewritten with the confirmed data-loss mechanism + 3-layer fix;
+  copilot-instructions.md short-list item 19 updated.
+  Files: qapbot/cache_manager.py, qapbot/db_manager.py. 1517 tests pass.
+  Note: the user's 5 links are being re-linked manually by the user; no data repair needed.
+
+2026-08-08 (16)
+- Fixed: user manually confirmed CODE_OPTIMIZATION_SUGGESTIONS.md item #3's fix (registration
+  buttons surviving a restart via bot.add_view()) but hit a regression: clicking an old message's
+  button right after a restart falsely reported "no linked accounts" for a user who was in fact
+  still registered. Root-caused (no DB corruption, no data loss): add_view() registers
+  RegistrationView's generic dispatch instance in _setup_hook(), which runs before the gateway
+  even connects — well before on_ready() finishes loading CACHE.user_accounts from the DB and
+  sets QBcore.bot.fully_initialized = True (that flag was already used to gate slash commands via
+  the CommandTree's interaction_check, but nothing gated component/button interactions the same
+  way). A click landing in that startup window read an empty/not-yet-populated
+  CACHE.user_accounts and reported "no accounts" even though the DB row was completely intact.
+  Fix: added RegistrationView.interaction_check() checking QBcore.bot.fully_initialized first —
+  if still starting up, responds with the existing commands.errors.startup_in_progress message
+  (ephemeral) and blocks the click; otherwise delegates to
+  super().interaction_check() (the existing maintenance-mode guard, monkey-patched onto
+  discord.ui.View in QBcore.py) so that behavior is unchanged once startup completes.
+  File: qapbot/ui_registration.py. New tests: tests/discord/test_ui_registration.py
+  (test_registration_view_blocks_before_fully_initialized,
+  test_registration_view_allows_once_fully_initialized). 1512 tests pass.
+
+2026-08-08 (15)
+- Fixed: user found a prod log line — `[NOTIFY-TIMING] index_build=0.001s get_active_wars=15.680s
+  war_loop=3.589s total=19.285s (active_wars=17302, ...)` — and suspected it was blocking Discord
+  command handling. Confirmed: `_get_active_wars()` (qapbot/war_notifications.py) is a plain
+  synchronous function with zero yield points in its loop (regex end-time parsing + dict/list
+  building per in-war clan), called directly (not via asyncio.to_thread) from
+  `check_wars_for_notifications()`. At CWL scale (17,302 in-war clans) this blocks the event loop
+  for the full ~15.7s — no Discord heartbeat or interaction can be processed for that entire
+  duration, exactly the suspected symptom.
+  History: this function used to be wrapped in `asyncio.to_thread()` for this exact reason: an
+  earlier changelog entry ("Performance: War notification check — eliminated 75-second event loop
+  blockage") added it as defense-in-depth. It was later removed once the function was rewritten to
+  be zero-file-I/O, on the assumption "zero I/O" also meant "fast enough to stay synchronous" — true
+  at the population size measured then, not at current CWL-season scale (17k+ in-war clans).
+  Fix: restored `await asyncio.to_thread(_get_active_wars)` at the call site. No signature change to
+  `_get_active_wars()` itself, so no test updates were needed — confirmed via
+  tests/unit/test_final_push_phase5.py's existing `patch(..., return_value=...)` mocks, which work
+  transparently through `asyncio.to_thread()` since it accepts any plain sync callable.
+  File: qapbot/war_notifications.py. 1514 tests pass (.\run_tests.ps1 -Full).
+  Note: written during a parallel Claude Code session's overlapping edits to this file — collided
+  on entry number (13) with entry-writing timing and was renumbered to (15) to stay unique, then
+  moved here to the top (its correct chronological position) once the parallel session finished.
+  Content/other entries untouched.
+
+2026-08-08 (14)
+- Changed: folded CODE_OPTIMIZATION_SUGGESTIONS.md item #6 (compute_roster_stats_sync() is the
+  one and only roster-scoring workhorse — extend it rather than adding parallel per-player stat
+  queries, per the 2026-07 hot/history-split correctness-bug lesson in DATABASE_ARCHITECTURE.md)
+  directly into CWL_ROSTER_PLANNING_PLAN.md's Phase 3 scoring section, where it's actually
+  needed. Also refreshed the plan's 3 remaining pointers at the (now fully implemented) items
+  #2/#3/#4 to describe the finished state instead of "not yet done" follow-up notes, and
+  removed the now-dangling CODE_OPTIMIZATION_SUGGESTIONS.md references in
+  QBhelperfunctions.py's coc_deep_link() docstring and
+  tests/unit/test_clan_tag_reference_registry.py's module docstring. Deleted
+  CODE_OPTIMIZATION_SUGGESTIONS.md — all 6 items are now either implemented (1-5) or merged
+  into the plan (6). All 1510 tests pass.
+
+2026-08-08 (13)
+- Fixed/Refactored: implemented CODE_OPTIMIZATION_SUGGESTIONS.md items #1 and #3 (both marked
+  done in that file; #2/#4/#5 were done in entry 12).
+  #1 — replaced is_clan_tag_referenced()'s hand-enumerated referencing-table checks with a
+  module-level CLAN_TAG_REFERENCING_TABLES registry (schema, table, column, extra_where) in
+  qapbot/db_manager.py. The conversion caught a REAL latent data-loss bug: guild_welcome_clans
+  has a REFERENCES clans ON DELETE CASCADE FK but was missing from the old enumeration — a clan
+  referenced only by welcome-message config could be orphan-purged, cascade-deleting its welcome
+  rows. Also newly protected: guild_config.welcome_clan_tag (legacy, still read) and main+history
+  cwl_league_groups (clan-name metadata for historical CWL displays). New test file
+  tests/unit/test_clan_tag_reference_registry.py (6 tests): asserts every REFERENCES clans FK in
+  the live DDL has a registry entry via PRAGMA foreign_key_list, validates registry entries
+  against real tables/columns and SQL validity, and covers purge-protection /
+  whois_player-discriminator behavior end-to-end. Pitfall 17 (COPILOT_PITFALLS_COOKBOOK.md) and
+  the CWL plan's ⚠️ note updated to point at the registry.
+  #3 — RegistrationView now registers a generic instance via QBcore.bot.add_view() in
+  _setup_hook() (QapBot.py), so registration-message buttons posted before a restart work
+  immediately instead of being dead until the next repost cycle. guild_id is now optional; all
+  button callbacks resolve guild context per-click via _resolve_guild_id(interaction) instead of
+  construction-time state (the generic instance has none). Repost path unchanged (still posts
+  per-guild instances with translated labels). First bot.add_view() usage in the codebase —
+  the same mechanism the CWL roster plan's hub views will use.
+  Files: qapbot/db_manager.py, qapbot/ui_registration.py, QapBot.py,
+  tests/unit/test_clan_tag_reference_registry.py. All 1510 tests pass.
+
+2026-08-08 (12)
+- Refactored: implemented CODE_OPTIMIZATION_SUGGESTIONS.md items #2, #4, #5 (all marked done
+  in that file).
+  #2 — added coc_deep_link()/coc_clan_profile_url()/coc_player_profile_url() helpers to
+  QBhelperfunctions.py; replaced all 10 inline CoC deep-link string-building call sites across
+  QBhelperfunctions.py, QapBot.py, QBdiscordcmds.py, fixing the QapBot.py:3064 site that was
+  missing the %23 encoding the other sites use.
+  #4 — extracted repost_anchored_message() (generic per-guild anchored-message post/repost/
+  delete driver) plus module-level _confirm_delete_message_from_channel()/
+  _get_channel_last_message_id() in QapBot.py, promoted out of repost_playerregistration_messages()'s
+  previously-nested helpers. repost_playerregistration_messages() is now a thin wrapper
+  supplying registration's config keys + content/view callback; behavior (confirmed-deletion-only
+  discipline per COPILOT_PITFALLS_COOKBOOK.md Pitfall 15, dev-mode channel filter, bump cooldown,
+  log lines) is unchanged. Future CWL hub anchored messages can call the generic driver directly.
+  #5 — generalized ChannelConfigurationView (qapbot/ui_clan_management.py) from 2 hardcoded
+  channel slots to a data-driven `ChannelSlotConfig`/`DEFAULT_CHANNEL_SLOTS` list with a
+  per-slot `on_apply` hook (used to preserve registration's old-channel-change tracking); a
+  future channel slot is one new ChannelSlotConfig entry, no new select/button/handler code.
+  All 1504 tests pass (verified via .\run_tests.ps1 after each change).
+
+- Changed: migrated the sole local-memory-tool note file (SQLite ATTACH/pragma scoping,
+  VACUUM INTO Windows/Linux ordering, LEFT JOIN + UNION ALL CTE materialization, GROUP BY
+  ambiguity after CTE-split, COUNT(*) hot+history caching, index-corruption quick_check,
+  event-loop/GIL blocking lesson, _ensure_clan_exists() FK-column gotcha, normalize_clan_tag()
+  over-matching, member_clans/member_families family-blind audit) out of the machine-local,
+  non-git-tracked memory store into the repo proper, per CLAUDE.md's "durable rules go in the
+  repo, not private memory" rule. DB/SQL-specific items folded into
+  qapbot/docs/DATABASE_ARCHITECTURE.md (Hot/History DB Split, Query Anti-Patterns,
+  Troubleshooting sections); code-pattern pitfalls added as Pitfalls 16-19 in
+  qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md, summarized as items 15-18 in
+  .github/copilot-instructions.md's pitfalls list. Updated stale "repo memory" references in
+  CWL_ROSTER_PLANNING_PLAN.md and CODE_OPTIMIZATION_SUGGESTIONS.md to point at the new doc
+  locations. Deleted the now-redundant local memory file; confirmed no other memory files
+  (user/session/repo scope) existed. Docs-only change, no code touched; no test run needed.
+
+2026-08-08 (10)
+- Changed: CWL_ROSTER_PLANNING_PLAN.md — full verification pass against the actual codebase
+  before implementation. Corrected wrong file/line claims (repost_playerregistration_messages
+  lives in QapBot.py:3186 not QBhelperfunctions.py; MemberClansConfigurationView at
+  ui_clan_management.py:3725; /help categories are t()-built, not static). Replaced the
+  planned bespoke guild_config per-column db setters with the real CACHE.server_config +
+  persist_server_config() pipeline (Cardinal Rule 2), documented the 3-stage guild_config
+  column pipeline new columns must thread through, switched Phase 3 scoring to reuse
+  compute_roster_stats_sync() (bulk, hot/history-aware) instead of per-player queries,
+  fixed Phase 5's join-link format to the existing in-repo pattern and start-time rendering
+  to Discord-native <t:...> timestamps (no locale helper exists in war_notifications.py),
+  aligned migration mechanics with the repo's "temporary ALTER block, then bake into
+  CREATE TABLE" convention, dropped the never-set 'assigning' status, and added two
+  regression guards: is_clan_tag_referenced() must learn the new clans-FK tables, and
+  cwl_events.updated_at must be set explicitly on every status transition (retention keys
+  off it). Added: CODE_OPTIMIZATION_SUGGESTIONS.md (project root) — 6 existing-code findings
+  from the review (orphan-purge table registry, inconsistent CoC deep-link encoding,
+  RegistrationView dead-button window, anchored-repost extraction, ChannelConfigurationView
+  generalization, compute_roster_stats_sync as the single roster-stats path).
+  Docs/planning-only change, no code touched; no test run needed.
+
 2026-08-08 (9)
 - Fixed: user spotted a redundant second full clan_name_cache scan every cycle, from prod log evidence
   — `[CATEGORIZE-TIMING] Categorized 419791 clan(s) in 5.086s` (the pre-existing main clan-categorization
