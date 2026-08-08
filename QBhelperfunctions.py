@@ -3518,9 +3518,20 @@ async def generate_cwl_group_analysis_embeds(clan_tag: str) -> List[discord.Embe
         avg_pos = map_pos_sum_val / total_atk if total_atk > 0 else 0
         pos_note = f"avg pos: {avg_pos:.1f}" if map_pos_sum_val > 0 else "pos unknown"
         atk_lines.append(
-            f"{_rank_label(rank)}{_th_emoji(th)} {player_link}"
-            f" · {clan_link}"
-            f" → ⭐ **{total_stars_val}** *({total_atk} atk · {pos_note})*"
+            # Bare (non-bracketed) LRM (U+200E) at the START of the line and
+            # at each transition OUT of an RTL name (after player_link, after
+            # clan_link) — matching the proven pattern used for opponent
+            # names elsewhere in this codebase: vs. [LRM name LRM](url)  LRM TAG.
+            # normalize_player_name() already brackets each name internally
+            # with LRM, but that alone only protects the name's own internal
+            # word order; live retesting confirmed a whole multi-field row
+            # like this one (rank, player, clan, arrow, stats) still gets its
+            # RTL runs merged into one and mirrored as a block unless every
+            # transition back to LTR content also has its own bare LRM
+            # anchor. See changelog for this bug.
+            f"\u200E{_rank_label(rank)}{_th_emoji(th)} {player_link}"
+            f"\u200E · {clan_link}"
+            f"\u200E → ⭐ **{total_stars_val}** *({total_atk} atk · {pos_note})*"
         )
     if not top_attackers:
         atk_lines.append("*Not enough attack data available yet.*")
@@ -3547,9 +3558,12 @@ async def generate_cwl_group_analysis_embeds(clan_tag: str) -> List[discord.Embe
         )
         player_link = f"[{normalize_player_name(dd['name'])}]({_player_url(ptag)})"
         def_lines.append(
-            f"{_rank_label(rank)}{_th_emoji(th)} {player_link}"
-            f" · {clan_link}"
-            f" → 🛡️ **{avg_conceded:.2f}** avg *({n_defs} defs)*"
+            # See matching comment in the attackers loop above for why bare
+            # LRM anchors are needed at every field transition, not just
+            # wrapped around each name.
+            f"\u200E{_rank_label(rank)}{_th_emoji(th)} {player_link}"
+            f"\u200E · {clan_link}"
+            f"\u200E → 🛡️ **{avg_conceded:.2f}** avg *({n_defs} defs)*"
         )
     if not top_defenders:
         def_lines.append("*Not enough defense data available yet.*")

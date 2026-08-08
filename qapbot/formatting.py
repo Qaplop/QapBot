@@ -444,18 +444,19 @@ def normalize_player_name(raw: str) -> str:
             break
     
     if has_rtl:
-        # Isolate the run with FSI/PDI (Unicode bidi isolates) rather than plain
-        # LRM marks. A bare LRM is a weak direction hint and does not stop the
-        # embedded RTL run from influencing neighboring neutral characters (dot
-        # separators, arrows, markdown link brackets/parens, medal/TH emoji) -
-        # in Discord embeds this caused surrounding punctuation to visually
-        # reorder around Arabic clan/player names (e.g. CWL group analyse
-        # embeds). FSI...PDI makes the whole run opaque to the outer LTR
-        # context while still rendering the RTL text in its own natural
-        # right-to-left word order internally.
-        FSI = '\u2068'  # First Strong Isolate
-        PDI = '\u2069'  # Pop Directional Isolate
-        return f"{FSI}{s}{PDI}"
+        # Wrap with LRM (Left-to-Right Mark), matching the proven pattern used
+        # elsewhere in this codebase for opponent names ("vs. [\u200e{name}\u200e]
+        # (...)  \u200e`{tag}`" in the CWL round lines). FSI/PDI Unicode bidi
+        # isolates were tried here first (theoretically stronger) but Discord's
+        # client does not appear to respect isolates \u2014 live retesting showed no
+        # change at all. Discord does respect plain LRM, but ONLY wrapping the
+        # name itself is not enough on its own: callers building a line that
+        # mixes an RTL name with other fields (separators, arrows, more text)
+        # also need a bare (non-bracketed) LRM at each transition OUT of the
+        # name into the next field \u2014 see QBhelperfunctions.py's CWL group
+        # analyse row builder for that half of the fix.
+        LRM = '\u200E'
+        return f"{LRM}{s}{LRM}"
 
     return s
 

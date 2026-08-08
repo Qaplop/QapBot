@@ -1,7 +1,6 @@
 Project Backlog, Improvement Ideas and General Remarks
 
 Immediate next steps:
-- Check the WARNINGs related to auto role system for missing users (see log file)
 - Known lower-priority follow-up (not fixed,
   admin-only/rarely invoked, no crash risk): the `/admin` CWL-group-backfill
   handler in qapbot/QBdiscocmdshelper_admin_command.py

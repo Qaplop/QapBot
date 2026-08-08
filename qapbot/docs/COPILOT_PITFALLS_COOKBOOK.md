@@ -662,3 +662,48 @@ Rule going forward: any new module-level code added near the top of `QapBot.py` 
 appends to a shared list) needs a dedup guard exactly like the one above, or it will silently
 double up the same way. Check with `python -c "import ast; ..."` or simply grep
 `^[A-Za-z_].*\.(append|add|register)\(` at column 0 in `QapBot.py` to audit for more of these.
+
+## Pitfall 23: RTL (Arabic/Hebrew) names in a Discord embed line scramble the WHOLE line, not just the name
+
+Symptom (2026-08-08): `/analyse league_group` embed rows mixing an Arabic clan/player name with other
+fields on the same line (`rank · player · clan → ⭐ total (atk info)`) displayed with the name's
+relative position swapped with the clan name, AND the trailing `→ ⭐ total` segment visually jumped to
+*before* the names — while the row's raw/logical text (confirmed via copy-paste out of Discord) was
+always byte-for-byte correct. Only the visual rendering was wrong.
+
+Root cause: Discord's client merges an RTL name with every following character up to the next
+unambiguous Latin-script text into ONE contiguous bidi run, and mirrors that whole span. In a line like
+`rank+TH  player · clan  → ⭐ 15  (5 atk...)`, everything from the RTL name through `→ ⭐ 15` gets pulled
+into that run — the mirror only stops at `(5 atk...)` because "atk" is unambiguous Latin text.
+
+Two plausible-looking fixes were tried and BOTH had zero effect, live-tested on Discord desktop and iOS:
+- **Unicode bidi isolates** (FSI `U+2068` / PDI `U+2069`) wrapped around the name. Theoretically the
+  textbook-correct fix (isolates make a run opaque to the surrounding context) — but Discord's client
+  does not appear to implement/respect isolates at all. (Independent corroborating signal: even the
+  `python-bidi` reference library throws `AssertionError: FSI not allowed here` — isolates are a
+  newer, less universally-supported bidi feature.)
+- **A single leading LRM** (`U+200E`) at the very start of the line. Anchors the START of the line to
+  LTR, but does nothing to stop content *after* the RTL name from being absorbed into its run — the
+  scramble was unaffected.
+
+Fix that actually worked: **plain LRM, applied twice per name** — once bracketing the name itself
+(already done by `normalize_player_name()` in `qapbot/formatting.py`: `f"{LRM}{name}{LRM}"`), AND
+again as a bare, non-bracketed LRM placed directly in the line's literal separator text at EVERY
+transition out of the name back into the rest of the line (before ` · `, before ` → `, etc.) — not
+just at the line's start. This matches an already-proven-working pattern elsewhere in this codebase,
+the CWL round-lines "vs. opponent" builder in `QBhelperfunctions.py`:
+```python
+f"vs. [{LRM}{opp_name}{LRM}]({opp_url})  {LRM}`{opp_tag}`{opp_league_str}"
+```
+Applied identically to the CWL group analyse row builder (also `QBhelperfunctions.py`):
+```python
+f"{LRM}{_rank_label(rank)}{_th_emoji(th)} {player_link}"
+f"{LRM} · {clan_link}"
+f"{LRM} → ⭐ **{total_stars_val}** *({total_atk} atk · {pos_note})*"
+```
+
+Rule going forward: any new Discord text (embed description, message content) that mixes a
+user-supplied RTL name with OTHER fields on the same line needs a bare LRM at every field-transition
+boundary after the name, not just marks wrapped around the name. Isolates (FSI/PDI) do not work on
+Discord — don't reach for them here even though they're the "more correct" Unicode mechanism in a
+spec-compliant renderer. When in doubt, replicate the two reference implementations above exactly.

@@ -967,16 +967,23 @@ kept here only for functions not narrated elsewhere.
 ├── pad_player_cell_leaderboard()
 ├── pad_player_cell_terminal()
 ├── normalize_player_name()
-│   └── RTL names (Arabic/Hebrew/etc.) are wrapped in FSI (U+2068) / PDI
-│       (U+2069) bidi isolate marks, not plain LRM (U+200E). LRM is a weak
-│       hint and does not stop an embedded RTL run from reordering adjacent
-│       LTR neutrals (·, →, markdown link brackets/parens, medal/TH emoji) —
-│       this caused visibly scrambled CWL group-analyse embed rows. FSI/PDI
-│       makes the run opaque to the outer LTR context while the RTL text
-│       still renders in its own natural direction inside the isolate. Both
-│       are zero-width (Cf category) so text_display_width() ignores them.
-│       Prefer this pattern (not manual LRM-wrapped "{name}" strings) for
-│       any new code embedding untrusted/user-supplied names in Discord text.
+│   └── RTL names (Arabic/Hebrew/etc.) are wrapped in plain LRM (U+200E)
+│       marks: "{LRM}{name}{LRM}". Unicode bidi ISOLATES (FSI U+2068 / PDI
+│       U+2069) were tried instead (theoretically stronger, and don't need
+│       help from the caller) but Discord's client does not appear to respect
+│       them — live retesting on both desktop and iOS showed zero effect.
+│       Plain LRM does work on Discord, but bracketing the name alone is only
+│       half the fix: any caller that builds a line mixing an RTL name with
+│       OTHER fields (separators, arrows, more text after the name) must ALSO
+│       place a bare, non-bracketed LRM at each transition out of the name
+│       back into the rest of the line — otherwise Discord merges the name's
+│       RTL run with everything up to the next unambiguous Latin-text run and
+│       mirrors that whole span (this is what caused CWL group-analyse embed
+│       rows to scramble — see changelog). See QBhelperfunctions.py's CWL
+│       group analyse row builder, and the "vs. [LRM name LRM](url)  LRM TAG"
+│       pattern in its CWL round-lines builder, for the reference
+│       implementation of both halves of this fix.
+│       LRM is zero-width (Cf category) so text_display_width() ignores it.
 
 🟦 QBcore.py
 ├── bot (discord.commands.Bot)

@@ -1,6 +1,67 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-08 (31)
+- Fixed: Entries 29/30's fixes for /analyse league_group's RTL scrambling also
+  had no effect live (confirmed identical on Discord desktop and iOS). Root-
+  caused precisely this time by comparing a real browser render of the exact
+  generated string against the row's actual raw text (copied out of Discord
+  by the user) and the screenshot's visual output side by side: the raw text
+  Discord stores is byte-for-byte correct in logical order — this was never
+  a text-construction bug — but the DISPLAYED order was an exact mirror of
+  the entire "player · clan → ⭐ total" span (both names swapped relative
+  order AND the trailing "→ ⭐ total" jumped to before them), stopping only
+  at "(atk info)" because that's unambiguous Latin text. That signature means
+  Discord is merging everything from the RTL name through the arrow/star/
+  total into ONE contiguous RTL run and reversing it as a block. Neither
+  entry 29's FSI/PDI isolates (Discord doesn't respect Unicode bidi isolate
+  characters at all — confirmed independently: even the python-bidi
+  reference library throws on them, they're a newer/less-supported feature)
+  nor entry 30's single leading LRM (only anchors the very start of the
+  line — does nothing to stop RTL absorption of content *after* the names)
+  addressed the actual mechanism.
+  Fix: found and matched the ALREADY-WORKING pattern elsewhere in this same
+  file — the CWL round-lines "vs. [opponent](url) `TAG`" builder (fixed
+  previously, see the "#2TAG rendering as 2#TAG" entry earlier in this log)
+  uses plain LRM (not isolates) bracketed around the name AND a second bare,
+  non-bracketed LRM placed directly in the literal separator text right
+  before the next field. Applied the exact same two-part pattern to
+  QBhelperfunctions.py's CWL group analyse row builder (both the attackers
+  and defenders loops): normalize_player_name() (qapbot/formatting.py)
+  reverted from FSI/PDI back to plain LRM bracketing, and a bare "‎" was
+  added at the START of each row and after player_link/clan_link — i.e.
+  immediately before every " · " and " → " transition, matching the proven
+  "vs. [LRM{name}LRM](url)  LRM`{tag}`" structure exactly. Updated the two
+  RTL-marker unit tests in test_formatting_modes.py back to asserting on
+  LRM. Corrected the qapbot/docs/CODE_STRUCTURE.md note (previously
+  recommended isolates) to describe the two-part LRM pattern and point at
+  both reference implementations for future RTL-name embedding.
+
+2026-08-08 (30)
+- Fixed: Entry 29's FSI/PDI isolate fix for /analyse league_group turned out to
+  be necessary but not sufficient — user retested live in Discord after a
+  restart and rows with Arabic names still scrambled identically. Diagnosed
+  with a side-by-side browser test (real Chromium, same rendering family as
+  Discord desktop/web): a plain browser renders the row CORRECTLY even with
+  NO direction marks at all, because a browser only ever reorders text within
+  the paragraph direction it's given, which defaults to LTR unless something
+  requests auto-detection. Discord's client must be auto-detecting a per-line
+  RTL/LTR direction from the line's first strong-direction character, and
+  that scan does not respect FSI/PDI isolate boundaries — it still "sees"
+  the Arabic name inside the isolate and flips the whole row's layout
+  (medal/star/arrow position), even though the name's own internal character
+  order is correctly isolated.
+  Fix: prepend a bare, non-isolated LRM (U+200E) as the literal first
+  character of each attacker/defender row string in QBhelperfunctions.py
+  (before _rank_label(rank)), so Discord's line-direction scan finds LTR
+  immediately, before it ever reaches the isolate. This is the same technique
+  (LRM placed directly in the line, not just wrapped around a name) that
+  already fixed the narrower "#TAG renders as TAG#" bug noted earlier in this
+  changelog — applied here at the whole-row scope because this row has more
+  content after the RTL name that also needs protecting from the flip.
+  The FSI/PDI isolation from entry 29 is kept (still correct for the name's
+  own internal RTL word order); this is an additive fix, not a revert.
+
 2026-08-08 (29)
 - Fixed: /analyse league_group embeds ("Best Attackers · CWL Group" /
   "Best Defenders · CWL Group") scrambled the display order of rows for
