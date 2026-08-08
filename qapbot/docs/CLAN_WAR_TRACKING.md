@@ -21,8 +21,40 @@ All write paths that change `track_war_updates` and `has_active_subscriptions` o
 | `track_war_updates` | QBhelperfunctions.py | `_harvest_cwl_group_clans()` | CWL group harvest | Group clan in Master III+ | True (22h polling) |
 | `track_war_updates` | QBhelperfunctions.py | `_harvest_cwl_group_clans()` | CWL group harvest | Group clan below Master III | False |
 | `has_active_subscriptions` | qapbot/ui_clan_management.py | `MemberClansConfigurationView._on_apply()` | Guild member_clan added, clan not yet cached | Unconditional (both fetch-success and fetch-failure branches) | False |
+| `has_active_subscriptions` | qapbot/cache_manager.py | `_sync_group_track_war_updates()` | Group league_rank freshly resolved (`_process_league_group_response`) | New group member not yet in `clan_name_cache` | False (inserted) |
+| `track_war_updates` | qapbot/cache_manager.py | `_sync_group_track_war_updates()` | Group league_rank freshly resolved (`_process_league_group_response`) | Any non-subscribed member (new insert or existing, promotion or demotion) | Set to match the group's confirmed league (True for M3+, False otherwise) |
 
 ---
+
+### 7. CWL group league confirmed (background, subscription-independent)
+
+File: qapbot/cache_manager.py `_sync_group_track_war_updates()`, called from `_process_league_group_response()`
+
+The group-wide counterpart to path 5 (`_update_clan_metadata()`) and path 6 (`_harvest_cwl_group_clans()`
+above) — those two only reach a clan that is already actively polled, or freshly discovered as an enemy
+of a *subscribed* clan, which left a gap: an already-known, non-subscribed clan in a group with no
+subscribed member (or no "new enemy" event this season) could sit indefinitely with a stale league and
+the wrong `track_war_updates` — the exact "~40,000 Master III+ clans silently stopped being polled"
+failure mode (2026-06-24 changelog entry).
+
+`_process_league_group_response()` runs on every fresh `get_league_group()` response (Layer 1 organic +
+Layer 2 finalization fallback, see `CWL_ROUND_TRACKING_PLAN.md`) and, the moment a group's `league_rank`
+is confirmed (new group discovery only — see that doc's league_rank timing note), sweeps every member in
+the response's `clans` list:
+
+- Subscribed clans are skipped entirely — always tracked regardless of league.
+- Members already in `clan_name_cache` get `war_league` and `track_war_updates` corrected to match the
+  group's confirmed league (promotion or demotion), with the same temp-file cleanup as path 5's demotion.
+- Members **not yet** in `clan_name_cache` at all are inserted directly from the already-fetched
+  `ClanWarLeagueGroup.clans` objects (tag + name) — no extra `get_clan()` call needed, since every member
+  of a CWL group shares one league by construction. Without this, only the single clan
+  `_process_league_group_response` may have queried live to resolve `league_rank` itself would get
+  inserted, silently dropping the other (up to 7) never-before-seen group-mates.
+
+This still cannot discover a "wholly foreign" group where **none** of the 8 members has ever been
+reachable from a subscribed clan (directly or transitively across past seasons) — every entry point into
+the discovery graph (`_upsert_enemy_clan_on_war_start`, `/cwlinfo`, and this sync) requires the querying
+clan to already be graph-reachable. See `CWL_ROUND_TRACKING_PLAN.md`'s coverage note for that residual gap.
 
 ## Detailed Assignment Locations
 
@@ -157,14 +189,11 @@ still a pure one-way ratchet. Globally, though, `track_war_updates` CAN go from 
 via a separate path: `qapbot/coc_cache.py` `_update_clan_metadata()` actively demotes non-subscribed
 clans that drop below Master III (see write path 5 and Critical Constraint 1 above).
 
-The league set (`_WAR_UPDATE_LEAGUES`) is defined identically in both:
-- qapbot/coc_cache.py  (module-level frozenset)
-- qapbot/cache_manager.py  (class-level frozenset on CacheManager)
-
-And the matching acquisition set (`_CWL_HARVEST_LEAGUES`) in:
-- QBhelperfunctions.py  (module-level frozenset)
-
-All three must be kept in sync when the threshold is changed.
+The league set is a single source of truth: `qapbot/constants.py` `WAR_UPDATE_LEAGUES`.
+`qapbot/coc_cache.py`, `qapbot/cache_manager.py`, and `QBhelperfunctions.py`
+(`_CWL_HARVEST_LEAGUES`) all import it rather than defining their own copy — previously these
+were three independently-maintained frozensets that had to be edited in lockstep by hand (see
+2026-04-11 threshold change below); now changing the threshold means editing one constant.
 
 ---
 

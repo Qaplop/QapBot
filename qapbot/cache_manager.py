@@ -53,7 +53,7 @@ import glob
 
 if TYPE_CHECKING:
     from qapbot.db_manager import WarHistoryDB
-from qapbot.constants import SECONDS_PER_HOUR, normalize_cwl_season
+from qapbot.constants import SECONDS_PER_HOUR, WAR_UPDATE_LEAGUES, normalize_cwl_season
 from qapbot.config import CONFIG
 from qapbot.coc_health import coc_retry
 from qapbot.coc_cache import CoCClanCache
@@ -572,20 +572,6 @@ class CacheManager:
         
         return False
 
-    # Leagues whose passively tracked clans still get 22h war polling (Master III+).
-    _WAR_UPDATE_LEAGUES: frozenset[str] = frozenset({
-        "Legend League",
-        "Titan League I",
-        "Titan League II",
-        "Titan League III",
-        "Champion League I",
-        "Champion League II",
-        "Champion League III",
-        "Master League I",
-        "Master League II",
-        "Master League III",
-    })
-
     # TTL for CWL caches — prevents unbounded memory growth from
     # accumulated coc.ClanWar and ClanWarLeagueGroup objects.
     _LEAGUE_WAR_CACHE_TTL: float = 7200.0   # 2 hours — enough for all CWL processing
@@ -611,7 +597,7 @@ class CacheManager:
         if is_tracked:
             return True
         league = clan_data.get("war_league")
-        if league and league in CacheManager._WAR_UPDATE_LEAGUES:
+        if league and league in WAR_UPDATE_LEAGUES:
             return True
         return False
 
@@ -3183,6 +3169,7 @@ class CacheManager:
 
             if _league_rank:
                 await db.update_cwl_league_rank(cwl_season, _group_id, _league_rank)
+                await self._sync_group_track_war_updates(_clan_objs, _league_rank)
 
             _log_msg = (
                 f"[CWL-ROUNDS] group {_group_id} season={cwl_season}: "
@@ -3195,6 +3182,90 @@ class CacheManager:
                 logging.debug(_log_msg + " (no-op, all rows already present)")
         except Exception as _ex:
             logging.warning(f"[CWL-ROUNDS] _process_league_group_response error: {_ex}")
+
+    async def _sync_group_track_war_updates(self, clan_objs: List[Any], league_rank: str) -> None:
+        """Enforce the Master III+ tracking gate across a CWL group whose league is confirmed.
+
+        This is the group-wide counterpart to ``_update_clan_metadata()``'s per-clan
+        promotion/demotion (qapbot/coc_cache.py) and ``_harvest_cwl_group_clans()``'s
+        subscription-gated harvest (QBhelperfunctions.py). Those two paths only reach
+        a clan when it is already being actively polled, or when it is freshly
+        discovered as an enemy of a *subscribed* clan — so an already-known,
+        non-subscribed clan in a group with no subscribed member (or no "new enemy"
+        event this season) can sit indefinitely with a stale league and the wrong
+        track_war_updates value.  This method fires for every group resolved by
+        ``_process_league_group_response()`` (Layer 1 organic + Layer 2 finalization
+        fallback get_league_group() calls), independent of subscription, closing
+        that gap — see the 2026-06-24 changelog entry ("~40,000 Master III+ clans
+        silently stopped being polled") for the failure mode this exists to prevent
+        from recurring in a new blind spot.
+
+        Also inserts group members that aren't in ``clan_name_cache`` at all yet —
+        without this, only the single clan ``_process_league_group_response`` may
+        have queried live via ``get_clan()`` (to resolve ``league_rank`` itself) gets
+        seeded, and the other (up to 7) never-before-seen members are silently
+        skipped.  No extra API call is needed for the insert: ``clan_objs`` is the
+        already-fetched ``ClanWarLeagueGroup.clans`` list, which carries tag + name
+        for every member, and every member of a CWL group is guaranteed to share
+        the season's one ``league_rank`` (CWL rule) — no per-clan war_league lookup
+        required.
+
+        Subscribed clans are always tracked regardless of league movement and are
+        left untouched.
+        """
+        should_track = league_rank in WAR_UPDATE_LEAGUES
+        now_iso = datetime.now(_dt_timezone.utc).isoformat()
+        for clan_obj in clan_objs:
+            tag = str(getattr(clan_obj, "tag", "") or "")
+            if not tag:
+                continue
+            clan_data = self.clan_name_cache.get(tag)
+            if not isinstance(clan_data, dict):
+                # Never-before-seen group member — insert it now (zero extra API
+                # calls: name comes from the already-fetched league group response).
+                name = str(getattr(clan_obj, "name", "") or "Unknown")
+                self.clan_name_cache[tag] = {
+                    "name": name,
+                    "has_active_subscriptions": False,
+                    "last_war_update": now_iso,
+                    "warlog_is_public": True,
+                    "last_checked_via_api": now_iso,
+                    "war_league": league_rank,
+                    "track_war_updates": should_track,
+                }
+                await self.persist_clan(tag)
+                logging.info(
+                    "[CWL-GROUP-SYNC] %s (%s): new clan, track_war_updates=%s (group league=%s)",
+                    tag, name, should_track, league_rank,
+                )
+                continue
+            if clan_data.get("has_active_subscriptions"):
+                continue  # subscribed clans stay tracked regardless of league
+
+            dirty = False
+            if clan_data.get("war_league") != league_rank:
+                clan_data["war_league"] = league_rank
+                dirty = True
+            if bool(clan_data.get("track_war_updates")) != should_track:
+                if not should_track:
+                    # Demotion: remove any ongoing temp war file first to prevent
+                    # orphans, mirroring _update_clan_metadata()'s demotion path.
+                    _removed = self.coc_clan_cache._cleanup_temp_war_files(tag)  # type: ignore[attr-defined]
+                    logging.info(
+                        "[CWL-GROUP-SYNC] %s: track_war_updates -> False (group league=%s, no subscriptions%s)",
+                        tag, league_rank,
+                        f", removed {_removed} temp war file(s)" if _removed else "",
+                    )
+                else:
+                    logging.info(
+                        "[CWL-GROUP-SYNC] %s: track_war_updates -> True (group league=%s)",
+                        tag, league_rank,
+                    )
+                clan_data["track_war_updates"] = should_track
+                dirty = True
+
+            if dirty:
+                await self.persist_clan(tag)
 
     def evict_stale_cwl_caches(self) -> None:
         """Evict expired entries from CWL caches to prevent unbounded memory growth.

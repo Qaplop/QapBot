@@ -1,6 +1,66 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-08 (4)
+- Fixed: `_sync_group_track_war_updates()` (added in (2) below) only corrected clans already
+  present in `clan_name_cache` — a group's other never-before-seen members were silently skipped,
+  since only the single clan `_process_league_group_response()` queried live to resolve
+  `league_rank` ever got inserted. Now inserts every member directly from the already-fetched
+  `ClanWarLeagueGroup.clans` list (tag + name), zero extra API calls — every CWL group member
+  shares one league by construction, so no per-clan league lookup is needed for the insert either.
+  Added 4 tests to test_cwl_league_rank_new_group_gate.py covering insertion, promotion/demotion of
+  existing entries, and subscribed-clan immunity.
+  Files: qapbot/cache_manager.py. Docs: CLAN_WAR_TRACKING.md, CWL_ROUND_TRACKING_PLAN.md,
+  CODE_STRUCTURE.md. 1497 tests pass (.\run_tests.ps1 -Full).
+
+2026-08-08 (3)
+- Fixed: two pre-existing stale-fixture test failures found while verifying (2)/(4) below,
+  unrelated to that work itself.
+  - test_db_errors_phase5.py::TestLoadAllTempWarStats::test_loads_from_json mocked away
+    load_all_temp_war_stats()'s two-phase filename-scan + subscription-gated JSON-parse rewrite
+    entirely instead of exercising it; rewritten against real temp files under a tmp_path-backed
+    CONFIG.data_dir.
+  - tests/smoke_live/test_live_status_and_admin_checks.py's fake interaction/cache/bot test
+    doubles were missing 4 attributes `/status` had grown to use since they were last updated
+    (`interaction.guild_id`, `bot.fully_initialized`, `CACHE.get_war_file_stats()`,
+    `CACHE.in_war_clan_tags`) — added them; verified end-to-end against the live DEV Discord
+    channel.
+  - run_tests.ps1 hard-`--deselect`ed both the fixed test above AND a same-named test in
+    `tests/unit/test_war_file_lifecycle.py` — a file that no longer exists anywhere in the repo.
+    Removed both now-dead deselects.
+  Files: tests/unit/test_db_errors_phase5.py, tests/smoke_live/test_live_status_and_admin_checks.py,
+  run_tests.ps1.
+
+2026-08-08 (2)
+- Fixed: investigated user report that CWL clan league promotion/demotion tracking
+  (`track_war_updates`) still doesn't work as intended after a season ends, despite the
+  2026-06-24 fix for the "~40,000 Master III+ clans silently stopped being polled" incident.
+  Root cause: that fix (`_harvest_cwl_group_clans()` in QBhelperfunctions.py) only re-evaluates a
+  group's members when triggered by a *subscribed* clan encountering a genuinely new enemy — in a
+  mature DB most opponents are already known, so it rarely fires anymore. Added
+  `_sync_group_track_war_updates()` in qapbot/cache_manager.py, called from
+  `_process_league_group_response()` (Layer 1 organic + Layer 2 finalization-fallback
+  `get_league_group()` calls — fires independent of subscription, for any group any actively
+  tracked clan touches): the moment a group's `league_rank` is freshly confirmed, sweeps every
+  member and corrects `war_league`/`track_war_updates` to match (subscribed clans left untouched).
+  Also deduped the Master III+ league frozenset, previously hand-maintained in 3 separate places
+  (coc_cache.py, cache_manager.py, QBhelperfunctions.py `_CWL_HARVEST_LEAGUES`), into one
+  `qapbot/constants.py:WAR_UPDATE_LEAGUES`.
+  Files: qapbot/constants.py, qapbot/coc_cache.py, qapbot/cache_manager.py, QBhelperfunctions.py.
+  Docs: CLAN_WAR_TRACKING.md (new write-path 7), CWL_ROUND_TRACKING_PLAN.md,
+  CLAN_AND_WAR_CYCLE_ARCHITECTURE.md (also corrected a stale claim there that track_war_updates is
+  a pure one-way ratchet — it hasn't been since the 2026-06-29 demotion fix).
+
+2026-08-08 (1)
+- Analysis: investigated a 43,194-war gap flagged by `qapbot/scripts/analyze_cwl_rounds.py
+  --fetch-missing` for the 2026-08 CWL season. Root cause: archiving is strictly per-clan-
+  perspective (one `war_summary` row per clan that was actually polled), and polling is gated by
+  `track_war_updates` — a below-Master-III, non-subscribed opponent's own perspective is simply
+  never fetched, so a war between a tracked and an untracked clan produces only one of its two
+  rows. This is expected/by-design given the subscription-rooted tracking model, not a pipeline
+  bug. Documented the mechanism (and its interaction with `process_cwl_recovery_batch()`'s own
+  `track_war_updates=True` participant filter) in `CWL_ROUND_TRACKING_PLAN.md`.
+
 2026-08-03 (7)
 - Fixed: The actual primary root cause of intermittent duplicate registration messages (audited all
   11 `bot.get_channel()`/`guild.get_channel()` call sites after (6) below to look for more instances

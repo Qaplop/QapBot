@@ -72,6 +72,23 @@ CWL_WAR_EXPIRY_DAYS = 60
 WAR_END_NOTIFICATION_HOURS_BEFORE = 4
 """Hours before war end to send notifications (default, overridden by CONFIG)."""
 
+WAR_UPDATE_LEAGUES: frozenset[str] = frozenset({
+    "Legend League",
+    "Titan League I",
+    "Titan League II",
+    "Titan League III",
+    "Champion League I",
+    "Champion League II",
+    "Champion League III",
+    "Master League I",
+    "Master League II",
+    "Master League III",
+})
+"""War leagues (Master III and above) that qualify a non-subscribed clan for
+active ``track_war_updates`` tracking (22h polling pool). Single source of
+truth — previously duplicated as ``_WAR_UPDATE_LEAGUES`` in coc_cache.py and
+cache_manager.py, and as ``_CWL_HARVEST_LEAGUES`` in QBhelperfunctions.py."""
+
 
 # ============================================================================
 # Cache and History Configuration

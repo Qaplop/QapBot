@@ -44,6 +44,7 @@ from qapbot.constants import (
     DISCORD_MESSAGE_MAX_LENGTH,
     SECONDS_PER_HOUR,
     SECONDS_PER_MINUTE,
+    WAR_UPDATE_LEAGUES,
 )
 from qapbot.exceptions import (
     WarProcessingError,
@@ -5472,18 +5473,7 @@ def _move_to_archive(war_file: str, archive_set: Optional[Set[str]] = None) -> N
 
 # CWL leagues for which we harvest all participating clans and track them over time.
 # Top 10 from the clashspot.net distribution table (Legend → Master III).
-_CWL_HARVEST_LEAGUES: frozenset[str] = frozenset({  # type: ignore[misc]
-    "Legend League",
-    "Titan League I",
-    "Titan League II",
-    "Titan League III",
-    "Champion League I",
-    "Champion League II",
-    "Champion League III",
-    "Master League I",
-    "Master League II",
-    "Master League III",
-})
+_CWL_HARVEST_LEAGUES: frozenset[str] = WAR_UPDATE_LEAGUES
 
 
 _CWL_LEAGUE_DEFAULT: str = "Master League I"

@@ -88,29 +88,66 @@ class TestSaveUserTransactionError:
 
 
 class TestLoadAllTempWarStats:
-    def test_loads_from_json(self):
+    def test_loads_from_json(self, tmp_path, monkeypatch):
+        """load_all_temp_war_stats() is a two-phase scan (see its docstring):
+        Phase 1 derives metadata for every clan from filenames alone (no I/O);
+        Phase 2 does a full JSON parse only for subscribed clans. A
+        non-subscribed clan with a temp file still gets Phase-1 metadata but
+        is NOT added to temp_war_stats — Phase-3 repopulates it after the
+        first update cycle.
+        """
+        import dataclasses
+        import json
+        import QBcsvhandling
+        import qapbot.cache_manager as cache_manager_module
         from qapbot.cache_manager import CacheManager
-        cm = CacheManager.__new__(CacheManager)
-        cm.clan_name_cache = {"#CL1": {"name": "C1"}, "#CL2": {"name": "C2"}}
-        cm.temp_war_stats = {}
+        from qapbot.config import CONFIG
 
-        def mock_load(clan_tag):
+        # CONFIG is a frozen dataclass — swap the module-level name cache_manager
+        # binds instead of mutating a field.
+        monkeypatch.setattr(cache_manager_module, "CONFIG", dataclasses.replace(CONFIG, data_dir=str(tmp_path)))
+        temp_dir = tmp_path / "temp" / "shard_0"
+        temp_dir.mkdir(parents=True)
+
+        cl1_file = temp_dir / "CL1_OPP1_202601010000_war_data.json"
+        cl1_file.write_text(json.dumps({"state": "inWar", "type": "random"}), encoding="utf-8")
+        cl2_file = temp_dir / "CL2_OPP2_202601010000_war_data.json"
+        cl2_file.write_text(json.dumps({"state": "inWar", "type": "random"}), encoding="utf-8")
+
+        cm = CacheManager.__new__(CacheManager)
+        cm.clan_name_cache = {
+            "#CL1": {"name": "C1", "has_active_subscriptions": True},
+            "#CL2": {"name": "C2", "has_active_subscriptions": False},
+        }
+        cm.in_war_clan_tags = set()
+        cm.temp_war_objects = {}
+
+        def mock_load(clan_tag, **kwargs):
             if clan_tag == "#CL1":
                 return {"player1": {"stars": 3}}
             return None
 
-        with patch("QBcsvhandling._load_war_data_from_json", side_effect=mock_load):
+        with patch.object(QBcsvhandling, "_load_war_data_from_json", side_effect=mock_load):
             cm.load_all_temp_war_stats()
 
-        assert "#CL1" in cm.temp_war_stats
+        # Subscribed clan: full JSON parse ran, stats populated.
         assert cm.temp_war_stats["#CL1"] == {"player1": {"stars": 3}}
-        assert cm.temp_war_stats["#CL2"] == {}
+        # Non-subscribed clan: Phase 1 metadata exists, but Phase 2 was skipped.
+        assert "#CL2" not in cm.temp_war_stats
+        assert "#CL1" in cm.temp_war_metadata
+        assert "#CL2" in cm.temp_war_metadata
 
-    def test_empty_clan_cache(self):
+    def test_empty_clan_cache(self, tmp_path, monkeypatch):
+        import dataclasses
+        import qapbot.cache_manager as cache_manager_module
         from qapbot.cache_manager import CacheManager
+        from qapbot.config import CONFIG
+
+        monkeypatch.setattr(cache_manager_module, "CONFIG", dataclasses.replace(CONFIG, data_dir=str(tmp_path)))
         cm = CacheManager.__new__(CacheManager)
         cm.clan_name_cache = {}
-        cm.temp_war_stats = {}
+        cm.in_war_clan_tags = set()
+        cm.temp_war_objects = {}
 
         with patch("QBcsvhandling._load_war_data_from_json"):
             cm.load_all_temp_war_stats()

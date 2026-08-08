@@ -65,6 +65,7 @@ class _FakeCache:
         self.clan_name_cache: Dict[str, Any] = {}
         self.coc_clan_cache = _StubCocClanCache()
         self.db_manager = _FakeDbManager()
+        self.in_war_clan_tags: set[str] = set()
         self._last_message_ids: Optional[list[int]] = None
 
     async def set_leaderboard_message(self, key: str, entry: Dict[str, Any]) -> None:
@@ -83,11 +84,15 @@ class _FakeCache:
             return str(value.get("name") or default)
         return default
 
+    def get_war_file_stats(self) -> Dict[str, int]:
+        return {"total": 0, "prep": 0, "in_war": 0, "war_ended": 0, "other": 0, "cwl_known": 0}
+
 
 class _FakeInteraction:
     def __init__(self, *, channel: Any, guild: Any, user: _FakeUser):
         self.channel = channel
         self.guild = guild
+        self.guild_id = guild.id if guild is not None else None
         self.user = user
         self.response = _FakeResponse()
         self.followup = None
@@ -136,6 +141,7 @@ async def test_live_status_handler_posts_message_and_can_be_fetched(review_timeo
             class _BotStub:
                 start_time = datetime.now()
                 last_sync = None
+                fully_initialized = True
 
             QBdiscordcmds.QBcore.bot = _BotStub()  # type: ignore[assignment]
             QBdiscordcmds.GLOBAL_GUILD_ID = guild_id  # type: ignore[assignment]

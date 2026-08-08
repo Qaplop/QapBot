@@ -44,8 +44,9 @@ from qapbot.cache_manager import CacheManager
 
 
 class _FakeClan:
-    def __init__(self, tag: str) -> None:
+    def __init__(self, tag: str, name: str | None = None) -> None:
         self.tag = tag
+        self.name = name or f"Clan {tag}"
 
 
 class _FakeLeagueGroup:
@@ -218,3 +219,92 @@ class TestNewGroupGating:
         await cm._process_league_group_response(lg, "2026-07")
 
         assert call_order == ["exists", "upsert"]
+
+
+class TestGroupTrackWarUpdatesSync:
+    """_sync_group_track_war_updates: the group-wide track_war_updates gate that
+    runs whenever a group's league_rank is freshly resolved (see docstring on
+    that method). Covers the fix for the "wholly foreign group" gap — members
+    never before seen in clan_name_cache must be inserted, not silently
+    skipped, since only ever seeing the single API-queried clan get inserted
+    would leave the other (up to 7) group-mates permanently undiscovered."""
+
+    @pytest.mark.asyncio
+    async def test_never_before_seen_members_are_inserted(self):
+        """A group with zero pre-existing clan_name_cache entries: every member
+        must be inserted with the group's confirmed league and the correct
+        M3+ tracking gate — no extra get_clan() call needed for the insert."""
+        tags = ["#NEW1", "#NEW2", "#NEW3"]
+        cm = _make_cm({}, group_exists=False)
+        lg = _FakeLeagueGroup(tags)
+        lg._raw_data = {
+            "clans": [{"tag": t, "warLeague": {"name": "Titan League II"}} for t in tags]
+        }
+
+        await cm._process_league_group_response(lg, "2026-07")
+
+        # The raw_data path resolves league_rank without any get_clan() call —
+        # the insert must not need one either.
+        cm.coc_clan_cache.get_clan.assert_not_awaited()
+        for t in tags:
+            assert cm.clan_name_cache[t]["track_war_updates"] is True
+            assert cm.clan_name_cache[t]["war_league"] == "Titan League II"
+            assert cm.clan_name_cache[t]["name"] == f"Clan {t}"
+            assert cm.clan_name_cache[t]["has_active_subscriptions"] is False
+
+    @pytest.mark.asyncio
+    async def test_never_before_seen_members_below_m3_not_tracked(self):
+        tags = ["#LOW1", "#LOW2"]
+        cm = _make_cm({}, group_exists=False)
+        lg = _FakeLeagueGroup(tags)
+        lg._raw_data = {
+            "clans": [{"tag": t, "warLeague": {"name": "Crystal League I"}} for t in tags]
+        }
+
+        await cm._process_league_group_response(lg, "2026-07")
+
+        for t in tags:
+            assert cm.clan_name_cache[t]["track_war_updates"] is False
+            assert cm.clan_name_cache[t]["war_league"] == "Crystal League I"
+
+    @pytest.mark.asyncio
+    async def test_existing_non_subscribed_member_promoted_and_corrected(self):
+        """A group member already in clan_name_cache, stuck at a stale
+        sub-M3 league with track_war_updates=False, must be corrected to
+        match the group's confirmed M3+ league — this is the exact
+        "~40,000 Master III+ clans silently stopped being polled" failure
+        mode the fix targets."""
+        tags = ["#STALE", "#OTHER"]
+        cm = _make_cm(
+            {"#STALE": {"war_league": "Crystal League I", "track_war_updates": False,
+                        "has_active_subscriptions": False}},
+            group_exists=False,
+        )
+        lg = _FakeLeagueGroup(tags)
+        lg._raw_data = {"clans": [{"tag": t, "warLeague": {"name": "Master League I"}} for t in tags]}
+
+        await cm._process_league_group_response(lg, "2026-07")
+
+        assert cm.clan_name_cache["#STALE"]["track_war_updates"] is True
+        assert cm.clan_name_cache["#STALE"]["war_league"] == "Master League I"
+
+    @pytest.mark.asyncio
+    async def test_subscribed_member_left_untouched_regardless_of_league(self):
+        """Subscribed clans are always tracked regardless of league movement —
+        the sync must not touch their war_league or track_war_updates, even
+        when it disagrees with the group's confirmed league."""
+        tags = ["#SUB", "#OTHER"]
+        cm = _make_cm(
+            {"#SUB": {"war_league": "Gold League I", "track_war_updates": True,
+                      "has_active_subscriptions": True}},
+            group_exists=False,
+        )
+        lg = _FakeLeagueGroup(tags)
+        lg._raw_data = {"clans": [{"tag": t, "warLeague": {"name": "Master League I"}} for t in tags]}
+
+        await cm._process_league_group_response(lg, "2026-07")
+
+        # war_league untouched even though it disagrees with the group's league —
+        # subscribed clans are immune to the group-wide sync entirely.
+        assert cm.clan_name_cache["#SUB"]["war_league"] == "Gold League I"
+        assert cm.clan_name_cache["#SUB"]["track_war_updates"] is True

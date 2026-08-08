@@ -113,10 +113,17 @@ at L543; parallel fetch loop/semaphore at L850-L949)
 **Decision Logic** (coc_cache.py):
 ```python
 _track = _wl_name in _WAR_UPDATE_LEAGUES  # Master III+ → True
+# _WAR_UPDATE_LEAGUES: single source of truth qapbot/constants.py:WAR_UPDATE_LEAGUES
 # Defined: Legend, Titan I-III, Champion I-III, Master I-III
 ```
 
-**One-way Ratchet**: track_war_updates never reverts to False on demotion.
+**Ratchet, with an explicit demotion exception**: promotion (False→True) never reverts on
+subscribe/unsubscribe or family changes. But `_update_clan_metadata()` (coc_cache.py) DOES flip a
+non-subscribed clan back to False when its league drops below Master III (added 2026-06-29) — so it
+is not a pure one-way ratchet overall. Subscribed clans are immune to demotion entirely. See
+`CLAN_WAR_TRACKING.md` for the full write-path table, including the group-wide sync
+(`_sync_group_track_war_updates()`, cache_manager.py) that corrects/creates entries for every
+member of a CWL group the moment its league is confirmed, independent of subscription.
 
 ## Clan Data Persistence
 

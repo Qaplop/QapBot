@@ -25,22 +25,7 @@ if TYPE_CHECKING:
 
 from qapbot.exceptions import CacheError
 from qapbot.coc_health import coc_retry
-
-# Leagues whose passively tracked clans still get 22h war polling (Master III through Legend).
-# Clans below this threshold only get metadata updates when encountered as enemies.
-# Keep in sync with _CWL_HARVEST_LEAGUES in QBhelperfunctions.py.
-_WAR_UPDATE_LEAGUES: frozenset[str] = frozenset({  # type: ignore[misc]
-    "Legend League",
-    "Titan League I",
-    "Titan League II",
-    "Titan League III",
-    "Champion League I",
-    "Champion League II",
-    "Champion League III",
-    "Master League I",
-    "Master League II",
-    "Master League III",
-})
+from qapbot.constants import WAR_UPDATE_LEAGUES as _WAR_UPDATE_LEAGUES
 
 
 class CoCClanCache:

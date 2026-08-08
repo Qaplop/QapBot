@@ -886,6 +886,11 @@ kept here only for functions not narrated elsewhere.
 │   │   └── SHA-256(season:sorted_tags)[:16] — stable, season-scoped group ID
 │   ├── _process_league_group_response(lg, cwl_season)
 │   │   └── Upserts CWL group/round data + triggers backfill; idempotent (INSERT OR IGNORE)
+│   │       When league_rank is freshly resolved, also calls _sync_group_track_war_updates()
+│   ├── _sync_group_track_war_updates(clan_objs, league_rank)
+│   │   └── Group-wide track_war_updates gate: corrects/creates every non-subscribed member's
+│   │       war_league + track_war_updates to match the group's confirmed league (see
+│   │       CLAN_WAR_TRACKING.md write-path 7); inserts never-before-seen members too
 │   ├── get_league_war(war_tag, max_age)
 │   ├── evict_stale_cwl_caches()
 │   ├── save_war_object(clan_tag, war)

@@ -17,7 +17,5 @@ if (-not (Test-Path $pythonExe)) { $pythonExe = 'python' }
 $testsDir = Join-Path $PSScriptRoot 'tests'
 
 & $pythonExe -m pytest $testsDir -x -q --tb=short `
-    --deselect "tests/unit/test_war_file_lifecycle.py::TestLoadAllTempWarStats::test_loads_from_json" `
-    --deselect "tests/unit/test_db_errors_phase5.py::TestLoadAllTempWarStats::test_loads_from_json" `
     @markFilter `
     @ExtraArgs

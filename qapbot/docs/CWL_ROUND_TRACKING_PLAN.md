@@ -259,6 +259,72 @@ _CacheManager._process_league_group_response(lg_response, season)
 
 ---
 
+## Why `war_summary` coverage is inherently asymmetric (by design)
+
+`cwl_league_rounds` (this doc) tracks *round metadata* cheaply for all 8 clans in
+a group via Layer 1/2 above — but that is independent of whether the bot ever
+archives a `war_summary` row for each clan's own perspective of a war. Archiving
+is per-clan: `add_war_data_sync()` writes exactly one row for the `clan_tag`
+whose own war fetch produced it (see `QBcsvhandling._append_current_war_to_history`).
+A war between clan A and clan B only gets **two** `war_summary` rows if *both*
+A and B are independently fetched and finalized — round metadata knowing about
+both sides does not cause both sides to be archived.
+
+Whether a clan is fetched at all is gated by `track_war_updates`, a **one-way
+ratchet** (see `qapbot/docs/CLAN_WAR_TRACKING.md`): only clans that are
+subscribed, or currently/formerly Master III+, are actively polled. Clans
+below Master III that are not subscribed and never a group-mate of a
+subscribed clan are "passively tracked" — no `war_summary` row is ever written
+for their own perspective. `CWL-GROUP-EXPAND` (`QapBot.py`) force-polls all 8
+members of any group containing a subscribed clan every cycle, which closes
+the gap for those groups, but groups with **no** subscribed member and whose
+clans are below M3 are never polled at all.
+
+Practical consequence for `qapbot/scripts/analyze_cwl_rounds.py --fetch-missing`:
+- "Missing both entries" (counter==2): the whole group had no subscribed
+  clan and no M3+ presence — neither side was ever fetched.
+- "Missing one entry" (counter==1): one clan of the pairing was tracked
+  (subscribed, group-expanded, or M3+) and got archived; the other was a
+  below-M3, non-subscribed opponent that was never independently fetched.
+  This is the dominant case in practice.
+
+This is **expected behavior**, not a pipeline bug — the bot intentionally does
+not attempt full bidirectional real-time archiving for every clan in every
+CWL group globally (that would require actively polling ~8x the clan
+population). `process_cwl_recovery_batch()` (`QBhelperfunctions.py`) — fed by
+this script's `--fetch-missing` output — is the intended catch-up path, and it
+also only writes rows for participants with `track_war_updates=True`
+(`QBhelperfunctions.py:6197`), so a below-M3 non-subscribed opponent's
+perspective stays permanently unarchived even after recovery, unless that
+clan is itself subscribed or promoted to M3+ later.
+
+**2026-08-08 fix**: `_sync_group_track_war_updates()` (`qapbot/cache_manager.py`,
+see `CLAN_WAR_TRACKING.md` write-path 7) now corrects `track_war_updates` for
+every group member the moment a group's `league_rank` is confirmed — including
+inserting members never before seen in `clan_name_cache` — closing the
+"already-known-but-stuck" variant of the ~40,000-clan incident referenced
+above for any group *reachable* from the discovery graph. It does **not**
+close the "missing both" case for a wholly foreign group with zero connection
+to any subscribed clan (directly or transitively): every discovery entry point
+still requires the querying clan tag to already be graph-reachable — there is
+no CoC rankings/location-endpoint scan or other independent clan enumeration
+in this codebase. That residual case is architectural, not a bug to fix
+incrementally.
+
+In practice this residual case is expected to self-resolve, not accumulate: CWL matchmaking pairs
+clans by strength/league, not by "known to the bot" status, and any clan that is `track_war_updates
+= True` stays in the active polling pool permanently (one-way ratchet — see `CLAN_WAR_TRACKING.md`).
+So the very next season a wholly-foreign clan gets grouped alongside *any* already-tracked clan,
+that group's `get_league_group()` response reaches `_sync_group_track_war_updates()` and every
+member — including the previously-foreign one — gets inserted and correctly tracked from then on.
+Given the already-large and still-growing tracked population (~110,000 clans across Bronze–Legend
+as of the 2026-08 season), the probability of a given active M3+ clan going many consecutive
+seasons without ever sharing a group with a tracked clan is low and shrinks further each season.
+This is a probabilistic/eventual-consistency guarantee, not a hard one by construction — but no
+further engineering is needed here unless it's later observed not to hold in practice.
+
+---
+
 ## Open Questions / Decisions Needed
 
 1. **Backfill**: ✅ Resolved — backfill the current season. Previous rounds'
