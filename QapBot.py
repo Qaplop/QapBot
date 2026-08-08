@@ -90,6 +90,7 @@ from qapbot.cache_manager import CACHE
 from qapbot.constants import (
     SECONDS_PER_HOUR,
     MAX_RETRY_BACKOFF_SECONDS,
+    PASSIVE_CLAN_REFRESH_INTERVAL_DAYS,
     PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS
 )
 from qapbot.discord_health import discord_retry
@@ -686,6 +687,17 @@ async def main() -> None:
     # codebase before (see changelog: ~40K Master III+ clans silently
     # stopped being polled). Not worth the correctness risk for a step
     # that's already non-blocking.
+    # Passive-clan monthly refresh (Phase 1.6, see CLAN_WAR_TRACKING.md write-path 8)
+    # piggybacks its candidate discovery on THIS loop instead of running a second
+    # full clan_name_cache scan: this loop already visits every clan every cycle
+    # and fast-rejects exactly the track_war_updates=False population Phase 1.6
+    # needs — collecting candidates here during that already-paid-for pass cut a
+    # ~5s redundant second scan entirely (confirmed via prod [CATEGORIZE-TIMING]
+    # vs the old separate [PASSIVE-REFRESH] scan line, both ~5s for the same
+    # ~420K clans).
+    _passive_refresh_candidates: list[tuple[str, str]] = []  # (clan_tag, sort_key)
+    _passive_refresh_cutoff = now - timedelta(days=PASSIVE_CLAN_REFRESH_INTERVAL_DAYS)
+
     _categorize_clan_count = 0
     for clan_tag, clan_data in list(CACHE.clan_name_cache.items()):
         _categorize_clan_count += 1
@@ -695,7 +707,21 @@ async def main() -> None:
         try:
             # Fast-reject path first: passively-tracked / deleted clans are
             # >99.9% of all entries and never need anything below this.
-            if not clan_data.get('track_war_updates', True) or clan_data.get('is_deleted'):
+            _is_deleted = clan_data.get('is_deleted')
+            if not clan_data.get('track_war_updates', True) or _is_deleted:
+                if not _is_deleted and not clan_data.get('has_active_subscriptions'):
+                    _last_checked = clan_data.get('last_checked_via_api')
+                    if not _last_checked:
+                        _passive_refresh_candidates.append((clan_tag, ''))
+                    else:
+                        try:
+                            _lc_dt = datetime.fromisoformat(_last_checked)
+                            if _lc_dt.tzinfo is None:
+                                _lc_dt = _lc_dt.replace(tzinfo=timezone.utc)
+                            if _lc_dt < _passive_refresh_cutoff:
+                                _passive_refresh_candidates.append((clan_tag, _last_checked))
+                        except (ValueError, TypeError):
+                            _passive_refresh_candidates.append((clan_tag, ''))
                 continue
         except AttributeError:
             # Treat old-format (non-dict) entries as active
@@ -1064,16 +1090,17 @@ async def main() -> None:
     # CLAN_WAR_TRACKING.md write-path 8). This periodically pings the most-overdue
     # ones so a real-game promotion to Master III+ is never missed indefinitely
     # for a clan whose group nobody else ever touches.
+    # Candidate discovery happens above, piggybacked on the categorization loop
+    # (_passive_refresh_candidates) — no second clan_name_cache scan here.
     # Runs every cycle (no interval gate) at _PASSIVE_REFRESH_BATCH_SIZE=1000/run
     # (QBhelperfunctions.py) to burn down the initial backlog in about a day
     # instead of trickling it out over a month. Once caught up, per-cycle
     # get_clan() volume drops close to zero naturally (few clans newly overdue
-    # each cycle) — the ongoing cost that doesn't taper is the full
-    # clan_name_cache scan every cycle needs to find candidates at all.
+    # each cycle).
     _phase16_t0 = time.monotonic()
     try:
         from QBhelperfunctions import refresh_stale_passive_clans  # type: ignore[attr-defined]
-        await refresh_stale_passive_clans()
+        await refresh_stale_passive_clans(_passive_refresh_candidates)
     except Exception as e:
         logging.error(f"[PHASE-1.6] Passive clan refresh error: {e}")
     logging.info(f"[PHASE-1.6-TIMING] Completed in {time.monotonic() - _phase16_t0:.3f}s")

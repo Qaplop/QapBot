@@ -2,13 +2,20 @@
 get_clan() ping for passively-tracked (track_war_updates=False) clans whose
 CWL group is never rediscovered by the normal discovery graph (see
 CLAN_WAR_TRACKING.md write-path 8).
+
+Candidate discovery (which clans are overdue) is done by QapBot.py's main
+clan-categorization loop, piggybacked on its own already-mandatory full
+clan_name_cache scan (merged in to eliminate a redundant second full-cache
+scan every cycle — see that loop's comments). This function only receives
+the resulting (clan_tag, sort_key) candidate list and does batch selection +
+the actual get_clan() fetches; it does not scan CACHE.clan_name_cache itself.
 """
 # pyright: reportPrivateUsage=false, reportUnknownMemberType=false, reportUnknownParameterType=false
 # pyright: reportMissingParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 from unittest.mock import AsyncMock, MagicMock
 
 import coc  # type: ignore[import-untyped]
@@ -41,44 +48,28 @@ class TestRefreshStalePassiveClans:
     @pytest.mark.asyncio
     async def test_no_candidates_returns_zero(self, monkeypatch):
         cache = _make_cache()
-        cache.clan_name_cache = {"#FRESH": _passive(_iso(1))}  # within interval
         monkeypatch.setattr(QBhelperfunctions, "CACHE", cache)
 
-        result = await refresh_stale_passive_clans()
+        result = await refresh_stale_passive_clans([])
 
         assert result == 0
         cache.coc_clan_cache.get_clan.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_never_checked_and_overdue_clans_are_refreshed(self, monkeypatch):
+    async def test_fetches_all_given_candidates(self, monkeypatch):
         cache = _make_cache()
         cache.clan_name_cache = {
             "#NEVER": _passive(None),
             "#OVERDUE": _passive(_iso(45)),
-            "#FRESH": _passive(_iso(2)),
         }
         monkeypatch.setattr(QBhelperfunctions, "CACHE", cache)
+        candidates: List[Tuple[str, str]] = [("#NEVER", ""), ("#OVERDUE", _iso(45))]
 
-        result = await refresh_stale_passive_clans()
+        result = await refresh_stale_passive_clans(candidates)
 
         assert result == 2
         called_tags = {c.args[0] for c in cache.coc_clan_cache.get_clan.await_args_list}
         assert called_tags == {"#NEVER", "#OVERDUE"}
-
-    @pytest.mark.asyncio
-    async def test_skips_subscribed_tracked_and_deleted_clans(self, monkeypatch):
-        cache = _make_cache()
-        cache.clan_name_cache = {
-            "#SUB": {**_passive(None), "has_active_subscriptions": True},
-            "#TRACKED": {**_passive(None), "track_war_updates": True},
-            "#DELETED": {**_passive(None), "is_deleted": True},
-        }
-        monkeypatch.setattr(QBhelperfunctions, "CACHE", cache)
-
-        result = await refresh_stale_passive_clans()
-
-        assert result == 0
-        cache.coc_clan_cache.get_clan.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_respects_batch_size_cap_most_overdue_first(self, monkeypatch):
@@ -90,12 +81,30 @@ class TestRefreshStalePassiveClans:
             "#OVERDUE": _passive(_iso(31)),
         }
         monkeypatch.setattr(QBhelperfunctions, "CACHE", cache)
+        # Unsorted on purpose — the function must sort by sort_key itself.
+        candidates: List[Tuple[str, str]] = [
+            ("#OVERDUE", _iso(31)), ("#OLDEST", _iso(100)), ("#OLDER", _iso(60)),
+        ]
 
-        result = await refresh_stale_passive_clans()
+        result = await refresh_stale_passive_clans(candidates)
 
         assert result == 2
         called_tags = {c.args[0] for c in cache.coc_clan_cache.get_clan.await_args_list}
         assert called_tags == {"#OLDEST", "#OLDER"}  # most overdue two, not #OVERDUE
+
+    @pytest.mark.asyncio
+    async def test_never_checked_sorts_before_any_iso_timestamp(self, monkeypatch):
+        """sort_key '' (never checked) must sort first — most urgent to refresh."""
+        cache = _make_cache()
+        monkeypatch.setattr(QBhelperfunctions, "_PASSIVE_REFRESH_BATCH_SIZE", 1)
+        cache.clan_name_cache = {"#NEVER": _passive(None), "#OLD": _passive(_iso(200))}
+        monkeypatch.setattr(QBhelperfunctions, "CACHE", cache)
+        candidates: List[Tuple[str, str]] = [("#OLD", _iso(200)), ("#NEVER", "")]
+
+        result = await refresh_stale_passive_clans(candidates)
+
+        assert result == 1
+        cache.coc_clan_cache.get_clan.assert_awaited_once_with("#NEVER")
 
     @pytest.mark.asyncio
     async def test_detects_promotion_after_get_clan(self, monkeypatch):
@@ -111,7 +120,7 @@ class TestRefreshStalePassiveClans:
         cache.coc_clan_cache.get_clan = AsyncMock(side_effect=_fake_get_clan)
         monkeypatch.setattr(QBhelperfunctions, "CACHE", cache)
 
-        result = await refresh_stale_passive_clans()
+        result = await refresh_stale_passive_clans([("#PROMOTED", "")])
 
         assert result == 1
         assert cache.clan_name_cache["#PROMOTED"]["track_war_updates"] is True
@@ -126,7 +135,7 @@ class TestRefreshStalePassiveClans:
         mark_deleted = AsyncMock()
         monkeypatch.setattr(QBhelperfunctions, "_mark_clan_deleted", mark_deleted)
 
-        result = await refresh_stale_passive_clans()
+        result = await refresh_stale_passive_clans([("#GONE", "")])
 
         assert result == 1  # still counted as "queried this cycle"
         mark_deleted.assert_awaited_once_with("#GONE")
@@ -144,6 +153,6 @@ class TestRefreshStalePassiveClans:
         cache.coc_clan_cache.get_clan = AsyncMock(side_effect=_flaky)
         monkeypatch.setattr(QBhelperfunctions, "CACHE", cache)
 
-        result = await refresh_stale_passive_clans()
+        result = await refresh_stale_passive_clans([("#A", ""), ("#B", "")])
 
         assert result == 2  # both attempted despite #A's failure

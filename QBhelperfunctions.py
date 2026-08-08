@@ -5751,7 +5751,7 @@ _PASSIVE_REFRESH_BATCH_SIZE: int = 1000
 _PASSIVE_REFRESH_CONCURRENCY: int = 15
 
 
-async def refresh_stale_passive_clans() -> int:
+async def refresh_stale_passive_clans(candidates: List[Tuple[str, str]]) -> int:
     """
     Phase 1.6 — lightweight get_clan() ping for passively-tracked clans overdue
     for their monthly refresh, run every update cycle.
@@ -5769,65 +5769,35 @@ async def refresh_stale_passive_clans() -> int:
     This does a cheap, clan-info-only get_clan() call — NOT the full
     fetch_clan_war_data() war-data pipeline (no temp files, no war processing;
     we are deliberately not tracking wars for these clans) — for the most
-    overdue passively-tracked clans (last_checked_via_api older than
-    PASSIVE_CLAN_REFRESH_INTERVAL_DAYS, or never checked at all), capped at
-    _PASSIVE_REFRESH_BATCH_SIZE per cycle to avoid a burst against the shared
-    API budget. Each successful fetch flows through the existing
-    CoCClanCache.get_clan() -> _update_clan_metadata() path, which already
-    transparently refreshes war_league and promotes track_war_updates to True
-    if the clan is now Master III+ — no special-casing needed here.
+    overdue of the given candidates, capped at _PASSIVE_REFRESH_BATCH_SIZE per
+    cycle to avoid a burst against the shared API budget. Each successful
+    fetch flows through the existing CoCClanCache.get_clan() ->
+    _update_clan_metadata() path, which already transparently refreshes
+    war_league and promotes track_war_updates to True if the clan is now
+    Master III+ — no special-casing needed here.
+
+    Args:
+        candidates: (clan_tag, sort_key) pairs already identified as overdue
+            (last_checked_via_api older than PASSIVE_CLAN_REFRESH_INTERVAL_DAYS,
+            or never checked — sort_key '' sorts first). Collected by
+            QapBot.py's main clan-categorization loop as a side effect of its
+            own already-mandatory full clan_name_cache scan, rather than this
+            function scanning the cache a second time — see
+            CLAN_WAR_TRACKING.md write-path 8.
 
     Returns the number of clans actually queried this cycle.
     """
     log_prefix = "[PASSIVE-REFRESH]"
-    cutoff = datetime.now(_tz.utc) - timedelta(days=PASSIVE_CLAN_REFRESH_INTERVAL_DAYS)
-
-    # (clan_tag, sort_key) — never-checked clans sort first ('' < any ISO string).
-    _scan_t0 = time.monotonic()
-    candidates: List[Tuple[str, str]] = []
-    _scan_count = 0
-    for clan_tag, clan_data in list(CACHE.clan_name_cache.items()):
-        _scan_count += 1
-        if _scan_count % 5000 == 0:
-            await asyncio.sleep(0)
-        if not isinstance(clan_data, dict):
-            continue
-        # Fast-reject: only passively-tracked, non-subscribed, non-deleted
-        # clans need this fallback path — everyone else is already covered by
-        # the main update loop's own polling.
-        if clan_data.get('track_war_updates', True):
-            continue
-        if clan_data.get('has_active_subscriptions') or clan_data.get('is_deleted'):
-            continue
-        last_checked = clan_data.get('last_checked_via_api')
-        if not last_checked:
-            candidates.append((clan_tag, ''))
-            continue
-        try:
-            dt = datetime.fromisoformat(last_checked)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=_tz.utc)
-            if dt < cutoff:
-                candidates.append((clan_tag, last_checked))
-        except (ValueError, TypeError):
-            candidates.append((clan_tag, ''))
-
-    candidates.sort(key=lambda c: c[1])  # most-overdue (or never-checked) first
-    _scan_elapsed = time.monotonic() - _scan_t0
 
     if not candidates:
-        logging.info(
-            f"{log_prefix} Scan: {_scan_count:,} clan(s) checked in {_scan_elapsed:.3f}s "
-            f"— nothing overdue"
-        )
         return 0
 
+    candidates = sorted(candidates, key=lambda c: c[1])  # most-overdue (or never-checked) first
     batch = [tag for tag, _ in candidates[:_PASSIVE_REFRESH_BATCH_SIZE]]
 
     logging.info(
-        f"{log_prefix} Scan: {_scan_count:,} clan(s) checked in {_scan_elapsed:.3f}s — "
-        f"{len(candidates):,} overdue (>{PASSIVE_CLAN_REFRESH_INTERVAL_DAYS}d), "
-        f"fetching {len(batch):,} this cycle"
+        f"{log_prefix} {len(candidates):,} passively-tracked clan(s) overdue "
+        f"(>{PASSIVE_CLAN_REFRESH_INTERVAL_DAYS}d) — fetching {len(batch):,} this cycle"
     )
 
     _sem = asyncio.Semaphore(_PASSIVE_REFRESH_CONCURRENCY)
@@ -5854,8 +5824,7 @@ async def refresh_stale_passive_clans() -> int:
     logging.info(
         f"{log_prefix} Fetch: {len(batch):,} check(s) in {_fetch_elapsed:.3f}s "
         f"({_fetch_elapsed / len(batch) * 1000:.1f}ms/clan avg at concurrency "
-        f"{_PASSIVE_REFRESH_CONCURRENCY}), {_promoted} promotion(s) detected. "
-        f"Total (scan+fetch): {_scan_elapsed + _fetch_elapsed:.3f}s"
+        f"{_PASSIVE_REFRESH_CONCURRENCY}), {_promoted} promotion(s) detected."
     )
     return len(batch)
 

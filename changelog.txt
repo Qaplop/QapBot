@@ -1,6 +1,22 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-08 (9)
+- Fixed: user spotted a redundant second full clan_name_cache scan every cycle, from prod log evidence
+  — `[CATEGORIZE-TIMING] Categorized 419791 clan(s) in 5.086s` (the pre-existing main clan-categorization
+  loop) running right alongside (6)/(7) below's own `[PASSIVE-REFRESH] Scan:` line (~4.3-5.2s for the
+  same ~420K clans). The categorization loop's fast-reject branch already discards exactly the
+  track_war_updates=False population the passive-refresh scan was separately re-scanning for.
+  Merged: the categorization loop (QapBot.py, Step 1) now also collects (clan_tag, sort_key)
+  passive-refresh candidates during its existing fast-reject branch, into a new
+  `_passive_refresh_candidates` list. `QBhelperfunctions.refresh_stale_passive_clans()` no longer scans
+  `clan_name_cache` itself — it now takes `candidates: List[Tuple[str, str]]` as a parameter and only
+  does batch selection + the get_clan() fetches. Eliminates one of the two ~5s full scans per cycle
+  entirely (verified via prod [CATEGORIZE-TIMING] and the now-removed separate scan timing line).
+  Files: QapBot.py, QBhelperfunctions.py. Docs: CLAN_WAR_TRACKING.md (write-path 8). Rewrote
+  tests/unit/test_passive_clan_refresh.py for the new signature (7 tests). 1508 tests pass
+  (.\run_tests.ps1 -Full).
+
 2026-08-08 (8)
 - Added: separate scan-vs-fetch timing to refresh_stale_passive_clans()'s [PASSIVE-REFRESH] log line
   (QBhelperfunctions.py), to make the (7) below cost trade-off directly observable instead of guessed
