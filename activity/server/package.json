@@ -1,0 +1,21 @@
+{
+  "name": "cwl-clan-config-server",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Cloudflare Worker backend for the CWL clan-config Discord Activity — OAuth2 token exchange + thin proxy to QapBot's bridge API. See CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --env dev",
+    "deploy:dev": "wrangler deploy --env dev",
+    "deploy:prod": "wrangler deploy --env prod",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260801.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.20.0"
+  }
+}

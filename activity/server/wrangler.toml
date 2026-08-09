@@ -1,0 +1,19 @@
+name = "cwl-clan-config-server"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+# CLIENT_ID is not secret (it's public in the OAuth flow anyway) so it lives here as a plain
+# var, per environment. CLIENT_SECRET / BRIDGE_URL / BRIDGE_SECRET are real secrets — never put
+# them here. Set them per environment with:
+#   wrangler secret put CLIENT_SECRET --env dev
+#   wrangler secret put BRIDGE_URL --env dev       (Phase B: the cloudflared tunnel URL for the DEV bot)
+#   wrangler secret put BRIDGE_SECRET --env dev     (Phase B: shared secret with QapBot's bridge API)
+# ...and again with --env prod once the PROD bot/tunnel exist (Phase D).
+
+[env.dev]
+name = "cwl-clan-config-server-dev"
+vars = { CLIENT_ID = "REPLACE_WITH_DEV_DISCORD_APPLICATION_CLIENT_ID" }
+
+[env.prod]
+name = "cwl-clan-config-server-prod"
+vars = { CLIENT_ID = "REPLACE_WITH_PROD_DISCORD_APPLICATION_CLIENT_ID" }

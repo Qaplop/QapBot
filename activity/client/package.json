@@ -1,0 +1,22 @@
+{
+  "name": "cwl-clan-config-client",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Cloudflare Pages frontend for the CWL clan-config Discord Activity. Plain TypeScript, no framework — see CWL_CLAN_CONFIG_ACTIVITY_PLAN.md for why.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "deploy:dev": "npm run build && wrangler pages deploy dist --project-name=cwl-clan-config-dev",
+    "deploy:prod": "npm run build && wrangler pages deploy dist --project-name=cwl-clan-config-prod"
+  },
+  "dependencies": {
+    "@discord/embedded-app-sdk": "^2.5.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vite": "^6.4.0",
+    "wrangler": "^4.20.0"
+  }
+}

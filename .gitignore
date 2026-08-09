@@ -242,5 +242,13 @@ instructions.txt
 *.bat
 *To_Do*
 .workspace_tools/
+
+# activity/ — Cloudflare Pages/Workers frontend+backend (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md)
+activity/**/node_modules/
+activity/**/.wrangler/
+activity/**/dist/
+activity/**/.dev.vars
+activity/**/.env
+activity/**/.env.local
 .repo_*backup*/
 .claude/
