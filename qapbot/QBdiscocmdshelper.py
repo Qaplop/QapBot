@@ -3970,11 +3970,11 @@ async def format_clan_management_message(clan_tag: str, guild: discord.Guild, mo
     elif mode == "config":
         return await _format_clan_management_config(guild)
     elif mode == "cwl_settings":
-        from qapbot.QBdiscocmdshelper_cwl import _format_clan_management_cwl_settings
-        return await _format_clan_management_cwl_settings(guild)
+        from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_settings
+        return await format_clan_management_cwl_settings(guild)
     elif mode == "cwl_management":
-        from qapbot.QBdiscocmdshelper_cwl import _format_clan_management_cwl_management
-        return await _format_clan_management_cwl_management(guild)
+        from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_management
+        return await format_clan_management_cwl_management(guild)
     else:  # Default to registrations
         return await _format_clan_management_registrations(clan_tag, guild)
 

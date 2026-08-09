@@ -513,9 +513,9 @@ class CwlManagementHubView(discord.ui.View):
         else:
             add_cwl_management_components(self, interaction.guild.id)
 
-        from qapbot.QBdiscocmdshelper_cwl import _format_clan_management_cwl_settings, _format_clan_management_cwl_management
+        from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_settings, format_clan_management_cwl_management
 
-        builder = _format_clan_management_cwl_settings if mode == "cwl_settings" else _format_clan_management_cwl_management
+        builder = format_clan_management_cwl_settings if mode == "cwl_settings" else format_clan_management_cwl_management
         embed, _, _, _ = await builder(interaction.guild)
 
         # This IS the anchored message's own interaction (a direct click on this view) — safe
@@ -560,9 +560,9 @@ class CwlManagementHubView(discord.ui.View):
         else:
             add_cwl_management_components(self, interaction.guild.id)
 
-        from qapbot.QBdiscocmdshelper_cwl import _format_clan_management_cwl_settings, _format_clan_management_cwl_management
+        from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_settings, format_clan_management_cwl_management
 
-        builder = _format_clan_management_cwl_settings if mode == "cwl_settings" else _format_clan_management_cwl_management
+        builder = format_clan_management_cwl_settings if mode == "cwl_settings" else format_clan_management_cwl_management
         embed, _, _, _ = await builder(interaction.guild)
 
         try:

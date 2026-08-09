@@ -5,8 +5,8 @@ Split out of QBdiscocmdshelper.py the same way QBdiscocmdshelper_admin_command.p
 an already-large file from growing further with an unrelated concern. See
 CWL_ROSTER_PLANNING_PLAN.md for the full feature design.
 
-The two embed builders here (_format_clan_management_cwl_settings /
-_format_clan_management_cwl_management) are the "shared content layer": they're called both
+The two embed builders here (format_clan_management_cwl_settings /
+format_clan_management_cwl_management) are the "shared content layer": they're called both
 from format_clan_management_message()'s dispatch (the /clan management path) and directly from
 the CWL Management Hub view's own render step (the anchored-message path) — written once,
 shown in two places, per the plan's Phase 1 design.
@@ -53,7 +53,7 @@ def get_current_cwl_event_sync(guild_id: int) -> Optional[Dict[str, Any]]:
     return events[0]  # list_cwl_events_sync already orders by cwl_season DESC
 
 
-async def _format_clan_management_cwl_settings(
+async def format_clan_management_cwl_settings(
     guild: discord.Guild,
 ) -> Tuple[discord.Embed, Optional[discord.Embed], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """CWL guild-preferences screen ("cwl_settings" mode) — shared by /clan management and the
@@ -113,7 +113,7 @@ async def _format_clan_management_cwl_settings(
     return embed, None, [], []
 
 
-async def _format_clan_management_cwl_management(
+async def format_clan_management_cwl_management(
     guild: discord.Guild,
 ) -> Tuple[discord.Embed, Optional[discord.Embed], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """CWL season-operations screen ("cwl_management" mode) — shared by /clan management and

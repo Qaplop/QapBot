@@ -3858,12 +3858,12 @@ async def repost_cwl_management_messages(*, only_if_not_bottom: bool = False, bu
     differ per anchored-message feature.
     """
     from qapbot.ui_cwl_roster import CwlManagementHubView, add_cwl_management_components
-    from qapbot.QBdiscocmdshelper_cwl import _format_clan_management_cwl_management
+    from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_management
 
     async def _build_cwl_management_content_and_view(channel: Any, guild_id_int: int) -> Tuple[str, discord.ui.View, Optional[discord.Embed]]:
         guild = channel.guild
         view = CwlManagementHubView()
-        embed, _, _, _ = await _format_clan_management_cwl_management(guild)
+        embed, _, _, _ = await format_clan_management_cwl_management(guild)
         add_cwl_management_components(view, guild_id_int)
         return "", view, embed
 
