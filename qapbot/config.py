@@ -173,8 +173,12 @@ class BotConfig:
     # CWL clan-config web bridge (qapbot/web_bridge.py, CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase B).
     # Both 0/empty by default = bridge not started. Bound to 127.0.0.1 only — a cloudflared
     # tunnel (not this bot) is what makes it reachable from the Cloudflare Worker.
-    web_bridge_port: int = 0                # WEB_BRIDGE_PORT in .env
-    web_bridge_secret: str = ""             # WEB_BRIDGE_SECRET in .env — shared with the Worker's BRIDGE_SECRET
+    # DEV/PROD-suffixed like discord_token/coc_email above (dev and prod hosts share one .env):
+    # WEB_BRIDGE_PORT_DEV/WEB_BRIDGE_SECRET_DEV when DISCORD_GUILD_ID > 0 (DEV mode), else
+    # WEB_BRIDGE_PORT/WEB_BRIDGE_SECRET. Each must match the corresponding Worker environment's
+    # BRIDGE_URL/BRIDGE_SECRET (env.dev vs env.prod in activity/server/wrangler.toml).
+    web_bridge_port: int = 0
+    web_bridge_secret: str = ""
 
 
 
@@ -337,12 +341,18 @@ def load_config() -> BotConfig:
     except ValueError:
         sim_max_workers = 0
 
-    # CWL clan-config web bridge (Phase B) — both must be set to start it
+    # CWL clan-config web bridge (Phase B) — both must be set to start it. DEV/PROD-suffixed
+    # like discord_token/coc_email above, since dev and prod hosts share one .env file.
+    if is_dev_mode:
+        _web_bridge_port_raw = os.getenv("WEB_BRIDGE_PORT_DEV", "0")
+        web_bridge_secret = os.getenv("WEB_BRIDGE_SECRET_DEV", "")
+    else:
+        _web_bridge_port_raw = os.getenv("WEB_BRIDGE_PORT", "0")
+        web_bridge_secret = os.getenv("WEB_BRIDGE_SECRET", "")
     try:
-        web_bridge_port = max(0, int(os.getenv("WEB_BRIDGE_PORT", "0")))
+        web_bridge_port = max(0, int(_web_bridge_port_raw))
     except ValueError:
         web_bridge_port = 0
-    web_bridge_secret = os.getenv("WEB_BRIDGE_SECRET", "")
 
     # Create config object
     config = BotConfig(
