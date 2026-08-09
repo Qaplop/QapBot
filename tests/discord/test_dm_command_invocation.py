@@ -70,10 +70,22 @@ def test_clan_management_is_still_guild_only():
 
 
 @pytest.mark.discord
-def test_whois_family_is_still_guild_only():
-    assert QBdiscordcmds.whois.guild_only is True
-    assert QBdiscordcmds.whois_message.guild_only is True
-    assert QBdiscordcmds.whois_slash.guild_only is True
+def test_whois_family_is_dm_invokable():
+    """Correction (17): _whois_logic()'s interaction.guild dependency turned out to be
+    cosmetic-only (guild nickname/avatar override), already with a working fallback — the
+    actual blocker was a separate, unnecessary `if not interaction.guild: reject` guard."""
+    assert QBdiscordcmds.whois.guild_only is False
+    assert QBdiscordcmds.whois_message.guild_only is False
+    assert QBdiscordcmds.whois_slash.guild_only is False
+
+
+@pytest.mark.discord
+def test_whois_slash_user_param_is_user_typed_not_member_typed():
+    """discord.Member-typed options can't resolve outside a guild — must be discord.User for
+    the user= path to even be selectable from a DM."""
+    annotation = QBdiscordcmds.whois_slash.callback.__annotations__["user"]
+    assert "Member" not in str(annotation)
+    assert "User" in str(annotation)
 
 
 # ---------------------------------------------------------------------------
@@ -100,9 +112,17 @@ class _FakeCache:
         self.server_config: Dict[str, Dict[str, Any]] = {}
         self.subscriptions: Dict[str, Dict[str, Any]] = {}
         self.clan_families: Dict[str, Dict[str, Any]] = {}
+        self.clan_name_cache: Dict[str, Dict[str, Any]] = {}
+        self.temp_war_metadata: Dict[str, Dict[str, Any]] = {}
 
     def get_all_subscriptions_flat(self) -> Dict[str, Any]:
         return {}
+
+    def get_clan_name(self, tag: str, default: str = "") -> str:
+        entry = self.clan_name_cache.get(tag)
+        if isinstance(entry, dict):
+            return entry.get("name", default)
+        return default
 
 
 @pytest.mark.discord
@@ -395,7 +415,7 @@ async def test_help_dm_filters_to_dm_available_commands(mock_interaction, monkey
     field_values = " ".join(f.value for f in embed.fields)
     # DM-available commands appear...
     assert "/status" in field_values or "status" in field_values
-    # ...guild-only commands (e.g. subscribe, highlightme, clan management, whois) do not.
+    # ...guild-only commands (e.g. subscribe, highlightme, clan management) do not.
     assert "/subscribe`" not in field_values
     assert "/highlightme`" not in field_values
 
@@ -425,7 +445,7 @@ async def test_help_command_autocomplete_dm_excludes_guild_only(mock_interaction
     assert "status" in values
     assert "subscribe" not in values
     assert "highlightme" not in values
-    assert "whois" not in values
+    assert "whois" in values  # whois is DM-invokable now — see test_whois_family_is_dm_invokable
 
 
 @pytest.mark.discord
@@ -438,4 +458,201 @@ async def test_help_command_autocomplete_guild_includes_all():
 
     values = {c.value for c in choices}
     assert "subscribe" in values
-    assert "highlightme" in values
+
+
+# ---------------------------------------------------------------------------
+# subscriptions() — server_wide forced True in DM (round 3 follow-up)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_subscriptions_dm_forces_server_wide_even_when_false(mock_interaction, monkeypatch):
+    """"Current channel" is the DM itself in a DM, never a meaningful subscription scope — must
+    be forced to the server_wide path regardless of what the caller passed (including the
+    parameter's own default of False)."""
+    mock_interaction.guild = None
+    mock_interaction.response.is_done = MagicMock(return_value=False)
+
+    fake_cache = _FakeCache()
+    fake_cache.user_accounts[str(mock_interaction.user.id)] = {
+        "players": [{"player_tag": "#P1", "current_clan_tag": "#CLAN1"}]
+    }
+    fake_cache.server_config["555"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    fake_cache.subscriptions["555"] = {}
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+    import qapbot.QBdiscocmdshelper as helper
+    monkeypatch.setattr(helper, "CACHE", fake_cache)
+
+    fake_guild = MagicMock()
+    fake_guild.id = 555
+    fake_guild.name = "TestGuild"
+    fake_bot = MagicMock()
+    fake_bot.get_guild = MagicMock(return_value=fake_guild)
+    monkeypatch.setattr(QBdiscordcmds.QBcore, "bot", fake_bot)
+
+    sent = {}
+
+    async def _fake_send_and_track(interaction, content=None, command_name=None, embed=None, ephemeral=False):
+        sent["content"] = content
+
+    monkeypatch.setattr(QBdiscordcmds, "send_and_track", _fake_send_and_track)
+
+    # server_wide left at its default (False) — the DM override must still kick in.
+    await QBdiscordcmds.subscriptions.callback(mock_interaction)  # type: ignore[arg-type]
+
+    fake_bot.get_guild.assert_called_once_with(555)
+    assert sent.get("content") == "This guild has no subscriptions."
+
+
+# ---------------------------------------------------------------------------
+# whois — DM invocation (round 3: made DM-invokable after further review)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_whois_logic_dm_falls_back_to_user_display_info(mock_interaction, monkeypatch):
+    """interaction.guild is None in a DM — must not crash, and must fall back to the plain
+    Discord username/avatar instead of a guild member's nickname/avatar override."""
+    _whois_logic = QBdiscordcmds._whois_logic
+
+    mock_interaction.guild = None
+    fake_cache = _FakeCache()
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+
+    target = MagicMock()
+    target.id = 555
+    target.name = "TargetUser"
+    target.display_avatar.url = "https://example.com/avatar.png"
+
+    await _whois_logic(mock_interaction, target)
+
+    mock_interaction.followup.send.assert_awaited_once()
+    embed = mock_interaction.followup.send.await_args.kwargs.get("embed")
+    assert embed is not None
+    assert "TargetUser" in embed.title
+
+
+# ---------------------------------------------------------------------------
+# leaderboard/analyse clan autocomplete — union of the DM caller's guilds (round 3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_leaderboard_clan_autocomplete_dm_offers_all_linked_guilds_clans(mock_interaction, monkeypatch):
+    mock_interaction.guild_id = None
+    fake_cache = _FakeCache()
+    fake_cache.user_accounts[str(mock_interaction.user.id)] = {
+        "players": [
+            {"player_tag": "#P1", "current_clan_tag": "#CLANA"},
+            {"player_tag": "#P2", "current_clan_tag": "#CLANB"},
+        ]
+    }
+    fake_cache.server_config["111"] = {"member_clans": ["#CLANA"], "member_families": []}
+    fake_cache.server_config["222"] = {"member_clans": ["#CLANB"], "member_families": []}
+    fake_cache.subscriptions["111"] = {"chanA": [{"clan_tag": "#CLANA"}]}
+    fake_cache.subscriptions["222"] = {"chanB": [{"clan_tag": "#CLANB"}]}
+    fake_cache.clan_name_cache = {"#CLANA": {"name": "Clan A"}, "#CLANB": {"name": "Clan B"}}
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+    import qapbot.QBdiscocmdshelper as helper
+    monkeypatch.setattr(helper, "CACHE", fake_cache)
+    # get_clan_family_autocomplete_choices() does its own `from qapbot.cache_manager import
+    # CACHE` inside its body (not the module-level reference above) — must patch the actual
+    # cache_manager singleton too, or it silently reads real (empty-in-tests) data.
+    import qapbot.cache_manager as cache_manager_module
+    monkeypatch.setattr(cache_manager_module, "CACHE", fake_cache)
+
+    choices = await QBdiscordcmds.leaderboard_clan_autocomplete(mock_interaction, "")
+
+    values = {c.value for c in choices}
+    assert values == {"#CLANA", "#CLANB"}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_leaderboard_clan_autocomplete_guild_unaffected(mock_interaction, monkeypatch):
+    """Regression guard: guild-invoked autocomplete keeps using interaction.guild_id directly,
+    never touching CACHE.user_accounts at all."""
+    mock_interaction.guild_id = 999
+    fake_cache = _FakeCache()
+    fake_cache.subscriptions["999"] = {"chan": [{"clan_tag": "#CLANC"}]}
+    fake_cache.clan_name_cache = {"#CLANC": {"name": "Clan C"}}
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+    import qapbot.cache_manager as cache_manager_module
+    monkeypatch.setattr(cache_manager_module, "CACHE", fake_cache)
+
+    choices = await QBdiscordcmds.leaderboard_clan_autocomplete(mock_interaction, "")
+
+    values = {c.value for c in choices}
+    assert values == {"#CLANC"}
+    assert fake_cache.user_accounts == {}
+
+
+# ---------------------------------------------------------------------------
+# Benign discord.py log-noise filters (QapBot.py) — round 3
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def qapbot_module_for_filters():
+    import QapBot
+    return QapBot
+
+
+@pytest.mark.discord
+def test_autocomplete_expired_interaction_filter_suppresses_10062(qapbot_module_for_filters):
+    import logging
+
+    record = logging.LogRecord(
+        name="discord.app_commands.tree", level=logging.ERROR, pathname=__file__, lineno=1,
+        msg="Ignoring exception in autocomplete for %r (Guild: %s, User: %s)",
+        args=("list", None, 123), exc_info=None,
+    )
+    try:
+        raise Exception("404 Not Found (error code: 10062): Unknown interaction")
+    except Exception as e:
+        record.exc_info = (type(e), e, e.__traceback__)
+
+    filt = qapbot_module_for_filters._AutocompleteExpiredInteractionFilter()
+    assert filt.filter(record) is False
+
+
+@pytest.mark.discord
+def test_autocomplete_expired_interaction_filter_keeps_genuine_errors(qapbot_module_for_filters):
+    import logging
+
+    record = logging.LogRecord(
+        name="discord.app_commands.tree", level=logging.ERROR, pathname=__file__, lineno=1,
+        msg="Ignoring exception in autocomplete for %r (Guild: %s, User: %s)",
+        args=("list", None, 123), exc_info=None,
+    )
+    try:
+        raise ValueError("a genuine bug")
+    except Exception as e:
+        record.exc_info = (type(e), e, e.__traceback__)
+
+    filt = qapbot_module_for_filters._AutocompleteExpiredInteractionFilter()
+    assert filt.filter(record) is True
+
+
+@pytest.mark.discord
+def test_discord_reconnect_filter_suppresses_reconnect_message(qapbot_module_for_filters):
+    import logging
+
+    record = logging.LogRecord(
+        name="discord.client", level=logging.ERROR, pathname=__file__, lineno=1,
+        msg="Attempting a reconnect in 5.00s", args=(), exc_info=None,
+    )
+    filt = qapbot_module_for_filters._DiscordReconnectFilter()
+    assert filt.filter(record) is False
+
+
+@pytest.mark.discord
+def test_log_filters_are_attached_to_every_handler(qapbot_module_for_filters):
+    """Regression guard for the actual bug this round fixed: a filter added via
+    logging.getLogger('discord').addFilter(...) never fires for records that only propagate up
+    from a child logger like discord.app_commands.tree — Python's Logger.callHandlers() walks
+    ancestor HANDLERS, not ancestor LOGGER filters. Both filters must be attached to the real
+    handlers instead."""
+    for handler in qapbot_module_for_filters.handlers:
+        filter_types = {type(f) for f in handler.filters}
+        assert qapbot_module_for_filters._DiscordReconnectFilter in filter_types
+        assert qapbot_module_for_filters._AutocompleteExpiredInteractionFilter in filter_types

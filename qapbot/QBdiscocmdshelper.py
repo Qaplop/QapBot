@@ -760,23 +760,28 @@ async def get_clan_family_autocomplete_choices(
     current: str,
     channel_id: Optional[str] = None,
     guild_id: Optional[str] = None,
+    guild_ids: Optional[List[str]] = None,
     mode: str = "all",
     max_choices: int = 25
 ) -> List[app_commands.Choice[str]]:
     """
     Generate autocomplete choices for clan/family parameters with configurable behavior.
-    
+
     Args:
         current: Current user input to filter suggestions
         channel_id: Discord channel ID for subscription-based filtering
         guild_id: Discord guild ID; when provided with subscribed_first mode, restricts
             the fallback to clans subscribed in this guild (not all bot-wide clans)
+        guild_ids: Multiple Discord guild IDs for "guild_first" mode — used instead of
+            guild_id when a DM caller is linked to more than one guild's clans (there's no
+            single interaction.guild_id to key off in a DM); the union of each guild's
+            subscribed clans is offered. Ignored by every mode except "guild_first".
         mode: Autocomplete mode - "all", "subscribed_only", "subscribed_first", "clans_only", or "guild_first"
         max_choices: Maximum number of choices to return
-        
+
     Returns:
         List of app_commands.Choice objects for Discord autocomplete
-        
+
     Modes:
         - "all": All tracked clans and families
         - "subscribed_only": Only clans/families subscribed in the given channel
@@ -816,13 +821,15 @@ async def get_clan_family_autocomplete_choices(
     
     # Handle guild_first mode: guild clans only when empty, extend to all when searching
     if mode == "guild_first":
+        guild_id_list: List[str] = list(guild_ids) if guild_ids else ([guild_id] if guild_id else [])
         guild_tags: Set[str] = set()
-        if guild_id and guild_id in CACHE.subscriptions:
-            for ch_subs in CACHE.subscriptions[guild_id].values():
-                for s in ch_subs:
-                    t_ = s.get('clan_tag')
-                    if t_ and t_ != 'PLAYERREGISTRATION':
-                        guild_tags.add(t_)
+        for gid in guild_id_list:
+            if gid and gid in CACHE.subscriptions:
+                for ch_subs in CACHE.subscriptions[gid].values():
+                    for s in ch_subs:
+                        t_ = s.get('clan_tag')
+                        if t_ and t_ != 'PLAYERREGISTRATION':
+                            guild_tags.add(t_)
         # Sort guild clans: CWL-active first (O(1) in-memory check), then alphabetical
         def _is_cwl_active(tag: str) -> bool:
             return bool(CACHE.temp_war_metadata.get(tag, {}).get('is_cwl', False))
@@ -1922,6 +1929,35 @@ def check_bot_admin_only(interaction: discord.Interaction, server_admin: str) ->
     return _is_configured_admin(interaction.user, server_admin)
 
 
+def get_dm_caller_matched_guild_ids(discord_id: str) -> List[int]:
+    """
+    Every guild whose tracked clans include at least one of discord_id's linked accounts'
+    current_clan_tag — the same matching logic resolve_guild_context() uses to decide
+    zero/one/many, factored out for callers that need the full list without the
+    interactive single-guild-or-picker resolution (e.g. autocomplete handlers, which can't
+    await user interaction and must return synchronously-ish).
+    """
+    user_data = CACHE.user_accounts.get(discord_id, {})
+    clan_tags: Set[str] = {
+        p["current_clan_tag"]
+        for p in user_data.get("players", [])
+        if p.get("current_clan_tag")
+    }
+    if not clan_tags:
+        return []
+
+    matched_guild_ids: List[int] = []
+    for guild_id_str in CACHE.server_config.keys():
+        try:
+            guild_id_int = int(guild_id_str)
+        except (TypeError, ValueError):
+            continue
+        guild_clans = set(get_guild_clans_including_member_config(guild_id_int))
+        if guild_clans & clan_tags:
+            matched_guild_ids.append(guild_id_int)
+    return matched_guild_ids
+
+
 async def resolve_guild_context(interaction: discord.Interaction) -> Optional[int]:
     """
     Resolve which guild a command invocation should operate against.
@@ -1947,25 +1983,7 @@ async def resolve_guild_context(interaction: discord.Interaction) -> Optional[in
     if interaction.guild is not None:
         return interaction.guild.id
 
-    discord_id = str(interaction.user.id)
-    user_data = CACHE.user_accounts.get(discord_id, {})
-    clan_tags: Set[str] = {
-        p["current_clan_tag"]
-        for p in user_data.get("players", [])
-        if p.get("current_clan_tag")
-    }
-    if not clan_tags:
-        return None
-
-    matched_guild_ids: List[int] = []
-    for guild_id_str in CACHE.server_config.keys():
-        try:
-            guild_id_int = int(guild_id_str)
-        except (TypeError, ValueError):
-            continue
-        guild_clans = set(get_guild_clans_including_member_config(guild_id_int))
-        if guild_clans & clan_tags:
-            matched_guild_ids.append(guild_id_int)
+    matched_guild_ids = get_dm_caller_matched_guild_ids(str(interaction.user.id))
 
     if not matched_guild_ids:
         return None

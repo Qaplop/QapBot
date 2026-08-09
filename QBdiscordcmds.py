@@ -872,9 +872,14 @@ async def leaderboard(
 
 @leaderboard.autocomplete('clan')  # type: ignore[attr-defined]
 async def leaderboard_clan_autocomplete(interaction: discord.Interaction, current: str):  # type: ignore[return]
-    """Autocomplete for clan: shows server's clans when empty, extends to all tracked clans when searching."""
-    guild_id = str(interaction.guild_id) if interaction.guild_id else None
-    return await get_clan_family_autocomplete_choices(current, guild_id=guild_id, mode="guild_first")
+    """Autocomplete for clan: shows server's clans when empty, extends to all tracked clans when
+    searching. In a DM (no single interaction.guild_id to key off), offers the union of clans
+    from every guild the caller is linked to via their registered CoC accounts."""
+    if interaction.guild_id:
+        return await get_clan_family_autocomplete_choices(current, guild_id=str(interaction.guild_id), mode="guild_first")
+    from qapbot.QBdiscocmdshelper import get_dm_caller_matched_guild_ids
+    guild_ids = [str(g) for g in get_dm_caller_matched_guild_ids(str(interaction.user.id))]
+    return await get_clan_family_autocomplete_choices(current, guild_ids=guild_ids, mode="guild_first")
 
 
 @leaderboard.autocomplete('mode')  # type: ignore[attr-defined]
@@ -2733,9 +2738,13 @@ async def analyse_leaguegroup(interaction: discord.Interaction, clan: str) -> No
 
 @analyse_leaguegroup.autocomplete('clan')
 async def analyse_leaguegroup_clan_autocomplete(interaction: discord.Interaction, current: str):
-    """Autocomplete: suggests tracked clans for the guild (also accepts any typed tag)."""
-    guild_id = str(interaction.guild_id) if interaction.guild_id else None
-    return await get_clan_family_autocomplete_choices(current, guild_id=guild_id, mode="guild_first")
+    """Autocomplete: suggests tracked clans for the guild (also accepts any typed tag). In a DM,
+    offers the union of clans from every guild the caller is linked to."""
+    if interaction.guild_id:
+        return await get_clan_family_autocomplete_choices(current, guild_id=str(interaction.guild_id), mode="guild_first")
+    from qapbot.QBdiscocmdshelper import get_dm_caller_matched_guild_ids
+    guild_ids = [str(g) for g in get_dm_caller_matched_guild_ids(str(interaction.user.id))]
+    return await get_clan_family_autocomplete_choices(current, guild_ids=guild_ids, mode="guild_first")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3176,14 +3185,18 @@ async def analyse_cwlopponent(interaction: discord.Interaction, clan: str) -> No
 
 @analyse_cwlopponent.autocomplete('clan')
 async def analyse_cwlopponent_clan_autocomplete(interaction: discord.Interaction, current: str):
-    """Autocomplete: suggests tracked clans for the guild (also accepts any typed tag)."""
-    guild_id = str(interaction.guild_id) if interaction.guild_id else None
-    return await get_clan_family_autocomplete_choices(current, guild_id=guild_id, mode="guild_first")
+    """Autocomplete: suggests tracked clans for the guild (also accepts any typed tag). In a DM,
+    offers the union of clans from every guild the caller is linked to."""
+    if interaction.guild_id:
+        return await get_clan_family_autocomplete_choices(current, guild_id=str(interaction.guild_id), mode="guild_first")
+    from qapbot.QBdiscocmdshelper import get_dm_caller_matched_guild_ids
+    guild_ids = [str(g) for g in get_dm_caller_matched_guild_ids(str(interaction.user.id))]
+    return await get_clan_family_autocomplete_choices(current, guild_ids=guild_ids, mode="guild_first")
 
 
 @app_commands.command(name="subscriptions", description=dev_mode+"Lists clan and family subscriptions for the current channel or entire discord server.")
 @app_commands.describe(
-    server_wide="If True, show all subscriptions for the entire discord server (default: False - current channel only)"
+    server_wide="If True, show all subscriptions for the entire discord server (default: False - current channel only). Always treated as True in a DM."
 )
 # DM-invokable (Phase 0b, CWL_ROSTER_PLANNING_PLAN.md) — read-only. server_wide=True resolves the
 # guild via resolve_guild_context() when invoked from a DM (see below); the default per-channel view
@@ -3196,8 +3209,12 @@ async def subscriptions(interaction: discord.Interaction, server_wide: bool = Fa
 
     Args:
         interaction: Discord interaction object
-        server_wide: If True, show all subscriptions across all channels in the discord server
+        server_wide: If True, show all subscriptions across all channels in the discord server.
+            Forced True in a DM regardless of what's passed — "the current channel" is the DM
+            itself there, which is never a meaningful subscription scope.
     """
+    if interaction.guild is None:
+        server_wide = True
     if server_wide:
         # resolve_guild_context() may need to send the interaction's first response itself (the
         # ambiguous multi-guild DM picker) — must run before _safe_defer(), not after.
@@ -4343,12 +4360,11 @@ async def _whois_logic(interaction: discord.Interaction, user: Union[discord.Use
     
     user_id_str = str(user.id)
     user_entry = CACHE.user_accounts.get(user_id_str)
-    
-    # Get guild member for display name and avatar
-    if not interaction.guild:
-        await interaction.followup.send("This command must be used in a guild.", ephemeral=True)
-        return
-    member = interaction.guild.get_member(user.id)
+
+    # Get guild member for display name and avatar (guild-specific nickname/avatar override) —
+    # optional, not required: falls back to the plain Discord username/avatar when unavailable
+    # (interaction.guild is None in a DM, or the target isn't a member of that guild).
+    member = interaction.guild.get_member(user.id) if interaction.guild else None
     display_name = member.display_name if member else user.name
     avatar_url = (member.display_avatar.url if member else user.display_avatar.url)
     
@@ -4539,13 +4555,13 @@ async def _whois_logic(interaction: discord.Interaction, user: Union[discord.Use
         await interaction.followup.send(embed=extra_embed, ephemeral=True)
 
 
-# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): _whois_logic() (below) needs
-# interaction.guild.get_member(user.id) to resolve the *target* user's membership — a different
-# person from the DM caller, so resolve_guild_context() (which resolves a guild from the caller's
-# own linked accounts) doesn't apply here. No DM analog without a different resolution strategy
-# (e.g. resolving from the target's own linked accounts instead).
+# DM-invokable (Phase 0b follow-up, CWL_ROSTER_PLANNING_PLAN.md) — correction against the original
+# draft: interaction.guild.get_member(user.id) in _whois_logic() turned out to be purely cosmetic
+# (guild nickname/avatar override), already with a working display_name/avatar_url fallback for
+# member is None — the guard that actually blocked DM use was a separate, unnecessary
+# `if not interaction.guild: reject` above that fallback, not a real data dependency. Right-clicking
+# a user works the same way in a DM as in a guild (targets the other DM participant).
 @app_commands.context_menu(name="whois")
-@app_commands.guild_only()
 async def whois(interaction: discord.Interaction, user: discord.User):
     """User context menu: right-click a user → Apps → whois."""
     if not await _safe_defer(interaction, thinking=True, ephemeral=True):
@@ -4555,10 +4571,8 @@ async def whois(interaction: discord.Interaction, user: discord.User):
     _log_cmd_done(interaction, "whois")
 
 
-# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): same target-user-guild-resolution issue
-# as whois, above.
+# DM-invokable (Phase 0b follow-up, CWL_ROSTER_PLANNING_PLAN.md) — same correction as whois, above.
 @app_commands.context_menu(name="whois")
-@app_commands.guild_only()
 async def whois_message(interaction: discord.Interaction, message: discord.Message):
     """Message context menu: right-click a message → Apps → whois (runs whois on the message author)."""
     if not await _safe_defer(interaction, thinking=True, ephemeral=True):
@@ -4585,17 +4599,16 @@ async def _whois_player_select_callback(interaction: discord.Interaction, select
     user="The Discord user to look up",
     player="Player tag (e.g. #ABC123) or name substring to search",
 )
-# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): the user= path hits the same
-# target-user-guild-resolution issue as the whois/whois_message context menus, AND its
-# `user: Optional[discord.Member]` parameter type is itself a blocker — Discord can't resolve a
-# Member-typed option outside a guild, so this parameter would need to become discord.User (and
-# _whois_logic's target-guild lookup redesigned) before this command could work from a DM at all.
-# The player= path (_player_report_logic) is otherwise guild-agnostic, but a slash command's
-# allowed-context is all-or-nothing, not per-parameter.
-@app_commands.guild_only()
+# DM-invokable (Phase 0b follow-up, CWL_ROSTER_PLANNING_PLAN.md) — correction against the original
+# draft: _whois_logic()'s guild dependency was cosmetic-only (see whois/whois_message, above), and
+# `user` is now typed discord.User instead of discord.Member — Member-typed options can only
+# resolve against a guild's member list, which doesn't exist in a DM; User-typed options resolve
+# to any Discord user regardless of context. _whois_logic() already accepted
+# Union[discord.User, discord.Member], so no change needed on that side. The player= path
+# (_player_report_logic) was already guild-agnostic.
 async def whois_slash(
     interaction: discord.Interaction,
-    user: Optional[discord.Member] = None,
+    user: Optional[discord.User] = None,
     player: Optional[str] = None,
 ) -> None:
     """Slash command: /whois — look up a Discord user's CoC accounts, or a player's war history."""

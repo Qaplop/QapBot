@@ -1,6 +1,44 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (17)
+- Fixed: four issues found while actually exercising Phase 0's DM commands live on the deployed
+  bot (third follow-up to Phase 0b, (14)/(15)/(16), CWL_ROSTER_PLANNING_PLAN.md):
+  (1) /subscriptions server_wide is now forced True whenever interaction.guild is None (including
+  when the caller doesn't pass it, its own default is False) — "the current channel" is the DM
+  itself in a DM, never a meaningful subscription scope.
+  (2) /whois (both context menus and the slash command) is now DM-invokable. _whois_logic()'s
+  interaction.guild.get_member(user.id) call turned out to be purely cosmetic (guild
+  nickname/avatar override) with an already-working fallback for member=None — the actual blocker
+  was a separate, unnecessary "if not interaction.guild: reject" guard sitting above that
+  fallback. whois_slash's user parameter changed from Optional[discord.Member] to
+  Optional[discord.User] — Member-typed options can't resolve outside a guild; _whois_logic()
+  already accepted Union[discord.User, discord.Member]. Note: this does broaden who can be looked
+  up from a DM (no longer implicitly scoped to "someone in a shared server") — worth a deliberate
+  look if that scoping was ever load-bearing.
+  (3) /leaderboard's and /analyse cwl_league_group's/cwl_opponent's clan= autocomplete previously
+  keyed off the single interaction.guild_id (always None in a DM), so with no search text typed
+  yet it silently returned nothing. get_clan_family_autocomplete_choices() (QBdiscocmdshelper.py)
+  gained a guild_ids: Optional[List[str]] parameter for its "guild_first" mode to union clans
+  across multiple guilds; a new get_dm_caller_matched_guild_ids() helper (factored out of
+  resolve_guild_context() — same guild-matching logic, minus the interactive
+  single-guild-or-picker resolution autocomplete handlers can't await) supplies the full list in
+  a DM, so these three autocompletes now offer the union of clans across every guild the caller
+  is linked to instead of nothing.
+  (4) The "Ignoring exception in autocomplete... Unknown interaction (10062)" ERROR discord.py
+  logs internally on every fast-typing autocomplete race (benign, already self-suppressed by
+  discord.py — "can't be handled anyway") became newly visible once autocomplete-bearing commands
+  like /list became DM-reachable. Suppressing it the way the pre-existing _DiscordReconnectFilter
+  suppresses "Attempting a reconnect" surfaced that neither filter actually worked: both were
+  registered via logging.getLogger('discord').addFilter(...), but the messages originate from
+  child loggers (discord.client, discord.app_commands.tree) — Python's Logger.callHandlers()
+  walks ancestor HANDLERS during propagation, not ancestor LOGGER filters, so a parent logger's
+  own addFilter() never fires for a child's records. Fixed by attaching both filters to the
+  actual handler objects instead.
+  Files: QBdiscordcmds.py, qapbot/QBdiscocmdshelper.py, QapBot.py,
+  tests/discord/test_dm_command_invocation.py.
+  1571 tests pass (.\run_tests.ps1).
+
 2026-08-09 (16)
 - Added: /admin is now DM-invokable for 17 of its 19 sub-actions, and /help now adapts its own
   command listing to the caller's context (second follow-up to Phase 0b, (14)/(15),

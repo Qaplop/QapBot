@@ -58,7 +58,33 @@ class _DiscordReconnectFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         return not (record.levelno == logging.ERROR and "Attempting a reconnect" in record.getMessage())
 
-logging.getLogger('discord').addFilter(_DiscordReconnectFilter())
+# Suppress the benign "Ignoring exception in autocomplete... Unknown interaction (10062)" ERROR
+# discord.py logs internally (app_commands/tree.py) when the Discord client fires a newer
+# autocomplete request before the bot finishes responding to the previous one (e.g. the user kept
+# typing) — the older interaction token is already invalid by the time we try to answer it.
+# discord.py's own comment there is "Suppress exception since it can't be handled anyway"; it
+# already swallows the exception, it just also logs it at ERROR level. Not a bug in our
+# autocomplete handlers, and became newly visible once Phase 0b (CWL_ROSTER_PLANNING_PLAN.md)
+# started allowing autocomplete-bearing commands like /list to be invoked from DMs.
+class _AutocompleteExpiredInteractionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno != logging.ERROR or "Ignoring exception in autocomplete" not in record.getMessage():
+            return True
+        exc = record.exc_info[1] if record.exc_info else None
+        return not (exc is not None and "10062" in str(exc))
+
+# Both filters above match ERROR records logged by discord.py submodule loggers (discord.client,
+# discord.app_commands.tree, ...), which are children of the 'discord' logger, not 'discord'
+# itself — a Logger's own addFilter() is only consulted for records logged directly on that exact
+# logger object, never for records merely propagating up from a child logger's log call (Python's
+# logging.Logger.callHandlers() walks ancestor HANDLERS, not ancestor LOGGER filters). Handler-level
+# filters, by contrast, run for every record that reaches that handler regardless of which logger
+# originated it — so both filters are attached to our actual handlers here rather than the
+# 'discord' logger object, which would silently never fire for either of these submodule-sourced
+# messages.
+for _h in handlers:
+    _h.addFilter(_DiscordReconnectFilter())
+    _h.addFilter(_AutocompleteExpiredInteractionFilter())
 
 # --- Automatic-GC pause visibility -----------------------------------------
 # The end of every update cycle already runs a scoped gc.collect(1) instead of
