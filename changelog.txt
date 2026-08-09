@@ -1,6 +1,28 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (20)
+- Added: Data Model layer for the CWL roster planning feature (Phase 1 start,
+  CWL_ROSTER_PLANNING_PLAN.md) — 4 new hot-DB-only tables (cwl_events, cwl_event_clans,
+  cwl_signups, cwl_assignments, all cascade-deleting from cwl_events), 2 new user_players
+  columns (cwl_permanent_optout, cwl_default_preferred_league_rank) and 9 new guild_config
+  columns (two anchored-message triplets-plus-bump-timestamp for the upcoming Personal CWL Hub
+  and CWL Management Hub messages, plus cwl_retention_months). Idempotent ALTER TABLE migration
+  block added for pre-existing databases (new _add_column_if_missing() helper, PRAGMA
+  table_info check-first — SQLite has no ADD COLUMN IF NOT EXISTS), to be removed once dev/prod
+  are both migrated per the established convention. cwl_event_clans.clan_tag and
+  cwl_assignments.assigned_clan_tag registered in CLAN_TAG_REFERENCING_TABLES so the orphan-clan
+  purge doesn't silently cascade-wipe CWL planning data mid-season (already caught once by
+  tests/unit/test_clan_tag_reference_registry.py before this entry was written).
+  New sync CRUD (db_manager.py, matching get_cwl_roster_sync's style): create_cwl_event_sync()
+  (idempotent upsert via ON CONFLICT...RETURNING), get_cwl_event_sync(), list_cwl_events_sync(),
+  update_cwl_event_status_sync(), set_cwl_event_clans_sync() (atomic replace-all),
+  get_cwl_event_clans_sync(), get_previous_cwl_event_clans_sync() (the prior-season carry-over
+  query). guild_config's new columns wired through save_guild_config()/get_guild_config()'s
+  explicit column lists (nothing auto-propagates there).
+  Files: qapbot/db_manager.py, tests/unit/test_db_manager_cwl_roster.py (new).
+  1585 tests pass (.\run_tests.ps1).
+
 2026-08-09 (19)
 - Fixed: qapbot/scripts/all_players_leaderboard.py silently posted to Discord channel 0
   ("Channel 0 not found (NotFound)") instead of erroring clearly. Root cause: LEADERBOARD_CHANNEL_ID

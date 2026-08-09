@@ -32,9 +32,15 @@ The plan below ships in 7 independently testable phases — the original 5, brac
 
 ---
 
-## Data Model (new tables, hot DB only)
+## Data Model (new tables, hot DB only) ✅ shipped 2026-08-09 (changelog (20))
 
 Add to `qapbot/db_manager.py`'s existing `CREATE TABLE IF NOT EXISTS` schema-creation block (same method that creates `clans`/`clan_families`/`guild_member_clans`, ~line 1538 area), so tables are created idempotently on `initialize()` like everything else. **Hot DB only** — no history-DB mirroring (per `qapbot/docs/DATABASE_ARCHITECTURE.md`, only `war_attacks`/`war_summary`/`cwl_league_groups`/`cwl_league_rounds` get mirrored). This is short-lived per-season operational data with a configurable retention policy (see Cross-Cutting Work below), so no history-split is needed even for long-retained guilds — deletion, not archival, is the mechanism.
+
+**Shipped exactly as designed**, with two implementation notes worth recording:
+- `create_cwl_event_sync()` uses `INSERT ... ON CONFLICT(guild_id, cwl_season) DO UPDATE SET updated_at = datetime('now') RETURNING id` — a single round-trip idempotent upsert (SQLite's bundled version supports `RETURNING`) rather than an insert-then-select pair, so "Configure Participating Clans" can be applied repeatedly against the same draft event without a race between the two queries.
+- `guild_config`'s two anchored-message triplets turned out to need a **4th** column each beyond the plan's original 3 (`*_channel_id`/`*_message_id`/`*_message_enabled`): `repost_anchored_message()` (the shared driver already built for the registration message, see Phase 1 below) requires a persisted `last_bump_key` for its cooldown gate — `cwl_hub_message_last_bump_iso` and `cwl_management_message_last_bump_iso`. The corresponding `_old_*_channel_id` tracking key (for detecting a channel change) is, like the registration message's equivalent, a transient `CACHE.server_config`-only key that's never persisted to the `guild_config` table at all — not a 5th column.
+
+**Tests:** `tests/unit/test_db_manager_cwl_roster.py` — CRUD roundtrip for all 4 new tables, `create_cwl_event_sync()`'s UNIQUE-constraint idempotency, cascade-delete from `cwl_events` down through all 3 child tables, `get_previous_cwl_event_clans_sync()`'s carry-over query (prior-season found / no prior season / no events at all), and the `guild_config` CWL columns' save/get roundtrip including their defaults for a guild that's never touched them.
 
 ### `cwl_events` — one row per guild × season planning campaign
 ```sql

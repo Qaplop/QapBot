@@ -91,6 +91,8 @@ CLAN_TAG_REFERENCING_TABLES: Tuple[Tuple[str, str, str, str], ...] = (
     ("main", "user_players", "current_clan_tag", ""),
     ("main", "guild_member_clans", "clan_tag", ""),
     ("main", "guild_welcome_clans", "clan_tag", ""),
+    ("main", "cwl_event_clans", "clan_tag", ""),
+    ("main", "cwl_assignments", "assigned_clan_tag", ""),
     # Non-FK columns that conceptually depend on a real clan:
     ("main", "guild_clan_roles", "clan_tag", ""),
     ("main", "subscriptions", "clan_tag", ""),  # also stores family tags — matching a clan tag still counts
@@ -1623,6 +1625,8 @@ class WarHistoryDB:
                 current_clan_tag TEXT,
                 is_primary BOOLEAN NOT NULL DEFAULT 0,
                 added_at TEXT NOT NULL DEFAULT (datetime('now')),
+                cwl_permanent_optout INTEGER NOT NULL DEFAULT 0,
+                cwl_default_preferred_league_rank TEXT,
                 FOREIGN KEY (discord_id) REFERENCES users(discord_id) ON DELETE CASCADE,
                 FOREIGN KEY (current_clan_tag) REFERENCES clans(clan_tag) ON DELETE SET NULL,
                 UNIQUE (discord_id, player_tag)
@@ -1682,6 +1686,15 @@ class WarHistoryDB:
                 welcome_message_mode TEXT NOT NULL DEFAULT 'clan_link',
                 welcome_apply_channel_id TEXT,
                 welcome_clan_tag TEXT,
+                cwl_hub_channel_id TEXT,
+                cwl_hub_message_id TEXT,
+                cwl_hub_message_enabled BOOLEAN NOT NULL DEFAULT 0,
+                cwl_hub_message_last_bump_iso TEXT,
+                cwl_management_channel_id TEXT,
+                cwl_management_message_id TEXT,
+                cwl_management_message_enabled BOOLEAN NOT NULL DEFAULT 0,
+                cwl_management_message_last_bump_iso TEXT,
+                cwl_retention_months INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
@@ -1715,6 +1728,101 @@ class WarHistoryDB:
         """)
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_guild_member_clans_guild_id ON guild_member_clans(guild_id)"
+        )
+
+        # CWL roster planning: one row per guild x season planning campaign.
+        # Hot DB only, no history-DB mirroring — short-lived per-season operational data with a
+        # configurable retention purge (guild_config.cwl_retention_months), see nightly_db_maintenance().
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS cwl_events (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id              TEXT    NOT NULL,
+                cwl_season            TEXT    NOT NULL,
+                status                TEXT    NOT NULL DEFAULT 'draft',
+                signup_deadline_at    TEXT,
+                template_season       TEXT,
+                created_by_discord_id TEXT    NOT NULL,
+                created_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (guild_id) REFERENCES guild_config(guild_id) ON DELETE CASCADE,
+                UNIQUE (guild_id, cwl_season)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_events_guild_status ON cwl_events(guild_id, status)"
+        )
+
+        # CWL roster planning: which member-clans participate in an event + their tier/roster size.
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS cwl_event_clans (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id            INTEGER NOT NULL,
+                clan_tag            TEXT    NOT NULL,
+                target_league_rank  TEXT,
+                roster_size         INTEGER NOT NULL DEFAULT 15,
+                tier_order          INTEGER NOT NULL DEFAULT 0,
+                cwl_start_at        TEXT,
+                locked_at           TEXT,
+                created_at          TEXT    NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (event_id) REFERENCES cwl_events(id) ON DELETE CASCADE,
+                FOREIGN KEY (clan_tag) REFERENCES clans(clan_tag) ON DELETE CASCADE,
+                UNIQUE (event_id, clan_tag)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_event_clans_event ON cwl_event_clans(event_id)"
+        )
+
+        # CWL roster planning: one row per player per event (sign-up/template-response tracking).
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS cwl_signups (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id              INTEGER NOT NULL,
+                player_tag            TEXT    NOT NULL,
+                player_name           TEXT,
+                discord_id            TEXT,
+                preferred_league_rank TEXT,
+                source                TEXT    NOT NULL,
+                status                TEXT    NOT NULL DEFAULT 'pending',
+                responded_at          TEXT,
+                created_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (event_id) REFERENCES cwl_events(id) ON DELETE CASCADE,
+                UNIQUE (event_id, player_tag)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_signups_event ON cwl_signups(event_id)"
+        )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_signups_discord ON cwl_signups(discord_id)"
+        )
+
+        # CWL roster planning: the actual/suggested player -> clan mapping for an event.
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS cwl_assignments (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id              INTEGER NOT NULL,
+                player_tag            TEXT    NOT NULL,
+                assigned_clan_tag     TEXT    NOT NULL,
+                suggested_clan_tag    TEXT,
+                assignment_source     TEXT    NOT NULL DEFAULT 'suggested',
+                score                 REAL,
+                score_breakdown_json  TEXT,
+                locked                BOOLEAN NOT NULL DEFAULT 0,
+                notified              BOOLEAN NOT NULL DEFAULT 0,
+                switched_at           TEXT,
+                alarm_stage_sent      INTEGER NOT NULL DEFAULT 0,
+                updated_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (event_id) REFERENCES cwl_events(id) ON DELETE CASCADE,
+                FOREIGN KEY (assigned_clan_tag) REFERENCES clans(clan_tag) ON DELETE CASCADE,
+                UNIQUE (event_id, player_tag)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_assignments_event ON cwl_assignments(event_id)"
+        )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_assignments_clan ON cwl_assignments(event_id, assigned_clan_tag)"
         )
 
         # Guild welcome-message family selections (clan-link mode, multi-select, per-family toggle)
@@ -1840,8 +1948,36 @@ class WarHistoryDB:
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_leaderboard_messages_channel_id ON leaderboard_messages(channel_id)"
         )
-        
+
+        # --- Temporary migration block: CWL roster planning columns on pre-existing DBs ---
+        # The CREATE TABLE statements above already bake these columns in for fresh installs;
+        # this block only matters for databases created before this feature shipped. Remove once
+        # dev and prod are both confirmed migrated, per the established convention (see
+        # changelog "Removed all one-time migration code from db_manager.py startup routines").
+        await self._add_column_if_missing("user_players", "cwl_permanent_optout", "INTEGER NOT NULL DEFAULT 0")
+        await self._add_column_if_missing("user_players", "cwl_default_preferred_league_rank", "TEXT")
+        await self._add_column_if_missing("guild_config", "cwl_hub_channel_id", "TEXT")
+        await self._add_column_if_missing("guild_config", "cwl_hub_message_id", "TEXT")
+        await self._add_column_if_missing("guild_config", "cwl_hub_message_enabled", "BOOLEAN NOT NULL DEFAULT 0")
+        await self._add_column_if_missing("guild_config", "cwl_hub_message_last_bump_iso", "TEXT")
+        await self._add_column_if_missing("guild_config", "cwl_management_channel_id", "TEXT")
+        await self._add_column_if_missing("guild_config", "cwl_management_message_id", "TEXT")
+        await self._add_column_if_missing("guild_config", "cwl_management_message_enabled", "BOOLEAN NOT NULL DEFAULT 0")
+        await self._add_column_if_missing("guild_config", "cwl_management_message_last_bump_iso", "TEXT")
+        await self._add_column_if_missing("guild_config", "cwl_retention_months", "INTEGER NOT NULL DEFAULT 0")
+
         logging.debug("[DB-SCHEMA] Maindata schema created/verified")
+
+    async def _add_column_if_missing(self, table: str, column: str, ddl_type: str) -> None:
+        """Idempotently ALTER TABLE ADD COLUMN for pre-existing databases (SQLite has no
+        ADD COLUMN IF NOT EXISTS). Checks PRAGMA table_info first since re-running ALTER TABLE
+        on a column that already exists raises. Part of the temporary migration block above —
+        remove alongside it once dev/prod are both migrated."""
+        cursor = await self._conn.execute(f"PRAGMA table_info({table})")
+        existing_columns = {row[1] async for row in cursor}
+        if column not in existing_columns:
+            await self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+            logging.info(f"[DB-MIGRATE] Added column {table}.{column}")
 
     async def _create_bot_metadata_schema(self) -> None:
         """Create the bot_metadata key-value table (idempotent)."""
@@ -2504,6 +2640,209 @@ class WarHistoryDB:
                 logging.error(
                     f"[DB-QUERY-SYNC] get_cwl_roster_sync failed for {clan_tag}: {e}"
                 )
+                return []
+
+    # --- CWL roster planning (CWL_ROSTER_PLANNING_PLAN.md Phase 1) -------------------------
+    # Sync CRUD, matching get_cwl_roster_sync's style above — called from UI callbacks, not
+    # the async polling loop.
+
+    def create_cwl_event_sync(
+        self,
+        guild_id: str,
+        cwl_season: str,
+        created_by_discord_id: str,
+        template_season: Optional[str] = None,
+    ) -> Optional[int]:
+        """Create a draft cwl_events row, or return the existing id if one already exists for
+        this guild+season — idempotent, since "Configure Participating Clans" may be applied
+        more than once against the same draft event before Start Enrollment locks it in."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO cwl_events (guild_id, cwl_season, created_by_discord_id, template_season)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(guild_id, cwl_season) DO UPDATE SET updated_at = datetime('now')
+                        RETURNING id
+                        """,
+                        (guild_id, cwl_season, created_by_discord_id, template_season),
+                    )
+                    row = cursor.fetchone()
+                    if self._should_commit():
+                        conn.commit()
+                return int(row["id"]) if row is not None else None
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] create_cwl_event_sync failed for guild {guild_id} season {cwl_season}: {e}")
+                conn.rollback()
+                return None
+
+    def get_cwl_event_sync(self, guild_id: str, cwl_season: str) -> Optional[Dict[str, Any]]:
+        """Return the cwl_events row for this guild+season, or None if it doesn't exist."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT * FROM cwl_events WHERE guild_id = ? AND cwl_season = ?",
+                    (guild_id, cwl_season),
+                ).fetchone()
+                return dict(row) if row is not None else None
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_event_sync failed for guild {guild_id} season {cwl_season}: {e}")
+                return None
+
+    def list_cwl_events_sync(self, guild_id: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Return this guild's cwl_events rows, newest season first, optionally filtered by status."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                if status is not None:
+                    rows = conn.execute(
+                        "SELECT * FROM cwl_events WHERE guild_id = ? AND status = ? ORDER BY cwl_season DESC",
+                        (guild_id, status),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM cwl_events WHERE guild_id = ? ORDER BY cwl_season DESC",
+                        (guild_id,),
+                    ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] list_cwl_events_sync failed for guild {guild_id}: {e}")
+                return []
+
+    def update_cwl_event_status_sync(self, event_id: int, status: str) -> bool:
+        """Transition a cwl_events row's status, always stamping updated_at explicitly
+        (SQLite's DEFAULT only applies at INSERT — the retention purge keys off this column)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "UPDATE cwl_events SET status = ?, updated_at = datetime('now') WHERE id = ?",
+                        (status, event_id),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] update_cwl_event_status_sync failed for event {event_id}: {e}")
+                conn.rollback()
+                return False
+
+    def set_cwl_event_clans_sync(self, event_id: int, clan_configs: List[Dict[str, Any]]) -> bool:
+        """Replace an event's full cwl_event_clans set in one atomic DELETE + INSERT (matches
+        the pattern used elsewhere for whole-collection replacement, e.g. war_attacks updates).
+
+        Args:
+            event_id: the cwl_events row to configure.
+            clan_configs: list of dicts, each with clan_tag (required) and optionally
+                target_league_rank, roster_size, tier_order, cwl_start_at.
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute("DELETE FROM cwl_event_clans WHERE event_id = ?", (event_id,))
+                    conn.executemany(
+                        """
+                        INSERT INTO cwl_event_clans
+                            (event_id, clan_tag, target_league_rank, roster_size, tier_order, cwl_start_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                event_id,
+                                cfg["clan_tag"],
+                                cfg.get("target_league_rank"),
+                                cfg.get("roster_size", 15),
+                                cfg.get("tier_order", 0),
+                                cfg.get("cwl_start_at"),
+                            )
+                            for cfg in clan_configs
+                        ],
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] set_cwl_event_clans_sync failed for event {event_id}: {e}")
+                conn.rollback()
+                return False
+
+    def get_cwl_event_clans_sync(self, event_id: int) -> List[Dict[str, Any]]:
+        """Return an event's participating clans, ordered by tier (0 = highest tier first)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM cwl_event_clans WHERE event_id = ? ORDER BY tier_order, clan_tag",
+                    (event_id,),
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_event_clans_sync failed for event {event_id}: {e}")
+                return []
+
+    def get_previous_cwl_event_clans_sync(
+        self, guild_id: str, exclude_event_id: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Return the most recent prior cwl_event_clans rows for this guild — the working-copy
+        seed for "Configure Participating Clans" when the current season has no rows of its own
+        yet, implementing the confirmed carry-over-from-previous-season default. "Most recent
+        prior" is the newest cwl_events row for this guild (by cwl_season) other than
+        exclude_event_id (the event currently being configured, if it already exists)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                if exclude_event_id is not None:
+                    prev_event = conn.execute(
+                        "SELECT id FROM cwl_events WHERE guild_id = ? AND id != ? ORDER BY cwl_season DESC LIMIT 1",
+                        (guild_id, exclude_event_id),
+                    ).fetchone()
+                else:
+                    prev_event = conn.execute(
+                        "SELECT id FROM cwl_events WHERE guild_id = ? ORDER BY cwl_season DESC LIMIT 1",
+                        (guild_id,),
+                    ).fetchone()
+                if prev_event is None:
+                    return []
+                rows = conn.execute(
+                    "SELECT * FROM cwl_event_clans WHERE event_id = ? ORDER BY tier_order, clan_tag",
+                    (prev_event["id"],),
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_previous_cwl_event_clans_sync failed for guild {guild_id}: {e}")
                 return []
 
     async def get_clan_attack_history(
@@ -5071,7 +5410,16 @@ class WarHistoryDB:
             "welcome_family_tags": welcome_family_tags,
             "member_families": families,
             "member_clans": clans,
-            "clan_roles": clan_roles
+            "clan_roles": clan_roles,
+            "cwl_hub_channel_id": row["cwl_hub_channel_id"],
+            "cwl_hub_message_id": row["cwl_hub_message_id"],
+            "cwl_hub_message_enabled": bool(row["cwl_hub_message_enabled"]) if row["cwl_hub_message_enabled"] is not None else False,
+            "cwl_hub_message_last_bump_iso": row["cwl_hub_message_last_bump_iso"],
+            "cwl_management_channel_id": row["cwl_management_channel_id"],
+            "cwl_management_message_id": row["cwl_management_message_id"],
+            "cwl_management_message_enabled": bool(row["cwl_management_message_enabled"]) if row["cwl_management_message_enabled"] is not None else False,
+            "cwl_management_message_last_bump_iso": row["cwl_management_message_last_bump_iso"],
+            "cwl_retention_months": row["cwl_retention_months"] if row["cwl_retention_months"] is not None else 0,
         }
     
     async def save_guild_config(self, guild_id: str, config: Dict[str, Any]) -> None:
@@ -5104,15 +5452,18 @@ class WarHistoryDB:
             await self._conn.execute("BEGIN")
             
             await self._conn.execute("""
-                INSERT INTO guild_config 
+                INSERT INTO guild_config
                 (guild_id, language, newbie_role_id, member_role_id, role_system_enabled,
                  registration_channel_id, war_notification_channel_id, registration_message_enabled,
                  registration_message_id, registration_message_last_bump_iso,
                  channel_war_notifications_enabled, war_notification_threshold_hours,
                  coc_role_enabled, clan_role_enabled,
                  coc_role_member_id, coc_role_elder_id, coc_role_coleader_id, coc_role_leader_id,
-                 welcome_message_enabled, welcome_message_mode, welcome_apply_channel_id, welcome_clan_tag)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 welcome_message_enabled, welcome_message_mode, welcome_apply_channel_id, welcome_clan_tag,
+                 cwl_hub_channel_id, cwl_hub_message_id, cwl_hub_message_enabled, cwl_hub_message_last_bump_iso,
+                 cwl_management_channel_id, cwl_management_message_id, cwl_management_message_enabled,
+                 cwl_management_message_last_bump_iso, cwl_retention_months)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     language = excluded.language,
                     newbie_role_id = excluded.newbie_role_id,
@@ -5134,7 +5485,16 @@ class WarHistoryDB:
                     welcome_message_enabled = excluded.welcome_message_enabled,
                     welcome_message_mode = excluded.welcome_message_mode,
                     welcome_apply_channel_id = excluded.welcome_apply_channel_id,
-                    welcome_clan_tag = excluded.welcome_clan_tag
+                    welcome_clan_tag = excluded.welcome_clan_tag,
+                    cwl_hub_channel_id = excluded.cwl_hub_channel_id,
+                    cwl_hub_message_id = excluded.cwl_hub_message_id,
+                    cwl_hub_message_enabled = excluded.cwl_hub_message_enabled,
+                    cwl_hub_message_last_bump_iso = excluded.cwl_hub_message_last_bump_iso,
+                    cwl_management_channel_id = excluded.cwl_management_channel_id,
+                    cwl_management_message_id = excluded.cwl_management_message_id,
+                    cwl_management_message_enabled = excluded.cwl_management_message_enabled,
+                    cwl_management_message_last_bump_iso = excluded.cwl_management_message_last_bump_iso,
+                    cwl_retention_months = excluded.cwl_retention_months
             """, (
                 guild_id,
                 config.get("language", "en"),
@@ -5157,7 +5517,16 @@ class WarHistoryDB:
                 1 if config.get("welcome_message_enabled", False) else 0,
                 config.get("welcome_message_mode", "clan_link"),
                 config.get("welcome_apply_channel_id"),
-                config.get("welcome_clan_tag")
+                config.get("welcome_clan_tag"),
+                config.get("cwl_hub_channel_id"),
+                config.get("cwl_hub_message_id"),
+                1 if config.get("cwl_hub_message_enabled", False) else 0,
+                config.get("cwl_hub_message_last_bump_iso"),
+                config.get("cwl_management_channel_id"),
+                config.get("cwl_management_message_id"),
+                1 if config.get("cwl_management_message_enabled", False) else 0,
+                config.get("cwl_management_message_last_bump_iso"),
+                config.get("cwl_retention_months", 0),
             ))
             
             # Delete existing member families and clans
