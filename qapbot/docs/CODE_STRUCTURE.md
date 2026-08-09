@@ -9,6 +9,10 @@ QapBot is a modular Python Discord bot for Clash of Clans, featuring:
 - Robust cache and file management for persistent data
 - Statistics calculation and formatting for Discord and terminal output
 - **Account protection system** with three-tier permission hierarchy
+- **CWL Clan-Config Discord Activity**: a Cloudflare Pages/Workers web app (`activity/`),
+  embedded in Discord's client via `@discord/embedded-app-sdk`, backed by an in-process
+  `aiohttp.web` bridge (`qapbot/web_bridge.py`) that reuses the bot's own `CACHE`/`db_manager` —
+  full design in `CWL_CLAN_CONFIG_ACTIVITY_PLAN.md`
 
 ## Account Protection Architecture
 
@@ -492,6 +496,26 @@ all rebuild/button-handler paths so the reference is never lost.
 - Discord API retry wrapper with exponential backoff
 - Rate limit handling (HTTP 429)
 - Basic statistics tracking for API calls
+- `bulk_sync_global_commands()`: raw-HTTP global command bulk-upsert that always re-includes
+  any existing Activities `PRIMARY_ENTRY_POINT` command (discord.py's `CommandTree.sync()` has
+  no model of it and would otherwise submit a payload that omits it — Discord rejects that
+  outright, HTTP 400/50240, instead of deleting it). Used in `QapBot.py` in place of
+  `tree.sync(guild=None)`/`tree.clear_commands(guild=None)` wherever a *global* sync happens;
+  guild-scoped syncs are unaffected (Entry Point commands are inherently global-only).
+  See CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase D.
+
+🟫 qapbot/web_bridge.py
+- `aiohttp.web` app for the CWL Clan-Config Discord Activity (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md
+  Phase B), started from `QapBot.py`'s `_setup_hook()` / stopped from `async_cleanup()` —
+  no-ops entirely unless `WEB_BRIDGE_PORT`/`WEB_BRIDGE_SECRET` (or the `_DEV` pair) are both set
+  in `.env`. Bound to `127.0.0.1` only; a `cloudflared` tunnel (quick tunnel for DEV, named
+  tunnel for PROD) is what makes it reachable from the Cloudflare Worker.
+- `GET/POST /api/cwl/clan-config`: re-derives admin status itself via the same
+  `check_admin_permissions()` logic the Discord-side UI uses (never trusts the Worker's OAuth
+  check alone) before reading/writing `cwl_events`/`cwl_event_clans` through the normal
+  `db_manager.py` functions — a second UI in front of the same data, not a second data store.
+- `GET /api/health`: unauthenticated liveness check (used by the tunnel setup to confirm
+  reachability end-to-end).
 
 🟫 qapbot/coc_health.py
 - CoC API retry wrapper: `coc_retry(operation, operation_name, max_retries=2)`
@@ -1021,6 +1045,15 @@ kept here only for functions not narrated elsewhere.
 🟫 qapbot/discord_health.py
 ├── discord_retry()
 ├── get_simple_discord_stats() (returns retry statistics)
+└── bulk_sync_global_commands() # preserves the Activities Entry Point command across a
+                                 # global bulk command sync — see Main Files entry above
+
+🟫 qapbot/web_bridge.py
+├── start_web_bridge() / stop_web_bridge()  # no-op unless WEB_BRIDGE_PORT/SECRET configured
+├── create_app()                            # builds the aiohttp.web.Application + routes
+├── handle_get_clan_config() / handle_post_clan_config()  # admin-reverified, same db_manager
+│                                                          # calls the Discord-side UI uses
+└── handle_health()                         # unauthenticated liveness check
 
 🟫 qapbot/coc_health.py
 ├── coc_retry()                    # main wrapper — routes all CoC API exceptions

@@ -155,7 +155,7 @@ Bot side: a 5th button, **"Open Clan Config (Web)"**, added to `add_cwl_manageme
 3. Closing the Activity from Save/Cancel — **confirmed working after a few false starts, worth recording accurately since it took three passes to get right**: first conclusion ("no close/exit API exists at all") was wrong, based on only checking the SDK's `commands/` folder. Corrected to `discordSdk.close(RPCCloseCodes.CLOSE_NORMAL, reason)` — a real, exported top-level method whose actual runtime implementation (checked directly in the installed package's compiled source, not just its `.d.ts`) posts a genuine `CLOSE`-opcode `postMessage` to Discord's client frame, the same mechanism every other SDK command uses. First live test of *that* appeared to show no effect — but the only place calling it at the time was Save's confirmation screen, and Cancel wasn't wired to it at all (so "nothing happens" was partly just Cancel being a no-op, not necessarily `close()` failing). Wired both buttons to it and retested: **it works** — confirmed live via both Save and Cancel. Final UX, per project owner preference: no intermediate confirmation screen at all — Save persists then closes immediately, Cancel discards and closes immediately, closing itself is the confirmation.
 4. **A real data-loss bug, not a platform limit**: deactivating a clan deleted its `cwl_event_clans` row entirely, silently discarding its `roster_size`/`cwl_start_at` — reactivating it (even within the same session) reset it to defaults. Root cause: "row exists" was the only signal for "participating" at all, so deactivating had no way to represent "off, but remember the settings." Added an explicit `participating` column (idempotent migration) — deactivating now sets `participating=0` and *keeps* the row instead of deleting it. Fixed at every layer that touches this data: `set_cwl_event_clans_sync()`/`get_previous_cwl_event_clans_sync()` (the latter still correctly excludes non-participating rows from next-season carry-over — that's a different, intentional filter), the web bridge's GET/POST, and the Discord-side `CwlEventSetupView` (toggling now flips `participating` in place instead of `del()`-ing the working-copy entry, which had the identical bug on the native side too, just never reported). Every *display* of "Participating Clans" now explicitly filters to `participating=1`, since the raw row set can contain deactivated-but-remembered clans. 6 new/updated tests across the DB layer, the bridge, and the Discord-side toggle — 1623 total tests pass.
 
-### Phase D — PROD rollout 🚧 in progress 2026-08-09
+### Phase D — PROD rollout ✅ shipped and verified live 2026-08-09
 Repeat the Developer Portal setup for the PROD application, deploy the `prod` Wrangler environment, add the PROD bridge (tunnel + `.env` secret on whatever host runs PROD), smoke-test in a real guild.
 
 **Done so far**: PROD Developer Portal setup (Activities enabled, URL Mapping, OAuth2 redirect —
@@ -186,10 +186,29 @@ permanent fix, not a one-off: every future global sync on either app (DEV or PRO
 Activities-enabled) would otherwise hit this. 3 new tests in `tests/discord/test_discord_health.py`
 — 1636 total tests pass.
 
-**Still open**: the named `cloudflared` tunnel on the PROD NAS host (domain `qapbot.uk`
-purchased via Cloudflare Registrar; DEV keeps its quick tunnel since a human restarts it by
-hand), wiring the Worker's `BRIDGE_URL` secret once that hostname is live, and a real end-to-end
-smoke test in a live guild.
+**Named tunnel + auto-start, including a real boot-time bug**: bought `qapbot.uk` via
+Cloudflare Registrar (DEV keeps its quick tunnel since a human restarts it by hand; PROD needed
+a stable hostname since nobody's watching for a changed URL after an unattended reboot).
+`cloudflared tunnel create`/`route dns` set up `bridge-prod.qapbot.uk` → `qapbot-prod-bridge` →
+`http://localhost:8789`, `BRIDGE_URL` set as a Worker secret, confirmed reachable end-to-end.
+The DSM Task Scheduler boot-up trigger for it **failed silently on the first real reboot test**
+(`ps aux` showed no `cloudflared` process; the Activity surfaced a bare 500 since the Worker's
+proxy fetch to a dead tunnel isn't handled as gracefully as the deliberate 501
+`bridgeNotConfigured()` case) — DSM's boot-up-triggered scripts run before `HOME` is reliably
+set to `/root` and before the network is necessarily up, so `cloudflared`'s default
+`~/.cloudflared/` lookup and its initial connection attempt can both fail with no retry. Fixed
+by making the task's script explicit rather than relying on defaults: `sleep 15` (network
+readiness margin), `HOME=/root` and `--config /root/.cloudflared/config.yml` (removes any
+ambiguity about which credentials/config to use), redirecting output to
+`/var/log/cloudflared-prod-bridge.log` (DSM's own Task Scheduler "View Result" panel showed
+nothing useful without a configured output-log folder — the script logging itself sidesteps
+that entirely). Re-verified via **Action → Run** showing a clean tunnel startup and an external
+`/api/health` check succeeding; a second full reboot to double-confirm the timing fix survives
+a genuine cold boot (vs. just a manual re-run of the same task) is a reasonable follow-up but
+non-blocking.
+
+Full chain confirmed live in a real PROD guild: Activity launches, clan-config table loads real
+data, Save round-trips through Worker → tunnel → bridge → `cwl_events`/`cwl_event_clans`.
 
 ### Phase E — Workflow redesign (web Activity becomes the sole clan-config entry point)
 Five-part follow-up requested once Phase C was verified live, replacing the native/web dual-path design with the web Activity as the only way to configure CWL clans:

@@ -862,3 +862,46 @@ the exception type itself is reused for routine conditions elsewhere. Reverted t
   (from `league_group.rounds`) and only keeping a tag in the warning if **some other war in the same
   round has data** — a round with zero data anywhere is indistinguishable from "not started" and isn't
   worth alarming over; a round with partial data but one specific war missing is a genuine gap.
+
+## Pitfall 25: Enabling Discord Activities breaks the next global command sync — `discord.py` has no model of the auto-created Entry Point command
+
+Symptom (2026-08-09, `CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` Phase D): restarting the PROD bot right
+after enabling Activities in the Developer Portal for the PROD application (a routine Phase D
+step, needed to launch the CWL Clan-Config web Activity) crashed the whole process on startup:
+
+```
+[SETUP_HOOK] Registering commands globally (global mode)
+global_command_sync failed: 400 400 Bad Request (error code: 50240): You cannot remove this
+app's Entry Point command in a bulk update operation. Please include the Entry Point command
+in your update request or delete it separately. (not retrying — client error)
+```
+
+`discord_retry()` correctly treats a 4xx as permanent and re-raises; that exception propagated
+out of `setup_hook`, uncaught, and the top-level handler ran `async_cleanup()` and exited —
+PROD was down until fixed.
+
+Root cause: enabling Activities auto-creates a **global** `PRIMARY_ENTRY_POINT` command (type
+4, Discord's auto-managed `/launch` command — see Phase A of the plan doc) that `discord.py`
+2.7.1 has zero awareness of at all; its `AppCommandType` enum doesn't even define the value.
+`CommandTree.sync(guild=None)` always does a full bulk overwrite built only from commands
+registered in the tree (`_get_all_commands()` → `bulk_upsert_global_commands()`), so it
+necessarily omits a command type the tree can't represent. Discord used to just silently delete
+whatever a bulk overwrite omitted; for Entry Point commands specifically it now refuses the
+entire request instead, per its own error message. `CommandTree.clear_commands(guild=None)`
+followed by `sync(guild=None)` hits the exact same wall (an empty payload still "omits" it) —
+this silently broke `_clear_global_commands_after_ready()`'s DEV-app cleanup path too, already
+wrapped in try/except there so non-fatal, but quietly failing to actually clear anything, since
+the DEV app has had an Entry Point command since Phase A.
+
+Fix: never call `tree.sync(guild=None)` or `tree.clear_commands(guild=None)` + `sync()`
+directly once an app might have Activities enabled. Use `bulk_sync_global_commands()`
+(`qapbot/discord_health.py`) instead — it fetches the app's current global commands via a raw
+`bot.http.get_global_commands()` call, filters for any command with `type == 4`, and always
+splices it back into the bulk-upsert payload (`tree_payload + entry_points`) before calling
+`bot.http.bulk_upsert_global_commands()` directly. Passing `tree_payload=[]` (the "clear"
+case) still correctly preserves the Entry Point command while wiping everything else. Guild-scoped
+syncs are never affected — Entry Point commands are inherently global-only, so
+`tree.sync(guild=some_id)` was never in danger. This is a standing fix, not a one-off
+workaround: every future global sync on either the DEV or PROD app (both Activities-enabled
+now) would otherwise hit this exact wall again. 3 tests added in
+`tests/discord/test_discord_health.py`.

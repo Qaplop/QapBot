@@ -1,6 +1,20 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (37)
+- Shipped: CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase D (PROD rollout) complete and verified live.
+  PROD Worker/Pages deployed, a named `cloudflared` tunnel (`bridge-prod.qapbot.uk`, via a
+  newly purchased `qapbot.uk` domain) replaces the DEV-style quick tunnel for the unattended
+  PROD host, and `BRIDGE_URL`/`BRIDGE_SECRET`/`CLIENT_SECRET` are set as `--env prod` Worker
+  secrets. Found and fixed a real bug along the way: the tunnel's DSM Task Scheduler boot-up
+  trigger failed silently on reboot because boot-time scripts on Synology DSM can run before
+  `HOME` is reliably `/root` and before the network is fully up — fixed by making the task's
+  script explicit (`HOME=/root`, `--config` flag, a startup delay, and logging its own output
+  to a file, since DSM's own "View Result" panel showed nothing without a separately-configured
+  output folder). Full chain confirmed live in a real PROD guild: Activity launches, table loads
+  real data, Save round-trips through Worker → tunnel → bridge → `cwl_events`/`cwl_event_clans`.
+  Files: CWL_CLAN_CONFIG_ACTIVITY_PLAN.md (Phase D write-up).
+
 2026-08-09 (36)
 - Fixed: a real PROD-startup crash discovered during CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase D
   (PROD rollout) — enabling Activities in the Developer Portal for the PROD application

@@ -1,6 +1,7 @@
 Project Backlog, Improvement Ideas and General Remarks
 
 Immediate next steps:
+- Check what happens with cloudflared on the NAS when a new DSM version is installed!
 - Check the difference of /analyse cwl_group on DEV and PROD
 - Known lower-priority follow-up (not fixed,
   admin-only/rarely invoked, no crash risk): the `/admin` CWL-group-backfill

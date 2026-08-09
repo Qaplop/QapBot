@@ -36,6 +36,18 @@ A powerful, modular Discord bot designed for Clash of Clans clan management, fea
 - Log analysis with notification counting
 - Data consistency checking
 
+### CWL Clan-Config Discord Activity
+- Season-based CWL clan configuration (participating clans, roster size, start time) via a
+  **Discord Activity** — a real web app embedded in Discord's client, launched from the CWL
+  Management Hub message
+- Real `<table>` UI (checkboxes, dropdowns, native date/time picker) — the config Discord's
+  own component API can't render (modals cap at 5 items; no table/grid primitive exists)
+- Timezone-aware locally, stored as UTC; season carry-over prompt when a new season has no
+  saved configuration yet
+- Architecture: Cloudflare Pages/Workers (`activity/`) + an in-process `aiohttp.web` bridge
+  (`qapbot/web_bridge.py`) that reuses the bot's own `CACHE`/`db_manager` — no second data
+  store. Full design and phase history in `CWL_CLAN_CONFIG_ACTIVITY_PLAN.md`.
+
 ### Notification System
 - **DM Reminders**: Automated direct messages for players with remaining attacks towards the end of a war
 - **Notification Modes**: 
@@ -203,10 +215,13 @@ QapBot/
 │   ├── ui_clan_management.py # Clan management UI
 │   ├── i18n.py            # Internationalization (i18n) module
 │   ├── discord_health.py  # Discord API retry wrapper with rate limit handling
+│   ├── web_bridge.py      # aiohttp.web bridge for the CWL Clan-Config Discord Activity
 │   ├── emojis.py          # Emoji definitions for Discord messages
 │   ├── QBdiscocmdshelper.py  # Command helper functions and autocomplete
 │   ├── QBdiscocmdshelper_admin_command.py  # Admin command helpers
 │   └── translations/      # Language files (en.json, de.json)
+├── activity/              # CWL Clan-Config Discord Activity — Cloudflare Pages/Workers
+│                          # frontend+backend; see CWL_CLAN_CONFIG_ACTIVITY_PLAN.md
 └── data/
     ├── qapbot.db          # SQLite database (hot: current + previous calendar month, WAL mode)
     ├── qapbot_history.db  # SQLite database (history: everything older, ATTACHed as schema 'history')
@@ -292,6 +307,8 @@ migration job moves data older than the retention window from hot to history —
 | `HISTORY_MIGRATION_TIME_BUDGET_MINUTES` | Cap on the scheduled 03:00 UTC nightly window's `monthly_history_migration()` run (not the manual `run_history_migration_now.py` CLI, which takes its own `--time-budget-minutes`, and not the per-cycle chunk below). A capped run reports PARTIAL and keeps retrying instead of blocking Discord commands for however long a large backlog takes in one sitting. | No | `90` |
 | `HISTORY_MIGRATION_CYCLE_CHUNK_MINUTES` | Opportunistic per-update-cycle migration chunk: spends up to this many minutes of the otherwise-idle sleep window (between cycles) on the migration whenever it's still due — self-limiting (does nothing once done), but dominates the idle window and blocks Discord commands most of the time while an actual backlog remains, in exchange for finishing far faster than the once-a-night chunk alone. Set to `0` to disable and rely only on the once-a-night scheduled window. | No | `4` |
 | `HISTORY_MIGRATION_ADMIN_BUDGET_MINUTES` | Cap on the migration step specifically when triggered via `/admin` "Execute Nightly Maintenance" — deliberately much shorter than the scheduled-window budget above, since `/admin` is an interactive, user-awaited command whose actual purpose is the maintenance steps (checkpoint/VACUUM/REINDEX/ANALYZE), not migration progress (the per-cycle chunk already carries that), and the Discord interaction token expires after ~15 min. | No | `1` |
+| `WEB_BRIDGE_PORT` / `WEB_BRIDGE_SECRET` | CWL Clan-Config Discord Activity bridge (PROD) — `127.0.0.1`-only port and shared secret for `qapbot/web_bridge.py`. Both must be set to start the bridge; a `cloudflared` tunnel makes it reachable from the Cloudflare Worker. See `CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` and `activity/README.md`. | No | `0` / *(empty, disabled)* |
+| `WEB_BRIDGE_PORT_DEV` / `WEB_BRIDGE_SECRET_DEV` | Same, for DEV mode (`DISCORD_GUILD_ID` > 0) | No | `0` / *(empty, disabled)* |
 
 ## 🏭 Production Environment
 
@@ -321,6 +338,11 @@ migration job moves data older than the retention window from hot to history —
 - **Python Version**: 3.14 or higher (tested with 3.14.5)
 - **Mode**: Set environment to use global commands
 - **Logs**: `data/logs/qapbot.log` in your installation directory
+- **CWL Clan-Config Activity bridge** (optional): if `WEB_BRIDGE_PORT`/`WEB_BRIDGE_SECRET` are
+  set, a `cloudflared` **named tunnel** (stable hostname, survives restarts — unlike the free
+  quick tunnel DEV uses, which is fine there since a human restarts it by hand) must be running
+  and auto-starting on boot for the Cloudflare Worker to reach the bridge. See
+  `activity/README.md`'s "PROD rollout" section for the full tunnel + auto-start setup.
 
 ### Switching Between Environments
 1. **DEV Mode**: Set `DISCORD_GUILD_ID` to your test server ID
@@ -448,6 +470,12 @@ See [changelog.txt](changelog.txt) for detailed changelog and version history.
 - Check `DISCORD_GUILD_ID` setting (0 for global, guild ID for testing)
 - Restart Discord client to refresh command cache
 - For DEV mode: Ensure commands registered on correct test server
+- **Bot crashed on startup with `global_command_sync failed: ... error code: 50240`**: this
+  means Discord Activities was enabled for that application (Developer Portal → Activities),
+  which auto-creates a global Entry Point command `discord.py` doesn't know about — a plain
+  `tree.sync(guild=None)` omits it and Discord now rejects the whole sync instead of deleting
+  it. Already fixed via `bulk_sync_global_commands()` (`qapbot/discord_health.py`) if you're on
+  a version of this bot that includes it; see `CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` Phase D.
 
 **Leaderboard not updating:**
 - Check clan is subscribed: `/subscriptions`
