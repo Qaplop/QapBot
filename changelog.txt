@@ -1,6 +1,20 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (19)
+- Fixed: qapbot/scripts/all_players_leaderboard.py silently posted to Discord channel 0
+  ("Channel 0 not found (NotFound)") instead of erroring clearly. Root cause: LEADERBOARD_CHANNEL_ID
+  was never set in the local dev machine's .env (CHANNEL_ID = int(os.getenv('LEADERBOARD_CHANNEL_ID',
+  '0')) silently defaults to 0), so the script ran all the way through database loading and
+  leaderboard aggregation before discovering at the very last step that it had nowhere to post.
+  Set LEADERBOARD_CHANNEL_ID in .env (reusing the already-configured
+  DEV_PLAYERREGISTRATION_CHANNEL_ID, per project owner confirmation — not committed, .env is
+  gitignored). Also added an early guard in post_all_players_leaderboard() that fails fast with a
+  clear message when CHANNEL_ID is unset/0, instead of doing all the data work first and only then
+  discovering the misconfiguration; corrected a stale log message that referenced "DISCORD_TOKEN"
+  when the actual env var this script reads is DISCORD_TOKEN_DEV.
+  Files: qapbot/scripts/all_players_leaderboard.py.
+
 2026-08-09 (18)
 - Fixed: /leaderboard's own-player ANSI highlight rendered as literal garbage escape-code text
   ("[1;33mQaplop...[0m") in the second and later Discord messages whenever a DM leaderboard's

@@ -496,7 +496,13 @@ async def post_all_players_leaderboard(clan_tag: Optional[str] = None, player_na
                      for each unique char in this name instead.
     """
     if not DISCORD_TOKEN:
-        logging.error('DISCORD_TOKEN not set in environment.')
+        logging.error('DISCORD_TOKEN_DEV not set in environment.')
+        return
+    if not CHANNEL_ID:
+        logging.error('LEADERBOARD_CHANNEL_ID not set in .env (or is 0) — set it to a real '
+                       'Discord channel ID before running this script. Failing fast here '
+                       'instead of doing all the data loading first and only discovering '
+                       'this at the very end when trying to post.')
         return
 
     # Only initialise the database when we actually need leaderboard data
@@ -721,7 +727,7 @@ def render_leaderboard(data: LeaderboardData, mode: Optional[str] = None, style:
         #'\u30C4': 1.66,    # ツ
         #'\uC9C0': 1.66,    # 지
         #'\uBBFC': 1.66,    # 민
-        #'☠': 1.00,         # U+2730 (Star)
+        #'☣': 1.00,         # U+2623 (Biohazard Sign)
         #'✌': 1.00,         # U+15F7 (Latin Letter B)
         #'✌️': 1.00,         # U+15F7 (Latin Letter B)
         #'ᗩ': 1.00,         # U+15F9 (Latin Letter A)
