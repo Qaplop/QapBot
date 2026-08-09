@@ -737,6 +737,7 @@
       "title": "⚙️ CWL Settings",
       "description": "Guild-level preferences for CWL roster planning in {guild_name}.",
       "channel_not_set": "Not set",
+      "no_channel_set": "⚠️ Please set a CWL Management Hub channel first",
       "status_enabled": "Enabled",
       "status_disabled": "Disabled",
       "hub_block_title": "CWL Management Hub",
@@ -779,7 +780,15 @@
       "header": "Select which clans participate this season ({count} selected):",
       "no_clans_selected": "No clans selected yet — click a clan below to add it.",
       "button_apply": "Apply",
-      "button_cancel": "Cancel"
+      "button_cancel": "Cancel",
+      "detail_header": "**{clan_name}** ({clan_tag}) — clan {index}/{count}\nRoster size: **{roster_size}**\nStart time (UTC): **{start_time}**",
+      "roster_size_placeholder": "Roster size...",
+      "button_set_start_time": "Set Start Time",
+      "button_done": "Done",
+      "start_time_modal_title": "Set CWL Start Time",
+      "start_time_modal_label": "Start Time (UTC)",
+      "start_time_modal_placeholder": "YYYY-MM-DD HH:MM — leave blank to clear",
+      "start_time_parse_error": "⚠️ Could not understand that date/time. Use the format YYYY-MM-DD HH:MM (UTC)."
     }
   }
 }

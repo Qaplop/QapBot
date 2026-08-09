@@ -736,6 +736,7 @@
       "title": "⚙️ CWL-Einstellungen",
       "description": "Server-weite Einstellungen für die CWL-Kaderplanung in {guild_name}.",
       "channel_not_set": "Nicht gesetzt",
+      "no_channel_set": "⚠️ Bitte zuerst einen Kanal für den CWL-Verwaltungs-Hub festlegen",
       "status_enabled": "Aktiviert",
       "status_disabled": "Deaktiviert",
       "hub_block_title": "CWL-Verwaltungs-Hub",
@@ -778,7 +779,15 @@
       "header": "Wähle die teilnehmenden Clans für diese Saison ({count} ausgewählt):",
       "no_clans_selected": "Noch keine Clans ausgewählt — klicke unten auf einen Clan, um ihn hinzuzufügen.",
       "button_apply": "Übernehmen",
-      "button_cancel": "Abbrechen"
+      "button_cancel": "Abbrechen",
+      "detail_header": "**{clan_name}** ({clan_tag}) — Clan {index}/{count}\nKadergröße: **{roster_size}**\nStartzeit (UTC): **{start_time}**",
+      "roster_size_placeholder": "Kadergröße...",
+      "button_set_start_time": "Startzeit festlegen",
+      "button_done": "Fertig",
+      "start_time_modal_title": "CWL-Startzeit festlegen",
+      "start_time_modal_label": "Startzeit (UTC)",
+      "start_time_modal_placeholder": "JJJJ-MM-TT HH:MM — leer lassen zum Löschen",
+      "start_time_parse_error": "⚠️ Datum/Uhrzeit konnte nicht verstanden werden. Format: JJJJ-MM-TT HH:MM (UTC)."
     }
   }
 }

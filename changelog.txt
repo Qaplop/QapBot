@@ -1,6 +1,47 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (22)
+- Fixed: five issues found while actually exercising the Phase 1 CWL Settings/Season Setup
+  screens live in a dev Discord guild (follow-up to Phase 1, (21), CWL_ROSTER_PLANNING_PLAN.md):
+  (1) qapbot/QBdiscocmdshelper_cwl.py's format_clan_management_cwl_settings/
+  format_clan_management_cwl_management were named with a leading underscore despite being
+  called from QapBot.py and qapbot/ui_cwl_roster.py outside their home module (Pylance
+  reportPrivateUsage) — renamed to public, matching the shared-content-layer design that
+  always intended cross-module calls.
+  (2) ChannelConfigurationView showed all 3 channel slots (registration, war, CWL Management
+  Hub) from both the basic server-configuration screen and the cwl_settings screen, which is
+  confusing (e.g. a CWL hub selector appearing under basic config). Added two context-scoped
+  subsets of DEFAULT_CHANNEL_SLOTS — BASIC_CONFIG_CHANNEL_SLOTS (registration + war) and
+  CWL_CONFIG_CHANNEL_SLOTS (CWL Management Hub only) — and passed the right one via
+  ChannelConfigurationView's existing slots= parameter from each "Configure Channels" call site.
+  (3) Activating the CWL Management Hub message toggle silently did nothing — the toggle
+  callback only flipped and persisted cwl_management_message_enabled, never actually posting
+  the anchored message (unlike registration's own toggle, which spawns an immediate repost).
+  The message only would have appeared on the next periodic cycle or bot restart. Fixed by
+  mirroring registration's pattern: guard against enabling with no channel set (new
+  cwl.settings.no_channel_set key), then spawn an immediate
+  repost_cwl_management_messages(only_if_not_bottom=False) right after persisting the flag.
+  (4) resolve_current_cwl_season() defaulted new events to the current calendar month, but CWL
+  runs in roughly the first ten days of a month — that month's war league is already locked in
+  (or running) by the time anyone could be setting up its roster, so roster planning is always
+  for next month's season. Fixed to add one month (rolling over the year at December).
+  (5) There was no way to actually set a participating clan's roster size or start time —
+  Phase 1 had deferred this to "a future drill-down screen," but live testing showed this
+  wasn't safe to defer further. Restructured CwlEventSetupView into a two-phase working-copy
+  view reusing one ephemeral message: phase 1 (select_clans, unchanged) picks participating
+  clans via toggle buttons; Apply persists the selection and transitions the same message into
+  phase 2 (edit_details) — a single-clan-at-a-time editor (◀/▶ navigation) with a roster-size
+  Select (5/15/30, CoC's only valid sizes) and a "Set Start Time" button opening the newly
+  built CwlStartTimeModal (single TextInput, "YYYY-MM-DD HH:MM" UTC, blank clears it,
+  unparseable input rejected with an ephemeral error without closing the modal). Every edit
+  persists immediately via set_cwl_event_clans_sync(); "Done" closes the screen and refreshes
+  the cwl_management parent.
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/ui_cwl_roster.py, qapbot/ui_clan_management.py,
+  qapbot/translations/en.json, qapbot/translations/de.json,
+  tests/discord/test_ui_cwl_roster.py.
+  1602 tests pass (.\run_tests.ps1).
+
 2026-08-09 (21)
 - Added: UI layer for the CWL roster planning feature's settings/season-setup screens
   (Phase 1 finish, CWL_ROSTER_PLANNING_PLAN.md), reachable through two entry points that

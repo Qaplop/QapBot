@@ -23,13 +23,19 @@ from qapbot.cache_manager import CACHE
 
 
 def resolve_current_cwl_season() -> str:
-    """Default cwl_season key for a newly-created event: the current calendar month (UTC).
+    """Default cwl_season key for a newly-created event: the *upcoming* calendar month (UTC).
 
-    Roster planning happens ahead of a season actually starting, so there is no CoC-API-derived
-    season key (normalize_cwl_season() in qapbot/constants.py) available yet to normalize
-    against — this is a simple month default, not an API-observed value.
+    CWL itself runs in roughly the first ten days of each month, so a given month's war league
+    is already locked in (or actively running) before roster planning for it could happen —
+    whenever leadership is setting up a roster, they are always preparing for next month's
+    season, never the current one. There is no CoC-API-derived season key
+    (normalize_cwl_season() in qapbot/constants.py) available yet to normalize against at setup
+    time — this is a simple calendar default, not an API-observed value.
     """
-    return datetime.now(timezone.utc).strftime("%Y-%m")
+    now = datetime.now(timezone.utc)
+    if now.month == 12:
+        return f"{now.year + 1}-01"
+    return f"{now.year}-{now.month + 1:02d}"
 
 
 def get_current_cwl_event_sync(guild_id: int) -> Optional[Dict[str, Any]]:

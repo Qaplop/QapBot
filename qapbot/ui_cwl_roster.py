@@ -13,12 +13,29 @@ render identically regardless of which shell opened them.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import discord
 
 from qapbot.cache_manager import CACHE
 from qapbot.ui_common import TrackedView
+
+
+def _parse_cwl_start_time(raw: str) -> Optional[str]:
+    """Parse a user-entered CWL start time into a UTC ISO-8601 string ("...T HH:MMZ"), or
+    None if unparseable. Accepts "YYYY-MM-DD HH:MM" (space or "T" separator) — always
+    interpreted as UTC, since the CWL Management Hub is admin-only and CWL start times need
+    one unambiguous reference point regardless of who's reading the roster.
+    """
+    candidate = raw.strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(candidate, fmt).replace(tzinfo=timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%MZ")
+        except ValueError:
+            continue
+    return None
 
 # CoC's real league ladder, used for target_league_rank / preferred_league_rank pickers
 # throughout this feature (Phase 1's per-clan target tier, Phase 2's sign-up preference).
@@ -95,11 +112,11 @@ def _make_cwl_settings_channels_callback(view: discord.ui.View):
         await interaction.response.defer(thinking=False, ephemeral=False)
         if not interaction.guild:
             return
-        from qapbot.ui_clan_management import ChannelConfigurationView, DEFAULT_CHANNEL_SLOTS
+        from qapbot.ui_clan_management import ChannelConfigurationView, CWL_CONFIG_CHANNEL_SLOTS
 
         config = CACHE.server_config.get(str(interaction.guild.id), {})
         current_channels: Dict[str, Optional[discord.TextChannel]] = {}
-        for slot in DEFAULT_CHANNEL_SLOTS:
+        for slot in CWL_CONFIG_CHANNEL_SLOTS:
             channel_id = config.get(slot.config_key)
             channel_obj: Optional[discord.TextChannel] = None
             if channel_id:
@@ -116,6 +133,7 @@ def _make_cwl_settings_channels_callback(view: discord.ui.View):
             clan_management_view=view,  # duck-typed: only needs .refresh_cwl_view()
             original_interaction=interaction,
             current_channels=current_channels,
+            slots=CWL_CONFIG_CHANNEL_SLOTS,
             timeout=300,
         )
         header_msg = channel_config_view._format_header()  # type: ignore[attr-defined]
@@ -132,10 +150,32 @@ def _make_cwl_settings_toggle_callback(view: discord.ui.View):
         await interaction.response.defer(thinking=False, ephemeral=False)
         if not interaction.guild:
             return
+        from qapbot.i18n import t
+
         guild_id_str = str(interaction.guild.id)
+        guild_id_int = interaction.guild.id
         config = CACHE.server_config.setdefault(guild_id_str, {})
-        config["cwl_management_message_enabled"] = not bool(config.get("cwl_management_message_enabled", False))
+        currently_enabled = bool(config.get("cwl_management_message_enabled", False))
+
+        if not currently_enabled and not config.get("cwl_management_channel_id"):
+            await interaction.followup.send(
+                t('cwl.settings.no_channel_set', guild_id=guild_id_int),
+                ephemeral=True,
+            )
+            return
+
+        config["cwl_management_message_enabled"] = not currently_enabled
         await CACHE.persist_server_config(guild_id_str)
+
+        # Post/delete the anchored Hub message immediately rather than waiting for the
+        # next periodic cycle or bot restart — mirrors ClanManagementView._on_toggle_registration.
+        try:
+            from QapBot import repost_cwl_management_messages
+            import QBcore
+            QBcore.spawn_tracked("repost-cwl-management-msg", repost_cwl_management_messages(only_if_not_bottom=False))
+        except Exception as e:
+            logging.warning(f"Could not update CWL Management Hub message immediately: {e}")
+
         await _refresh_parent(view, interaction, "cwl_settings")
 
     return callback
@@ -278,18 +318,22 @@ async def _refresh_parent(view: discord.ui.View, interaction: discord.Interactio
 # ---------------------------------------------------------------------------
 
 class CwlEventSetupView(TrackedView):
-    """Toggle-button working-copy view for choosing which clans participate in the upcoming
-    CWL event, structurally mirroring MemberClansConfigurationView (ui_clan_management.py) —
-    same toggle-button/working-copy/Apply pattern, capped at the same practical Discord
-    component budget.
+    """Two-phase working-copy view for setting up a CWL event, structurally mirroring
+    MemberClansConfigurationView (ui_clan_management.py)'s toggle-button/working-copy/Apply
+    pattern for phase 1, then reusing the same ephemeral message for phase 2:
 
-    Scope note: this phase ships clan selection (with previous-season carry-over as the
-    default working state, per the confirmed design decision) and persists new clans at the
-    default roster_size=15 with no start time set. Per-clan roster-size and start-time editing
-    needs its own drill-down screen to fit inside Discord's 5-action-row budget once more than
-    a couple of clans are involved — flagged as a fast-follow, not silently dropped; Finalize
-    (Phase 4) is what actually requires every clan to have a start time, and Phase 4 isn't
-    built yet either.
+    1. ``select_clans`` (the view's initial state): toggle buttons for which clans participate
+       this season, seeded from the current event's clans or — if none yet — the previous
+       season's via get_previous_cwl_event_clans_sync() (the confirmed "carry over" default).
+       Capped at 20 clans (4 rows x 5 — row 4 reserved for Apply/Cancel), matching
+       MemberClansConfigurationView's own practical Discord component budget.
+    2. ``edit_details`` (entered on Apply): a single-clan-at-a-time roster-size/start-time
+       editor with Prev/Next navigation (see _render_detail_step()) — this is what lets an
+       arbitrary number of participating clans each get their own roster size and start time
+       without exceeding Discord's 5-action-row budget, which a flat "one row per clan" layout
+       could never do once more than a couple of clans are involved. Every edit here persists
+       immediately (via _persist_detail_edit()); "Done" simply closes the screen and refreshes
+       the cwl_management parent.
     """
 
     def __init__(self, guild: discord.Guild, parent_view: discord.ui.View, timeout: int = 300):
@@ -297,6 +341,10 @@ class CwlEventSetupView(TrackedView):
         self.guild = guild
         self.parent_view = parent_view
         self.working_clans: Dict[str, Dict[str, Any]] = {}
+        self.phase: str = "select_clans"
+        self.event_id: Optional[int] = None
+        self.detail_clan_tags: List[str] = []
+        self.detail_index: int = 0
         self._seed_working_clans()
         self._add_clan_buttons()
         self._add_control_buttons()
@@ -414,6 +462,25 @@ class CwlEventSetupView(TrackedView):
         except discord.NotFound:
             pass
 
+    def _persist_detail_edit(self) -> None:
+        """Write self.working_clans to the DB as an atomic replace-all — cheap enough (a
+        handful of clans) to call again on every single roster-size/start-time edit rather
+        than adding a separate partial-update DB method."""
+        db = CACHE.db_manager
+        if db is None or self.event_id is None:
+            return
+        clan_configs = [
+            {
+                "clan_tag": tag,
+                "target_league_rank": cfg.get("target_league_rank"),
+                "roster_size": cfg.get("roster_size", 15),
+                "tier_order": idx,
+                "cwl_start_at": cfg.get("cwl_start_at"),
+            }
+            for idx, (tag, cfg) in enumerate(self.working_clans.items())
+        ]
+        db.set_cwl_event_clans_sync(self.event_id, clan_configs)
+
     async def _on_apply(self, interaction: discord.Interaction) -> None:
         if not await _check_cwl_admin_permission(interaction):
             return
@@ -428,26 +495,28 @@ class CwlEventSetupView(TrackedView):
         event_id = db.create_cwl_event_sync(guild_id_str, season, str(interaction.user.id))
         if event_id is None:
             return
-        clan_configs = [
-            {
-                "clan_tag": tag,
-                "target_league_rank": cfg.get("target_league_rank"),
-                "roster_size": cfg.get("roster_size", 15),
-                "tier_order": cfg.get("tier_order", idx),
-                "cwl_start_at": cfg.get("cwl_start_at"),
-            }
-            for idx, (tag, cfg) in enumerate(self.working_clans.items())
-        ]
-        db.set_cwl_event_clans_sync(event_id, clan_configs)
+        self.event_id = event_id
+        self._persist_detail_edit()
 
+        if not self.working_clans:
+            try:
+                await interaction.delete_original_response()
+            except discord.NotFound:
+                pass
+            self.message = None
+            await _refresh_parent(self.parent_view, interaction, "cwl_management")
+            return
+
+        # Move into the per-clan roster-size/start-time step, reusing this same ephemeral
+        # message — picking participants and configuring their roster/start time is one flow.
+        self.phase = "edit_details"
+        self.detail_clan_tags = list(self.working_clans.keys())
+        self.detail_index = 0
+        self._render_detail_step()
         try:
-            await interaction.delete_original_response()
+            await interaction.edit_original_response(content=self._build_detail_content(), view=self)
         except discord.NotFound:
             pass
-        self.message = None
-        # "Configure Participating Clans" only opens from the cwl_management screen (see
-        # add_cwl_management_components() above) — always the mode to refresh back into.
-        await _refresh_parent(self.parent_view, interaction, "cwl_management")
 
     async def _on_cancel(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=False, ephemeral=True)
@@ -456,6 +525,191 @@ class CwlEventSetupView(TrackedView):
         except discord.NotFound:
             pass
         self.message = None
+
+    # -- edit_details phase: single-clan-at-a-time roster-size/start-time editor -----------
+
+    def _render_detail_step(self) -> None:
+        from qapbot.i18n import t
+
+        self.clear_items()
+        guild_id = self.guild.id
+        tag = self.detail_clan_tags[self.detail_index]
+        cfg = self.working_clans.get(tag, {})
+        count = len(self.detail_clan_tags)
+
+        prev_button: discord.ui.Button[Any] = discord.ui.Button(
+            label="◀",
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_setup_detail_prev",
+            row=0,
+            disabled=(count <= 1),
+        )
+        prev_button.callback = self._make_detail_nav_callback(-1)  # type: ignore[assignment]
+        self.add_item(prev_button)
+
+        clan_name = CACHE.get_clan_name(tag, tag)
+        label_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=f"{clan_name} ({self.detail_index + 1}/{count})",
+            style=discord.ButtonStyle.primary,
+            custom_id="cwl_setup_detail_label",
+            row=0,
+            disabled=True,
+        )
+        self.add_item(label_button)
+
+        next_button: discord.ui.Button[Any] = discord.ui.Button(
+            label="▶",
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_setup_detail_next",
+            row=0,
+            disabled=(count <= 1),
+        )
+        next_button.callback = self._make_detail_nav_callback(1)  # type: ignore[assignment]
+        self.add_item(next_button)
+
+        roster_size = cfg.get("roster_size", 15)
+        roster_select: discord.ui.Select[Any] = discord.ui.Select(
+            placeholder=t('cwl.setup.roster_size_placeholder', guild_id=guild_id),
+            options=[
+                discord.SelectOption(label=str(size), value=str(size), default=(roster_size == size))
+                for size in (5, 15, 30)
+            ],
+            row=1,
+            custom_id="cwl_setup_detail_roster",
+        )
+        roster_select.callback = self._on_detail_roster_select  # type: ignore[assignment]
+        self.add_item(roster_select)
+
+        start_time_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.setup.button_set_start_time', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_setup_detail_start_time",
+            row=2,
+        )
+        start_time_button.callback = self._on_detail_start_time_click  # type: ignore[assignment]
+        self.add_item(start_time_button)
+
+        done_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.setup.button_done', guild_id=guild_id),
+            style=discord.ButtonStyle.primary,
+            custom_id="cwl_setup_detail_done",
+            row=3,
+        )
+        done_button.callback = self._on_detail_done  # type: ignore[assignment]
+        self.add_item(done_button)
+
+    def _build_detail_content(self) -> str:
+        from qapbot.i18n import t
+
+        guild_id = self.guild.id
+        tag = self.detail_clan_tags[self.detail_index]
+        cfg = self.working_clans.get(tag, {})
+        start_display = cfg.get("cwl_start_at") or t('cwl.management.start_time_unset', guild_id=guild_id)
+        return t(
+            'cwl.setup.detail_header',
+            guild_id=guild_id,
+            clan_name=CACHE.get_clan_name(tag, tag),
+            clan_tag=tag,
+            index=self.detail_index + 1,
+            count=len(self.detail_clan_tags),
+            roster_size=cfg.get("roster_size", 15),
+            start_time=start_display,
+        )
+
+    def _make_detail_nav_callback(self, delta: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            if not await _check_cwl_admin_permission(interaction):
+                return
+            await interaction.response.defer(thinking=False, ephemeral=True)
+            self.detail_index = (self.detail_index + delta) % len(self.detail_clan_tags)
+            self._render_detail_step()
+            try:
+                await interaction.edit_original_response(content=self._build_detail_content(), view=self)
+            except discord.NotFound:
+                pass
+
+        return callback
+
+    async def _on_detail_roster_select(self, interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        if not isinstance(interaction.data, dict):
+            return
+        values = interaction.data.get("values") or ["15"]
+        tag = self.detail_clan_tags[self.detail_index]
+        self.working_clans[tag]["roster_size"] = int(values[0])
+        self._persist_detail_edit()
+        self._render_detail_step()
+        try:
+            await interaction.edit_original_response(content=self._build_detail_content(), view=self)
+        except discord.NotFound:
+            pass
+
+    async def _on_detail_start_time_click(self, interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        tag = self.detail_clan_tags[self.detail_index]
+        await interaction.response.send_modal(CwlStartTimeModal(self, tag))
+
+    async def _on_detail_done(self, interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        try:
+            await interaction.delete_original_response()
+        except discord.NotFound:
+            pass
+        self.message = None
+        await _refresh_parent(self.parent_view, interaction, "cwl_management")
+
+
+class CwlStartTimeModal(discord.ui.Modal):
+    """Single-TextInput modal for setting (or clearing) one clan's CWL start time, opened from
+    CwlEventSetupView's edit_details step. Submitting re-renders that same view/message via
+    interaction.response.edit_message() — valid here because the modal was itself opened from a
+    component on that message, not from a slash command.
+    """
+
+    def __init__(self, parent_view: CwlEventSetupView, clan_tag: str):
+        from qapbot.i18n import t
+
+        guild_id = parent_view.guild.id
+        super().__init__(title=t('cwl.setup.start_time_modal_title', guild_id=guild_id))
+        self.parent_view = parent_view
+        self.clan_tag = clan_tag
+        current = parent_view.working_clans.get(clan_tag, {}).get("cwl_start_at") or ""
+        self.start_time_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
+            label=t('cwl.setup.start_time_modal_label', guild_id=guild_id),
+            placeholder=t('cwl.setup.start_time_modal_placeholder', guild_id=guild_id),
+            required=False,
+            default=current,
+            max_length=32,
+        )
+        self.add_item(self.start_time_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        from qapbot.i18n import t
+
+        raw = (self.start_time_input.value or "").strip()
+        if not raw:
+            self.parent_view.working_clans[self.clan_tag]["cwl_start_at"] = None
+        else:
+            parsed = _parse_cwl_start_time(raw)
+            if parsed is None:
+                await interaction.response.send_message(
+                    t('cwl.setup.start_time_parse_error', guild_id=self.parent_view.guild.id),
+                    ephemeral=True,
+                )
+                return
+            self.parent_view.working_clans[self.clan_tag]["cwl_start_at"] = parsed
+
+        self.parent_view._persist_detail_edit()
+        self.parent_view._render_detail_step()
+        await interaction.response.edit_message(
+            content=self.parent_view._build_detail_content(),
+            view=self.parent_view,
+        )
 
 
 # ---------------------------------------------------------------------------

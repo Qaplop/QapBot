@@ -2346,9 +2346,11 @@ class ClanManagementView(discord.ui.View):
         guild_id_str = str(interaction.guild.id)
         config = CACHE.server_config.get(guild_id_str, {})
         
-        # Resolve the current channel object (if any) for every configured slot
+        # Resolve the current channel object (if any) for every slot relevant to this
+        # (basic server configuration) screen — CWL's own channel slots are configured
+        # from the cwl_settings screen instead, see CWL_CONFIG_CHANNEL_SLOTS.
         current_channels: Dict[str, Optional[discord.TextChannel]] = {}
-        for slot in DEFAULT_CHANNEL_SLOTS:
+        for slot in BASIC_CONFIG_CHANNEL_SLOTS:
             channel_id = config.get(slot.config_key)
             channel_obj: Optional[discord.TextChannel] = None
             if channel_id:
@@ -2359,13 +2361,14 @@ class ClanManagementView(discord.ui.View):
                 except Exception:
                     pass
             current_channels[slot.key] = channel_obj
-        
+
         # Create channel configuration view
         channel_config_view = ChannelConfigurationView(
             guild=interaction.guild,
             clan_management_view=self,
             original_interaction=interaction,
             current_channels=current_channels,
+            slots=BASIC_CONFIG_CHANNEL_SLOTS,
             timeout=300
         )
         
@@ -2665,6 +2668,18 @@ DEFAULT_CHANNEL_SLOTS: Tuple[ChannelSlotConfig, ...] = (
         disable_flag_keys=("cwl_management_message_enabled",),
         on_apply=_track_cwl_management_channel_change,
     ),
+)
+
+# Context-scoped subsets of DEFAULT_CHANNEL_SLOTS: the basic "config" mode's "Configure
+# Channels" button and the cwl_settings screen's "Configure Channels" button both open
+# ChannelConfigurationView, but each should only offer the slots relevant to its own
+# screen — showing every slot from both contexts in either one is confusing (e.g. a CWL
+# hub channel selector appearing under basic server configuration).
+BASIC_CONFIG_CHANNEL_SLOTS: Tuple[ChannelSlotConfig, ...] = tuple(
+    slot for slot in DEFAULT_CHANNEL_SLOTS if slot.key in ("registration", "war")
+)
+CWL_CONFIG_CHANNEL_SLOTS: Tuple[ChannelSlotConfig, ...] = tuple(
+    slot for slot in DEFAULT_CHANNEL_SLOTS if slot.key in ("cwl_management",)
 )
 
 
