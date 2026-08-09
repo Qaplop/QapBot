@@ -1,6 +1,30 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (15)
+- Added: /leaderboard is now DM-invokable too (follow-up to Phase 0b, (14),
+  CWL_ROSTER_PLANNING_PLAN.md) — a project-owner review of (14) corrected the initial scope call
+  that had grouped it with subscribe/unsubscribe/highlightme as "no DM analog": the clan-omitted
+  path reading "this channel's" subscriptions already degrades gracefully in a DM (empty, since
+  /subscribe itself stays guild_only() — a coherent "nothing to do" error, not a crash). Its four
+  output branches (cwlinfo, cwlinfo_comp, cwlgroup, default text table) each gained an is_dm branch
+  that sends directly instead of going through post_discord_content_with_tracking()/
+  post_leaderboard_to_discord() — both stay strictly guild-channel-typed (shared with the periodic
+  subscription-broadcast system; not worth widening for this). Generalized while at it:
+  send_and_track() (QBdiscocmdshelper.py) gained an is_dm bypass that skips the tracked-message
+  lifecycle (find/delete prior messages of the same mode, persist new message IDs) for any DM
+  send, not just leaderboard's — that bookkeeping exists to prevent shared-channel clutter across
+  repeated invocations, which isn't a concern in a private 1:1 DM history. Any future
+  send_and_track() caller gets this for free.
+  Also documented a DEV-environment testing gotcha found during manual verification (not a code
+  bug): DEV registers all commands guild-scoped (QapBot.py:2667-2679, fast-propagating but a hard
+  Discord platform restriction to that one guild — never invocable from a DM regardless of any
+  contexts/guild_only() setting), so Phase 0's DM behavior can only be manually verified against
+  PROD (global sync) or a temporarily-global-synced DEV (existing commented-out override,
+  QapBot.py:202).
+  Files: QBdiscordcmds.py, qapbot/QBdiscocmdshelper.py, tests/discord/test_dm_command_invocation.py.
+  1555 tests pass (.\run_tests.ps1).
+
 2026-08-09 (14)
 - Added: Phase 0b of the CWL roster planning feature's DM-interaction foundation
   (CWL_ROSTER_PLANNING_PLAN.md) — per-command @app_commands.guild_only() rollout on top of Phase

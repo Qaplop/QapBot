@@ -7,13 +7,19 @@ Two layers:
    on a command that was deliberately left guild-only.
 2. Functional DM-invocation coverage for the commands that actually gained new logic in
    this phase (ping — pure decorator removal, cheapest possible smoke test; subscriptions
-   server_wide=True — the one command whose body changed, using resolve_guild_context()).
-   The other five converted commands (status, help, list, analyse_leaguegroup,
-   analyse_cwlopponent) had zero functional interaction.guild dependency per the Phase 0b
-   audit — no code inside them changed, only the decorator — so the structural check plus
-   their existing (guild-mode) test coverage is the right amount of testing here; a full
-   DM-mode functional re-test of unchanged logic would mostly be re-testing discord.py's
-   own decorator mechanics.
+   server_wide=True — resolve_guild_context()-based guild resolution; leaderboard — its
+   four output branches (cwlinfo/cwlinfo_comp/cwlgroup/default-text) each gained a DM
+   direct-send path bypassing the tracked-posting helpers). The other four converted
+   commands (status, help, list, analyse_leaguegroup, analyse_cwlopponent) had zero
+   functional interaction.guild dependency per the Phase 0b audit — no code inside them
+   changed, only the decorator — so the structural check plus their existing (guild-mode)
+   test coverage is the right amount of testing here; a full DM-mode functional re-test of
+   unchanged logic would mostly be re-testing discord.py's own decorator mechanics.
+3. send_and_track()'s is_dm bypass (Phase 0b follow-up, QBdiscocmdshelper.py) — DMs skip
+   the tracked-message-lifecycle bookkeeping (find/delete prior messages of this mode,
+   persist new message IDs) since there's no shared-channel clutter to prevent in a
+   private 1:1 history; covered directly here since it's shared infrastructure, not
+   specific to any one converted command.
 """
 from __future__ import annotations
 
@@ -21,6 +27,7 @@ import os
 from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 
 os.environ.setdefault("DISCORD_TOKEN", "test-token")
@@ -32,10 +39,9 @@ import QBdiscordcmds  # noqa: E402
 # Structural regression check
 # ---------------------------------------------------------------------------
 
-_CONVERTED = ["status", "ping", "help", "list", "subscriptions"]
+_CONVERTED = ["status", "ping", "help", "list", "subscriptions", "leaderboard"]
 _CONVERTED_GROUP_COMMANDS = ["cwl_league_group", "cwl_opponent"]  # analyse_group
-_LEFT_GUILD_ONLY = ["subscribe", "unsubscribe", "leaderboard", "highlightme", "admin"]
-_LEFT_GUILD_ONLY_GROUP_COMMANDS = [("clan_group", "management")]
+_LEFT_GUILD_ONLY = ["subscribe", "unsubscribe", "highlightme", "admin"]
 
 
 @pytest.mark.discord
@@ -164,3 +170,124 @@ async def test_subscriptions_server_wide_dm_resolves_single_guild(mock_interacti
     # Never touched interaction.guild (which is None) — resolved the Guild via QBcore.bot.get_guild().
     fake_bot.get_guild.assert_called_once_with(555)
     assert sent.get("content") == "This guild has no subscriptions."
+
+
+# ---------------------------------------------------------------------------
+# send_and_track()'s is_dm bypass (shared infrastructure, QBdiscocmdshelper.py)
+# ---------------------------------------------------------------------------
+
+class _FakeLeaderboardCache:
+    def __init__(self) -> None:
+        self.leaderboard_messages: Dict[str, Dict[str, Any]] = {}
+
+    async def set_leaderboard_message(self, key: str, entry: Dict[str, Any]) -> None:
+        self.leaderboard_messages[key] = entry
+
+    async def delete_leaderboard_message(self, key: str) -> None:
+        self.leaderboard_messages.pop(key, None)
+
+
+async def _passthrough_discord_retry(op, _name="x"):
+    return await op()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_send_and_track_dm_skips_tracking_and_deletion(mock_interaction, monkeypatch):
+    import qapbot.QBdiscocmdshelper as helper
+
+    mock_interaction.guild = None
+    fake_cache = _FakeLeaderboardCache()
+    # A pre-existing tracked message for this channel+mode — must survive untouched, since a DM
+    # send must not run the "find and delete prior messages of this mode" cleanup at all.
+    fake_cache.leaderboard_messages["pre-existing"] = {
+        "clan_tag": f"channel_{mock_interaction.channel.id}",
+        "channel_id": str(mock_interaction.channel.id),
+        "mode": "leaderboard_test",
+        "message_ids": "111",
+    }
+    monkeypatch.setattr(helper, "CACHE", fake_cache)
+    monkeypatch.setattr(helper, "discord_retry", _passthrough_discord_retry)
+
+    await helper.send_and_track(mock_interaction, content="hello", command_name="leaderboard_test")
+
+    mock_interaction.channel.send.assert_awaited_once_with("hello")
+    # Untouched: neither deleted (cleanup skipped) nor added to (final tracking-store skipped).
+    assert fake_cache.leaderboard_messages == {
+        "pre-existing": {
+            "clan_tag": f"channel_{mock_interaction.channel.id}",
+            "channel_id": str(mock_interaction.channel.id),
+            "mode": "leaderboard_test",
+            "message_ids": "111",
+        }
+    }
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_send_and_track_guild_still_tracks(mock_interaction, monkeypatch):
+    """Companion regression guard: guild-invoked sends must keep tracking as before."""
+    import qapbot.QBdiscocmdshelper as helper
+
+    fake_cache = _FakeLeaderboardCache()
+    monkeypatch.setattr(helper, "CACHE", fake_cache)
+    monkeypatch.setattr(helper, "discord_retry", _passthrough_discord_retry)
+
+    await helper.send_and_track(mock_interaction, content="hello", command_name="leaderboard_test")
+
+    mock_interaction.channel.send.assert_awaited_once_with("hello")
+    assert len(fake_cache.leaderboard_messages) == 1
+    stored = next(iter(fake_cache.leaderboard_messages.values()))
+    assert stored["mode"] == "leaderboard_test"
+    assert stored["message_ids"]
+
+
+# ---------------------------------------------------------------------------
+# leaderboard()'s DM output path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_leaderboard_dm_default_text_sends_directly_without_tracking(mock_interaction, monkeypatch):
+    """The common case: /leaderboard clan:<tag> from a DM, default mode. Must route through
+    send_and_track's is_dm bypass rather than post_leaderboard_to_discord (guild-channel-typed,
+    shared with the periodic broadcast system)."""
+    mock_interaction.guild = None
+    mock_interaction.guild_id = None
+
+    fake_cache = _FakeLeaderboardCache()
+    fake_cache.user_accounts = {}
+    fake_cache.clan_families = {}  # "#CLAN1" resolved via _get_clan_tag below, not as a family
+    fake_cache.subscriptions = {}
+
+    def _fake_get_all_subscriptions_flat():
+        return {}
+
+    fake_cache.get_all_subscriptions_flat = _fake_get_all_subscriptions_flat  # type: ignore[attr-defined]
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+
+    monkeypatch.setattr(QBdiscordcmds, "_get_clan_tag", lambda clan: (1, "#CLAN1"))
+    monkeypatch.setattr(QBdiscordcmds, "update_clan_war_info_and_stats", AsyncMock(return_value=True))
+    monkeypatch.setattr(QBdiscordcmds, "generate_leaderboard_text", lambda *a, **k: "PLAYER TABLE")
+
+    sent_and_tracked = {}
+
+    async def _fake_send_and_track(interaction, content=None, command_name=None, embed=None, ephemeral=False):
+        sent_and_tracked["content"] = content
+        sent_and_tracked["command_name"] = command_name
+        sent_and_tracked["ephemeral"] = ephemeral
+
+    monkeypatch.setattr(QBdiscordcmds, "send_and_track", _fake_send_and_track)
+
+    post_leaderboard_mock = AsyncMock()
+    monkeypatch.setattr(QBdiscordcmds, "post_leaderboard_to_discord", post_leaderboard_mock)
+
+    await QBdiscordcmds.leaderboard.callback(  # type: ignore[arg-type]
+        mock_interaction, clan="#CLAN1", scope="own",
+    )
+
+    # Routed through send_and_track (is_dm-aware), never the guild-channel-typed helper.
+    post_leaderboard_mock.assert_not_awaited()
+    assert sent_and_tracked["ephemeral"] is False
+    assert sent_and_tracked["content"] == "```ansi\nPLAYER TABLE```"
+    assert sent_and_tracked["command_name"] == "leaderboard_#CLAN1_attack"

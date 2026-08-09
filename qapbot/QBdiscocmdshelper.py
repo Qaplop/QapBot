@@ -119,6 +119,13 @@ async def send_and_track(
         else:
             logging.warning(f"delete_original_response failed: {e}")
     
+    # DMs skip the tracked-message lifecycle entirely (generate/store a key, find+delete prior
+    # messages of this mode, persist new message IDs for future cleanup): that bookkeeping exists
+    # to prevent shared-channel clutter across repeated invocations, which isn't a concern in a
+    # private 1:1 DM history. Still sends a normal (non-ephemeral, persistent) message — only the
+    # tracking/deletion bookkeeping is skipped, not the "ephemeral" send style above.
+    is_dm = interaction.guild is None
+
     # Generate timestamp-based key using unified helper
     timestamp = generate_message_key_timestamp()
     # Store metadata in value dict
@@ -131,43 +138,44 @@ async def send_and_track(
         'message_ids': '',
         'content_hash': ''
     }
-    keys_to_delete = []
-    # For 'status' and 'userinfo', preserve last 3 (preserve_count + new) messages of that type
-    preserve_count = 2 if command_name in ('status', 'userinfo') else 0
-    # Find all matching keys for this context and mode
-    matching_keys = [k for k, v in CACHE.leaderboard_messages.items()
-                     if v.get('clan_tag') == entry['clan_tag'] and v.get('channel_id') == entry['channel_id'] and v.get('mode') == entry['mode']]
-    # Sort keys by timestamp (oldest first)
-    matching_keys_sorted = sorted(matching_keys)
-    # Only delete if more than preserve_count exist
-    if preserve_count > 0 and len(matching_keys_sorted) > preserve_count:
-        keys_to_delete = matching_keys_sorted[:len(matching_keys_sorted)-preserve_count]
-    else:
-        keys_to_delete = [] if preserve_count > 0 else matching_keys_sorted
-    for k in keys_to_delete:
-        v = CACHE.leaderboard_messages[k]
-        msg_ids = v.get('message_ids', '')
-        if msg_ids:
-            for msg_id in msg_ids.split(','):
-                try:
-                    if not interaction.channel or not hasattr(interaction.channel, 'fetch_message'):
-                        continue
-                    msg = await interaction.channel.fetch_message(int(msg_id))  # type: ignore[union-attr]
-                    await discord_retry(  # type: ignore[misc]
-                        lambda: msg.delete(),  # type: ignore[misc]
-                        f"delete_message_{msg_id}"
-                    )
-                    await asyncio.sleep(0.5)  # pace deletions to avoid Discord rate limits
-                except discord.HTTPException as e:
-                    # Error code 10008 = Unknown Message (manually deleted by user)
-                    if e.code == 10008:
-                        logging.info(f"Message {msg_id} already deleted (error 10008), removing from cache")
-                    else:
-                        logging.warning(f"Failed to delete message {msg_id}: {e}")
-                except Exception as e:
-                    logging.info(f"Could not delete message {msg_id}: {e}")
-        await CACHE.delete_leaderboard_message(k)
-    
+    if not is_dm:
+        keys_to_delete = []
+        # For 'status' and 'userinfo', preserve last 3 (preserve_count + new) messages of that type
+        preserve_count = 2 if command_name in ('status', 'userinfo') else 0
+        # Find all matching keys for this context and mode
+        matching_keys = [k for k, v in CACHE.leaderboard_messages.items()
+                         if v.get('clan_tag') == entry['clan_tag'] and v.get('channel_id') == entry['channel_id'] and v.get('mode') == entry['mode']]
+        # Sort keys by timestamp (oldest first)
+        matching_keys_sorted = sorted(matching_keys)
+        # Only delete if more than preserve_count exist
+        if preserve_count > 0 and len(matching_keys_sorted) > preserve_count:
+            keys_to_delete = matching_keys_sorted[:len(matching_keys_sorted)-preserve_count]
+        else:
+            keys_to_delete = [] if preserve_count > 0 else matching_keys_sorted
+        for k in keys_to_delete:
+            v = CACHE.leaderboard_messages[k]
+            msg_ids = v.get('message_ids', '')
+            if msg_ids:
+                for msg_id in msg_ids.split(','):
+                    try:
+                        if not interaction.channel or not hasattr(interaction.channel, 'fetch_message'):
+                            continue
+                        msg = await interaction.channel.fetch_message(int(msg_id))  # type: ignore[union-attr]
+                        await discord_retry(  # type: ignore[misc]
+                            lambda: msg.delete(),  # type: ignore[misc]
+                            f"delete_message_{msg_id}"
+                        )
+                        await asyncio.sleep(0.5)  # pace deletions to avoid Discord rate limits
+                    except discord.HTTPException as e:
+                        # Error code 10008 = Unknown Message (manually deleted by user)
+                        if e.code == 10008:
+                            logging.info(f"Message {msg_id} already deleted (error 10008), removing from cache")
+                        else:
+                            logging.warning(f"Failed to delete message {msg_id}: {e}")
+                    except Exception as e:
+                        logging.info(f"Could not delete message {msg_id}: {e}")
+            await CACHE.delete_leaderboard_message(k)
+
     # Send message (embed or text content)
     sent_message_ids = []
     
@@ -225,8 +233,8 @@ async def send_and_track(
             except Exception as e:
                 logging.error(f"Failed to send {command_name} message chunk {chunk_idx}: {e}")
     
-    # Store all message IDs as comma-separated string
-    if sent_message_ids:
+    # Store all message IDs as comma-separated string (skipped for DMs — see is_dm above)
+    if sent_message_ids and not is_dm:
         entry['message_ids'] = ','.join(sent_message_ids)  # type: ignore[arg-type]
         await CACHE.set_leaderboard_message(timestamp, entry)
 

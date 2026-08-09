@@ -507,12 +507,14 @@ async def unsubscribe_mode_autocomplete(interaction: discord.Interaction, curren
     app_commands.Choice(name="All clans a current member played for (default)", value="all"),
     app_commands.Choice(name="Own clans only (current member clans of this server)", value="own"),
 ])
-# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): the clan-omitted path reads *this
-# channel's* subscriptions (same channel-subscription concept as subscribe/highlightme), and the
-# posting step later in this function is gated on isinstance(interaction.channel, (TextChannel,
-# Thread)) regardless of whether clan is given — would silently no-op in a DM. Revisit only with
-# an explicit DM output-path decision.
-@app_commands.guild_only()
+# DM-invokable (Phase 0b, CWL_ROSTER_PLANNING_PLAN.md) — not actually channel-bound: the
+# clan-omitted path reads "this channel's" subscriptions, which in a DM is simply empty (nobody
+# subscribes a DM channel — /subscribe stays guild_only()) and already degrades to the existing
+# "nothing to do" error, not a crash. The output step below branches on interaction.guild is None
+# to send directly (no tracking/dedup — see send_and_track's is_dm handling and the comments at
+# each branch below) instead of going through post_discord_content_with_tracking()/
+# post_leaderboard_to_discord(), which stay guild-channel-only (shared with the periodic broadcast
+# system — not worth the risk of widening their typed channel parameter for this).
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
 async def leaderboard(
     interaction: discord.Interaction,
@@ -761,22 +763,37 @@ async def leaderboard(
             if isinstance(p, dict) and p.get('player_tag'):
                 highlight_player_ids.add(p['player_tag'])
 
-    # Generate and post leaderboards for requested targets
+    # Generate and post leaderboards for requested targets. DM invocations send directly
+    # (no tracking/dedup — a DM has no shared-channel clutter to prevent) rather than going
+    # through the tracked-posting helpers shared with the periodic broadcast system.
+    is_dm = interaction.guild is None
     for i, tag in enumerate(tags):
         is_family = tag in CACHE.clan_families
         if is_family and per_tag_modes[i] in ('currentwar', 'cwlinfo', 'cwlinfo_comp', 'cwlgroup'):
             continue  # Skip live-war / group modes for families
         period_month, period_year = per_tag_periods[i] if i < len(per_tag_periods) else (month_range, yr)
         if per_tag_modes[i] == 'cwlinfo':
-            if interaction.channel and isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
-                cwl_embeds = await generate_cwlinfo_embeds(tag)
+            if not interaction.channel:
+                continue
+            cwl_embeds = await generate_cwlinfo_embeds(tag)
+            if is_dm:
+                for cwl_embed in cwl_embeds:
+                    await interaction.followup.send(embed=cwl_embed)
+            elif isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
                 await post_discord_content_with_tracking(tag, interaction.channel, embeds=cwl_embeds)
         elif per_tag_modes[i] == 'cwlinfo_comp':
-            if interaction.channel and isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
-                cwl_embeds, cwl_debug = await generate_cwlinfo_comp_embeds(tag)
+            if not interaction.channel:
+                continue
+            cwl_embeds, cwl_debug = await generate_cwlinfo_comp_embeds(tag)
+            if is_dm:
+                for cwl_embed in cwl_embeds:
+                    await interaction.followup.send(embed=cwl_embed)
+                if cwl_debug:
+                    await interaction.followup.send(content=cwl_debug)
+            elif isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
                 await post_discord_content_with_tracking(tag, interaction.channel, 'cwlinfo_comp', embeds=cwl_embeds, debug_content=cwl_debug)
         elif per_tag_modes[i] == 'cwlgroup':
-            if interaction.channel and isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+            if interaction.channel:
                 guild_id = interaction.guild.id if interaction.guild else None
                 # Year without month: error — we can't know which month to show
                 if year is not None and cwlgroup_month is None:
@@ -834,7 +851,10 @@ async def leaderboard(
                     )
                 else:
                     img_bytes = await asyncio.to_thread(generate_cwl_group_image, standings, _season, tag)
-                    await post_discord_content_with_tracking(tag, interaction.channel, f"cwlgroup_{_season}", file_bytes=img_bytes, file_name="cwlgroup.png", update_existing=False)
+                    if is_dm:
+                        await interaction.followup.send(file=discord.File(io.BytesIO(img_bytes), filename="cwlgroup.png"))
+                    elif isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+                        await post_discord_content_with_tracking(tag, interaction.channel, f"cwlgroup_{_season}", file_bytes=img_bytes, file_name="cwlgroup.png", update_existing=False)
         else:
             text = await asyncio.to_thread(
                 generate_leaderboard_text, tag, month=period_month, year=period_year,
@@ -842,7 +862,11 @@ async def leaderboard(
                 scope=scope, member_player_tags=member_tags_by_tag.get(tag),
                 highlight_player_ids=highlight_player_ids,
             )
-            if interaction.channel and isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+            if is_dm:
+                # ```ansi fence matches post_leaderboard_to_discord()'s formatting — the
+                # auto-highlight feature above embeds ANSI codes for the caller's own player(s).
+                await send_and_track(interaction, content=f"```ansi\n{text}```", command_name=f'leaderboard_{tag}_{per_tag_modes[i]}', ephemeral=False)
+            elif interaction.channel and isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
                 await post_leaderboard_to_discord(text, tag, month=period_month, year=period_year, channel=interaction.channel, mode=per_tag_modes[i], cwl_season=cwl_season)
 
 
