@@ -170,6 +170,12 @@ class BotConfig:
     sim_multiprocess_enabled: bool = True   # SIM_MULTIPROCESS_ENABLED in .env
     sim_max_workers: int = 0                 # SIM_MAX_WORKERS in .env (0 = all cores, capped at 8)
 
+    # CWL clan-config web bridge (qapbot/web_bridge.py, CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase B).
+    # Both 0/empty by default = bridge not started. Bound to 127.0.0.1 only — a cloudflared
+    # tunnel (not this bot) is what makes it reachable from the Cloudflare Worker.
+    web_bridge_port: int = 0                # WEB_BRIDGE_PORT in .env
+    web_bridge_secret: str = ""             # WEB_BRIDGE_SECRET in .env — shared with the Worker's BRIDGE_SECRET
+
 
 
 
@@ -331,6 +337,13 @@ def load_config() -> BotConfig:
     except ValueError:
         sim_max_workers = 0
 
+    # CWL clan-config web bridge (Phase B) — both must be set to start it
+    try:
+        web_bridge_port = max(0, int(os.getenv("WEB_BRIDGE_PORT", "0")))
+    except ValueError:
+        web_bridge_port = 0
+    web_bridge_secret = os.getenv("WEB_BRIDGE_SECRET", "")
+
     # Create config object
     config = BotConfig(
         coc_email=coc_email,
@@ -357,6 +370,8 @@ def load_config() -> BotConfig:
         no_coc_api=no_coc_api,
         sim_multiprocess_enabled=sim_multiprocess_enabled,
         sim_max_workers=sim_max_workers,
+        web_bridge_port=web_bridge_port,
+        web_bridge_secret=web_bridge_secret,
     )
     
     # Validate configuration (fail fast on startup)

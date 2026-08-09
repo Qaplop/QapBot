@@ -2747,6 +2747,12 @@ async def _setup_hook():
     QBcore.bot.add_view(CwlManagementHubView())
     logging.info("[SETUP_HOOK] Registered persistent CwlManagementHubView for restart-surviving buttons")
 
+    # CWL clan-config web bridge (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase B) — no-ops unless
+    # WEB_BRIDGE_PORT/WEB_BRIDGE_SECRET are both configured, so this is a no-op for any
+    # deployment that hasn't opted into the Discord Activity feature.
+    from qapbot.web_bridge import start_web_bridge
+    await start_web_bridge()
+
     logging.info("[SETUP_HOOK] Setup hook completed successfully")
 
 async def _clear_global_commands_after_ready():
@@ -3943,6 +3949,13 @@ async def async_cleanup() -> None:
         shutdown_sim_pool()
     except Exception:
         pass
+
+    # CWL clan-config web bridge (Phase B) — no-op if it was never started
+    try:
+        from qapbot.web_bridge import stop_web_bridge
+        await stop_web_bridge()
+    except Exception as e:
+        logging.error(f"[WEB-BRIDGE] Error during shutdown: {e}")
 
     QBcore.cleaned_up = True
     logging.info("Cleanup complete. Goodbye!")

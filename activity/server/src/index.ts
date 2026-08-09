@@ -4,9 +4,15 @@
  *
  * This Worker does two things, on purpose, and nothing else:
  *  1. OAuth2 code -> access_token exchange (CLIENT_SECRET must never reach the frontend).
- *  2. A thin proxy to QapBot's own bridge API (Phase B+), which is the actual source of
- *     truth for CWL data and re-verifies admin status itself — this Worker is a UX/session
- *     gate, not the security boundary. See "Auth & permission model" in the plan doc.
+ *  2. A thin proxy to QapBot's own bridge API, which is the actual source of truth for CWL
+ *     data and re-verifies admin status itself — this Worker is a UX/session gate, not the
+ *     security boundary. See "Auth & permission model" in the plan doc.
+ *
+ * Identity verification (Phase B): the discord_user_id forwarded to the bridge is NEVER taken
+ * from anything the client sends directly — that would be trivially spoofable (anyone could
+ * claim to be a known admin's Discord ID). Every /cwl/clan-config request must carry the
+ * user's real OAuth access_token as a Bearer token, which this Worker independently exchanges
+ * for the true user id via Discord's own GET /users/@me before forwarding anything to the bridge.
  */
 import { Hono, type Context } from 'hono'
 
@@ -17,7 +23,7 @@ type Bindings = {
   // Nothing ever navigates here for an Activity — Discord's token endpoint just requires it
   // to be present and registered, per standard OAuth2 authorization_code grant rules.
   REDIRECT_URI: string
-  // Phase B+: cloudflared tunnel URL to QapBot's bridge API, and the shared secret it expects.
+  // cloudflared tunnel URL to QapBot's bridge API, and the shared secret it expects.
   BRIDGE_URL?: string
   BRIDGE_SECRET?: string
 }
@@ -72,26 +78,57 @@ function bridgeNotConfigured(c: AppContext) {
   )
 }
 
+/** Independently verifies the caller's access_token against Discord itself and returns their
+ * real user id — never trust a client-supplied discord_user_id for anything security-relevant. */
+async function verifiedDiscordUserId(c: AppContext): Promise<string | null> {
+  const auth = c.req.header('Authorization')
+  if (!auth?.startsWith('Bearer ')) return null
+
+  const response = await fetch('https://discord.com/api/users/@me', {
+    headers: { Authorization: auth },
+  })
+  if (!response.ok) return null
+
+  const user = await response.json<{ id: string }>()
+  return user.id
+}
+
 api.get('/cwl/clan-config', async (c) => {
   const guildId = c.req.query('guild_id')
   if (!guildId) return c.json({ error: 'missing guild_id' }, 400)
+
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
   if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
 
   const upstream = await fetch(
-    `${c.env.BRIDGE_URL}/api/cwl/clan-config?guild_id=${encodeURIComponent(guildId)}`,
+    `${c.env.BRIDGE_URL}/api/cwl/clan-config?guild_id=${encodeURIComponent(guildId)}&discord_user_id=${encodeURIComponent(discordUserId)}`,
     { headers: { 'X-Bridge-Secret': c.env.BRIDGE_SECRET } },
   )
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
 })
 
 api.post('/cwl/clan-config', async (c) => {
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
   if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
 
-  const body = await c.req.json()
+  let body: Record<string, unknown>
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
   const upstream = await fetch(`${c.env.BRIDGE_URL}/api/cwl/clan-config`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': c.env.BRIDGE_SECRET },
-    body: JSON.stringify(body),
+    // discord_user_id always comes from the server-verified value above, never from `body` —
+    // spreading body first so a client-supplied discord_user_id field, if present, gets
+    // overwritten rather than trusted.
+    body: JSON.stringify({ ...body, discord_user_id: discordUserId }),
   })
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
 })

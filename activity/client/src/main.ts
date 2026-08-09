@@ -1,7 +1,8 @@
 /**
- * Phase A skeleton: proves the OAuth round-trip and the LAUNCH_ACTIVITY entry point work end
- * to end. The real clan-config table (checkbox/tag/tier/roster-size/start-time columns) is
- * Phase C — see CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.
+ * Phase A proved the OAuth round-trip and the LAUNCH_ACTIVITY entry point work end to end.
+ * Phase B adds a smoke test of the full bridge chain (Worker -> cloudflared tunnel -> QapBot),
+ * fetching real clan-config data and rendering it as raw JSON — not the real table yet, that's
+ * Phase C. See CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.
  */
 import { DiscordSDK } from '@discord/embedded-app-sdk'
 
@@ -43,7 +44,19 @@ async function setup(): Promise<void> {
 
     await discordSdk.commands.authenticate({ access_token: accessToken })
 
-    root.textContent = `Hello, guild ${discordSdk.guildId ?? '(no guild context)'} — OAuth round-trip OK.`
+    const guildId = discordSdk.guildId
+    root.textContent = `Hello, guild ${guildId ?? '(no guild context)'} — OAuth round-trip OK.\n\nFetching clan-config...`
+
+    if (guildId) {
+      const configResponse = await fetch(`/api/cwl/clan-config?guild_id=${encodeURIComponent(guildId)}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      })
+      const configBody = await configResponse.json()
+      root.textContent =
+        `Hello, guild ${guildId} — OAuth round-trip OK.\n\n` +
+        `GET /api/cwl/clan-config -> ${configResponse.status}\n` +
+        JSON.stringify(configBody, null, 2)
+    }
   } catch (err) {
     console.error(err)
     root.textContent = `Setup failed: ${(err as Error).message}`

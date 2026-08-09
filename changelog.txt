@@ -1,6 +1,40 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (25)
+- Added: qapbot/web_bridge.py, the QapBot-side half of the CWL clan-config Activity's Phase B
+  (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md) — an aiohttp.web app with GET/POST /api/cwl/clan-config
+  (plus /api/health), started from _setup_hook()/stopped from async_cleanup(), no-op entirely
+  unless the two new BotConfig fields (web_bridge_port, web_bridge_secret; same "0/empty =
+  disabled" convention as the rest of config.py) are both set via new WEB_BRIDGE_PORT/
+  WEB_BRIDGE_SECRET env vars. Bound to 127.0.0.1 only — a cloudflared tunnel, not this process,
+  is what makes it reachable from the Cloudflare Worker.
+  Every request independently re-verifies admin status itself (guild administrator permission,
+  or the configured single super-admin by numeric ID) via a live guild-member lookup through
+  the bot's own gateway cache — mirrors QBdiscocmdshelper.check_admin_permissions()'s logic
+  without needing a discord.Interaction, since none exists in an HTTP handler.
+  Extracted refresh_cwl_management_hub_message(guild_id, mode) as a free function in
+  qapbot/ui_cwl_roster.py (previously inline in CwlManagementHubView.refresh_cwl_view(), which
+  only ever used interaction.guild.id) so the bridge can trigger the same anchored-message
+  refresh after a web-side save — pure extraction, refresh_cwl_view()'s own existing tests pass
+  unchanged, confirming no behavior change there.
+  Closed a real security gap in the Worker (activity/server) before it ever shipped live: its
+  first-draft clan-config proxy would have forwarded whatever discord_user_id the client
+  claimed, trivially spoofable since Discord user IDs are often visible in a guild's own
+  message history. Fixed: the Worker now requires an Authorization: Bearer <access_token>
+  header and independently calls Discord's GET /users/@me with it to get the real user id
+  before forwarding anything to the bridge, overwriting rather than trusting any client-
+  supplied discord_user_id in the request body.
+  Still pending before this is live: installing/running cloudflared on the DEV bot's host,
+  setting BRIDGE_URL/BRIDGE_SECRET as Worker secrets and WEB_BRIDGE_PORT/WEB_BRIDGE_SECRET in
+  .env, and an actual end-to-end verification through the tunnel (Phase A's OAuth round-trip
+  was verified live in Discord before being marked done; Phase B isn't, yet, for the same
+  reason — the tunnel doesn't exist until the project owner sets it up locally).
+  Files: qapbot/web_bridge.py (new), qapbot/config.py, QapBot.py, qapbot/ui_cwl_roster.py,
+  .env.example, tests/discord/test_web_bridge.py (new), activity/server/src/index.ts,
+  activity/client/src/main.ts, activity/client/index.html, CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.
+  1618 tests pass (.\run_tests.ps1).
+
 2026-08-09 (24)
 - Added: implementation plan (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md) and Phase A skeleton for a
   Discord Activity replacing the "Configure Participating Clans" screen with a real HTML table

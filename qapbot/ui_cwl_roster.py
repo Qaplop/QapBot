@@ -869,6 +869,51 @@ class CwlStartTimeModal(discord.ui.Modal):
         )
 
 
+async def refresh_cwl_management_hub_message(guild_id: int, mode: str) -> None:
+    """Resolve and edit a guild's anchored CWL Management Hub message directly via the bot
+    client — no discord.Interaction needed at all, so this is callable from contexts that
+    don't have one (the web bridge's HTTP handlers, Phase B) as well as from
+    CwlManagementHubView.refresh_cwl_view() (which just derives guild_id from its interaction
+    and delegates here). Silently no-ops if the guild has no Hub message configured/tracked.
+    """
+    import QBcore
+
+    guild = QBcore.bot.get_guild(guild_id)
+    if guild is None:
+        return
+    guild_id_str = str(guild_id)
+    config = CACHE.server_config.get(guild_id_str, {})
+    channel_id = config.get("cwl_management_channel_id")
+    message_id = config.get("cwl_management_message_id")
+    if not channel_id or not message_id:
+        return
+
+    channel = QBcore.bot.get_channel(int(channel_id))
+    if channel is None or not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return
+
+    view = CwlManagementHubView()
+    view.clear_items()
+    view._add_toggle_buttons(mode)
+    if mode == "cwl_settings":
+        add_cwl_settings_components(view, guild_id)
+    else:
+        add_cwl_management_components(view, guild_id)
+
+    from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_settings, format_clan_management_cwl_management
+
+    builder = format_clan_management_cwl_settings if mode == "cwl_settings" else format_clan_management_cwl_management
+    embed, _, _, _ = await builder(guild)
+
+    try:
+        message = await channel.fetch_message(int(message_id))
+        await message.edit(embed=embed, view=view)
+    except discord.NotFound:
+        logging.debug(f"[CWL] Hub message {message_id} not found in channel {channel_id} (guild {guild_id_str}) — will be reposted on the next repost_cwl_management_messages() cycle")
+    except Exception as e:
+        logging.warning(f"[CWL] refresh_cwl_management_hub_message() could not update message: {e}")
+
+
 # ---------------------------------------------------------------------------
 # CwlManagementHubView — entry point (b): dedicated anchored admin message
 # ---------------------------------------------------------------------------
@@ -945,41 +990,11 @@ class CwlManagementHubView(discord.ui.View):
         Unlike _render() above, the *interaction* passed here often belongs to a different,
         already-responded-to interaction (e.g. CwlEventSetupView's own ephemeral Apply button,
         not a click on this anchored message) — its response methods would target the wrong
-        message, or fail outright on an already-consumed interaction. So this always resolves
-        and edits the guild's tracked anchored message directly via the bot client instead of
-        going through the interaction's response at all.
+        message, or fail outright on an already-consumed interaction. Delegates to the
+        guild-id-based core below, which has no interaction dependency at all — that's also
+        what the web bridge (Phase B, no Interaction available in an HTTP handler) calls
+        directly after a clan-config change made from the Activity.
         """
         if not interaction.guild:
             return
-        guild_id_str = str(interaction.guild.id)
-        config = CACHE.server_config.get(guild_id_str, {})
-        channel_id = config.get("cwl_management_channel_id")
-        message_id = config.get("cwl_management_message_id")
-        if not channel_id or not message_id:
-            return
-
-        import QBcore
-
-        channel = QBcore.bot.get_channel(int(channel_id))
-        if channel is None or not isinstance(channel, (discord.TextChannel, discord.Thread)):
-            return
-
-        self.clear_items()
-        self._add_toggle_buttons(mode)
-        if mode == "cwl_settings":
-            add_cwl_settings_components(self, interaction.guild.id)
-        else:
-            add_cwl_management_components(self, interaction.guild.id)
-
-        from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_settings, format_clan_management_cwl_management
-
-        builder = format_clan_management_cwl_settings if mode == "cwl_settings" else format_clan_management_cwl_management
-        embed, _, _, _ = await builder(interaction.guild)
-
-        try:
-            message = await channel.fetch_message(int(message_id))
-            await message.edit(embed=embed, view=self)
-        except discord.NotFound:
-            logging.debug(f"[CWL] Hub message {message_id} not found in channel {channel_id} (guild {guild_id_str}) — will be reposted on the next repost_cwl_management_messages() cycle")
-        except Exception as e:
-            logging.warning(f"[CWL] CwlManagementHubView.refresh_cwl_view() could not update message: {e}")
+        await refresh_cwl_management_hub_message(interaction.guild.id, mode)
