@@ -14,12 +14,21 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import discord
 
 from qapbot.cache_manager import CACHE
 from qapbot.ui_common import TrackedView
+
+
+def _default_cwl_start_time() -> str:
+    """CWL sign-ups (and the war itself) consistently start on the 1st of the season's month
+    at 08:00 UTC (the game's static schedule) — used to prefill the start-time modal so an
+    admin only needs to override it when a clan genuinely deviates from that default."""
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+
+    return f"{resolve_current_cwl_season()}-01 08:00"
 
 
 def _parse_cwl_start_time(raw: str) -> Optional[str]:
@@ -90,19 +99,14 @@ def add_cwl_settings_components(view: discord.ui.View, guild_id: int) -> None:
     toggle_button.callback = _make_cwl_settings_toggle_callback(view)  # type: ignore[assignment]
     view.add_item(toggle_button)  # type: ignore[arg-type]
 
-    retention_months = guild_config.get("cwl_retention_months", 0)
-    retention_choices = ((0, t('cwl.settings.retention_never', guild_id=guild_id)), (3, "3"), (6, "6"), (12, "12"), (24, "24"))
-    retention_select: discord.ui.Select[Any] = discord.ui.Select(
-        placeholder=t('cwl.settings.retention_placeholder', guild_id=guild_id),
-        options=[
-            discord.SelectOption(label=label, value=str(value), default=(retention_months == value))
-            for value, label in retention_choices
-        ],
+    retention_button: discord.ui.Button[Any] = discord.ui.Button(
+        label=t('cwl.settings.button_configure_retention', guild_id=guild_id),
+        style=discord.ButtonStyle.secondary,
+        custom_id="cwl_settings_retention_button",
         row=3,
-        custom_id="cwl_settings_retention",
     )
-    retention_select.callback = _make_cwl_settings_retention_callback(view)  # type: ignore[assignment]
-    view.add_item(retention_select)  # type: ignore[arg-type]
+    retention_button.callback = _make_cwl_settings_retention_button_callback(view)  # type: ignore[assignment]
+    view.add_item(retention_button)  # type: ignore[arg-type]
 
 
 def _make_cwl_settings_channels_callback(view: discord.ui.View):
@@ -182,21 +186,65 @@ def _make_cwl_settings_toggle_callback(view: discord.ui.View):
     return callback
 
 
-def _make_cwl_settings_retention_callback(view: discord.ui.View):
+def _make_cwl_settings_retention_button_callback(view: discord.ui.View):
     async def callback(interaction: discord.Interaction) -> None:
         if not await _check_cwl_admin_permission(interaction):
             return
-        await interaction.response.defer(thinking=False, ephemeral=False)
-        if not interaction.guild or not isinstance(interaction.data, dict):
+        if not interaction.guild:
             return
-        values = interaction.data.get("values") or ["0"]
-        guild_id_str = str(interaction.guild.id)
-        config = CACHE.server_config.setdefault(guild_id_str, {})
-        config["cwl_retention_months"] = int(values[0])
-        await CACHE.persist_server_config(guild_id_str)
-        await _refresh_parent(view, interaction, "cwl_settings")
+        guild_config = CACHE.server_config.get(str(interaction.guild.id), {})
+        current_months = guild_config.get("cwl_retention_months", 0)
+        await interaction.response.send_modal(CwlRetentionModal(view, interaction.guild.id, current_months))
 
     return callback
+
+
+class CwlRetentionModal(discord.ui.Modal):
+    """Radio-button retention picker, opened from a button rather than shown as an inline
+    dropdown on the cwl_settings screen (project owner preference) — uses discord.py 2.7's
+    RadioGroup/Label modal components (Components V2); classic discord.py Modals only support
+    TextInput, and Discord has no standalone radio-button component outside a modal.
+    """
+
+    RETENTION_MONTHS: Tuple[int, ...] = (0, 3, 6, 12, 24)
+
+    def __init__(self, parent_view: discord.ui.View, guild_id: int, current_months: int):
+        from qapbot.i18n import t
+
+        super().__init__(title=t('cwl.settings.retention_modal_title', guild_id=guild_id))
+        self.parent_view = parent_view
+        self.guild_id = guild_id
+
+        options = [
+            discord.RadioGroupOption(
+                label=(
+                    t('cwl.settings.retention_never', guild_id=guild_id)
+                    if months == 0
+                    else t('cwl.settings.retention_months', guild_id=guild_id, months=months)
+                ),
+                value=str(months),
+                default=(months == current_months),
+            )
+            for months in self.RETENTION_MONTHS
+        ]
+        self.radio_group: discord.ui.RadioGroup[Any] = discord.ui.RadioGroup(
+            custom_id="cwl_retention_radio",
+            options=options,
+        )
+        self.add_item(discord.ui.Label(
+            text=t('cwl.settings.retention_block_title', guild_id=guild_id),
+            component=self.radio_group,
+        ))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        value = self.radio_group.value
+        months = int(value) if value is not None else 0
+        guild_id_str = str(self.guild_id)
+        config = CACHE.server_config.setdefault(guild_id_str, {})
+        config["cwl_retention_months"] = months
+        await CACHE.persist_server_config(guild_id_str)
+        await _refresh_parent(self.parent_view, interaction, "cwl_settings")
 
 
 # ---------------------------------------------------------------------------
@@ -679,7 +727,7 @@ class CwlStartTimeModal(discord.ui.Modal):
         super().__init__(title=t('cwl.setup.start_time_modal_title', guild_id=guild_id))
         self.parent_view = parent_view
         self.clan_tag = clan_tag
-        current = parent_view.working_clans.get(clan_tag, {}).get("cwl_start_at") or ""
+        current = parent_view.working_clans.get(clan_tag, {}).get("cwl_start_at") or _default_cwl_start_time()
         self.start_time_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
             label=t('cwl.setup.start_time_modal_label', guild_id=guild_id),
             placeholder=t('cwl.setup.start_time_modal_placeholder', guild_id=guild_id),

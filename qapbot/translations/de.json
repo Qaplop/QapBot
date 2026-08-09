@@ -746,8 +746,9 @@
       "retention_months": "{months} Monate",
       "retention_block_title": "Datenaufbewahrung",
       "retention_value": "Abgeschlossene/abgebrochene Events werden gelöscht nach: {value}",
-      "retention_placeholder": "Datenaufbewahrung...",
+      "retention_modal_title": "Datenaufbewahrung festlegen",
       "button_configure_channels": "Kanäle konfigurieren",
+      "button_configure_retention": "Datenaufbewahrung konfigurieren",
       "button_activate_hub": "CWL-Verwaltungs-Hub-Nachricht aktivieren",
       "button_deactivate_hub": "CWL-Verwaltungs-Hub-Nachricht deaktivieren"
     },

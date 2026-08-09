@@ -747,8 +747,9 @@
       "retention_months": "{months} months",
       "retention_block_title": "Data Retention",
       "retention_value": "Completed/cancelled events are purged after: {value}",
-      "retention_placeholder": "Data retention...",
+      "retention_modal_title": "Set Data Retention",
       "button_configure_channels": "Configure Channels",
+      "button_configure_retention": "Configure Data Retention",
       "button_activate_hub": "Activate CWL Management Hub Message",
       "button_deactivate_hub": "Deactivate CWL Management Hub Message"
     },

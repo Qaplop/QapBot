@@ -137,7 +137,7 @@ def test_clan_management_view_cwl_settings_mode_constructs_without_row_conflict(
         sent_message=sent_message, mode="cwl_settings", timeout=300,
     )
 
-    assert len(view.children) == 5  # mode select + refresh + channel/toggle buttons + retention select
+    assert len(view.children) == 5  # mode select + refresh + channel/toggle/retention buttons
 
 
 @pytest.mark.discord
@@ -478,6 +478,68 @@ async def test_cwl_event_setup_view_detail_step_start_time_modal(db, mock_intera
     await modal2.on_submit(mock_interaction)
     assert view.working_clans["#CLAN1"]["cwl_start_at"] == "2026-09-05T20:00Z"
     mock_interaction.response.send_message.assert_awaited_once()
+
+
+@pytest.mark.discord
+def test_cwl_start_time_modal_prefills_static_ingame_schedule_when_unset():
+    """CWL sign-ups/war always start on the 1st of the season month at 08:00 UTC — a clan with
+    no start time set yet should have the modal's field prefilled with that default, not
+    blank, so an admin can just accept it instead of typing the same value every time."""
+    from qapbot.ui_cwl_roster import CwlEventSetupView, CwlStartTimeModal, _default_cwl_start_time
+
+    guild = MagicMock()
+    guild.id = 888
+    view = MagicMock(spec=CwlEventSetupView)
+    view.guild = guild
+    view.working_clans = {"#CLAN1": {"cwl_start_at": None}}
+
+    modal = CwlStartTimeModal(view, "#CLAN1")
+
+    assert modal.start_time_input.default == _default_cwl_start_time()
+    assert _default_cwl_start_time().endswith("-01 08:00")
+
+
+# ---------------------------------------------------------------------------
+# CwlRetentionModal — radio-button retention picker (replaces the inline Select)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+def test_cwl_retention_modal_seeds_default_option():
+    from qapbot.ui_cwl_roster import CwlRetentionModal
+
+    parent = MagicMock()
+    modal = CwlRetentionModal(parent, guild_id=777, current_months=12)
+
+    default_values = {opt.value for opt in modal.radio_group.options if opt.default}
+    assert default_values == {"12"}
+    assert {opt.value for opt in modal.radio_group.options} == {"0", "3", "6", "12", "24"}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_retention_modal_persists_selection(db, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlRetentionModal
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+
+    modal = CwlRetentionModal(parent, mock_interaction.guild.id, current_months=0)
+    modal.radio_group._value = "12"
+
+    await modal.on_submit(mock_interaction)
+
+    assert CACHE.server_config[guild_id_str]["cwl_retention_months"] == 12
+    persisted = await db.get_guild_config(guild_id_str)
+    assert persisted is not None and persisted.get("cwl_retention_months") == 12
+    parent.refresh_cwl_view.assert_awaited_once()
+    assert parent.refresh_cwl_view.await_args.args[1] == "cwl_settings"
 
 
 @pytest.mark.discord
