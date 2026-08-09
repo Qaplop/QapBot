@@ -235,10 +235,30 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     season = resolve_selected_cwl_season(guild_id)
     event = db.get_cwl_event_sync(str(guild_id), season) if db is not None else None
 
-    # Row 1, not 0: row 0 is reserved by both possible shells (ClanManagementView's refresh
-    # button, CwlManagementHubView's Settings/Season Management toggle) regardless of mode.
+    # Season select (Phase E.3) — row 1, directly below row 0 (reserved by both possible shells:
+    # ClanManagementView's refresh button, CwlManagementHubView's Settings/Season Management
+    # toggle) and above the action buttons (row 3), per the project owner's explicit request to
+    # put it above the buttons. Only shown once at least one season exists; before that, "Add
+    # New Season" is the only way to get started (see the no_event embed text).
+    #
+    # No option is ever marked `default=True`: the season is already shown prominently in the
+    # embed's own "Season **{season}** — {status}" header, so the select always displays its
+    # `placeholder` ("Select CWL season:") as a static caption instead of duplicating that value
+    # — Discord's classic components have no separate label element to attach text to a select,
+    # this is the idiomatic way bots achieve one.
+    events = db.list_cwl_events_sync(str(guild_id)) if db is not None else []
+    if events:
+        season_select: discord.ui.Select[Any] = discord.ui.Select(
+            placeholder=t('cwl.management.season_select_placeholder', guild_id=guild_id),
+            options=[discord.SelectOption(label=e["cwl_season"], value=e["cwl_season"]) for e in events[:25]],
+            row=1,
+            custom_id="cwl_management_season_select",
+        )
+        season_select.callback = _make_cwl_management_season_select_callback(view)  # type: ignore[assignment]
+        view.add_item(season_select)  # type: ignore[arg-type]
+
     # "Configure Participating Clans" opens the web Activity (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md)
-    # for whichever season is currently selected (the season select below, or its persisted
+    # for whichever season is currently selected (the season select above, or its persisted
     # default) — it never creates a season or offers carry-over itself; that's exclusively
     # "Add New Season"'s job (Phase E.3), so this button carries no season-resolution logic at
     # all beyond what the bridge already does.
@@ -246,7 +266,7 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
         label=t('cwl.management.button_configure_clans', guild_id=guild_id),
         style=discord.ButtonStyle.primary,
         custom_id="cwl_management_configure_clans",
-        row=1,
+        row=3,
         # Disabled until a season exists to configure — the bridge's POST refuses to save
         # without one (it never creates a season itself, see the comment above), so there's
         # nothing this button could productively do before "Add New Season" has run once.
@@ -263,7 +283,7 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
         label=t('cwl.management.button_start_enrollment', guild_id=guild_id),
         style=discord.ButtonStyle.success,
         custom_id="cwl_management_start_enrollment",
-        row=1,
+        row=3,
         disabled=True,
     )
     view.add_item(start_button)  # type: ignore[arg-type]
@@ -272,7 +292,7 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
         label=t('cwl.management.button_manage_assignments', guild_id=guild_id),
         style=discord.ButtonStyle.secondary,
         custom_id="cwl_management_manage_assignments",
-        row=1,
+        row=3,
         disabled=True,
     )
     view.add_item(manage_button)  # type: ignore[arg-type]
@@ -283,19 +303,19 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
         label=t('cwl.management.button_delete_season', guild_id=guild_id),
         style=discord.ButtonStyle.danger,
         custom_id="cwl_management_delete_season",
-        row=1,
+        row=3,
         disabled=(event is None),
     )
     delete_button.callback = _make_cwl_management_delete_callback(view)  # type: ignore[assignment]
     view.add_item(delete_button)  # type: ignore[arg-type]
 
-    # 5th and last slot in row 1 (Discord's per-row button cap) — the sole place that creates a
+    # 5th and last slot in row 3 (Discord's per-row button cap) — the sole place that creates a
     # season and/or offers the carry-over-from-last-month prompt (Phase E.3/E.4).
     add_season_button = discord.ui.Button(
         label=t('cwl.management.button_add_season', guild_id=guild_id),
         style=discord.ButtonStyle.success,
         custom_id="cwl_management_add_season",
-        row=1,
+        row=3,
     )
     add_season_button.callback = _make_cwl_management_add_season_callback(view)  # type: ignore[assignment]
     view.add_item(add_season_button)  # type: ignore[arg-type]
@@ -307,22 +327,6 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
         missing_start = [c["clan_tag"] for c in clans if c.get("participating", 1) and not c.get("cwl_start_at")]
         if missing_start:
             logging.debug(f"[CWL] guild {guild_id} event {event['id']}: {len(missing_start)} clan(s) missing a start time")
-
-    # Season select (Phase E.3) — its own row, only shown once at least one season exists;
-    # before that, "Add New Season" is the only way to get started (see the no_event embed text).
-    events = db.list_cwl_events_sync(str(guild_id)) if db is not None else []
-    if events:
-        season_select: discord.ui.Select[Any] = discord.ui.Select(
-            placeholder=t('cwl.management.season_select_placeholder', guild_id=guild_id),
-            options=[
-                discord.SelectOption(label=e["cwl_season"], value=e["cwl_season"], default=(e["cwl_season"] == season))
-                for e in events[:25]
-            ],
-            row=3,
-            custom_id="cwl_management_season_select",
-        )
-        season_select.callback = _make_cwl_management_season_select_callback(view)  # type: ignore[assignment]
-        view.add_item(season_select)  # type: ignore[arg-type]
 
 
 def _make_cwl_management_delete_callback(view: discord.ui.View):

@@ -107,9 +107,14 @@ export function renderClanConfigTable(
   `
   table.appendChild(thead)
 
+  // CWL itself never starts before the 1st of the season's month at 08:00 UTC (the game's
+  // static schedule) — clamp every row's picker to that floor so an admin can't accidentally
+  // schedule a clan's switch-over before CWL has even begun.
+  const seasonStartUtc = `${payload.season}-01T08:00Z`
+
   const tbody = document.createElement('tbody')
   for (const clan of working) {
-    tbody.appendChild(buildRow(clan))
+    tbody.appendChild(buildRow(clan, seasonStartUtc))
   }
   table.appendChild(tbody)
   container.appendChild(table)
@@ -153,8 +158,10 @@ export function renderClanConfigTable(
   container.appendChild(footer)
 }
 
-function buildRow(clan: ClanConfig): HTMLTableRowElement {
+function buildRow(clan: ClanConfig, seasonStartUtc: string): HTMLTableRowElement {
   const row = document.createElement('tr')
+  const seasonStartMs = new Date(seasonStartUtc).getTime()
+  const seasonStartLocal = utcStringToLocalParts(seasonStartUtc)
 
   const checkboxCell = document.createElement('td')
   const checkbox = document.createElement('input')
@@ -184,6 +191,12 @@ function buildRow(clan: ClanConfig): HTMLTableRowElement {
 
   const dateInput = document.createElement('input')
   dateInput.type = 'date'
+  // Native first line of defense — most browsers refuse to pick an earlier date in the
+  // calendar UI at all. Direct keyboard entry can still bypass it, so updateStartValue() below
+  // re-checks and clamps on every change regardless of how the value got there.
+  if (seasonStartLocal) {
+    dateInput.min = seasonStartLocal.date
+  }
 
   const timeSelect = document.createElement('select')
   for (const time of TIME_OF_DAY_OPTIONS) {
@@ -214,7 +227,21 @@ function buildRow(clan: ClanConfig): HTMLTableRowElement {
   }
 
   function updateStartValue(): void {
-    clan.cwl_start_at = dateInput.value ? localPartsToUtcString(dateInput.value, timeSelect.value) : null
+    if (!dateInput.value) {
+      clan.cwl_start_at = null
+      return
+    }
+    const candidateUtc = localPartsToUtcString(dateInput.value, timeSelect.value)
+    // CWL never starts before the season's official 1st-of-month 08:00 UTC — clamp instead of
+    // silently persisting an earlier value (the native `min` above stops most attempts, but
+    // typed-in dates and the boundary day's earlier time-of-day options need this too).
+    if (new Date(candidateUtc).getTime() < seasonStartMs && seasonStartLocal) {
+      dateInput.value = seasonStartLocal.date
+      timeSelect.value = seasonStartLocal.time
+      clan.cwl_start_at = seasonStartUtc
+      return
+    }
+    clan.cwl_start_at = candidateUtc
   }
 
   checkbox.addEventListener('change', () => {

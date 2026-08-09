@@ -780,7 +780,7 @@
       "button_add_season": "Neue Saison hinzufügen",
       "delete_confirm_body": "⚠️ Die CWL-Saison **{season}** löschen? Dadurch werden alle Einstellungen der teilnehmenden Clans und alle Anmeldungen dafür entfernt und können nicht wiederhergestellt werden.",
       "open_web_fallback": "⚠️ Die Web-Ansicht konnte nicht direkt geöffnet werden — versuche stattdessen den Befehl /launch.",
-      "season_select_placeholder": "Saison auswählen…",
+      "season_select_placeholder": "CWL-Saison auswählen:",
       "add_season_already_exists": "Die Saison **{season}** existiert bereits — wähle sie stattdessen im Saison-Dropdown aus.",
       "add_season_db_unavailable": "⚠️ Datenbank nicht bereit — bitte gleich erneut versuchen.",
       "add_season_failed": "⚠️ Die neue Saison konnte nicht erstellt werden. Bitte versuche es erneut.",

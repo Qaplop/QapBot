@@ -781,7 +781,7 @@
       "button_add_season": "Add New Season",
       "delete_confirm_body": "⚠️ Delete the **{season}** CWL season? This removes all participating-clan settings and sign-ups for it and cannot be undone.",
       "open_web_fallback": "⚠️ Could not open the web view directly — try the /launch command instead.",
-      "season_select_placeholder": "Select a season…",
+      "season_select_placeholder": "Select CWL season:",
       "add_season_already_exists": "Season **{season}** already exists — pick it from the season dropdown instead.",
       "add_season_db_unavailable": "⚠️ Database not ready — try again shortly.",
       "add_season_failed": "⚠️ Could not create the new season. Please try again.",
