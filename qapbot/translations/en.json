@@ -779,22 +779,10 @@
       "button_delete_season": "Delete Season",
       "button_confirm_delete": "Yes, Delete Season",
       "delete_confirm_body": "⚠️ Delete the **{season}** CWL season? This removes all participating-clan settings and sign-ups for it and cannot be undone.",
-      "button_open_web": "Open Clan Config (Web)",
       "open_web_fallback": "⚠️ Could not open the web view directly — try the /launch command instead."
     },
     "setup": {
-      "header": "Select which clans participate this season ({count} selected):",
-      "no_clans_selected": "No clans selected yet — click a clan below to add it.",
-      "button_apply": "Apply",
-      "button_cancel": "Cancel",
-      "detail_header": "**{clan_name}** ({clan_tag}) — clan {index}/{count}\n{tier}\n\nRoster size: **{roster_size}**\nStart time (UTC): **{start_time}**",
-      "roster_size_placeholder": "Roster size...",
-      "button_set_start_time": "Set Start Time",
-      "button_done": "Done",
-      "start_time_modal_title": "Set CWL Start Time",
-      "start_time_modal_label": "Start Time (UTC)",
-      "start_time_modal_placeholder": "YYYY-MM-DD HH:MM — leave blank to clear",
-      "start_time_parse_error": "⚠️ Could not understand that date/time. Use the format YYYY-MM-DD HH:MM (UTC)."
+      "button_cancel": "Cancel"
     }
   }
 }

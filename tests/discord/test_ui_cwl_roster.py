@@ -1,7 +1,8 @@
 """Tests for the CWL roster planning UI layer (CWL_ROSTER_PLANNING_PLAN.md Phase 1):
 the shared cwl_settings/cwl_management content layer, both entry points
-(ClanManagementView's mode dropdown and CwlManagementHubView), and CwlEventSetupView's
-toggle-and-carry-over working-copy flow.
+(ClanManagementView's mode dropdown and CwlManagementHubView), and the
+"Configure Participating Clans" button's LAUNCH_ACTIVITY callback (the web Activity is now
+the sole clan-config entry point; the native toggle-and-carry-over flow was retired).
 """
 from __future__ import annotations
 
@@ -157,7 +158,7 @@ def test_clan_management_view_cwl_management_mode_constructs_without_row_conflic
         sent_message=sent_message, mode="cwl_management", timeout=300,
     )
 
-    assert len(view.children) == 7  # mode select + refresh + configure/start(disabled)/manage(disabled)/delete/open_web
+    assert len(view.children) == 6  # mode select + refresh + configure(web)/start(disabled)/manage(disabled)/delete
 
 
 @pytest.mark.discord
@@ -303,204 +304,6 @@ async def test_cwl_management_hub_view_refresh_noop_without_tracked_message():
 
     view = CwlManagementHubView()
     await view.refresh_cwl_view(interaction, "cwl_management")  # must not raise
-
-
-# ---------------------------------------------------------------------------
-# CwlEventSetupView — toggle + carry-over + Apply
-# ---------------------------------------------------------------------------
-
-@pytest.mark.discord
-@pytest.mark.asyncio
-async def test_cwl_event_setup_view_seeds_from_previous_season_carry_over(db):
-    from qapbot.cache_manager import CACHE
-    from qapbot.ui_cwl_roster import CwlEventSetupView
-
-    await _seed_guild_and_clans(db, "111", {"#CLAN1": "Alpha"})
-    old_event_id = db.create_cwl_event_sync("111", "2026-07", "discordid1")
-    db.set_cwl_event_clans_sync(old_event_id, [{"clan_tag": "#CLAN1", "roster_size": 30, "tier_order": 0}])
-
-    CACHE.db_manager = db
-    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
-    CACHE.server_config["111"] = {"member_clans": ["#CLAN1"], "member_families": []}
-    CACHE.subscriptions = {}
-    CACHE.clan_families = {}
-
-    guild = MagicMock()
-    guild.id = 111
-    parent = MagicMock()
-
-    view = CwlEventSetupView(guild=guild, parent_view=parent)
-
-    assert "#CLAN1" in view.working_clans
-    assert view.working_clans["#CLAN1"]["roster_size"] == 30
-
-
-@pytest.mark.discord
-@pytest.mark.asyncio
-async def test_cwl_event_setup_view_toggle_adds_and_removes_clan(db, mock_interaction):
-    from qapbot.cache_manager import CACHE
-    from qapbot.ui_cwl_roster import CwlEventSetupView
-
-    await _seed_guild_and_clans(db, "222", {"#CLAN1": "Alpha"})
-    CACHE.db_manager = db
-    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
-    CACHE.server_config["222"] = {"member_clans": ["#CLAN1"], "member_families": []}
-    CACHE.subscriptions = {}
-    CACHE.clan_families = {}
-
-    guild = MagicMock()
-    guild.id = 222
-    parent = MagicMock()
-    view = CwlEventSetupView(guild=guild, parent_view=parent)
-    assert "#CLAN1" not in view.working_clans
-
-    toggle_button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_setup_clan_#CLAN1")
-    mock_interaction.edit_original_response = AsyncMock()
-    await toggle_button.callback(mock_interaction)  # type: ignore[misc]
-    assert view.working_clans["#CLAN1"]["participating"] is True
-
-    # Toggling off must flip participating in place, not delete the entry — roster_size/
-    # cwl_start_at need to survive a deactivate-then-reactivate cycle (regression guard for the
-    # data-loss bug this behavior fixes).
-    toggle_button_again = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_setup_clan_#CLAN1")
-    await toggle_button_again.callback(mock_interaction)  # type: ignore[misc]
-    assert "#CLAN1" in view.working_clans
-    assert view.working_clans["#CLAN1"]["participating"] is False
-
-
-@pytest.mark.discord
-@pytest.mark.asyncio
-async def test_cwl_event_setup_view_apply_persists_and_enters_detail_step(db, mock_interaction):
-    """Apply persists the clan selection and moves into the per-clan roster-size/start-time
-    editor in the same message — it does NOT refresh the cwl_management parent yet (only
-    "Done" on the detail step does that, see test_cwl_event_setup_view_detail_step_*)."""
-    from qapbot.cache_manager import CACHE
-    from qapbot.ui_cwl_roster import CwlEventSetupView
-    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
-
-    await _seed_guild_and_clans(db, "333", {"#CLAN1": "Alpha"})
-    CACHE.db_manager = db
-    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
-    CACHE.server_config["333"] = {"member_clans": ["#CLAN1"], "member_families": []}
-    CACHE.subscriptions = {}
-    CACHE.clan_families = {}
-
-    guild = MagicMock()
-    guild.id = 333
-    parent = MagicMock()
-    parent.refresh_cwl_view = AsyncMock()
-
-    view = CwlEventSetupView(guild=guild, parent_view=parent)
-    view.working_clans["#CLAN1"] = {"target_league_rank": None, "roster_size": 15, "tier_order": 0, "cwl_start_at": None}
-
-    mock_interaction.edit_original_response = AsyncMock()
-    await view._on_apply(mock_interaction)
-
-    event = db.get_cwl_event_sync("333", resolve_current_cwl_season())
-    assert event is not None
-    clans = db.get_cwl_event_clans_sync(event["id"])
-    assert [c["clan_tag"] for c in clans] == ["#CLAN1"]
-
-    assert view.phase == "edit_details"
-    assert view.detail_clan_tags == ["#CLAN1"]
-    parent.refresh_cwl_view.assert_not_awaited()
-
-
-@pytest.mark.discord
-@pytest.mark.asyncio
-async def test_cwl_event_setup_view_detail_step_roster_select_persists(db, mock_interaction):
-    from qapbot.cache_manager import CACHE
-    from qapbot.ui_cwl_roster import CwlEventSetupView
-
-    await _seed_guild_and_clans(db, "555", {"#CLAN1": "Alpha"})
-    CACHE.db_manager = db
-    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
-    CACHE.server_config["555"] = {"member_clans": ["#CLAN1"], "member_families": []}
-    CACHE.subscriptions = {}
-    CACHE.clan_families = {}
-
-    guild = MagicMock()
-    guild.id = 555
-    parent = MagicMock()
-    parent.refresh_cwl_view = AsyncMock()
-
-    view = CwlEventSetupView(guild=guild, parent_view=parent)
-    view.working_clans["#CLAN1"] = {"target_league_rank": None, "roster_size": 15, "tier_order": 0, "cwl_start_at": None}
-    mock_interaction.edit_original_response = AsyncMock()
-    await view._on_apply(mock_interaction)
-
-    mock_interaction.data = {"values": ["30"]}
-    await view._on_detail_roster_select(mock_interaction)
-    assert view.working_clans["#CLAN1"]["roster_size"] == 30
-
-    persisted = CACHE.db_manager.get_cwl_event_clans_sync(view.event_id)
-    assert persisted[0]["roster_size"] == 30
-
-    # "Done" is what actually hands control back to cwl_management.
-    await view._on_detail_done(mock_interaction)
-    parent.refresh_cwl_view.assert_awaited_once()
-    assert parent.refresh_cwl_view.await_args.args[1] == "cwl_management"
-
-
-@pytest.mark.discord
-@pytest.mark.asyncio
-async def test_cwl_event_setup_view_detail_step_start_time_modal(db, mock_interaction):
-    from qapbot.cache_manager import CACHE
-    from qapbot.ui_cwl_roster import CwlEventSetupView, CwlStartTimeModal
-
-    await _seed_guild_and_clans(db, "666", {"#CLAN1": "Alpha"})
-    CACHE.db_manager = db
-    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
-    CACHE.server_config["666"] = {"member_clans": ["#CLAN1"], "member_families": []}
-    CACHE.subscriptions = {}
-    CACHE.clan_families = {}
-
-    guild = MagicMock()
-    guild.id = 666
-    parent = MagicMock()
-    parent.refresh_cwl_view = AsyncMock()
-
-    view = CwlEventSetupView(guild=guild, parent_view=parent)
-    view.working_clans["#CLAN1"] = {"target_league_rank": None, "roster_size": 15, "tier_order": 0, "cwl_start_at": None}
-    mock_interaction.edit_original_response = AsyncMock()
-    await view._on_apply(mock_interaction)
-
-    modal = CwlStartTimeModal(view, "#CLAN1")
-    modal.start_time_input._value = "2026-09-05 20:00"
-    mock_interaction.response.edit_message = AsyncMock()
-    await modal.on_submit(mock_interaction)
-
-    assert view.working_clans["#CLAN1"]["cwl_start_at"] == "2026-09-05T20:00Z"
-    persisted = CACHE.db_manager.get_cwl_event_clans_sync(view.event_id)
-    assert persisted[0]["cwl_start_at"] == "2026-09-05T20:00Z"
-    mock_interaction.response.edit_message.assert_awaited_once()
-
-    # Bad input is rejected without mutating state.
-    modal2 = CwlStartTimeModal(view, "#CLAN1")
-    modal2.start_time_input._value = "not a date"
-    mock_interaction.response.send_message = AsyncMock()
-    await modal2.on_submit(mock_interaction)
-    assert view.working_clans["#CLAN1"]["cwl_start_at"] == "2026-09-05T20:00Z"
-    mock_interaction.response.send_message.assert_awaited_once()
-
-
-@pytest.mark.discord
-def test_cwl_start_time_modal_prefills_static_ingame_schedule_when_unset():
-    """CWL sign-ups/war always start on the 1st of the season month at 08:00 UTC — a clan with
-    no start time set yet should have the modal's field prefilled with that default, not
-    blank, so an admin can just accept it instead of typing the same value every time."""
-    from qapbot.ui_cwl_roster import CwlEventSetupView, CwlStartTimeModal, _default_cwl_start_time
-
-    guild = MagicMock()
-    guild.id = 888
-    view = MagicMock(spec=CwlEventSetupView)
-    view.guild = guild
-    view.working_clans = {"#CLAN1": {"cwl_start_at": None}}
-
-    modal = CwlStartTimeModal(view, "#CLAN1")
-
-    assert modal.start_time_input.default == _default_cwl_start_time()
-    assert _default_cwl_start_time().endswith("-01 08:00")
 
 
 # ---------------------------------------------------------------------------
@@ -673,28 +476,3 @@ async def test_cwl_management_open_web_callback_falls_back_if_launch_activity_re
     await callback(mock_interaction)
 
     mock_interaction.response.send_message.assert_awaited_once()
-
-
-@pytest.mark.discord
-@pytest.mark.asyncio
-async def test_cwl_event_setup_view_cancel_does_not_persist(db, mock_interaction):
-    from qapbot.cache_manager import CACHE
-    from qapbot.ui_cwl_roster import CwlEventSetupView
-
-    await _seed_guild_and_clans(db, "444", {"#CLAN1": "Alpha"})
-    CACHE.db_manager = db
-    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
-    CACHE.server_config["444"] = {"member_clans": ["#CLAN1"], "member_families": []}
-    CACHE.subscriptions = {}
-    CACHE.clan_families = {}
-
-    guild = MagicMock()
-    guild.id = 444
-    parent = MagicMock()
-    view = CwlEventSetupView(guild=guild, parent_view=parent)
-    view.working_clans["#CLAN1"] = {"target_league_rank": None, "roster_size": 15, "tier_order": 0, "cwl_start_at": None}
-
-    mock_interaction.delete_original_response = AsyncMock()
-    await view._on_cancel(mock_interaction)
-
-    assert db.list_cwl_events_sync("444") == []

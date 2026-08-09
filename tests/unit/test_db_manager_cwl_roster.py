@@ -119,8 +119,8 @@ class TestCwlEventClans:
     async def test_deactivating_a_clan_preserves_its_settings_not_deletes_row(self, db):
         """Regression guard for the data-loss bug fixed in CWL_CLAN_CONFIG_ACTIVITY_PLAN.md:
         a clan with participating=False must keep its row (and roster_size/cwl_start_at), not
-        get dropped entirely — the caller (web bridge / CwlEventSetupView) is responsible for
-        passing the clan through at all; this only guards that when it does, nothing is lost."""
+        get dropped entirely — the caller (the web bridge) is responsible for passing the clan
+        through at all; this only guards that when it does, nothing is lost."""
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
         event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
 

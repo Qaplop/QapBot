@@ -140,8 +140,7 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
     if event_id is None:
         return web.json_response({"error": "failed to create/find event"}, status=500)
 
-    # Same shape create_cwl_event_sync()/set_cwl_event_clans_sync() already expect — matches
-    # CwlEventSetupView._on_apply()/_persist_detail_edit()'s exact contract (Discord-side).
+    # Same shape create_cwl_event_sync()/set_cwl_event_clans_sync() already expect.
     # Every clan the frontend sent is persisted, participating or not — set_cwl_event_clans_sync()
     # drops any clan omitted entirely, so a deactivated clan must still be included (with
     # participating=False) or its roster_size/cwl_start_at would be lost, not just hidden.

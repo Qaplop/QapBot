@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (32)
+- Removed: the native "Configure Participating Clans" flow, now that the web Activity (Phase C)
+  covers the same ground with a real table instead of Discord's row-budget-limited toggle
+  buttons + separate detail-editing step. The CWL Management Hub's "Configure Participating
+  Clans" button now opens the web Activity directly (reusing the old "Open Clan Config (Web)"
+  button's callback under the original button's label/position); the separate web-only button
+  was removed since its job is now folded into this one. Deleted the fully dead
+  CwlEventSetupView/CwlStartTimeModal classes and their only-used-there helpers
+  (_default_cwl_start_time, _parse_cwl_start_time), the now-unused TrackedView import, the 7
+  tests that exercised them, and the orphaned cwl.setup.*/cwl.management.button_open_web i18n
+  keys in en.json/de.json (kept cwl.setup.button_cancel — still reused by
+  CwlDeleteSeasonConfirmView). First step of a 5-part workflow redesign requested after Phase C
+  went live (season-aware defaults, a season dropdown, a carry-over prompt, and timezone-aware
+  date/time handling are next). 1616 tests pass.
+  Files: qapbot/ui_cwl_roster.py, tests/discord/test_ui_cwl_roster.py,
+  tests/unit/test_db_manager_cwl_roster.py, qapbot/web_bridge.py,
+  qapbot/translations/en.json, qapbot/translations/de.json, CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.
+
 2026-08-09 (31)
 - Fixed/confirmed: discordSdk.close() for the CWL clan-config Activity actually does work,
   correcting (30)'s "doesn't work" conclusion — the real issue was that only Save called it

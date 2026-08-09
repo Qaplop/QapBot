@@ -158,6 +158,16 @@ Bot side: a 5th button, **"Open Clan Config (Web)"**, added to `add_cwl_manageme
 ### Phase D — PROD rollout
 Repeat the Developer Portal setup for the PROD application, deploy the `prod` Wrangler environment, add the PROD bridge (tunnel + `.env` secret on whatever host runs PROD), smoke-test in a real guild.
 
+### Phase E — Workflow redesign (web Activity becomes the sole clan-config entry point)
+Five-part follow-up requested once Phase C was verified live, replacing the native/web dual-path design with the web Activity as the only way to configure CWL clans:
+
+1. ✅ **Retired the native "Configure Participating Clans" flow entirely.** `add_cwl_management_components()`'s `configure_button` now opens the web Activity directly (the same `LAUNCH_ACTIVITY` callback the old separate "Open Clan Config (Web)" button used), reusing that button's original label/position; the standalone web button was removed since its job is now folded into `configure_button`. Deleted the entire now-dead `CwlEventSetupView`/`CwlStartTimeModal` classes and their only-used-there helpers (`_default_cwl_start_time()`, `_parse_cwl_start_time()`), the now-unused `TrackedView` import, the 7 tests in `tests/discord/test_ui_cwl_roster.py` that exercised them, and the now-orphaned `cwl.setup.*`/`cwl.management.button_open_web` i18n keys in both `en.json`/`de.json` (kept `cwl.setup.button_cancel` — still reused by `CwlDeleteSeasonConfirmView`'s Cancel button). 1616 tests pass after cleanup.
+   - **Correction to this doc's own "Explicitly out of scope" section**: that section previously said *"Removing or deprecating the existing native `CwlEventSetupView` flow — both stay available side by side"* — this Phase E item does exactly that removal, superseding that line.
+2. ⏳ Season-deletion / new-season defaults: roster size 15, start time the 1st of the month at 08:00 UTC, pre-set automatically rather than left blank.
+3. ⏳ Season-selection dropdown in the Activity UI (currently always resolves to `resolve_current_cwl_season()` with no way to view/edit another season).
+4. ⏳ Carry-over prompt when creating the next season: ask whether to copy the previous month's config or start from the Phase E.2 defaults, instead of silently seeding from `get_previous_cwl_event_clans_sync()` with no user choice.
+5. ⏳ Timezone-aware date/time display and input: the user sees and sets CWL start times in their own browser timezone; conversion to/from the DB's stored UTC happens transparently in the frontend. (Supersedes Phase C's "always UTC by convention, never a timezone conversion" note above — that note described the Phase C baseline, not the final design.)
+
 Each phase gets its own changelog entry and commit, per the project's established convention — same discipline as `CWL_ROSTER_PLANNING_PLAN.md`'s phases.
 
 ---
@@ -195,5 +205,6 @@ Each phase gets its own changelog entry and commit, per the project's establishe
 ## Explicitly out of scope for this plan
 
 - The 50-player roster/sign-up/assignment screens (Phases 2-4 of `CWL_ROSTER_PLANNING_PLAN.md`) — a future Activity extension, not this one.
-- Removing or deprecating the existing native `CwlEventSetupView` flow — both stay available side by side.
 - Any change to QapBot's core `db_manager.py`/`CACHE` architecture — the bridge API is purely a new *read/write client* of the existing layer, per Cardinal Rule 2 (CACHE-only data access).
+
+(Note: this section originally also listed "removing or deprecating the native `CwlEventSetupView` flow" as out of scope — Phase E superseded that and removed it entirely; see Phase E.1 above.)
