@@ -323,6 +323,35 @@ seasons without ever sharing a group with a tracked clan is low and shrinks furt
 This is a probabilistic/eventual-consistency guarantee, not a hard one by construction — but no
 further engineering is needed here unless it's later observed not to hold in practice.
 
+**2026-08-09 finding: the mid-season-abandonment bucket regrows after the fix, not just a
+one-time backlog.** `repromote_mid_season_clans.py --apply` was run on prod 2026-08-08 and
+confirmed down to 0. One day later, a dry-run against a fresh prod backup found **2,332 new**
+clans back in the exact same state (`track_war_updates=0` with archived `war_summary` rows for
+the in-progress 2026-08 season). Root cause: the 2026-08-08 guard
+(`clan_has_cwl_data_for_season()` / `clan_has_in_progress_cwl_data()`) only blocks a demotion
+*at the moment it's evaluated* — if a clan is demoted while it genuinely has zero season data yet
+(e.g. an early-round demotion), the demotion is correct at that instant. But
+`CWL-GROUP-EXPAND` (`QapBot.py`, ~line 1049) force-fetches all 8 members of any CWL group
+containing an actively-tracked clan every cycle, via
+`db_manager.get_active_cwl_group_member_tags()` — which filters only on group membership and
+`cwl_ended=0`, **not** on the fetched clan's own `track_war_updates`. That fetch gets archived
+through the normal Phase 3/3B pipeline regardless of `track_war_updates`. So an already-(correctly)
+-demoted clan can still pick up `war_summary` rows later in the same season purely by being a
+group-mate of a tracked clan — landing it right back in the "demoted mid-season with partial
+data" bucket, as a brand-new instance, not a leftover. Nothing re-evaluates `track_war_updates`
+for it afterward unless its league itself changes (a real promotion/demotion event), since
+`_sync_group_track_war_updates()` only acts on a league-based mismatch.
+Expected to keep recurring every cycle, for the rest of any in-progress season, until fixed.
+**Fixed 2026-08-09**: `_sync_group_track_war_updates()` (`qapbot/cache_manager.py`) now also
+force-promotes `track_war_updates → True` whenever a non-subscribed clan is currently `False`,
+still correctly below Master III (no league mismatch, so the demotion-transition branch never
+ran), but `clan_has_cwl_data_for_season()` is true for the season being processed — reusing the
+same guard helper (now extracted into `_clan_has_cwl_data_for_season_safe()`) proactively instead
+of only at demotion time. This still only fires when this clan's group is next resolved via
+`get_league_group()` (Layer 1/2, see docstring above) — not immediately when
+`CWL-GROUP-EXPAND` archives the row — so a regrown clan can sit un-healed for up to that long, but
+is no longer permanently stuck requiring a manual `repromote_mid_season_clans.py` re-run.
+
 ---
 
 ## Open Questions / Decisions Needed

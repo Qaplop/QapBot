@@ -839,7 +839,13 @@ here. When a library's `raise X(...) from original_exception` re-wrap looks like
 detail, check `__cause__` before assuming the detail is gone — it's very often still there. And once a
 class of failure is proven non-transient (an auth rejection, not a data-freshness race), don't keep
 retrying it just because the surrounding code already has a retry loop — check *why* the retry existed
-before reusing it for a new failure mode.
+before reusing it for a new failure mode. One more from this same incident: `coc_retry()` is a shared
+handler called from dozens of unrelated call sites — elevating `coc.NotFound`'s log level from silent to
+`WARNING` (done here specifically to see CWL war-tag 404s) also caught `get_league_group()`'s routine
+"clan not currently in CWL" 404, fired for every actively-tracked clan every cycle, and flooded PROD's
+log at fleet scale. Before raising a shared handler's log level for one investigation, check what *else*
+routes through that same branch — a change scoped to "this one exception" can still be far too broad if
+the exception type itself is reused for routine conditions elsewhere. Reverted to debug.
 
 **Follow-up (same day), two more refinements once the dust settled:**
 - **DB-first, not live-first.** Prompted by "why do we hit the live API at all when this bot's own

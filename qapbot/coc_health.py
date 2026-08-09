@@ -207,7 +207,15 @@ async def coc_retry(
         except coc.NotFound:
             # Don't retry NotFound errors (specific before HTTPException)
             _stats['api_errors'] += 1
-            logging.warning(f"[COC-API-NOTFOUND] {operation_name} - resource not found (no retry)")
+            # debug, not warning: NotFound is routine/expected for several call sites, not just
+            # an unusual failure. In particular get_league_group() 404s constantly under normal
+            # operation — _find_active_cwl_war_for_clan() (QBhelperfunctions.py) calls it for
+            # every actively-tracked clan every cycle, and a 404 there just means "not currently
+            # in CWL" (true for the vast majority of clans most of the time, since CWL runs ~1
+            # week/month). A brief WARNING-level version of this line (2026-08-09, while chasing
+            # the incident in COPILOT_PITFALLS_COOKBOOK.md Pitfall 24) flooded PROD's log at fleet
+            # scale for exactly this reason — reverted back to debug.
+            logging.debug(f"[COC-API-NOTFOUND] {operation_name} - resource not found (no retry)")
             raise
             
         except coc.PrivateWarLog:

@@ -1,6 +1,44 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (12)
+- Fixed: mid-season CWL tracking abandonment (entry 2026-08-08 (5)'s bug) was regrowing after
+  being backfilled to 0. `repromote_mid_season_clans.py` was run on prod 2026-08-08 and confirmed
+  down to 0 clans; a dry-run against the next day's prod backup found 2,332 fresh occurrences.
+  Root cause: the 2026-08-08 guard (`clan_has_cwl_data_for_season()`) only blocks a demotion *at
+  the moment it's evaluated* — a clan correctly demoted while it had zero season data can still
+  pick up archived `war_summary` rows later the same season via `CWL-GROUP-EXPAND` (`QapBot.py`,
+  ~line 1049), which force-fetches every member of any group containing an actively-tracked clan
+  every cycle, independent of the fetched clan's own `track_war_updates`. That lands the clan back
+  in the "demoted mid-season with partial data" bucket as a brand-new instance — and since its
+  league itself never changed, `_sync_group_track_war_updates()`'s demotion-transition branch never
+  re-runs to catch it. Fix: `_sync_group_track_war_updates()` (`qapbot/cache_manager.py`) now also
+  checks, unconditionally for any non-subscribed clan currently `track_war_updates=False` and still
+  correctly below Master III (no league mismatch), whether it already has season data — if so,
+  force-promotes it back to `track_war_updates=True` for the rest of the season, self-healing
+  instead of requiring another manual `repromote_mid_season_clans.py` run. The existing guard check
+  was extracted into a shared `_clan_has_cwl_data_for_season_safe()` helper (same False-on-error
+  fallback for both the demotion guard and the new self-heal check). Note: this only re-evaluates
+  when the clan's group is next resolved via `get_league_group()` (Layer 1/2), not immediately when
+  `CWL-GROUP-EXPAND` archives the row, so a regrown clan can still sit un-healed for a while — just
+  no longer permanently. Documented in `qapbot/docs/CWL_ROUND_TRACKING_PLAN.md` and
+  `qapbot/docs/CLAN_WAR_TRACKING.md` (write-path 7). Added 2 tests
+  (tests/unit/test_cwl_league_rank_new_group_gate.py). File changed: qapbot/cache_manager.py.
+  1521 tests pass (.\run_tests.ps1).
+
+2026-08-09 (12)
+- Fixed: entry (2)'s addition of a WARNING-level [COC-API-NOTFOUND] log line
+  for every coc.NotFound (coc_retry(), qapbot/coc_health.py) was too broad —
+  it flooded PROD's log at fleet scale, reported by user. NotFound is routine
+  there for several call sites, not just the CWL case it was added for: in
+  particular get_league_group() 404s constantly under normal operation,
+  since _find_active_cwl_war_for_clan() (QBhelperfunctions.py) calls it for
+  every actively-tracked clan every cycle, and a 404 there just means "not
+  currently in CWL" — true for the vast majority of clans most of the time
+  (CWL runs ~1 week/month). Reverted to debug, matching how coc.PrivateWarLog
+  (an equally routine/expected condition) is already treated. File:
+  qapbot/coc_health.py. 1521 tests pass.
+
 2026-08-09 (11)
 - Fixed (correction to entry (10) — the actual noise was one level up): the
   "[CWL-ANALYSE] N war(s) came back with no attack data...retrying with a

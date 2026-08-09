@@ -363,3 +363,47 @@ class TestGroupTrackWarUpdatesSync:
 
         assert cm.clan_name_cache["#NODATA"]["track_war_updates"] is False
         assert cm.clan_name_cache["#NODATA"]["war_league"] == "Crystal League I"
+
+    @pytest.mark.asyncio
+    async def test_self_heal_repromotes_already_demoted_clan_with_season_data(self):
+        """2026-08-09 fix: a clan already track_war_updates=False, still
+        confirmed below M3 (no league mismatch, so the demotion-transition
+        branch never runs) can still pick up archived war_summary rows for the
+        in-progress season via CWL-GROUP-EXPAND, which fetches every group
+        member regardless of its own track_war_updates. Once that happens it
+        must be self-healed back to track_war_updates=True for the rest of the
+        season, exactly like a deferred demotion would be."""
+        tags = ["#REGROWN", "#OTHER"]
+        cm = _make_cm(
+            {"#REGROWN": {"war_league": "Crystal League I", "track_war_updates": False,
+                          "has_active_subscriptions": False}},
+            group_exists=False,
+            has_season_data=True,
+        )
+        lg = _FakeLeagueGroup(tags)
+        lg._raw_data = {"clans": [{"tag": t, "warLeague": {"name": "Crystal League I"}} for t in tags]}
+
+        await cm._process_league_group_response(lg, "2026-08")
+
+        cm.db_manager.clan_has_cwl_data_for_season.assert_any_await("#REGROWN", "2026-08")
+        assert cm.clan_name_cache["#REGROWN"]["track_war_updates"] is True
+        assert cm.clan_name_cache["#REGROWN"]["war_league"] == "Crystal League I"
+
+    @pytest.mark.asyncio
+    async def test_no_self_heal_when_already_demoted_clan_has_no_season_data(self):
+        """Same shape as the self-heal test, but with no season data on file —
+        a correctly-demoted clan that never picked up any data must stay
+        demoted; the self-heal check must not re-promote it unconditionally."""
+        tags = ["#STILLDOWN", "#OTHER"]
+        cm = _make_cm(
+            {"#STILLDOWN": {"war_league": "Crystal League I", "track_war_updates": False,
+                            "has_active_subscriptions": False}},
+            group_exists=False,
+            has_season_data=False,
+        )
+        lg = _FakeLeagueGroup(tags)
+        lg._raw_data = {"clans": [{"tag": t, "warLeague": {"name": "Crystal League I"}} for t in tags]}
+
+        await cm._process_league_group_response(lg, "2026-08")
+
+        assert cm.clan_name_cache["#STILLDOWN"]["track_war_updates"] is False

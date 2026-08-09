@@ -61,6 +61,17 @@ the response's `clans` list:
   to prod 2026-08-08) derived `track_war_updates` from the currently in-progress season and demoted
   clans mid-way through it; remediated via `qapbot/scripts/repromote_mid_season_clans.py`. See path 5
   above for the equivalent, separately-added guard on the older single-clan demotion path.
+- **Self-heal (added 2026-08-09):** the guard above only fires *at the moment of a demotion
+  transition*. A clan correctly demoted while it had zero season data can still pick up archived
+  `war_summary` rows later the same season via `CWL-GROUP-EXPAND` (`QapBot.py`), which force-fetches
+  every member of any group containing an actively-tracked clan every cycle, independent of the
+  fetched clan's own `track_war_updates` — landing it back in the same "demoted mid-season with
+  partial data" state as a brand-new instance. Since the clan's league itself hasn't changed, this
+  never reaches the transition branch above. Now checked unconditionally for any non-subscribed
+  member still correctly below M3: if `clan_has_cwl_data_for_season()` is True, `track_war_updates`
+  is force-promoted back to `True` for the rest of the season. Confirmed regrowing in prod:
+  `repromote_mid_season_clans.py` was run to 0 on 2026-08-08 and found 2,332 fresh occurrences one
+  day later.
 
 This still cannot discover a "wholly foreign" group where **none** of the 8 members has ever been
 reachable from a subscribed clan (directly or transitively across past seasons) — every entry point into

@@ -3274,6 +3274,23 @@ class CacheManager:
         one-time backfill remediation in
         qapbot/scripts/repromote_mid_season_clans.py, written after discovering
         the same gap in the retroactive backfill for this fix (2026-08-08).
+
+        Self-heal (2026-08-09): the guard above only fires *at the moment of a
+        demotion transition*. A clan that was already, correctly, demoted while
+        it had zero season data can still pick up archived war_summary rows
+        later in the same season — ``CWL-GROUP-EXPAND`` (``QapBot.py``)
+        force-fetches every member of a group containing an actively-tracked
+        clan each cycle, independent of the fetched clan's own
+        ``track_war_updates`` — landing it right back in the "demoted mid-season
+        with partial data" bucket as a brand-new instance, not a leftover (see
+        ``qapbot/docs/CWL_ROUND_TRACKING_PLAN.md`` 2026-08-09 finding:
+        ``repromote_mid_season_clans.py`` found 2,332 fresh occurrences one day
+        after being run to zero). Since that case has no league mismatch (the
+        clan is still correctly below Master III), it never reached the
+        transition branch below at all. Now checked unconditionally for any
+        non-subscribed clan currently ``track_war_updates=False``: if it already
+        has season data, re-promote it for the rest of this season using the
+        same guard, proactively rather than only reactively.
         """
         should_track = league_rank in WAR_UPDATE_LEAGUES
         now_iso = datetime.now(_dt_timezone.utc).isoformat()
@@ -3308,21 +3325,14 @@ class CacheManager:
             if clan_data.get("war_league") != league_rank:
                 clan_data["war_league"] = league_rank
                 dirty = True
-            if bool(clan_data.get("track_war_updates")) != should_track:
+            _currently_tracked = bool(clan_data.get("track_war_updates"))
+            if _currently_tracked != should_track:
                 if not should_track:
                     # Demotion candidate — defer if the clan already has
                     # in-progress data for THIS season (see docstring).
-                    _has_season_data = False
-                    if self.db_manager is not None:
-                        try:
-                            _has_season_data = await self.db_manager.clan_has_cwl_data_for_season(
-                                tag, cwl_season
-                            )
-                        except Exception as _hd_ex:
-                            logging.warning(
-                                "[CWL-GROUP-SYNC] %s: clan_has_cwl_data_for_season check "
-                                "failed (%s) — proceeding with demotion", tag, _hd_ex,
-                            )
+                    _has_season_data = await self._clan_has_cwl_data_for_season_safe(
+                        tag, cwl_season, "demotion guard"
+                    )
                     if _has_season_data:
                         logging.info(
                             "[CWL-GROUP-SYNC] %s: demotion deferred (group league=%s) — "
@@ -3347,9 +3357,44 @@ class CacheManager:
                     )
                     clan_data["track_war_updates"] = True
                     dirty = True
+            elif not should_track and not _currently_tracked:
+                # No league mismatch (still correctly below M3) but already
+                # demoted — self-heal: it may have picked up season data since
+                # the demotion via CWL-GROUP-EXPAND (see docstring). Re-promote
+                # for the rest of THIS season if so.
+                _has_season_data = await self._clan_has_cwl_data_for_season_safe(
+                    tag, cwl_season, "self-heal check"
+                )
+                if _has_season_data:
+                    logging.info(
+                        "[CWL-GROUP-SYNC] %s: re-promoted (group league=%s) — picked up "
+                        "%s CWL data while demoted (self-heal); will re-evaluate at next "
+                        "season's group discovery", tag, league_rank, cwl_season,
+                    )
+                    clan_data["track_war_updates"] = True
+                    dirty = True
 
             if dirty:
                 await self.persist_clan(tag)
+
+    async def _clan_has_cwl_data_for_season_safe(
+        self, tag: str, cwl_season: str, context: str
+    ) -> bool:
+        """``db_manager.clan_has_cwl_data_for_season()`` with a safe False default
+        and consistent logging on error — shared by ``_sync_group_track_war_updates()``'s
+        demotion guard and self-heal checks. False is always the safe fallback for
+        both callers: the demotion guard proceeds with demotion, and the self-heal
+        check leaves track_war_updates unchanged."""
+        if self.db_manager is None:
+            return False
+        try:
+            return await self.db_manager.clan_has_cwl_data_for_season(tag, cwl_season)
+        except Exception as _hd_ex:
+            logging.warning(
+                "[CWL-GROUP-SYNC] %s: clan_has_cwl_data_for_season check failed during "
+                "%s (%s)", tag, context, _hd_ex,
+            )
+            return False
 
     def evict_stale_cwl_caches(self) -> None:
         """Evict expired entries from CWL caches to prevent unbounded memory growth.
