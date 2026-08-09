@@ -332,7 +332,14 @@
       "timeout_error": "⏰ **Operation timed out!** The request took too long to complete.",
       "unexpected_error": "💥 **An unexpected error occurred!**\nThis has been logged for investigation. Please try again or contact support if the issue persists.",
       "unexpected_error_fallback": "An unexpected error occurred while running this command.",
-      "debug_continued": "**...continued ({current}/{total})**"
+      "debug_continued": "**...continued ({current}/{total})**",
+      "dm_not_linked": "❌ You don't have any linked Clash of Clans accounts, so I can't tell which server this command should apply to. Link an account first, or run this command inside the server."
+    },
+    "dm": {
+      "fallback_reply": "👋 I don't understand free text messages — try `/help` to see what I can do, or use a slash command right here in this DM.",
+      "guild_picker_prompt": "You're linked to accounts in more than one server. Which server should this apply to?",
+      "guild_picker_placeholder": "Select a server...",
+      "guild_picker_selected": "✅ Got it — continuing with that server."
     }
   },
   "notifications": {},

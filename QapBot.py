@@ -3378,6 +3378,37 @@ async def on_member_join(member: discord.Member) -> None:
         logging.error(f"Error in welcome message flow for user {member.id} in guild {member.guild.id}: {e}")
 
 
+@QBcore.bot.event
+async def on_message(message: discord.Message) -> None:
+    """
+    Event handler for messages sent directly to the bot (DMs).
+
+    Fulfils the long-standing backlog item ("Add on_message handler for DM so that
+    bot can reply to direct chat input from users") as the first slice of the CWL
+    roster planning feature's Phase 0 (DM interaction foundation) — see
+    CWL_ROSTER_PLANNING_PLAN.md. Deliberately narrow: not a chatbot, no NLU/intent
+    parsing, just a pointer back to /help for free text sent directly to the bot in
+    a DM. Slash commands typed from DMs go through normal application-command
+    dispatch, not this handler.
+    """
+    if not message.author.bot and message.guild is None:
+        from qapbot.i18n import t
+
+        logging.debug(f"[DM] Received DM from user {message.author.id}: {message.content[:80]!r}")
+        try:
+            await message.channel.send(t('commands.dm.fallback_reply', user_id=str(message.author.id)))
+        except discord.Forbidden:
+            logging.warning(f"[DM] Could not reply to DM from user {message.author.id} — forbidden (blocked/closed DMs)")
+        except Exception as e:
+            logging.error(f"[DM] Failed to reply to DM from user {message.author.id}: {e}")
+
+    # Required when overriding on_message on a commands.Bot subclass to keep prefix-command
+    # dispatch working. No @QBcore.bot.command() handlers exist today (slash commands only),
+    # so this is currently a no-op — kept for correctness per discord.py's documented contract,
+    # and as a safety net if a prefix command is ever added.
+    await QBcore.bot.process_commands(message)
+
+
 async def cleanup_stale_ui_messages() -> None:
     """
     Clean up messages with UI elements (Views) from before bot restart.

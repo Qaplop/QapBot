@@ -1,6 +1,41 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (13)
+- Added: Phase 0a of the CWL roster planning feature's DM-interaction foundation
+  (CWL_ROSTER_PLANNING_PLAN.md) — framework only, no command behavior changed yet
+  (Phase 0b converts individual commands to allow DM invocation in a later pass).
+  New: resolve_guild_context(interaction) (qapbot/QBdiscocmdshelper.py) — returns
+  interaction.guild.id unchanged for guild-invoked commands; for DM invocations,
+  resolves the caller's guild from their linked CoC accounts' current_clan_tag
+  matched against each guild's configured clans, showing an ephemeral guild-picker
+  Select (reusing ui_common.GenericSelectView) when more than one guild matches.
+  check_admin_permissions() gained an optional resolved_guild_id parameter so a DM
+  caller's guild-administrator status can be checked against the resolved guild via
+  guild.fetch_member() — fails closed (falls through to the existing bot-admin
+  check) if the caller isn't actually a member of that guild, so an admin of guild A
+  can never inherit permissions in guild B just because that guild_id was resolved.
+  Existing guild-invoked call sites are unaffected (parameter defaults to None, and
+  the pre-existing isinstance(discord.Member) branch is untouched). New
+  QapBot.on_message() handler replies to free-text DMs with a pointer to /help
+  (fulfils the backlog item at backlog.txt "Add on_message handler for DM...");
+  deliberately narrow scope, no NLU. New i18n keys under commands.dm.* and
+  commands.errors.dm_not_linked (en.json/de.json). Correction against the plan
+  doc's original draft: no command-tree-level "allowed_contexts" default change is
+  needed — discord.py already defaults an un-decorated command to allow all
+  contexts (the `contexts` field is simply omitted from the command payload when
+  unset); only @app_commands.guild_only() explicitly restricts a command, and
+  Phase 0b removes that per command as each one is converted, which is the only
+  lever that actually matters. Also fixed a pre-existing test-isolation bug
+  surfaced while adding this phase's tests: tests/discord/test_commands.py's
+  test_status_calls_send_and_track() replaced QBcore.bot with a stub via direct
+  assignment (not monkeypatch.setattr), permanently leaking into every test that
+  ran afterward in the same session.
+  Files: qapbot/QBdiscocmdshelper.py, QapBot.py, qapbot/translations/en.json,
+  qapbot/translations/de.json, tests/unit/test_dm_interaction_foundation.py (new),
+  tests/discord/test_commands.py.
+  1536 tests pass (.\run_tests.ps1).
+
 2026-08-09 (12)
 - Fixed: mid-season CWL tracking abandonment (entry 2026-08-08 (5)'s bug) was regrowing after
   being backfilled to 0. `repromote_mid_season_clans.py` was run on prod 2026-08-08 and confirmed

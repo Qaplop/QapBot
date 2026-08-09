@@ -331,7 +331,14 @@
       "timeout_error": "⏰ **Operation hat zu lange gedauert!** Die Anfrage hat zu lange gedauert.",
       "unexpected_error": "💥 **Ein unerwarteter Fehler ist aufgetreten!**\nDies wurde protokolliert. Bitte versuche es erneut oder kontaktiere den Support, wenn das Problem weiterhin besteht.",
       "unexpected_error_fallback": "Ein unerwarteter Fehler ist aufgetreten, während dieser Befehl ausgeführt wurde.",
-      "debug_continued": "**...Fortsetzung ({current}/{total})**"
+      "debug_continued": "**...Fortsetzung ({current}/{total})**",
+      "dm_not_linked": "❌ Du hast keine verknüpften Clash of Clans-Accounts, daher kann ich nicht erkennen, auf welchen Server sich dieser Befehl beziehen soll. Verknüpfe zuerst einen Account oder nutze diesen Befehl direkt auf dem Server."
+    },
+    "dm": {
+      "fallback_reply": "👋 Ich verstehe keine Freitext-Nachrichten — probiere `/help`, um zu sehen, was ich kann, oder nutze direkt hier in der DM einen Slash-Befehl.",
+      "guild_picker_prompt": "Du bist mit Accounts auf mehreren Servern verknüpft. Für welchen Server soll das gelten?",
+      "guild_picker_placeholder": "Server auswählen...",
+      "guild_picker_selected": "✅ Alles klar — weiter mit diesem Server."
     }
   },
   "notifications": {},

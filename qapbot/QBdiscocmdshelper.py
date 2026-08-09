@@ -1844,17 +1844,25 @@ def _is_configured_admin(user: Union[discord.User, discord.Member], server_admin
     # Legacy fallback: username match (deprecated — configure the numeric user ID instead)
     return str(user) == server_admin
 
-async def check_admin_permissions(interaction: discord.Interaction, server_admin: str) -> bool:
+async def check_admin_permissions(
+    interaction: discord.Interaction,
+    server_admin: str,
+    resolved_guild_id: Optional[int] = None,
+) -> bool:
     """
     Check if user has administrator permissions or is the configured bot admin.
-    
+
     Args:
         interaction: Discord interaction object
         server_admin: Configured bot admin — numeric Discord user ID (preferred) or username (legacy)
-        
+        resolved_guild_id: Guild to check guild-administrator status against when the
+            interaction itself carries no guild (DM invocation). Pass the result of
+            resolve_guild_context(interaction) here. Ignored when interaction.guild is
+            already set — guild-invoked callers are unaffected by this parameter.
+
     Returns:
         bool: True if user has permissions, False otherwise
-        
+
     Usage:
         if not await check_admin_permissions(interaction, SERVER_ADMIN):
             guild_id = interaction.guild.id if interaction.guild else None
@@ -1864,6 +1872,18 @@ async def check_admin_permissions(interaction: discord.Interaction, server_admin
     # Check if user is a Member (has guild_permissions) or fallback to User check
     if isinstance(interaction.user, discord.Member):
         return interaction.user.guild_permissions.administrator or _is_configured_admin(interaction.user, server_admin)
+    if resolved_guild_id is not None:
+        guild = interaction.client.get_guild(resolved_guild_id)
+        if guild is not None:
+            try:
+                member = await guild.fetch_member(interaction.user.id)
+            except (discord.NotFound, discord.HTTPException):
+                # Not a member of the resolved guild (or a transient API error) — no guild-admin
+                # grant. Deliberately fails closed: falls through to the bot-admin check below
+                # rather than raising, so an admin of guild A never inherits permissions in guild B.
+                member = None
+            if member is not None and member.guild_permissions.administrator:
+                return True
     return _is_configured_admin(interaction.user, server_admin)
 
 def check_bot_admin_only(interaction: discord.Interaction, server_admin: str) -> bool:
@@ -1884,6 +1904,111 @@ def check_bot_admin_only(interaction: discord.Interaction, server_admin: str) ->
             return
     """
     return _is_configured_admin(interaction.user, server_admin)
+
+
+async def resolve_guild_context(interaction: discord.Interaction) -> Optional[int]:
+    """
+    Resolve which guild a command invocation should operate against.
+
+    Guild-invoked interactions are returned unchanged (zero behavior change — this is
+    a pass-through for the overwhelming majority of calls today). DM-invoked
+    interactions (interaction.guild is None) are resolved from the caller's linked
+    CoC accounts: each linked account's current_clan_tag is matched against every
+    guild's configured clans (get_guild_clans_including_member_config). Zero matches
+    means the caller isn't linked to any tracked clan family; exactly one match
+    resolves silently; more than one match shows an ephemeral guild-picker Select and
+    waits for the caller to choose.
+
+    IMPORTANT: call this before the interaction has received its first response
+    (i.e. before interaction.response.send_message()/defer()) — the multi-match branch
+    needs to send that first response itself, to display the picker.
+
+    Returns:
+        The resolved guild ID, or None if the caller isn't linked to any guild's
+        tracked clans (caller should show a "not linked" error) or the picker timed
+        out without a selection.
+    """
+    if interaction.guild is not None:
+        return interaction.guild.id
+
+    discord_id = str(interaction.user.id)
+    user_data = CACHE.user_accounts.get(discord_id, {})
+    clan_tags: Set[str] = {
+        p["current_clan_tag"]
+        for p in user_data.get("players", [])
+        if p.get("current_clan_tag")
+    }
+    if not clan_tags:
+        return None
+
+    matched_guild_ids: List[int] = []
+    for guild_id_str in CACHE.server_config.keys():
+        try:
+            guild_id_int = int(guild_id_str)
+        except (TypeError, ValueError):
+            continue
+        guild_clans = set(get_guild_clans_including_member_config(guild_id_int))
+        if guild_clans & clan_tags:
+            matched_guild_ids.append(guild_id_int)
+
+    if not matched_guild_ids:
+        return None
+    if len(matched_guild_ids) == 1:
+        return matched_guild_ids[0]
+    return await _prompt_dm_guild_picker(interaction, matched_guild_ids)
+
+
+async def _prompt_dm_guild_picker(interaction: discord.Interaction, guild_ids: List[int]) -> Optional[int]:
+    """
+    Send an ephemeral guild-picker Select for a DM caller linked to multiple guilds'
+    clans, and wait for their choice (or the view's timeout). Sends the interaction's
+    first response — only call when interaction.response.is_done() is False.
+    """
+    from qapbot.i18n import t
+    from qapbot.ui_common import GenericSelectView
+
+    user_id = str(interaction.user.id)
+    loop = asyncio.get_running_loop()
+    result: "asyncio.Future[Optional[int]]" = loop.create_future()
+
+    async def _on_pick(pick_interaction: discord.Interaction, selected_value: str) -> None:
+        if not result.done():
+            result.set_result(int(selected_value))
+        await pick_interaction.response.edit_message(
+            content=t('commands.dm.guild_picker_selected', user_id=user_id),
+            view=None,
+        )
+
+    options: List[discord.SelectOption] = []
+    for guild_id in guild_ids[:25]:
+        guild_obj = interaction.client.get_guild(guild_id)
+        label = guild_obj.name if guild_obj is not None else str(guild_id)
+        options.append(discord.SelectOption(label=label[:100], value=str(guild_id)))
+
+    view = GenericSelectView(
+        options=options,
+        callback_fn=_on_pick,
+        placeholder=t('commands.dm.guild_picker_placeholder', user_id=user_id),
+        timeout=60,
+    )
+    original_on_timeout = view.on_timeout
+
+    async def _on_timeout() -> None:
+        if not result.done():
+            result.set_result(None)
+        await original_on_timeout()
+
+    view.on_timeout = _on_timeout  # type: ignore[method-assign]
+
+    await interaction.response.send_message(
+        content=t('commands.dm.guild_picker_prompt', user_id=user_id),
+        view=view,
+        ephemeral=True,
+    )
+    view.message = await interaction.original_response()
+
+    return await result
+
 
 def get_clan_display_name(clan_tag: str) -> str:
     """

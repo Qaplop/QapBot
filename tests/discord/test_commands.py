@@ -86,7 +86,7 @@ async def test_status_calls_send_and_track(monkeypatch: pytest.MonkeyPatch, mock
         last_sync = None
         fully_initialized = True
 
-    QBdiscordcmds.QBcore.bot = _BotStub()  # type: ignore[assignment]
+    monkeypatch.setattr(QBdiscordcmds.QBcore, "bot", _BotStub())
 
     # status is an app_commands.Command; call its underlying callback
     await QBdiscordcmds.status.callback(mock_interaction)  # type: ignore[arg-type]
