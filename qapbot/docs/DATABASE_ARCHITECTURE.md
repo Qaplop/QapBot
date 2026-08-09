@@ -1202,6 +1202,34 @@ re-check) rather than trusting them long-term.
   default.
 - Files: `qapbot/db_manager.py` (`fast_bulk_history_migration`).
 
+### 2026-08-09: Manual Maintenance Run Silently Suppressed That Night's Automatic Run
+- **Symptom**: nightly maintenance didn't run at all overnight — `qapbot_PROD.log` had zero
+  `[NIGHTLY-MAINTENANCE]` lines for the whole day (not a failed/crashed run — the task was never
+  spawned in the first place).
+- **Root cause**: `periodic_main()`'s scheduled trigger (`_maint_due` in `QapBot.py`) gated firing on
+  `hour == 3 and (now - CACHE.last_db_maintenance) > 20h`. `last_db_maintenance` is shared with
+  manual `/admin` Optimize DB / Execute Nightly Maintenance runs — `nightly_db_maintenance()`
+  persists it to `bot_metadata` unconditionally, regardless of caller. On 2026-08-08, a manual run
+  (testing that day's maintenance-code changes) completed at 17:16 UTC. A later same-evening
+  redeploy restarted the bot process; on restart, `CACHE.last_db_maintenance` is `None` in memory,
+  so the startup hydration block re-loaded that fresh 17:16 UTC value from `bot_metadata`. At the
+  03:00 UTC check that night, only ~9h46m had elapsed since 17:16 UTC — under the 20h threshold —
+  so `_maint_due` was `False` and the automatic run silently never fired. Confirmed by directly
+  reading `data/qapbot.db`'s `bot_metadata` table (`last_db_maintenance` = `2026-08-08T17:16:11Z`)
+  and cross-referencing the commit timeline (a maintenance-code commit at 18:42 CEST, final same-day
+  redeploy at 19:46 CEST).
+  This is a latent design gap, not new breakage: any manual/test maintenance run after roughly
+  07:00 UTC, followed by a same-day restart, can suppress that night's scheduled run for up to 20h.
+  It's self-healing after 20h pass with no further manual runs near the window, which is why it
+  hadn't been noticed before — most manual runs during dev aren't followed by a restart within the
+  same night.
+- **Fix**: `_maint_due`'s guard now compares UTC calendar dates
+  (`CACHE.last_db_maintenance.date() != _now_utc.date()`) instead of elapsed hours — "has
+  maintenance of any origin already run today?" This still prevents the original double-fire case
+  (a restart within the same 03:00 window recomputes the same date, correctly skips), but is no
+  longer sensitive to what time of day an unrelated manual run happened.
+- Files: `QapBot.py` (`periodic_main()`'s `_maint_due` block). 1519 tests pass.
+
 ### Future Phases
 **Not currently planned:**
 - Phase 4: Temp war stats (JSON → DB)

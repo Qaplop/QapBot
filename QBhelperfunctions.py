@@ -2242,6 +2242,118 @@ async def generate_cwlinfo_comp_embeds(clan_tag: str) -> Tuple[List[discord.Embe
     return embeds, debug_text
 
 
+def _load_cwl_wars_from_db_sync(
+    war_tags: List[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any], Set[str]]:
+    """
+    Load per-attack data for specific CWL war tags from war_attacks / war_summary.
+
+    Used as a last-resort fill-in for wars the live CoC API failed to return
+    usable attack data for (see generate_cwl_group_analysis_embeds). Unlike
+    _load_cwl_analysis_from_db_sync this looks up by war_tag rather than by
+    clan_tag + season, so it also picks up wars still in progress: war_summary
+    / war_attacks are kept current by this bot's periodic tracking for any
+    clan it actively follows, including partial attack data recorded mid-war.
+
+    Returns (attacker_data, defender_data, tags_with_data) — tags_with_data is
+    the subset of *war_tags* for which at least one attack row was found.
+    """
+    empty: Tuple[Dict[str, Any], Dict[str, Any], Set[str]] = ({}, {}, set())
+    if not war_tags or not CACHE.db_manager or not CACHE.db_manager.db_path:
+        return empty
+
+    try:
+        with CACHE.db_manager.sync_conn() as conn:
+            ph = ",".join("?" * len(war_tags))
+            ws_rows = conn.execute(
+                f"SELECT DISTINCT war_id, clan_tag, war_tag FROM war_summary "
+                f"WHERE war_tag IN ({ph}) AND is_cwl = 1",
+                list(war_tags),
+            ).fetchall()
+            if not ws_rows:
+                return empty
+            war_id_to_tag: Dict[str, str] = {str(r["war_id"]): str(r["war_tag"]) for r in ws_rows}
+            war_ids = {str(r["war_id"]) for r in ws_rows}
+
+            wid_ph = ",".join("?" * len(war_ids))
+            atk_rows = conn.execute(
+                f"""
+                SELECT wa.war_id, wa.player_tag, wa.player_name, wa.th_level, wa.clan_tag,
+                       wa.stars, wa.defender_tag, wa.defender_map_position
+                FROM war_attacks wa
+                WHERE wa.war_id IN ({wid_ph}) AND wa.attack_order > 0
+                """,
+                list(war_ids),
+            ).fetchall()
+    except Exception as exc:
+        logging.error(f"[CWL-ANALYSE-DB] Per-war DB lookup failed for {war_tags}: {exc}")
+        return empty
+
+    if not atk_rows:
+        return empty
+
+    # Same roster-slot normalization as _load_cwl_analysis_from_db_sync below.
+    war_side_raw: Dict[Tuple[str, str], Dict[str, int]] = {}
+    for r in atk_rows:
+        key = (str(r["war_id"]), str(r["clan_tag"]))
+        raw_pos = int(r["defender_map_position"] or 0)
+        def_tag = str(r["defender_tag"] or "")
+        if raw_pos > 0 and def_tag:
+            war_side_raw.setdefault(key, {})[def_tag] = raw_pos
+    normalized_def_pos: Dict[Tuple[str, str, str], int] = {}
+    for (war_id, clan_t), pos_map in war_side_raw.items():
+        for rank, (dtag, _) in enumerate(sorted(pos_map.items(), key=lambda kv: kv[1]), start=1):
+            normalized_def_pos[(war_id, clan_t, dtag)] = rank
+
+    player_info: Dict[str, Dict[str, Any]] = {}
+    for r in atk_rows:
+        t = r["player_tag"]
+        if t and t not in player_info:
+            player_info[t] = {"name": r["player_name"], "th": int(r["th_level"]), "clan": r["clan_tag"]}
+
+    attacker_data: Dict[str, Dict[str, Any]] = {}
+    defender_data: Dict[str, Dict[str, Any]] = {}
+    tags_with_data: Set[str] = set()
+    for r in atk_rows:
+        war_id_str = str(r["war_id"])
+        wtag = war_id_to_tag.get(war_id_str, '')
+        if wtag:
+            tags_with_data.add(wtag)
+        atk_tag = r["player_tag"]
+        def_tag = str(r["defender_tag"] or "")
+        stars = int(r["stars"])
+        clan_tag_str = str(r["clan_tag"])
+        def_map_pos = normalized_def_pos.get(
+            (war_id_str, clan_tag_str, def_tag), int(r["defender_map_position"] or 0)
+        )
+
+        if atk_tag not in attacker_data:
+            attacker_data[atk_tag] = {
+                "name": r["player_name"], "clan_tag": r["clan_tag"], "th": int(r["th_level"]),
+                "attacks": 0, "total_stars": 0, "map_pos_sum": 0,
+            }
+        ad = attacker_data[atk_tag]
+        ad["attacks"] += 1
+        ad["total_stars"] += stars
+        if def_map_pos > 0:
+            ad["map_pos_sum"] += def_map_pos
+        if int(r["th_level"]) > 0:
+            ad["th"] = int(r["th_level"])
+
+        if def_tag:
+            if def_tag not in defender_data:
+                pinfo = player_info.get(def_tag, {})
+                defender_data[def_tag] = {
+                    "name": pinfo.get("name", def_tag), "clan_tag": pinfo.get("clan", ""),
+                    "th": pinfo.get("th", 0), "defenses": 0, "stars_conceded": 0,
+                }
+            dd = defender_data[def_tag]
+            dd["defenses"] += 1
+            dd["stars_conceded"] += stars
+
+    return attacker_data, defender_data, tags_with_data
+
+
 def _load_cwl_analysis_from_db_sync(
     clan_tag: str,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], str, int, int, Set[str]]:
@@ -3271,8 +3383,14 @@ async def generate_cwl_group_analysis_embeds(clan_tag: str) -> List[discord.Embe
     """
     Generate CWL league group analysis embeds for a clan.
 
-    Fetches all wars in the current/last CWL group and ranks every player across
-    all clans in the group by:
+    Fetches the current/last CWL group's roster+rounds live (one cheap call), then
+    resolves each round war's attack data DB-first: this bot's own periodic tracking
+    already records every war for any clan it actively follows — including partial
+    data for a war still in progress — so a local lookup covers most/all of the group
+    with zero further live calls. Only wars the DB doesn't have yet (e.g. a clan
+    outside this bot's tracked family, or a round too new to have been polled) fall
+    through to a live per-war fetch, with one cache-bypassing retry for anything that
+    comes back empty. Ranks every player across all clans in the group by:
     - Best attackers: most total stars across the season; tiebreak by lowest sum of
       attacked opponents' map positions (map position 1 = strongest defender, so a
       lower position sum means harder opponents were faced; min. 3 attacks to qualify)
@@ -3293,6 +3411,10 @@ async def generate_cwl_group_analysis_embeds(clan_tag: str) -> List[discord.Embe
     clan_names: Dict[str, str] = {}
     _is_historical: bool = False
     _live_ok: bool = False
+    # War tags this bot instance could not confirm attack data for, after live
+    # fetch + retry + local DB fallback all came up empty. Surfaced in the
+    # embed footer so a live-vs-local discrepancy is visible, not just logged.
+    _unrecovered_war_tags: List[str] = []
 
     try:
         league_group: Any = await CACHE.get_league_group(clan_tag)
@@ -3331,113 +3453,262 @@ async def generate_cwl_group_analysis_embeds(clan_tag: str) -> List[discord.Embe
                 for round_list in (list(getattr(league_group, 'rounds', []) or []))
                 for wt in (list(round_list) if round_list else [])
             ]
-            if all_war_tags:
-                logging.info(
-                    f"[CWL-ANALYSE] Fetching {len(all_war_tags)} wars for {clan_tag} "
-                    f"group analysis (season {season})"
-                )
-                war_futures: Any = await asyncio.gather(
-                    *[CACHE.get_league_war(wt) for wt in all_war_tags],
-                    return_exceptions=True
-                )
-                wars: List[Any] = [
-                    w for w in war_futures
-                    if not isinstance(w, Exception) and w is not None
-                ]
 
-                if wars:
-                    # ── Process all attacks across all completed wars ──────────
-                    for war in wars:
-                        war_clan = getattr(war, 'clan', None)
-                        war_opp = getattr(war, 'opponent', None)
-                        if war_clan is None or war_opp is None:
+            def _process_war(war: Any) -> bool:
+                """Fold one fetched war's attacks into attacker_data/defender_data.
+
+                Returns True if the war carried at least one real attack (i.e.
+                it wasn't an empty/incomplete snapshot).
+                """
+                war_clan = getattr(war, 'clan', None)
+                war_opp = getattr(war, 'opponent', None)
+                if war_clan is None or war_opp is None:
+                    return False
+
+                # Build tag→TH/name/map_position maps for all members in this specific war
+                war_member_th: Dict[str, int] = {}
+                war_member_name: Dict[str, str] = {}
+                war_member_map_pos: Dict[str, int] = {}
+                for side in [war_clan, war_opp]:
+                    side_pos_list: List[Tuple[str, int]] = []
+                    for m in list(getattr(side, 'members', []) or []):
+                        mtag = str(getattr(m, 'tag', '') or '')
+                        mth = int(getattr(m, 'town_hall', 0) or 0)
+                        mname = normalize_player_name(str(getattr(m, 'name', mtag) or mtag))
+                        mpos = int(getattr(m, 'map_position', getattr(m, 'mapPosition', 0)) or 0)
+                        if mtag:
+                            if mth > 0:
+                                war_member_th[mtag] = mth
+                            war_member_name[mtag] = mname
+                            if mpos > 0:
+                                side_pos_list.append((mtag, mpos))
+                    # Normalize roster slots to sequential war ranks (1 = strongest)
+                    # The CoC API returns mapPosition as the league group roster slot
+                    # (1-30), not the 1-N war lineup position. Sorting by roster slot
+                    # and assigning sequential ranks ensures avg positions stay ≤ team_size.
+                    for rank, (mtag, _) in enumerate(
+                        sorted(side_pos_list, key=lambda x: x[1]), start=1
+                    ):
+                        war_member_map_pos[mtag] = rank
+
+                has_attacks = False
+                for side in [war_clan, war_opp]:
+                    side_tag = str(getattr(side, 'tag', '') or '')
+                    for m in list(getattr(side, 'members', []) or []):
+                        m_tag = str(getattr(m, 'tag', '') or '')
+                        if not m_tag:
                             continue
+                        m_th = war_member_th.get(m_tag, player_to_th.get(m_tag, 0))
+                        m_name = war_member_name.get(m_tag, player_to_name.get(m_tag, m_tag))
+                        m_clan = player_to_clan.get(m_tag, side_tag)
 
-                        # Build tag→TH/name/map_position maps for all members in this specific war
-                        war_member_th: Dict[str, int] = {}
-                        war_member_name: Dict[str, str] = {}
-                        war_member_map_pos: Dict[str, int] = {}
-                        for side in [war_clan, war_opp]:
-                            side_pos_list: List[Tuple[str, int]] = []
-                            for m in list(getattr(side, 'members', []) or []):
-                                mtag = str(getattr(m, 'tag', '') or '')
-                                mth = int(getattr(m, 'town_hall', 0) or 0)
-                                mname = normalize_player_name(str(getattr(m, 'name', mtag) or mtag))
-                                mpos = int(getattr(m, 'map_position', getattr(m, 'mapPosition', 0)) or 0)
-                                if mtag:
-                                    if mth > 0:
-                                        war_member_th[mtag] = mth
-                                    war_member_name[mtag] = mname
-                                    if mpos > 0:
-                                        side_pos_list.append((mtag, mpos))
-                            # Normalize roster slots to sequential war ranks (1 = strongest)
-                            # The CoC API returns mapPosition as the league group roster slot
-                            # (1-30), not the 1-N war lineup position. Sorting by roster slot
-                            # and assigning sequential ranks ensures avg positions stay ≤ team_size.
-                            for rank, (mtag, _) in enumerate(
-                                sorted(side_pos_list, key=lambda x: x[1]), start=1
-                            ):
-                                war_member_map_pos[mtag] = rank
+                        for atk in list(getattr(m, 'attacks', []) or []):
+                            def_tag = str(
+                                getattr(atk, 'defender_tag', getattr(atk, 'defenderTag', '')) or ''
+                            )
+                            stars = int(getattr(atk, 'stars', 0) or 0)
+                            def_th = war_member_th.get(def_tag, player_to_th.get(def_tag, m_th))
+                            has_attacks = True
 
-                        has_attacks = False
-                        for side in [war_clan, war_opp]:
-                            side_tag = str(getattr(side, 'tag', '') or '')
-                            for m in list(getattr(side, 'members', []) or []):
-                                m_tag = str(getattr(m, 'tag', '') or '')
-                                if not m_tag:
-                                    continue
-                                m_th = war_member_th.get(m_tag, player_to_th.get(m_tag, 0))
-                                m_name = war_member_name.get(m_tag, player_to_name.get(m_tag, m_tag))
-                                m_clan = player_to_clan.get(m_tag, side_tag)
+                            # Attacker stats
+                            def_map_pos = war_member_map_pos.get(def_tag, 0)
+                            if m_tag not in attacker_data:
+                                attacker_data[m_tag] = {
+                                    'name': m_name, 'clan_tag': m_clan, 'th': m_th,
+                                    'attacks': 0, 'total_stars': 0,
+                                    'map_pos_sum': 0,
+                                }
+                            ad = attacker_data[m_tag]
+                            ad['attacks'] += 1
+                            ad['total_stars'] += stars
+                            if def_map_pos > 0:
+                                ad['map_pos_sum'] += def_map_pos
+                            if m_th > 0:
+                                ad['th'] = m_th
+                            if m_name:
+                                ad['name'] = m_name
 
-                                for atk in list(getattr(m, 'attacks', []) or []):
-                                    def_tag = str(
-                                        getattr(atk, 'defender_tag', getattr(atk, 'defenderTag', '')) or ''
-                                    )
-                                    stars = int(getattr(atk, 'stars', 0) or 0)
-                                    def_th = war_member_th.get(def_tag, player_to_th.get(def_tag, m_th))
-                                    has_attacks = True
+                            # Defender stats (for the player being attacked)
+                            if def_tag:
+                                def_th_val = max(def_th, war_member_th.get(def_tag, player_to_th.get(def_tag, 0)))
+                                def_name = war_member_name.get(def_tag, player_to_name.get(def_tag, def_tag))
+                                def_clan = player_to_clan.get(def_tag, '')
+                                if def_tag not in defender_data:
+                                    defender_data[def_tag] = {
+                                        'name': def_name, 'clan_tag': def_clan, 'th': def_th_val,
+                                        'defenses': 0, 'stars_conceded': 0,
+                                    }
+                                dd = defender_data[def_tag]
+                                dd['defenses'] += 1
+                                dd['stars_conceded'] += stars
+                                if def_th_val > 0:
+                                    dd['th'] = def_th_val
+                                if def_name:
+                                    dd['name'] = def_name
+                return has_attacks
 
-                                    # Attacker stats
-                                    def_map_pos = war_member_map_pos.get(def_tag, 0)
-                                    if m_tag not in attacker_data:
-                                        attacker_data[m_tag] = {
-                                            'name': m_name, 'clan_tag': m_clan, 'th': m_th,
-                                            'attacks': 0, 'total_stars': 0,
-                                            'map_pos_sum': 0,
-                                        }
-                                    ad = attacker_data[m_tag]
-                                    ad['attacks'] += 1
-                                    ad['total_stars'] += stars
-                                    if def_map_pos > 0:
-                                        ad['map_pos_sum'] += def_map_pos
-                                    if m_th > 0:
-                                        ad['th'] = m_th
-                                    if m_name:
-                                        ad['name'] = m_name
+            if all_war_tags:
+                # ── DB-first ─────────────────────────────────────────────────
+                # This bot's own periodic tracking already records every war for
+                # any clan it actively follows — including partial data for a war
+                # still in progress — so check that before ever touching the live
+                # API. Usually resolves the whole group with zero live calls, and
+                # sidesteps the live-fetch flakiness explored in
+                # COPILOT_PITFALLS_COOKBOOK.md Pitfall 24 (a broken API key,
+                # transient CoC API staleness) for anything this bot has already
+                # seen. Live API becomes the fallback for what the DB doesn't have
+                # yet — typically a war involving a clan outside this bot's
+                # tracked family, or a round too new for the periodic tracker to
+                # have polled yet.
+                logging.info(
+                    f"[CWL-ANALYSE] Checking local DB for {len(all_war_tags)} wars for "
+                    f"{clan_tag} group analysis (season {season})"
+                )
+                _db_atk, _db_def, _db_tags_with_data = await asyncio.to_thread(
+                    _load_cwl_wars_from_db_sync, all_war_tags
+                )
+                for ptag, ad in _db_atk.items():
+                    attacker_data[ptag] = ad
+                for ptag, dd in _db_def.items():
+                    defender_data[ptag] = dd
+                wars_with_data += len(_db_tags_with_data)
 
-                                    # Defender stats (for the player being attacked)
-                                    if def_tag:
-                                        def_th_val = max(def_th, war_member_th.get(def_tag, player_to_th.get(def_tag, 0)))
-                                        def_name = war_member_name.get(def_tag, player_to_name.get(def_tag, def_tag))
-                                        def_clan = player_to_clan.get(def_tag, '')
-                                        if def_tag not in defender_data:
-                                            defender_data[def_tag] = {
-                                                'name': def_name, 'clan_tag': def_clan, 'th': def_th_val,
-                                                'defenses': 0, 'stars_conceded': 0,
-                                            }
-                                        dd = defender_data[def_tag]
-                                        dd['defenses'] += 1
-                                        dd['stars_conceded'] += stars
-                                        if def_th_val > 0:
-                                            dd['th'] = def_th_val
-                                        if def_name:
-                                            dd['name'] = def_name
+                missing_tags: List[str] = [wt for wt in all_war_tags if wt not in _db_tags_with_data]
 
-                        if has_attacks:
+                if missing_tags:
+                    logging.info(
+                        f"[CWL-ANALYSE] {len(missing_tags)}/{len(all_war_tags)} war(s) not yet "
+                        f"in the local DB for {clan_tag} (season {season}); fetching live: "
+                        f"{missing_tags}"
+                    )
+                    war_futures: Any = await asyncio.gather(
+                        *[CACHE.get_league_war(wt) for wt in missing_tags],
+                        return_exceptions=True
+                    )
+
+                    # A tag is "suspect" if the fetch raised, or it succeeded but
+                    # carried no attacks at all — the CoC API is known to mark a
+                    # CWL war warEnded slightly before its attack list has fully
+                    # replicated, and since ended wars are cached as immutable
+                    # (get_league_war), an ordinary retry would just be served
+                    # that same incomplete snapshot again. We can't tell "round
+                    # genuinely hasn't been attacked yet" apart from "API gave us
+                    # a stale snapshot" from the object alone, so every empty
+                    # result is treated as suspect and re-verified below.
+                    #
+                    # coc.PrivateWarLog is the one exception NOT worth retrying: for
+                    # get_league_war() specifically it's a misnomer coc.py raises for
+                    # ANY 403 on that endpoint, not just genuine warlog-privacy 403s
+                    # (see COPILOT_PITFALLS_COOKBOOK.md Pitfall 24) — root-caused to a
+                    # broken CoC API key rejecting the request outright ("Invalid
+                    # authorization"). That's an auth-level rejection, not a transient
+                    # data-freshness gap, so a cache-bypass retry within the same
+                    # process/session would just burn an API call for the same
+                    # result. We already checked the local DB above, so this simply
+                    # counts as unrecovered.
+                    suspect_tags: List[str] = []
+                    _unrecovered_war_tags = []
+                    for wt, w in zip(missing_tags, war_futures):
+                        if isinstance(w, Exception):
+                            logging.warning(
+                                f"[CWL-ANALYSE] get_league_war({wt}) failed: "
+                                f"{type(w).__name__}: {w}"
+                            )
+                            if isinstance(w, coc.PrivateWarLog):  # type: ignore[attr-defined]
+                                _unrecovered_war_tags.append(wt)
+                            else:
+                                suspect_tags.append(wt)
+                            continue
+                        if w is None:
+                            suspect_tags.append(wt)
+                            continue
+                        if _process_war(w):
                             wars_with_data += 1
+                        else:
+                            suspect_tags.append(wt)
 
-                    _live_ok = bool(attacker_data or defender_data)
+                    if suspect_tags:
+                        # Don't even attempt the retry for a tag whose whole round has
+                        # zero recovered data anywhere (DB, or this same live pass) —
+                        # that's indistinguishable from "round hasn't started yet", the
+                        # retry is guaranteed to fail exactly like it just did, and
+                        # logging a retry attempt for it would be noise for the expected,
+                        # common case (every group has a not-started trailing round until
+                        # the season ends). Only retry tags whose round has SOME other
+                        # recovered war — a genuine per-war gap, worth the extra call.
+                        _recovered_so_far = set(all_war_tags) - set(suspect_tags) - set(_unrecovered_war_tags)
+                        _round_lists = [
+                            list(rl) for rl in (list(getattr(league_group, 'rounds', []) or []))
+                            if rl
+                        ]
+                        _not_yet_played_tags: Set[str] = set()
+                        for _round_tags in _round_lists:
+                            _round_suspect = [t for t in _round_tags if t in suspect_tags]
+                            if _round_suspect and not (set(_round_tags) & _recovered_so_far):
+                                _not_yet_played_tags.update(_round_suspect)
+                        retry_tags = [t for t in suspect_tags if t not in _not_yet_played_tags]
+                        # Feed straight into _unrecovered_war_tags (not silently dropped) so
+                        # the final safety-net filter below — which already excludes zero-data
+                        # rounds from the warning — accounts for them correctly when deciding
+                        # what actually counts as "recovered" for any other still-unrecovered
+                        # tag in the same round.
+                        _unrecovered_war_tags.extend(_not_yet_played_tags)
+
+                        if retry_tags:
+                            logging.warning(
+                                f"[CWL-ANALYSE] {len(retry_tags)}/{len(missing_tags)} war(s) came "
+                                f"back with no attack data for {clan_tag} (season {season}); "
+                                f"retrying with a forced cache bypass: {retry_tags}"
+                            )
+                            retry_futures: Any = await asyncio.gather(
+                                *[CACHE.get_league_war(wt, force_refresh=True) for wt in retry_tags],
+                                return_exceptions=True
+                            )
+                            for wt, w in zip(retry_tags, retry_futures):
+                                if isinstance(w, Exception):
+                                    logging.warning(
+                                        f"[CWL-ANALYSE] Retry of get_league_war({wt}) failed: "
+                                        f"{type(w).__name__}: {w}"
+                                    )
+                                    _unrecovered_war_tags.append(wt)
+                                    continue
+                                if w is None or not _process_war(w):
+                                    _unrecovered_war_tags.append(wt)
+                                    continue
+                                wars_with_data += 1
+
+                # ── Don't warn about rounds that simply haven't been played yet ──
+                # Safety net for whatever reached here still unrecovered (PrivateWarLog
+                # failures skip straight past the retry gate above, so they still need
+                # this check): a round where NONE of its wars have data anywhere (DB or
+                # live) is indistinguishable from "not started" — only surface the
+                # warning for a round where SOME wars have data but this one doesn't, a
+                # genuine gap rather than the season just being mid-way through.
+                if _unrecovered_war_tags:
+                    _recovered_tags = set(all_war_tags) - set(_unrecovered_war_tags)
+                    _round_lists = [
+                        list(rl) for rl in (list(getattr(league_group, 'rounds', []) or []))
+                        if rl
+                    ]
+                    # Not-yet-played rounds are silently dropped here, on purpose —
+                    # every group has a trailing not-started round until the season
+                    # ends, so logging that every single time would just be noise
+                    # for the expected, common case. Only a genuine gap (below) is
+                    # worth a log line.
+                    _genuinely_missing: List[str] = []
+                    for _round_tags in _round_lists:
+                        _round_unrecovered = [t for t in _round_tags if t in _unrecovered_war_tags]
+                        if _round_unrecovered and (set(_round_tags) & _recovered_tags):
+                            _genuinely_missing.extend(_round_unrecovered)
+                    _unrecovered_war_tags = _genuinely_missing
+                    if _unrecovered_war_tags:
+                        logging.warning(
+                            f"[CWL-ANALYSE] {len(_unrecovered_war_tags)} war(s) have no attack "
+                            f"data live or in the local DB for {clan_tag} (season {season}): "
+                            f"{_unrecovered_war_tags}"
+                        )
+
+                _live_ok = bool(attacker_data or defender_data)
 
     # ── DB fallback: use historical war_attacks data if live path gave nothing ─
     if not _live_ok:
@@ -3479,6 +3750,12 @@ async def generate_cwl_group_analysis_embeds(clan_tag: str) -> List[discord.Embe
     MEDAL_ICONS = ["🥇", "🥈", "🥉"]
     _data_note = " *(historical data)*" if _is_historical else ""
     group_summary = f"{n_group_clans} clans · {wars_with_data} wars · Season **{season}**{_data_note}"
+    if _unrecovered_war_tags:
+        _n_missing = len(_unrecovered_war_tags)
+        group_summary += (
+            f"\n⚠️ *{_n_missing} war{'s' if _n_missing != 1 else ''} could not be verified "
+            f"live or in local records — totals below may be incomplete.*"
+        )
 
     def _player_url(ptag: str) -> str:
         return coc_player_profile_url(ptag)

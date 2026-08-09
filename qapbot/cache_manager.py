@@ -2910,6 +2910,7 @@ class CacheManager:
         *,
         max_age: float = 0,
         cache_result: bool = True,
+        force_refresh: bool = False,
     ) -> 'coc.ClanWar':
         """
         Fetch CWL war data by war tag, with in-memory caching.
@@ -2932,6 +2933,16 @@ class CacheManager:
                           Use this for one-shot bulk backfills (for example CWL
                           recovery) so large historical batches do not inflate
                           in-memory cache usage across cycles.
+            force_refresh: When ``True``, skip the cache read entirely (even
+                          for an already-cached ``warended`` entry) and evict
+                          any existing entry before fetching. Use this for a
+                          deliberate retry of a war that came back with no
+                          attack data — the CoC API is occasionally seen to
+                          mark a CWL war ``warEnded`` slightly before its
+                          attacks have fully replicated, and since ended wars
+                          are normally cached as immutable, a plain retry
+                          would otherwise just be served that same incomplete
+                          snapshot again.
 
         Returns:
             ``coc.ClanWar`` object for the specific CWL war.
@@ -2945,7 +2956,9 @@ class CacheManager:
 
         # ── Check cache ──────────────────────────────────────────────────
         _now = time.time()
-        if cache_result:
+        if cache_result and force_refresh:
+            self._league_war_cache.pop(war_tag, None)
+        if cache_result and not force_refresh:
             cached = self._league_war_cache.get(war_tag)
             if cached is not None:
                 war_obj, fetch_ts, cached_state = cached

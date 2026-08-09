@@ -707,3 +707,152 @@ user-supplied RTL name with OTHER fields on the same line needs a bare LRM at ev
 boundary after the name, not just marks wrapped around the name. Isolates (FSI/PDI) do not work on
 Discord — don't reach for them here even though they're the "more correct" Unicode mechanism in a
 spec-compliant renderer. When in doubt, replicate the two reference implementations above exactly.
+
+## Pitfall 24: `generate_cwl_group_analysis_embeds()` (`/analyse league_group`) silently dropped wars fetched live from the CoC API
+
+Symptom (2026-08-09): running `/analyse league_group` back-to-back on DEV and PROD, for the exact same
+CWL group and season, on databases confirmed byte-identical (a fresh PROD→DEV backup had just been
+taken), gave *consistently* different leaderboards — PROD reported 24 of 28 group wars had attack data,
+DEV consistently reported only 20, every time, across multiple restarts. Not a one-off flake: repeated
+runs on each side kept landing on their own number.
+
+Root cause (function bypasses the DB — see below — so "identical DB" was a red herring): the function
+fetches the CWL group and every one of its round wars **live** from the Clash of Clans API on every
+invocation (`CACHE.get_league_group()` + `CACHE.get_league_war()` per war tag), and any per-war fetch
+that came back without attack data was silently dropped:
+```python
+wars = [w for w in war_futures if not isinstance(w, Exception) and w is not None]
+```
+No logging (`coc.NotFound` wasn't logged at any level — see `coc_retry()` in `qapbot/coc_health.py`),
+no retry, no indication in the output that data was incomplete. DEV and PROD log in via *separate*
+Clash of Clans developer accounts (`COC_API_EMAIL_DEV` vs `COC_API_EMAIL`, see `qapbot/config.py`).
+
+Fix applied: `generate_cwl_group_analysis_embeds()` now (1) logs every failed/empty per-war fetch, (2)
+retries any war that came back without attacks exactly once, forcing a real cache bypass via
+`CACHE.get_league_war(wt, force_refresh=True)` — needed because `get_league_war()` normally treats a
+`warEnded` result as immutable and caches it permanently for the TTL, so a plain retry would just be
+served the same incomplete snapshot again, and (3) for any war still missing attack data after the
+retry, falls back to this bot's own locally-recorded `war_attacks`/`war_summary` rows for that specific
+war tag (`_load_cwl_wars_from_db_sync()`, keyed by `war_tag` rather than by clan+season like the
+whole-command DB fallback) — this also recovers *partial* data for a war that's still in progress,
+since the periodic tracker keeps those rows updated throughout the war, not just after it ends. If a
+war is still unrecovered after all three steps, its count is surfaced in the embed itself
+(`⚠️ N war(s) could not be verified live or in local records`) instead of just silently under-counting.
+
+After this fix, DEV and PROD converged on the *correct* number (24/28 — this group was mid-round-6-of-7,
+so round 7 legitimately had no data yet on either side; the embed's warning about those 4 wars is
+expected behaviour, not a bug, when a season is still in progress). One real DEV-only gap remained
+though: 4 already-*played* war tags occasionally came back as `coc.PrivateWarLog: accessDenied (403)`
+on DEV, while PROD fetched the exact same tags cleanly every time.
+
+`coc.PrivateWarLog` is a misnomer for this call path — verified directly in the installed `coc.py`
+source, not just inferred. `Client.get_league_war()` does:
+```python
+# coc/client.py:1134-1137
+try:
+    data = await self.http.get_cwl_wars(war_tag, **{**self._defaults, **kwargs})
+except Forbidden as exception:
+    raise PrivateWarLog(exception.response, exception.reason) from exception
+```
+— it blindly relabels **any** 403 from that endpoint as `PrivateWarLog`, with no check on the actual
+reason and no clan-privacy lookup anywhere in the path. The name is inherited from a *different* method
+(`get_current_war()`, which genuinely does gate on a clan's `isWarLogPublic` flag) — for
+`get_league_war()` it just means "got a 403 from `/clanwarleagues/wars/{warTag}`", nothing more. CWL
+league-war-by-tag lookups are not supposed to be gated by clan warlog privacy at all, and that setting
+is clan-level game data — identical regardless of which account queries it — so this was never a real
+privacy difference between DEV and PROD.
+
+That also rules out the tidier "stale API key registered under a different IP" theory that seemed
+promising at first: `coc.py`'s low-level `request()` already special-cases exactly that scenario and
+self-heals it *before* it can surface as an exception —
+```python
+# coc/http.py:362-369
+if response.status == 403:
+    if data.get("reason") == "accessDenied.invalidIp" and self.email and self.password:
+        await self.initialise_keys()          # re-provision keys...
+        return await self.request(route, **kwargs)   # ...then silently retry
+    raise Forbidden(response, data)
+```
+The exception we actually logged was `PrivateWarLog: accessDenied (status code: 403)` — reason is bare
+`"accessDenied"`, not `"accessDenied.invalidIp"`. Had it been the IP-mismatch case, the library would
+have reprovisioned and retried internally and we'd never have seen an exception at all. So whatever
+Supercell is rejecting this specific account's request for is a different condition than a mismatched
+key IP.
+
+**Root cause, confirmed**: `raise PrivateWarLog(exception.response, exception.reason) from exception`
+drops the original `Forbidden`'s `.message` field (only `.reason` survives the re-wrap) — but the
+original `Forbidden` is still reachable as `__cause__` (preserved by that `from exception`), and it
+still has `.message` intact. Added temporary diagnostic logging in `coc_retry()`
+(`qapbot/coc_health.py`, scoped to `operation_name.startswith("get_league_war")` so it doesn't add noise
+to the routine, genuinely-expected `PrivateWarLog` hits on regular `get_current_war()` polling elsewhere)
+to surface it. First DEV run with that logging live:
+```
+cause_message='Invalid authorization'
+```
+That's decisive: the bearer token itself was rejected by Supercell — a broken API key, not a privacy
+setting, not IP mismatch, not eventual consistency. `HTTPClient.initialise_keys()` (`coc/http.py:551-561`)
+only validates a candidate key's **name + registered CIDR** against the `/apikey/list` response before
+reusing it — it never test-calls the key. So if one of a developer account's registered keys is broken
+on Supercell's auth side while still listing normally in the developer portal, `initialise_keys()` will
+silently keep including that same dead key in the rotation on every restart — and since
+`BatchThrottler` cycles through the key list in a stable order, and `all_war_tags` is dispatched in a
+stable order too (from `league_group.rounds`), the same position in every request batch keeps landing
+on the same broken key. That's exactly why the identical set of war tags failed identically across five
+independent DEV restarts spanning over an hour (07:49, 07:54, 08:02, 08:24, 08:58) — not a timing
+coincidence, a structurally-guaranteed repeat. PROD's log showed zero `PrivateWarLog` hits the entire
+time, so only DEV's account has a bad key.
+
+**Fix was account hygiene, not code**: deleted the keys named `"Created with coc.py Client"`
+(`coc.py`'s default — nothing in this repo overrides it, so every script under `qapbot/scripts/` that
+logs into the same account shares this key name) from the DEV account (`COC_API_EMAIL_DEV`) on
+developer.clashofclans.com. On the next DEV login, `initialise_keys()` found 0 matching keys and
+created a fresh set of `key_count=10`, all valid — confirmed clean afterward.
+
+**Status: resolved (2026-08-09).** Follow-up hardening once the cause was confirmed:
+- **Retry no longer wastes a call on this case**: `generate_cwl_group_analysis_embeds()`
+  (`QBhelperfunctions.py`) now separates `coc.PrivateWarLog` failures out of the general retry pool —
+  a broken/revoked key is an auth-level rejection that a cache-bypass retry within the same session
+  cannot fix, so those tags skip straight to the local-DB-fallback step instead of burning a second,
+  guaranteed-to-fail API call.
+- **Proactive detection at startup**: new `_validate_coc_api_keys()` (`QapBot.py`), fired as a
+  fire-and-forget background task right after `coc_client.login()`, test-calls each of the `key_count`
+  provisioned keys directly (bypassing the round-robin) against the cheap `/locations` endpoint. Any
+  key that fails logs `[COC-KEY-SANITY] CRITICAL` with its 1-indexed position, **and DMs the configured
+  `SERVER_ADMIN`** via `CACHE.send_user_dm()` (a log line alone had already gone unnoticed for over an
+  hour across 5 DEV restarts before this incident was traced) — so a future dead key is caught before
+  it ever reaches a user-facing command, on both DEV and PROD. Doesn't auto-fix anything; the fix is
+  still manual account cleanup as above.
+- **Temporary diagnostics reverted**: the verbose `[COC-PRIVATEWARLOG-DIAG]` block in `coc_retry()`
+  (`qapbot/coc_health.py`) and the DEV-only `coc.http` logger `INFO` override (`QapBot.py`) are both
+  back to their original state — the startup guard above is the permanent replacement for "notice a
+  dead key," so the reactive per-call diagnostic logging that did its job here is no longer needed.
+
+Rule going forward: any code path that fans out `asyncio.gather(..., return_exceptions=True)` over
+several independent live API calls and then filters `if not isinstance(w, Exception)` needs to also
+log what got filtered out and decide a recovery strategy — silently discarding a subset of a batch
+fetch is very easy to miss in testing (a single run looks fine; it's only "the same query, run twice,
+gives two different answers" that exposes it). Don't trust an exception's *name* over what its raise
+site actually checks: `coc.PrivateWarLog` reads like a clan-privacy issue, and IS one for
+`get_current_war()` — but for `get_league_war()` it's raised unconditionally for any 403, so treating it
+as "expected, no big deal" without reading the raise site first would have masked a real broken API key
+here. When a library's `raise X(...) from original_exception` re-wrap looks like it dropped useful
+detail, check `__cause__` before assuming the detail is gone — it's very often still there. And once a
+class of failure is proven non-transient (an auth rejection, not a data-freshness race), don't keep
+retrying it just because the surrounding code already has a retry loop — check *why* the retry existed
+before reusing it for a new failure mode.
+
+**Follow-up (same day), two more refinements once the dust settled:**
+- **DB-first, not live-first.** Prompted by "why do we hit the live API at all when this bot's own
+  periodic tracking already has the data" — a fair question, since the whole DB-fallback machinery
+  above only exists *because* the data is already there. `generate_cwl_group_analysis_embeds()` now
+  checks `war_attacks`/`war_summary` for every war tag in the group **before** any live call
+  (`_load_cwl_wars_from_db_sync(all_war_tags)`, one bulk query), and only fetches live for whatever the
+  DB doesn't have yet. In the common case (a group made entirely of clans this bot's Discord server
+  tracks — the normal case for a "family" server) that's zero live calls, not up to 28: faster, and
+  structurally immune to the whole class of live-fetch flakiness this pitfall exists to document.
+- **Stop warning about rounds that haven't been played yet.** The "N war(s) could not be verified"
+  footer was firing even when the *correct* answer was "round 7 of 7 hasn't started" (e.g. 24/28 wars
+  — genuinely complete for round 6). Fixed by grouping unrecovered tags by which round they belong to
+  (from `league_group.rounds`) and only keeping a tag in the warning if **some other war in the same
+  round has data** — a round with zero data anywhere is indistinguishable from "not started" and isn't
+  worth alarming over; a round with partial data but one specific war missing is a genuine gap.

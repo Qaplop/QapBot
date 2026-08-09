@@ -12,6 +12,31 @@ Implemented BatchThrottler-based rate limiting with parallel API calls to maximi
 - **Configured Limit**: `throttle_limit=100` total requests/sec across all keys (i.e., 10 keys × 10 req/sec per key)
 - **Benefit**: Requests across keys execute in parallel, not sequentially
 
+### 1a. Startup key sanity check
+`coc.py`'s own key rotation (`HTTPClient.initialise_keys()`, run during `login()`) only checks a
+candidate key's name + registered IP against the developer-portal listing before reusing it across
+restarts — it never test-calls the key itself. A key that's been revoked or is otherwise broken on
+Supercell's auth side, while still listing normally on the portal, therefore stays silently in rotation
+forever: every restart picks it back up, and since `BatchThrottler` cycles through the key list in a
+stable order, the same fraction of requests keeps failing with `Invalid authorization` on every run. See
+`qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md` Pitfall 24 for the incident (2026-08-09) this guards against —
+it went undetected for over an hour across 5 DEV restarts because nothing checked at startup, only
+surfacing later as scattered per-war 403s.
+
+`QapBot.py: _validate_coc_api_keys()` runs as a fire-and-forget background task right after
+`coc_client.login()` (reference held on `QBcore.coc_key_sanity_task` so it isn't garbage-collected
+mid-flight; runs from `on_ready()` so the Discord client is already connected by the time it fires).
+It tests each of the `key_count` keys directly (bypassing the round-robin) against the cheap, tag-free
+`/locations` endpoint, and on any failure logs a `[COC-KEY-SANITY]` `CRITICAL` line naming the
+1-indexed position(s) — **and DMs the configured `SERVER_ADMIN`** via `CACHE.send_user_dm()`, on both
+DEV and PROD, since a log-only alert had already gone unnoticed for over an hour across 5 restarts in
+the incident this guards against. If `SERVER_ADMIN` isn't configured, or the DM can't be delivered
+(DMs disabled, bot blocked), it logs a `WARNING` noting that instead — the `CRITICAL` log line is
+always written either way. One `INFO` line if all keys pass. It does not block startup and does not
+raise; a broken key must still be fixed manually (delete the affected account's `"Created with coc.py
+Client"` keys at developer.clashofclans.com and let `coc.py` recreate a fresh set
+on the next login) — this only makes the failure visible immediately instead of days later.
+
 ### 2. Centralized API Access
 
 All CoC API calls route through `CACHE` (cache_manager):

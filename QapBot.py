@@ -351,6 +351,101 @@ async def initialize_database() -> None:
         QBcore.db_maintenance_mode = False
 
 
+async def _validate_coc_api_keys() -> None:
+    """
+    Sanity-check that every provisioned CoC API key actually authenticates.
+
+    coc.py's own key rotation (``HTTPClient.initialise_keys()``, called during
+    ``login()``) only checks a candidate key's name + registered IP against the
+    developer-portal listing before reusing it across restarts — it never
+    test-calls the key itself. A key that's been revoked or is otherwise
+    broken on Supercell's auth side, while still listing normally on the
+    portal, therefore stays silently in rotation forever: every restart keeps
+    picking it back up, and BatchThrottler's stable round-robin means the same
+    fraction of requests keeps failing with "Invalid authorization" on every
+    run. This bit DEV for over an hour across 5 restarts before being traced
+    (2026-08-09) purely because nothing surfaced it at startup — it only
+    showed up later as scattered per-war 403s. See
+    qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md Pitfall 24 for the full incident.
+
+    Runs as a fire-and-forget background task (not awaited by
+    startup_login()) so a slow/unreachable key doesn't extend the bot's
+    startup timeout budget; only logs, never raises.
+    """
+    client = QBcore.coc_client
+    http = getattr(client, 'http', None) if client else None
+    keys: List[str] = list(getattr(http, '_keys', None) or []) if http else []
+    if not keys:
+        return
+
+    base_url = getattr(http, 'base_url', 'https://api.clashofclans.com/v1')
+    bad_key_positions: List[int] = []
+
+    async def _check_one(index: int, key: str) -> None:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{base_url}/locations",
+                    headers={"Authorization": f"Bearer {key}"},
+                    params={"limit": 1},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        body = (await resp.text())[:200]
+                        logging.critical(
+                            f"[COC-KEY-SANITY] API key #{index + 1}/{len(keys)} failed validation: "
+                            f"HTTP {resp.status} — {body}"
+                        )
+                        bad_key_positions.append(index)
+        except Exception as exc:
+            logging.critical(f"[COC-KEY-SANITY] API key #{index + 1}/{len(keys)} check errored: {exc}")
+            bad_key_positions.append(index)
+
+    try:
+        await asyncio.gather(*[_check_one(i, k) for i, k in enumerate(keys)])
+    except Exception as exc:
+        logging.error(f"[COC-KEY-SANITY] Key validation pass itself errored: {exc}")
+        return
+
+    if bad_key_positions:
+        mode_str = "DEV" if CONFIG.is_dev_mode else "PROD"
+        positions_1idx = [p + 1 for p in bad_key_positions]
+        logging.critical(
+            f"[COC-KEY-SANITY] ({mode_str}) {len(bad_key_positions)}/{len(keys)} CoC API key(s) "
+            f"failed validation at startup (1-indexed position(s) {positions_1idx}) — "
+            f"a matching fraction of requests will silently fail until the broken key(s) are "
+            f"removed at developer.clashofclans.com (delete the keys named 'Created with coc.py "
+            f"Client' for this account; coc.py recreates a fresh full set on the next restart)."
+        )
+        # Log-only alerts get missed for days (this exact incident took over an hour across 5
+        # restarts to notice manually, see Pitfall 24) — DM the configured admin so a broken key
+        # is impossible to miss. This runs from on_ready() -> _run_startup_initialization(), so
+        # the Discord client is already logged in and ready; no wait_until_ready() needed.
+        if CONFIG.server_admin:
+            dm_sent = await CACHE.send_user_dm(
+                CONFIG.server_admin,
+                f"⚠️ **QapBot CoC API key alert ({mode_str})**\n"
+                f"{len(bad_key_positions)}/{len(keys)} CoC API key(s) failed validation at "
+                f"startup (position(s) {positions_1idx}).\n"
+                f"A matching fraction of CWL/war requests will silently fail until this is fixed.\n"
+                f"Fix: delete the keys named `Created with coc.py Client` for the {mode_str} "
+                f"account at developer.clashofclans.com, then restart the bot.",
+            )
+            if not dm_sent:
+                logging.warning(
+                    "[COC-KEY-SANITY] Could not DM the configured admin about the broken key(s) "
+                    "(DMs disabled, bot blocked, or user fetch failed) — see the CRITICAL log "
+                    "line above instead."
+                )
+        else:
+            logging.warning(
+                "[COC-KEY-SANITY] SERVER_ADMIN is not configured — cannot DM an alert about the "
+                "broken key(s) above."
+            )
+    else:
+        logging.info(f"[COC-KEY-SANITY] All {len(keys)} CoC API key(s) validated OK.")
+
+
 async def startup_login() -> None:
     """
     Authenticate the Clash of Clans API client with BatchThrottler.
@@ -420,6 +515,10 @@ async def startup_login() -> None:
         # the client if the aiohttp session is unexpectedly closed.
         from qapbot.coc_health import set_reconnect_callback
         set_reconnect_callback(startup_login)
+        # Fire-and-forget key sanity check (see _validate_coc_api_keys docstring) — holds a
+        # strong reference on QBcore so the task isn't garbage-collected mid-flight, per the
+        # standard asyncio create_task() pitfall.
+        QBcore.coc_key_sanity_task = asyncio.create_task(_validate_coc_api_keys())
     else:
         logging.info("[NO_COC_API] Skipping CoC API login (NO_COC_API=true)")
 
@@ -2372,11 +2471,24 @@ async def periodic_main() -> None:
                             CACHE.last_db_maintenance = datetime.fromisoformat(_stored)
                         except ValueError:
                             pass  # Malformed value — treat as never run
+                # Due-check uses the UTC calendar date, not "elapsed > 20h", because
+                # last_db_maintenance is shared with manual /admin Optimize DB /
+                # Execute Nightly Maintenance runs (nightly_db_maintenance() persists
+                # it unconditionally — see db_manager.py). A rolling-hours window meant
+                # a manual/test run any time after ~07:00 UTC, followed by a same-day
+                # restart (which re-hydrates from that fresh bot_metadata value), would
+                # silently suppress that night's 03:00 UTC automatic run for up to 20h
+                # (confirmed in prod 2026-08-09: a 17:16 UTC manual test run + evening
+                # redeploy blocked the same night's automatic maintenance). Comparing
+                # calendar dates instead only skips when maintenance (of any origin)
+                # has already run *today*, which still covers the original restart-
+                # within-the-same-window case while no longer being sensitive to what
+                # time of day an unrelated manual run happened.
                 _maint_due = (
                     _now_utc.hour == 3
                     and (
                         CACHE.last_db_maintenance is None
-                        or (_now_utc - CACHE.last_db_maintenance).total_seconds() > 20 * 3600
+                        or CACHE.last_db_maintenance.date() != _now_utc.date()
                     )
                 )
                 # --- Monthly hot->history DB migration ---

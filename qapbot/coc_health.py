@@ -207,12 +207,21 @@ async def coc_retry(
         except coc.NotFound:
             # Don't retry NotFound errors (specific before HTTPException)
             _stats['api_errors'] += 1
+            logging.warning(f"[COC-API-NOTFOUND] {operation_name} - resource not found (no retry)")
             raise
             
         except coc.PrivateWarLog:
             # Don't retry PrivateWarLog errors - this is expected for clans with private warlogs
             # Count as successful: the API responded correctly with a definitive 403, not an API failure.
             # Not counting this caused success_rate < 100% with 0 errors in /status.
+            #
+            # Note: for get_league_war() specifically, coc.py relabels ANY 403 from the CWL
+            # war-by-tag endpoint as PrivateWarLog — it's not actually gated by a clan's
+            # warlog-public setting there. A broken/revoked API key surfaces through this same
+            # branch (root-caused 2026-08-09, see qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md
+            # Pitfall 24) — startup_login()'s _validate_coc_api_keys() (QapBot.py) now catches
+            # that case proactively at startup instead of relying on this log line, so this
+            # stays at debug for both call sites.
             _stats['successful_calls'] += 1
             logging.debug(f"[COC-API-INFO] {operation_name} - War log is private (no retry needed)")
             raise

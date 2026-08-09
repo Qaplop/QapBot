@@ -374,6 +374,15 @@ IMPORTANT - Caching:
         - Dramatic performance improvement (15s → 2s on cache hit)
 """
 
+coc_key_sanity_task: Optional["asyncio.Task[None]"] = None
+"""
+Strong reference to the fire-and-forget CoC API key validation task started
+right after login in startup_login() (see QapBot.py's _validate_coc_api_keys()).
+Holding this reference here prevents the task from being garbage-collected
+mid-flight — a standard asyncio.create_task() pitfall. The task only logs
+(CRITICAL on a broken key, INFO once all keys pass); nothing awaits its result.
+"""
+
 shutdown_event: asyncio.Event = asyncio.Event()
 """
 Asyncio event for coordinating graceful shutdown across all tasks.

@@ -1,6 +1,209 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (11)
+- Fixed (correction to entry (10) — the actual noise was one level up): the
+  "[CWL-ANALYSE] N war(s) came back with no attack data...retrying with a
+  forced cache bypass" WARNING still fired for a not-yet-played trailing
+  round, because that check only ran after the retry attempt/log had already
+  happened — removing the downstream "not yet played" INFO line in entry
+  (10) didn't touch it. Moved the round-completeness check earlier so it
+  gates the retry itself: a suspect tag whose whole round has zero recovered
+  data anywhere (DB or this same live pass) is no longer retried or logged
+  at all, only tags whose round has SOME other recovered war (a genuine gap)
+  still get the retry + WARNING. Also fixed a correctness gap introduced by
+  that split: skipped not-yet-played tags now still feed into
+  _unrecovered_war_tags (instead of being dropped from tracking entirely) so
+  the existing final safety-net filter continues to compute "what's actually
+  recovered" correctly for any other tag sharing that round. File:
+  QBhelperfunctions.py. 1519 tests pass.
+
+2026-08-09 (10)
+- Fixed: entry (9)'s round-completeness fix correctly suppressed the "could
+  not be verified" WARNING for a not-yet-played trailing round, but still
+  logged an INFO line every time saying so ("...treating as not yet played,
+  not a data gap") — itself just noise for the expected, common case (every
+  group has a not-started round until the season ends). Removed; the
+  not-yet-played filtering behavior is unchanged, just silent now. Only a
+  genuine partial-round gap still logs anything. File: QBhelperfunctions.py.
+  1519 tests pass.
+
+2026-08-09 (9)
+- Changed: /analyse league_group now checks the local DB for every war in the
+  group BEFORE any live API call (_load_cwl_wars_from_db_sync(all_war_tags),
+  one bulk query), falling through to live per-war fetches only for whatever
+  the DB doesn't have yet. This bot's own periodic tracking already records
+  every war for any clan it actively follows (including partial data for a
+  war still in progress), so the DB-fallback path built earlier today was
+  really the answer all along, not just a last resort — for a CWL group made
+  entirely of tracked "family" clans this now means zero live calls instead
+  of up to 28. Also removed a redundant second DB round-trip that only ever
+  re-checked tags the first DB pass had already just confirmed were missing.
+- Fixed: the "N war(s) could not be verified" embed warning was firing for
+  a season that was simply still in progress (e.g. round 6 of 7 complete,
+  round 7 not started — 24/28 is the correct, complete answer). Unrecovered
+  tags are now grouped by round (from league_group.rounds); a round only
+  keeps its tag(s) in the warning if some OTHER war in that same round has
+  data — a round with zero data anywhere reads as "not started yet", not a
+  gap. File: QBhelperfunctions.py. 1519 tests pass.
+
+2026-08-09 (8)
+- Fixed/Added (closes the entry (2)-(7) CoC key incident): broken DEV keys
+  deleted from the developer account and confirmed re-provisioned clean.
+  Three follow-ups now that the cause is confirmed: (1) added DM alerting —
+  _validate_coc_api_keys() (QapBot.py) now DMs the configured SERVER_ADMIN
+  via CACHE.send_user_dm() when a key fails validation at startup, on both
+  DEV and PROD, since the CRITICAL log line alone had already gone unnoticed
+  for over an hour across 5 restarts during this incident; falls back to a
+  WARNING log if SERVER_ADMIN isn't set or the DM can't be delivered; (2)
+  generate_cwl_group_analysis_embeds() (QBhelperfunctions.py) no longer
+  retries coc.PrivateWarLog failures specifically — that's an auth-level
+  rejection (a broken/revoked key), not the data-freshness race the retry
+  pass exists for, so retrying it was guaranteed to fail and just burned an
+  extra API call; those tags now go straight to the local DB fallback; (3)
+  reverted the temporary diagnostics from entries (5)-(6) back to normal —
+  coc_retry()'s verbose [COC-PRIVATEWARLOG-DIAG] block (qapbot/coc_health.py)
+  and the DEV-only coc.http logger INFO override (QapBot.py) are both back
+  to their original state, since the new startup guard is the permanent
+  replacement for catching a dead key, not the reactive per-call logging.
+  Files: QapBot.py, QBhelperfunctions.py, qapbot/coc_health.py,
+  qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md,
+  qapbot/docs/RATE_LIMITING_IMPLEMENTATION.md. 1519 tests pass.
+
+2026-08-09 (7)
+- Added: startup guard that validates every provisioned CoC API key actually
+  authenticates, closing the visibility gap behind entries (2)-(6)'s DEV key
+  incident — coc.py's own key rotation never test-calls a key before reusing
+  it, so a broken-but-normally-listed key stays silently in rotation forever
+  and only surfaces later as scattered per-war 403s (took over an hour across
+  5 DEV restarts to trace this time). New _validate_coc_api_keys() (QapBot.py)
+  runs as a fire-and-forget background task right after coc_client.login(),
+  test-calling each of the key_count keys directly against the cheap,
+  tag-free /locations endpoint and logging CRITICAL with the 1-indexed
+  position of any key that fails (or one INFO line if all pass). Reference
+  held on new QBcore.coc_key_sanity_task to avoid the task being
+  garbage-collected mid-flight. Doesn't block startup, doesn't auto-fix —
+  a broken key still needs manual deletion at developer.clashofclans.com —
+  but makes the failure visible immediately instead of only via user reports.
+  Files: QapBot.py, QBcore.py, qapbot/docs/RATE_LIMITING_IMPLEMENTATION.md.
+  1519 tests pass.
+
+2026-08-09 (6)
+- Root-caused (closes entries (2)-(5)): the DEV-only coc.PrivateWarLog(403) on
+  CWL get_league_war() fetches is a broken DEV Clash of Clans API key, not a
+  code bug. Entry (5)'s diagnostic logging showed cause_message='Invalid
+  authorization' on the first DEV run — a rejected bearer token, not a
+  privacy/IP/consistency issue. coc.py's HTTPClient.initialise_keys() only
+  validates a key's name+CIDR against the developer-portal listing before
+  reusing it, never test-calls it, so a key that's broken on Supercell's auth
+  side but still lists normally gets silently reused every restart — matching
+  the identical failure pattern seen across 5 separate DEV restarts over an
+  hour. PROD's log showed zero PrivateWarLog hits throughout, so only DEV's
+  account is affected. Fix is account hygiene (delete the "Created with
+  coc.py Client" keys under the DEV developer account so they get recreated
+  fresh), not a code change — see qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md
+  Pitfall 24 for the full trace. No code changes this entry.
+
+2026-08-09 (5)
+- Added: diagnostic logging for the still-unidentified DEV-only
+  coc.PrivateWarLog(403 accessDenied) on CWL get_league_war() fetches (see
+  entries (3)/(4) and COPILOT_PITFALLS_COOKBOOK.md Pitfall 24). coc.py's
+  `raise PrivateWarLog(...) from exception` re-wrap drops the original
+  Forbidden's .message field, keeping only the bare .reason — but the
+  original Forbidden survives as __cause__ (via that `from exception`), so
+  coc_retry()'s except coc.PrivateWarLog branch (qapbot/coc_health.py) now,
+  specifically when operation_name starts with "get_league_war" (left
+  untouched for the routine, expected private-warlog case on regular
+  get_current_war() calls elsewhere), logs the cause's .message/.reason plus
+  the raw response .status/.headers at WARNING — may reveal detail beyond
+  the bare "accessDenied" reason code (e.g. a more specific message, or
+  response headers hinting at which Supercell edge/datacenter served the
+  rejection). Temporary — revert to the plain debug-only branch once
+  root-caused. File: qapbot/coc_health.py. 1519 tests pass.
+
+2026-08-09 (4)
+- Investigating (correction to entry (3)): traced the DEV-only coc.PrivateWarLog
+  (403) into coc.py's actual source rather than guessing further. Two findings:
+  (a) coc/client.py's get_league_war() blindly relabels ANY 403 from that
+  endpoint as PrivateWarLog with no reason check and no clan-privacy lookup —
+  the exception name is inherited from a different method (get_current_war(),
+  which does check a clan's warlog-public flag) and is a pure misnomer here,
+  confirming this was never a real privacy difference between accounts; (b)
+  this also rules out entry (3)'s "stale API key registered under the wrong
+  IP" theory — coc/http.py's request() already special-cases exactly that
+  condition (reason == "accessDenied.invalidIp") and self-heals it internally
+  (reprovision + silent retry) before it can ever surface as an exception, but
+  our logged exception's reason was bare "accessDenied", a different Supercell
+  rejection reason. Root cause still unidentified; the DEV-only INFO logging
+  from entry (3) stays in place since it's still useful context, just no
+  longer expected to be the full answer. No code changes this entry — docs
+  only (qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md Pitfall 24 corrected in place
+  rather than left stale).
+
+2026-08-09 (3)
+- Investigating: entry (2)'s fix confirmed DEV and PROD now converge on identical
+  /analyse league_group output (24/28 wars — correct, since this CWL group is
+  currently mid-round-6-of-7, round 7 genuinely has no data yet on either side).
+  One real gap remains, DEV-only: 4 already-played war tags occasionally come
+  back as coc.PrivateWarLog (403 accessDenied) on DEV but fetch cleanly on
+  PROD every time. CWL league-war-by-tag lookups aren't gated by a clan's
+  regular war-log-public setting, so this isn't a real privacy difference.
+  Leading theory: coc.py auto-provisions 10 IP-restricted API keys per
+  developer account on every login (see coc/http.py initialise_keys()); if
+  DEV's key pool has a key still registered under a stale/different IP,
+  requests round-robined onto that one key would 403 while the rest of the
+  same batch succeeds on other keys — matching the reproducible-subset
+  pattern seen. Can't confirm yet: QapBot.py silenced the 'coc.http' logger
+  to WARNING, hiding initialise_keys()'s IP/key-count log lines. Changed:
+  that logger now runs at INFO in DEV mode only (PROD unaffected) so the next
+  DEV restart logs the detected IP and key count, to confirm or rule this out.
+  File: QapBot.py. 1519 tests pass.
+
+2026-08-09 (2)
+- Fixed: /analyse league_group could silently under-count wars and mis-rank
+  players. Root cause: generate_cwl_group_analysis_embeds() fetches the CWL
+  group's wars LIVE from the CoC API on every call (not from the local DB —
+  the DB is only used as a last-resort fallback when the live fetch returns
+  nothing at all), and any per-war fetch that came back with no attack data
+  was silently dropped with zero logging and no retry. Confirmed via a user
+  report: running the command back-to-back on DEV and PROD, against a
+  database backup confirmed byte-identical between the two, consistently
+  (not randomly) showed 20 vs 24 of 28 group wars — DEV and PROD each log in
+  via a separate CoC developer account/key pool (COC_API_EMAIL_DEV vs
+  COC_API_EMAIL), and the leading (unconfirmed) hypothesis is per-key/region
+  eventual consistency on Supercell's own API backend for recently-ended CWL
+  wars. Fix: (1) log every failed/empty per-war fetch (coc.NotFound was
+  previously not logged at all, in coc_retry()), (2) retry any war that came
+  back without attacks once, forcing a genuine cache bypass via the new
+  CACHE.get_league_war(force_refresh=True) — a plain retry would otherwise
+  be served the same cached "warEnded" snapshot again, since ended wars are
+  normally treated as immutable, (3) for any war still missing attack data
+  after the retry, fall back to this bot's own locally-recorded war_attacks/
+  war_summary rows for that specific war tag (new
+  _load_cwl_wars_from_db_sync(), keyed by war_tag rather than clan+season —
+  also recovers partial data from wars still in progress). Any war still
+  unrecovered after all three steps is now surfaced in the embed itself
+  instead of silently under-counting. See qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md
+  Pitfall 24 for the full writeup.
+  Files: QBhelperfunctions.py, qapbot/cache_manager.py, qapbot/coc_health.py.
+  1519 tests pass.
+
+2026-08-09 (1)
+- Fixed: Nightly DB maintenance silently skipped for a night in PROD. Root
+  cause: the 03:00 UTC due-check compared elapsed time since last_db_maintenance
+  against a rolling 20h window, but that timestamp is shared with manual
+  /admin Optimize DB / Execute Nightly Maintenance runs (nightly_db_maintenance()
+  persists it unconditionally). A manual test run at 17:16 UTC on 2026-08-08,
+  followed by an evening redeploy/restart that re-hydrated CACHE.last_db_maintenance
+  from that fresh value, left only ~9h46m elapsed by the 03:00 UTC check —
+  under the 20h threshold — so the automatic run never fired (confirmed via
+  qapbot_PROD.log: zero [NIGHTLY-MAINTENANCE] lines all day) until manually
+  triggered the next morning. Fix: due-check now compares UTC calendar dates
+  (has maintenance of any origin already run today?) instead of elapsed hours,
+  which still prevents double-firing on a same-window restart without being
+  sensitive to what time of day an unrelated manual run happened.
+  File: QapBot.py. 1519 tests pass.
+
 2026-08-08 (31)
 - Fixed: Entries 29/30's fixes for /analyse league_group's RTL scrambling also
   had no effect live (confirmed identical on Discord desktop and iOS). Root-
