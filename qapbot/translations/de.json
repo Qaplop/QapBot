@@ -258,7 +258,7 @@
       "help": {
         "short": "Hilfeinformationen anzeigen",
         "title": "❓ Help-Befehl",
-        "detailed": "Zeige Hilfeinformationen über Bot-Befehle an.\n\n**Verwendung:**\n`/help [command:<befehlsname>]`\n\n**Parameter:**\n• `command` - Optional: Bestimmter Befehl, für den detaillierte Hilfe angezeigt werden soll\n\n**Ohne Parameter:**\nZeigt Liste aller verfügbaren Befehle nach Kategorien organisiert mit Kurzbeschreibungen.\n\n**Mit command-Parameter:**\nZeigt detaillierte Hilfe für den angegebenen Befehl einschließlich Verwendungsbeispielen und Parameterbeschreibungen.\n\n**Beispiele:**\n`/help` - Alle Befehle anzeigen\n`/help command:subscribe` - Detaillierte Hilfe für subscribe-Befehl\n`/help command:leaderboard` - Detaillierte Hilfe für leaderboard-Befehl"
+        "detailed": "Zeige Hilfeinformationen für Bot-Befehle an.\n\n**Verwendung:**\n`/help [command:<befehlsname>]`\n\n**Parameter:**\n• `command` - Optional: Bestimmter Befehl, für den detaillierte Hilfe angezeigt werden soll\n\n**Ohne Parameter:**\nZeigt Liste aller verfügbaren Befehle nach Kategorien organisiert mit Kurzbeschreibungen.\n\n**Mit command-Parameter:**\nZeigt detaillierte Hilfe für den angegebenen Befehl einschließlich Verwendungsbeispielen und Parameterbeschreibungen.\n\n**Beispiele:**\n`/help` - Alle Befehle anzeigen\n`/help command:subscribe` - Detaillierte Hilfe für subscribe-Befehl\n`/help command:leaderboard` - Detaillierte Hilfe für leaderboard-Befehl"
       }
     },
     "subscribe": {},
