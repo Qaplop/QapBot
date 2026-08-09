@@ -77,7 +77,17 @@ async function setup(): Promise<void> {
           throw new Error(`${saveResponse.status}: ${body}`)
         }
       },
-      () => discordSdk.close(RPCCloseCodes.CLOSE_NORMAL, ''),
+      (reason: string) => {
+        // Diagnostic logging (visible via Discord's own Activity dev console) in case this
+        // silently no-ops for some environments — console output is routed to Discord's client
+        // by the SDK itself (see Discord.d.ts's overrideConsoleLogging warning).
+        console.log(`[cwl-clan-config] calling discordSdk.close(CLOSE_NORMAL, "${reason}")`)
+        try {
+          discordSdk.close(RPCCloseCodes.CLOSE_NORMAL, reason)
+        } catch (err) {
+          console.error('[cwl-clan-config] discordSdk.close() threw:', err)
+        }
+      },
     )
   } catch (err) {
     console.error(err)

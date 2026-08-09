@@ -1,31 +1,51 @@
 import type { ClanConfig, ClanConfigPayload } from './types'
 
 const ROSTER_SIZES = [5, 15, 30] as const
-// datetime-local's `step` is in seconds; 900s = 15 minutes restricts the native picker's
-// minute column to :00/:15/:30/:45 instead of every single minute.
-const START_TIME_STEP_SECONDS = 900
-// Long enough to actually read "Saved", short enough not to feel like a stuck screen.
-const AUTO_CLOSE_DELAY_MS = 1200
+
+// datetime-local's `step` attribute only affects *validation*, never which minutes the native
+// picker actually shows (confirmed: the spec ties step to validity checking, not UI presentation
+// — Chromium's scrollable minute list always offers all 60 regardless of step). The only
+// reliable way to truly restrict the *visible* options is to stop using the native minute
+// picker for it: a plain date input (unaffected by this issue) plus a <select> pre-populated
+// with only :00/:15/:30/:45 per hour.
+const TIME_OF_DAY_OPTIONS: string[] = (() => {
+  const options: string[] = []
+  for (let h = 0; h < 24; h++) {
+    for (const m of [0, 15, 30, 45]) {
+      options.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`)
+    }
+  }
+  return options
+})()
+
+function snapToQuarterHour(hhmm: string): string {
+  const [hStr, mStr] = hhmm.split(':')
+  const h = Number(hStr) || 0
+  const m = Number(mStr) || 0
+  const snappedM = Math.round(m / 15) * 15
+  const carry = snappedM === 60
+  const finalH = (h + (carry ? 1 : 0)) % 24
+  return `${String(finalH).padStart(2, '0')}:${String(carry ? 0 : snappedM).padStart(2, '0')}`
+}
 
 /** Renders the real Phase C table — checkbox / tag / tier / roster-size select / start-time
  * picker per row — into `container`, replacing whatever was there. This is the actual reason
  * this Activity exists: none of these five columns fit together in any Discord-native
  * component (see CWL_CLAN_CONFIG_ACTIVITY_PLAN.md's "Context" section).
  *
- * Edits are held in a working copy and only sent anywhere when "Save" is clicked — same
- * working-copy-then-apply pattern as the Discord-side CwlEventSetupView. "Cancel" just
- * re-renders from the untouched original `payload` (no server round-trip needed, since nothing
- * was ever sent until Save).
+ * Edits are held in a working copy and only sent anywhere when "Save" is clicked. Both buttons
+ * close the Activity via `onClose` when done — Save persists first then closes, Cancel closes
+ * immediately without saving anything. No intermediate confirmation screen; closing itself is
+ * the confirmation.
  *
- * `onClose` calls discordSdk.close() (RPCCloseCodes.CLOSE_NORMAL) — a real SDK method, missed
- * on first pass because it isn't listed under commands/ like everything else; it's a top-level
- * DiscordSDK method that sends a raw CLOSE protocol frame instead of a request/response command.
+ * `onClose(reason)` calls discordSdk.close(RPCCloseCodes.CLOSE_NORMAL, reason) — a real,
+ * documented top-level SDK method, confirmed working live (both from Save and Cancel).
  */
 export function renderClanConfigTable(
   container: HTMLElement,
   payload: ClanConfigPayload,
   onSave: (clans: ClanConfig[]) => Promise<void>,
-  onClose: () => void,
+  onClose: (reason: string) => void,
 ): void {
   const working: ClanConfig[] = payload.clans.map((c) => ({ ...c }))
 
@@ -67,7 +87,7 @@ export function renderClanConfigTable(
   cancelButton.textContent = 'Cancel'
   cancelButton.className = 'cancel-button'
   cancelButton.addEventListener('click', () => {
-    renderClanConfigTable(container, payload, onSave, onClose)
+    onClose('Cancelled')
   })
 
   saveButton.addEventListener('click', async () => {
@@ -77,7 +97,7 @@ export function renderClanConfigTable(
     status.className = 'save-status'
     try {
       await onSave(working)
-      renderSavedState(container, payload, onSave, onClose)
+      onClose('Saved')
     } catch (err) {
       console.error(err)
       status.textContent = `Save failed: ${(err as Error).message}`
@@ -93,32 +113,6 @@ export function renderClanConfigTable(
   footer.appendChild(cancelButton)
   footer.appendChild(status)
   container.appendChild(footer)
-}
-
-/** Post-save confirmation, briefly shown before the Activity closes itself via onClose(). */
-function renderSavedState(
-  container: HTMLElement,
-  payload: ClanConfigPayload,
-  onSave: (clans: ClanConfig[]) => Promise<void>,
-  onClose: () => void,
-): void {
-  container.innerHTML = ''
-
-  const message = document.createElement('div')
-  message.className = 'saved-message'
-  message.textContent = '✓ Saved — closing…'
-  container.appendChild(message)
-
-  const editAgainButton = document.createElement('button')
-  editAgainButton.textContent = 'Edit again'
-  editAgainButton.className = 'cancel-button'
-
-  const closeTimer = window.setTimeout(onClose, AUTO_CLOSE_DELAY_MS)
-  editAgainButton.addEventListener('click', () => {
-    window.clearTimeout(closeTimer)
-    renderClanConfigTable(container, payload, onSave, onClose)
-  })
-  container.appendChild(editAgainButton)
 }
 
 function buildRow(clan: ClanConfig): HTMLTableRowElement {
@@ -148,22 +142,41 @@ function buildRow(clan: ClanConfig): HTMLTableRowElement {
   rosterCell.appendChild(rosterSelect)
 
   const startCell = document.createElement('td')
-  const startInput = document.createElement('input')
-  startInput.type = 'datetime-local'
-  startInput.step = String(START_TIME_STEP_SECONDS)
-  // Bridge format is "YYYY-MM-DDTHH:MMZ" (always UTC, matching the Discord-side modal's own
-  // convention) — datetime-local wants "YYYY-MM-DDTHH:MM" with no timezone suffix at all, and
-  // is treated as a plain UTC value here too (never converted to/from the browser's locale).
-  if (clan.cwl_start_at) {
-    startInput.value = clan.cwl_start_at.replace(/Z$/, '')
+  startCell.className = 'start-time-cell'
+
+  const dateInput = document.createElement('input')
+  dateInput.type = 'date'
+
+  const timeSelect = document.createElement('select')
+  for (const time of TIME_OF_DAY_OPTIONS) {
+    const option = document.createElement('option')
+    option.value = time
+    option.textContent = time
+    timeSelect.appendChild(option)
   }
-  startCell.appendChild(startInput)
+
+  // Bridge format is "YYYY-MM-DDTHH:MMZ" (always UTC, matching the Discord-side modal's own
+  // convention) — split into a plain date and a quarter-hour-snapped time-of-day. Never
+  // converted to/from the browser's locale; both sides always mean UTC.
+  if (clan.cwl_start_at) {
+    const [datePart, timePart] = clan.cwl_start_at.replace(/Z$/, '').split('T')
+    dateInput.value = datePart ?? ''
+    timeSelect.value = snapToQuarterHour(timePart ?? '08:00')
+  } else {
+    timeSelect.value = '08:00' // just a sane starting position — doesn't set anything until a date is chosen
+  }
+  startCell.append(dateInput, timeSelect)
 
   function syncDisabledState(): void {
     const disabled = !checkbox.checked
     rosterSelect.disabled = disabled
-    startInput.disabled = disabled
+    dateInput.disabled = disabled
+    timeSelect.disabled = disabled
     row.classList.toggle('inactive', disabled)
+  }
+
+  function updateStartValue(): void {
+    clan.cwl_start_at = dateInput.value ? `${dateInput.value}T${timeSelect.value}Z` : null
   }
 
   checkbox.addEventListener('change', () => {
@@ -173,9 +186,8 @@ function buildRow(clan: ClanConfig): HTMLTableRowElement {
   rosterSelect.addEventListener('change', () => {
     clan.roster_size = Number(rosterSelect.value)
   })
-  startInput.addEventListener('change', () => {
-    clan.cwl_start_at = startInput.value ? `${startInput.value}Z` : null
-  })
+  dateInput.addEventListener('change', updateStartValue)
+  timeSelect.addEventListener('change', updateStartValue)
   syncDisabledState()
 
   checkboxCell.appendChild(checkbox)

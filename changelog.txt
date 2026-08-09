@@ -1,6 +1,37 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (31)
+- Fixed/confirmed: discordSdk.close() for the CWL clan-config Activity actually does work,
+  correcting (30)'s "doesn't work" conclusion — the real issue was that only Save called it
+  (via a confirmation screen) and Cancel was wired to nothing at all, so "nothing happens" on
+  the previous test was partly Cancel being a genuine no-op, not necessarily close() failing.
+  Wired Cancel to discard-and-close immediately (it previously just silently reset the table to
+  its original state, which looked identical to "did nothing" if nothing had been edited yet).
+  Retested both buttons live — confirmed working. Per project owner preference, removed the
+  "✓ Saved — closing..." intermediate confirmation screen entirely: Save now persists then
+  closes immediately, matching Cancel's immediacy — closing itself is the confirmation.
+  Files: activity/client/src/clanConfigTable.ts, activity/client/src/main.ts,
+  activity/client/index.html, CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.
+
+2026-08-09 (30)
+- Fixed: two of (29)'s fixes turned out not to actually work when live-tested again — corrected
+  both properly this time:
+  (1) The 15-minute start-time step (datetime-local's step="900") didn't restrict anything —
+  confirmed the HTML spec ties `step` to validation only, never to which values the native
+  picker UI actually shows; Chromium's minute scroller ignores it entirely. Replaced the
+  minute-picking part of the UI outright: a plain date input (unaffected) plus a <select>
+  pre-populated with the 96 valid quarter-hour values, combined on change into the same
+  "YYYY-MM-DDTHH:MMZ" value the bridge expects.
+  (2) The discordSdk.close(RPCCloseCodes.CLOSE_NORMAL) "auto-close" from (29) also didn't work
+  live — the method is real and documented, but Discord's client doesn't visibly act on it.
+  Reverted the misleading "Saved — closing..." countdown UI back to a static "Saved — you can
+  close this window now" message (still calls close() once as a harmless best-effort, just
+  without promising an effect that doesn't happen). Manually closing via Discord's own collapse
+  control remains the only confirmed-working way to dismiss an Activity.
+  Files: activity/client/src/clanConfigTable.ts, activity/client/index.html,
+  CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.
+
 2026-08-09 (29)
 - Fixed: two issues from continued live testing of the CWL clan-config Activity, (27)/(28):
   (1) The Activity now actually closes itself after a successful Save. Earlier I'd concluded

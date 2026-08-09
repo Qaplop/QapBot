@@ -23,7 +23,7 @@
       .tier-cell { color: #949ba4; }
 
       input[type="checkbox"] { width: 18px; height: 18px; accent-color: #5865f2; }
-      select, input[type="datetime-local"] {
+      select, input[type="date"] {
         background: #1e1f22;
         color: #f2f3f5;
         border: 1px solid #3f4147;
@@ -32,6 +32,8 @@
         font-size: 0.9rem;
       }
       select:disabled, input:disabled { cursor: not-allowed; }
+      .start-time-cell { display: flex; gap: 8px; align-items: center; }
+      .start-time-cell input[type="date"] { flex: 1; min-width: 0; }
 
       .footer { margin-top: 16px; display: flex; align-items: center; gap: 12px; }
       .save-button {
@@ -59,8 +61,6 @@
       .save-status { font-size: 0.85rem; color: #949ba4; }
       .save-status.success { color: #23a55a; }
       .save-status.error { color: #f23f42; }
-
-      .saved-message { font-size: 1.1rem; color: #23a55a; margin-bottom: 16px; }
     </style>
   </head>
   <body>
