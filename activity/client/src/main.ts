@@ -52,43 +52,57 @@ async function setup(): Promise<void> {
       return
     }
 
-    root.textContent = 'Loading clan configuration…'
-
-    const configResponse = await fetch(`/api/cwl/clan-config?guild_id=${encodeURIComponent(guildId)}`, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    })
-    if (!configResponse.ok) {
-      const body = await configResponse.text()
-      throw new Error(`failed to load clan config (${configResponse.status}): ${body}`)
+    const onCloseActivity = (reason: string): void => {
+      // Diagnostic logging (visible via Discord's own Activity dev console) in case this
+      // silently no-ops for some environments — console output is routed to Discord's client
+      // by the SDK itself (see Discord.d.ts's overrideConsoleLogging warning).
+      console.log(`[cwl-clan-config] calling discordSdk.close(CLOSE_NORMAL, "${reason}")`)
+      try {
+        discordSdk.close(RPCCloseCodes.CLOSE_NORMAL, reason)
+      } catch (err) {
+        console.error('[cwl-clan-config] discordSdk.close() threw:', err)
+      }
     }
-    const payload = (await configResponse.json()) as ClanConfigPayload
 
-    renderClanConfigTable(
-      root,
-      payload,
-      async (clans: ClanConfig[]) => {
-        const saveResponse = await fetch('/api/cwl/clan-config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
-          body: JSON.stringify({ guild_id: guildId, clans }),
-        })
-        if (!saveResponse.ok) {
-          const body = await saveResponse.text()
-          throw new Error(`${saveResponse.status}: ${body}`)
-        }
-      },
-      (reason: string) => {
-        // Diagnostic logging (visible via Discord's own Activity dev console) in case this
-        // silently no-ops for some environments — console output is routed to Discord's client
-        // by the SDK itself (see Discord.d.ts's overrideConsoleLogging warning).
-        console.log(`[cwl-clan-config] calling discordSdk.close(CLOSE_NORMAL, "${reason}")`)
-        try {
-          discordSdk.close(RPCCloseCodes.CLOSE_NORMAL, reason)
-        } catch (err) {
-          console.error('[cwl-clan-config] discordSdk.close() threw:', err)
-        }
-      },
-    )
+    // Re-invoked on season-dropdown changes (see renderClanConfigTable's onSeasonChange) as a
+    // full reload-and-rerender — simpler and safer than trying to patch DOM state in place, and
+    // this screen is opened/edited interactively, not on any kind of tight loop.
+    const loadAndRender = async (season?: string): Promise<void> => {
+      root.textContent = 'Loading clan configuration…'
+
+      const query = season ? `&season=${encodeURIComponent(season)}` : ''
+      const configResponse = await fetch(
+        `/api/cwl/clan-config?guild_id=${encodeURIComponent(guildId)}${query}`,
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+      )
+      if (!configResponse.ok) {
+        const body = await configResponse.text()
+        throw new Error(`failed to load clan config (${configResponse.status}): ${body}`)
+      }
+      const payload = (await configResponse.json()) as ClanConfigPayload
+
+      renderClanConfigTable(
+        root,
+        payload,
+        async (clans: ClanConfig[]) => {
+          const saveResponse = await fetch('/api/cwl/clan-config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+            body: JSON.stringify({ guild_id: guildId, season: payload.season, clans }),
+          })
+          if (!saveResponse.ok) {
+            const body = await saveResponse.text()
+            throw new Error(`${saveResponse.status}: ${body}`)
+          }
+        },
+        onCloseActivity,
+        (newSeason: string) => {
+          void loadAndRender(newSeason)
+        },
+      )
+    }
+
+    await loadAndRender()
   } catch (err) {
     console.error(err)
     root.textContent = `Setup failed: ${(err as Error).message}`

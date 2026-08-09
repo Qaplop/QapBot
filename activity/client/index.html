@@ -14,7 +14,44 @@
       }
       #app { padding: 16px; }
 
-      .header { font-size: 1.1rem; font-weight: 600; margin-bottom: 12px; }
+      .header { margin-bottom: 12px; }
+      .season-row { display: flex; align-items: center; gap: 10px; }
+      .season-select { font-size: 1.05rem; font-weight: 600; }
+      .status-badge {
+        background: #3f4147;
+        color: #949ba4;
+        border-radius: 4px;
+        padding: 2px 8px;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.02em;
+      }
+      .tz-note { margin-top: 4px; font-size: 0.8rem; color: #949ba4; }
+
+      .carry-over-banner {
+        background: #2b2d31;
+        border: 1px solid #3f4147;
+        border-radius: 6px;
+        padding: 10px 12px;
+        margin-bottom: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        font-size: 0.9rem;
+      }
+      .carry-over-buttons { display: flex; gap: 8px; flex-shrink: 0; }
+      .carry-over-yes, .carry-over-no {
+        border: none;
+        border-radius: 4px;
+        padding: 6px 12px;
+        font-size: 0.85rem;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      .carry-over-yes { background: #5865f2; color: white; }
+      .carry-over-no { background: #3f4147; color: #f2f3f5; }
 
       table { border-collapse: collapse; width: 100%; }
       th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #3f4147; }
