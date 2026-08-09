@@ -2716,13 +2716,17 @@ class ChannelConfigurationView(discord.ui.View):
         self._add_clear_buttons(button_row)
 
     def _add_channel_select(self, slot: ChannelSlotConfig, row: int) -> None:
-        """Add a channel selector for one slot."""
+        """Add a channel selector for one slot, pre-selected to the currently configured
+        channel (if any) via ChannelSelect's default_values — otherwise every reopen of this
+        view looks unconfigured even when a channel is already set."""
+        current_channel = self.selected_channels.get(slot.key)
         select = discord.ui.ChannelSelect(
             placeholder=f"Select {slot.label.lower()} channel...",
             min_values=1,
             max_values=1,
             channel_types=[discord.ChannelType.text],
             custom_id=f"config_channel_select_{slot.key}",
+            default_values=[current_channel] if current_channel else [],
             row=row
         )
         select.callback = self._make_select_callback(slot)  # type: ignore[assignment]
