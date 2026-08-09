@@ -2809,6 +2809,25 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] get_cwl_event_clans_sync failed for event {event_id}: {e}")
                 return []
 
+    def get_cwl_signup_status_counts_sync(self, event_id: int) -> Dict[str, int]:
+        """Return {status: count} for an event's cwl_signups (pending/confirmed/declined/
+        withdrawn) — statuses with zero rows are simply absent from the dict, not zero-filled."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT status, COUNT(*) AS n FROM cwl_signups WHERE event_id = ? GROUP BY status",
+                    (event_id,),
+                ).fetchall()
+                return {row["status"]: int(row["n"]) for row in rows}
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_signup_status_counts_sync failed for event {event_id}: {e}")
+                return {}
+
     def get_previous_cwl_event_clans_sync(
         self, guild_id: str, exclude_event_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:

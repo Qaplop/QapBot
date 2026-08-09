@@ -324,7 +324,7 @@ class ClanManagementView(discord.ui.View):
         self._add_mode_select()  # type: ignore[attr-defined]
         
         # Add clan selection dropdown (not needed for roles, families, or config mode)
-        if mode not in ["roles", "families", "config"]:
+        if mode not in ["roles", "families", "config", "cwl_settings", "cwl_management"]:
             logging.debug(f"Mode requires clan select, calling _add_clan_select()")
             self._add_clan_select()
         else:
@@ -357,7 +357,16 @@ class ClanManagementView(discord.ui.View):
             # Add basic configuration components
             logging.debug(f"Adding basic config components")
             self._add_basic_config_components()
-        
+        elif mode in ("cwl_settings", "cwl_management"):
+            _cwl_guild_id = self.sent_message.guild.id if self.sent_message and self.sent_message.guild else None
+            if _cwl_guild_id is not None:
+                if mode == "cwl_settings":
+                    from qapbot.ui_cwl_roster import add_cwl_settings_components
+                    add_cwl_settings_components(self, _cwl_guild_id)
+                else:
+                    from qapbot.ui_cwl_roster import add_cwl_management_components
+                    add_cwl_management_components(self, _cwl_guild_id)
+
         logging.debug(f"Adding refresh button")
         # Add refresh button
         self._add_refresh_button()  # type: ignore[attr-defined]
@@ -455,6 +464,18 @@ class ClanManagementView(discord.ui.View):
                 value="notifications",
                 description=t('ui_components.clan_management.mode_notifications_desc', guild_id=guild_id),
                 default=(self.mode == "notifications")
+            ),
+            discord.SelectOption(
+                label=t('ui_components.clan_management.mode_cwl_settings_label', guild_id=guild_id),
+                value="cwl_settings",
+                description=t('ui_components.clan_management.mode_cwl_settings_desc', guild_id=guild_id),
+                default=(self.mode == "cwl_settings")
+            ),
+            discord.SelectOption(
+                label=t('ui_components.clan_management.mode_cwl_management_label', guild_id=guild_id),
+                value="cwl_management",
+                description=t('ui_components.clan_management.mode_cwl_management_desc', guild_id=guild_id),
+                default=(self.mode == "cwl_management")
             )
         ]
         
@@ -2271,10 +2292,45 @@ class ClanManagementView(discord.ui.View):
                 embeds=[main_embed],  # type: ignore[arg-type]
                 view=new_view
             )
-            
+
         except Exception as e:
             logging.error(f"Failed to refresh config view: {e}")
-    
+
+    async def refresh_cwl_view(self, interaction: discord.Interaction, mode: str) -> None:
+        """Duck-typed refresh target for the CWL settings/management sub-screens
+        (qapbot/ui_cwl_roster.py's _refresh_parent()) — same pattern as
+        _refresh_config_view() above, generalized to take the mode explicitly rather than
+        hardcoding "config", since this one method serves both cwl_settings and cwl_management.
+        The equivalent method on CwlManagementHubView (entry point b) resolves and edits that
+        guild's anchored message directly instead, since that view is a single shared instance
+        across every guild rather than one instance per open /clan management session.
+        """
+        from qapbot.QBdiscocmdshelper import format_clan_management_message
+
+        if not interaction.guild:
+            return
+
+        try:
+            main_embed, _, _, _ = await format_clan_management_message(
+                self.clan_tag,
+                interaction.guild,
+                mode=mode,
+            )
+            new_view = ClanManagementView(
+                clan_tag=self.clan_tag,
+                guild_clans=self.guild_clans,
+                unlinked_players=self.unlinked_players,
+                sent_message=self.sent_message,
+                mode=mode,
+                timeout=1800,
+            )
+            await self.sent_message.edit(
+                embeds=[main_embed],  # type: ignore[arg-type]
+                view=new_view,
+            )
+        except Exception as e:
+            logging.error(f"Failed to refresh CWL view ({mode}): {e}")
+
     async def _on_select_channels(self, interaction: discord.Interaction) -> None:
         """Open channel configuration view."""
         if not await self._check_admin_permission(interaction):
@@ -2580,6 +2636,14 @@ def _track_registration_channel_change(guild_id_str: str, old_channel_id: Option
         logging.debug(f"Channel change tracked during apply: old={old_channel_id}, new={new_channel_id}")
 
 
+def _track_cwl_management_channel_change(guild_id_str: str, old_channel_id: Optional[str], new_channel_id: Optional[str]) -> None:
+    """Record the previous CWL Management Hub channel so the next repost_cwl_management_messages()
+    cycle can clean up the old message — same pattern as the registration message's tracking."""
+    if old_channel_id and new_channel_id and old_channel_id != new_channel_id:
+        CACHE.server_config[guild_id_str]["_old_cwl_management_channel_id"] = old_channel_id
+        logging.debug(f"CWL Management Hub channel change tracked during apply: old={old_channel_id}, new={new_channel_id}")
+
+
 DEFAULT_CHANNEL_SLOTS: Tuple[ChannelSlotConfig, ...] = (
     ChannelSlotConfig(
         key="registration",
@@ -2593,6 +2657,13 @@ DEFAULT_CHANNEL_SLOTS: Tuple[ChannelSlotConfig, ...] = (
         label="War",
         config_key="war_notification_channel_id",
         disable_flag_keys=("channel_war_notifications_enabled",),
+    ),
+    ChannelSlotConfig(
+        key="cwl_management",
+        label="CWL Management Hub",
+        config_key="cwl_management_channel_id",
+        disable_flag_keys=("cwl_management_message_enabled",),
+        on_apply=_track_cwl_management_channel_change,
     ),
 )
 

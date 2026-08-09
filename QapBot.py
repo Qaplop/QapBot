@@ -783,6 +783,7 @@ async def main() -> None:
     if CONFIG.no_coc_api:
         logging.info("[NO_COC_API] Skipping clan war updates and leaderboard posts (NO_COC_API=true)")
         await repost_playerregistration_messages(only_if_not_bottom=True, bump_cooldown_seconds=PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS)
+        await repost_cwl_management_messages(only_if_not_bottom=True, bump_cooldown_seconds=PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS)
         return
 
     # Reset CoC API rate limit tracking for this cycle
@@ -1866,6 +1867,7 @@ async def main() -> None:
     await post_leaderboards_to_subscribed_channels()
     logging.info("Discord leaderboard posts complete.")
     await repost_playerregistration_messages(only_if_not_bottom=True, bump_cooldown_seconds=PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS)
+    await repost_cwl_management_messages(only_if_not_bottom=True, bump_cooldown_seconds=PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS)
 
 def _archive_move_nightly() -> None:
     """
@@ -2738,6 +2740,13 @@ async def _setup_hook():
     QBcore.bot.add_view(RegistrationView())
     logging.info("[SETUP_HOOK] Registered persistent RegistrationView for restart-surviving buttons")
 
+    # CWL Management Hub message (CWL_ROSTER_PLANNING_PLAN.md Phase 1) — same restart-survival
+    # reasoning as RegistrationView above: a single generic dispatch instance resolves guild
+    # context per-click rather than being constructed per-guild.
+    from qapbot.ui_cwl_roster import CwlManagementHubView
+    QBcore.bot.add_view(CwlManagementHubView())
+    logging.info("[SETUP_HOOK] Registered persistent CwlManagementHubView for restart-surviving buttons")
+
     logging.info("[SETUP_HOOK] Setup hook completed successfully")
 
 async def _clear_global_commands_after_ready():
@@ -3185,7 +3194,18 @@ async def _run_startup_initialization() -> None:
         except Exception as e:
             logging.error(f"❌ Failed to repost playerregistration messages: {e}")
         logging.info("[INIT-STEP-8] Done")
-        
+
+        # Step 8b: Repost CWL Management Hub messages on startup
+        logging.info("[INIT-STEP-8b] Starting CWL Management Hub message repost...")
+        try:
+            await asyncio.wait_for(repost_cwl_management_messages(), timeout=30.0)
+            logging.info("✅ CWL Management Hub messages reposted successfully")
+        except asyncio.TimeoutError:
+            logging.warning("⚠️ Reposting CWL Management Hub messages timed out after 30 seconds (continuing)")
+        except Exception as e:
+            logging.error(f"❌ Failed to repost CWL Management Hub messages: {e}")
+        logging.info("[INIT-STEP-8b] Done")
+
         # Step 9: Finalize initialization
         QBcore.bot.fully_initialized = True
         QBcore.bot.initialization_in_progress = False
@@ -3585,7 +3605,7 @@ async def repost_anchored_message(
 ) -> Tuple[int, int]:
     """
     Generic anchored-message lifecycle shared by every persistent, per-guild tracked message
-    (currently registration; future callers e.g. CWL hub messages reuse this instead of a copy).
+    (registration; the CWL Management/Personal Hub messages reuse this instead of a copy).
 
     Handles: posting/reposting, deleting when disabled, following a channel change, and never
     risking a duplicate on an inconclusive delete (see COPILOT_PITFALLS_COOKBOOK.md Pitfall 15).
@@ -3596,8 +3616,10 @@ async def repost_anchored_message(
         log_label: short name used in log lines (e.g. "registration").
         enabled_key/channel_key/message_id_key/old_channel_key/last_bump_key: the
             CACHE.server_config[guild_id] keys this feature uses for its anchored message.
-        build_content_and_view: async callback (channel, guild_id_int) -> (content, view)
-            returning what to post/repost.
+        build_content_and_view: async callback (channel, guild_id_int) -> (content, view, embed)
+            returning what to post/repost. embed may be None (registration posts plain content
+            only); callers whose anchored message shows live embed-based state (e.g. the CWL
+            Management Hub) pass a real discord.Embed here instead.
         dev_mode_allowed_channel_id: in DEV mode, skip all channels except this one
             (None/0 = no DEV-mode filtering).
         only_if_not_bottom: if True, only repost when the tracked message is NOT the newest
@@ -3743,11 +3765,11 @@ async def repost_anchored_message(
                 logging.warning(f"Could not confirm deletion of old {log_label} message {tracked_message_id} in channel {channel_id} ({e}); skipping repost this cycle to avoid a duplicate.")
                 continue
 
-        content, view = await build_content_and_view(channel, guild_id_int)
+        content, view, embed = await build_content_and_view(channel, guild_id_int)
 
         try:
             # Post new anchored message
-            new_message = await channel.send(content, view=view)
+            new_message = await channel.send(content, view=view, embed=embed)
 
             # Update server config with new message ID
             config[message_id_key] = str(new_message.id)
@@ -3790,13 +3812,13 @@ async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False
     from qapbot.ui_registration import RegistrationView
     from qapbot.QBdiscocmdshelper import get_playerregistration_message
 
-    async def _build_registration_content_and_view(channel: Any, guild_id_int: int) -> Tuple[str, discord.ui.View]:
+    async def _build_registration_content_and_view(channel: Any, guild_id_int: int) -> Tuple[str, discord.ui.View, Optional[discord.Embed]]:
         server_name = channel.guild.name
         logging.debug(f"Generating registration message:")
         logging.debug(f"  - Guild: {guild_id_int} ({server_name})")
         registration_msg = get_playerregistration_message(server_name, guild_id=guild_id_int)
         logging.debug(f"Generated registration message (first 200 chars):\n{registration_msg[:200]}...")
-        return registration_msg, RegistrationView(guild_id_int)
+        return registration_msg, RegistrationView(guild_id_int), None
 
     playerregistration_count, filtered_count = await repost_anchored_message(
         log_label="registration",
@@ -3822,6 +3844,55 @@ async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False
             logging.info(f"No registration messages to repost in guild {CONFIG.discord_guild_id} ({filtered_count} guilds filtered)")
         else:
             logging.info("No registration messages to repost")
+
+
+async def repost_cwl_management_messages(*, only_if_not_bottom: bool = False, bump_cooldown_seconds: int = PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS) -> None:
+    """
+    Repost CWL Management Hub messages for guilds with the hub enabled
+    (CWL_ROSTER_PLANNING_PLAN.md Phase 1) — the admin-facing anchored message showing the
+    cwl_settings/cwl_management screens (entry point b; /clan management's own mode dropdown
+    is entry point a, sharing the exact same content/component builders).
+
+    Thin wrapper around the generic repost_anchored_message() driver, same discipline as
+    repost_playerregistration_messages() above — only the config keys and message content/view
+    differ per anchored-message feature.
+    """
+    from qapbot.ui_cwl_roster import CwlManagementHubView, add_cwl_management_components
+    from qapbot.QBdiscocmdshelper_cwl import _format_clan_management_cwl_management
+
+    async def _build_cwl_management_content_and_view(channel: Any, guild_id_int: int) -> Tuple[str, discord.ui.View, Optional[discord.Embed]]:
+        guild = channel.guild
+        view = CwlManagementHubView()
+        embed, _, _, _ = await _format_clan_management_cwl_management(guild)
+        add_cwl_management_components(view, guild_id_int)
+        return "", view, embed
+
+    cwl_management_count, filtered_count = await repost_anchored_message(
+        log_label="CWL Management Hub",
+        enabled_key="cwl_management_message_enabled",
+        channel_key="cwl_management_channel_id",
+        message_id_key="cwl_management_message_id",
+        old_channel_key="_old_cwl_management_channel_id",
+        last_bump_key="cwl_management_message_last_bump_iso",
+        build_content_and_view=_build_cwl_management_content_and_view,
+        # Reuses the registration message's DEV test channel rather than requiring a second,
+        # dedicated env var — both exist purely to avoid posting to real guilds' channels while
+        # testing in DEV mode.
+        dev_mode_allowed_channel_id=CONFIG.dev_playerregistration_channel_id or None,
+        only_if_not_bottom=only_if_not_bottom,
+        bump_cooldown_seconds=bump_cooldown_seconds,
+    )
+
+    if cwl_management_count > 0:
+        if CONFIG.is_dev_mode and filtered_count > 0:
+            logging.info(f"Successfully reposted {cwl_management_count} CWL Management Hub messages ({filtered_count} guilds filtered in DEV mode)")
+        else:
+            logging.info(f"Successfully reposted {cwl_management_count} CWL Management Hub messages")
+    else:
+        if CONFIG.is_dev_mode and filtered_count > 0:
+            logging.info(f"No CWL Management Hub messages to repost in guild {CONFIG.discord_guild_id} ({filtered_count} guilds filtered)")
+        else:
+            logging.info("No CWL Management Hub messages to repost")
 
 def log_lifetime_stats() -> None:
     """Log lifetime stats exactly once.  Safe to call from any shutdown path."""

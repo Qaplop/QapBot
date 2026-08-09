@@ -1,6 +1,61 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (21)
+- Added: UI layer for the CWL roster planning feature's settings/season-setup screens
+  (Phase 1 finish, CWL_ROSTER_PLANNING_PLAN.md), reachable through two entry points that
+  share one implementation: two new modes on the existing /clan management view
+  ("cwl_settings", "cwl_management"), and a new permanently-anchored CWL Management Hub
+  message showing the same two screens.
+  Shared content layer (called by both entry points, never duplicated): embed builders
+  _format_clan_management_cwl_settings()/_format_clan_management_cwl_management() in new
+  file qapbot/QBdiscocmdshelper_cwl.py; button-row builders add_cwl_settings_components()/
+  add_cwl_management_components() in new file qapbot/ui_cwl_roster.py — free functions
+  rather than private view methods, since ClanManagementView and the new
+  CwlManagementHubView both attach them to their own view instance.
+  cwl_settings: hub channel configuration (new "CWL Management Hub" slot on
+  ChannelConfigurationView's existing data-driven DEFAULT_CHANNEL_SLOTS — that class was
+  already generalized for exactly this, no new sub-screen needed), hub message
+  activate/deactivate toggle, retention Select (Never/3/6/12/24 months).
+  cwl_management: current event/season status, per-clan participant breakdown, sign-up
+  status counts; "Configure Participating Clans" opens new CwlEventSetupView (clan
+  toggle buttons, capped at 20, seeded from the current event's clans or — if none yet —
+  the prior season's via get_previous_cwl_event_clans_sync(), implementing "carry over
+  from previous season" as the default state). Deliberately deferred this pass: per-clan
+  roster-size/start-time editing (doesn't fit Discord's 5-action-row budget alongside
+  each screen's own always-present chrome; needs its own drill-down screen) — new clans
+  default to roster_size=15/no start time, and CwlStartTimeModal from the original draft
+  was not built since it has no caller yet. "Start Enrollment"/"Manage Assignments"
+  buttons added but hardcoded disabled=True until Phases 2/4 ship their handlers.
+  repost_anchored_message() (QapBot.py)'s build_content_and_view callback contract
+  extended from (content, view) to (content, view, embed) (embed optional, None for the
+  existing registration-message caller — zero behavior change there) so the Hub's
+  anchored message can render live embed state, not just plain text. New
+  repost_cwl_management_messages() wraps it the same way repost_playerregistration_messages()
+  already does, wired into the 3 existing call sites (NO_COC_API branch, end of the
+  normal per-cycle update flow, startup "Step 8b").
+  Caught and fixed before shipping: CwlManagementHubView is registered once via
+  bot.add_view() and serves every guild's anchored Hub message concurrently (same pattern
+  as RegistrationView) — an early draft stored "which screen is showing" as self.mode
+  instance state, which would have let concurrent clicks from different guilds clobber
+  each other's screen. Fixed by threading mode as an explicit parameter through
+  refresh_cwl_view() at every call site instead; added a regression test asserting the
+  view holds no such instance state. Also fixed refresh_cwl_view() targeting the wrong
+  message when called from a different, already-consumed sub-screen interaction (e.g.
+  CwlEventSetupView's Apply button) — it now always resolves and edits the guild's
+  tracked anchored message directly via the bot client rather than reusing that
+  interaction's own response methods.
+  cwl_group (the member-facing /cwl signup /cwl withdraw command group) was not created
+  this phase — an app_commands.Group with zero subcommands has nothing to register;
+  it's created in Phase 2, which actually adds those subcommands.
+  New i18n: top-level "cwl" namespace (settings/management/setup) in en.json/de.json,
+  plus ui_components.clan_management mode-select labels for the two new modes.
+  Files: qapbot/QBdiscocmdshelper_cwl.py (new), qapbot/ui_cwl_roster.py (new),
+  qapbot/ui_clan_management.py, qapbot/QBdiscocmdshelper.py, QapBot.py,
+  qapbot/translations/en.json, qapbot/translations/de.json,
+  tests/discord/test_ui_cwl_roster.py (new).
+  1600 tests pass (.\run_tests.ps1).
+
 2026-08-09 (20)
 - Added: Data Model layer for the CWL roster planning feature (Phase 1 start,
   CWL_ROSTER_PLANNING_PLAN.md) — 4 new hot-DB-only tables (cwl_events, cwl_event_clans,

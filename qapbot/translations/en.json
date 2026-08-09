@@ -370,6 +370,10 @@
       "mode_families_desc": "Create and manage clan families",
       "mode_config_label": "⚙️ Basic Configuration",
       "mode_config_desc": "Server language, channels, and settings",
+      "mode_cwl_settings_label": "🏆 CWL Settings",
+      "mode_cwl_settings_desc": "CWL Management Hub channel, message toggle, retention",
+      "mode_cwl_management_label": "🗡️ CWL Season Management",
+      "mode_cwl_management_desc": "Configure participating clans, manage the current season",
       "mode_placeholder": "Select management mode...",
       "clan_placeholder": "Select clan to manage...",
       "button_previous": "◀ Previous",
@@ -726,6 +730,56 @@
       "field_source_info": "📊 Source Information",
       "failed_title": "❌ Import Failed",
       "parse_failed_title": "❌ Parse Failed"
+    }
+  },
+  "cwl": {
+    "settings": {
+      "title": "⚙️ CWL Settings",
+      "description": "Guild-level preferences for CWL roster planning in {guild_name}.",
+      "channel_not_set": "Not set",
+      "status_enabled": "Enabled",
+      "status_disabled": "Disabled",
+      "hub_block_title": "CWL Management Hub",
+      "hub_status": "Status: {status}",
+      "hub_channel": "Channel: {channel}",
+      "retention_never": "Keep indefinitely",
+      "retention_months": "{months} months",
+      "retention_block_title": "Data Retention",
+      "retention_value": "Completed/cancelled events are purged after: {value}",
+      "retention_placeholder": "Data retention...",
+      "button_configure_channels": "Configure Channels",
+      "button_activate_hub": "Activate CWL Management Hub Message",
+      "button_deactivate_hub": "Deactivate CWL Management Hub Message"
+    },
+    "management": {
+      "title": "🏆 CWL Management",
+      "no_event": "No CWL event has been configured yet. Use \"Configure Participating Clans\" below to get started.",
+      "season_header": "Season **{season}** — {status}",
+      "event_status_draft": "Draft",
+      "event_status_signup_open": "Sign-Up Open",
+      "event_status_finalized": "Finalized",
+      "event_status_announced": "Announced",
+      "event_status_cancelled": "Cancelled",
+      "no_clans_configured": "No clans configured yet.",
+      "tier_unset": "tier not set",
+      "start_time_unset": "not set",
+      "roster_slots": "roster slots",
+      "start_label": "Start",
+      "clans_block_title": "Participating Clans",
+      "signup_status_pending": "Pending",
+      "signup_status_confirmed": "Confirmed",
+      "signup_status_declined": "Declined",
+      "signup_status_withdrawn": "Withdrawn",
+      "signups_block_title": "Sign-Ups",
+      "button_configure_clans": "Configure Participating Clans",
+      "button_start_enrollment": "Start Enrollment",
+      "button_manage_assignments": "Manage Assignments"
+    },
+    "setup": {
+      "header": "Select which clans participate this season ({count} selected):",
+      "no_clans_selected": "No clans selected yet — click a clan below to add it.",
+      "button_apply": "Apply",
+      "button_cancel": "Cancel"
     }
   }
 }

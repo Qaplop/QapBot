@@ -369,6 +369,10 @@
       "mode_families_desc": "Clan-Familien erstellen und verwalten",
       "mode_config_label": "⚙️ Grundeinstellungen",
       "mode_config_desc": "Serversprache, Kanäle und Einstellungen",
+      "mode_cwl_settings_label": "🏆 CWL-Einstellungen",
+      "mode_cwl_settings_desc": "CWL-Verwaltungs-Hub-Kanal, Nachrichten-Umschalter, Aufbewahrung",
+      "mode_cwl_management_label": "🗡️ CWL-Saisonverwaltung",
+      "mode_cwl_management_desc": "Teilnehmende Clans konfigurieren, aktuelle Saison verwalten",
       "mode_placeholder": "Verwaltungsmodus auswählen...",
       "clan_placeholder": "Clan zum Verwalten auswählen...",
       "button_previous": "◀ Zurück",
@@ -725,6 +729,56 @@
       "field_source_info": "📊 Quellinformationen",
       "failed_title": "❌ Import fehlgeschlagen",
       "parse_failed_title": "❌ Parsen fehlgeschlagen"
+    }
+  },
+  "cwl": {
+    "settings": {
+      "title": "⚙️ CWL-Einstellungen",
+      "description": "Server-weite Einstellungen für die CWL-Kaderplanung in {guild_name}.",
+      "channel_not_set": "Nicht gesetzt",
+      "status_enabled": "Aktiviert",
+      "status_disabled": "Deaktiviert",
+      "hub_block_title": "CWL-Verwaltungs-Hub",
+      "hub_status": "Status: {status}",
+      "hub_channel": "Kanal: {channel}",
+      "retention_never": "Unbegrenzt aufbewahren",
+      "retention_months": "{months} Monate",
+      "retention_block_title": "Datenaufbewahrung",
+      "retention_value": "Abgeschlossene/abgebrochene Events werden gelöscht nach: {value}",
+      "retention_placeholder": "Datenaufbewahrung...",
+      "button_configure_channels": "Kanäle konfigurieren",
+      "button_activate_hub": "CWL-Verwaltungs-Hub-Nachricht aktivieren",
+      "button_deactivate_hub": "CWL-Verwaltungs-Hub-Nachricht deaktivieren"
+    },
+    "management": {
+      "title": "🏆 CWL-Verwaltung",
+      "no_event": "Es wurde noch kein CWL-Event konfiguriert. Nutze unten \"Teilnehmende Clans konfigurieren\", um zu starten.",
+      "season_header": "Saison **{season}** — {status}",
+      "event_status_draft": "Entwurf",
+      "event_status_signup_open": "Anmeldung offen",
+      "event_status_finalized": "Finalisiert",
+      "event_status_announced": "Angekündigt",
+      "event_status_cancelled": "Abgebrochen",
+      "no_clans_configured": "Noch keine Clans konfiguriert.",
+      "tier_unset": "Liga nicht gesetzt",
+      "start_time_unset": "nicht gesetzt",
+      "roster_slots": "Kaderplätze",
+      "start_label": "Start",
+      "clans_block_title": "Teilnehmende Clans",
+      "signup_status_pending": "Ausstehend",
+      "signup_status_confirmed": "Bestätigt",
+      "signup_status_declined": "Abgelehnt",
+      "signup_status_withdrawn": "Zurückgezogen",
+      "signups_block_title": "Anmeldungen",
+      "button_configure_clans": "Teilnehmende Clans konfigurieren",
+      "button_start_enrollment": "Anmeldephase starten",
+      "button_manage_assignments": "Zuweisungen verwalten"
+    },
+    "setup": {
+      "header": "Wähle die teilnehmenden Clans für diese Saison ({count} ausgewählt):",
+      "no_clans_selected": "Noch keine Clans ausgewählt — klicke unten auf einen Clan, um ihn hinzuzufügen.",
+      "button_apply": "Übernehmen",
+      "button_cancel": "Abbrechen"
     }
   }
 }
