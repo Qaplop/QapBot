@@ -1,6 +1,65 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (24)
+- Added: implementation plan (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md) and Phase A skeleton for a
+  Discord Activity replacing the "Configure Participating Clans" screen with a real HTML table
+  (checkbox/tag/tier/roster-size/start-time columns) — confirmed against the actual installed
+  discord.py==2.7.1 that no combination of Modals/Views can render this for 12+ clans (modals
+  cap at 5 top-level items; CheckboxGroup caps at 10 options; no native date/time picker exists
+  at all). New activity/server (Cloudflare Worker, Hono, OAuth2 token exchange + a Phase-B-stubbed
+  proxy to a future QapBot bridge API) and activity/client (Cloudflare Pages, plain TypeScript —
+  deliberately no framework, since this MVP's ~12-30 rows don't need React/TanStack Table's
+  search/sort/filter/pagination machinery) projects, both installing/typechecking/building clean
+  with zero npm audit findings.
+  Phase A (OAuth round-trip + launch mechanism) shipped and verified live against the DEV
+  Discord application: launched for real from inside Discord (voice channel -> "Choose Activity"
+  -> Qaps-CoC-Bot[DEV]) and confirmed showing the actual DEV guild's ID end-to-end. Three real
+  bugs found and fixed along the way: (1) Discord's /oauth2/token endpoint requires a
+  redirect_uri in the server-side token exchange even though the SDK's own authorize() call has
+  no such parameter and nothing ever navigates there — both research threads' reference code had
+  simply omitted it; (2) Discord's Proxy Path Mapping prefix-stripping behavior is undocumented,
+  so the Worker's routes are now mounted at both /api/* and unprefixed /* rather than guessing,
+  plus a notFound handler that echoes the exact received path as a standing diagnostic;
+  (3) confirmed (not just hoped) that enabling Activities auto-creates a global Entry Point
+  Command (type 4, handler DISCORD_LAUNCH_ACTIVITY) that Discord handles entirely itself — no
+  bot code needed for the default /launch path. Still open for Phase C: whether a custom
+  in-context button's LAUNCH_ACTIVITY response (needed since discord.py has no high-level
+  wrapper for interaction callback type 12) works the same way.
+  Files: CWL_CLAN_CONFIG_ACTIVITY_PLAN.md (new), activity/ (new), .gitignore.
+
+2026-08-09 (23)
+- Fixed: four more issues found continuing to live-test the Phase 1 CWL screens (second
+  follow-up round, after (22)):
+  (1) ChannelConfigurationView's dropdowns always opened blank even when a channel was already
+  configured — discord.py's ChannelSelect needs an explicit default_values list, it doesn't
+  infer one. Passed the already-resolved current channel through as default_values.
+  (2) Clicking "Apply Changes" from the CWL Management Hub's "Configure Channels" flow crashed
+  outright (AttributeError: CwlManagementHubView has no _refresh_config_view — that method only
+  exists on ClanManagementView) and, since the crash happened before the view's own cleanup
+  code, left the ephemeral "Channel Configuration" prompt stuck open. Added an explicit
+  origin_mode passed in by each caller and switched to the duck-typed refresh_cwl_view(mode)
+  both shells already implement, so Apply refreshes back into whichever screen actually opened
+  it instead of assuming basic configuration.
+  (3) Data Retention was an inline Select dropdown; per project owner preference, replaced with
+  a button opening CwlRetentionModal — a discord.py 2.7 Components V2 modal using RadioGroup/
+  Label (genuine radio buttons, confirmed available in the pinned discord.py version) instead of
+  a dropdown, since classic Modals only support TextInput and Discord has no radio-button
+  component outside a modal. CwlStartTimeModal also now prefills unset clans with the game's
+  static schedule (1st of the season month, 08:00 UTC) instead of a blank field.
+  (4) The CWL league tier shown per clan was always blank ("tier not set") since nothing ever
+  wrote target_league_rank — it's not admin-configurable, it's the clan's live war_league from
+  the CoC API. Added CACHE.get_clan_war_league() and used it (preferring the live value over any
+  stored snapshot, so promotions/demotions since roster setup still show correctly) everywhere a
+  clan's tier is displayed or persisted; the per-clan detail screen now shows it as its own line
+  under the clan name. Also added a "Delete Season" admin action (Season Management screen,
+  behind a Confirm/Cancel dialog) for testing/starting over, backed by new delete_cwl_event_sync().
+  Files: qapbot/ui_clan_management.py, qapbot/ui_cwl_roster.py, qapbot/cache_manager.py,
+  qapbot/db_manager.py, qapbot/QBdiscocmdshelper_cwl.py, qapbot/translations/en.json,
+  qapbot/translations/de.json, tests/discord/test_ui_cwl_roster.py,
+  tests/unit/test_db_manager_cwl_roster.py.
+  1611 tests pass (.\run_tests.ps1).
+
 2026-08-09 (22)
 - Fixed: five issues found while actually exercising the Phase 1 CWL Settings/Season Setup
   screens live in a dev Discord guild (follow-up to Phase 1, (21), CWL_ROSTER_PLANNING_PLAN.md):

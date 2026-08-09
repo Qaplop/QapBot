@@ -13,6 +13,10 @@ import { Hono, type Context } from 'hono'
 type Bindings = {
   CLIENT_ID: string
   CLIENT_SECRET: string
+  // Must exactly match a URL registered under OAuth2 -> Redirects in the Developer Portal.
+  // Nothing ever navigates here for an Activity — Discord's token endpoint just requires it
+  // to be present and registered, per standard OAuth2 authorization_code grant rules.
+  REDIRECT_URI: string
   // Phase B+: cloudflared tunnel URL to QapBot's bridge API, and the shared secret it expects.
   BRIDGE_URL?: string
   BRIDGE_SECRET?: string
@@ -20,11 +24,16 @@ type Bindings = {
 
 type AppContext = Context<{ Bindings: Bindings }>
 
-const app = new Hono<{ Bindings: Bindings }>()
+// Routes defined unprefixed, then mounted at both "/" and "/api" below — Discord's Activity
+// proxy documentation doesn't specify whether a "/api" Proxy Path Mapping strips that prefix
+// before forwarding to the target or preserves it, so we just answer to both until confirmed
+// empirically (a 404 on first deploy told us the frontend's "/api/token" wasn't reaching a
+// registered route — this makes it reach one regardless of which behavior Discord actually has).
+const api = new Hono<{ Bindings: Bindings }>()
 
-app.get('/api/health', (c) => c.json({ ok: true }))
+api.get('/health', (c) => c.json({ ok: true, path: c.req.path }))
 
-app.post('/api/token', async (c) => {
+api.post('/token', async (c) => {
   let code: string | undefined
   try {
     ;({ code } = await c.req.json<{ code?: string }>())
@@ -43,6 +52,7 @@ app.post('/api/token', async (c) => {
       client_secret: c.env.CLIENT_SECRET,
       grant_type: 'authorization_code',
       code,
+      redirect_uri: c.env.REDIRECT_URI,
     }),
   })
 
@@ -62,7 +72,7 @@ function bridgeNotConfigured(c: AppContext) {
   )
 }
 
-app.get('/api/cwl/clan-config', async (c) => {
+api.get('/cwl/clan-config', async (c) => {
   const guildId = c.req.query('guild_id')
   if (!guildId) return c.json({ error: 'missing guild_id' }, 400)
   if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
@@ -74,7 +84,7 @@ app.get('/api/cwl/clan-config', async (c) => {
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
 })
 
-app.post('/api/cwl/clan-config', async (c) => {
+api.post('/cwl/clan-config', async (c) => {
   if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
 
   const body = await c.req.json()
@@ -85,5 +95,13 @@ app.post('/api/cwl/clan-config', async (c) => {
   })
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
 })
+
+const app = new Hono<{ Bindings: Bindings }>()
+app.route('/api', api)
+app.route('/', api)
+
+// If this still 404s, the response body tells us the exact path Cloudflare actually received —
+// the real diagnostic we were missing before this change.
+app.notFound((c) => c.json({ error: 'not found', path: c.req.path, method: c.req.method }, 404))
 
 export default app

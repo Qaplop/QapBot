@@ -10,10 +10,15 @@ compatibility_date = "2026-08-01"
 #   wrangler secret put BRIDGE_SECRET --env dev     (Phase B: shared secret with QapBot's bridge API)
 # ...and again with --env prod once the PROD bot/tunnel exist (Phase D).
 
+# REDIRECT_URI must exactly match a URL registered under OAuth2 -> Redirects in the Developer
+# Portal for that application. Nothing ever actually navigates there for an Activity (the SDK
+# exchanges the code in-iframe) — Discord's /oauth2/token endpoint just requires it to be
+# present and registered, per standard OAuth2 authorization_code grant rules.
+
 [env.dev]
 name = "cwl-clan-config-server-dev"
-vars = { CLIENT_ID = "REPLACE_WITH_DEV_DISCORD_APPLICATION_CLIENT_ID" }
+vars = { CLIENT_ID = "1442060461783781479", REDIRECT_URI = "https://cwl-clan-config-dev.pages.dev/" }
 
 [env.prod]
 name = "cwl-clan-config-server-prod"
-vars = { CLIENT_ID = "REPLACE_WITH_PROD_DISCORD_APPLICATION_CLIENT_ID" }
+vars = { CLIENT_ID = "REPLACE_WITH_PROD_DISCORD_APPLICATION_CLIENT_ID", REDIRECT_URI = "REPLACE_WITH_PROD_PAGES_URL" }

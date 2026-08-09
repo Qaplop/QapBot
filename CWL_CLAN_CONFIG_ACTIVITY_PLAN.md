@@ -99,14 +99,9 @@ No new persistence layer, no new tables — this is a second UI in front of the 
 
 ## Launch mechanism (Discord side)
 
-Add a new button, **"Open Clan Config (Web)"**, next to the existing "Configure Participating Clans" button in `add_cwl_management_components()` (`qapbot/ui_cwl_roster.py`) — both remain available; the native flow isn't being removed, just given a richer alternative. discord.py has no high-level wrapper for `LAUNCH_ACTIVITY` (interaction callback type 12), so the button's callback responds via a raw HTTP call:
+**Resolved in Phase A, no longer a risk:** enabling Activities in the Developer Portal auto-creates a global `PRIMARY_ENTRY_POINT` command (type 4, name `launch`, `handler: 2` = `DISCORD_LAUNCH_ACTIVITY`) — confirmed by querying `GET /applications/{id}/commands` directly. Discord handles this command's interaction entirely itself; **zero bot code was needed** to make `/launch` (or the voice-channel "Choose Activity" picker) open the Activity. This also means the original plan's raw `bot.http.request(..., callback_type=12)` approach was solving a problem that, for the *default* entry point, doesn't need solving.
 
-```python
-await interaction.response.send_message(...)  # NOT this — need callback type 12 specifically
-# actual mechanism: raw REST call through QBcore.bot.http, callback_type=12
-```
-
-**Risk flagged for early verification (Phase A):** the reference material is ambiguous on whether *any* interaction can be answered with a `LAUNCH_ACTIVITY` callback once Activities are enabled for the application, or whether it's restricted to a dedicated `PRIMARY_ENTRY_POINT` (command type 4) command. This needs a real spike against the Developer Portal before the rest of the plan depends on it — see Phase A.
+What's still planned for Phase C: a **"Open Clan Config (Web)"** button next to "Configure Participating Clans" in `add_cwl_management_components()` (`qapbot/ui_cwl_roster.py`), for in-context launch from the screen an admin is already on, rather than requiring them to discover `/launch` separately. discord.py has no high-level wrapper for responding to a component interaction with a `LAUNCH_ACTIVITY` callback (type 12), so that button's callback will still need a raw REST call through `QBcore.bot.http` — this part is **not yet verified**, only the auto-created entry point command is. Worth a quick spike at the start of Phase C before assuming it works identically.
 
 ---
 
@@ -124,8 +119,15 @@ For each application:
 
 ## Phased implementation
 
-### Phase A — Skeleton + the LAUNCH_ACTIVITY spike
-Bare Cloudflare Pages + Worker deploy (DEV environment only), OAuth round-trip working end-to-end, page shows "Hello, guild {guildId}". Resolve the `LAUNCH_ACTIVITY` callback-type question against the DEV application before building anything else on top of it. **Gate**: if this doesn't work as expected, the launch mechanism needs a fallback (e.g. a `link`-style button opening the Pages URL directly in a browser tab instead of an in-Discord iframe) — decide before Phase B.
+### Phase A — Skeleton + the LAUNCH_ACTIVITY spike ✅ shipped 2026-08-09 (DEV environment)
+Bare Cloudflare Pages + Worker deploy, OAuth round-trip working end-to-end, launched for real from inside Discord (voice channel → "Choose Activity" → Qaps-CoC-Bot[DEV]) and confirmed showing `Hello, guild 1145641080621109312 — OAuth round-trip OK.` — the actual DEV test guild's ID, proving `discordSdk.guildId` resolves correctly through the whole chain.
+
+Three real bugs found and fixed getting there, all now reflected in the scaffold itself:
+1. **`redirect_uri` is required** in the server-side token exchange (`POST https://discord.com/api/oauth2/token`), even though the SDK's own `authorize()` call has no such parameter and nothing ever navigates to it — standard OAuth2 `authorization_code` grant behavior that the original reference code (from both research threads) had simply omitted. Fixed: added a `REDIRECT_URI` binding (any URL registered under the application's OAuth2 → Redirects; using the Pages root URL) and included it in the token-exchange request body.
+2. **Discord's Proxy Path Mapping prefix behavior is undocumented** (whether a `/api` prefix mapping strips itself before forwarding to the target, or is preserved) — hit as a 404 on `/api/token`. Rather than guess, the Worker's routes are now defined once and mounted at both `/api/*` and unprefixed `/*`, so it answers correctly either way; a `notFound` handler that echoes back the exact received path was added as a standing diagnostic for any future path-mapping surprises.
+3. **The Entry Point Command question is resolved, not just worked around**: enabling Activities auto-creates a global `type: 4` (`PRIMARY_ENTRY_POINT`) command named `launch` with `handler: 2` (`DISCORD_LAUNCH_ACTIVITY`) — confirmed by querying `GET /applications/{id}/commands` directly against the live DEV application. Discord handles the whole interaction itself; no bot code was needed for this path. See "Launch mechanism" above for what's still open (the custom in-context button planned for Phase C).
+
+Not yet done in Phase A: the PROD environment (deliberately deferred to Phase D per the phase plan — DEV validates the pipeline first).
 
 ### Phase B — Bridge API + tunnel
 `qapbot/web_bridge.py` with the two endpoints, started from `_setup_hook()`. `cloudflared` tunnel running alongside the DEV bot process. Worker calls the bridge through the tunnel with the shared secret; verify a round-trip with a hardcoded test payload (no real UI yet).
