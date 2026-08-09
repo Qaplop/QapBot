@@ -194,6 +194,44 @@ def test_cwl_management_channel_slot_registered():
     assert slot.disable_flag_keys == ("cwl_management_message_enabled",)
 
 
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_channel_configuration_view_apply_refreshes_hub_and_closes_ephemeral(db, mock_interaction):
+    """Regression guard: ChannelConfigurationView opened from the CWL Management Hub (entry
+    point b) used to crash on Apply because it hardcoded a call to _refresh_config_view(),
+    which only ClanManagementView has — CwlManagementHubView doesn't. Also covers that the
+    ephemeral sub-screen actually closes itself once applied, which it never did before."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_clan_management import ChannelConfigurationView, CWL_CONFIG_CHANNEL_SLOTS
+    from qapbot.ui_cwl_roster import CwlManagementHubView
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    hub_view = CwlManagementHubView()
+    channel = MagicMock()
+    channel.id = 555666777
+
+    config_view = ChannelConfigurationView(
+        guild=mock_interaction.guild,
+        clan_management_view=hub_view,
+        original_interaction=mock_interaction,
+        current_channels={"cwl_management": None},
+        slots=CWL_CONFIG_CHANNEL_SLOTS,
+        origin_mode="cwl_settings",
+    )
+    config_view.selected_channels["cwl_management"] = channel
+    config_view.config_message = AsyncMock()
+
+    await config_view._on_apply(mock_interaction)  # must not raise
+
+    assert CACHE.server_config[guild_id_str]["cwl_management_channel_id"] == str(channel.id)
+    config_view.config_message.delete.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # CwlManagementHubView — entry point (b)
 # ---------------------------------------------------------------------------

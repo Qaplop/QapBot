@@ -2369,6 +2369,7 @@ class ClanManagementView(discord.ui.View):
             original_interaction=interaction,
             current_channels=current_channels,
             slots=BASIC_CONFIG_CHANNEL_SLOTS,
+            origin_mode="config",
             timeout=300
         )
         
@@ -2696,6 +2697,7 @@ class ChannelConfigurationView(discord.ui.View):
         original_interaction: discord.Interaction,
         current_channels: Optional[Dict[str, Optional[discord.TextChannel]]] = None,
         slots: Tuple[ChannelSlotConfig, ...] = DEFAULT_CHANNEL_SLOTS,
+        origin_mode: str = "config",
         timeout: int = 300
     ):
         super().__init__(timeout=timeout)
@@ -2703,6 +2705,10 @@ class ChannelConfigurationView(discord.ui.View):
         self.clan_management_view = clan_management_view
         self.original_interaction = original_interaction
         self.slots = slots
+        # Which screen/mode opened this configuration flow — Apply refreshes back into this,
+        # not unconditionally "config" (see _on_apply below; that used to be hardcoded and
+        # always bounced the caller back to basic server configuration).
+        self.origin_mode = origin_mode
         self.selected_channels: Dict[str, Optional[discord.TextChannel]] = dict(current_channels or {})
 
         # Store config message for later deletion
@@ -2831,8 +2837,10 @@ class ChannelConfigurationView(discord.ui.View):
             except Exception as e:
                 logging.warning(f"Could not trigger repost after channel config apply: {e}")
 
-        # Refresh management view
-        await self.clan_management_view._refresh_config_view(interaction)  # type: ignore[attr-defined]
+        # Refresh whichever screen opened this configuration flow (basic config, cwl_settings,
+        # or the CWL Management Hub) — refresh_cwl_view() is the duck-typed contract both
+        # ClanManagementView and CwlManagementHubView implement for exactly this.
+        await self.clan_management_view.refresh_cwl_view(interaction, self.origin_mode)  # type: ignore[attr-defined]
 
         # Delete the configuration message after a short delay to ensure main view is updated
         if self.config_message:

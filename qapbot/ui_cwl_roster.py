@@ -134,6 +134,7 @@ def _make_cwl_settings_channels_callback(view: discord.ui.View):
             original_interaction=interaction,
             current_channels=current_channels,
             slots=CWL_CONFIG_CHANNEL_SLOTS,
+            origin_mode="cwl_settings",
             timeout=300,
         )
         header_msg = channel_config_view._format_header()  # type: ignore[attr-defined]
