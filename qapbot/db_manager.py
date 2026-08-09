@@ -1762,6 +1762,12 @@ class WarHistoryDB:
                 roster_size         INTEGER NOT NULL DEFAULT 15,
                 tier_order          INTEGER NOT NULL DEFAULT 0,
                 cwl_start_at        TEXT,
+                -- Deactivating a clan (unchecking it in the UI) must NOT delete this row —
+                -- roster_size/cwl_start_at/target_league_rank need to survive a
+                -- deactivate-then-reactivate cycle, so "participating" is an explicit column
+                -- rather than "row exists" being the implicit signal (that was the original
+                -- design and lost data on every toggle-off; see CWL_CLAN_CONFIG_ACTIVITY_PLAN.md).
+                participating       INTEGER NOT NULL DEFAULT 1,
                 locked_at           TEXT,
                 created_at          TEXT    NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY (event_id) REFERENCES cwl_events(id) ON DELETE CASCADE,
@@ -1965,6 +1971,7 @@ class WarHistoryDB:
         await self._add_column_if_missing("guild_config", "cwl_management_message_enabled", "BOOLEAN NOT NULL DEFAULT 0")
         await self._add_column_if_missing("guild_config", "cwl_management_message_last_bump_iso", "TEXT")
         await self._add_column_if_missing("guild_config", "cwl_retention_months", "INTEGER NOT NULL DEFAULT 0")
+        await self._add_column_if_missing("cwl_event_clans", "participating", "INTEGER NOT NULL DEFAULT 1")
 
         logging.debug("[DB-SCHEMA] Maindata schema created/verified")
 
@@ -2773,10 +2780,18 @@ class WarHistoryDB:
         """Replace an event's full cwl_event_clans set in one atomic DELETE + INSERT (matches
         the pattern used elsewhere for whole-collection replacement, e.g. war_attacks updates).
 
+        Callers must pass every clan that has ever been configured for this event — participating
+        and deactivated alike — not just the currently-participating ones. A clan omitted here
+        entirely loses its row (and thus its roster_size/cwl_start_at); a clan included with
+        participating=False keeps its row (and settings) but won't count as participating. This
+        is what lets deactivating a clan preserve its settings instead of discarding them.
+
         Args:
             event_id: the cwl_events row to configure.
             clan_configs: list of dicts, each with clan_tag (required) and optionally
-                target_league_rank, roster_size, tier_order, cwl_start_at.
+                target_league_rank, roster_size, tier_order, cwl_start_at, participating
+                (defaults to True — existing callers written before this field existed still
+                mean "participating" by omitting it).
         """
         import sqlite3
 
@@ -2790,8 +2805,8 @@ class WarHistoryDB:
                     conn.executemany(
                         """
                         INSERT INTO cwl_event_clans
-                            (event_id, clan_tag, target_league_rank, roster_size, tier_order, cwl_start_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                            (event_id, clan_tag, target_league_rank, roster_size, tier_order, cwl_start_at, participating)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         [
                             (
@@ -2801,6 +2816,7 @@ class WarHistoryDB:
                                 cfg.get("roster_size", 15),
                                 cfg.get("tier_order", 0),
                                 cfg.get("cwl_start_at"),
+                                1 if cfg.get("participating", True) else 0,
                             )
                             for cfg in clan_configs
                         ],
@@ -2877,8 +2893,11 @@ class WarHistoryDB:
                     ).fetchone()
                 if prev_event is None:
                     return []
+                # Only carry over clans that were actually participating last season — a clan
+                # explicitly deactivated then (row kept for its settings, per the fix above)
+                # should not silently reappear as a carry-over default this season.
                 rows = conn.execute(
-                    "SELECT * FROM cwl_event_clans WHERE event_id = ? ORDER BY tier_order, clan_tag",
+                    "SELECT * FROM cwl_event_clans WHERE event_id = ? AND participating = 1 ORDER BY tier_order, clan_tag",
                     (prev_event["id"],),
                 ).fetchall()
                 return [dict(row) for row in rows]

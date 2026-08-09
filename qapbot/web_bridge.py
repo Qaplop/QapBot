@@ -65,21 +65,25 @@ async def _build_clan_config_payload(guild_id: int) -> Dict[str, Any]:
     event = get_current_cwl_event_sync(guild_id)
     db = CACHE.db_manager
 
-    participating_rows: Dict[str, Dict[str, Any]] = {}
+    # Keyed by clan_tag -> its cwl_event_clans row, which now exists for every clan ever
+    # touched (participating or not) — deactivating a clan keeps its row (with settings intact)
+    # instead of deleting it, so reactivating doesn't lose roster_size/cwl_start_at. "row exists"
+    # is therefore no longer the same thing as "participating"; use the explicit column instead.
+    known_rows: Dict[str, Dict[str, Any]] = {}
     if db is not None and event is not None:
         for row in db.get_cwl_event_clans_sync(event["id"]):
-            participating_rows[row["clan_tag"]] = row
+            known_rows[row["clan_tag"]] = row
 
     clans: List[Dict[str, Any]] = []
     for tag in sorted(all_tags, key=lambda t: (CACHE.get_clan_name(t, t) or t).lower()):
-        row = participating_rows.get(tag)
+        row = known_rows.get(tag)
         clans.append({
             "clan_tag": tag,
             "name": CACHE.get_clan_name(tag, tag),
             # Tier is always the live value (CoC-defined, never admin-set) — same rule as the
             # Discord-side screens, see CWL_ROSTER_PLANNING_PLAN.md's tier fix.
             "tier": CACHE.get_clan_war_league(tag),
-            "participating": row is not None,
+            "participating": bool(row["participating"]) if row else False,
             "roster_size": row["roster_size"] if row else 15,
             "cwl_start_at": row["cwl_start_at"] if row else None,
         })
@@ -138,6 +142,9 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
 
     # Same shape create_cwl_event_sync()/set_cwl_event_clans_sync() already expect — matches
     # CwlEventSetupView._on_apply()/_persist_detail_edit()'s exact contract (Discord-side).
+    # Every clan the frontend sent is persisted, participating or not — set_cwl_event_clans_sync()
+    # drops any clan omitted entirely, so a deactivated clan must still be included (with
+    # participating=False) or its roster_size/cwl_start_at would be lost, not just hidden.
     clan_configs = [
         {
             "clan_tag": c["clan_tag"],
@@ -145,8 +152,9 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
             "roster_size": int(c.get("roster_size", 15)),
             "tier_order": idx,
             "cwl_start_at": c.get("cwl_start_at"),
+            "participating": bool(c.get("participating", False)),
         }
-        for idx, c in enumerate(c for c in clans_in if c.get("participating"))
+        for idx, c in enumerate(clans_in)
     ]
     db.set_cwl_event_clans_sync(event_id, clan_configs)
 

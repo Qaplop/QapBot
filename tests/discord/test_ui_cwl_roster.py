@@ -357,11 +357,15 @@ async def test_cwl_event_setup_view_toggle_adds_and_removes_clan(db, mock_intera
     toggle_button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_setup_clan_#CLAN1")
     mock_interaction.edit_original_response = AsyncMock()
     await toggle_button.callback(mock_interaction)  # type: ignore[misc]
-    assert "#CLAN1" in view.working_clans
+    assert view.working_clans["#CLAN1"]["participating"] is True
 
+    # Toggling off must flip participating in place, not delete the entry — roster_size/
+    # cwl_start_at need to survive a deactivate-then-reactivate cycle (regression guard for the
+    # data-loss bug this behavior fixes).
     toggle_button_again = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_setup_clan_#CLAN1")
     await toggle_button_again.callback(mock_interaction)  # type: ignore[misc]
-    assert "#CLAN1" not in view.working_clans
+    assert "#CLAN1" in view.working_clans
+    assert view.working_clans["#CLAN1"]["participating"] is False
 
 
 @pytest.mark.discord

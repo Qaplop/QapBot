@@ -210,3 +210,65 @@ async def test_clan_config_post_persists_and_refreshes_hub(db, bridge_config, cl
     assert clans[0]["target_league_rank"] == "Master League II"
 
     refresh_mock.assert_awaited_once_with(666, "cwl_management")
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_deactivating_clan_via_bridge_preserves_settings(db, bridge_config, client, monkeypatch):
+    """Regression guard, exercised through the actual GET/POST endpoints (not just the DB
+    layer): deactivate a clan that has custom roster_size/cwl_start_at, confirm GET still
+    reports those values (participating=False), then reactivate and confirm they're still
+    there — the exact bug the project owner found live in the Activity."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "777", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha", "war_league": "Master League II"}}
+    CACHE.server_config["777"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(777, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    headers = {"X-Bridge-Secret": "test-secret"}
+
+    # 1. Activate with custom settings.
+    await client.post(
+        "/api/cwl/clan-config",
+        json={"guild_id": 777, "discord_user_id": 42, "clans": [
+            {"clan_tag": "#CLAN1", "participating": True, "roster_size": 30, "cwl_start_at": "2026-09-01T08:00Z"},
+        ]},
+        headers=headers,
+    )
+
+    # 2. Deactivate — settings must be echoed back, not reset to defaults.
+    await client.post(
+        "/api/cwl/clan-config",
+        json={"guild_id": 777, "discord_user_id": 42, "clans": [
+            {"clan_tag": "#CLAN1", "participating": False, "roster_size": 30, "cwl_start_at": "2026-09-01T08:00Z"},
+        ]},
+        headers=headers,
+    )
+    resp = await client.get("/api/cwl/clan-config", params={"guild_id": "777", "discord_user_id": "42"}, headers=headers)
+    body = await resp.json()
+    clan = body["clans"][0]
+    assert clan["participating"] is False
+    assert clan["roster_size"] == 30
+    assert clan["cwl_start_at"] == "2026-09-01T08:00Z"
+
+    # 3. Reactivate — same settings, not reset to the 15/None defaults.
+    await client.post(
+        "/api/cwl/clan-config",
+        json={"guild_id": 777, "discord_user_id": 42, "clans": [
+            {"clan_tag": "#CLAN1", "participating": True, "roster_size": 30, "cwl_start_at": "2026-09-01T08:00Z"},
+        ]},
+        headers=headers,
+    )
+    resp = await client.get("/api/cwl/clan-config", params={"guild_id": "777", "discord_user_id": "42"}, headers=headers)
+    body = await resp.json()
+    clan = body["clans"][0]
+    assert clan["participating"] is True
+    assert clan["roster_size"] == 30
+    assert clan["cwl_start_at"] == "2026-09-01T08:00Z"

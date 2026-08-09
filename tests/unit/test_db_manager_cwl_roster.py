@@ -116,6 +116,56 @@ class TestCwlEventClans:
         assert clans[0]["clan_tag"] == "#CLAN1"
 
     @pytest.mark.integration
+    async def test_deactivating_a_clan_preserves_its_settings_not_deletes_row(self, db):
+        """Regression guard for the data-loss bug fixed in CWL_CLAN_CONFIG_ACTIVITY_PLAN.md:
+        a clan with participating=False must keep its row (and roster_size/cwl_start_at), not
+        get dropped entirely — the caller (web bridge / CwlEventSetupView) is responsible for
+        passing the clan through at all; this only guards that when it does, nothing is lost."""
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
+
+        db.set_cwl_event_clans_sync(event_id, [
+            {"clan_tag": "#CLAN1", "roster_size": 30, "cwl_start_at": "2026-09-01T08:00Z", "participating": True},
+        ])
+        assert db.get_cwl_event_clans_sync(event_id)[0]["participating"] == 1
+
+        # Deactivate — settings must be passed through unchanged, not dropped.
+        db.set_cwl_event_clans_sync(event_id, [
+            {"clan_tag": "#CLAN1", "roster_size": 30, "cwl_start_at": "2026-09-01T08:00Z", "participating": False},
+        ])
+        clans = db.get_cwl_event_clans_sync(event_id)
+        assert len(clans) == 1  # row kept, not deleted
+        assert clans[0]["participating"] == 0
+        assert clans[0]["roster_size"] == 30
+        assert clans[0]["cwl_start_at"] == "2026-09-01T08:00Z"
+
+        # Reactivate — same settings still there.
+        db.set_cwl_event_clans_sync(event_id, [
+            {"clan_tag": "#CLAN1", "roster_size": 30, "cwl_start_at": "2026-09-01T08:00Z", "participating": True},
+        ])
+        clans = db.get_cwl_event_clans_sync(event_id)
+        assert clans[0]["participating"] == 1
+        assert clans[0]["roster_size"] == 30
+        assert clans[0]["cwl_start_at"] == "2026-09-01T08:00Z"
+
+    @pytest.mark.integration
+    async def test_get_previous_cwl_event_clans_sync_excludes_non_participating(self, db):
+        """Carry-over must only offer clans that were actually participating last season — a
+        clan deactivated then (row kept for its settings) shouldn't silently reappear."""
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_guild_and_clan(db, guild_id="111", clan_tag="#CLAN2")
+        old_event_id = db.create_cwl_event_sync("111", "2026-07", "discordid1")
+        db.set_cwl_event_clans_sync(old_event_id, [
+            {"clan_tag": "#CLAN1", "participating": True},
+            {"clan_tag": "#CLAN2", "participating": False},
+        ])
+
+        new_event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
+        prev_clans = db.get_previous_cwl_event_clans_sync("111", exclude_event_id=new_event_id)
+
+        assert [c["clan_tag"] for c in prev_clans] == ["#CLAN1"]
+
+    @pytest.mark.integration
     async def test_get_previous_cwl_event_clans_sync_carries_over_prior_season(self, db):
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
         old_event_id = db.create_cwl_event_sync("111", "2026-07", "discordid1")

@@ -4,7 +4,7 @@
  * (this file) renders the real table — see clanConfigTable.ts — and wires Save back to the
  * bridge. See CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.
  */
-import { DiscordSDK } from '@discord/embedded-app-sdk'
+import { DiscordSDK, RPCCloseCodes } from '@discord/embedded-app-sdk'
 import { renderClanConfigTable } from './clanConfigTable'
 import type { ClanConfig, ClanConfigPayload } from './types'
 
@@ -63,17 +63,22 @@ async function setup(): Promise<void> {
     }
     const payload = (await configResponse.json()) as ClanConfigPayload
 
-    renderClanConfigTable(root, payload, async (clans: ClanConfig[]) => {
-      const saveResponse = await fetch('/api/cwl/clan-config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
-        body: JSON.stringify({ guild_id: guildId, clans }),
-      })
-      if (!saveResponse.ok) {
-        const body = await saveResponse.text()
-        throw new Error(`${saveResponse.status}: ${body}`)
-      }
-    })
+    renderClanConfigTable(
+      root,
+      payload,
+      async (clans: ClanConfig[]) => {
+        const saveResponse = await fetch('/api/cwl/clan-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+          body: JSON.stringify({ guild_id: guildId, clans }),
+        })
+        if (!saveResponse.ok) {
+          const body = await saveResponse.text()
+          throw new Error(`${saveResponse.status}: ${body}`)
+        }
+      },
+      () => discordSdk.close(RPCCloseCodes.CLOSE_NORMAL, ''),
+    )
   } catch (err) {
     console.error(err)
     root.textContent = `Setup failed: ${(err as Error).message}`

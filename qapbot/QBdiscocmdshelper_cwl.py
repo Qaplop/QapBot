@@ -141,7 +141,11 @@ async def format_clan_management_cwl_management(
         return embed, None, [], []
 
     db = CACHE.db_manager
-    clans = db.get_cwl_event_clans_sync(event["id"]) if db is not None else []
+    # get_cwl_event_clans_sync() returns every clan ever configured for this event, including
+    # deactivated ones whose settings are kept (not deleted) so reactivating restores them — the
+    # "Participating Clans" display must only show the ones actually currently participating.
+    all_clans = db.get_cwl_event_clans_sync(event["id"]) if db is not None else []
+    clans = [c for c in all_clans if c.get("participating", 1)]
 
     embed.description = t(
         'cwl.management.season_header',

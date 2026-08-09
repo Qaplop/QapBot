@@ -321,7 +321,7 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
         # participating clan already has a start time set (Finalize, Phase 4, will require it).
         db = CACHE.db_manager
         clans = db.get_cwl_event_clans_sync(event["id"]) if db is not None else []
-        missing_start = [c["clan_tag"] for c in clans if not c.get("cwl_start_at")]
+        missing_start = [c["clan_tag"] for c in clans if c.get("participating", 1) and not c.get("cwl_start_at")]
         if missing_start:
             logging.debug(f"[CWL] guild {guild_id} event {event['id']}: {len(missing_start)} clan(s) missing a start time")
 
@@ -565,6 +565,11 @@ class CwlEventSetupView(TrackedView):
                 "roster_size": row.get("roster_size", 15),
                 "tier_order": row.get("tier_order", 0),
                 "cwl_start_at": row.get("cwl_start_at"),
+                # Loaded from the current event's rows as-is (participating or not) so a
+                # previously-deactivated clan still shows up unchecked with its settings intact
+                # rather than vanishing — carry-over rows (from get_previous_cwl_event_clans_sync)
+                # are always participating=1 already, since that query itself filters to it.
+                "participating": bool(row.get("participating", 1)),
             }
 
     def _available_clan_tags(self) -> List[str]:
@@ -580,7 +585,7 @@ class CwlEventSetupView(TrackedView):
 
         for idx, clan_tag in enumerate(clans_to_show):
             clan_name = CACHE.get_clan_name(clan_tag, "Unknown")
-            is_selected = clan_tag in self.working_clans
+            is_selected = self.working_clans.get(clan_tag, {}).get("participating", False)
             display_name = (clan_name[:30] + "...") if clan_name and len(clan_name) > 30 else (clan_name or "Unknown")
 
             button: discord.ui.Button[Any] = discord.ui.Button(
@@ -599,7 +604,10 @@ class CwlEventSetupView(TrackedView):
                 return
             await interaction.response.defer(thinking=False, ephemeral=True)
             if clan_tag in self.working_clans:
-                del self.working_clans[clan_tag]
+                # Flip in place, never delete: roster_size/cwl_start_at/target_league_rank must
+                # survive a deactivate-then-reactivate cycle within this same session (this used
+                # to del() the entry, silently discarding those settings on every toggle-off).
+                self.working_clans[clan_tag]["participating"] = not self.working_clans[clan_tag]["participating"]
             else:
                 self.working_clans[clan_tag] = {
                     # target_league_rank is CoC-defined, not admin-set — snapshot the clan's
@@ -608,6 +616,7 @@ class CwlEventSetupView(TrackedView):
                     "roster_size": 15,
                     "tier_order": len(self.working_clans),
                     "cwl_start_at": None,
+                    "participating": True,
                 }
             await self._refresh_self(interaction)
 
@@ -636,14 +645,18 @@ class CwlEventSetupView(TrackedView):
         cancel_button.callback = self._on_cancel  # type: ignore[assignment]
         self.add_item(cancel_button)
 
+    def _participating_clans(self) -> Dict[str, Dict[str, Any]]:
+        return {tag: cfg for tag, cfg in self.working_clans.items() if cfg.get("participating", True)}
+
     def _build_content(self) -> str:
         from qapbot.i18n import t
 
         guild_id = self.guild.id
-        if not self.working_clans:
+        participating = self._participating_clans()
+        if not participating:
             return t('cwl.setup.no_clans_selected', guild_id=guild_id)
-        lines = [t('cwl.setup.header', guild_id=guild_id, count=len(self.working_clans))]
-        for tag, cfg in self.working_clans.items():
+        lines = [t('cwl.setup.header', guild_id=guild_id, count=len(participating))]
+        for tag, cfg in participating.items():
             name = CACHE.get_clan_name(tag, tag)
             lines.append(f"• **{name}** ({tag}) — {cfg.get('roster_size', 15)} {t('cwl.management.roster_slots', guild_id=guild_id)}")
         return "\n".join(lines)
@@ -664,7 +677,10 @@ class CwlEventSetupView(TrackedView):
     def _persist_detail_edit(self) -> None:
         """Write self.working_clans to the DB as an atomic replace-all — cheap enough (a
         handful of clans) to call again on every single roster-size/start-time edit rather
-        than adding a separate partial-update DB method."""
+        than adding a separate partial-update DB method. Includes deactivated clans too (with
+        participating=False) so their settings survive — set_cwl_event_clans_sync() drops any
+        clan omitted here entirely, so a deactivated clan must still be passed through, not
+        filtered out, or its roster_size/cwl_start_at would be lost."""
         db = CACHE.db_manager
         if db is None or self.event_id is None:
             return
@@ -675,6 +691,7 @@ class CwlEventSetupView(TrackedView):
                 "roster_size": cfg.get("roster_size", 15),
                 "tier_order": idx,
                 "cwl_start_at": cfg.get("cwl_start_at"),
+                "participating": cfg.get("participating", True),
             }
             for idx, (tag, cfg) in enumerate(self.working_clans.items())
         ]
@@ -697,7 +714,8 @@ class CwlEventSetupView(TrackedView):
         self.event_id = event_id
         self._persist_detail_edit()
 
-        if not self.working_clans:
+        participating_tags = list(self._participating_clans().keys())
+        if not participating_tags:
             try:
                 await interaction.delete_original_response()
             except discord.NotFound:
@@ -708,8 +726,10 @@ class CwlEventSetupView(TrackedView):
 
         # Move into the per-clan roster-size/start-time step, reusing this same ephemeral
         # message — picking participants and configuring their roster/start time is one flow.
+        # Only currently-participating clans get this step; a deactivated clan's settings are
+        # already preserved (see _persist_detail_edit()) with nothing left to configure for it.
         self.phase = "edit_details"
-        self.detail_clan_tags = list(self.working_clans.keys())
+        self.detail_clan_tags = participating_tags
         self.detail_index = 0
         self._render_detail_step()
         try:

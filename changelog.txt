@@ -1,6 +1,37 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (29)
+- Fixed: two issues from continued live testing of the CWL clan-config Activity, (27)/(28):
+  (1) The Activity now actually closes itself after a successful Save. Earlier I'd concluded
+  the Embedded App SDK had no close/exit API at all, based on grepping only its commands/
+  folder — wrong: discordSdk.close(RPCCloseCodes.CLOSE_NORMAL, '') is a real, exported
+  top-level SDK method (a raw CLOSE protocol frame, not a request/response "command", which is
+  why it wasn't where I first looked). Save now shows "Saved — closing..." briefly (1.2s, via
+  an "Edit again" button that cancels the pending close if clicked in time) then closes.
+  (2) Real data-loss bug: deactivating a clan (unchecking it) deleted its cwl_event_clans row
+  entirely, silently discarding its roster_size/cwl_start_at — reactivating it later (even
+  within the same edit session on the Discord-side CwlEventSetupView) reset it to defaults.
+  Root cause: "row exists" was the only signal for "participating," so deactivating had no way
+  to remember anything about a clan except by keeping it as if still active. Added an explicit
+  participating column to cwl_event_clans (idempotent migration for existing DBs) — a
+  deactivated clan now keeps its row (and settings) with participating=0 instead of being
+  deleted. Fixed in the data layer (set_cwl_event_clans_sync/get_previous_cwl_event_clans_sync,
+  the latter still correctly excluding non-participating rows from next-season carry-over),
+  the web bridge (both GET and POST), and the Discord-side CwlEventSetupView (toggling now
+  flips participating in place instead of del()-ing the working-copy entry). Every place that
+  reads the "Participating Clans" list for display (the cwl_management embed, the missing-
+  start-time debug check) now explicitly filters to participating=1, since the raw row set can
+  contain deactivated-but-remembered clans too.
+  6 new tests (2 unit: preserve-then-restore round trip via set/get_cwl_event_clans_sync,
+  carry-over still excludes non-participating; 1 bridge: full deactivate/reactivate cycle
+  through the real GET/POST endpoints; regression update to the existing Discord-side toggle
+  test) — 1623 total tests pass.
+  Files: qapbot/db_manager.py, qapbot/web_bridge.py, qapbot/ui_cwl_roster.py,
+  qapbot/QBdiscocmdshelper_cwl.py, activity/client/src/main.ts,
+  activity/client/src/clanConfigTable.ts, tests/unit/test_db_manager_cwl_roster.py,
+  tests/discord/test_web_bridge.py, tests/discord/test_ui_cwl_roster.py.
+
 2026-08-09 (28)
 - Fixed: Phase C of the CWL clan-config Activity (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md), (27),
   verified live in Discord (button launch + table + Save all confirmed working end-to-end) —

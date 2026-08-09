@@ -4,6 +4,8 @@ const ROSTER_SIZES = [5, 15, 30] as const
 // datetime-local's `step` is in seconds; 900s = 15 minutes restricts the native picker's
 // minute column to :00/:15/:30/:45 instead of every single minute.
 const START_TIME_STEP_SECONDS = 900
+// Long enough to actually read "Saved", short enough not to feel like a stuck screen.
+const AUTO_CLOSE_DELAY_MS = 1200
 
 /** Renders the real Phase C table — checkbox / tag / tier / roster-size select / start-time
  * picker per row — into `container`, replacing whatever was there. This is the actual reason
@@ -15,16 +17,15 @@ const START_TIME_STEP_SECONDS = 900
  * re-renders from the untouched original `payload` (no server round-trip needed, since nothing
  * was ever sent until Save).
  *
- * Note on "closing" after save: the Embedded App SDK has no close/exit/minimize command at
- * all (checked its full command list) — an Activity can never programmatically close itself,
- * only the user can (the collapse control Discord itself provides). So a successful save
- * replaces the form with an explicit "done, safe to close" state instead of pretending to close
- * the window — the closest honest equivalent given that real platform constraint.
+ * `onClose` calls discordSdk.close() (RPCCloseCodes.CLOSE_NORMAL) — a real SDK method, missed
+ * on first pass because it isn't listed under commands/ like everything else; it's a top-level
+ * DiscordSDK method that sends a raw CLOSE protocol frame instead of a request/response command.
  */
 export function renderClanConfigTable(
   container: HTMLElement,
   payload: ClanConfigPayload,
   onSave: (clans: ClanConfig[]) => Promise<void>,
+  onClose: () => void,
 ): void {
   const working: ClanConfig[] = payload.clans.map((c) => ({ ...c }))
 
@@ -66,7 +67,7 @@ export function renderClanConfigTable(
   cancelButton.textContent = 'Cancel'
   cancelButton.className = 'cancel-button'
   cancelButton.addEventListener('click', () => {
-    renderClanConfigTable(container, payload, onSave)
+    renderClanConfigTable(container, payload, onSave, onClose)
   })
 
   saveButton.addEventListener('click', async () => {
@@ -76,7 +77,7 @@ export function renderClanConfigTable(
     status.className = 'save-status'
     try {
       await onSave(working)
-      renderSavedState(container, payload, onSave)
+      renderSavedState(container, payload, onSave, onClose)
     } catch (err) {
       console.error(err)
       status.textContent = `Save failed: ${(err as Error).message}`
@@ -94,26 +95,28 @@ export function renderClanConfigTable(
   container.appendChild(footer)
 }
 
-/** Post-save confirmation — no SDK API exists to actually close the Activity (see the module
- * docstring above), so this is the honest substitute: a clear "done" state plus a way back in
- * if the admin realizes they need another change, rather than a dead end. */
+/** Post-save confirmation, briefly shown before the Activity closes itself via onClose(). */
 function renderSavedState(
   container: HTMLElement,
   payload: ClanConfigPayload,
   onSave: (clans: ClanConfig[]) => Promise<void>,
+  onClose: () => void,
 ): void {
   container.innerHTML = ''
 
   const message = document.createElement('div')
   message.className = 'saved-message'
-  message.textContent = '✓ Saved — you can close this window now.'
+  message.textContent = '✓ Saved — closing…'
   container.appendChild(message)
 
   const editAgainButton = document.createElement('button')
   editAgainButton.textContent = 'Edit again'
   editAgainButton.className = 'cancel-button'
+
+  const closeTimer = window.setTimeout(onClose, AUTO_CLOSE_DELAY_MS)
   editAgainButton.addEventListener('click', () => {
-    renderClanConfigTable(container, payload, onSave)
+    window.clearTimeout(closeTimer)
+    renderClanConfigTable(container, payload, onSave, onClose)
   })
   container.appendChild(editAgainButton)
 }
