@@ -241,6 +241,7 @@ def text_display_width_float(s: str) -> float:
         '➳': 1.34,          # U+2793 HEAVY WIDE-HEADED RIGHTWARDS ARROW - Dingbats block (0x2700-0x27BF), cat=So, not in emoji ranges
         '⚜': 1.2,          # U+269C FLEUR-DE-LIS - Dingbats block (0x2700-0x27BF), cat=So, not in emoji ranges
         '✯': 1.367,          # U+269C FLEUR-DE-LIS - Dingbats block (0x2700-0x27BF), cat=So, not in emoji ranges
+        '☣': 1.25,          # U+2623 Biohazard Sign - Dingbats block (0x2700-0x27BF), cat=So, not in emoji ranges
     }
     ZERO_WIDTH_CATS = {"Mn", "Me", "Cf"}
     ZERO_WIDTH_CHARS = {"\u200d", "\ufe0f"}  # ZWJ, VS16

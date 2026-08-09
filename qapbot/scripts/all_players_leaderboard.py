@@ -727,7 +727,7 @@ def render_leaderboard(data: LeaderboardData, mode: Optional[str] = None, style:
         #'\u30C4': 1.66,    # ツ
         #'\uC9C0': 1.66,    # 지
         #'\uBBFC': 1.66,    # 민
-        #'☣': 1.00,         # U+2623 (Biohazard Sign)
+        '☣': 1.00,         # U+2623 (Biohazard Sign)
         #'✌': 1.00,         # U+15F7 (Latin Letter B)
         #'✌️': 1.00,         # U+15F7 (Latin Letter B)
         #'ᗩ': 1.00,         # U+15F9 (Latin Letter A)
