@@ -142,8 +142,12 @@ Extracted `refresh_cwl_management_hub_message(guild_id, mode)` as a free functio
 
 Named/production `cloudflared` tunnel setup (vs. the quick tunnel used for DEV) is a Phase D decision, not resolved here.
 
-### Phase C — Real table UI
-Build the actual frontend table (checkbox/tag/tier/roster-size-select/start-time-picker per row), wired to the two bridge endpoints. Add the "Open Clan Config (Web)" button. End-to-end test in the DEV guild: open from Discord, edit, save, confirm the anchored CWL Management Hub message updates.
+### Phase C — Real table UI ✅ code shipped 2026-08-09 (DEV; live verification pending)
+`activity/client/src/clanConfigTable.ts`: the actual reason this Activity exists — a real `<table>` with a checkbox/clan-name/tier(read-only)/roster-size-`<select>`/start-time-`<input type="datetime-local">` row per clan, editing a working copy that only reaches the bridge on "Save" (same working-copy-then-apply pattern as the Discord-side `CwlEventSetupView`). `main.ts` now loads this instead of Phase B's raw-JSON smoke test. Datetime handling is a plain string transform, never a timezone conversion: the bridge's `"YYYY-MM-DDTHH:MMZ"` and `datetime-local`'s `"YYYY-MM-DDTHH:MM"` differ only by the trailing `Z`, and both are always UTC by convention (matching the Discord-side modal) — never interpreted against the browser's local timezone.
+
+Bot side: a 5th button, **"Open Clan Config (Web)"**, added to `add_cwl_management_components()` (`qapbot/ui_cwl_roster.py`) — exactly fills row 1's 5-button cap. Its callback resolves Phase A's flagged open question for real: whether a plain component-interaction (not the auto-created Entry Point command) can be answered with a `LAUNCH_ACTIVITY` (type 12) response. Implemented via a raw `interaction.client.http.request()` call (discord.py has no high-level wrapper), with a graceful ephemeral fallback message if Discord ever rejects it — so a "no" answer here degrades to a clear hint instead of a silently dead button. 2 new tests in `tests/discord/test_ui_cwl_roster.py` (correct callback-type-12 payload; fallback path when the raw call raises) — 1620 total tests pass.
+
+**Live verification still pending** (needs the project owner, same as every other phase's actual proof): restart the DEV bot to pick up the new button, click "Open Clan Config (Web)" on the CWL Management screen (resolves the LAUNCH_ACTIVITY-from-button question for real), then in the opened table — toggle a clan, change its roster size and start time, click Save, and confirm the anchored CWL Management Hub message updates to match. Until that's done, "shipped" here means "code complete and unit-tested," not "confirmed working," per this plan's own standard from Phases A and B.
 
 ### Phase D — PROD rollout
 Repeat the Developer Portal setup for the PROD application, deploy the `prod` Wrangler environment, add the PROD bridge (tunnel + `.env` secret on whatever host runs PROD), smoke-test in a real guild.

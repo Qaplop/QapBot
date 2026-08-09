@@ -778,7 +778,9 @@
       "button_manage_assignments": "Manage Assignments",
       "button_delete_season": "Delete Season",
       "button_confirm_delete": "Yes, Delete Season",
-      "delete_confirm_body": "⚠️ Delete the **{season}** CWL season? This removes all participating-clan settings and sign-ups for it and cannot be undone."
+      "delete_confirm_body": "⚠️ Delete the **{season}** CWL season? This removes all participating-clan settings and sign-ups for it and cannot be undone.",
+      "button_open_web": "Open Clan Config (Web)",
+      "open_web_fallback": "⚠️ Could not open the web view directly — try the /launch command instead."
     },
     "setup": {
       "header": "Select which clans participate this season ({count} selected):",

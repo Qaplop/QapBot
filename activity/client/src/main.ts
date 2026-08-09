@@ -1,10 +1,12 @@
 /**
  * Phase A proved the OAuth round-trip and the LAUNCH_ACTIVITY entry point work end to end.
- * Phase B adds a smoke test of the full bridge chain (Worker -> cloudflared tunnel -> QapBot),
- * fetching real clan-config data and rendering it as raw JSON — not the real table yet, that's
- * Phase C. See CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.
+ * Phase B proved the full bridge chain (Worker -> cloudflared tunnel -> QapBot) live. Phase C
+ * (this file) renders the real table — see clanConfigTable.ts — and wires Save back to the
+ * bridge. See CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.
  */
 import { DiscordSDK } from '@discord/embedded-app-sdk'
+import { renderClanConfigTable } from './clanConfigTable'
+import type { ClanConfig, ClanConfigPayload } from './types'
 
 const clientId = import.meta.env.VITE_CLIENT_ID as string | undefined
 
@@ -45,18 +47,33 @@ async function setup(): Promise<void> {
     await discordSdk.commands.authenticate({ access_token: accessToken })
 
     const guildId = discordSdk.guildId
-    root.textContent = `Hello, guild ${guildId ?? '(no guild context)'} — OAuth round-trip OK.\n\nFetching clan-config...`
-
-    if (guildId) {
-      const configResponse = await fetch(`/api/cwl/clan-config?guild_id=${encodeURIComponent(guildId)}`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      })
-      const configBody = await configResponse.json()
-      root.textContent =
-        `Hello, guild ${guildId} — OAuth round-trip OK.\n\n` +
-        `GET /api/cwl/clan-config -> ${configResponse.status}\n` +
-        JSON.stringify(configBody, null, 2)
+    if (!guildId) {
+      root.textContent = 'This Activity must be launched from inside a guild.'
+      return
     }
+
+    root.textContent = 'Loading clan configuration…'
+
+    const configResponse = await fetch(`/api/cwl/clan-config?guild_id=${encodeURIComponent(guildId)}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    })
+    if (!configResponse.ok) {
+      const body = await configResponse.text()
+      throw new Error(`failed to load clan config (${configResponse.status}): ${body}`)
+    }
+    const payload = (await configResponse.json()) as ClanConfigPayload
+
+    renderClanConfigTable(root, payload, async (clans: ClanConfig[]) => {
+      const saveResponse = await fetch('/api/cwl/clan-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify({ guild_id: guildId, clans }),
+      })
+      if (!saveResponse.ok) {
+        const body = await saveResponse.text()
+        throw new Error(`${saveResponse.status}: ${body}`)
+      }
+    })
   } catch (err) {
     console.error(err)
     root.textContent = `Setup failed: ${(err as Error).message}`

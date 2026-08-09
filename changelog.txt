@@ -1,6 +1,32 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (27)
+- Added: Phase C of the CWL clan-config Activity (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md) — the real
+  table UI this whole feature exists for. activity/client/src/clanConfigTable.ts renders a
+  genuine HTML table (checkbox / clan name / tier (read-only, CoC-defined) / roster-size select
+  / start-time datetime-local input per clan), editing a working copy that only reaches the
+  bridge on Save. Datetime conversion between the bridge's "YYYY-MM-DDTHH:MMZ" and
+  datetime-local's "YYYY-MM-DDTHH:MM" is a plain string transform (strip/append "Z"), never a
+  timezone conversion — both sides always mean UTC, matching the Discord-side modal's own
+  convention. main.ts now loads this instead of Phase B's raw-JSON smoke test.
+  Bot side: a 5th button, "Open Clan Config (Web)" (add_cwl_management_components(),
+  qapbot/ui_cwl_roster.py — exactly fills row 1's 5-button cap), whose callback answers Phase
+  A's flagged open question for real: can a plain component interaction (not just the
+  auto-created Entry Point command) respond with a LAUNCH_ACTIVITY (type 12) callback.
+  Implemented via a raw interaction.client.http.request() call (discord.py has no high-level
+  wrapper for this callback type), with a graceful ephemeral fallback message if Discord ever
+  rejects it. 2 new tests in tests/discord/test_ui_cwl_roster.py (correct callback-type-12
+  payload; fallback path) — 1620 total tests pass.
+  Still needed: the project owner restarting the DEV bot and clicking through the new button +
+  table + Save flow live in Discord — "shipped" here means code-complete and unit-tested, not
+  yet confirmed working, per every other phase's own standard in this plan.
+  Files: qapbot/ui_cwl_roster.py, qapbot/translations/en.json, qapbot/translations/de.json,
+  tests/discord/test_ui_cwl_roster.py, activity/client/src/clanConfigTable.ts (new),
+  activity/client/src/types.ts (new), activity/client/src/main.ts, activity/client/index.html,
+  CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.
+  1620 tests pass (.\run_tests.ps1).
+
 2026-08-09 (26)
 - Verified: Phase B of the CWL clan-config Activity (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md), (25),
   live end-to-end against the DEV guild — the full chain (Discord iframe -> Cloudflare Pages ->

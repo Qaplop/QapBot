@@ -157,7 +157,7 @@ def test_clan_management_view_cwl_management_mode_constructs_without_row_conflic
         sent_message=sent_message, mode="cwl_management", timeout=300,
     )
 
-    assert len(view.children) == 6  # mode select + refresh + configure/start(disabled)/manage(disabled)/delete
+    assert len(view.children) == 7  # mode select + refresh + configure/start(disabled)/manage(disabled)/delete/open_web
 
 
 @pytest.mark.discord
@@ -628,6 +628,47 @@ async def test_cwl_delete_season_confirm_view_cancel_does_not_delete(db, mock_in
     assert db.get_cwl_event_sync("555", "2026-09") is not None
     mock_interaction.delete_original_response.assert_awaited_once()
     parent.refresh_cwl_view.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# "Open Clan Config (Web)" — LAUNCH_ACTIVITY interaction-response callback
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_management_open_web_callback_sends_launch_activity(mock_interaction):
+    from qapbot.ui_cwl_roster import _make_cwl_management_open_web_callback
+
+    mock_interaction.id = 123456789
+    mock_interaction.token = "test-token"
+    callback = _make_cwl_management_open_web_callback(MagicMock())
+
+    await callback(mock_interaction)
+
+    mock_interaction.client.http.request.assert_awaited_once()
+    args, kwargs = mock_interaction.client.http.request.await_args
+    route = args[0]
+    assert route.method == "POST"
+    assert route.url == "https://discord.com/api/v10/interactions/123456789/test-token/callback"
+    assert kwargs["json"] == {"type": 12, "data": {}}  # 12 = LAUNCH_ACTIVITY
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_management_open_web_callback_falls_back_if_launch_activity_rejected(mock_interaction):
+    """If Discord ever rejects LAUNCH_ACTIVITY from a plain component interaction (the risk
+    CWL_CLAN_CONFIG_ACTIVITY_PLAN.md flagged as unverified for this path), admins should get a
+    clear ephemeral hint instead of a silently dead button."""
+    from qapbot.ui_cwl_roster import _make_cwl_management_open_web_callback
+
+    mock_interaction.client.http.request = AsyncMock(side_effect=RuntimeError("boom"))
+    mock_interaction.response.is_done = MagicMock(return_value=False)
+    mock_interaction.response.send_message = AsyncMock()
+
+    callback = _make_cwl_management_open_web_callback(MagicMock())
+    await callback(mock_interaction)
+
+    mock_interaction.response.send_message.assert_awaited_once()
 
 
 @pytest.mark.discord

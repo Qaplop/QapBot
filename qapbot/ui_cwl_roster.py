@@ -304,6 +304,18 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     delete_button.callback = _make_cwl_management_delete_callback(view)  # type: ignore[assignment]
     view.add_item(delete_button)  # type: ignore[arg-type]
 
+    # 5th and last button on row 1 (Discord's per-row cap) — opens the CWL_CLAN_CONFIG_ACTIVITY_PLAN.md
+    # Phase C Discord Activity (real table UI) in-context, as an alternative to "Configure
+    # Participating Clans" above rather than a replacement for it.
+    open_web_button = discord.ui.Button(
+        label=t('cwl.management.button_open_web', guild_id=guild_id),
+        style=discord.ButtonStyle.secondary,
+        custom_id="cwl_management_open_web",
+        row=1,
+    )
+    open_web_button.callback = _make_cwl_management_open_web_callback(view)  # type: ignore[assignment]
+    view.add_item(open_web_button)  # type: ignore[arg-type]
+
     if event is not None:
         # Surfaced so an admin opening this screen can see at a glance whether every
         # participating clan already has a start time set (Finalize, Phase 4, will require it).
@@ -350,6 +362,44 @@ def _make_cwl_management_delete_callback(view: discord.ui.View):
             view=confirm_view,
             ephemeral=True,
         )
+
+    return callback
+
+
+def _make_cwl_management_open_web_callback(view: discord.ui.View):
+    """Opens the CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Discord Activity in-context via the
+    LAUNCH_ACTIVITY interaction-response callback (type 12) — flagged in the plan as unverified
+    from a plain component interaction (only confirmed working for the auto-created Entry Point
+    /launch command). discord.py has no high-level wrapper for this callback type, so it's a
+    raw REST call through the bot's own HTTPClient, matching the plan's documented mechanism.
+    """
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        from discord.http import Route
+
+        try:
+            await interaction.client.http.request(
+                Route(
+                    "POST",
+                    "/interactions/{interaction_id}/{interaction_token}/callback",
+                    interaction_id=interaction.id,
+                    interaction_token=interaction.token,
+                ),
+                json={"type": 12, "data": {}},  # 12 = LAUNCH_ACTIVITY
+            )
+        except Exception as e:
+            logging.warning(f"[CWL] LAUNCH_ACTIVITY callback failed, falling back to a text hint: {e}")
+            if not interaction.response.is_done():
+                from qapbot.i18n import t
+                guild_id = interaction.guild.id if interaction.guild else None
+                try:
+                    await interaction.response.send_message(
+                        t('cwl.management.open_web_fallback', guild_id=guild_id),
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
 
     return callback
 
