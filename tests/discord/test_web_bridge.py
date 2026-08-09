@@ -140,6 +140,7 @@ async def test_clan_config_get_super_admin_bypasses_guild_lookup(monkeypatch):
 @pytest.mark.asyncio
 async def test_clan_config_get_returns_payload_for_admin(db, bridge_config, client, monkeypatch):
     from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
 
     await _seed_guild_and_clans(db, "555", {"#CLAN1": "Alpha"})
     CACHE.db_manager = db
@@ -158,13 +159,21 @@ async def test_clan_config_get_returns_payload_for_admin(db, bridge_config, clie
     )
     assert resp.status == 200
     body = await resp.json()
+    season = resolve_current_cwl_season()
+    assert body["season"] == season
+    assert body["has_own_data"] is False
+    assert body["carry_over_available"] is False
+    assert body["previous_clans"] is None
+    assert season in body["available_seasons"]
+    # No cwl_event_clans row yet for this clan -> season-aware defaults, not nulls (Phase E.2):
+    # roster_size 15, start time the 1st of the season's month at 08:00 UTC.
     assert body["clans"] == [{
         "clan_tag": "#CLAN1",
         "name": "Alpha",
         "tier": "Crystal League I",
         "participating": False,
         "roster_size": 15,
-        "cwl_start_at": None,
+        "cwl_start_at": f"{season}-01T08:00Z",
     }]
 
 
@@ -272,3 +281,188 @@ async def test_deactivating_clan_via_bridge_preserves_settings(db, bridge_config
     assert clan["participating"] is True
     assert clan["roster_size"] == 30
     assert clan["cwl_start_at"] == "2026-09-01T08:00Z"
+
+
+# ---------------------------------------------------------------------------
+# Season selection, carry-over detection, season-aware defaults (Phase E)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_config_get_honors_explicit_season_param(db, bridge_config, client, monkeypatch):
+    """A season param picks that season's own event/clans, not whatever
+    get_current_cwl_event_sync() would otherwise resolve to."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "888", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha", "war_league": "Master League II"}}
+    CACHE.server_config["888"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("888", "2026-06", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#CLAN1", "roster_size": 5, "cwl_start_at": "2026-06-01T08:00Z", "participating": True},
+    ])
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(888, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/clan-config",
+        params={"guild_id": "888", "discord_user_id": "42", "season": "2026-06"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    body = await resp.json()
+    assert body["season"] == "2026-06"
+    assert body["has_own_data"] is True
+    assert body["clans"][0]["roster_size"] == 5
+    assert body["clans"][0]["cwl_start_at"] == "2026-06-01T08:00Z"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_config_get_lists_available_seasons(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+
+    await _seed_guild_and_clans(db, "999", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.server_config["999"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    db.create_cwl_event_sync("999", "2026-05", "discordid1")
+    db.create_cwl_event_sync("999", "2026-06", "discordid1")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(999, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/clan-config",
+        params={"guild_id": "999", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    body = await resp.json()
+    assert {"2026-05", "2026-06", resolve_current_cwl_season()} <= set(body["available_seasons"])
+    # Newest first.
+    assert body["available_seasons"] == sorted(body["available_seasons"], reverse=True)
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_config_get_offers_carry_over_when_new_season_has_no_data(db, bridge_config, client, monkeypatch):
+    """A season with no cwl_event_clans rows of its own yet, but a previous season with
+    participating clans, should surface that previous data as an explicit opt-in choice
+    (carry_over_available/carry_over_season/previous_clans) — never silently pre-applied to
+    `clans` itself, which must stay at the plain season-aware defaults."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "111", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha", "war_league": "Master League II"}}
+    CACHE.server_config["111"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    old_event_id = db.create_cwl_event_sync("111", "2026-06", "discordid1")
+    db.set_cwl_event_clans_sync(old_event_id, [
+        {"clan_tag": "#CLAN1", "roster_size": 30, "cwl_start_at": "2026-06-01T08:00Z", "participating": True},
+    ])
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(111, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/clan-config",
+        params={"guild_id": "111", "discord_user_id": "42", "season": "2026-07"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    body = await resp.json()
+    assert body["season"] == "2026-07"
+    assert body["has_own_data"] is False
+    assert body["carry_over_available"] is True
+    assert body["carry_over_season"] == "2026-06"
+    assert body["previous_clans"] == [
+        {"clan_tag": "#CLAN1", "roster_size": 30, "cwl_start_at": "2026-06-01T08:00Z"}
+    ]
+    # The plain `clans` array stays at defaults — carry-over is opt-in, not auto-applied.
+    assert body["clans"][0]["participating"] is False
+    assert body["clans"][0]["roster_size"] == 15
+    assert body["clans"][0]["cwl_start_at"] == "2026-07-01T08:00Z"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_config_get_no_carry_over_once_season_has_own_data(db, bridge_config, client, monkeypatch):
+    """Once a season has its own saved clans, it's no longer a carry-over candidate — even if
+    an earlier season also has data."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "222", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.server_config["222"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    old_event_id = db.create_cwl_event_sync("222", "2026-06", "discordid1")
+    db.set_cwl_event_clans_sync(old_event_id, [
+        {"clan_tag": "#CLAN1", "roster_size": 30, "cwl_start_at": "2026-06-01T08:00Z", "participating": True},
+    ])
+    new_event_id = db.create_cwl_event_sync("222", "2026-07", "discordid1")
+    db.set_cwl_event_clans_sync(new_event_id, [
+        {"clan_tag": "#CLAN1", "roster_size": 5, "cwl_start_at": "2026-07-01T08:00Z", "participating": True},
+    ])
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(222, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/clan-config",
+        params={"guild_id": "222", "discord_user_id": "42", "season": "2026-07"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    body = await resp.json()
+    assert body["has_own_data"] is True
+    assert body["carry_over_available"] is False
+    assert body["previous_clans"] is None
+    assert body["clans"][0]["roster_size"] == 5
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_config_post_persists_to_explicit_season(db, bridge_config, client, monkeypatch):
+    """POST honors an explicit `season` in the body, so a save made while the dropdown has a
+    non-default season selected lands in that season's event, not always resolve_current_cwl_season()."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "333", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha", "war_league": "Master League II"}}
+    CACHE.server_config["333"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(333, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    resp = await client.post(
+        "/api/cwl/clan-config",
+        json={
+            "guild_id": 333,
+            "discord_user_id": 42,
+            "season": "2026-11",
+            "clans": [{"clan_tag": "#CLAN1", "participating": True, "roster_size": 30, "cwl_start_at": "2026-11-01T08:00Z"}],
+        },
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+
+    event = db.get_cwl_event_sync("333", "2026-11")
+    assert event is not None
+    clans = db.get_cwl_event_clans_sync(event["id"])
+    assert clans[0]["roster_size"] == 30

@@ -57,13 +57,28 @@ async def _resolve_admin(guild_id: int, discord_user_id: int) -> bool:
     return bool(member.guild_permissions.administrator)
 
 
-async def _build_clan_config_payload(guild_id: int) -> Dict[str, Any]:
+async def _build_clan_config_payload(guild_id: int, season: Optional[str] = None) -> Dict[str, Any]:
+    """Build the GET response for a given season (or the guild's "current" one if *season* is
+    omitted — preserves the pre-dropdown default of resolving via get_current_cwl_event_sync()).
+
+    Season-aware defaults (Phase E.2/E.4): a clan with no row yet for the selected season
+    defaults to roster_size=15, cwl_start_at=the 1st of that season's month at 08:00 UTC (the
+    game's static schedule) and participating=False — never silently carried over from a
+    previous season. Carry-over is instead surfaced as an explicit, frontend-driven choice via
+    has_own_data/carry_over_available/carry_over_season/previous_clans below, so the user picks
+    "start fresh" vs. "copy last month" rather than it happening invisibly.
+    """
     from qapbot.QBdiscocmdshelper import get_guild_clans_including_member_config
     from qapbot.QBdiscocmdshelper_cwl import get_current_cwl_event_sync, resolve_current_cwl_season
 
     all_tags = get_guild_clans_including_member_config(guild_id)
-    event = get_current_cwl_event_sync(guild_id)
     db = CACHE.db_manager
+
+    if season is not None:
+        event = db.get_cwl_event_sync(str(guild_id), season) if db is not None else None
+    else:
+        event = get_current_cwl_event_sync(guild_id)
+        season = event["cwl_season"] if event else resolve_current_cwl_season()
 
     # Keyed by clan_tag -> its cwl_event_clans row, which now exists for every clan ever
     # touched (participating or not) — deactivating a clan keeps its row (with settings intact)
@@ -73,6 +88,9 @@ async def _build_clan_config_payload(guild_id: int) -> Dict[str, Any]:
     if db is not None and event is not None:
         for row in db.get_cwl_event_clans_sync(event["id"]):
             known_rows[row["clan_tag"]] = row
+    has_own_data = bool(known_rows)
+
+    default_start_at = f"{season}-01T08:00Z"
 
     clans: List[Dict[str, Any]] = []
     for tag in sorted(all_tags, key=lambda t: (CACHE.get_clan_name(t, t) or t).lower()):
@@ -85,13 +103,42 @@ async def _build_clan_config_payload(guild_id: int) -> Dict[str, Any]:
             "tier": CACHE.get_clan_war_league(tag),
             "participating": bool(row["participating"]) if row else False,
             "roster_size": row["roster_size"] if row else 15,
-            "cwl_start_at": row["cwl_start_at"] if row else None,
+            "cwl_start_at": row["cwl_start_at"] if row else default_start_at,
         })
 
+    available_seasons = {resolve_current_cwl_season(), season}
+    event_season_by_id: Dict[int, str] = {}
+    if db is not None:
+        for e in db.list_cwl_events_sync(str(guild_id)):
+            available_seasons.add(e["cwl_season"])
+            event_season_by_id[e["id"]] = e["cwl_season"]
+
+    previous_clans: Optional[List[Dict[str, Any]]] = None
+    carry_over_season: Optional[str] = None
+    if db is not None and not has_own_data:
+        prev_rows = db.get_previous_cwl_event_clans_sync(
+            str(guild_id), exclude_event_id=event["id"] if event is not None else None
+        )
+        if prev_rows:
+            carry_over_season = event_season_by_id.get(prev_rows[0]["event_id"])
+            previous_clans = [
+                {
+                    "clan_tag": r["clan_tag"],
+                    "roster_size": r["roster_size"],
+                    "cwl_start_at": r["cwl_start_at"],
+                }
+                for r in prev_rows
+            ]
+
     return {
-        "season": event["cwl_season"] if event else resolve_current_cwl_season(),
+        "season": season,
         "event_status": event["status"] if event else None,
+        "available_seasons": sorted(available_seasons, reverse=True),
+        "has_own_data": has_own_data,
+        "carry_over_available": previous_clans is not None,
+        "carry_over_season": carry_over_season,
         "clans": clans,
+        "previous_clans": previous_clans,
     }
 
 
@@ -111,7 +158,8 @@ async def handle_get_clan_config(request: web.Request) -> web.Response:
     if not await _resolve_admin(guild_id, discord_user_id):
         return web.json_response({"error": "not an admin of this guild"}, status=403)
 
-    return web.json_response(await _build_clan_config_payload(guild_id))
+    season = request.query.get("season") or None
+    return web.json_response(await _build_clan_config_payload(guild_id, season))
 
 
 async def handle_post_clan_config(request: web.Request) -> web.Response:
@@ -135,7 +183,7 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
     from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
     from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
 
-    season = resolve_current_cwl_season()
+    season = body.get("season") or resolve_current_cwl_season()
     event_id = db.create_cwl_event_sync(str(guild_id), season, str(discord_user_id))
     if event_id is None:
         return web.json_response({"error": "failed to create/find event"}, status=500)
