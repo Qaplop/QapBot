@@ -155,8 +155,41 @@ Bot side: a 5th button, **"Open Clan Config (Web)"**, added to `add_cwl_manageme
 3. Closing the Activity from Save/Cancel — **confirmed working after a few false starts, worth recording accurately since it took three passes to get right**: first conclusion ("no close/exit API exists at all") was wrong, based on only checking the SDK's `commands/` folder. Corrected to `discordSdk.close(RPCCloseCodes.CLOSE_NORMAL, reason)` — a real, exported top-level method whose actual runtime implementation (checked directly in the installed package's compiled source, not just its `.d.ts`) posts a genuine `CLOSE`-opcode `postMessage` to Discord's client frame, the same mechanism every other SDK command uses. First live test of *that* appeared to show no effect — but the only place calling it at the time was Save's confirmation screen, and Cancel wasn't wired to it at all (so "nothing happens" was partly just Cancel being a no-op, not necessarily `close()` failing). Wired both buttons to it and retested: **it works** — confirmed live via both Save and Cancel. Final UX, per project owner preference: no intermediate confirmation screen at all — Save persists then closes immediately, Cancel discards and closes immediately, closing itself is the confirmation.
 4. **A real data-loss bug, not a platform limit**: deactivating a clan deleted its `cwl_event_clans` row entirely, silently discarding its `roster_size`/`cwl_start_at` — reactivating it (even within the same session) reset it to defaults. Root cause: "row exists" was the only signal for "participating" at all, so deactivating had no way to represent "off, but remember the settings." Added an explicit `participating` column (idempotent migration) — deactivating now sets `participating=0` and *keeps* the row instead of deleting it. Fixed at every layer that touches this data: `set_cwl_event_clans_sync()`/`get_previous_cwl_event_clans_sync()` (the latter still correctly excludes non-participating rows from next-season carry-over — that's a different, intentional filter), the web bridge's GET/POST, and the Discord-side `CwlEventSetupView` (toggling now flips `participating` in place instead of `del()`-ing the working-copy entry, which had the identical bug on the native side too, just never reported). Every *display* of "Participating Clans" now explicitly filters to `participating=1`, since the raw row set can contain deactivated-but-remembered clans. 6 new/updated tests across the DB layer, the bridge, and the Discord-side toggle — 1623 total tests pass.
 
-### Phase D — PROD rollout
+### Phase D — PROD rollout 🚧 in progress 2026-08-09
 Repeat the Developer Portal setup for the PROD application, deploy the `prod` Wrangler environment, add the PROD bridge (tunnel + `.env` secret on whatever host runs PROD), smoke-test in a real guild.
+
+**Done so far**: PROD Developer Portal setup (Activities enabled, URL Mapping, OAuth2 redirect —
+`activity/README.md`'s deterministic-URL trick meant the mapping could be entered *before*
+deploying, since Cloudflare Worker/Pages URLs are `<name>.<account-subdomain>.workers.dev` /
+`<project-name>.pages.dev`, both fully known from `wrangler.toml`/`package.json` ahead of time).
+PROD Worker + Pages both deployed (`cwl-clan-config-server-prod`, `cwl-clan-config-prod`).
+`CLIENT_SECRET`/`BRIDGE_SECRET` set as Worker secrets for `--env prod`. Client build config
+fixed to use real Vite modes (`vite build --mode dev|prod` loading `.env.dev.local`/
+`.env.prod.local`) instead of one shared `.env.local` that had to be manually swapped before
+every deploy — a footgun once two people/sessions might deploy either environment.
+
+**A real PROD-startup crash found and fixed, not just a config gap**: restarting the PROD bot
+after enabling Activities on the PROD Discord application (a Phase D step) made `setup_hook`'s
+global command sync fail with HTTP 400 / error code 50240 ("You cannot remove this app's Entry
+Point command in a bulk update operation"), an uncaught exception that exited the whole process
+— PROD was down until fixed. Root cause: enabling Activities auto-creates a global
+`PRIMARY_ENTRY_POINT` command that `discord.py` 2.7.1 has no model of at all (its
+`AppCommandType` enum doesn't even define the value), so `tree.sync(guild=None)`'s bulk
+overwrite always omits it — Discord rejects that outright rather than silently deleting it. The
+same restriction silently broke `_clear_global_commands_after_ready`'s DEV-app cleanup too
+(already wrapped in try/except there, so non-fatal, but not doing its job — the DEV app has had
+an Entry Point command since Phase A). Fixed with `bulk_sync_global_commands()`
+(`qapbot/discord_health.py`): fetches the app's current global commands via a raw HTTP call,
+filters for an existing Entry Point command, and always splices it back into the bulk-upsert
+payload — used at both call sites in `QapBot.py` in place of `tree.sync(guild=None)`. This is a
+permanent fix, not a one-off: every future global sync on either app (DEV or PROD, both now
+Activities-enabled) would otherwise hit this. 3 new tests in `tests/discord/test_discord_health.py`
+— 1636 total tests pass.
+
+**Still open**: the named `cloudflared` tunnel on the PROD NAS host (domain `qapbot.uk`
+purchased via Cloudflare Registrar; DEV keeps its quick tunnel since a human restarts it by
+hand), wiring the Worker's `BRIDGE_URL` secret once that hostname is live, and a real end-to-end
+smoke test in a live guild.
 
 ### Phase E — Workflow redesign (web Activity becomes the sole clan-config entry point)
 Five-part follow-up requested once Phase C was verified live, replacing the native/web dual-path design with the web Activity as the only way to configure CWL clans:

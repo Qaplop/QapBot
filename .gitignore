@@ -250,5 +250,6 @@ activity/**/dist/
 activity/**/.dev.vars
 activity/**/.env
 activity/**/.env.local
+activity/**/.env.*.local
 .repo_*backup*/
 .claude/

@@ -21,4 +21,4 @@ vars = { CLIENT_ID = "1442060461783781479", REDIRECT_URI = "https://cwl-clan-con
 
 [env.prod]
 name = "cwl-clan-config-server-prod"
-vars = { CLIENT_ID = "REPLACE_WITH_PROD_DISCORD_APPLICATION_CLIENT_ID", REDIRECT_URI = "REPLACE_WITH_PROD_PAGES_URL" }
+vars = { CLIENT_ID = "1394733938961944787", REDIRECT_URI = "https://cwl-clan-config-prod.pages.dev/" }

@@ -153,6 +153,28 @@ async def discord_retry(
     
     raise RuntimeError("Retry logic error - should not reach here")
 
+# discord.py 2.7.1's AppCommandType enum has no member for this — it predates Discord Activities'
+# auto-created "launch" Entry Point command (see CWL_CLAN_CONFIG_ACTIVITY_PLAN.md). Raw type id
+# per Discord's API docs (application command type 4, PRIMARY_ENTRY_POINT).
+PRIMARY_ENTRY_POINT_TYPE = 4
+
+async def bulk_sync_global_commands(bot: discord.Client, tree_payload: list) -> list:
+    """Bulk-overwrites global commands via a raw HTTP call, always re-including whatever
+    Activities Entry Point command already exists on the application.
+
+    Once Activities is enabled in the Developer Portal, Discord auto-creates a global
+    PRIMARY_ENTRY_POINT command that `discord.py`'s `CommandTree` has no knowledge of.
+    `tree.sync(guild=None)`/`tree.clear_commands(guild=None)` + `tree.sync()` both submit a
+    bulk overwrite payload that omits it, which Discord rejects outright (HTTP 400, error code
+    50240) rather than silently deleting it — so every global bulk-upsert must fetch the
+    current commands first and splice the Entry Point one back in, even when clearing
+    everything else (`tree_payload=[]`).
+    """
+    app_id = bot.application_id
+    existing = await bot.http.get_global_commands(app_id)
+    entry_points = [cmd for cmd in existing if cmd.get('type') == PRIMARY_ENTRY_POINT_TYPE]
+    return await bot.http.bulk_upsert_global_commands(app_id, payload=tree_payload + entry_points)
+
 def get_simple_discord_stats() -> Dict[str, Any]:
     """
     Get basic Discord API statistics for status reporting.

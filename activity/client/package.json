@@ -8,8 +8,8 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "deploy:dev": "npm run build && wrangler pages deploy dist --project-name=cwl-clan-config-dev",
-    "deploy:prod": "npm run build && wrangler pages deploy dist --project-name=cwl-clan-config-prod"
+    "deploy:dev": "vite build --mode dev && wrangler pages deploy dist --project-name=cwl-clan-config-dev",
+    "deploy:prod": "vite build --mode prod && wrangler pages deploy dist --project-name=cwl-clan-config-prod"
   },
   "dependencies": {
     "@discord/embedded-app-sdk": "^2.5.0"

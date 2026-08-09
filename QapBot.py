@@ -180,7 +180,7 @@ from qapbot.constants import (
     PASSIVE_CLAN_REFRESH_INTERVAL_DAYS,
     PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS
 )
-from qapbot.discord_health import discord_retry
+from qapbot.discord_health import discord_retry, bulk_sync_global_commands
 from qapbot.coc_health import reset_cycle_stats, get_coc_stats, clear_maintenance_detection, is_maintenance_detected, clear_dns_detection
 from QBhelperfunctions import (
     generate_leaderboard_text, generate_cwlinfo_embeds, generate_cwlinfo_comp_embeds, post_discord_content_with_tracking,
@@ -2723,8 +2723,9 @@ async def _setup_hook():
         logging.info(f"[SETUP_HOOK] Commands added to tree, now syncing...")
         
         async def _sync_global_commands():
-            return await QBcore.bot.tree.sync(guild=None)
-        
+            payload = [cmd.to_dict(QBcore.bot.tree) for cmd in QBcore.bot.tree.get_commands(guild=None)]
+            return await bulk_sync_global_commands(QBcore.bot, payload)
+
         await discord_retry(
             _sync_global_commands,
             "global_command_sync"
@@ -2771,7 +2772,7 @@ async def _clear_global_commands_after_ready():
         QBcore.bot.tree.clear_commands(guild=None)
         logging.info("[CLEAR-CMDS] Calling tree.sync(guild=None) via discord_retry (max 3 retries)...")
         await discord_retry(
-            lambda: QBcore.bot.tree.sync(guild=None),
+            lambda: bulk_sync_global_commands(QBcore.bot, []),
             "clear_global_commands"
         )
         logging.info("✅ Global commands cleared from DEV app successfully")

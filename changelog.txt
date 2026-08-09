@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (36)
+- Fixed: a real PROD-startup crash discovered during CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase D
+  (PROD rollout) — enabling Activities in the Developer Portal for the PROD application
+  auto-creates a global `PRIMARY_ENTRY_POINT` command (type 4, the "launch" command), which
+  `discord.py` 2.7.1 has zero awareness of. The bot's global command sync
+  (`bot.tree.sync(guild=None)`) does a bulk overwrite that omits it, which Discord now rejects
+  outright (HTTP 400, error code 50240: "You cannot remove this app's Entry Point command in a
+  bulk update operation") instead of silently deleting it — `setup_hook` raised, uncaught, and
+  the whole PROD process exited on startup. The same restriction hit `_clear_global_commands_after_ready`'s
+  DEV-app cleanup path too (already non-fatal there, but silently failing to actually clear
+  anything, since the DEV app also has Activities/an Entry Point command enabled since Phase A).
+  Fixed with a new `bulk_sync_global_commands()` helper (`qapbot/discord_health.py`) that fetches
+  the app's current global commands via a raw HTTP call, filters for any existing Entry Point
+  command, and always re-includes it verbatim in the bulk-upsert payload — used in place of
+  `tree.sync(guild=None)` at both call sites in `QapBot.py`. 3 new tests in
+  `tests/discord/test_discord_health.py` (entry point preserved alongside tree commands, no-op
+  when none exists, preserved even when clearing everything else) — 1636 total tests pass.
+
 2026-08-09 (35)
 - Fixed/Changed: two follow-up fixes to (34)'s CWL Management redesign after live testing:
   (1) The Activity's start-time picker now prohibits a date/time before the season's official
