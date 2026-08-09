@@ -20,6 +20,55 @@ from typing import Any, Dict, List, Optional, Tuple
 import discord
 
 from qapbot.cache_manager import CACHE
+from qapbot.constants import CWL_LEAGUE_ORDER
+
+
+def cwl_league_rank(tier: Optional[str]) -> int:
+    """Numeric rank for sorting clans by CWL tier, highest league first (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md
+    Phase E: both the CWL Management embed and the web Activity's clan-config table sort this
+    way now). Unknown/never-synced tiers rank below Bronze League III (-1), so they sort last."""
+    if not tier:
+        return -1
+    try:
+        return CWL_LEAGUE_ORDER.index(tier)
+    except ValueError:
+        return -1
+
+
+def cwl_start_at_discord_timestamp(cwl_start_at: Optional[str], style: str = "f") -> Optional[str]:
+    """Convert a stored UTC "YYYY-MM-DDTHH:MMZ" cwl_start_at into Discord's `<t:unix:style>`
+    timestamp markup, or None if unset/unparseable.
+
+    Discord's client renders this markup in *each viewer's own* locale/timezone automatically —
+    no per-guild timezone setting is needed to satisfy "show it in the calling client's
+    timezone" (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase E.4); this is the native mechanism built
+    for exactly that, and it's more correct than a single guild-wide setting could ever be
+    (each admin sees their own local time, not the guild's).
+    """
+    if not cwl_start_at:
+        return None
+    try:
+        naive = datetime.strptime(cwl_start_at.rstrip("Z"), "%Y-%m-%dT%H:%M")
+    except ValueError:
+        return None
+    epoch = int(naive.replace(tzinfo=timezone.utc).timestamp())
+    return f"<t:{epoch}:{style}>"
+
+
+def resolve_selected_cwl_season(guild_id: int) -> str:
+    """The season currently selected for CWL Management display/editing — the persisted
+    guild_config.cwl_selected_season if set (driven by the season dropdown on the CWL
+    Management screen, CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase E.3), else falls back to
+    get_current_cwl_event_sync()'s season, else the calendar default. Single resolution path
+    shared by the Discord-side embed/season-select and the web bridge, so both always agree on
+    "which season is this" without either needing its own heuristic.
+    """
+    guild_id_str = str(guild_id)
+    selected = CACHE.server_config.get(guild_id_str, {}).get("cwl_selected_season")
+    if selected:
+        return selected
+    event = get_current_cwl_event_sync(guild_id)
+    return event["cwl_season"] if event else resolve_current_cwl_season()
 
 
 def resolve_current_cwl_season() -> str:
@@ -129,7 +178,9 @@ async def format_clan_management_cwl_management(
     from qapbot.i18n import t
 
     guild_id_int = guild.id
-    event = get_current_cwl_event_sync(guild_id_int)
+    season = resolve_selected_cwl_season(guild_id_int)
+    db = CACHE.db_manager
+    event = db.get_cwl_event_sync(str(guild_id_int), season) if db is not None else None
 
     embed = discord.Embed(
         title=t('cwl.management.title', guild_id=guild_id_int),
@@ -137,15 +188,25 @@ async def format_clan_management_cwl_management(
     )
 
     if event is None:
-        embed.description = t('cwl.management.no_event', guild_id=guild_id_int)
+        embed.description = t('cwl.management.no_event', guild_id=guild_id_int, season=season)
         return embed, None, [], []
 
-    db = CACHE.db_manager
     # get_cwl_event_clans_sync() returns every clan ever configured for this event, including
     # deactivated ones whose settings are kept (not deleted) so reactivating restores them — the
     # "Participating Clans" display must only show the ones actually currently participating.
     all_clans = db.get_cwl_event_clans_sync(event["id"]) if db is not None else []
     clans = [c for c in all_clans if c.get("participating", 1)]
+
+    def _tier_for(clan: Dict[str, Any]) -> Optional[str]:
+        # The CWL tier is CoC-defined (war_league), never admin-set — prefer the live value
+        # over the stored snapshot in case the clan was promoted/demoted since.
+        return CACHE.get_clan_war_league(clan["clan_tag"]) or clan.get("target_league_rank")
+
+    # Highest tier first (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase E), name as the tiebreaker.
+    clans = sorted(
+        clans,
+        key=lambda c: (-cwl_league_rank(_tier_for(c)), (CACHE.get_clan_name(c["clan_tag"], c["clan_tag"]) or "").lower()),
+    )
 
     embed.description = t(
         'cwl.management.season_header',
@@ -160,14 +221,13 @@ async def format_clan_management_cwl_management(
         lines = []
         for clan in clans:
             clan_name = CACHE.get_clan_name(clan["clan_tag"], clan["clan_tag"])
-            # The CWL tier is CoC-defined (war_league), never admin-set — prefer the live
-            # value over the stored snapshot in case the clan was promoted/demoted since.
-            tier = (
-                CACHE.get_clan_war_league(clan["clan_tag"])
-                or clan.get("target_league_rank")
-                or t('cwl.management.tier_unset', guild_id=guild_id_int)
+            tier = _tier_for(clan) or t('cwl.management.tier_unset', guild_id=guild_id_int)
+            # Discord renders <t:unix:f> in each viewer's own local timezone automatically —
+            # see cwl_start_at_discord_timestamp()'s docstring.
+            start_display = (
+                cwl_start_at_discord_timestamp(clan.get("cwl_start_at"))
+                or t('cwl.management.start_time_unset', guild_id=guild_id_int)
             )
-            start_display = clan.get("cwl_start_at") or t('cwl.management.start_time_unset', guild_id=guild_id_int)
             lines.append(
                 f"• **{clan_name}** ({clan['clan_tag']}) — {tier}, "
                 f"{clan['roster_size']} {t('cwl.management.roster_slots', guild_id=guild_id_int)}, "

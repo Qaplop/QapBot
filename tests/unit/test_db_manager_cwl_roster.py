@@ -245,6 +245,7 @@ class TestGuildConfigCwlColumns:
             "cwl_management_channel_id": "666",
             "cwl_management_message_enabled": True,
             "cwl_retention_months": 12,
+            "cwl_selected_season": "2026-09",
         })
 
         cfg = await db.get_guild_config("111")
@@ -253,6 +254,7 @@ class TestGuildConfigCwlColumns:
         assert cfg["cwl_management_channel_id"] == "666"
         assert cfg["cwl_management_message_enabled"] is True
         assert cfg["cwl_retention_months"] == 12
+        assert cfg["cwl_selected_season"] == "2026-09"
         # Untouched fields default sanely
         assert cfg["cwl_hub_message_id"] is None
         assert cfg["cwl_management_message_id"] is None
@@ -264,3 +266,4 @@ class TestGuildConfigCwlColumns:
         assert cfg["cwl_hub_message_enabled"] is False
         assert cfg["cwl_management_message_enabled"] is False
         assert cfg["cwl_retention_months"] == 0
+        assert cfg["cwl_selected_season"] is None

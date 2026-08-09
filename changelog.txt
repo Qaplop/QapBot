@@ -1,6 +1,38 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (34)
+- Changed: moved CWL season selection and the carry-over-vs-defaults prompt out of the web
+  Activity from (33) into the Discord-side "CWL Management" message, per follow-up feedback,
+  and added two more items:
+  (1) Clans are now sorted by CWL tier, highest first, in both the web Activity's table and the
+  Discord embed (new CWL_LEAGUE_ORDER constant + cwl_league_rank() helper).
+  (2) The season dropdown lives on the CWL Management message itself now (new
+  guild_config.cwl_selected_season column + a shared resolve_selected_cwl_season() resolution
+  path) — the web Activity has no season picker of its own anymore, it just reflects whichever
+  season is selected there.
+  (3) A new "Add New Season" button is the exclusive place that creates a season or offers the
+  carry-over-from-last-month prompt (a new ephemeral CwlCarryOverPromptView, Yes/No). "Configure
+  Participating Clans" no longer creates seasons or carries anything over — it's disabled until
+  a season already exists, and the bridge's POST now returns 409 instead of silently creating
+  one if it doesn't.
+  (4) The Discord embed shows CWL start times via Discord's native <t:unix:f> timestamp markup
+  instead of a raw UTC string — renders in each viewer's own local timezone automatically, no
+  guild-wide timezone setting needed (a strictly worse alternative that was floated as a
+  fallback, since one guild-wide time can't be everyone's local time at once).
+  Replaced the (33) season-selection/carry-over bridge test suite with tests for this simpler,
+  persisted-selection-driven design; added Discord-side tests for the season select, "Add New
+  Season", CwlCarryOverPromptView, and the new helper functions. 1633 total tests pass. Frontend
+  reverted to a single fetch/render with no season param and no in-Activity carry-over UI;
+  npm run typecheck/build both clean.
+  Files: qapbot/constants.py, qapbot/QBdiscocmdshelper_cwl.py, qapbot/db_manager.py,
+  qapbot/web_bridge.py, qapbot/ui_cwl_roster.py, qapbot/translations/en.json,
+  qapbot/translations/de.json, tests/discord/test_web_bridge.py,
+  tests/discord/test_ui_cwl_roster.py, tests/unit/test_db_manager_cwl_roster.py,
+  activity/client/src/types.ts, activity/client/src/main.ts,
+  activity/client/src/clanConfigTable.ts, activity/client/index.html,
+  CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.
+
 2026-08-09 (33)
 - Added: season selection, a carry-over prompt, and timezone-aware date/time handling to the
   CWL clan-config Activity, completing the 5-part workflow redesign from (32):

@@ -225,24 +225,32 @@ class CwlRetentionModal(discord.ui.Modal):
 # ---------------------------------------------------------------------------
 
 def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
-    """Attach the cwl_management screen's buttons to *view* — either a ClanManagementView
-    (entry point a) or a CwlManagementHubView (entry point b, Phase 1)."""
+    """Attach the cwl_management screen's buttons (+ season select, if any seasons exist) to
+    *view* — either a ClanManagementView (entry point a) or a CwlManagementHubView (entry point
+    b, Phase 1)."""
     from qapbot.i18n import t
-    from qapbot.QBdiscocmdshelper_cwl import get_current_cwl_event_sync
+    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
 
-    event = get_current_cwl_event_sync(guild_id)
+    db = CACHE.db_manager
+    season = resolve_selected_cwl_season(guild_id)
+    event = db.get_cwl_event_sync(str(guild_id), season) if db is not None else None
 
     # Row 1, not 0: row 0 is reserved by both possible shells (ClanManagementView's refresh
     # button, CwlManagementHubView's Settings/Season Management toggle) regardless of mode.
-    # "Configure Participating Clans" now opens the web Activity (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md)
-    # directly — the native CwlEventSetupView flow this button used to open was retired once the
-    # Activity covered the same ground with a real table instead of Discord's row-budget-limited
-    # toggle buttons + a separate detail-editing step.
+    # "Configure Participating Clans" opens the web Activity (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md)
+    # for whichever season is currently selected (the season select below, or its persisted
+    # default) — it never creates a season or offers carry-over itself; that's exclusively
+    # "Add New Season"'s job (Phase E.3), so this button carries no season-resolution logic at
+    # all beyond what the bridge already does.
     configure_button = discord.ui.Button(
         label=t('cwl.management.button_configure_clans', guild_id=guild_id),
         style=discord.ButtonStyle.primary,
         custom_id="cwl_management_configure_clans",
         row=1,
+        # Disabled until a season exists to configure — the bridge's POST refuses to save
+        # without one (it never creates a season itself, see the comment above), so there's
+        # nothing this button could productively do before "Add New Season" has run once.
+        disabled=(event is None),
     )
     configure_button.callback = _make_cwl_management_open_web_callback(view)  # type: ignore[assignment]
     view.add_item(configure_button)  # type: ignore[arg-type]
@@ -281,14 +289,40 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     delete_button.callback = _make_cwl_management_delete_callback(view)  # type: ignore[assignment]
     view.add_item(delete_button)  # type: ignore[arg-type]
 
+    # 5th and last slot in row 1 (Discord's per-row button cap) — the sole place that creates a
+    # season and/or offers the carry-over-from-last-month prompt (Phase E.3/E.4).
+    add_season_button = discord.ui.Button(
+        label=t('cwl.management.button_add_season', guild_id=guild_id),
+        style=discord.ButtonStyle.success,
+        custom_id="cwl_management_add_season",
+        row=1,
+    )
+    add_season_button.callback = _make_cwl_management_add_season_callback(view)  # type: ignore[assignment]
+    view.add_item(add_season_button)  # type: ignore[arg-type]
+
     if event is not None:
         # Surfaced so an admin opening this screen can see at a glance whether every
         # participating clan already has a start time set (Finalize, Phase 4, will require it).
-        db = CACHE.db_manager
         clans = db.get_cwl_event_clans_sync(event["id"]) if db is not None else []
         missing_start = [c["clan_tag"] for c in clans if c.get("participating", 1) and not c.get("cwl_start_at")]
         if missing_start:
             logging.debug(f"[CWL] guild {guild_id} event {event['id']}: {len(missing_start)} clan(s) missing a start time")
+
+    # Season select (Phase E.3) — its own row, only shown once at least one season exists;
+    # before that, "Add New Season" is the only way to get started (see the no_event embed text).
+    events = db.list_cwl_events_sync(str(guild_id)) if db is not None else []
+    if events:
+        season_select: discord.ui.Select[Any] = discord.ui.Select(
+            placeholder=t('cwl.management.season_select_placeholder', guild_id=guild_id),
+            options=[
+                discord.SelectOption(label=e["cwl_season"], value=e["cwl_season"], default=(e["cwl_season"] == season))
+                for e in events[:25]
+            ],
+            row=3,
+            custom_id="cwl_management_season_select",
+        )
+        season_select.callback = _make_cwl_management_season_select_callback(view)  # type: ignore[assignment]
+        view.add_item(season_select)  # type: ignore[arg-type]
 
 
 def _make_cwl_management_delete_callback(view: discord.ui.View):
@@ -298,9 +332,11 @@ def _make_cwl_management_delete_callback(view: discord.ui.View):
         await interaction.response.defer(thinking=False, ephemeral=True)
         if not interaction.guild:
             return
-        from qapbot.QBdiscocmdshelper_cwl import get_current_cwl_event_sync
+        from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
 
-        event = get_current_cwl_event_sync(interaction.guild.id)
+        db = CACHE.db_manager
+        season = resolve_selected_cwl_season(interaction.guild.id)
+        event = db.get_cwl_event_sync(str(interaction.guild.id), season) if db is not None else None
         if event is None:
             return
         confirm_view = CwlDeleteSeasonConfirmView(
@@ -316,6 +352,165 @@ def _make_cwl_management_delete_callback(view: discord.ui.View):
         )
 
     return callback
+
+
+def _make_cwl_management_season_select_callback(view: discord.ui.View):
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        if not interaction.guild or not isinstance(interaction.data, dict):
+            return
+        values = interaction.data.get("values") or []
+        if not values:
+            return
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        guild_id_str = str(interaction.guild.id)
+        config = CACHE.server_config.setdefault(guild_id_str, {})
+        config["cwl_selected_season"] = values[0]
+        await CACHE.persist_server_config(guild_id_str)
+        await _refresh_parent(view, interaction, "cwl_management")
+
+    return callback
+
+
+def _make_cwl_management_add_season_callback(view: discord.ui.View):
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        if not interaction.guild:
+            return
+        from qapbot.i18n import t
+        from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+
+        db = CACHE.db_manager
+        guild_id_int = interaction.guild.id
+        guild_id_str = str(guild_id_int)
+        target_season = resolve_current_cwl_season()
+
+        if db is None:
+            await interaction.response.send_message(
+                t('cwl.management.add_season_db_unavailable', guild_id=guild_id_int), ephemeral=True,
+            )
+            return
+
+        if db.get_cwl_event_sync(guild_id_str, target_season) is not None:
+            await interaction.response.send_message(
+                t('cwl.management.add_season_already_exists', guild_id=guild_id_int, season=target_season),
+                ephemeral=True,
+            )
+            return
+
+        # Carry-over-vs-defaults is decided exclusively here — never by "Configure Participating
+        # Clans"/the web Activity (Phase E.3's explicit instruction).
+        previous_rows = db.get_previous_cwl_event_clans_sync(guild_id_str)
+        if previous_rows:
+            await interaction.response.defer(thinking=False, ephemeral=True)
+            prompt_view = CwlCarryOverPromptView(
+                parent_view=view, guild_id=guild_id_int, target_season=target_season, previous_rows=previous_rows,
+            )
+            await interaction.followup.send(
+                prompt_view._build_content(), view=prompt_view, ephemeral=True,  # type: ignore[attr-defined]
+            )
+            return
+
+        # No previous data to offer — create the season outright with plain defaults.
+        event_id = db.create_cwl_event_sync(guild_id_str, target_season, str(interaction.user.id))
+        if event_id is None:
+            await interaction.response.send_message(
+                t('cwl.management.add_season_failed', guild_id=guild_id_int), ephemeral=True,
+            )
+            return
+        config = CACHE.server_config.setdefault(guild_id_str, {})
+        config["cwl_selected_season"] = target_season
+        await CACHE.persist_server_config(guild_id_str)
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        await _refresh_parent(view, interaction, "cwl_management")
+
+    return callback
+
+
+class CwlCarryOverPromptView(discord.ui.View):
+    """Yes/No prompt shown by "Add New Season" when a previous season has participating clans
+    to offer as a template (Phase E.4). Carry-over logic lives exclusively here — never in
+    "Configure Participating Clans"/the web Activity, per the project owner's explicit
+    instruction that only this button creates seasons or takes over defaults."""
+
+    def __init__(
+        self,
+        parent_view: discord.ui.View,
+        guild_id: int,
+        target_season: str,
+        previous_rows: List[Dict[str, Any]],
+        timeout: int = 60,
+    ):
+        super().__init__(timeout=timeout)
+        self.parent_view = parent_view
+        self.guild_id = guild_id
+        self.target_season = target_season
+        self.previous_rows = previous_rows
+
+        from qapbot.i18n import t
+
+        yes_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.management.add_season_carry_over_yes', guild_id=guild_id),
+            style=discord.ButtonStyle.primary,
+            custom_id="cwl_carry_over_yes",
+        )
+        yes_button.callback = self._on_yes  # type: ignore[assignment]
+        self.add_item(yes_button)
+
+        no_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.management.add_season_carry_over_no', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_carry_over_no",
+        )
+        no_button.callback = self._on_no  # type: ignore[assignment]
+        self.add_item(no_button)
+
+    def _build_content(self) -> str:
+        from qapbot.i18n import t
+
+        return t('cwl.management.add_season_carry_over_prompt', guild_id=self.guild_id, season=self.target_season)
+
+    async def _create_season(self, discord_user_id: int, apply_carry_over: bool) -> None:
+        db = CACHE.db_manager
+        if db is None:
+            return
+        guild_id_str = str(self.guild_id)
+        event_id = db.create_cwl_event_sync(guild_id_str, self.target_season, str(discord_user_id))
+        if event_id is not None and apply_carry_over:
+            clan_configs = [
+                {
+                    "clan_tag": r["clan_tag"],
+                    "target_league_rank": r.get("target_league_rank"),
+                    "roster_size": r.get("roster_size", 15),
+                    "tier_order": r.get("tier_order", 0),
+                    "cwl_start_at": r.get("cwl_start_at"),
+                    "participating": True,
+                }
+                for r in self.previous_rows
+            ]
+            db.set_cwl_event_clans_sync(event_id, clan_configs)
+        config = CACHE.server_config.setdefault(guild_id_str, {})
+        config["cwl_selected_season"] = self.target_season
+        await CACHE.persist_server_config(guild_id_str)
+
+    async def _finish(self, interaction: discord.Interaction, apply_carry_over: bool) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        await self._create_season(interaction.user.id, apply_carry_over)
+        try:
+            await interaction.delete_original_response()
+        except discord.NotFound:
+            pass
+        await _refresh_parent(self.parent_view, interaction, "cwl_management")
+
+    async def _on_yes(self, interaction: discord.Interaction) -> None:
+        await self._finish(interaction, apply_carry_over=True)
+
+    async def _on_no(self, interaction: discord.Interaction) -> None:
+        await self._finish(interaction, apply_carry_over=False)
 
 
 def _make_cwl_management_open_web_callback(view: discord.ui.View):
@@ -398,6 +593,14 @@ class CwlDeleteSeasonConfirmView(discord.ui.View):
         db = CACHE.db_manager
         if db is not None:
             db.delete_cwl_event_sync(self.event_id)
+        # The season select (Phase E.3) can't keep pointing at a season that no longer has an
+        # event — clear the persisted selection so the next open falls back to
+        # resolve_selected_cwl_season()'s other-events/calendar-default resolution.
+        guild_id_str = str(self.guild_id)
+        config = CACHE.server_config.get(guild_id_str, {})
+        if config.get("cwl_selected_season") == self.season:
+            config["cwl_selected_season"] = None
+            await CACHE.persist_server_config(guild_id_str)
         try:
             await interaction.delete_original_response()
         except discord.NotFound:

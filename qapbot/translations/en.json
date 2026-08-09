@@ -755,7 +755,7 @@
     },
     "management": {
       "title": "🏆 CWL Management",
-      "no_event": "No CWL event has been configured yet. Use \"Configure Participating Clans\" below to get started.",
+      "no_event": "No CWL event has been configured yet for season **{season}**. Use \"Add New Season\" below to get started.",
       "season_header": "Season **{season}** — {status}",
       "event_status_draft": "Draft",
       "event_status_signup_open": "Sign-Up Open",
@@ -778,8 +778,16 @@
       "button_manage_assignments": "Manage Assignments",
       "button_delete_season": "Delete Season",
       "button_confirm_delete": "Yes, Delete Season",
+      "button_add_season": "Add New Season",
       "delete_confirm_body": "⚠️ Delete the **{season}** CWL season? This removes all participating-clan settings and sign-ups for it and cannot be undone.",
-      "open_web_fallback": "⚠️ Could not open the web view directly — try the /launch command instead."
+      "open_web_fallback": "⚠️ Could not open the web view directly — try the /launch command instead.",
+      "season_select_placeholder": "Select a season…",
+      "add_season_already_exists": "Season **{season}** already exists — pick it from the season dropdown instead.",
+      "add_season_db_unavailable": "⚠️ Database not ready — try again shortly.",
+      "add_season_failed": "⚠️ Could not create the new season. Please try again.",
+      "add_season_carry_over_prompt": "No CWL event exists yet for **{season}**. Carry over the previous season's participating clans and their settings, or start fresh with defaults?",
+      "add_season_carry_over_yes": "Yes, carry over",
+      "add_season_carry_over_no": "No, start fresh"
     },
     "setup": {
       "button_cancel": "Cancel"

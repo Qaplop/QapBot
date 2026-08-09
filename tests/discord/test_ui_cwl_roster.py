@@ -158,7 +158,9 @@ def test_clan_management_view_cwl_management_mode_constructs_without_row_conflic
         sent_message=sent_message, mode="cwl_management", timeout=300,
     )
 
-    assert len(view.children) == 6  # mode select + refresh + configure(web)/start(disabled)/manage(disabled)/delete
+    # mode select + refresh + configure(web)/start(disabled)/manage(disabled)/delete/add_season
+    # (no season select: CACHE.db_manager is None here, so there are no events to list)
+    assert len(view.children) == 7
 
 
 @pytest.mark.discord
@@ -370,6 +372,87 @@ def test_get_clan_war_league_reads_from_clan_name_cache():
 
 
 # ---------------------------------------------------------------------------
+# cwl_league_rank / cwl_start_at_discord_timestamp / resolve_selected_cwl_season (Phase E)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+def test_cwl_league_rank_orders_highest_first():
+    from qapbot.QBdiscocmdshelper_cwl import cwl_league_rank
+
+    assert cwl_league_rank("Legend League") > cwl_league_rank("Titan League I")
+    assert cwl_league_rank("Titan League I") > cwl_league_rank("Champion League I")
+    assert cwl_league_rank("Bronze League III") > cwl_league_rank(None)
+    assert cwl_league_rank("Bronze League III") > cwl_league_rank("Not A Real League")
+    assert cwl_league_rank(None) == cwl_league_rank("Not A Real League")
+
+
+@pytest.mark.discord
+def test_cwl_start_at_discord_timestamp_renders_native_markup():
+    from qapbot.QBdiscocmdshelper_cwl import cwl_start_at_discord_timestamp
+
+    result = cwl_start_at_discord_timestamp("2026-09-01T08:00Z")
+    assert result is not None
+    assert result.startswith("<t:") and result.endswith(":f>")
+
+    assert cwl_start_at_discord_timestamp(None) is None
+    assert cwl_start_at_discord_timestamp("not a date") is None
+
+
+@pytest.mark.discord
+def test_resolve_selected_cwl_season_prefers_persisted_selection(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+
+    CACHE.db_manager = db
+    CACHE.server_config["9999"] = {"cwl_selected_season": "2026-02"}
+
+    assert resolve_selected_cwl_season(9999) == "2026-02"
+
+
+@pytest.mark.discord
+def test_resolve_selected_cwl_season_falls_back_without_persisted_selection():
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season, resolve_selected_cwl_season
+
+    CACHE.db_manager = None
+    CACHE.server_config["8887"] = {}
+
+    assert resolve_selected_cwl_season(8887) == resolve_current_cwl_season()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_format_clan_management_cwl_management_sorts_by_tier_and_uses_discord_timestamp(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_management
+
+    await _seed_guild_and_clans(db, "6543", {"#CLAN1": "Bronze Clan", "#CLAN2": "Champion Clan"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {
+        "#CLAN1": {"name": "Bronze Clan", "war_league": "Bronze League III"},
+        "#CLAN2": {"name": "Champion Clan", "war_league": "Champion League I"},
+    }
+    CACHE.server_config["6543"] = {}
+
+    event_id = db.create_cwl_event_sync("6543", "2026-05", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#CLAN1", "roster_size": 15, "cwl_start_at": "2026-05-01T08:00Z", "participating": True},
+        {"clan_tag": "#CLAN2", "roster_size": 15, "cwl_start_at": "2026-05-01T08:00Z", "participating": True},
+    ])
+
+    guild = MagicMock()
+    guild.id = 6543
+
+    embed, _, _, _ = await format_clan_management_cwl_management(guild)
+
+    clans_field = next(f for f in embed.fields if "Clan" in f.name)
+    # Champion (higher tier) must be listed before Bronze.
+    assert clans_field.value.index("Champion Clan") < clans_field.value.index("Bronze Clan")
+    # Discord's native per-viewer timestamp markup, not a raw UTC string.
+    assert "<t:" in clans_field.value and ":f>" in clans_field.value
+
+
+# ---------------------------------------------------------------------------
 # "Delete Season" — CwlDeleteSeasonConfirmView
 # ---------------------------------------------------------------------------
 
@@ -476,3 +559,212 @@ async def test_cwl_management_open_web_callback_falls_back_if_launch_activity_re
     await callback(mock_interaction)
 
     mock_interaction.response.send_message.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# "Add New Season" — season creation + the exclusively-here carry-over prompt
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_add_season_creates_event_directly_when_no_previous_data(db, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+    from qapbot.ui_cwl_roster import _make_cwl_management_add_season_callback
+
+    await _seed_guild_and_clans(db, "1111", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["1111"] = {}
+    mock_interaction.guild.id = 1111
+
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+
+    callback = _make_cwl_management_add_season_callback(parent)
+    await callback(mock_interaction)
+
+    season = resolve_current_cwl_season()
+    assert db.get_cwl_event_sync("1111", season) is not None
+    assert CACHE.server_config["1111"]["cwl_selected_season"] == season
+    parent.refresh_cwl_view.assert_awaited_once()
+    assert parent.refresh_cwl_view.await_args.args[1] == "cwl_management"
+    # No carry-over data existed, so no ephemeral prompt should have been sent either.
+    mock_interaction.followup.send.assert_not_awaited()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_add_season_rejects_when_season_already_exists(db, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+    from qapbot.ui_cwl_roster import _make_cwl_management_add_season_callback
+
+    await _seed_guild_and_clans(db, "2222", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["2222"] = {}
+    mock_interaction.guild.id = 2222
+
+    season = resolve_current_cwl_season()
+    db.create_cwl_event_sync("2222", season, "discordid1")
+
+    mock_interaction.response.send_message = AsyncMock()
+    callback = _make_cwl_management_add_season_callback(MagicMock())
+    await callback(mock_interaction)
+
+    mock_interaction.response.send_message.assert_awaited_once()
+    # Still exactly one event for that season — idempotent create_cwl_event_sync() would have
+    # silently no-op'd anyway, but the point is the admin gets told, not left guessing.
+    assert len(db.list_cwl_events_sync("2222")) == 1
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_add_season_offers_carry_over_prompt_when_previous_data_exists(db, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+    from qapbot.ui_cwl_roster import _make_cwl_management_add_season_callback, CwlCarryOverPromptView
+
+    await _seed_guild_and_clans(db, "3333", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["3333"] = {}
+    mock_interaction.guild.id = 3333
+
+    old_event_id = db.create_cwl_event_sync("3333", "2026-01", "discordid1")
+    db.set_cwl_event_clans_sync(old_event_id, [
+        {"clan_tag": "#CLAN1", "roster_size": 30, "cwl_start_at": "2026-01-01T08:00Z", "participating": True},
+    ])
+
+    mock_interaction.followup.send = AsyncMock()
+    callback = _make_cwl_management_add_season_callback(MagicMock())
+    await callback(mock_interaction)
+
+    season = resolve_current_cwl_season()
+    # No event created yet — that only happens once the admin answers Yes/No.
+    assert db.get_cwl_event_sync("3333", season) is None
+    mock_interaction.followup.send.assert_awaited_once()
+    _, kwargs = mock_interaction.followup.send.call_args
+    assert isinstance(kwargs.get("view"), CwlCarryOverPromptView)
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_carry_over_prompt_yes_copies_previous_clans(db, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCarryOverPromptView
+
+    await _seed_guild_and_clans(db, "4444", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["4444"] = {}
+    mock_interaction.guild.id = 4444
+
+    previous_rows = [{
+        "clan_tag": "#CLAN1", "target_league_rank": "Master League II",
+        "roster_size": 30, "tier_order": 0, "cwl_start_at": "2026-01-01T08:00Z",
+    }]
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+    prompt_view = CwlCarryOverPromptView(
+        parent_view=parent, guild_id=4444, target_season="2026-02", previous_rows=previous_rows,
+    )
+
+    await prompt_view._on_yes(mock_interaction)
+
+    event = db.get_cwl_event_sync("4444", "2026-02")
+    assert event is not None
+    clans = db.get_cwl_event_clans_sync(event["id"])
+    assert clans[0]["clan_tag"] == "#CLAN1"
+    assert clans[0]["roster_size"] == 30
+    assert clans[0]["cwl_start_at"] == "2026-01-01T08:00Z"
+    assert CACHE.server_config["4444"]["cwl_selected_season"] == "2026-02"
+    mock_interaction.delete_original_response.assert_awaited_once()
+    parent.refresh_cwl_view.assert_awaited_once()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_carry_over_prompt_no_creates_without_copying(db, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCarryOverPromptView
+
+    await _seed_guild_and_clans(db, "5555", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["5555"] = {}
+    mock_interaction.guild.id = 5555
+
+    previous_rows = [{"clan_tag": "#CLAN1", "roster_size": 30, "cwl_start_at": "2026-01-01T08:00Z"}]
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+    prompt_view = CwlCarryOverPromptView(
+        parent_view=parent, guild_id=5555, target_season="2026-02", previous_rows=previous_rows,
+    )
+
+    await prompt_view._on_no(mock_interaction)
+
+    event = db.get_cwl_event_sync("5555", "2026-02")
+    assert event is not None
+    assert db.get_cwl_event_clans_sync(event["id"]) == []
+    assert CACHE.server_config["5555"]["cwl_selected_season"] == "2026-02"
+
+
+# ---------------------------------------------------------------------------
+# Season select — persisted selection driving both entry points (Phase E.3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_season_select_callback_persists_selection_and_refreshes(db, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import _make_cwl_management_season_select_callback
+
+    await _seed_guild_and_clans(db, "6666", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["6666"] = {}
+    mock_interaction.guild.id = 6666
+    mock_interaction.data = {"values": ["2026-03"]}
+
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+
+    callback = _make_cwl_management_season_select_callback(parent)
+    await callback(mock_interaction)
+
+    assert CACHE.server_config["6666"]["cwl_selected_season"] == "2026-03"
+    parent.refresh_cwl_view.assert_awaited_once()
+    assert parent.refresh_cwl_view.await_args.args[1] == "cwl_management"
+
+
+@pytest.mark.discord
+def test_season_select_absent_without_any_events(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    CACHE.db_manager = db
+    CACHE.server_config["7777"] = {}
+    view = discord.ui.View(timeout=300)
+
+    add_cwl_management_components(view, 7777)
+
+    assert not any(getattr(c, "custom_id", None) == "cwl_management_season_select" for c in view.children)
+    configure_button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_configure_clans")
+    assert configure_button.disabled is True  # type: ignore[union-attr]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_season_select_present_and_configure_enabled_once_a_season_exists(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    await _seed_guild_and_clans(db, "8888", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["8888"] = {}
+    db.create_cwl_event_sync("8888", "2026-04", "discordid1")
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 8888)
+
+    season_select = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_season_select")
+    values = {opt.value for opt in season_select.options}  # type: ignore[union-attr]
+    assert values == {"2026-04"}
+    configure_button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_configure_clans")
+    assert configure_button.disabled is False  # type: ignore[union-attr]

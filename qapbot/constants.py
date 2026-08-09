@@ -15,6 +15,7 @@ Usage:
         # Split message
         pass
 """
+from typing import Tuple
 
 # ============================================================================
 # Discord API Limits
@@ -88,6 +89,35 @@ WAR_UPDATE_LEAGUES: frozenset[str] = frozenset({
 active ``track_war_updates`` tracking (22h polling pool). Single source of
 truth — previously duplicated as ``_WAR_UPDATE_LEAGUES`` in coc_cache.py and
 cache_manager.py, and as ``_CWL_HARVEST_LEAGUES`` in QBhelperfunctions.py."""
+
+CWL_LEAGUE_ORDER: Tuple[str, ...] = (
+    "Bronze League III",
+    "Bronze League II",
+    "Bronze League I",
+    "Silver League III",
+    "Silver League II",
+    "Silver League I",
+    "Gold League III",
+    "Gold League II",
+    "Gold League I",
+    "Crystal League III",
+    "Crystal League II",
+    "Crystal League I",
+    "Master League III",
+    "Master League II",
+    "Master League I",
+    "Champion League III",
+    "Champion League II",
+    "Champion League I",
+    "Titan League III",
+    "Titan League II",
+    "Titan League I",
+    "Legend League",
+)
+"""Canonical CWL league ladder, lowest to highest — used to sort clans by tier, highest first,
+in the CWL Management embed and the web Activity's clan-config table (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md
+Phase E). Mirrors chart_clans_per_league.py's own LEAGUE_ORDER (kept separate there — that
+module pulls in matplotlib, too heavy a dependency for this constants module)."""
 
 PASSIVE_CLAN_REFRESH_INTERVAL_DAYS = 30
 """Days between opportunistic get_clan() refreshes for passively-tracked
