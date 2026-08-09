@@ -67,7 +67,7 @@ from qapbot.QBdiscocmdshelper import (  # type: ignore[attr-defined]
     check_admin_permissions, get_clan_display_name, get_family_display_name, get_clan_or_family_display_name,
     resolve_clan_or_family_tag, get_user_player, restore_player_from_unassigned,  # type: ignore[attr-defined]
     verify_and_update_player, is_already_subscribed, cleanup_stale_messages_for_channel,  # type: ignore[attr-defined]
-    validate_and_add_clan_to_cache
+    validate_and_add_clan_to_cache, resolve_guild_context
 )
 from qapbot.i18n import t  # type: ignore[attr-defined]
 
@@ -135,6 +135,9 @@ async def _safe_defer(
     cwl_only="Restrict subscription to CWL stats only",
     current_year="Use current year instead of current month for scheduled leaderboard posts"
 )
+# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): subscribes *this channel* to periodic
+# leaderboard posts — a persistent guild-channel concept with no coherent DM analog (unlike
+# highlightme, below). Revisit only with an explicit redesign (e.g. an explicit channel parameter).
 @app_commands.guild_only()
 async def subscribe(
     interaction: discord.Interaction,
@@ -267,6 +270,8 @@ async def subscribe_mode_autocomplete(interaction: discord.Interaction, current:
     mode="Leaderboard mode to unsubscribe from (optional - if omitted, unsubscribes from all modes)",
     current_year="Unsubscribe the year-to-date variant (True) or the monthly variant (False). Leave empty to affect both."
 )
+# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): mirror of subscribe, above — same
+# this-channel-subscription concept with no coherent DM analog.
 @app_commands.guild_only()
 async def unsubscribe(
     interaction: discord.Interaction,
@@ -502,6 +507,11 @@ async def unsubscribe_mode_autocomplete(interaction: discord.Interaction, curren
     app_commands.Choice(name="All clans a current member played for (default)", value="all"),
     app_commands.Choice(name="Own clans only (current member clans of this server)", value="own"),
 ])
+# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): the clan-omitted path reads *this
+# channel's* subscriptions (same channel-subscription concept as subscribe/highlightme), and the
+# posting step later in this function is gated on isinstance(interaction.channel, (TextChannel,
+# Thread)) regardless of whether clan is given — would silently no-op in a DM. Revisit only with
+# an explicit DM output-path decision.
 @app_commands.guild_only()
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
 async def leaderboard(
@@ -849,6 +859,10 @@ async def leaderboard_mode_autocomplete(interaction: discord.Interaction, curren
     return await get_mode_autocomplete_choices(current, include_cwl_variants=False)
 
 @app_commands.command(name="highlightme", description=dev_mode+"Re-post this channel's leaderboards with your own player(s) highlighted (one-time).")
+# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): re-posts *this channel's* subscribed
+# leaderboards — a guild-channel-subscription concept with no DM analog. The guard at the top of
+# this function (not isinstance(interaction.channel, (TextChannel, Thread)) -> silent return) is
+# effectively this command's own guild-only check.
 @app_commands.guild_only()
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
 async def highlightme(interaction: discord.Interaction):
@@ -957,7 +971,7 @@ async def highlightme(interaction: discord.Interaction):
 @app_commands.describe(
     command="Optional: Select a specific command to get detailed help"
 )
-@app_commands.guild_only()
+# DM-invokable (Phase 0b, CWL_ROSTER_PLANNING_PLAN.md) — display-only guild_id, no functional guild dependency.
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
 async def help(interaction: discord.Interaction, command: Optional[str] = None):
     """
@@ -1172,6 +1186,12 @@ async def do_maintenance_shutdown() -> None:
     app_commands.Choice(name="Maintenance Start - Suspend updates and close DB for safe data access (bot admin)", value="MAINTENANCE_START"),
     app_commands.Choice(name="Maintenance End - Restart bot and resume normal operation (bot admin)", value="MAINTENANCE_END"),
 ])
+# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): most of this command's 19 sub-actions
+# are bot-admin-only maintenance tooling and would be trivially DM-safe, but IMPORT_DATA needs a
+# real Guild object's member list for Discord-username matching (parse_clashperk_embed) and
+# CLEANUP_MESSAGES's helper needs auditing for guild-channel assumptions — converting the whole
+# command wholesale risks a partially-broken sub-action. Revisit as a per-sub-action split if DM
+# access to admin tooling becomes valuable enough to justify it.
 @app_commands.guild_only()
 async def admin(
     interaction: discord.Interaction,
@@ -2386,6 +2406,12 @@ async def admin(
 clan_group = app_commands.Group(name="clan", description=dev_mode+"Clan management commands")
 
 @clan_group.command(name="management", description=dev_mode+"Display clan members with linking status and tools to link player accounts.")
+# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): needs a real discord.Guild object for
+# member lookups (format_clan_management_message) and posts a non-ephemeral, persistent
+# interactive view via interaction.channel.send(), guarded on isinstance(interaction.channel,
+# (TextChannel, Thread)) — a DM channel fails that guard. Revisit only with a real Guild-object
+# substitution (interaction.client.get_guild(resolved_guild_id)) and a decision on where a
+# DM-invoked instance of this view would actually post.
 @app_commands.guild_only()
 @app_commands.checks.cooldown(1, 10.0, key=lambda i: (i.guild_id, i.user.id))
 async def clan_management(interaction: discord.Interaction):
@@ -2543,7 +2569,7 @@ analyse_group = app_commands.Group(name="analyse", description=dev_mode+"Perform
     description=dev_mode+"Analyse all clans in a CWL group: top attackers and best defenders.",
 )
 @app_commands.describe(clan="Clan tag or name to look up the CWL league group for")
-@app_commands.guild_only()
+# DM-invokable (Phase 0b, CWL_ROSTER_PLANNING_PLAN.md) — display-only guild_id, no functional guild dependency.
 @app_commands.checks.cooldown(1, 30.0, key=lambda i: (i.guild_id, i.user.id))
 async def analyse_leaguegroup(interaction: discord.Interaction, clan: str) -> None:
     """
@@ -2807,7 +2833,7 @@ async def _cwlopponent_select_callback(
     description=dev_mode + "Analyse a CWL opponent clan: player stats (skill/reliability/activity) for their roster.",
 )
 @app_commands.describe(clan="Clan tag or name to look up the CWL league group for")
-@app_commands.guild_only()
+# DM-invokable (Phase 0b, CWL_ROSTER_PLANNING_PLAN.md) — display-only guild_id, no functional guild dependency.
 @app_commands.checks.cooldown(1, 30.0, key=lambda i: (i.guild_id, i.user.id))
 async def analyse_cwlopponent(interaction: discord.Interaction, clan: str) -> None:
     """
@@ -3057,53 +3083,66 @@ async def analyse_cwlopponent_clan_autocomplete(interaction: discord.Interaction
 @app_commands.describe(
     server_wide="If True, show all subscriptions for the entire discord server (default: False - current channel only)"
 )
-@app_commands.guild_only()
+# DM-invokable (Phase 0b, CWL_ROSTER_PLANNING_PLAN.md) — read-only. server_wide=True resolves the
+# guild via resolve_guild_context() when invoked from a DM (see below); the default per-channel view
+# needs no guild resolution at all, since interaction.channel is meaningful (if subscription-less) in
+# a DM too.
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
 async def subscriptions(interaction: discord.Interaction, server_wide: bool = False):
     """
     Lists clan and family subscriptions for the current channel or entire discord server.
-    
+
     Args:
         interaction: Discord interaction object
         server_wide: If True, show all subscriptions across all channels in the discord server
     """
-    if not await _safe_defer(interaction, thinking=False):
-        return
-    _log_cmd(interaction, "subscriptions", server_wide=server_wide)
-    subs = CACHE.get_all_subscriptions_flat()
-    
     if server_wide:
-        # Show all subscriptions for all channels in the guild
-        if not interaction.guild:
+        # resolve_guild_context() may need to send the interaction's first response itself (the
+        # ambiguous multi-guild DM picker) — must run before _safe_defer(), not after.
+        resolved_guild_id = await resolve_guild_context(interaction)
+        if resolved_guild_id is None:
+            msg = t('commands.errors.dm_not_linked', user_id=str(interaction.user.id))
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
             return
-        guild_id = str(interaction.guild.id)
+        if not interaction.response.is_done():
+            if not await _safe_defer(interaction, thinking=False):
+                return
+        _log_cmd(interaction, "subscriptions", server_wide=server_wide)
+
+        guild = QBcore.bot.get_guild(resolved_guild_id)
+        if not guild:
+            return
+        guild_id = str(guild.id)
         guild_subs = CACHE.subscriptions.get(guild_id, {})
-        
+
         if not guild_subs:
             await send_and_track(interaction, "This guild has no subscriptions.", 'subscriptions')
             return
-        
+
         # Collect all subscriptions across all channels
         all_entries: List[Dict[str, Any]] = []
         for channel_id, channel_clans in guild_subs.items():
             try:
-                channel = interaction.guild.get_channel(int(channel_id))
+                channel = guild.get_channel(int(channel_id))
                 channel_name = channel.name if channel else f"Unknown ({channel_id})"
             except:
                 channel_name = f"Unknown ({channel_id})"
-            
+
             for entry in channel_clans:
                 if 'clan_tag' in entry:  # type: ignore[misc]
                     entry_with_channel = entry.copy()
                     entry_with_channel['channel_name'] = channel_name
                     entry_with_channel['channel_id'] = channel_id
                     all_entries.append(entry_with_channel)
-        
+
         if not all_entries:
             await send_and_track(interaction, "This guild has no clan or family subscriptions.", 'subscriptions')
             return
-        
-        header = f"**Guild-Wide Subscriptions ({interaction.guild.name}):**\n"
+
+        header = f"**Guild-Wide Subscriptions ({guild.name}):**\n"
         channel_col = 18
         name_col = 17
         tag_col = 13
@@ -3140,10 +3179,15 @@ async def subscriptions(interaction: discord.Interaction, server_wide: bool = Fa
         
         await send_and_track(interaction, f"```{header}{table}```", 'subscriptions')
     else:
-        # Original behavior: show subscriptions for current channel only
+        # Original behavior: show subscriptions for current channel only — no guild resolution
+        # needed, interaction.channel is meaningful (if subscription-less) in a DM too.
+        if not await _safe_defer(interaction, thinking=False):
+            return
+        _log_cmd(interaction, "subscriptions", server_wide=server_wide)
         if not interaction.channel:
             return
         channel_id = str(interaction.channel.id)
+        subs = CACHE.get_all_subscriptions_flat()
         clans = subs.get(channel_id, [])
         if not clans:
             await send_and_track(interaction, "This channel is not subscribed to any clans or families.", 'subscriptions')
@@ -3188,7 +3232,7 @@ async def subscriptions(interaction: discord.Interaction, server_wide: bool = Fa
     force_refresh="If True, refresh the cached database statistics before showing status "
                   "(default: False - use cached values, up to 25h stale; see /status output for freshness)"
 )
-@app_commands.guild_only()
+# DM-invokable (Phase 0b, CWL_ROSTER_PLANNING_PLAN.md) — purely bot-wide stats, no interaction.guild usage.
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
 async def status(interaction: discord.Interaction, force_refresh: bool = False):
     """
@@ -3392,7 +3436,7 @@ async def status(interaction: discord.Interaction, force_refresh: bool = False):
     await send_and_track(interaction, f"```{msg}```", 'status')
 
 @app_commands.command(name="ping", description=dev_mode+"Show bot latency and responsiveness.")
-@app_commands.guild_only()
+# DM-invokable (Phase 0b, CWL_ROSTER_PLANNING_PLAN.md) — display-only guild_id, no functional guild dependency.
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
 async def ping(interaction: discord.Interaction):
     """
@@ -3431,7 +3475,7 @@ async def ping(interaction: discord.Interaction):
     app_commands.Choice(name="Players - List all players for a given clan or family", value="PLAYERS"),
     app_commands.Choice(name="Tracked Clans - Chart of tracked clans per war league", value="TRACKED_CLANS"),
 ])
-@app_commands.guild_only()
+# DM-invokable (Phase 0b, CWL_ROSTER_PLANNING_PLAN.md) — operates on global CACHE data, no admin gate, display-only guild_id.
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
 async def list(
     interaction: discord.Interaction,
@@ -4393,6 +4437,11 @@ async def _whois_logic(interaction: discord.Interaction, user: Union[discord.Use
         await interaction.followup.send(embed=extra_embed, ephemeral=True)
 
 
+# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): _whois_logic() (below) needs
+# interaction.guild.get_member(user.id) to resolve the *target* user's membership — a different
+# person from the DM caller, so resolve_guild_context() (which resolves a guild from the caller's
+# own linked accounts) doesn't apply here. No DM analog without a different resolution strategy
+# (e.g. resolving from the target's own linked accounts instead).
 @app_commands.context_menu(name="whois")
 @app_commands.guild_only()
 async def whois(interaction: discord.Interaction, user: discord.User):
@@ -4404,6 +4453,8 @@ async def whois(interaction: discord.Interaction, user: discord.User):
     _log_cmd_done(interaction, "whois")
 
 
+# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): same target-user-guild-resolution issue
+# as whois, above.
 @app_commands.context_menu(name="whois")
 @app_commands.guild_only()
 async def whois_message(interaction: discord.Interaction, message: discord.Message):
@@ -4432,6 +4483,13 @@ async def _whois_player_select_callback(interaction: discord.Interaction, select
     user="The Discord user to look up",
     player="Player tag (e.g. #ABC123) or name substring to search",
 )
+# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): the user= path hits the same
+# target-user-guild-resolution issue as the whois/whois_message context menus, AND its
+# `user: Optional[discord.Member]` parameter type is itself a blocker — Discord can't resolve a
+# Member-typed option outside a guild, so this parameter would need to become discord.User (and
+# _whois_logic's target-guild lookup redesigned) before this command could work from a DM at all.
+# The player= path (_player_report_logic) is otherwise guild-agnostic, but a slash command's
+# allowed-context is all-or-nothing, not per-parameter.
 @app_commands.guild_only()
 async def whois_slash(
     interaction: discord.Interaction,

@@ -1,6 +1,30 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (14)
+- Added: Phase 0b of the CWL roster planning feature's DM-interaction foundation
+  (CWL_ROSTER_PLANNING_PLAN.md) — per-command @app_commands.guild_only() rollout on top of Phase
+  0a's framework (13). Converted 7 of the 16 guild_only()-decorated commands in QBdiscordcmds.py
+  to work from a DM: status, ping, help, list, analyse cwl_league_group, analyse cwl_opponent
+  (pure decorator removal — audit confirmed zero functional interaction.guild dependency in these
+  bodies, only display-only guild_id already handled gracefully by t()) and subscriptions
+  (server_wide=True branch rewritten to use resolve_guild_context() +
+  QBcore.bot.get_guild(resolved_guild_id) instead of interaction.guild; the default per-channel
+  view was already DM-safe). This surfaced a real ordering constraint: resolve_guild_context()'s
+  ambiguous-multi-guild picker must be the interaction's first response, so it has to run before
+  _safe_defer() rather than after, breaking the codebase's usual "defer first" convention for that
+  one call site. The other 9 guild_only() sites (subscribe, unsubscribe, leaderboard, highlightme,
+  admin, clan_management, whois, whois_message, whois_slash) were deliberately left guild-only —
+  each carries an inline comment explaining why (channel-subscription commands with no DM analog;
+  admin's IMPORT_DATA sub-action needs a guild member list; clan_management needs a
+  where-does-it-post design decision; the whois family needs a *different* person's guild
+  membership than resolve_guild_context() resolves, plus whois_slash's Member-typed parameter is a
+  separate blocker). This is a scope correction against the plan doc's original draft, which had
+  classified subscribe/unsubscribe/leaderboard as trivially convertible without spotting the
+  channel-subscription coupling.
+  Files: QBdiscordcmds.py, tests/discord/test_dm_command_invocation.py (new).
+  1552 tests pass (.\run_tests.ps1).
+
 2026-08-09 (13)
 - Added: Phase 0a of the CWL roster planning feature's DM-interaction foundation
   (CWL_ROSTER_PLANNING_PLAN.md) — framework only, no command behavior changed yet
