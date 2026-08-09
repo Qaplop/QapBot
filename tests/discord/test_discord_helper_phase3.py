@@ -31,6 +31,42 @@ def test_split_message_into_chunks_preserves_code_blocks():
 
 
 @pytest.mark.discord
+def test_split_message_into_chunks_preserves_ansi_tag_on_every_chunk():
+    """Regression test: /leaderboard's DM path wraps content in a ```ansi fence (for its
+    own-player highlight ANSI codes) and sends it through this generic splitter. Before this
+    fix, only the first chunk kept the "ansi" tag — every later chunk lost it, so Discord
+    rendered the raw ANSI escape sequences as literal garbage text instead of interpreting
+    them as color codes (only post_leaderboard_to_discord's guild-mode splitter, a separate
+    ansi-aware implementation, handled this correctly)."""
+    from qapbot.QBdiscocmdshelper import _split_message_into_chunks
+
+    lines = [f"line{i}" for i in range(20)]
+    content = "```ansi\n" + "\n".join(lines) + "```"
+    chunks = _split_message_into_chunks(content, max_size=30)
+
+    assert len(chunks) >= 2
+    assert all(chunk.startswith("```ansi\n") for chunk in chunks)
+    assert all(chunk.endswith("```") for chunk in chunks)
+    # No stray literal "ansi" text leaked into the actual content — it's only ever the fence tag.
+    assert all(chunk.count("ansi") == 1 for chunk in chunks)
+
+
+@pytest.mark.discord
+def test_split_message_into_chunks_non_ansi_code_block_unaffected():
+    """Backward-compat guard: a non-ansi code block (the common case — /status, /list,
+    /subscriptions, etc.) must still split with bare ``` fences, not gain a spurious tag."""
+    from qapbot.QBdiscocmdshelper import _split_message_into_chunks
+
+    lines = [f"Tag {i}   Name of clan {i}" for i in range(20)]
+    content = "```" + "\n".join(lines) + "```"
+    chunks = _split_message_into_chunks(content, max_size=40)
+
+    assert len(chunks) >= 2
+    assert all(chunk.startswith("```") and not chunk.startswith("```ansi") for chunk in chunks)
+    assert all(chunk.endswith("```") for chunk in chunks)
+
+
+@pytest.mark.discord
 def test_split_embed_by_description_splits_and_adds_part_footer():
     from qapbot.QBdiscocmdshelper import _split_embed_by_description
 

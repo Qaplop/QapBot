@@ -1,6 +1,26 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (18)
+- Fixed: /leaderboard's own-player ANSI highlight rendered as literal garbage escape-code text
+  ("[1;33mQaplop...[0m") in the second and later Discord messages whenever a DM leaderboard's
+  output was long enough to split into multiple messages — worked fine on the first message, and
+  worked fine in a guild channel regardless of length. Root cause: guild-mode posting
+  (post_leaderboard_to_discord -> _split_and_post_leaderboard_helper, QBhelperfunctions.py) has
+  always been ```ansi-fence-aware when splitting long content, but the DM path (send_and_track ->
+  _split_message_into_chunks, QBdiscocmdshelper.py — the generic splitter, newly exercised by
+  leaderboard's Phase 0b DM conversion) was not: it stripped exactly 3 chars off each end of a
+  ```ansi\n...``` block, leaving "ansi\n" embedded as ordinary text in chunk 1 and silently
+  dropping the ```ansi fence tag from every chunk after the first, so Discord rendered those
+  later chunks' embedded ANSI color codes as raw, visible escape characters instead of applying
+  them as formatting. Fixed by having _split_message_into_chunks detect and strip a leading
+  "ansi\n" fence-language tag once, then re-prepend it to every split chunk's opening fence — a
+  known, explicitly-flagged limitation from the original leaderboard DM conversion ((15)) that
+  turned out to actually matter once a real multi-message DM leaderboard was posted. Non-ansi
+  code blocks (the common case — /status, /list, /subscriptions, etc.) are unaffected.
+  Files: qapbot/QBdiscocmdshelper.py, tests/discord/test_discord_helper_phase3.py.
+  1573 tests pass (.\run_tests.ps1).
+
 2026-08-09 (17)
 - Fixed: four issues found while actually exercising Phase 0's DM commands live on the deployed
   bot (third follow-up to Phase 0b, (14)/(15)/(16), CWL_ROSTER_PLANNING_PLAN.md):

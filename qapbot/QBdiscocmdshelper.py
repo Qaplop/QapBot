@@ -259,36 +259,50 @@ def _split_message_into_chunks(content: str, max_size: int) -> List[str]:
         return [content]
     
     chunks: List[str] = []
-    
+
     # Check if content is wrapped in code block
     is_code_block = content.startswith('```') and content.endswith('```')
-    
+
     if is_code_block:
         # Extract content between code block markers
         inner_content = content[3:-3]
-        
+
+        # Preserve a fenced-language tag (e.g. "```ansi\n...") across every split chunk, not
+        # just the first — otherwise only the first chunk keeps the tag, and any ANSI escape
+        # codes embedded further in (e.g. /leaderboard's own-player highlight) render as
+        # literal garbage text in later chunks instead of being interpreted as color codes,
+        # since Discord only applies ANSI colors inside a ```ansi fence.
+        lang_tag = ""
+        for _lang in ("ansi",):  # extend if another fenced language tag is ever used here
+            _prefix = f"{_lang}\n"
+            if inner_content.startswith(_prefix):
+                lang_tag = _lang
+                inner_content = inner_content[len(_prefix):]
+                break
+        fence_open = f"```{lang_tag}\n" if lang_tag else "```"
+        fence_overhead = len(fence_open) + 3  # + closing ```
+
         # Split inner content into chunks
         current_chunk = ""
         lines = inner_content.split('\n')
-        
+
         for line in lines:
             # Check if adding this line would exceed the limit
-            # Account for code block markers: ``` at start (3) + ``` at end (3) = 6 chars overhead
-            if len(current_chunk) + len(line) + 1 + 6 > max_size:
+            if len(current_chunk) + len(line) + 1 + fence_overhead > max_size:
                 if current_chunk:
                     # Close current chunk and add to chunks list
-                    chunks.append(f"```{current_chunk}```")
+                    chunks.append(f"{fence_open}{current_chunk}```")
                     current_chunk = ""
-            
+
             # Add line to current chunk
             if current_chunk:
                 current_chunk += '\n' + line
             else:
                 current_chunk = line
-        
+
         # Add remaining content as final chunk
         if current_chunk:
-            chunks.append(f"```{current_chunk}```")
+            chunks.append(f"{fence_open}{current_chunk}```")
     else:
         # Non-code-block content: split at newlines
         current_chunk = ""
