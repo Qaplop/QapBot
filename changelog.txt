@@ -1,6 +1,26 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (26)
+- Verified: Phase B of the CWL clan-config Activity (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md), (25),
+  live end-to-end against the DEV guild — the full chain (Discord iframe -> Cloudflare Pages ->
+  Worker -> cloudflared tunnel -> qapbot/web_bridge.py -> real cwl_events/cwl_event_clans data
+  -> back through the same chain) returned the actual DEV guild's live CWL clan-config, matching
+  what's shown on the Discord-side CWL Management screens. Set up via cloudflared's free "quick
+  tunnel" (no named-tunnel/Cloudflare-account tunnel config needed for DEV) running alongside
+  the DEV bot process, with BRIDGE_URL/BRIDGE_SECRET set as Worker secrets.
+  Also split WEB_BRIDGE_PORT/WEB_BRIDGE_SECRET into DEV/PROD-suffixed env vars
+  (WEB_BRIDGE_PORT_DEV/WEB_BRIDGE_SECRET_DEV vs WEB_BRIDGE_PORT/WEB_BRIDGE_SECRET) — this
+  project runs DEV and PROD off one shared .env file, so the mode-agnostic names from (25)
+  would have collided; now mirrors DISCORD_TOKEN/DISCORD_TOKEN_DEV's existing selection.
+  Two non-code snags along the way: cloudflared installed via winget wasn't on PATH in an
+  already-open terminal (needed a fresh terminal); the Activity kept showing a pre-update build
+  after redeploying the client, which turned out to be Discord/browser-side caching rather than
+  a failed deploy (confirmed by curling the live Pages bundle directly and finding the new code
+  already there) — a full Discord client restart cleared it.
+  Files: qapbot/config.py, .env.example, CWL_CLAN_CONFIG_ACTIVITY_PLAN.md.
+  1618 tests pass (.\run_tests.ps1).
+
 2026-08-09 (25)
 - Added: qapbot/web_bridge.py, the QapBot-side half of the CWL clan-config Activity's Phase B
   (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md) — an aiohttp.web app with GET/POST /api/cwl/clan-config
