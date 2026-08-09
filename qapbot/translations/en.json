@@ -775,14 +775,17 @@
       "signups_block_title": "Sign-Ups",
       "button_configure_clans": "Configure Participating Clans",
       "button_start_enrollment": "Start Enrollment",
-      "button_manage_assignments": "Manage Assignments"
+      "button_manage_assignments": "Manage Assignments",
+      "button_delete_season": "Delete Season",
+      "button_confirm_delete": "Yes, Delete Season",
+      "delete_confirm_body": "⚠️ Delete the **{season}** CWL season? This removes all participating-clan settings and sign-ups for it and cannot be undone."
     },
     "setup": {
       "header": "Select which clans participate this season ({count} selected):",
       "no_clans_selected": "No clans selected yet — click a clan below to add it.",
       "button_apply": "Apply",
       "button_cancel": "Cancel",
-      "detail_header": "**{clan_name}** ({clan_tag}) — clan {index}/{count}\nRoster size: **{roster_size}**\nStart time (UTC): **{start_time}**",
+      "detail_header": "**{clan_name}** ({clan_tag}) — clan {index}/{count}\n{tier}\n\nRoster size: **{roster_size}**\nStart time (UTC): **{start_time}**",
       "roster_size_placeholder": "Roster size...",
       "button_set_start_time": "Set Start Time",
       "button_done": "Done",

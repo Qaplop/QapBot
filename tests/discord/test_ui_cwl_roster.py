@@ -157,7 +157,7 @@ def test_clan_management_view_cwl_management_mode_constructs_without_row_conflic
         sent_message=sent_message, mode="cwl_management", timeout=300,
     )
 
-    assert len(view.children) == 5  # mode select + refresh + configure/start(disabled)/manage(disabled)
+    assert len(view.children) == 6  # mode select + refresh + configure/start(disabled)/manage(disabled)/delete
 
 
 @pytest.mark.discord
@@ -540,6 +540,94 @@ async def test_cwl_retention_modal_persists_selection(db, mock_interaction):
     assert persisted is not None and persisted.get("cwl_retention_months") == 12
     parent.refresh_cwl_view.assert_awaited_once()
     assert parent.refresh_cwl_view.await_args.args[1] == "cwl_settings"
+
+
+# ---------------------------------------------------------------------------
+# CACHE.get_clan_war_league — CWL tier is CoC-defined, not admin-set
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+def test_get_clan_war_league_reads_from_clan_name_cache():
+    from qapbot.cache_manager import CACHE
+
+    CACHE.clan_name_cache = {
+        "#CLAN1": {"name": "Alpha", "war_league": "Crystal League I"},
+        "#CLAN2": {"name": "Beta"},  # never synced a war_league yet
+        "#CLAN3": "LegacyStringFormat",  # pre-dict cache format
+    }
+
+    assert CACHE.get_clan_war_league("#CLAN1") == "Crystal League I"
+    assert CACHE.get_clan_war_league("#CLAN2") is None
+    assert CACHE.get_clan_war_league("#CLAN3") is None
+    assert CACHE.get_clan_war_league("#UNKNOWN", default="fallback") == "fallback"
+
+
+# ---------------------------------------------------------------------------
+# "Delete Season" — CwlDeleteSeasonConfirmView
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+def test_cwl_management_delete_button_disabled_without_event():
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    CACHE.server_config["333"] = {}
+    CACHE.db_manager = None  # no event configured -> disabled
+    view = discord.ui.View(timeout=300)
+
+    add_cwl_management_components(view, 333)
+
+    delete_button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_delete_season")
+    assert delete_button.disabled is True  # type: ignore[union-attr]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_delete_season_confirm_view_confirm_deletes_and_refreshes(db, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlDeleteSeasonConfirmView
+
+    await _seed_guild_and_clans(db, "444", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["444"] = {}
+
+    event_id = db.create_cwl_event_sync("444", "2026-09", "discordid1")
+
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+
+    confirm_view = CwlDeleteSeasonConfirmView(parent_view=parent, guild_id=444, event_id=event_id, season="2026-09")
+    assert "2026-09" in confirm_view._build_content()
+
+    await confirm_view._on_confirm(mock_interaction)
+
+    assert db.get_cwl_event_sync("444", "2026-09") is None
+    mock_interaction.delete_original_response.assert_awaited_once()
+    parent.refresh_cwl_view.assert_awaited_once()
+    assert parent.refresh_cwl_view.await_args.args[1] == "cwl_management"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_delete_season_confirm_view_cancel_does_not_delete(db, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlDeleteSeasonConfirmView
+
+    await _seed_guild_and_clans(db, "555", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["555"] = {}
+
+    event_id = db.create_cwl_event_sync("555", "2026-09", "discordid1")
+
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+    confirm_view = CwlDeleteSeasonConfirmView(parent_view=parent, guild_id=555, event_id=event_id, season="2026-09")
+
+    await confirm_view._on_cancel(mock_interaction)
+
+    assert db.get_cwl_event_sync("555", "2026-09") is not None
+    mock_interaction.delete_original_response.assert_awaited_once()
+    parent.refresh_cwl_view.assert_not_awaited()
 
 
 @pytest.mark.discord

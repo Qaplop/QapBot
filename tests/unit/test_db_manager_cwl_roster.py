@@ -172,6 +172,19 @@ class TestCwlCascadeDelete:
         row2 = await cursor2.fetchone()
         assert row2["n"] == 0
 
+    async def test_delete_cwl_event_sync_cascades_and_returns_true(self, db):
+        """delete_cwl_event_sync() (the "Delete Season" admin action's backing call, distinct
+        from update_cwl_event_status_sync()'s normal lifecycle transitions) uses a separate
+        sync sqlite3 connection — confirm cascade delete still applies there too, not just on
+        the async connection exercised by the raw-SQL test above."""
+        await _seed_guild_and_clan(db, guild_id="222", clan_tag="#CLAN1")
+        event_id = db.create_cwl_event_sync("222", "2026-09", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+
+        assert db.delete_cwl_event_sync(event_id) is True
+        assert db.get_cwl_event_sync("222", "2026-09") is None
+        assert db.get_cwl_event_clans_sync(event_id) == []
+
 
 class TestGuildConfigCwlColumns:
     @pytest.mark.integration

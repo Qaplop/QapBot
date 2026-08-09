@@ -156,7 +156,13 @@ async def format_clan_management_cwl_management(
         lines = []
         for clan in clans:
             clan_name = CACHE.get_clan_name(clan["clan_tag"], clan["clan_tag"])
-            tier = clan.get("target_league_rank") or t('cwl.management.tier_unset', guild_id=guild_id_int)
+            # The CWL tier is CoC-defined (war_league), never admin-set — prefer the live
+            # value over the stored snapshot in case the clan was promoted/demoted since.
+            tier = (
+                CACHE.get_clan_war_league(clan["clan_tag"])
+                or clan.get("target_league_rank")
+                or t('cwl.management.tier_unset', guild_id=guild_id_int)
+            )
             start_display = clan.get("cwl_start_at") or t('cwl.management.start_time_unset', guild_id=guild_id_int)
             lines.append(
                 f"• **{clan_name}** ({clan['clan_tag']}) — {tier}, "

@@ -758,6 +758,20 @@ class CacheManager:
         # Defensive: handle unexpected non-dict format gracefully
         return clan_data if isinstance(clan_data, str) else default  # type: ignore[misc, return-value]
 
+    def get_clan_war_league(self, clan_tag: str, default: Optional[str] = None) -> Optional[str]:
+        """Safely get a clan's current CWL league tier (e.g. "Crystal League I") from cache.
+
+        This is CoC-API-sourced (clans.war_league, synced via coc_cache.py) and reflects the
+        game's own promotion/demotion state — it is not something admins configure, so any UI
+        showing a clan's CWL tier should read it from here rather than treating it as an
+        editable field.
+        """
+        clan_data = self.clan_name_cache.get(clan_tag)
+        if not isinstance(clan_data, dict):  # type: ignore[misc]
+            return default
+        war_league = clan_data.get('war_league')  # type: ignore[union-attr]
+        return war_league if isinstance(war_league, str) and war_league else default
+
     async def load_leaderboard_messages(self) -> None:
         """
         Load leaderboard messages (IDs + content hashes + metadata) from database.

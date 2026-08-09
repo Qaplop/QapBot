@@ -2747,6 +2747,28 @@ class WarHistoryDB:
                 conn.rollback()
                 return False
 
+    def delete_cwl_event_sync(self, event_id: int) -> bool:
+        """Delete a cwl_events row outright — cascades to cwl_event_clans/cwl_signups/
+        cwl_assignments (ON DELETE CASCADE). Used by the admin "Delete Season" action (mainly
+        for testing/starting over), not part of the normal draft->announced lifecycle, which
+        uses update_cwl_event_status_sync() instead."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute("DELETE FROM cwl_events WHERE id = ?", (event_id,))
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] delete_cwl_event_sync failed for event {event_id}: {e}")
+                conn.rollback()
+                return False
+
     def set_cwl_event_clans_sync(self, event_id: int, clan_configs: List[Dict[str, Any]]) -> bool:
         """Replace an event's full cwl_event_clans set in one atomic DELETE + INSERT (matches
         the pattern used elsewhere for whole-collection replacement, e.g. war_attacks updates).

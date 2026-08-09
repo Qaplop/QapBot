@@ -292,6 +292,18 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     )
     view.add_item(manage_button)  # type: ignore[arg-type]
 
+    # Mainly for testing/starting over — not gated behind a later phase like the two buttons
+    # above, so it's only disabled when there's genuinely nothing to delete.
+    delete_button = discord.ui.Button(
+        label=t('cwl.management.button_delete_season', guild_id=guild_id),
+        style=discord.ButtonStyle.danger,
+        custom_id="cwl_management_delete_season",
+        row=1,
+        disabled=(event is None),
+    )
+    delete_button.callback = _make_cwl_management_delete_callback(view)  # type: ignore[assignment]
+    view.add_item(delete_button)  # type: ignore[arg-type]
+
     if event is not None:
         # Surfaced so an admin opening this screen can see at a glance whether every
         # participating clan already has a start time set (Finalize, Phase 4, will require it).
@@ -313,6 +325,89 @@ def _make_cwl_management_configure_callback(view: discord.ui.View):
         await setup_view.send_initial(interaction)
 
     return callback
+
+
+def _make_cwl_management_delete_callback(view: discord.ui.View):
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        if not interaction.guild:
+            return
+        from qapbot.QBdiscocmdshelper_cwl import get_current_cwl_event_sync
+
+        event = get_current_cwl_event_sync(interaction.guild.id)
+        if event is None:
+            return
+        confirm_view = CwlDeleteSeasonConfirmView(
+            parent_view=view,
+            guild_id=interaction.guild.id,
+            event_id=event["id"],
+            season=event["cwl_season"],
+        )
+        await interaction.followup.send(
+            confirm_view._build_content(),  # type: ignore[attr-defined]
+            view=confirm_view,
+            ephemeral=True,
+        )
+
+    return callback
+
+
+class CwlDeleteSeasonConfirmView(discord.ui.View):
+    """Confirm/cancel dialog for deleting a CWL event outright, mirroring
+    ui_registration.py's UnlinkConfirmView. Mainly for testing/starting over — deletion
+    cascades to cwl_event_clans/cwl_signups/cwl_assignments (ON DELETE CASCADE)."""
+
+    def __init__(self, parent_view: discord.ui.View, guild_id: int, event_id: int, season: str, timeout: int = 60):
+        super().__init__(timeout=timeout)
+        self.parent_view = parent_view
+        self.guild_id = guild_id
+        self.event_id = event_id
+        self.season = season
+
+        from qapbot.i18n import t
+
+        confirm_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.management.button_confirm_delete', guild_id=guild_id),
+            style=discord.ButtonStyle.danger,
+            custom_id="cwl_delete_confirm",
+        )
+        confirm_button.callback = self._on_confirm  # type: ignore[assignment]
+        self.add_item(confirm_button)
+
+        cancel_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.setup.button_cancel', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_delete_cancel",
+        )
+        cancel_button.callback = self._on_cancel  # type: ignore[assignment]
+        self.add_item(cancel_button)
+
+    def _build_content(self) -> str:
+        from qapbot.i18n import t
+
+        return t('cwl.management.delete_confirm_body', guild_id=self.guild_id, season=self.season)
+
+    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        db = CACHE.db_manager
+        if db is not None:
+            db.delete_cwl_event_sync(self.event_id)
+        try:
+            await interaction.delete_original_response()
+        except discord.NotFound:
+            pass
+        await _refresh_parent(self.parent_view, interaction, "cwl_management")
+
+    async def _on_cancel(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        try:
+            await interaction.delete_original_response()
+        except discord.NotFound:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +508,10 @@ class CwlEventSetupView(TrackedView):
             rows = db.get_previous_cwl_event_clans_sync(str(self.guild.id))
         for row in rows:
             self.working_clans[row["clan_tag"]] = {
-                "target_league_rank": row.get("target_league_rank"),
+                # target_league_rank is CoC-defined (CACHE.get_clan_war_league(), synced from
+                # the clan's live war_league), never admin-set — a stored snapshot only
+                # persists if the clan hasn't been re-synced/promoted since carry-over.
+                "target_league_rank": row.get("target_league_rank") or CACHE.get_clan_war_league(row["clan_tag"]),
                 "roster_size": row.get("roster_size", 15),
                 "tier_order": row.get("tier_order", 0),
                 "cwl_start_at": row.get("cwl_start_at"),
@@ -454,7 +552,9 @@ class CwlEventSetupView(TrackedView):
                 del self.working_clans[clan_tag]
             else:
                 self.working_clans[clan_tag] = {
-                    "target_league_rank": None,
+                    # target_league_rank is CoC-defined, not admin-set — snapshot the clan's
+                    # current war league at selection time (see CACHE.get_clan_war_league()).
+                    "target_league_rank": CACHE.get_clan_war_league(clan_tag),
                     "roster_size": 15,
                     "tier_order": len(self.working_clans),
                     "cwl_start_at": None,
@@ -654,6 +754,13 @@ class CwlEventSetupView(TrackedView):
         tag = self.detail_clan_tags[self.detail_index]
         cfg = self.working_clans.get(tag, {})
         start_display = cfg.get("cwl_start_at") or t('cwl.management.start_time_unset', guild_id=guild_id)
+        # The CWL tier is CoC-defined (war_league), never admin-set — prefer the live value
+        # over the stored snapshot, matching the cwl_management embed (QBdiscocmdshelper_cwl.py).
+        tier = (
+            CACHE.get_clan_war_league(tag)
+            or cfg.get("target_league_rank")
+            or t('cwl.management.tier_unset', guild_id=guild_id)
+        )
         return t(
             'cwl.setup.detail_header',
             guild_id=guild_id,
@@ -661,6 +768,7 @@ class CwlEventSetupView(TrackedView):
             clan_tag=tag,
             index=self.detail_index + 1,
             count=len(self.detail_clan_tags),
+            tier=tier,
             roster_size=cfg.get("roster_size", 15),
             start_time=start_display,
         )
