@@ -39,9 +39,9 @@ import QBdiscordcmds  # noqa: E402
 # Structural regression check
 # ---------------------------------------------------------------------------
 
-_CONVERTED = ["status", "ping", "help", "list", "subscriptions", "leaderboard"]
+_CONVERTED = ["status", "ping", "help", "list", "subscriptions", "leaderboard", "admin"]
 _CONVERTED_GROUP_COMMANDS = ["cwl_league_group", "cwl_opponent"]  # analyse_group
-_LEFT_GUILD_ONLY = ["subscribe", "unsubscribe", "highlightme", "admin"]
+_LEFT_GUILD_ONLY = ["subscribe", "unsubscribe", "highlightme"]
 
 
 @pytest.mark.discord
@@ -291,3 +291,151 @@ async def test_leaderboard_dm_default_text_sends_directly_without_tracking(mock_
     assert sent_and_tracked["ephemeral"] is False
     assert sent_and_tracked["content"] == "```ansi\nPLAYER TABLE```"
     assert sent_and_tracked["command_name"] == "leaderboard_#CLAN1_attack"
+
+
+# ---------------------------------------------------------------------------
+# cleanup_channel_messages()'s DM-safety (QBdiscocmdshelper.py)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cleanup_channel_messages_dm_channel_no_crash(monkeypatch):
+    """A DMChannel has no .name and DMChannel.guild is always None (never raises, per
+    discord.py's own docs — 'provided for compatibility purposes in duck typing') — but
+    channel.guild.name would still raise AttributeError on None. Regression guard for the
+    log-line fix that made this DM-safe."""
+    import qapbot.QBdiscocmdshelper as helper
+
+    fake_cache = _FakeLeaderboardCache()
+    monkeypatch.setattr(helper, "CACHE", fake_cache)
+    monkeypatch.setattr(helper, "discord_retry", _passthrough_discord_retry)
+
+    bot_user = MagicMock()
+    bot_user.id = 999
+    fake_bot = MagicMock()
+    fake_bot.user = bot_user
+
+    class _FakeDMChannel:
+        id = 42
+        guild = None  # matches discord.DMChannel.guild's real behavior
+
+        async def history(self, limit=50):
+            for _ in ():
+                yield  # pragma: no cover — empty async generator
+
+    result = await helper.cleanup_channel_messages(_FakeDMChannel(), fake_bot)  # type: ignore[arg-type]
+    assert result == (0, 0)
+
+
+# ---------------------------------------------------------------------------
+# admin() — DM invocation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_admin_test_notify_rejects_dm(mock_interaction):
+    """TEST_NOTIFY's user picker is a discord.ui.UserSelect (guild-scoped component) — must
+    reject DM invocation explicitly rather than showing a broken/empty picker."""
+    mock_interaction.guild = None
+
+    await QBdiscordcmds.admin.callback(mock_interaction, action="TEST_NOTIFY")  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited_once()
+    sent_text = mock_interaction.followup.send.await_args.args[0]
+    assert "server" in sent_text.lower() or "dm" in sent_text.lower()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_admin_cleanup_messages_works_from_dm_for_bot_admin(mock_interaction, monkeypatch):
+    """CLEANUP_MESSAGES has no modal (unlike REMOVE_CLAN/DEBUG_MESSAGE), so it's fully
+    resolve_guild_context()-aware; a configured bot-admin must be able to run it from a DM."""
+    mock_interaction.guild = None
+    mock_interaction.user.id = 123456789  # matches SERVER_ADMIN fixture convention below
+    # See test_subscriptions_server_wide_dm_not_linked's comment above: response.is_done()
+    # is synchronous in real discord.py; override the AsyncMock-inherited async default.
+    mock_interaction.response.is_done = MagicMock(return_value=False)
+
+    fake_cache = _FakeLeaderboardCache()
+    fake_cache.user_accounts = {}  # type: ignore[attr-defined]  # resolve_guild_context() reads this
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+    import qapbot.QBdiscocmdshelper as helper
+    monkeypatch.setattr(helper, "CACHE", fake_cache)
+    monkeypatch.setattr(QBdiscordcmds, "SERVER_ADMIN", "123456789")
+
+    cleanup_mock = AsyncMock(return_value="Deleted 0 orphaned bot messages in this channel.")
+    monkeypatch.setattr(
+        "qapbot.QBdiscocmdshelper_admin_command.handle_cleanup_messages_channel", cleanup_mock
+    )
+
+    await QBdiscordcmds.admin.callback(mock_interaction, action="CLEANUP_MESSAGES")  # type: ignore[arg-type]
+
+    cleanup_mock.assert_awaited_once()
+    mock_interaction.followup.send.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# help() — DM-filtered command listing
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_help_dm_filters_to_dm_available_commands(mock_interaction, monkeypatch):
+    mock_interaction.guild = None
+    mock_interaction.guild_id = None
+    mock_interaction.client = MagicMock()
+    mock_interaction.client.application_id = 0
+
+    await QBdiscordcmds.help.callback(mock_interaction)  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited_once()
+    embed = mock_interaction.followup.send.await_args.kwargs.get("embed")
+    assert embed is not None
+    field_names = {f.name for f in embed.fields}
+    field_values = " ".join(f.value for f in embed.fields)
+    # DM-available commands appear...
+    assert "/status" in field_values or "status" in field_values
+    # ...guild-only commands (e.g. subscribe, highlightme, clan management, whois) do not.
+    assert "/subscribe`" not in field_values
+    assert "/highlightme`" not in field_values
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_help_dm_rejects_detail_request_for_guild_only_command(mock_interaction, monkeypatch):
+    mock_interaction.guild = None
+    mock_interaction.guild_id = None
+
+    await QBdiscordcmds.help.callback(mock_interaction, command="subscribe")  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited_once()
+    embed = mock_interaction.followup.send.await_args.kwargs.get("embed")
+    assert embed is not None
+    assert embed.color == discord.Color.red()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_help_command_autocomplete_dm_excludes_guild_only(mock_interaction):
+    mock_interaction.guild = None
+
+    choices = await QBdiscordcmds.help_command_autocomplete(mock_interaction, "")
+
+    values = {c.value for c in choices}
+    assert "status" in values
+    assert "subscribe" not in values
+    assert "highlightme" not in values
+    assert "whois" not in values
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_help_command_autocomplete_guild_includes_all():
+    guild_interaction = MagicMock()
+    guild_interaction.guild = MagicMock()
+
+    choices = await QBdiscordcmds.help_command_autocomplete(guild_interaction, "")
+
+    values = {c.value for c in choices}
+    assert "subscribe" in values
+    assert "highlightme" in values

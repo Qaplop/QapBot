@@ -183,6 +183,7 @@
     "help": {
       "list_title": "QapBot Befehle",
       "list_description": "Verwende `/help command:BefehlName` für detaillierte Hilfe zu einem bestimmten Befehl.",
+      "dm_filtered_note": "🏠 Manche Befehle funktionieren nur auf einem Server und werden hier nicht angezeigt — führe `/help` dort aus, um die vollständige Liste zu sehen.",
       "command_not_found_title": "Befehl nicht gefunden",
       "command_not_found_desc": "Keine detaillierte Hilfe verfügbar für `/{command}`. Verwende `/help` ohne Parameter, um alle Befehle anzuzeigen.",
       "category_leaderboards": "📊 Ranglisten & Abos",

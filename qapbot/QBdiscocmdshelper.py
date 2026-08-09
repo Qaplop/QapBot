@@ -562,14 +562,22 @@ async def cleanup_channel_messages(channel: discord.TextChannel, bot: discord.Cl
     to_delete = [msg for msg in bot_msgs if str(msg.id) not in tracked_ids and not msg.interaction_metadata]
     logging.debug(f"Bot messages in channel {channel.id}: {[msg.id for msg in bot_msgs]}")
 
+    # DMChannel has neither .name nor a real .guild (DMChannel.guild is always None, for duck-typing
+    # compatibility only) — build a log-friendly location string that works for both channel types.
+    channel_location = (
+        f"channel '{channel.name}' on server '{channel.guild.name}'"
+        if getattr(channel, "guild", None) is not None
+        else f"DM channel {channel.id}"
+    )
+
     async def _delete_msg(msg: discord.Message) -> bool:
         try:
             await discord_retry(lambda: msg.delete(), f"delete_orphaned_message_{msg.id}")
-            logging.debug(f"Deleted orphaned bot message {msg.id} in channel '{channel.name}' on server '{channel.guild.name}'")
+            logging.debug(f"Deleted orphaned bot message {msg.id} in {channel_location}")
             logging.debug(f"Deleted message content:\n{msg.content}")
             return True
         except Exception as e:
-            logging.warning(f"Failed to delete orphaned bot message {msg.id} in channel '{channel.name}' on server '{channel.guild.name}': {e}")
+            logging.warning(f"Failed to delete orphaned bot message {msg.id} in {channel_location}: {e}")
             return False
 
     delete_results = await asyncio.gather(*[_delete_msg(msg) for msg in to_delete])

@@ -1,6 +1,37 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (16)
+- Added: /admin is now DM-invokable for 17 of its 19 sub-actions, and /help now adapts its own
+  command listing to the caller's context (second follow-up to Phase 0b, (14)/(15),
+  CWL_ROSTER_PLANNING_PLAN.md) — another project-owner review found the first pass had been too
+  conservative in blocking /admin wholesale rather than reviewing it sub-action by sub-action.
+  Only 2 sub-actions have a genuine, narrow guild scope and are gated individually instead of
+  blocking the whole command: IMPORT_DATA (needs a specific guild channel's ClashPerk embed
+  message — its existing "must be used in a guild channel" guard already handles DM correctly, no
+  code change needed) and TEST_NOTIFY (its user-picker is a discord.ui.UserSelect, a guild-scoped
+  component with no DM equivalent — given an explicit upfront rejection rather than risking a
+  broken/empty picker). REMOVE_CLAN/DEBUG_MESSAGE open a modal as their first response, which
+  can't be preceded by resolve_guild_context()'s ambiguous-guild picker (also a first response) —
+  left DM-narrower than the rest on purpose: bot-admins get full DM access via the existing
+  fallback, guild-admins-only get the pre-existing rejection rather than a picker (not a
+  regression). CLEANUP_MESSAGES got the full resolve_guild_context() treatment (no modal, so no
+  conflict) — its cleanup_channel_messages() helper (QBdiscocmdshelper.py) needed a small DM-safety
+  fix first: its orphaned-message log lines read channel.guild.name unconditionally, and
+  DMChannel.guild is always None by design (discord.py: "provided for compatibility purposes in
+  duck typing") while DMChannel has no .name either — both would have raised AttributeError the
+  first time this ran against a DM channel.
+  /help: both the full listing and the command= autocomplete now filter to only DM-invokable
+  commands when interaction.guild is None, driven by each command's own .guild_only attribute
+  (new _get_help_command_dm_status() helper) rather than a second hand-maintained list that could
+  drift out of sync with the guild_only() decorators themselves. Also fixed a small pre-existing
+  inconsistency noticed while touching this: the autocomplete's command list was missing
+  "highlightme" (present in the main validation list, so `/help command:highlightme` worked but
+  was never suggested).
+  Files: QBdiscordcmds.py, qapbot/QBdiscocmdshelper.py, qapbot/translations/en.json,
+  qapbot/translations/de.json, tests/discord/test_dm_command_invocation.py.
+  1562 tests pass (.\run_tests.ps1).
+
 2026-08-09 (15)
 - Added: /leaderboard is now DM-invokable too (follow-up to Phase 0b, (14),
   CWL_ROSTER_PLANNING_PLAN.md) — a project-owner review of (14) corrected the initial scope call

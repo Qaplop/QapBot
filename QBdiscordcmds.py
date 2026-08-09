@@ -991,11 +991,41 @@ async def highlightme(interaction: discord.Interaction):
     _log_cmd_done(interaction, "highlightme")
     await interaction.followup.send(t('commands.highlightme.success', guild_id=guild_id, count=reposted), ephemeral=True)
 
+def _get_help_command_dm_status() -> Dict[str, bool]:
+    """Maps /help's display names to their command's `.guild_only` flag, so /help can filter
+    itself to only the commands actually invokable from a DM.
+
+    Built at call time, not import time: it references command objects (e.g. analyse_leaguegroup,
+    admin) defined later in this module. Python only resolves a function body's names when the
+    function actually runs, so this forward reference is safe as long as nothing calls this
+    before the whole module has finished loading (true for both of its callers below, which only
+    run per-interaction, long after import).
+    """
+    return {
+        "subscribe": subscribe.guild_only,
+        "unsubscribe": unsubscribe.guild_only,
+        "subscriptions": subscriptions.guild_only,
+        "leaderboard": leaderboard.guild_only,
+        "highlightme": highlightme.guild_only,
+        "analyse cwl_league_group": analyse_leaguegroup.guild_only,
+        "analyse cwl_opponent": analyse_cwlopponent.guild_only,
+        "clan management": clan_management.guild_only,
+        "admin": admin.guild_only,
+        "list": list.guild_only,
+        "whois": whois_slash.guild_only,
+        "ping": ping.guild_only,
+        "status": status.guild_only,
+        "help": help.guild_only,
+    }
+
+
 @app_commands.command(name="help", description=dev_mode+"Display help information about the available bot commands.")
 @app_commands.describe(
     command="Optional: Select a specific command to get detailed help"
 )
 # DM-invokable (Phase 0b, CWL_ROSTER_PLANNING_PLAN.md) — display-only guild_id, no functional guild dependency.
+# Filters its own command listing to DM-available commands when invoked from a DM — see
+# _get_help_command_dm_status() above.
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
 async def help(interaction: discord.Interaction, command: Optional[str] = None):
     """
@@ -1005,13 +1035,19 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
     Otherwise, show list of all available commands with short descriptions.
     """
     from qapbot.i18n import t  # type: ignore[attr-defined]
-    
-    # Command list for autocomplete and validation
+
+    is_dm = interaction.guild is None
+
+    # Command list for autocomplete and validation — in a DM, filtered down to only the
+    # commands that are actually invokable there (see _get_help_command_dm_status()).
     AVAILABLE_COMMANDS = [
         "subscribe", "unsubscribe", "subscriptions", "leaderboard", "highlightme", "analyse cwl_league_group",
         "analyse cwl_opponent", "clan management", "admin", "list", "whois", "ping", "status", "help"
     ]
-    
+    if is_dm:
+        dm_status = _get_help_command_dm_status()
+        AVAILABLE_COMMANDS = [c for c in AVAILABLE_COMMANDS if not dm_status.get(c, True)]
+
     user_id = str(interaction.user.id)
     guild_id = interaction.guild_id
     
@@ -1082,7 +1118,9 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
         embed.description = description
     else:
         embed.description = t('commands.help.list_description', user_id=user_id, guild_id=guild_id)
-    
+    if is_dm:
+        embed.description = (embed.description or "") + "\n" + t('commands.help.dm_filtered_note', user_id=user_id, guild_id=guild_id)
+
     # Organize commands by category (reorganized per user request)
     categories = {
         t('commands.help.category_leaderboards', user_id=user_id, guild_id=guild_id): ["subscribe", "unsubscribe", "subscriptions", "leaderboard", "highlightme"],
@@ -1090,11 +1128,19 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
         t('commands.help.category_administration', user_id=user_id, guild_id=guild_id): ["clan management", "admin", "list"],
         t('commands.help.category_bot_info', user_id=user_id, guild_id=guild_id): ["ping", "status", "help"],
     }
-    
+    if is_dm:
+        dm_status = _get_help_command_dm_status()
+        categories = {
+            category: [c for c in commands_list if not dm_status.get(c, True)]
+            for category, commands_list in categories.items()
+        }
+
     for category, commands_list in categories.items():
+        if not commands_list:
+            continue  # entire category filtered out in DM \u2014 skip it, including its blank-line spacer
         # Add blank line before category (except first)
         embed.add_field(name="\u200b", value="", inline=False)
-        
+
         field_value = ""
         for cmd in commands_list:
             short_desc = t(f'commands.help.{cmd}.short', user_id=user_id, guild_id=guild_id)
@@ -1121,12 +1167,16 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
 
 @help.autocomplete('command')
 async def help_command_autocomplete(interaction: discord.Interaction, current: str):
-    """Autocomplete for help command parameter."""
+    """Autocomplete for help command parameter — filtered to DM-available commands when
+    invoked from a DM (see _get_help_command_dm_status())."""
     commands_list = [
-        "subscribe", "unsubscribe", "subscriptions", "leaderboard", "analyse cwl_league_group",
+        "subscribe", "unsubscribe", "subscriptions", "leaderboard", "highlightme", "analyse cwl_league_group",
         "analyse cwl_opponent", "clan management", "admin", "list", "whois", "ping", "status", "help"
     ]
-    
+    if interaction.guild is None:
+        dm_status = _get_help_command_dm_status()
+        commands_list = [c for c in commands_list if not dm_status.get(c, True)]
+
     current_lower = (current or "").lower()
     choices = [
         app_commands.Choice(name=cmd, value=cmd)
@@ -1210,13 +1260,16 @@ async def do_maintenance_shutdown() -> None:
     app_commands.Choice(name="Maintenance Start - Suspend updates and close DB for safe data access (bot admin)", value="MAINTENANCE_START"),
     app_commands.Choice(name="Maintenance End - Restart bot and resume normal operation (bot admin)", value="MAINTENANCE_END"),
 ])
-# NOT converted in Phase 0b (CWL_ROSTER_PLANNING_PLAN.md): most of this command's 19 sub-actions
-# are bot-admin-only maintenance tooling and would be trivially DM-safe, but IMPORT_DATA needs a
-# real Guild object's member list for Discord-username matching (parse_clashperk_embed) and
-# CLEANUP_MESSAGES's helper needs auditing for guild-channel assumptions — converting the whole
-# command wholesale risks a partially-broken sub-action. Revisit as a per-sub-action split if DM
-# access to admin tooling becomes valuable enough to justify it.
-@app_commands.guild_only()
+# DM-invokable (Phase 0b follow-up, CWL_ROSTER_PLANNING_PLAN.md) — per-sub-action review found 17 of
+# 19 sub-actions have no functional interaction.guild dependency at all (bot-wide/global effect via
+# check_bot_admin_only, or global CACHE data). Two sub-actions have a genuine, narrow guild scope and
+# are individually gated inside their own branch rather than blocking the whole command — see
+# IMPORT_DATA (needs a specific guild channel's ClashPerk embed message — "current channel" is
+# meaningless in a DM) and TEST_NOTIFY (its user-picker uses discord.ui.UserSelect, a guild-scoped
+# component). REMOVE_CLAN/DEBUG_MESSAGE open a modal as their first response, which can't be preceded
+# by resolve_guild_context()'s ambiguous-guild picker (also a first response) — so their permission
+# check is deliberately left DM-narrower than the rest: bot-admins get full DM access as before,
+# guild-admins-only get the existing "you need admin permissions" rejection rather than a picker.
 async def admin(
     interaction: discord.Interaction,
     action: str
@@ -1482,7 +1535,12 @@ async def admin(
         await interaction.response.send_modal(WarPredictModal())
         return
 
-    # Handle REMOVE_CLAN action
+    # Handle REMOVE_CLAN action. DM-invokable, but deliberately not resolved_guild_id-aware: this
+    # opens a modal as its first response, which can't be preceded by resolve_guild_context()'s
+    # ambiguous-guild picker (also a first response — Discord allows only one). Bot-admins already
+    # pass via the existing fallback below; a guild-admin-only caller gets the normal "you need
+    # admin permissions" rejection from DM rather than a picker, which is a narrower-but-safe
+    # default, not a regression (identical to today's DM behavior before this phase).
     if action_norm == "REMOVE_CLAN":
         if not await check_admin_permissions(interaction, SERVER_ADMIN):
             guild_id = interaction.guild.id if interaction.guild else None
@@ -1630,6 +1688,11 @@ async def admin(
         return
     
     # Handle IMPORT_DATA action (bot admin only - shows modal)
+    # Handle IMPORT_DATA action — stays guild-only in effect: the modal below already rejects
+    # a missing interaction.guild on submit ("Command must be used in a guild channel") since
+    # the ClashPerk embed being imported lives in a specific guild channel that a DM's "current
+    # channel" can never be — the modal opens fine from a DM, it just can't succeed there. No
+    # code change needed; documenting why this one stays effectively guild-scoped.
     if action_norm == "IMPORT_DATA":
         from qapbot.QBdiscocmdshelper import check_bot_admin_only
         if not check_bot_admin_only(interaction, CONFIG.server_admin):
@@ -1836,7 +1899,10 @@ async def admin(
         await interaction.followup.send(msg, ephemeral=True)
         return
 
-    # Handle DEBUG_MESSAGE action
+    # Handle DEBUG_MESSAGE action. Same modal-vs-picker tradeoff as REMOVE_CLAN, above — DM-invokable
+    # for bot-admins (existing fallback), guild-admins-only get the normal rejection rather than a
+    # picker. The fetch itself is already cross-guild by design (QBcore.bot.get_channel/fetch_channel),
+    # so no guild-object substitution would be needed even if the picker conflict were resolved later.
     if action_norm == "DEBUG_MESSAGE":
         if not await check_admin_permissions(interaction, SERVER_ADMIN):
             guild_id = interaction.guild.id if interaction.guild else None
@@ -1988,11 +2054,18 @@ async def admin(
         await interaction.response.send_modal(DebugMessageModal())
         return
     
-    # Handle CLEANUP_MESSAGES action (channel scope)
+    # Handle CLEANUP_MESSAGES action (channel scope — also DM-safe, cleans up the bot's own
+    # orphaned messages in whichever channel this was invoked from, including a DM channel)
     if action_norm == "CLEANUP_MESSAGES":
-        if not await _safe_defer(interaction, thinking=True, ephemeral=True):
-            return
-        if not await check_admin_permissions(interaction, SERVER_ADMIN):
+        # resolve_guild_context() may need to send the interaction's first response itself (the
+        # ambiguous multi-guild DM picker) — must run before _safe_defer(), not after. If it
+        # already responded (the picker), _safe_defer() must be skipped entirely — it would raise
+        # discord.InteractionResponded on an already-answered interaction.
+        resolved_guild_id = await resolve_guild_context(interaction)
+        if not interaction.response.is_done():
+            if not await _safe_defer(interaction, thinking=True, ephemeral=True):
+                return
+        if not await check_admin_permissions(interaction, SERVER_ADMIN, resolved_guild_id=resolved_guild_id):
             guild_id = interaction.guild.id if interaction.guild else None
             await interaction.followup.send(t('commands.errors.admin_required', guild_id=guild_id), ephemeral=True)
             return
@@ -2005,7 +2078,7 @@ async def admin(
             await interaction.followup.send(t('commands.errors.error_during_channel_cleanup', guild_id=guild_id, error=str(e)), ephemeral=True)
             logging.error(f"CLEANUP_MESSAGES failed: {e}")
         return
-    
+
     # Handle CLEANUP_MESSAGES_ALL action (all channels, bot admin only)
     if action_norm == "CLEANUP_MESSAGES_ALL":
         if not await _safe_defer(interaction, thinking=True, ephemeral=True):
@@ -2113,9 +2186,14 @@ async def admin(
             logging.error(f"LIST_ALL_SUBSCRIPTIONS failed: {e}")
         return
     
-    # Handle TEST_NOTIFY action
+    # Handle TEST_NOTIFY action — stays guild-only: the user picker below is a
+    # discord.ui.UserSelect, a guild-scoped component (populated from a guild's member list;
+    # has no DM equivalent), unlike the rest of /admin.
     if action_norm == "TEST_NOTIFY":
         if not await _safe_defer(interaction, thinking=True, ephemeral=True):
+            return
+        if interaction.guild is None:
+            await interaction.followup.send(t('commands.errors.dms_only_error', guild_id=None), ephemeral=True)
             return
         from qapbot.QBdiscocmdshelper import check_bot_admin_only
         if not check_bot_admin_only(interaction, SERVER_ADMIN):
@@ -2125,7 +2203,7 @@ async def admin(
                 ephemeral=True
             )
             return
-        
+
         # Create a custom view with user select for test notifications
         class TestNotifyView(discord.ui.View):
             def __init__(self, original_interaction: discord.Interaction):

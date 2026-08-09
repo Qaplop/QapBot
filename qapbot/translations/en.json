@@ -183,6 +183,7 @@
     "help": {
       "list_title": "QapBot Commands",
       "list_description": "Use `/help command:CommandName` for detailed help about a specific command.",
+      "dm_filtered_note": "🏠 Some commands only work inside a server and aren't shown here — run `/help` there to see the full list.",
       "command_not_found_title": "Command Not Found",
       "command_not_found_desc": "No detailed help available for `/{command}`. Use `/help` without parameters to see all commands.",
       "category_leaderboards": "📊 Leaderboards & Subscriptions",
