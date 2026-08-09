@@ -1,6 +1,22 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-09 (28)
+- Fixed: Phase C of the CWL clan-config Activity (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md), (27),
+  verified live in Discord (button launch + table + Save all confirmed working end-to-end) —
+  three refinements requested after that live test:
+  (1) the start-time picker's minute column now only offers :00/:15/:30/:45, via
+  datetime-local's step="900" (seconds) attribute — a native browser feature, no custom picker.
+  (2) Added a Cancel button next to Save — re-renders the table from the untouched original
+  payload (no server round-trip needed, since nothing was ever sent until Save was clicked).
+  (3) Checked whether a successful save could auto-close the Activity window — the Embedded App
+  SDK has no close/exit/minimize command in its entire command list; an Activity can never
+  programmatically close itself, only the user can (Discord's own collapse control). Since that
+  specific request isn't achievable on this platform, a successful Save now replaces the form
+  with an explicit "✓ Saved — you can close this window now" state (plus an "Edit again" way
+  back in) instead of silently pretending to close anything.
+  Files: activity/client/src/clanConfigTable.ts, activity/client/index.html.
+
 2026-08-09 (27)
 - Added: Phase C of the CWL clan-config Activity (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md) — the real
   table UI this whole feature exists for. activity/client/src/clanConfigTable.ts renders a
