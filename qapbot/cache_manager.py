@@ -208,6 +208,13 @@ class CacheManager:
         # Each entry is a war_tag string (e.g. '#ABC123').  Consumed in batches per update cycle.
         self.pending_cwl_recovery: deque[str] = deque()
         self.last_cwl_recovery_summary: str = ""  # Summary of last completed recovery batch
+        # "Manage Enrollment" web-Activity screen picker (CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10):
+        # (guild_id_str, discord_user_id_str) -> "clan_config" | "enrollment", set by whichever
+        # Discord button fired LAUNCH_ACTIVITY, popped by the bridge's GET /api/cwl/screen on the
+        # Activity's very first fetch. Deliberately ephemeral/unpersisted (a single-use launch
+        # hint, not state) and pop-on-read self-cleaning — see web_bridge.py's handler docstring
+        # for why no TTL/eviction is needed beyond that.
+        self.pending_cwl_activity_screen: Dict[Tuple[str, str], str] = {}
         self.last_db_maintenance: Optional[datetime] = None  # UTC timestamp of last nightly DB maintenance run
         self.last_history_migration: Optional[datetime] = None  # UTC timestamp of last monthly hot->history DB migration
         # Cross-cycle datetime parse cache for the clan categorization loop.

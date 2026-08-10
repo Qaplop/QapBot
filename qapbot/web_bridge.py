@@ -144,7 +144,241 @@ async def _build_clan_config_payload(guild_id: int) -> Dict[str, Any]:
     }
 
 
+async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
+    """Build the GET response for the "Manage Enrollment" board — the guild's selected season's
+    participating clans as columns, and a merged player list combining cwl_signups (whatever's
+    already been recorded) with get_current_clan_members_sync() (so a current member who never
+    got/answered the template DM still shows up, ready for a 1-click sign-up rather than being
+    invisible until they act first — same reasoning start_cwl_enrollment() already uses for its
+    seed pool). Each player is annotated with their current assignment, if any (None = the
+    Unassigned pool)."""
+    from qapbot.QBdiscocmdshelper_cwl import cwl_league_rank, resolve_selected_cwl_season
+
+    db = CACHE.db_manager
+    season = resolve_selected_cwl_season(guild_id)
+    event = db.get_cwl_event_sync(str(guild_id), season) if db is not None else None
+
+    if db is None or event is None:
+        return {
+            "season": season,
+            "event_status": event["status"] if event else None,
+            "clans": [],
+            "players": [],
+        }
+
+    all_clans = db.get_cwl_event_clans_sync(event["id"])
+    participating_clans = [c for c in all_clans if c.get("participating", 1)]
+    participating_clan_tags = [c["clan_tag"] for c in participating_clans]
+
+    # Highest tier first, name as the tiebreaker — same sort as the clan-config payload and the
+    # Discord-side CWL Management embed.
+    def _tier_for(clan_row: Dict[str, Any]) -> Optional[str]:
+        return CACHE.get_clan_war_league(clan_row["clan_tag"]) or clan_row.get("target_league_rank")
+
+    participating_clans.sort(
+        key=lambda c: (-cwl_league_rank(_tier_for(c)), (CACHE.get_clan_name(c["clan_tag"], c["clan_tag"]) or "").lower())
+    )
+    clans = [
+        {
+            "clan_tag": c["clan_tag"],
+            "name": CACHE.get_clan_name(c["clan_tag"], c["clan_tag"]),
+            "tier": _tier_for(c),
+        }
+        for c in participating_clans
+    ]
+
+    players_by_tag: Dict[str, Dict[str, Any]] = {}
+    for signup in db.get_cwl_signups_for_event_sync(event["id"]):
+        players_by_tag[signup["player_tag"]] = {
+            "player_tag": signup["player_tag"],
+            "player_name": signup["player_name"],
+            "discord_id": signup["discord_id"],
+            "signup_status": signup["status"],
+        }
+    for member in db.get_current_clan_members_sync(participating_clan_tags):
+        if member["player_tag"] not in players_by_tag:
+            players_by_tag[member["player_tag"]] = {
+                "player_tag": member["player_tag"],
+                "player_name": member["player_name"],
+                "discord_id": member["discord_id"],
+                "signup_status": None,
+            }
+
+    assigned_clan_by_tag = {
+        a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event["id"])
+    }
+    for player_tag, player in players_by_tag.items():
+        player["assigned_clan_tag"] = assigned_clan_by_tag.get(player_tag)
+
+    players = sorted(players_by_tag.values(), key=lambda p: (p["player_name"] or p["player_tag"]).lower())
+
+    return {
+        "season": season,
+        "event_status": event["status"],
+        "clans": clans,
+        "players": players,
+    }
+
+
 async def handle_health(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True})
+
+
+async def handle_get_cwl_screen(request: web.Request) -> web.Response:
+    """Pops the pending-screen hint recorded by whichever Discord button fired LAUNCH_ACTIVITY
+    (CACHE.pending_cwl_activity_screen — see its field docstring in cache_manager.py for the
+    full "no reliable way to pass this through Discord's own launch mechanism" design history).
+    No admin/leader re-check here — it reveals nothing sensitive (just which of two already
+    permission-gated screens to fetch next), and the caller doesn't know which permission level
+    even applies until this returns.
+    """
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        guild_id_str = str(int(request.query["guild_id"]))
+        discord_user_id_str = str(int(request.query["discord_user_id"]))
+    except (KeyError, ValueError):
+        return web.json_response({"error": "missing/invalid guild_id or discord_user_id"}, status=400)
+
+    screen = CACHE.pending_cwl_activity_screen.pop((guild_id_str, discord_user_id_str), "clan_config")
+    return web.json_response({"screen": screen})
+
+
+async def handle_get_cwl_enrollment(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        guild_id = int(request.query["guild_id"])
+        discord_user_id = int(request.query["discord_user_id"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "missing/invalid guild_id or discord_user_id"}, status=400)
+
+    if not await _resolve_admin_or_leader(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
+
+    return web.json_response(await _build_enrollment_payload(guild_id))
+
+
+async def handle_post_cwl_enrollment_signup(request: web.Request) -> web.Response:
+    """1-click sign-up/withdraw from the Manage Enrollment board. Never trusts client-supplied
+    player_name/discord_id — both are resolved server-side (from the existing cwl_signups row if
+    one exists, else from get_current_clan_members_sync(), matching start_cwl_enrollment()'s own
+    resolution) rather than accepted from the request body, consistent with every other identity
+    field in this feature never coming from the client."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        guild_id = int(body["guild_id"])
+        discord_user_id = int(body["discord_user_id"])
+        player_tag = str(body["player_tag"])
+        action = str(body["action"])
+    except (KeyError, ValueError, TypeError):
+        return web.json_response({"error": "invalid request body"}, status=400)
+    if action not in ("confirm", "withdraw"):
+        return web.json_response({"error": "action must be 'confirm' or 'withdraw'"}, status=400)
+
+    if not await _resolve_admin_or_leader(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
+
+    db = CACHE.db_manager
+    if db is None:
+        return web.json_response({"error": "database not ready"}, status=503)
+
+    from datetime import datetime, timezone
+
+    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+    from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+
+    season = resolve_selected_cwl_season(guild_id)
+    event = db.get_cwl_event_sync(str(guild_id), season)
+    if event is None:
+        return web.json_response(
+            {"error": f"no CWL event exists yet for season {season}"}, status=409
+        )
+
+    existing = db.get_cwl_signup_sync(event["id"], player_tag)
+    if existing is not None:
+        player_name = existing["player_name"]
+        discord_id = existing["discord_id"]
+        preferred_league_rank = existing["preferred_league_rank"]
+    else:
+        all_clans = db.get_cwl_event_clans_sync(event["id"])
+        participating_clan_tags = [c["clan_tag"] for c in all_clans if c.get("participating", 1)]
+        member = next(
+            (m for m in db.get_current_clan_members_sync(participating_clan_tags) if m["player_tag"] == player_tag),
+            None,
+        )
+        if member is None:
+            return web.json_response(
+                {"error": "player is not a current member of any participating clan"}, status=404
+            )
+        player_name = member["player_name"]
+        discord_id = member["discord_id"]
+        preferred_league_rank = member["preferred_league_rank"]
+
+    new_status = "confirmed" if action == "confirm" else "withdrawn"
+    responded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    db.upsert_cwl_signup_sync(
+        event["id"], player_tag, player_name, discord_id, preferred_league_rank,
+        "admin_added", new_status, responded_at=responded_at,
+    )
+
+    # A withdrawn player shouldn't linger assigned to a clan column.
+    if action == "withdraw":
+        db.delete_cwl_assignment_sync(event["id"], player_tag)
+
+    try:
+        await refresh_cwl_management_hub_message(guild_id, "cwl_management")
+    except Exception as e:
+        logging.warning(f"[WEB-BRIDGE] Saved signup but could not refresh the Hub message: {e}")
+
+    return web.json_response({"ok": True})
+
+
+async def handle_post_cwl_enrollment_assign(request: web.Request) -> web.Response:
+    """Drag-and-drop move on the Manage Enrollment board. clan_tag: null means the card was
+    dropped on the Unassigned column."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        guild_id = int(body["guild_id"])
+        discord_user_id = int(body["discord_user_id"])
+        player_tag = str(body["player_tag"])
+        clan_tag = body.get("clan_tag")
+    except (KeyError, ValueError, TypeError):
+        return web.json_response({"error": "invalid request body"}, status=400)
+
+    if not await _resolve_admin_or_leader(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
+
+    db = CACHE.db_manager
+    if db is None:
+        return web.json_response({"error": "database not ready"}, status=503)
+
+    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+    from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+
+    season = resolve_selected_cwl_season(guild_id)
+    event = db.get_cwl_event_sync(str(guild_id), season)
+    if event is None:
+        return web.json_response(
+            {"error": f"no CWL event exists yet for season {season}"}, status=409
+        )
+
+    if clan_tag is None:
+        db.delete_cwl_assignment_sync(event["id"], player_tag)
+    else:
+        db.upsert_cwl_assignment_sync(
+            event["id"], player_tag, str(clan_tag), assignment_source="admin_override", locked=True
+        )
+
+    try:
+        await refresh_cwl_management_hub_message(guild_id, "cwl_management")
+    except Exception as e:
+        logging.warning(f"[WEB-BRIDGE] Saved assignment but could not refresh the Hub message: {e}")
+
     return web.json_response({"ok": True})
 
 
@@ -229,6 +463,10 @@ def create_app() -> web.Application:
     app.router.add_get("/api/health", handle_health)
     app.router.add_get("/api/cwl/clan-config", handle_get_clan_config)
     app.router.add_post("/api/cwl/clan-config", handle_post_clan_config)
+    app.router.add_get("/api/cwl/screen", handle_get_cwl_screen)
+    app.router.add_get("/api/cwl/enrollment", handle_get_cwl_enrollment)
+    app.router.add_post("/api/cwl/enrollment/signup", handle_post_cwl_enrollment_signup)
+    app.router.add_post("/api/cwl/enrollment/assign", handle_post_cwl_enrollment_assign)
     return app
 
 

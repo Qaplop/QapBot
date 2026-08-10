@@ -133,6 +133,85 @@ api.post('/cwl/clan-config', async (c) => {
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
 })
 
+// "Manage Enrollment" (CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10) — four routes, same
+// verify-identity-then-proxy pattern as /cwl/clan-config above. /cwl/screen deliberately skips
+// nothing security-relevant by not checking BRIDGE_URL/BRIDGE_SECRET differently — it goes
+// through the exact same proxy path, just to a cheaper bridge endpoint.
+
+api.get('/cwl/screen', async (c) => {
+  const guildId = c.req.query('guild_id')
+  if (!guildId) return c.json({ error: 'missing guild_id' }, 400)
+
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  const upstream = await fetch(
+    `${c.env.BRIDGE_URL}/api/cwl/screen?guild_id=${encodeURIComponent(guildId)}&discord_user_id=${encodeURIComponent(discordUserId)}`,
+    { headers: { 'X-Bridge-Secret': c.env.BRIDGE_SECRET } },
+  )
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
+})
+
+api.get('/cwl/enrollment', async (c) => {
+  const guildId = c.req.query('guild_id')
+  if (!guildId) return c.json({ error: 'missing guild_id' }, 400)
+
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  const upstream = await fetch(
+    `${c.env.BRIDGE_URL}/api/cwl/enrollment?guild_id=${encodeURIComponent(guildId)}&discord_user_id=${encodeURIComponent(discordUserId)}`,
+    { headers: { 'X-Bridge-Secret': c.env.BRIDGE_SECRET } },
+  )
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
+})
+
+api.post('/cwl/enrollment/signup', async (c) => {
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  let body: Record<string, unknown>
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  const upstream = await fetch(`${c.env.BRIDGE_URL}/api/cwl/enrollment/signup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': c.env.BRIDGE_SECRET },
+    body: JSON.stringify({ ...body, discord_user_id: discordUserId }),
+  })
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 404 | 409 | 503)
+})
+
+api.post('/cwl/enrollment/assign', async (c) => {
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  let body: Record<string, unknown>
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  const upstream = await fetch(`${c.env.BRIDGE_URL}/api/cwl/enrollment/assign`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': c.env.BRIDGE_SECRET },
+    body: JSON.stringify({ ...body, discord_user_id: discordUserId }),
+  })
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 409 | 503)
+})
+
 const app = new Hono<{ Bindings: Bindings }>()
 app.route('/api', api)
 app.route('/', api)

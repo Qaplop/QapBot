@@ -1,6 +1,22 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (13)
+- Added (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", slice 3 of 5 — bridge + Worker
+  endpoints): four new `qapbot/web_bridge.py` routes backing the upcoming enrollment board —
+  `GET /api/cwl/screen` (pops the pending-screen hint set by whichever launch button was
+  clicked, defaulting to `clan_config`; see the plan doc's "Key architectural decision" for why
+  this replaces routing by event status), `GET /api/cwl/enrollment` (`_build_enrollment_payload`
+  merges `cwl_signups` with current clan membership so an un-signed-up current member still
+  shows up, each player annotated with its `cwl_assignments` row if any), `POST
+  /api/cwl/enrollment/signup` (confirm/withdraw, withdraw also cascades to delete any existing
+  assignment), and `POST /api/cwl/enrollment/assign` (drag-and-drop move; `clan_tag: null`
+  unassigns). New `CACHE.pending_cwl_activity_screen` ephemeral pop-on-read dict
+  (`cache_manager.py`). Mirrored with four matching proxy routes in
+  `activity/server/src/index.ts` (identity-verify-then-proxy, same pattern as the existing
+  clan-config routes). Nothing calls these yet — no Discord button or frontend screen wired up
+  until slices 4-5. 19 new tests in `tests/discord/test_web_bridge.py`; 1750 total tests pass.
+
 2026-08-10 (12)
 - Added (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", slice 2 of 5 — permission check):
   new `check_admin_or_leader_permission()` (`QBdiscocmdshelper.py`) — admin, configured bot
