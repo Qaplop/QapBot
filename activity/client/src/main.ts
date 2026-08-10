@@ -6,7 +6,8 @@
  */
 import { DiscordSDK, RPCCloseCodes } from '@discord/embedded-app-sdk'
 import { renderClanConfigTable } from './clanConfigTable'
-import type { ClanConfig, ClanConfigPayload } from './types'
+import { renderEnrollmentBoard } from './enrollmentBoard'
+import type { ClanConfig, ClanConfigPayload, EnrollmentPayload, ScreenPayload } from './types'
 
 const clientId = import.meta.env.VITE_CLIENT_ID as string | undefined
 
@@ -52,7 +53,73 @@ async function setup(): Promise<void> {
       return
     }
 
-    root.textContent = 'Loading clan configuration…'
+    const closeActivity = (reason: string): void => {
+      // Diagnostic logging (visible via Discord's own Activity dev console) in case this
+      // silently no-ops for some environments — console output is routed to Discord's client
+      // by the SDK itself (see Discord.d.ts's overrideConsoleLogging warning).
+      console.log(`[cwl-activity] calling discordSdk.close(CLOSE_NORMAL, "${reason}")`)
+      try {
+        discordSdk.close(RPCCloseCodes.CLOSE_NORMAL, reason)
+      } catch (err) {
+        console.error('[cwl-activity] discordSdk.close() threw:', err)
+      }
+    }
+
+    root.textContent = 'Loading…'
+
+    // Which screen to render is decided by the bot, not by fetched event status — see
+    // CWL_ROSTER_PLANNING_PLAN.md's "Manage Enrollment" architectural decision for why (the two
+    // screens must stay independently reachable at any event status, not gated by it).
+    const screenResponse = await fetch(`/api/cwl/screen?guild_id=${encodeURIComponent(guildId)}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    })
+    if (!screenResponse.ok) {
+      const body = await screenResponse.text()
+      throw new Error(`failed to resolve screen (${screenResponse.status}): ${body}`)
+    }
+    const { screen } = (await screenResponse.json()) as ScreenPayload
+
+    if (screen === 'enrollment') {
+      root.textContent = 'Loading enrollment…'
+
+      const enrollmentResponse = await fetch(`/api/cwl/enrollment?guild_id=${encodeURIComponent(guildId)}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      })
+      if (!enrollmentResponse.ok) {
+        const body = await enrollmentResponse.text()
+        throw new Error(`failed to load enrollment (${enrollmentResponse.status}): ${body}`)
+      }
+      const payload = (await enrollmentResponse.json()) as EnrollmentPayload
+
+      renderEnrollmentBoard(
+        root,
+        payload,
+        async (playerTag: string, action: 'confirm' | 'withdraw') => {
+          const response = await fetch('/api/cwl/enrollment/signup', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+            body: JSON.stringify({ guild_id: guildId, player_tag: playerTag, action }),
+          })
+          if (!response.ok) {
+            const body = await response.text()
+            throw new Error(`${response.status}: ${body}`)
+          }
+        },
+        async (playerTag: string, clanTag: string | null) => {
+          const response = await fetch('/api/cwl/enrollment/assign', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+            body: JSON.stringify({ guild_id: guildId, player_tag: playerTag, clan_tag: clanTag }),
+          })
+          if (!response.ok) {
+            const body = await response.text()
+            throw new Error(`${response.status}: ${body}`)
+          }
+        },
+        closeActivity,
+      )
+      return
+    }
 
     // No season query param — the bridge always resolves whichever season is currently
     // selected on the Discord-side CWL Management screen (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md
@@ -80,17 +147,7 @@ async function setup(): Promise<void> {
           throw new Error(`${saveResponse.status}: ${body}`)
         }
       },
-      (reason: string) => {
-        // Diagnostic logging (visible via Discord's own Activity dev console) in case this
-        // silently no-ops for some environments — console output is routed to Discord's client
-        // by the SDK itself (see Discord.d.ts's overrideConsoleLogging warning).
-        console.log(`[cwl-clan-config] calling discordSdk.close(CLOSE_NORMAL, "${reason}")`)
-        try {
-          discordSdk.close(RPCCloseCodes.CLOSE_NORMAL, reason)
-        } catch (err) {
-          console.error('[cwl-clan-config] discordSdk.close() threw:', err)
-        }
-      },
+      closeActivity,
     )
   } catch (err) {
     console.error(err)

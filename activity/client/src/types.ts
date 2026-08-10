@@ -21,3 +21,37 @@ export type ClanConfigPayload = {
   event_status: string | null
   clans: ClanConfig[]
 }
+
+/** Which of the two screens to render — set by whichever Discord button fired LAUNCH_ACTIVITY
+ * (CACHE.pending_cwl_activity_screen), read once via GET /api/cwl/screen. See
+ * CWL_ROSTER_PLANNING_PLAN.md's "Manage Enrollment" architectural decision for why this exists
+ * instead of routing by fetched event status. */
+export type ScreenPayload = {
+  screen: 'clan_config' | 'enrollment'
+}
+
+/** Matches qapbot/web_bridge.py's GET /api/cwl/enrollment payload shape exactly. */
+export type EnrollmentClan = {
+  clan_tag: string
+  name: string | null
+  tier: string | null
+}
+
+/** `signup_status` is null when the player is a current clan member who hasn't signed up (or
+ * responded to anything) at all yet — still shown on the board, ready for a 1-click Confirm.
+ * `assigned_clan_tag` is null for "Unassigned" — the `cwl_assignments` table has no row for
+ * this player, never a nullable value on that row itself (see the plan doc's data model note). */
+export type EnrollmentPlayer = {
+  player_tag: string
+  player_name: string | null
+  discord_id: string | null
+  signup_status: 'pending' | 'confirmed' | 'declined' | 'withdrawn' | null
+  assigned_clan_tag: string | null
+}
+
+export type EnrollmentPayload = {
+  season: string
+  event_status: string | null
+  clans: EnrollmentClan[]
+  players: EnrollmentPlayer[]
+}

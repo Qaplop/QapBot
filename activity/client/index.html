@@ -62,6 +62,62 @@
       .save-status { font-size: 0.85rem; color: #949ba4; }
       .save-status.success { color: #23a55a; }
       .save-status.error { color: #f23f42; }
+
+      .board { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px; }
+      .column {
+        flex: 0 0 220px;
+        background: #2b2d31;
+        border: 1px solid #3f4147;
+        border-radius: 6px;
+        display: flex;
+        flex-direction: column;
+        max-height: 70vh;
+      }
+      .column.column-unassigned { border-color: #4a4d54; }
+      .column.drop-target { border-color: #5865f2; background: #32354b; }
+      .column-header {
+        padding: 8px 10px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: #949ba4;
+        text-transform: uppercase;
+        letter-spacing: 0.02em;
+        border-bottom: 1px solid #3f4147;
+      }
+      .card-list { padding: 8px; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+      .player-card {
+        background: #1e1f22;
+        border: 1px solid #3f4147;
+        border-radius: 4px;
+        padding: 8px;
+        cursor: grab;
+      }
+      .player-card.dragging { opacity: 0.4; }
+      .player-name { font-size: 0.85rem; margin-bottom: 6px; }
+      .signup-badge {
+        display: inline-block;
+        font-size: 0.7rem;
+        padding: 2px 6px;
+        border-radius: 3px;
+        background: #3f4147;
+        color: #949ba4;
+        margin-bottom: 6px;
+      }
+      .signup-badge.signup-confirmed { background: #1c3a2a; color: #23a55a; }
+      .signup-badge.signup-pending { background: #3a3620; color: #e3b341; }
+      .signup-badge.signup-declined, .signup-badge.signup-withdrawn { background: #3a2226; color: #f23f42; }
+      .signup-toggle {
+        display: block;
+        width: 100%;
+        background: #3f4147;
+        color: #f2f3f5;
+        border: none;
+        border-radius: 4px;
+        padding: 5px 8px;
+        font-size: 0.75rem;
+        cursor: pointer;
+      }
+      .signup-toggle:hover { background: #4a4d54; }
     </style>
   </head>
   <body>

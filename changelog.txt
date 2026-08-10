@@ -1,6 +1,18 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (14)
+- Added (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", slice 4 of 5 — frontend board): new
+  `activity/client/src/enrollmentBoard.ts` renders the "Manage Assignment" screen — participating
+  clans as drag-and-drop columns plus an "Unassigned" pool, each player a card with a 1-click
+  Confirm/Withdraw signup toggle. Unlike the existing clan-config table's batched Save/Cancel,
+  every action here calls the bridge immediately with an optimistic UI update that reverts on
+  failure — there's no separate Save step. `main.ts` now fetches `GET /api/cwl/screen` first and
+  branches to either this board or the existing clan-config table based on the result. New types
+  in `types.ts`, board CSS appended to `index.html`'s existing style block (same Discord-dark
+  palette, no new stylesheet). `npm run typecheck`/`npm run build` both clean; no live
+  click-through yet since no Discord button reaches this screen until slice 5.
+
 2026-08-10 (13)
 - Added (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", slice 3 of 5 — bridge + Worker
   endpoints): four new `qapbot/web_bridge.py` routes backing the upcoming enrollment board —
