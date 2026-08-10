@@ -109,12 +109,15 @@ export function renderClanConfigTable(
 
   // CWL itself never starts before the 1st of the season's month at 08:00 UTC (the game's
   // static schedule) — clamp every row's picker to that floor so an admin can't accidentally
-  // schedule a clan's switch-over before CWL has even begun.
+  // schedule a clan's switch-over before CWL has even begun. The ceiling (+48h) exists because
+  // a clan switching in later than that would miss too much of the war league to make sense —
+  // both bounds are enforced identically (native min/max plus JS re-validation on every change).
   const seasonStartUtc = `${payload.season}-01T08:00Z`
+  const seasonEndUtc = `${new Date(new Date(seasonStartUtc).getTime() + 48 * 60 * 60 * 1000).toISOString().slice(0, 16)}Z`
 
   const tbody = document.createElement('tbody')
   for (const clan of working) {
-    tbody.appendChild(buildRow(clan, seasonStartUtc))
+    tbody.appendChild(buildRow(clan, seasonStartUtc, seasonEndUtc))
   }
   table.appendChild(tbody)
   container.appendChild(table)
@@ -158,10 +161,12 @@ export function renderClanConfigTable(
   container.appendChild(footer)
 }
 
-function buildRow(clan: ClanConfig, seasonStartUtc: string): HTMLTableRowElement {
+function buildRow(clan: ClanConfig, seasonStartUtc: string, seasonEndUtc: string): HTMLTableRowElement {
   const row = document.createElement('tr')
   const seasonStartMs = new Date(seasonStartUtc).getTime()
+  const seasonEndMs = new Date(seasonEndUtc).getTime()
   const seasonStartLocal = utcStringToLocalParts(seasonStartUtc)
+  const seasonEndLocal = utcStringToLocalParts(seasonEndUtc)
 
   const checkboxCell = document.createElement('td')
   const checkbox = document.createElement('input')
@@ -196,6 +201,9 @@ function buildRow(clan: ClanConfig, seasonStartUtc: string): HTMLTableRowElement
   // re-checks and clamps on every change regardless of how the value got there.
   if (seasonStartLocal) {
     dateInput.min = seasonStartLocal.date
+  }
+  if (seasonEndLocal) {
+    dateInput.max = seasonEndLocal.date
   }
 
   const timeSelect = document.createElement('select')
@@ -232,13 +240,22 @@ function buildRow(clan: ClanConfig, seasonStartUtc: string): HTMLTableRowElement
       return
     }
     const candidateUtc = localPartsToUtcString(dateInput.value, timeSelect.value)
+    const candidateMs = new Date(candidateUtc).getTime()
     // CWL never starts before the season's official 1st-of-month 08:00 UTC — clamp instead of
     // silently persisting an earlier value (the native `min` above stops most attempts, but
     // typed-in dates and the boundary day's earlier time-of-day options need this too).
-    if (new Date(candidateUtc).getTime() < seasonStartMs && seasonStartLocal) {
+    if (candidateMs < seasonStartMs && seasonStartLocal) {
       dateInput.value = seasonStartLocal.date
       timeSelect.value = seasonStartLocal.time
       clan.cwl_start_at = seasonStartUtc
+      return
+    }
+    // A clan can't switch in more than 48h after the official start either — same clamp,
+    // same reasoning, just the ceiling instead of the floor.
+    if (candidateMs > seasonEndMs && seasonEndLocal) {
+      dateInput.value = seasonEndLocal.date
+      timeSelect.value = seasonEndLocal.time
+      clan.cwl_start_at = seasonEndUtc
       return
     }
     clan.cwl_start_at = candidateUtc
