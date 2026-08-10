@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (15)
+- Added (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", slice 5 of 5 — button consolidation):
+  the CWL Management screen's row-3 slot that used to hold a fixed "Start Enrollment" button
+  plus a permanently-disabled "Manage Assignments" placeholder (dead since Phase 1) is now one
+  dynamically-labeled button — "Start Enrollment" while the event is `draft`/nonexistent
+  (unchanged behavior), "Manage Assignment" once `signup_open` or later, opening the new
+  drag-and-drop board via the same `LAUNCH_ACTIVITY` mechanism "Configure Participating Clans"
+  already used, gated by the admin-or-leader permission tier (slice 2) instead of admin-only.
+  Both launch buttons now record which screen was requested (`CACHE.pending_cwl_activity_screen`)
+  immediately before launching, so the Activity's first fetch renders the right one — and
+  "Configure Participating Clans" stays reachable at any event status, letting clans change
+  plans mid-enrollment as required. New i18n keys `button_manage_assignment`/
+  `open_enrollment_fallback` (en/de); the dead `button_manage_assignments` placeholder text
+  removed. **This completes all 5 slices of "Manage Enrollment"** — a live DEV click-through
+  (per the plan doc's end-to-end checklist) is still outstanding before calling the feature
+  fully verified. 4 new/updated tests in `tests/discord/test_ui_cwl_roster.py`; 1752 total tests
+  pass.
+
 2026-08-10 (14)
 - Added (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", slice 4 of 5 — frontend board): new
   `activity/client/src/enrollmentBoard.ts` renders the "Manage Assignment" screen — participating

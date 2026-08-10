@@ -158,9 +158,10 @@ def test_clan_management_view_cwl_management_mode_constructs_without_row_conflic
         sent_message=sent_message, mode="cwl_management", timeout=300,
     )
 
-    # mode select + refresh + configure(web)/start(disabled)/manage(disabled)/delete/add_season
+    # mode select + refresh + configure(web)/start(disabled)/delete/add_season — the row-3 slot
+    # is a single dynamically-labeled start/manage button now (slice 5), not two side by side.
     # (no season select: CACHE.db_manager is None here, so there are no events to list)
-    assert len(view.children) == 7
+    assert len(view.children) == 6
 
 
 @pytest.mark.discord
@@ -641,10 +642,13 @@ async def test_cwl_delete_season_confirm_view_cancel_does_not_delete(db, mock_in
 @pytest.mark.discord
 @pytest.mark.asyncio
 async def test_cwl_management_open_web_callback_sends_launch_activity(mock_interaction):
+    from qapbot.cache_manager import CACHE
     from qapbot.ui_cwl_roster import _make_cwl_management_open_web_callback
 
     mock_interaction.id = 123456789
     mock_interaction.token = "test-token"
+    mock_interaction.guild.id = 111222
+    mock_interaction.user.id = 333444
     callback = _make_cwl_management_open_web_callback(MagicMock())
 
     await callback(mock_interaction)
@@ -655,6 +659,9 @@ async def test_cwl_management_open_web_callback_sends_launch_activity(mock_inter
     assert route.method == "POST"
     assert route.url == "https://discord.com/api/v10/interactions/123456789/test-token/callback"
     assert kwargs["json"] == {"type": 12, "data": {}}  # 12 = LAUNCH_ACTIVITY
+    # Recorded *before* the LAUNCH_ACTIVITY call so the Activity's first fetch (GET
+    # /api/cwl/screen) sees it regardless of how quickly the client races that request.
+    assert CACHE.pending_cwl_activity_screen[("111222", "333444")] == "clan_config"
 
 
 @pytest.mark.discord
@@ -673,6 +680,50 @@ async def test_cwl_management_open_web_callback_falls_back_if_launch_activity_re
     await callback(mock_interaction)
 
     mock_interaction.response.send_message.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# "Manage Assignment" — same LAUNCH_ACTIVITY mechanism, "enrollment" screen (slice 5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_management_open_enrollment_web_callback_sends_launch_activity(mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import _make_cwl_management_open_enrollment_web_callback
+
+    mock_interaction.id = 987654321
+    mock_interaction.token = "test-token-2"
+    mock_interaction.guild.id = 555666
+    mock_interaction.user.id = 777888
+    callback = _make_cwl_management_open_enrollment_web_callback(MagicMock())
+
+    await callback(mock_interaction)
+
+    mock_interaction.client.http.request.assert_awaited_once()
+    args, kwargs = mock_interaction.client.http.request.await_args
+    route = args[0]
+    assert route.method == "POST"
+    assert route.url == "https://discord.com/api/v10/interactions/987654321/test-token-2/callback"
+    assert kwargs["json"] == {"type": 12, "data": {}}  # 12 = LAUNCH_ACTIVITY
+    assert CACHE.pending_cwl_activity_screen[("555666", "777888")] == "enrollment"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_management_open_enrollment_web_callback_falls_back_if_launch_activity_rejected(mock_interaction):
+    from qapbot.ui_cwl_roster import _make_cwl_management_open_enrollment_web_callback
+
+    mock_interaction.client.http.request = AsyncMock(side_effect=RuntimeError("boom"))
+    mock_interaction.response.is_done = MagicMock(return_value=False)
+    mock_interaction.response.send_message = AsyncMock()
+
+    callback = _make_cwl_management_open_enrollment_web_callback(MagicMock())
+    await callback(mock_interaction)
+
+    mock_interaction.response.send_message.assert_awaited_once()
+    args, _ = mock_interaction.response.send_message.call_args
+    assert "enrollment" in args[0].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -926,7 +977,11 @@ async def test_start_enrollment_button_disabled_without_participating_clans(db):
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_start_enrollment_button_disabled_once_already_started(db):
+async def test_start_enrollment_button_replaced_by_manage_assignment_once_signup_open(db):
+    """Once enrollment has started, the row-3 slot flips to a single dynamically-labeled
+    "Manage Assignment" button (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment" slice 5) — the
+    old "Start Enrollment" custom_id no longer exists at all, rather than sticking around
+    disabled."""
     from qapbot.cache_manager import CACHE
     from qapbot.ui_cwl_roster import add_cwl_management_components
 
@@ -940,7 +995,10 @@ async def test_start_enrollment_button_disabled_once_already_started(db):
     view = discord.ui.View(timeout=300)
     add_cwl_management_components(view, 9003)
 
-    assert _start_button(view).disabled is True  # type: ignore[union-attr]
+    assert not any(getattr(c, "custom_id", None) == "cwl_management_start_enrollment" for c in view.children)
+    manage_button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_manage_assignment")
+    assert manage_button.disabled is False  # type: ignore[union-attr]
+    assert manage_button.callback is not None  # type: ignore[union-attr]
 
 
 @pytest.mark.discord

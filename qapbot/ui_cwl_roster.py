@@ -281,29 +281,32 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     configure_button.callback = _make_cwl_management_open_web_callback(view)  # type: ignore[assignment]
     view.add_item(configure_button)  # type: ignore[arg-type]
 
-    # Start Enrollment (Phase 2): real gating now — draft status and at least one participating
-    # clan, mirroring the defensive re-check start_cwl_enrollment() itself performs.
-    start_button = discord.ui.Button(
-        label=t('cwl.management.button_start_enrollment', guild_id=guild_id),
-        style=discord.ButtonStyle.success,
-        custom_id="cwl_management_start_enrollment",
-        row=3,
-        disabled=(event is None or event["status"] != "draft" or not participating_clans),
-    )
-    start_button.callback = _make_cwl_management_start_enrollment_callback(view)  # type: ignore[assignment]
+    # Start Enrollment / Manage Assignment — one dynamically-labeled button in the same row-3
+    # slot ("Manage Enrollment", 2026-08-10): "Start Enrollment" while the event is still draft
+    # (unchanged Phase 2 gating/callback), "Manage Assignment" once signup_open or later — opens
+    # the same web Activity mechanism as "Configure Participating Clans" below, just recording a
+    # different pending screen (see the plan doc's architectural decision for why screen
+    # selection goes through CACHE.pending_cwl_activity_screen rather than routing by event
+    # status). Never disabled once reached — an event only reaches signup_open with clans
+    # already configured.
+    if event is None or event["status"] == "draft":
+        start_button = discord.ui.Button(
+            label=t('cwl.management.button_start_enrollment', guild_id=guild_id),
+            style=discord.ButtonStyle.success,
+            custom_id="cwl_management_start_enrollment",
+            row=3,
+            disabled=(event is None or not participating_clans),
+        )
+        start_button.callback = _make_cwl_management_start_enrollment_callback(view)  # type: ignore[assignment]
+    else:
+        start_button = discord.ui.Button(
+            label=t('cwl.management.button_manage_assignment', guild_id=guild_id),
+            style=discord.ButtonStyle.success,
+            custom_id="cwl_management_manage_assignment",
+            row=3,
+        )
+        start_button.callback = _make_cwl_management_open_enrollment_web_callback(view)  # type: ignore[assignment]
     view.add_item(start_button)  # type: ignore[arg-type]
-
-    # Still gated until its backing handler ships (Phase 4) — a click with no phased backing
-    # would be a dead end for dev testers. Real gating condition replaces this hardcoded disable
-    # once that phase lands.
-    manage_button = discord.ui.Button(
-        label=t('cwl.management.button_manage_assignments', guild_id=guild_id),
-        style=discord.ButtonStyle.secondary,
-        custom_id="cwl_management_manage_assignments",
-        row=3,
-        disabled=True,
-    )
-    view.add_item(manage_button)  # type: ignore[arg-type]
 
     # Mainly for testing/starting over — not gated behind a later phase like the two buttons
     # above, so it's only disabled when there's genuinely nothing to delete.
@@ -534,6 +537,9 @@ def _make_cwl_management_open_web_callback(view: discord.ui.View):
     async def callback(interaction: discord.Interaction) -> None:
         if not await _check_cwl_admin_permission(interaction):
             return
+        guild_id = interaction.guild.id if interaction.guild else None
+        if guild_id is not None:
+            CACHE.pending_cwl_activity_screen[(str(guild_id), str(interaction.user.id))] = "clan_config"
         from discord.http import Route
 
         try:
@@ -550,10 +556,48 @@ def _make_cwl_management_open_web_callback(view: discord.ui.View):
             logging.warning(f"[CWL] LAUNCH_ACTIVITY callback failed, falling back to a text hint: {e}")
             if not interaction.response.is_done():
                 from qapbot.i18n import t
-                guild_id = interaction.guild.id if interaction.guild else None
                 try:
                     await interaction.response.send_message(
                         t('cwl.management.open_web_fallback', guild_id=guild_id),
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+
+    return callback
+
+
+def _make_cwl_management_open_enrollment_web_callback(view: discord.ui.View):
+    """Same LAUNCH_ACTIVITY mechanism as _make_cwl_management_open_web_callback above, but
+    records "enrollment" as the pending screen (CACHE.pending_cwl_activity_screen) before
+    launching, and is gated by the admin-or-leader permission tier rather than admin-only —
+    this is the "Manage Assignment" button's callback (CWL_ROSTER_PLANNING_PLAN.md "Manage
+    Enrollment" slice 5)."""
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_or_leader_permission(interaction):
+            return
+        guild_id = interaction.guild.id if interaction.guild else None
+        if guild_id is not None:
+            CACHE.pending_cwl_activity_screen[(str(guild_id), str(interaction.user.id))] = "enrollment"
+        from discord.http import Route
+
+        try:
+            await interaction.client.http.request(
+                Route(
+                    "POST",
+                    "/interactions/{interaction_id}/{interaction_token}/callback",
+                    interaction_id=interaction.id,
+                    interaction_token=interaction.token,
+                ),
+                json={"type": 12, "data": {}},  # 12 = LAUNCH_ACTIVITY
+            )
+        except Exception as e:
+            logging.warning(f"[CWL] LAUNCH_ACTIVITY callback failed, falling back to a text hint: {e}")
+            if not interaction.response.is_done():
+                from qapbot.i18n import t
+                try:
+                    await interaction.response.send_message(
+                        t('cwl.management.open_enrollment_fallback', guild_id=guild_id),
                         ephemeral=True,
                     )
                 except Exception:
