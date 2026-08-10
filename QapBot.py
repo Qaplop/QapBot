@@ -2748,6 +2748,15 @@ async def _setup_hook():
     QBcore.bot.add_view(CwlManagementHubView())
     logging.info("[SETUP_HOOK] Registered persistent CwlManagementHubView for restart-surviving buttons")
 
+    # CWL template-copy DM confirm/opt-out buttons (CWL_ROSTER_PLANNING_PLAN.md Phase 2) — a
+    # DynamicItem, not add_view(): the custom_id itself carries the per-DM state (action/
+    # event_id/player_tag), so a bot restart between sending the DM and a member clicking it
+    # still resolves correctly instead of leaving a dead button until the next repost cycle
+    # (there is no repost cycle for a DM anyway, unlike the anchored messages above).
+    from qapbot.ui_cwl_roster import CwlSignupResponseButton
+    QBcore.bot.add_dynamic_items(CwlSignupResponseButton)
+    logging.info("[SETUP_HOOK] Registered persistent CwlSignupResponseButton dynamic item for restart-surviving DM buttons")
+
     # CWL clan-config web bridge (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase B) — no-ops unless
     # WEB_BRIDGE_PORT/WEB_BRIDGE_SECRET are both configured, so this is a no-op for any
     # deployment that hasn't opted into the Discord Activity feature.

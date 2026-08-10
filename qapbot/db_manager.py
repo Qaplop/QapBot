@@ -2709,6 +2709,24 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] get_cwl_event_sync failed for guild {guild_id} season {cwl_season}: {e}")
                 return None
 
+    def get_cwl_event_by_id_sync(self, event_id: int) -> Optional[Dict[str, Any]]:
+        """Return a cwl_events row by its own id, or None. Needed wherever only the id is known
+        (e.g. a DynamicItem DM button's custom_id embeds event_id, not guild_id/cwl_season)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT * FROM cwl_events WHERE id = ?", (event_id,)
+                ).fetchone()
+                return dict(row) if row is not None else None
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_event_by_id_sync failed for event {event_id}: {e}")
+                return None
+
     def list_cwl_events_sync(self, guild_id: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
         """Return this guild's cwl_events rows, newest season first, optionally filtered by status."""
         import sqlite3

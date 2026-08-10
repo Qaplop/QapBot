@@ -787,10 +787,28 @@
       "add_season_failed": "⚠️ Could not create the new season. Please try again.",
       "add_season_carry_over_prompt": "No CWL event exists yet for **{season}**. Carry over the previous season's participating clans and their settings, or start fresh with defaults?",
       "add_season_carry_over_yes": "Yes, carry over",
-      "add_season_carry_over_no": "No, start fresh"
+      "add_season_carry_over_no": "No, start fresh",
+      "button_confirm_start_enrollment": "Yes, Start Enrollment",
+      "start_enrollment_confirm_body": "⚠️ Start enrollment for season **{season}**? This copies last season's roster as a template and sends every resolved member a confirm/opt-out DM. This cannot be undone.",
+      "start_enrollment_summary": "✅ Enrollment started.\nSeeded: {seeded}\nContacted: {contacted}\nSkipped (opted out): {skipped_optout}\nSkipped (no linked account): {skipped_unlinked}\nSkipped (DEV-mode guard): {skipped_dev_guard}",
+      "start_enrollment_error_no_database": "⚠️ Database not ready — try again shortly.",
+      "start_enrollment_error_no_event": "⚠️ No CWL event found for this season anymore — it may have been deleted.",
+      "start_enrollment_error_not_draft": "⚠️ Enrollment has already been started for this season.",
+      "start_enrollment_error_no_clans": "⚠️ Add at least one participating clan before starting enrollment."
     },
     "setup": {
       "button_cancel": "Cancel"
+    },
+    "template": {
+      "confirm_button": "Confirm",
+      "optout_button": "Opt Out",
+      "dm_body": "You were on last season's CWL roster. Are you playing again this season, **{player_name}**? Tap Confirm to join the roster pool, or Opt Out to sit this one out.",
+      "confirmed_msg": "✅ Thanks — you're confirmed for this season's CWL roster pool.",
+      "declined_msg": "👍 Got it — you've opted out of this season's CWL roster pool.",
+      "no_longer_valid": "⚠️ This sign-up is no longer valid (the season may have been deleted).",
+      "not_your_signup": "⚠️ This sign-up belongs to a different account.",
+      "signup_closed": "⚠️ Sign-up isn't open for this season anymore.",
+      "db_unavailable": "⚠️ Database not ready — try again shortly."
     }
   }
 }

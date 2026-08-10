@@ -786,10 +786,28 @@
       "add_season_failed": "⚠️ Die neue Saison konnte nicht erstellt werden. Bitte versuche es erneut.",
       "add_season_carry_over_prompt": "Für **{season}** existiert noch kein CWL-Event. Sollen die teilnehmenden Clans und Einstellungen der letzten Saison übernommen werden, oder mit Standardwerten neu gestartet werden?",
       "add_season_carry_over_yes": "Ja, übernehmen",
-      "add_season_carry_over_no": "Nein, neu starten"
+      "add_season_carry_over_no": "Nein, neu starten",
+      "button_confirm_start_enrollment": "Ja, Anmeldephase starten",
+      "start_enrollment_confirm_body": "⚠️ Anmeldephase für Saison **{season}** starten? Dabei wird der Kader der letzten Saison als Vorlage übernommen und jedem zuordenbaren Mitglied eine Bestätigen/Absagen-DM gesendet. Dies kann nicht rückgängig gemacht werden.",
+      "start_enrollment_summary": "✅ Anmeldephase gestartet.\nAngelegt: {seeded}\nKontaktiert: {contacted}\nÜbersprungen (abgemeldet): {skipped_optout}\nÜbersprungen (kein verknüpfter Account): {skipped_unlinked}\nÜbersprungen (DEV-Modus-Schutz): {skipped_dev_guard}",
+      "start_enrollment_error_no_database": "⚠️ Datenbank nicht bereit — bitte gleich erneut versuchen.",
+      "start_enrollment_error_no_event": "⚠️ Für diese Saison wurde kein CWL-Event mehr gefunden — es wurde möglicherweise gelöscht.",
+      "start_enrollment_error_not_draft": "⚠️ Die Anmeldephase für diese Saison wurde bereits gestartet.",
+      "start_enrollment_error_no_clans": "⚠️ Füge mindestens einen teilnehmenden Clan hinzu, bevor die Anmeldephase gestartet wird."
     },
     "setup": {
       "button_cancel": "Abbrechen"
+    },
+    "template": {
+      "confirm_button": "Bestätigen",
+      "optout_button": "Abmelden",
+      "dm_body": "Du warst letzte Saison im CWL-Kader. Spielst du diese Saison wieder mit, **{player_name}**? Tippe auf Bestätigen, um dem Kader-Pool beizutreten, oder auf Abmelden, um diese Saison auszusetzen.",
+      "confirmed_msg": "✅ Danke — du bist für den CWL-Kader-Pool dieser Saison bestätigt.",
+      "declined_msg": "👍 Verstanden — du hast dich für den CWL-Kader-Pool dieser Saison abgemeldet.",
+      "no_longer_valid": "⚠️ Diese Anmeldung ist nicht mehr gültig (die Saison wurde möglicherweise gelöscht).",
+      "not_your_signup": "⚠️ Diese Anmeldung gehört zu einem anderen Account.",
+      "signup_closed": "⚠️ Die Anmeldung ist für diese Saison nicht mehr offen.",
+      "db_unavailable": "⚠️ Datenbank nicht bereit — bitte gleich erneut versuchen."
     }
   }
 }

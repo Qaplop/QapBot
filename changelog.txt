@@ -1,6 +1,22 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (3)
+- Added (CWL_ROSTER_PLANNING_PLAN.md Phase 2, slice 2 of 4 — DM confirm/opt-out buttons +
+  "Start Enrollment"): the "Start Enrollment" button on the CWL Management screen is now real
+  (was a hardcoded-disabled placeholder) — behind a Yes/No confirmation, it copies last season's
+  roster into `cwl_signups`, DMs every resolved account a Confirm/Opt Out button pair, and moves
+  the event from draft to sign-up-open. The DM buttons use discord.py's `DynamicItem` (a new
+  pattern for this codebase) so they keep working across a bot restart between send and click.
+  Also added the DEV-mode DM safety guard recorded in the plan doc yesterday: while running in
+  DEV, the blast only ever actually reaches the project owner's own Discord account — everyone
+  else is skipped and counted, so the whole flow can be tested live without risking real clan
+  members getting DMed mid-development. PROD is unaffected. `cache_manager.send_user_dm()`
+  gained optional `view`/`embed` kwargs to support this. 25 new tests across
+  `tests/integration/test_cwl_start_enrollment.py` and `tests/discord/test_ui_cwl_roster.py`.
+  Nothing else on the CWL Management screen changed — "Manage Assignments" stays disabled
+  pending Phase 4, and the Personal CWL Hub / `/cwl signup` land in slices 3-4.
+
 2026-08-10 (2)
 - Added (CWL_ROSTER_PLANNING_PLAN.md Phase 2, slice 1 of 4 — data layer): sync CRUD for
   `cwl_signups` (`bulk_create_cwl_signups_sync` for the template-copy seed, `upsert_cwl_signup_sync`

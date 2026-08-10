@@ -1271,35 +1271,43 @@ class CacheManager:
             logging.error(f"Failed to fetch user {user_id} for DM: {e}", exc_info=True)
             return None
 
-    async def send_user_dm(self, user_id: str, message: str) -> bool:
+    async def send_user_dm(
+        self,
+        user_id: str,
+        message: str,
+        view: Optional['discord.ui.View'] = None,
+        embed: Optional['discord.Embed'] = None,
+    ) -> bool:
         """
         Send DM to user, handling fetch and metadata update internally.
-        
+
         Centralizes DM sending with automatic user fetching and metadata updates.
         Handles common exceptions (Forbidden, NotFound) gracefully.
-        
+
         Args:
             user_id: Discord user ID (string or int)
             message: Message text to send
-        
+            view: Optional interactive view to attach (e.g. CWL confirm/opt-out buttons)
+            embed: Optional embed to attach
+
         Returns:
             True if sent successfully, False otherwise
-        
+
         Example:
             success = await CACHE.send_user_dm(str(user_id), "War reminder!")
             if not success:
                 logging.warning(f"Could not DM user {user_id}")
         """
         import discord
-        
+
         try:
             user = await self.get_user_for_dm(user_id)
             if not user:
                 return False
-            
-            await user.send(message)
+
+            await user.send(message, view=view, embed=embed)
             return True
-            
+
         except discord.Forbidden:
             logging.info(f"Cannot send DM to user {user_id}: DMs disabled or bot blocked")
             return False

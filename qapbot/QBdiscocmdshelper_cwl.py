@@ -252,3 +252,124 @@ async def format_clan_management_cwl_management(
     )
 
     return embed, None, [], []
+
+
+def _resolve_template_season_for_event(current_season: str) -> Optional[str]:
+    """The season Start Enrollment copies as a template: the calendar month immediately before
+    current_season ("YYYY-MM"). CWL is played every month regardless of whether a cwl_events
+    planning row exists for it — war_summary/war_attacks are populated by the bot's regular war-
+    tracking cycle, independent of this feature — so "last calendar month" is the right template
+    source, not "this guild's most recent prior cwl_events row" (which could be many months
+    stale, or simply never used the bot for planning before)."""
+    try:
+        year_str, month_str = current_season.split("-")
+        year, month = int(year_str), int(month_str)
+    except (ValueError, AttributeError):
+        return None
+    if month == 1:
+        return f"{year - 1}-12"
+    return f"{year}-{month - 1:02d}"
+
+
+async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
+    """The single "Start Enrollment" admin action (CWL_ROSTER_PLANNING_PLAN.md Phase 2): seeds
+    cwl_signups from last season's roster, sends the confirm/opt-out DM blast to every resolved
+    account, and transitions the event draft -> signup_open. Re-fetches the event fresh by
+    guild_id+season rather than trusting a caller-held event dict/id, matching the re-read
+    discipline used everywhere else in this feature for actions gated behind a confirmation step.
+
+    Returns a summary dict the caller renders back to the admin: ok, error (reason string if not
+    ok), seeded (signup rows created), contacted (DMs actually sent), skipped_optout,
+    skipped_unlinked, skipped_dev_guard.
+
+    DEV-mode safety (operational directive, CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10): while
+    CONFIG.is_dev_mode is True, only CONFIG.server_admin's own Discord account is actually
+    DMed — every other resolved recipient is counted in skipped_dev_guard instead of contacted.
+    This lets the whole flow be exercised live in DEV without risking a DM blast to real clan
+    members while the feature is still being built. PROD (CONFIG.is_dev_mode is False) is
+    unaffected — the guard never activates there.
+    """
+    from qapbot.config import CONFIG
+
+    summary: Dict[str, Any] = {
+        "ok": False, "error": None, "seeded": 0, "contacted": 0,
+        "skipped_optout": 0, "skipped_unlinked": 0, "skipped_dev_guard": 0,
+    }
+
+    db = CACHE.db_manager
+    if db is None:
+        summary["error"] = "no_database"
+        return summary
+
+    guild_id_str = str(guild_id)
+    event = db.get_cwl_event_sync(guild_id_str, season)
+    if event is None:
+        summary["error"] = "no_event"
+        return summary
+    if event["status"] != "draft":
+        summary["error"] = "not_draft"
+        return summary
+
+    all_clans = db.get_cwl_event_clans_sync(event["id"])
+    participating_clan_tags = [c["clan_tag"] for c in all_clans if c.get("participating", 1)]
+    if not participating_clan_tags:
+        summary["error"] = "no_clans"
+        return summary
+
+    template_season = _resolve_template_season_for_event(event["cwl_season"])
+    participants = (
+        db.get_previous_cwl_participants_sync(participating_clan_tags, template_season)
+        if template_season else []
+    )
+
+    signups_to_create: List[Dict[str, Any]] = []
+    dm_targets: List[Dict[str, Any]] = []
+    for participant in participants:
+        if participant["cwl_permanent_optout"]:
+            summary["skipped_optout"] += 1
+            continue
+        signups_to_create.append({
+            "player_tag": participant["player_tag"],
+            "player_name": participant["player_name"],
+            "discord_id": participant["discord_id"],
+            "preferred_league_rank": participant["preferred_league_rank"],
+            "source": "template_confirm",
+            "status": "pending",
+        })
+        if participant["discord_id"]:
+            dm_targets.append(participant)
+        else:
+            summary["skipped_unlinked"] += 1
+
+    if signups_to_create:
+        db.bulk_create_cwl_signups_sync(event["id"], signups_to_create)
+        summary["seeded"] = len(signups_to_create)
+
+    for participant in dm_targets:
+        if CONFIG.is_dev_mode and str(participant["discord_id"]) != CONFIG.server_admin:
+            summary["skipped_dev_guard"] += 1
+            continue
+        sent = await _send_cwl_signup_template_dm(event["id"], guild_id, participant)
+        if sent:
+            summary["contacted"] += 1
+
+    db.update_cwl_event_status_sync(event["id"], "signup_open")
+    summary["ok"] = True
+    return summary
+
+
+async def _send_cwl_signup_template_dm(event_id: int, guild_id: int, participant: Dict[str, Any]) -> bool:
+    """Send one template-copy confirm/opt-out DM. Kept as its own function so start_cwl_enrollment
+    stays readable — this is the only place that builds the DM's content+view pair."""
+    from qapbot.i18n import t
+    from qapbot.ui_cwl_roster import build_cwl_signup_response_view
+
+    discord_id = participant["discord_id"]
+    message = t(
+        'cwl.template.dm_body',
+        guild_id=guild_id,
+        user_id=discord_id,
+        player_name=participant["player_name"] or participant["player_tag"],
+    )
+    view = build_cwl_signup_response_view(event_id, participant["player_tag"])
+    return await CACHE.send_user_dm(str(discord_id), message, view=view)

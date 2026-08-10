@@ -13,6 +13,7 @@ render identically regardless of which shell opened them.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import discord
@@ -234,6 +235,11 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     db = CACHE.db_manager
     season = resolve_selected_cwl_season(guild_id)
     event = db.get_cwl_event_sync(str(guild_id), season) if db is not None else None
+    participating_clans = (
+        [c for c in db.get_cwl_event_clans_sync(event["id"]) if c.get("participating", 1)]
+        if event is not None and db is not None
+        else []
+    )
 
     # Season select (Phase E.3) — row 1, directly below row 0 (reserved by both possible shells:
     # ClanManagementView's refresh button, CwlManagementHubView's Settings/Season Management
@@ -275,19 +281,21 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     configure_button.callback = _make_cwl_management_open_web_callback(view)  # type: ignore[assignment]
     view.add_item(configure_button)  # type: ignore[arg-type]
 
-    # Both gated buttons below are always present but disabled until their backing handler
-    # ships (Start Enrollment: Phase 2: Manage Assignments: Phase 4) — a click with no phased
-    # backing would be a dead end for dev testers. Real gating conditions replace these
-    # hardcoded disables once those phases land.
+    # Start Enrollment (Phase 2): real gating now — draft status and at least one participating
+    # clan, mirroring the defensive re-check start_cwl_enrollment() itself performs.
     start_button = discord.ui.Button(
         label=t('cwl.management.button_start_enrollment', guild_id=guild_id),
         style=discord.ButtonStyle.success,
         custom_id="cwl_management_start_enrollment",
         row=3,
-        disabled=True,
+        disabled=(event is None or event["status"] != "draft" or not participating_clans),
     )
+    start_button.callback = _make_cwl_management_start_enrollment_callback(view)  # type: ignore[assignment]
     view.add_item(start_button)  # type: ignore[arg-type]
 
+    # Still gated until its backing handler ships (Phase 4) — a click with no phased backing
+    # would be a dead end for dev testers. Real gating condition replaces this hardcoded disable
+    # once that phase lands.
     manage_button = discord.ui.Button(
         label=t('cwl.management.button_manage_assignments', guild_id=guild_id),
         style=discord.ButtonStyle.secondary,
@@ -323,8 +331,7 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     if event is not None:
         # Surfaced so an admin opening this screen can see at a glance whether every
         # participating clan already has a start time set (Finalize, Phase 4, will require it).
-        clans = db.get_cwl_event_clans_sync(event["id"]) if db is not None else []
-        missing_start = [c["clan_tag"] for c in clans if c.get("participating", 1) and not c.get("cwl_start_at")]
+        missing_start = [c["clan_tag"] for c in participating_clans if not c.get("cwl_start_at")]
         if missing_start:
             logging.debug(f"[CWL] guild {guild_id} event {event['id']}: {len(missing_start)} clan(s) missing a start time")
 
@@ -617,6 +624,215 @@ class CwlDeleteSeasonConfirmView(discord.ui.View):
             await interaction.delete_original_response()
         except discord.NotFound:
             pass
+
+
+# ---------------------------------------------------------------------------
+# cwl_management — Start Enrollment (Phase 2)
+# ---------------------------------------------------------------------------
+
+def _make_cwl_management_start_enrollment_callback(view: discord.ui.View):
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        if not interaction.guild:
+            return
+        from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+
+        db = CACHE.db_manager
+        season = resolve_selected_cwl_season(interaction.guild.id)
+        event = db.get_cwl_event_sync(str(interaction.guild.id), season) if db is not None else None
+        if event is None:
+            return
+        confirm_view = CwlStartEnrollmentConfirmView(
+            parent_view=view,
+            guild_id=interaction.guild.id,
+            season=event["cwl_season"],
+        )
+        await interaction.followup.send(
+            confirm_view._build_content(),  # type: ignore[attr-defined]
+            view=confirm_view,
+            ephemeral=True,
+        )
+
+    return callback
+
+
+class CwlStartEnrollmentConfirmView(discord.ui.View):
+    """Confirm/cancel dialog for Start Enrollment, mirroring CwlDeleteSeasonConfirmView — this
+    action sends real DMs to real members (the template-copy confirm/opt-out blast) and seeds
+    cwl_signups, so it's deliberately not a single-click action."""
+
+    def __init__(self, parent_view: discord.ui.View, guild_id: int, season: str, timeout: int = 60):
+        super().__init__(timeout=timeout)
+        self.parent_view = parent_view
+        self.guild_id = guild_id
+        self.season = season
+
+        from qapbot.i18n import t
+
+        confirm_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.management.button_confirm_start_enrollment', guild_id=guild_id),
+            style=discord.ButtonStyle.success,
+            custom_id="cwl_start_enrollment_confirm",
+        )
+        confirm_button.callback = self._on_confirm  # type: ignore[assignment]
+        self.add_item(confirm_button)
+
+        cancel_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.setup.button_cancel', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_start_enrollment_cancel",
+        )
+        cancel_button.callback = self._on_cancel  # type: ignore[assignment]
+        self.add_item(cancel_button)
+
+    def _build_content(self) -> str:
+        from qapbot.i18n import t
+
+        return t('cwl.management.start_enrollment_confirm_body', guild_id=self.guild_id, season=self.season)
+
+    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        from qapbot.i18n import t
+        from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+        summary = await start_cwl_enrollment(self.guild_id, self.season)
+        if not summary["ok"]:
+            content = t(f"cwl.management.start_enrollment_error_{summary['error']}", guild_id=self.guild_id)
+        else:
+            content = t(
+                'cwl.management.start_enrollment_summary',
+                guild_id=self.guild_id,
+                seeded=summary["seeded"],
+                contacted=summary["contacted"],
+                skipped_optout=summary["skipped_optout"],
+                skipped_unlinked=summary["skipped_unlinked"],
+                skipped_dev_guard=summary["skipped_dev_guard"],
+            )
+        try:
+            await interaction.edit_original_response(content=content, view=None)
+        except discord.NotFound:
+            pass
+        if summary["ok"]:
+            await _refresh_parent(self.parent_view, interaction, "cwl_management")
+
+    async def _on_cancel(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        try:
+            await interaction.delete_original_response()
+        except discord.NotFound:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Template-copy DM confirm/opt-out buttons (Phase 2) — DynamicItem, restart-safe
+# ---------------------------------------------------------------------------
+
+CWL_SIGNUP_RESPONSE_TEMPLATE = r'^cwl:signup:(?P<action>confirm|optout):(?P<event_id>\d+):(?P<player_tag>#[A-Z0-9]{1,15})$'
+
+
+def build_cwl_signup_response_view(event_id: int, player_tag: str, guild_id: Optional[int] = None) -> discord.ui.View:
+    """Build the confirm/opt-out button pair for one template-copy DM. timeout=None since these
+    must keep working for as long as the sign-up window is open, independent of any single bot
+    session — CwlSignupResponseButton is a DynamicItem precisely so a bot restart between send
+    and click doesn't silently break it (registered once via add_dynamic_items(), QapBot.py)."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(CwlSignupResponseButton("confirm", event_id, player_tag, guild_id))
+    view.add_item(CwlSignupResponseButton("optout", event_id, player_tag, guild_id))
+    return view
+
+
+class CwlSignupResponseButton(
+    discord.ui.DynamicItem[discord.ui.Button],  # type: ignore[type-arg]
+    template=CWL_SIGNUP_RESPONSE_TEMPLATE,
+):
+    """Restart-safe confirm/opt-out button for Phase 2's template-copy DM. custom_id embeds
+    action/event_id/player_tag so from_custom_id() can fully reconstruct this item's state on
+    every dispatch without a lookup table — the guild_id used only for label localization at
+    initial-send time is deliberately NOT part of the custom_id (keeps it short, and it's
+    resolvable from event_id via get_cwl_event_by_id_sync() if ever needed on click)."""
+
+    def __init__(self, action: str, event_id: int, player_tag: str, guild_id: Optional[int] = None):
+        self.action = action
+        self.event_id = event_id
+        self.player_tag = player_tag
+
+        from qapbot.i18n import t
+
+        label_key = 'cwl.template.confirm_button' if action == "confirm" else 'cwl.template.optout_button'
+        style = discord.ButtonStyle.success if action == "confirm" else discord.ButtonStyle.secondary
+        super().__init__(
+            discord.ui.Button(
+                label=t(label_key, guild_id=guild_id),
+                style=style,
+                custom_id=f"cwl:signup:{action}:{event_id}:{player_tag}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls, interaction: discord.Interaction, item: discord.ui.Item[Any], match: 're.Match[str]', /
+    ) -> 'CwlSignupResponseButton':
+        return cls(action=match["action"], event_id=int(match["event_id"]), player_tag=match["player_tag"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        from qapbot.i18n import t
+
+        db = CACHE.db_manager
+        user_id_str = str(interaction.user.id)
+        if db is None:
+            await interaction.response.send_message(
+                t('cwl.template.db_unavailable', user_id=user_id_str), ephemeral=True
+            )
+            return
+
+        # Never trust the reconstructed item's own state beyond routing (action/event_id/
+        # player_tag) — always re-read cwl_signups/cwl_events live, since the event may have
+        # moved to finalized/cancelled (or this row may no longer exist) since the DM was sent.
+        event = db.get_cwl_event_by_id_sync(self.event_id)
+        signup = db.get_cwl_signup_sync(self.event_id, self.player_tag)
+        guild_id = int(event["guild_id"]) if event is not None else None
+
+        if event is None or signup is None:
+            await interaction.response.send_message(
+                t('cwl.template.no_longer_valid', user_id=user_id_str, guild_id=guild_id), ephemeral=True
+            )
+            return
+        if signup.get("discord_id") and signup["discord_id"] != user_id_str:
+            await interaction.response.send_message(
+                t('cwl.template.not_your_signup', user_id=user_id_str, guild_id=guild_id), ephemeral=True
+            )
+            return
+        if event["status"] != "signup_open":
+            await interaction.response.send_message(
+                t('cwl.template.signup_closed', user_id=user_id_str, guild_id=guild_id), ephemeral=True
+            )
+            return
+
+        new_status = "confirmed" if self.action == "confirm" else "declined"
+        source = "template_confirm" if self.action == "confirm" else "template_optout"
+        responded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        db.upsert_cwl_signup_sync(
+            self.event_id, self.player_tag, signup.get("player_name"), signup.get("discord_id"),
+            signup.get("preferred_league_rank"), source, new_status, responded_at=responded_at,
+        )
+
+        response_key = 'cwl.template.confirmed_msg' if self.action == "confirm" else 'cwl.template.declined_msg'
+        try:
+            await interaction.response.edit_message(
+                content=t(response_key, user_id=user_id_str, guild_id=guild_id), view=None
+            )
+        except discord.NotFound as e:
+            if getattr(e, "code", None) == 10062:
+                logging.warning(
+                    f"[CwlSignupResponseButton] Interaction expired before bot could respond (10062): "
+                    f"event={self.event_id} player={self.player_tag}"
+                )
+            else:
+                raise
 
 
 # ---------------------------------------------------------------------------

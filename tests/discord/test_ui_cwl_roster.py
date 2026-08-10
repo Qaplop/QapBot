@@ -768,3 +768,322 @@ async def test_season_select_present_and_configure_enabled_once_a_season_exists(
     assert values == {"2026-04"}
     configure_button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_configure_clans")
     assert configure_button.disabled is False  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# Start Enrollment (Phase 2) — button gating, confirm dialog, DynamicItem DM buttons
+# ---------------------------------------------------------------------------
+
+def _start_button(view: discord.ui.View):
+    return next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_start_enrollment")
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_start_enrollment_button_disabled_without_event(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    CACHE.db_manager = db
+    CACHE.server_config["9001"] = {}
+    view = discord.ui.View(timeout=300)
+
+    add_cwl_management_components(view, 9001)
+
+    assert _start_button(view).disabled is True  # type: ignore[union-attr]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_start_enrollment_button_disabled_without_participating_clans(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    await _seed_guild_and_clans(db, "9002", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["9002"] = {}
+    db.create_cwl_event_sync("9002", "2026-08", "discordid1")  # no clans configured yet
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 9002)
+
+    assert _start_button(view).disabled is True  # type: ignore[union-attr]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_start_enrollment_button_disabled_once_already_started(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    await _seed_guild_and_clans(db, "9003", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["9003"] = {}
+    event_id = db.create_cwl_event_sync("9003", "2026-08", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+    db.update_cwl_event_status_sync(event_id, "signup_open")
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 9003)
+
+    assert _start_button(view).disabled is True  # type: ignore[union-attr]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_start_enrollment_button_enabled_for_draft_event_with_clans(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    await _seed_guild_and_clans(db, "9004", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["9004"] = {}
+    event_id = db.create_cwl_event_sync("9004", "2026-08", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 9004)
+
+    button = _start_button(view)
+    assert button.disabled is False  # type: ignore[union-attr]
+    assert button.callback is not None  # type: ignore[union-attr]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_start_enrollment_callback_opens_confirm_view(db, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlStartEnrollmentConfirmView, _make_cwl_management_start_enrollment_callback
+
+    await _seed_guild_and_clans(db, "9005", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["9005"] = {}
+    event_id = db.create_cwl_event_sync("9005", "2026-08", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+    mock_interaction.guild.id = 9005
+
+    mock_interaction.followup.send = AsyncMock()
+    callback = _make_cwl_management_start_enrollment_callback(MagicMock())
+    await callback(mock_interaction)
+
+    mock_interaction.followup.send.assert_awaited_once()
+    _, kwargs = mock_interaction.followup.send.call_args
+    view = kwargs.get("view")
+    assert isinstance(view, CwlStartEnrollmentConfirmView)
+    assert view.season == "2026-08"
+    # Nothing enrolled yet — only the confirm dialog was shown.
+    assert db.get_cwl_event_sync("9005", "2026-08")["status"] == "draft"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_start_enrollment_confirm_view_confirm_starts_enrollment_and_refreshes(db, mock_interaction, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlStartEnrollmentConfirmView
+
+    await _seed_guild_and_clans(db, "9006", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["9006"] = {}
+    event_id = db.create_cwl_event_sync("9006", "2026-08", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+    confirm_view = CwlStartEnrollmentConfirmView(parent_view=parent, guild_id=9006, season="2026-08")
+    assert "2026-08" in confirm_view._build_content()
+
+    mock_interaction.edit_original_response = AsyncMock()
+    await confirm_view._on_confirm(mock_interaction)
+
+    assert db.get_cwl_event_sync("9006", "2026-08")["status"] == "signup_open"
+    mock_interaction.edit_original_response.assert_awaited_once()
+    _, kwargs = mock_interaction.edit_original_response.call_args
+    assert kwargs["view"] is None
+    parent.refresh_cwl_view.assert_awaited_once()
+    assert parent.refresh_cwl_view.await_args.args[1] == "cwl_management"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_start_enrollment_confirm_view_cancel_does_not_start(db, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlStartEnrollmentConfirmView
+
+    await _seed_guild_and_clans(db, "9007", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["9007"] = {}
+    event_id = db.create_cwl_event_sync("9007", "2026-08", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+    confirm_view = CwlStartEnrollmentConfirmView(parent_view=parent, guild_id=9007, season="2026-08")
+
+    await confirm_view._on_cancel(mock_interaction)
+
+    assert db.get_cwl_event_sync("9007", "2026-08")["status"] == "draft"
+    mock_interaction.delete_original_response.assert_awaited_once()
+    parent.refresh_cwl_view.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# CwlSignupResponseButton — restart-safe DM confirm/opt-out DynamicItem
+# ---------------------------------------------------------------------------
+
+class TestCwlSignupResponseButton:
+    def test_template_matches_valid_custom_id(self):
+        import re
+        from qapbot.ui_cwl_roster import CWL_SIGNUP_RESPONSE_TEMPLATE
+
+        m = re.match(CWL_SIGNUP_RESPONSE_TEMPLATE, "cwl:signup:confirm:42:#ABC12")
+        assert m is not None
+        assert m.group("action") == "confirm"
+        assert m.group("event_id") == "42"
+        assert m.group("player_tag") == "#ABC12"
+
+    def test_template_rejects_malformed_custom_id(self):
+        import re
+        from qapbot.ui_cwl_roster import CWL_SIGNUP_RESPONSE_TEMPLATE
+
+        assert re.match(CWL_SIGNUP_RESPONSE_TEMPLATE, "cwl:signup:maybe:42:#ABC12") is None  # bad action
+        assert re.match(CWL_SIGNUP_RESPONSE_TEMPLATE, "cwl:signup:confirm:abc:#ABC12") is None  # non-numeric event_id
+        assert re.match(CWL_SIGNUP_RESPONSE_TEMPLATE, "cwl:signup:confirm:42:ABC12") is None  # missing '#'
+        assert re.match(CWL_SIGNUP_RESPONSE_TEMPLATE, "not:cwl:at:all") is None
+
+    @pytest.mark.asyncio
+    async def test_from_custom_id_reconstructs_state(self):
+        import re
+        from qapbot.ui_cwl_roster import CWL_SIGNUP_RESPONSE_TEMPLATE, CwlSignupResponseButton
+
+        match = re.match(CWL_SIGNUP_RESPONSE_TEMPLATE, "cwl:signup:optout:7:#ZZZ1")
+        item = await CwlSignupResponseButton.from_custom_id(MagicMock(), MagicMock(), match)
+        assert item.action == "optout"
+        assert item.event_id == 7
+        assert item.player_tag == "#ZZZ1"
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
+    async def test_confirm_click_updates_signup_and_edits_message(self, db, mock_interaction):
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlSignupResponseButton
+
+        await _seed_guild_and_clans(db, "9101", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9101", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "123456789", None, "template_confirm", "pending")
+
+        mock_interaction.user.id = 123456789  # matches the signup's discord_id
+        mock_interaction.response.edit_message = AsyncMock()
+
+        button = CwlSignupResponseButton("confirm", event_id, "#P1")
+        await button.callback(mock_interaction)
+
+        signup = db.get_cwl_signup_sync(event_id, "#P1")
+        assert signup["status"] == "confirmed"
+        assert signup["responded_at"] is not None
+        mock_interaction.response.edit_message.assert_awaited_once()
+        _, kwargs = mock_interaction.response.edit_message.call_args
+        assert kwargs["view"] is None
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
+    async def test_optout_click_marks_declined(self, db, mock_interaction):
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlSignupResponseButton
+
+        await _seed_guild_and_clans(db, "9102", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9102", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "123456789", None, "template_confirm", "pending")
+
+        mock_interaction.user.id = 123456789
+        mock_interaction.response.edit_message = AsyncMock()
+
+        button = CwlSignupResponseButton("optout", event_id, "#P1")
+        await button.callback(mock_interaction)
+
+        signup = db.get_cwl_signup_sync(event_id, "#P1")
+        assert signup["status"] == "declined"
+        assert signup["source"] == "template_optout"
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
+    async def test_click_on_deleted_signup_shows_no_longer_valid(self, db, mock_interaction):
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlSignupResponseButton
+
+        await _seed_guild_and_clans(db, "9103", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9103", "2026-08", "discordid1")
+
+        mock_interaction.response.send_message = AsyncMock()
+        button = CwlSignupResponseButton("confirm", event_id, "#NEVERUP")
+        await button.callback(mock_interaction)
+
+        mock_interaction.response.send_message.assert_awaited_once()
+        assert db.get_cwl_signup_sync(event_id, "#NEVERUP") is None
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
+    async def test_click_by_wrong_account_is_rejected(self, db, mock_interaction):
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlSignupResponseButton
+
+        await _seed_guild_and_clans(db, "9104", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9104", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "111111111", None, "template_confirm", "pending")
+
+        mock_interaction.user.id = 999999999  # different account
+        mock_interaction.response.send_message = AsyncMock()
+
+        button = CwlSignupResponseButton("confirm", event_id, "#P1")
+        await button.callback(mock_interaction)
+
+        mock_interaction.response.send_message.assert_awaited_once()
+        assert db.get_cwl_signup_sync(event_id, "#P1")["status"] == "pending"  # unchanged
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
+    async def test_click_after_event_no_longer_signup_open_is_rejected(self, db, mock_interaction):
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlSignupResponseButton
+
+        await _seed_guild_and_clans(db, "9105", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9105", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "123456789", None, "template_confirm", "pending")
+        db.update_cwl_event_status_sync(event_id, "finalized")  # closed since the DM was sent
+
+        mock_interaction.user.id = 123456789
+        mock_interaction.response.send_message = AsyncMock()
+
+        button = CwlSignupResponseButton("confirm", event_id, "#P1")
+        await button.callback(mock_interaction)
+
+        mock_interaction.response.send_message.assert_awaited_once()
+        assert db.get_cwl_signup_sync(event_id, "#P1")["status"] == "pending"  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# _resolve_template_season_for_event — Start Enrollment's template-season default
+# ---------------------------------------------------------------------------
+
+def test_resolve_template_season_for_event_subtracts_one_month():
+    from qapbot.QBdiscocmdshelper_cwl import _resolve_template_season_for_event
+
+    assert _resolve_template_season_for_event("2026-08") == "2026-07"
+
+
+def test_resolve_template_season_for_event_rolls_over_year_boundary():
+    from qapbot.QBdiscocmdshelper_cwl import _resolve_template_season_for_event
+
+    assert _resolve_template_season_for_event("2026-01") == "2025-12"
