@@ -2653,6 +2653,62 @@ class WarHistoryDB:
                 )
                 return []
 
+    def get_most_recent_cwl_war_roster_sync(self, clan_tag: str) -> List[Dict[str, Any]]:
+        """Same shape as get_cwl_roster_sync() above, but finds this clan's own most recent
+        CWL war regardless of season (drops the `ws.cwl_season = ?` filter) and includes the
+        attack date. Used by the "Manage Enrollment" auto-assignment seed (resolve_prior_cwl_
+        assignments() in QBdiscocmdshelper_cwl.py): "if a clan didn't play CWL last month, fall
+        back to that clan's own most recent CWL season" — each clan resolved independently, not
+        against one shared season — and the date is needed to break ties when the same player
+        qualifies for more than one candidate clan (latest attack wins).
+
+        Returns:
+            List of dicts: player_tag, player_name, th_level, map_position, date
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute("""
+                    WITH wa AS (
+                        SELECT * FROM main.war_attacks
+                        UNION ALL SELECT * FROM history.war_attacks
+                    ), ws AS (
+                        SELECT * FROM main.war_summary
+                        UNION ALL SELECT * FROM history.war_summary
+                    )
+                    SELECT wa.player_tag, wa.player_name,
+                           wa.th_level, wa.map_position, wa.date
+                    FROM wa
+                    WHERE wa.clan_tag = ?
+                      AND wa.war_id = (
+                          SELECT ws.war_id FROM ws
+                          WHERE ws.clan_tag = ?
+                            AND ws.is_cwl   = 1
+                          ORDER BY ws.date DESC
+                          LIMIT 1
+                      )
+                    GROUP BY wa.player_tag
+                """, (clan_tag, clan_tag)).fetchall()
+                return [
+                    {
+                        "player_tag":   row["player_tag"],
+                        "player_name":  row["player_name"],
+                        "th_level":     int(row["th_level"]),
+                        "map_position": int(row["map_position"]),
+                        "date":         row["date"],
+                    }
+                    for row in rows
+                ]
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-QUERY-SYNC] get_most_recent_cwl_war_roster_sync failed for {clan_tag}: {e}"
+                )
+                return []
+
     # --- CWL roster planning (CWL_ROSTER_PLANNING_PLAN.md Phase 1) -------------------------
     # Sync CRUD, matching get_cwl_roster_sync's style above — called from UI callbacks, not
     # the async polling loop.
@@ -3151,6 +3207,136 @@ class WarHistoryDB:
             except sqlite3.Error as e:
                 logging.error(f"[DB-QUERY-SYNC] get_cwl_signup_sync failed for event {event_id} player {player_tag}: {e}")
                 return None
+
+    def upsert_cwl_assignment_sync(
+        self,
+        event_id: int,
+        player_tag: str,
+        assigned_clan_tag: str,
+        assignment_source: str = "suggested",
+        suggested_clan_tag: Optional[str] = None,
+        locked: bool = False,
+    ) -> bool:
+        """Create or overwrite one player's clan assignment for an event — the write path for
+        both the auto-assignment seed (assignment_source='suggested') and a manual drag-and-drop
+        move on the "Manage Enrollment" board (assignment_source='admin_override', locked=True).
+        "Unassigned" is represented by the row's absence (assigned_clan_tag is NOT NULL) rather
+        than a nullable column — see delete_cwl_assignment_sync() for the inverse."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        """
+                        INSERT INTO cwl_assignments
+                            (event_id, player_tag, assigned_clan_tag, suggested_clan_tag, assignment_source, locked)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(event_id, player_tag) DO UPDATE SET
+                            assigned_clan_tag = excluded.assigned_clan_tag,
+                            suggested_clan_tag = excluded.suggested_clan_tag,
+                            assignment_source = excluded.assignment_source,
+                            locked = excluded.locked,
+                            updated_at = datetime('now')
+                        """,
+                        (event_id, player_tag, assigned_clan_tag, suggested_clan_tag, assignment_source, 1 if locked else 0),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] upsert_cwl_assignment_sync failed for event {event_id} player {player_tag}: {e}")
+                conn.rollback()
+                return False
+
+    def bulk_create_cwl_assignments_sync(self, event_id: int, assignments: List[Dict[str, Any]]) -> bool:
+        """Bulk-insert cwl_assignments rows for the auto-assignment seed (Start Enrollment,
+        resolve_prior_cwl_assignments() in QBdiscocmdshelper_cwl.py). Idempotent via
+        ON CONFLICT(event_id, player_tag) DO NOTHING — the seed runs once at Start Enrollment
+        time; re-running it (defensively) must never clobber a manual drag-and-drop move that
+        happened since. Each dict: player_tag, assigned_clan_tag, and optionally
+        suggested_clan_tag (defaults to assigned_clan_tag — the seed's suggestion *is* the
+        initial assignment)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not assignments:
+            return True
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.executemany(
+                        """
+                        INSERT INTO cwl_assignments
+                            (event_id, player_tag, assigned_clan_tag, suggested_clan_tag, assignment_source)
+                        VALUES (?, ?, ?, ?, 'suggested')
+                        ON CONFLICT(event_id, player_tag) DO NOTHING
+                        """,
+                        [
+                            (
+                                event_id,
+                                a["player_tag"],
+                                a["assigned_clan_tag"],
+                                a.get("suggested_clan_tag", a["assigned_clan_tag"]),
+                            )
+                            for a in assignments
+                        ],
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] bulk_create_cwl_assignments_sync failed for event {event_id}: {e}")
+                conn.rollback()
+                return False
+
+    def get_cwl_assignments_sync(self, event_id: int) -> List[Dict[str, Any]]:
+        """Return every current assignment for an event (one row per assigned player_tag — an
+        unassigned player simply has no row here)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM cwl_assignments WHERE event_id = ?",
+                    (event_id,),
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_assignments_sync failed for event {event_id}: {e}")
+                return []
+
+    def delete_cwl_assignment_sync(self, event_id: int, player_tag: str) -> bool:
+        """Remove one player's assignment — the "drag to Unassigned" action on the Manage
+        Enrollment board, and the cascade a signup withdrawal triggers (a withdrawn player
+        shouldn't linger in a clan column)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "DELETE FROM cwl_assignments WHERE event_id = ? AND player_tag = ?",
+                        (event_id, player_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] delete_cwl_assignment_sync failed for event {event_id} player {player_tag}: {e}")
+                conn.rollback()
+                return False
 
     async def get_clan_attack_history(
         self,

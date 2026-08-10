@@ -707,6 +707,7 @@ class CwlStartEnrollmentConfirmView(discord.ui.View):
                 'cwl.management.start_enrollment_summary',
                 guild_id=self.guild_id,
                 seeded=summary["seeded"],
+                assigned=summary["assigned"],
                 contacted=summary["contacted"],
                 skipped_optout=summary["skipped_optout"],
                 skipped_unlinked=summary["skipped_unlinked"],

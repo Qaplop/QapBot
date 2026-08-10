@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (11)
+- Added (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", slice 1 of 5 — DB layer): data-layer
+  groundwork for the new "Manage Assignment" drag-and-drop board that replaces the old
+  Phase 3/4 design (skill-scored suggestion engine + separate override screen, neither ever
+  built). New `get_most_recent_cwl_war_roster_sync()` (a clan's own most recent CWL war,
+  independent of season) and full `cwl_assignments` CRUD in `db_manager.py`; new
+  `resolve_prior_cwl_assignments()` in `QBdiscocmdshelper_cwl.py` implementing the confirmed
+  algorithm (last month's CWL attacker → assigned to that clan; a clan that skipped last month
+  falls back to its own most recent CWL season; ties broken by latest attack date). Wired into
+  `start_cwl_enrollment()` — runs once, seeds initial assignments alongside signups, excludes
+  departed members, surfaces a new "Pre-assigned from last month's CWL" count in the admin
+  confirmation message. No user-visible change yet — the Start Enrollment button and screen are
+  unchanged; this is purely the data layer the upcoming board will read/write. 25 new tests;
+  1716 total tests pass.
+
 2026-08-10 (10)
 - Fixed (CWL_ROSTER_PLANNING_PLAN.md, a third live-testing gap): changes made via
   `/clan management` (entry point a) never propagated to the anchored CWL Management Hub

@@ -312,7 +312,26 @@ New `cwl.*` namespace in `qapbot/translations/en.json` and `de.json`: `cwl.setup
 
 ---
 
-## Phase 3 — Auto-Assignment Suggestion Engine
+## "Manage Enrollment" (2026-08-10) — supersedes Phase 3's scoring engine and Phase 4's separate screen
+
+Live-tested gap: "Manage Assignments" sat permanently disabled since Phase 1 shipped — nothing ever built it. Revisited with the project owner rather than building the original Phase 3 (skill/reliability-scored suggestion engine) + Phase 4 (separate leadership override screen) as designed below. Confirmed decisions, superseding those two phases' designs entirely:
+- **Who**: guild admins, **plus** anyone currently holding the guild's Leader or Co-Leader Discord role (the existing CoC-rank auto-role feature, `coc_role_leader_id`/`coc_role_coleader_id` on `guild_config` — one shared pair of roles per guild, not per-clan). A leader/co-leader manages **every** participating clan's enrollment, not just their own.
+- **One button, dynamically labeled**, not two sitting side by side: "Start Enrollment" while the event is `draft`, "Manage Assignment" once `signup_open` or later — same row-3 slot in `add_cwl_management_components`.
+- **One web UI (Discord Activity), not Discord-native embeds** — a drag-and-drop board: participating clans as columns, an "Unassigned" pool column, 1-click sign-up/withdraw per player card. This replaces Phase 3's separate scoring computation entirely — no `compute_roster_stats_sync`-based skill/reliability engine, no tier-fit logic.
+- **Initial assignment seed** (replaces Phase 3's scoring formula): a player who attacked for a clan in that clan's own most recent CWL war is assigned to that clan. If a clan didn't play CWL last month, fall back to that specific clan's own most recent CWL season — resolved independently per clan, never one shared "template season". A player qualifying for more than one participating clan resolves to whichever clan has their **most recent** qualifying attack.
+- **The two screens (Configure Participating Clans / Manage Assignment) must be independently launchable at any time, in parallel, regardless of event status** — clans change plans last-minute even after enrollment starts. Ruled out routing the Activity by fetched event status (would force disabling Configure Participating Clans once `signup_open` begins) after this was explicitly rejected. Also ruled out (researched, not assumed) passing a "which screen" parameter through Discord's `LAUNCH_ACTIVITY` interaction callback (`type: 12`) — Discord's own interaction-response docs specify a full `data` schema for every other callback type (Messages/Autocomplete/Modal) but leave LAUNCH_ACTIVITY's `data` completely unspecified; `discord-api-types` doesn't define one either; and a single Discord Application can only have one Activity URL mapping, so "two native Activities" would need a second whole Application registration, which a single bot's own interaction response can't `LAUNCH_ACTIVITY` for anyway. **Solution: the bot remembers which button was clicked, not Discord** — each launch callback records `CACHE.pending_cwl_activity_screen[(guild_id, discord_user_id)] = "clan_config" | "enrollment"` immediately before firing `LAUNCH_ACTIVITY`; the Activity's first fetch is a new tiny `GET /api/cwl/screen` bridge endpoint that pops that value (defaults to `"clan_config"` if nothing was recorded — e.g. a bot restart between click and load) and renders accordingly. No dependency on undocumented Discord behavior; `configure_button`'s existing `disabled=(event is None)` gating is otherwise untouched.
+
+**Slice 1 — DB layer: assignment CRUD + auto-assignment seed ✅ shipped 2026-08-10.**
+- `get_most_recent_cwl_war_roster_sync(clan_tag)` (`db_manager.py`) — same shape as `get_cwl_roster_sync()` but drops the `cwl_season` filter (finds the clan's own most recent `is_cwl=1` war regardless of season) and includes `date` (needed for the conflict tie-break below).
+- `upsert_cwl_assignment_sync` / `bulk_create_cwl_assignments_sync` (idempotent, `ON CONFLICT DO NOTHING` — never clobbers a manual drag-and-drop move if the seed is defensively re-run) / `get_cwl_assignments_sync` / `delete_cwl_assignment_sync` (`db_manager.py`) — full CRUD for the already-existing-but-unused `cwl_assignments` table. "Unassigned" = no row (the column is `NOT NULL`), not a nullable value.
+- `resolve_prior_cwl_assignments(clan_tags) -> Dict[player_tag, clan_tag]` (`QBdiscocmdshelper_cwl.py`) — pure-ish orchestration implementing the algorithm above: per clan, pulls its own most-recent-CWL-war roster, keeps the candidate with the latest `date` per player_tag across all clans (plain ISO-8601 string comparison — `war_attacks.date` is sortable throughout the codebase, confirmed against `get_clan_attack_history_sync`'s own range comparisons).
+- Wired into `start_cwl_enrollment()`: runs once, right after the signup seed, intersected against the same current-member player_tag set already resolved there (so a departed player's old CWL history never auto-assigns them into a roster they've actually left) — new `summary["assigned"]` count surfaced in the admin-facing confirmation message (`cwl.management.start_enrollment_summary`, en/de). Every later change happens only via manual drag-and-drop on the board (`assignment_source='admin_override'`, `locked=True`) — this seed never re-runs.
+- 25 new tests: `tests/unit/test_db_manager_cwl_roster.py` (`get_most_recent_cwl_war_roster_sync`, full `cwl_assignments` CRUD including the idempotent-seed-preserves-manual-override case), `tests/discord/test_ui_cwl_roster.py` (`resolve_prior_cwl_assignments` — single clan, no-history clan contributes nothing, conflict resolution both directions), `tests/integration/test_cwl_start_enrollment.py` (assignments actually seeded alongside signups end-to-end, departed-member exclusion, no-CWL-history player lands unassigned but still seeded as a signup candidate). 1716 total tests pass.
+- **Not yet built** (remaining slices — permission check, bridge/Worker endpoints including `/api/cwl/screen`, the drag-and-drop frontend board, and the Discord button consolidation itself): the button still reads "Start Enrollment"/disabled placeholder exactly as before this slice — nothing user-visible changed yet, this was purely the data layer.
+
+---
+
+## Phase 3 — Auto-Assignment Suggestion Engine (superseded — see "Manage Enrollment" above)
 
 **Ships:** pure computation — reads `cwl_signups` where `status='confirmed'`, scores each player, writes `cwl_assignments` rows (`assignment_source='suggested'`). No player/clan-visible change yet.
 
@@ -339,7 +358,7 @@ composite    = data_confidence * (0.6*skill + 0.4*reliability)
 
 ---
 
-## Phase 4 — Leadership Management/Override Screen
+## Phase 4 — Leadership Management/Override Screen (superseded — see "Manage Enrollment" above)
 
 **Ships:** admin screen showing all signups + current assignments for an event, with move/kick/bring-in controls and the finalize gate.
 

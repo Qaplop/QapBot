@@ -1298,3 +1298,86 @@ async def test_clan_management_view_refresh_cwl_view_also_refreshes_the_hub(monk
     await view.refresh_cwl_view(interaction, "cwl_management")
 
     hub_refresh.assert_awaited_once_with(9210, "cwl_management")
+
+
+# ---------------------------------------------------------------------------
+# resolve_prior_cwl_assignments — "Manage Enrollment" auto-assignment seed
+# (CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10)
+# ---------------------------------------------------------------------------
+
+async def _seed_cwl_war(db, clan_tag: str, players: list, date: str = "2026-07-01T08:00", war_id: str = None) -> None:
+    war_id = war_id or f"war_{clan_tag}_{date}"
+    await db.conn.execute(
+        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) VALUES (?, ?, ?, 1, ?, ?)",
+        (war_id, clan_tag, "#OPP", date[:7], date),
+    )
+    for player_tag, player_name, th_level, map_position in players:
+        await db.conn.execute(
+            "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+            (war_id, clan_tag, date, player_name, player_tag, th_level, map_position),
+        )
+    await db.conn.commit()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_resolve_prior_cwl_assignments_single_clan(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
+
+    await _seed_guild_and_clans(db, "9301", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha", 15, 1), ("#P2", "Bravo", 14, 2)])
+
+    assert resolve_prior_cwl_assignments(["#CLAN1"]) == {"#P1": "#CLAN1", "#P2": "#CLAN1"}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_resolve_prior_cwl_assignments_clan_with_no_history_contributes_nothing(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
+
+    await _seed_guild_and_clans(db, "9302", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
+    CACHE.db_manager = db
+    await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha", 15, 1)])
+    # #CLAN2 has never played CWL — contributes no candidates, doesn't error.
+
+    assert resolve_prior_cwl_assignments(["#CLAN1", "#CLAN2"]) == {"#P1": "#CLAN1"}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_resolve_prior_cwl_assignments_conflict_latest_attack_wins(db):
+    """A player who attacked for #CLAN1 more recently than for #CLAN2 must resolve to #CLAN1,
+    even if #CLAN2's own most-recent-CWL-war lookup also surfaces them."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
+
+    await _seed_guild_and_clans(db, "9303", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
+    CACHE.db_manager = db
+    await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha", 15, 1)], date="2026-07-01T08:00")
+    await _seed_cwl_war(db, "#CLAN2", [("#P1", "Alpha", 15, 1)], date="2026-05-01T08:00")
+
+    assert resolve_prior_cwl_assignments(["#CLAN1", "#CLAN2"]) == {"#P1": "#CLAN1"}
+
+    # Reversed dates -> reversed winner, confirming it's genuinely date-driven, not insertion-order.
+    await _seed_guild_and_clans(db, "9304", {"#CLAN3": "Charlie", "#CLAN4": "Delta"})
+    await _seed_cwl_war(db, "#CLAN3", [("#P2", "Bravo", 15, 1)], date="2026-05-01T08:00")
+    await _seed_cwl_war(db, "#CLAN4", [("#P2", "Bravo", 15, 1)], date="2026-07-01T08:00")
+    assert resolve_prior_cwl_assignments(["#CLAN3", "#CLAN4"]) == {"#P2": "#CLAN4"}
+
+
+def test_resolve_prior_cwl_assignments_returns_empty_without_db_manager():
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
+
+    CACHE.db_manager = None
+    assert resolve_prior_cwl_assignments(["#CLAN1"]) == {}
+
+
+def test_resolve_prior_cwl_assignments_returns_empty_for_no_clans():
+    from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
+
+    assert resolve_prior_cwl_assignments([]) == {}

@@ -28,6 +28,25 @@ async def _seed_guild_and_clan(db: WarHistoryDB, guild_id: str = "111", clan_tag
     await db.conn.commit()
 
 
+async def _seed_cwl_war(
+    db: WarHistoryDB, clan_tag: str, cwl_season: str, players: list, date: str = "2026-07-01T08:00", war_id: str = None,
+) -> None:
+    """Seed a minimal is_cwl=1 war_summary + war_attacks pair. players: list of
+    (player_tag, player_name, th_level, map_position) tuples. All attacks share `date`."""
+    war_id = war_id or f"war_{clan_tag}_{cwl_season}_{date}"
+    await db.conn.execute(
+        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) VALUES (?, ?, ?, 1, ?, ?)",
+        (war_id, clan_tag, "#OPP", cwl_season, date),
+    )
+    for player_tag, player_name, th_level, map_position in players:
+        await db.conn.execute(
+            "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+            (war_id, clan_tag, date, player_name, player_tag, th_level, map_position),
+        )
+    await db.conn.commit()
+
+
 async def _seed_user_player(
     db: WarHistoryDB,
     discord_id: str,
@@ -480,3 +499,125 @@ class TestGetCurrentClanMembers:
 
         members = db.get_current_clan_members_sync(["#CLAN1", "#CLAN2"])
         assert {m["player_tag"] for m in members} == {"#P1", "#P2"}
+
+
+class TestGetMostRecentCwlWarRoster:
+    """get_most_recent_cwl_war_roster_sync() — the "Manage Enrollment" auto-assignment seed's
+    per-clan data source: this clan's own most recent CWL war, regardless of season."""
+
+    @pytest.mark.integration
+    async def test_returns_empty_when_no_cwl_war_exists(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        assert db.get_most_recent_cwl_war_roster_sync("#CLAN1") == []
+
+    @pytest.mark.integration
+    async def test_ignores_non_cwl_wars(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await db.conn.execute(
+            "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
+            "VALUES ('regular_war', '#CLAN1', '#OPP', 0, '', '2026-07-15T10:00')"
+        )
+        await db.conn.execute(
+            "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
+            "VALUES ('regular_war', '#CLAN1', '2026-07-15T10:00', 'Alpha', '#P1', 15, 1, 0)"
+        )
+        await db.conn.commit()
+        assert db.get_most_recent_cwl_war_roster_sync("#CLAN1") == []
+
+    @pytest.mark.integration
+    async def test_finds_most_recent_cwl_war_regardless_of_season(self, db):
+        """The whole point: no cwl_season filter — a clan that skipped last month resolves
+        against whichever season it last actually played."""
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_cwl_war(db, "#CLAN1", "2026-05", [("#OLD", "Old", 14, 1)], date="2026-05-01T08:00")
+        await _seed_cwl_war(db, "#CLAN1", "2026-07", [("#NEW", "New", 15, 1)], date="2026-07-01T08:00")
+
+        roster = db.get_most_recent_cwl_war_roster_sync("#CLAN1")
+        assert [r["player_tag"] for r in roster] == ["#NEW"]
+        assert roster[0]["date"] == "2026-07-01T08:00"
+
+    @pytest.mark.integration
+    async def test_returns_date_for_every_player(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_cwl_war(
+            db, "#CLAN1", "2026-07",
+            [("#P1", "Alpha", 15, 1), ("#P2", "Bravo", 14, 2)],
+            date="2026-07-01T08:00",
+        )
+        roster = db.get_most_recent_cwl_war_roster_sync("#CLAN1")
+        assert {r["player_tag"]: r["date"] for r in roster} == {
+            "#P1": "2026-07-01T08:00", "#P2": "2026-07-01T08:00",
+        }
+
+
+class TestCwlAssignmentsCrud:
+    @pytest.mark.integration
+    async def test_upsert_creates_then_overwrites(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_guild_and_clan(db, guild_id="111", clan_tag="#CLAN2")
+        event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
+
+        assert db.upsert_cwl_assignment_sync(event_id, "#P1", "#CLAN1", assignment_source="suggested") is True
+        assignments = db.get_cwl_assignments_sync(event_id)
+        assert len(assignments) == 1
+        assert assignments[0]["assigned_clan_tag"] == "#CLAN1"
+        assert assignments[0]["assignment_source"] == "suggested"
+        assert assignments[0]["locked"] == 0
+
+        # Drag-and-drop move: overwrite, not a second row.
+        db.upsert_cwl_assignment_sync(event_id, "#P1", "#CLAN2", assignment_source="admin_override", locked=True)
+        assignments = db.get_cwl_assignments_sync(event_id)
+        assert len(assignments) == 1
+        assert assignments[0]["assigned_clan_tag"] == "#CLAN2"
+        assert assignments[0]["assignment_source"] == "admin_override"
+        assert assignments[0]["locked"] == 1
+
+    @pytest.mark.integration
+    async def test_bulk_create_is_idempotent_and_preserves_manual_overrides(self, db):
+        """Re-running the seed (defensively) must never clobber a drag-and-drop move that
+        happened since — same ON CONFLICT DO NOTHING discipline as bulk_create_cwl_signups_sync."""
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_guild_and_clan(db, guild_id="111", clan_tag="#CLAN2")
+        event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
+
+        db.bulk_create_cwl_assignments_sync(event_id, [{"player_tag": "#P1", "assigned_clan_tag": "#CLAN1"}])
+        db.upsert_cwl_assignment_sync(event_id, "#P1", "#CLAN2", assignment_source="admin_override", locked=True)
+
+        # Re-running the seed must not revert the manual override back to #CLAN1.
+        db.bulk_create_cwl_assignments_sync(event_id, [{"player_tag": "#P1", "assigned_clan_tag": "#CLAN1"}])
+
+        assignments = db.get_cwl_assignments_sync(event_id)
+        assert len(assignments) == 1
+        assert assignments[0]["assigned_clan_tag"] == "#CLAN2"
+        assert assignments[0]["locked"] == 1
+
+    @pytest.mark.integration
+    async def test_bulk_create_defaults_suggested_clan_tag_to_assigned(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
+        db.bulk_create_cwl_assignments_sync(event_id, [{"player_tag": "#P1", "assigned_clan_tag": "#CLAN1"}])
+        assignments = db.get_cwl_assignments_sync(event_id)
+        assert assignments[0]["suggested_clan_tag"] == "#CLAN1"
+
+    @pytest.mark.integration
+    async def test_get_cwl_assignments_sync_empty_event(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
+        assert db.get_cwl_assignments_sync(event_id) == []
+
+    @pytest.mark.integration
+    async def test_delete_cwl_assignment_sync_removes_the_row(self, db):
+        """Unassigned = no row (assigned_clan_tag is NOT NULL) — dragging to the Unassigned
+        pool must delete, not null out, the row."""
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
+        db.upsert_cwl_assignment_sync(event_id, "#P1", "#CLAN1")
+
+        assert db.delete_cwl_assignment_sync(event_id, "#P1") is True
+        assert db.get_cwl_assignments_sync(event_id) == []
+
+    @pytest.mark.integration
+    async def test_delete_cwl_assignment_sync_nonexistent_row_is_a_noop(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
+        assert db.delete_cwl_assignment_sync(event_id, "#NEVER") is True

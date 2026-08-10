@@ -356,6 +356,37 @@ async def format_clan_management_cwl_management(
     return embed, None, [], []
 
 
+def resolve_prior_cwl_assignments(clan_tags: List[str]) -> Dict[str, str]:
+    """player_tag -> clan_tag, the "Manage Enrollment" auto-assignment seed (per-owner
+    confirmed algorithm, 2026-08-10): for each participating clan, pull its own most recent
+    CWL war's attackers (get_most_recent_cwl_war_roster_sync — independently per clan, so a
+    clan that skipped last month's CWL still resolves against whichever season it last actually
+    played, never a single shared "template season"). If the same player_tag qualifies for more
+    than one candidate clan (played CWL for clan A last month, but their most-recent-ever CWL
+    war was actually for clan B further back), the clan with the **latest** qualifying attack
+    date wins — a straight string comparison, since war_attacks.date is a sortable ISO-8601
+    string throughout the codebase (confirmed against get_clan_attack_history_sync's own
+    date-range comparisons).
+
+    A player with no CWL history in any participating clan simply isn't in the returned dict —
+    the caller decides what "no prior assignment" means (in start_cwl_enrollment(), it just
+    means they start out in the Unassigned pool)."""
+    db = CACHE.db_manager
+    if db is None or not clan_tags:
+        return {}
+
+    candidates: Dict[str, Tuple[str, str]] = {}  # player_tag -> (clan_tag, date)
+    for clan_tag in clan_tags:
+        for row in db.get_most_recent_cwl_war_roster_sync(clan_tag):
+            player_tag = row["player_tag"]
+            date = row["date"]
+            existing = candidates.get(player_tag)
+            if existing is None or date > existing[1]:
+                candidates[player_tag] = (clan_tag, date)
+
+    return {player_tag: clan_tag for player_tag, (clan_tag, _date) in candidates.items()}
+
+
 async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     """The single "Start Enrollment" admin action (CWL_ROSTER_PLANNING_PLAN.md Phase 2): seeds
     cwl_signups from the participating clans' *current* membership, sends the confirm/opt-out DM
@@ -384,7 +415,7 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     from qapbot.config import CONFIG
 
     summary: Dict[str, Any] = {
-        "ok": False, "error": None, "seeded": 0, "contacted": 0,
+        "ok": False, "error": None, "seeded": 0, "contacted": 0, "assigned": 0,
         "skipped_optout": 0, "skipped_unlinked": 0, "skipped_dev_guard": 0,
     }
 
@@ -432,6 +463,21 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     if signups_to_create:
         db.bulk_create_cwl_signups_sync(event["id"], signups_to_create)
         summary["seeded"] = len(signups_to_create)
+
+    # Auto-assignment seed — the initial "who probably plays where" suggestion, from last
+    # month's CWL activity (or each clan's own most recent CWL season if it skipped last
+    # month). Runs once, here; every later change happens via manual drag-and-drop on the
+    # Manage Enrollment board (assignment_source='admin_override', locked=True there).
+    current_member_tags = {p["player_tag"] for p in participants}
+    prior_assignments = resolve_prior_cwl_assignments(participating_clan_tags)
+    assignments_to_create = [
+        {"player_tag": player_tag, "assigned_clan_tag": clan_tag}
+        for player_tag, clan_tag in prior_assignments.items()
+        if player_tag in current_member_tags  # exclude a departed player's stale CWL history
+    ]
+    if assignments_to_create:
+        db.bulk_create_cwl_assignments_sync(event["id"], assignments_to_create)
+        summary["assigned"] = len(assignments_to_create)
 
     for participant in dm_targets:
         if CONFIG.is_dev_mode and str(participant["discord_id"]) != CONFIG.server_admin:

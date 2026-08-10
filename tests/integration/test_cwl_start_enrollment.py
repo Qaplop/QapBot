@@ -57,6 +57,21 @@ async def _make_event(db: WarHistoryDB, guild_id: str, season: str, clan_tag: st
     return event_id
 
 
+async def _seed_cwl_war(db: WarHistoryDB, clan_tag: str, players: list, date: str = "2026-07-01T08:00") -> None:
+    war_id = f"war_{clan_tag}_{date}"
+    await db.conn.execute(
+        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) VALUES (?, ?, ?, 1, ?, ?)",
+        (war_id, clan_tag, "#OPP", date[:7], date),
+    )
+    for player_tag, player_name in players:
+        await db.conn.execute(
+            "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
+            "VALUES (?, ?, ?, ?, ?, 15, 1, 0)",
+            (war_id, clan_tag, date, player_name, player_tag),
+        )
+    await db.conn.commit()
+
+
 @pytest.mark.asyncio
 async def test_rejects_when_no_event(db, monkeypatch):
     from qapbot.cache_manager import CACHE
@@ -255,3 +270,67 @@ async def test_prod_mode_is_unaffected_by_dev_guard(db, monkeypatch):
     assert summary["contacted"] == 2
     assert summary["skipped_dev_guard"] == 0
     assert sorted(sent_to) == ["d1", "d2"]
+
+
+@pytest.mark.asyncio
+async def test_seeds_auto_assignments_from_last_months_cwl_activity(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    await _seed_guild_and_clan(db, "1010")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(db, "d1", "#P1")
+    await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha")])
+    await _make_event(db, "1010", "2026-08")
+
+    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+
+    summary = await start_cwl_enrollment(1010, "2026-08")
+
+    assert summary["assigned"] == 1
+    event_id = db.get_cwl_event_sync("1010", "2026-08")["id"]
+    assignments = db.get_cwl_assignments_sync(event_id)
+    assert len(assignments) == 1
+    assert assignments[0]["player_tag"] == "#P1"
+    assert assignments[0]["assigned_clan_tag"] == "#CLAN1"
+    assert assignments[0]["assignment_source"] == "suggested"
+
+
+@pytest.mark.asyncio
+async def test_departed_member_is_not_auto_assigned(db, monkeypatch):
+    """A player with CWL history for this clan who is no longer a current member (per
+    user_players.current_clan_tag) must not get auto-assigned — matches current membership."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    await _seed_guild_and_clan(db, "1011")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    # #P1 has CWL history for #CLAN1 but is not currently tracked as a member of any clan.
+    await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha")])
+    await _make_event(db, "1011", "2026-08")
+
+    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+
+    summary = await start_cwl_enrollment(1011, "2026-08")
+
+    assert summary["assigned"] == 0
+    event_id = db.get_cwl_event_sync("1011", "2026-08")["id"]
+    assert db.get_cwl_assignments_sync(event_id) == []
+
+
+@pytest.mark.asyncio
+async def test_no_cwl_history_leaves_player_unassigned(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    await _seed_guild_and_clan(db, "1012")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(db, "d1", "#P1")  # never played CWL
+    await _make_event(db, "1012", "2026-08")
+
+    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+
+    summary = await start_cwl_enrollment(1012, "2026-08")
+
+    assert summary["seeded"] == 1  # still seeded as a signup candidate
+    assert summary["assigned"] == 0  # just not auto-assigned to any clan
