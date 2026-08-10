@@ -2907,6 +2907,217 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] get_previous_cwl_event_clans_sync failed for guild {guild_id}: {e}")
                 return []
 
+    def get_previous_cwl_participants_sync(
+        self, clan_tags: List[str], template_season: str
+    ) -> List[Dict[str, Any]]:
+        """Return the previous season's CWL participants for the given clans — the template-copy
+        seed for Phase 2's "Start Enrollment" action. One dict per player, sourced from
+        get_cwl_roster_sync() per clan (deduplicated by player_tag if the same account somehow
+        appears in more than one clan's most recent roster row) and cross-referenced in a single
+        batched query against user_players to resolve discord_id/verified/opt-out/preferred rank.
+
+        Returns dicts with: player_tag, player_name, clan_tag, discord_id (None if unlinked),
+        verified (False if unlinked), cwl_permanent_optout, preferred_league_rank. Callers decide
+        what to do with opted-out/unlinked accounts (this function only resolves data, it does not
+        filter) — per the confirmed design, opt-out exclusion and DM-eligibility are Start
+        Enrollment's concerns, not this query's.
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not clan_tags:
+            return []
+
+        participants: List[Dict[str, Any]] = []
+        seen_player_tags: set = set()
+        for clan_tag in clan_tags:
+            for row in self.get_cwl_roster_sync(clan_tag, template_season):
+                player_tag = row["player_tag"]
+                if player_tag in seen_player_tags:
+                    continue
+                seen_player_tags.add(player_tag)
+                participants.append(
+                    {
+                        "player_tag": player_tag,
+                        "player_name": row["player_name"],
+                        "clan_tag": clan_tag,
+                        "discord_id": None,
+                        "verified": False,
+                        "cwl_permanent_optout": False,
+                        "preferred_league_rank": None,
+                    }
+                )
+        if not participants:
+            return participants
+
+        with self._sync_conn() as conn:
+            try:
+                placeholders = ",".join("?" for _ in participants)
+                rows = conn.execute(
+                    f"""
+                    SELECT player_tag, discord_id, verified, cwl_permanent_optout,
+                           cwl_default_preferred_league_rank
+                    FROM user_players
+                    WHERE player_tag IN ({placeholders})
+                    ORDER BY verified DESC
+                    """,
+                    [p["player_tag"] for p in participants],
+                ).fetchall()
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_previous_cwl_participants_sync failed: {e}")
+                return participants
+
+        # ORDER BY verified DESC means the first row seen per player_tag is the verified one,
+        # if any exists — an unverified/disputed second linker never overwrites it.
+        linked_by_tag: Dict[str, sqlite3.Row] = {}
+        for row in rows:
+            linked_by_tag.setdefault(row["player_tag"], row)
+
+        for participant in participants:
+            linked = linked_by_tag.get(participant["player_tag"])
+            if linked is not None:
+                participant["discord_id"] = linked["discord_id"]
+                participant["verified"] = bool(linked["verified"])
+                participant["cwl_permanent_optout"] = bool(linked["cwl_permanent_optout"])
+                participant["preferred_league_rank"] = linked["cwl_default_preferred_league_rank"]
+        return participants
+
+    def bulk_create_cwl_signups_sync(self, event_id: int, signups: List[Dict[str, Any]]) -> bool:
+        """Bulk-insert cwl_signups rows for Start Enrollment's template-copy step. Idempotent via
+        ON CONFLICT(event_id, player_tag) DO NOTHING — safe to re-run without clobbering a row a
+        player may have already responded to (defensive; Start Enrollment only runs once per event
+        while status is still 'draft', before self-signup/DM responses are even possible)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not signups:
+            return True
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.executemany(
+                        """
+                        INSERT INTO cwl_signups
+                            (event_id, player_tag, player_name, discord_id, preferred_league_rank, source, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(event_id, player_tag) DO NOTHING
+                        """,
+                        [
+                            (
+                                event_id,
+                                s["player_tag"],
+                                s.get("player_name"),
+                                s.get("discord_id"),
+                                s.get("preferred_league_rank"),
+                                s.get("source", "template_confirm"),
+                                s.get("status", "pending"),
+                            )
+                            for s in signups
+                        ],
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] bulk_create_cwl_signups_sync failed for event {event_id}: {e}")
+                conn.rollback()
+                return False
+
+    def upsert_cwl_signup_sync(
+        self,
+        event_id: int,
+        player_tag: str,
+        player_name: Optional[str],
+        discord_id: Optional[str],
+        preferred_league_rank: Optional[str],
+        source: str,
+        status: str,
+        responded_at: Optional[str] = None,
+    ) -> bool:
+        """Create or overwrite a single cwl_signups row — the write path for an explicit action
+        (self-signup, DM confirm/opt-out button, admin-added), as opposed to the bulk template-copy
+        seed above. Always overwrites on conflict since an explicit action supersedes whatever was
+        there before (e.g. a member re-running /cwl signup to change their preferred tier)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        """
+                        INSERT INTO cwl_signups
+                            (event_id, player_tag, player_name, discord_id, preferred_league_rank, source, status, responded_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(event_id, player_tag) DO UPDATE SET
+                            player_name = excluded.player_name,
+                            discord_id = excluded.discord_id,
+                            preferred_league_rank = excluded.preferred_league_rank,
+                            source = excluded.source,
+                            status = excluded.status,
+                            responded_at = excluded.responded_at
+                        """,
+                        (event_id, player_tag, player_name, discord_id, preferred_league_rank, source, status, responded_at),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] upsert_cwl_signup_sync failed for event {event_id} player {player_tag}: {e}")
+                conn.rollback()
+                return False
+
+    def get_cwl_signups_for_event_sync(
+        self, event_id: int, status: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Return an event's cwl_signups rows, optionally filtered to one status."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                if status is not None:
+                    rows = conn.execute(
+                        "SELECT * FROM cwl_signups WHERE event_id = ? AND status = ? ORDER BY player_name",
+                        (event_id, status),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM cwl_signups WHERE event_id = ? ORDER BY player_name",
+                        (event_id,),
+                    ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_signups_for_event_sync failed for event {event_id}: {e}")
+                return []
+
+    def get_cwl_signup_sync(self, event_id: int, player_tag: str) -> Optional[Dict[str, Any]]:
+        """Return one cwl_signups row, or None. Callers that mutate signup state on a DM-button
+        click or /cwl command must re-read via this rather than trusting closure/cached state —
+        the event may have moved to finalized/cancelled since the row was first fetched."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT * FROM cwl_signups WHERE event_id = ? AND player_tag = ?",
+                    (event_id, player_tag),
+                ).fetchone()
+                return dict(row) if row is not None else None
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_signup_sync failed for event {event_id} player {player_tag}: {e}")
+                return None
+
     async def get_clan_attack_history(
         self,
         clan_tag: str,

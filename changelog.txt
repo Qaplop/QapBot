@@ -1,6 +1,23 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (2)
+- Added (CWL_ROSTER_PLANNING_PLAN.md Phase 2, slice 1 of 4 — data layer): sync CRUD for
+  `cwl_signups` (`bulk_create_cwl_signups_sync` for the template-copy seed, `upsert_cwl_signup_sync`
+  for explicit single-account actions like self-signup/DM-button confirm-decline, plus
+  `get_cwl_signups_for_event_sync`/`get_cwl_signup_sync`) and `get_previous_cwl_participants_sync`
+  (reads last season's roster per participating clan via the existing `get_cwl_roster_sync`,
+  cross-references `user_players` in one batched query to resolve `discord_id`/`verified`/
+  `cwl_permanent_optout`/`cwl_default_preferred_league_rank`, preferring a verified link over an
+  unverified one if the same tag is claimed twice). The `user_players`/`guild_config` schema
+  columns these read (opt-out/preferred-rank, Personal CWL Hub triplet) were already baked in from
+  Phase 1's Data Model work — this slice is purely the read/write functions on top. 27 new tests
+  in `tests/unit/test_db_manager_cwl_roster.py`. No player/admin-visible behavior yet — nothing
+  calls these functions outside tests until slice 2 (DM confirm/opt-out buttons + "Start
+  Enrollment") lands. Also recorded two operational directives in the plan doc: PROD stays frozen
+  at v1.3.1 until told otherwise, and Phase 2's DM-blast testing in DEV must be gated to the
+  project owner's own Discord account before it's exercised live (guard lands with slice 2).
+
 2026-08-10 (1)
 - Fixed (NAS ops, no code change): the PROD `cloudflared` tunnel's binary and credentials
   (`/usr/local/bin/cloudflared`, `/root/.cloudflared/`) lived outside `/volume1`, the same
