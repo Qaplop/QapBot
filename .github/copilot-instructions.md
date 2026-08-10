@@ -260,7 +260,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 📖 **../qapbot/docs/COC_GAME_MECHANICS.md**: CWL round schedule, regular war states, passive/inactive tracking, warlog visibility  
 📖 **../qapbot/docs/ARCHIVE_SCAN_PERFORMANCE_ANALYSIS.md**: Archive-directory rescan cost analysis — dated investigation, revisit trigger noted inside  
 📖 **../qapbot/docs/TEST_CONCEPT.md**: Test tier design (smoke/integration/discord/live/e2e), fixture strategy, coverage targets, CI pipeline — see also "Run tests with" above for the one-line version  
-📖 **../CWL_CLAN_CONFIG_ACTIVITY_PLAN.md**: CWL Clan-Config Discord Activity — Cloudflare Pages/Workers + `qapbot/web_bridge.py` architecture, auth model, phase-by-phase history (see also Pitfall 25 / `../qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md` for the Activities Entry Point command gotcha)  
+📖 **../qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md**: CWL Clan-Config Discord Activity — Cloudflare Pages/Workers + `qapbot/web_bridge.py` architecture, auth model, phase-by-phase history (see also Pitfall 25 / `../qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md` for the Activities Entry Point command gotcha)  
 📖 **../activity/README.md**: Activity dev setup, deploy commands, PROD rollout runbook (domain, named `cloudflared` tunnel, NAS auto-start)  
 📖 **../README.md**: Installation, environment variables, commands, deployment, features  
 📖 **../backlog.txt**: Feature roadmap

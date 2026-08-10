@@ -46,7 +46,7 @@ A powerful, modular Discord bot designed for Clash of Clans clan management, fea
   saved configuration yet
 - Architecture: Cloudflare Pages/Workers (`activity/`) + an in-process `aiohttp.web` bridge
   (`qapbot/web_bridge.py`) that reuses the bot's own `CACHE`/`db_manager` — no second data
-  store. Full design and phase history in `CWL_CLAN_CONFIG_ACTIVITY_PLAN.md`.
+  store. Full design and phase history in `qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md`.
 
 ### Notification System
 - **DM Reminders**: Automated direct messages for players with remaining attacks towards the end of a war
@@ -221,7 +221,7 @@ QapBot/
 │   ├── QBdiscocmdshelper_admin_command.py  # Admin command helpers
 │   └── translations/      # Language files (en.json, de.json)
 ├── activity/              # CWL Clan-Config Discord Activity — Cloudflare Pages/Workers
-│                          # frontend+backend; see CWL_CLAN_CONFIG_ACTIVITY_PLAN.md
+│                          # frontend+backend; see qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md
 └── data/
     ├── qapbot.db          # SQLite database (hot: current + previous calendar month, WAL mode)
     ├── qapbot_history.db  # SQLite database (history: everything older, ATTACHed as schema 'history')
@@ -307,7 +307,7 @@ migration job moves data older than the retention window from hot to history —
 | `HISTORY_MIGRATION_TIME_BUDGET_MINUTES` | Cap on the scheduled 03:00 UTC nightly window's `monthly_history_migration()` run (not the manual `run_history_migration_now.py` CLI, which takes its own `--time-budget-minutes`, and not the per-cycle chunk below). A capped run reports PARTIAL and keeps retrying instead of blocking Discord commands for however long a large backlog takes in one sitting. | No | `90` |
 | `HISTORY_MIGRATION_CYCLE_CHUNK_MINUTES` | Opportunistic per-update-cycle migration chunk: spends up to this many minutes of the otherwise-idle sleep window (between cycles) on the migration whenever it's still due — self-limiting (does nothing once done), but dominates the idle window and blocks Discord commands most of the time while an actual backlog remains, in exchange for finishing far faster than the once-a-night chunk alone. Set to `0` to disable and rely only on the once-a-night scheduled window. | No | `4` |
 | `HISTORY_MIGRATION_ADMIN_BUDGET_MINUTES` | Cap on the migration step specifically when triggered via `/admin` "Execute Nightly Maintenance" — deliberately much shorter than the scheduled-window budget above, since `/admin` is an interactive, user-awaited command whose actual purpose is the maintenance steps (checkpoint/VACUUM/REINDEX/ANALYZE), not migration progress (the per-cycle chunk already carries that), and the Discord interaction token expires after ~15 min. | No | `1` |
-| `WEB_BRIDGE_PORT` / `WEB_BRIDGE_SECRET` | CWL Clan-Config Discord Activity bridge (PROD) — `127.0.0.1`-only port and shared secret for `qapbot/web_bridge.py`. Both must be set to start the bridge; a `cloudflared` tunnel makes it reachable from the Cloudflare Worker. See `CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` and `activity/README.md`. | No | `0` / *(empty, disabled)* |
+| `WEB_BRIDGE_PORT` / `WEB_BRIDGE_SECRET` | CWL Clan-Config Discord Activity bridge (PROD) — `127.0.0.1`-only port and shared secret for `qapbot/web_bridge.py`. Both must be set to start the bridge; a `cloudflared` tunnel makes it reachable from the Cloudflare Worker. See `qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` and `activity/README.md`. | No | `0` / *(empty, disabled)* |
 | `WEB_BRIDGE_PORT_DEV` / `WEB_BRIDGE_SECRET_DEV` | Same, for DEV mode (`DISCORD_GUILD_ID` > 0) | No | `0` / *(empty, disabled)* |
 
 ## 🏭 Production Environment
@@ -475,7 +475,7 @@ See [changelog.txt](changelog.txt) for detailed changelog and version history.
   which auto-creates a global Entry Point command `discord.py` doesn't know about — a plain
   `tree.sync(guild=None)` omits it and Discord now rejects the whole sync instead of deleting
   it. Already fixed via `bulk_sync_global_commands()` (`qapbot/discord_health.py`) if you're on
-  a version of this bot that includes it; see `CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` Phase D.
+  a version of this bot that includes it; see `qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` Phase D.
 
 **Leaderboard not updating:**
 - Check clan is subscribed: `/subscriptions`

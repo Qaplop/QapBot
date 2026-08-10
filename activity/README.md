@@ -1,7 +1,8 @@
 # CWL Clan-Config Activity
 
-Phase A skeleton of the Discord Activity described in `CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` (repo
-root). Two independent Node/TypeScript projects, deployed to Cloudflare:
+Phase A skeleton of the Discord Activity described in
+`../qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md`. Two independent Node/TypeScript projects,
+deployed to Cloudflare:
 
 - **`server/`** — Cloudflare Worker (Hono). OAuth2 code→token exchange, plus a thin proxy to
   QapBot's own bridge API (not wired up until Phase B).
@@ -116,6 +117,6 @@ restarts, at the cost of needing one domain in the same Cloudflare account.
 
 ## Status
 
-Phases A-C (skeleton, bridge API, real table UI) are shipped and verified live in DEV — see
-`CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` for the phase-by-phase history. This file's "PROD rollout"
-section above is Phase D.
+All phases (A-E, skeleton through PROD rollout and the workflow redesign) are shipped and
+verified live in both DEV and PROD — see `../qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` for
+the full phase-by-phase history. This file's "PROD rollout" section above is Phase D.

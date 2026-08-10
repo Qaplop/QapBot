@@ -1,5 +1,9 @@
 # CWL Clan-Config Activity — Implementation Plan
 
+**Status**: Implemented (Phases A-E, including the same-day Phase E revision, all shipped and
+verified live in DEV and PROD)
+**Session**: 2026-08-09
+
 ## Context
 
 While building `CWL_ROSTER_PLANNING_PLAN.md` Phase 1's "Configure Participating Clans" screen, the project owner asked for a genuine table UI — a checkbox column, clan tag, league tier, a roster-size dropdown, and a date/time picker, one row per member clan, for at least 12 clans at once. Discord's native component API cannot render this (confirmed against the actual installed `discord.py==2.7.1` source, not guesses):
@@ -257,11 +261,11 @@ Each phase gets its own changelog entry and commit, per the project's establishe
 
 ---
 
-## Open items still to decide (non-blocking — can be settled during Phase A/B)
+## Decisions made along the way (originally listed as open items)
 
-- Exact visual styling of the table (match Discord's dark theme colors vs. a neutral admin-tool look).
-- Whether the bridge shared-secret is a single static token or a short-lived signed token per session (static token is simpler and adequate at this scale; flagging in case you'd rather not have a long-lived secret at all).
-- Whether DEV and PROD bridges share one `cloudflared` tunnel config or get fully separate tunnels (separate tunnels is cleaner isolation, marginally more setup).
+- **Table visual styling**: left as a neutral admin-tool look — never revisited, no issue raised. Still open if you want to match Discord's dark theme colors, but non-blocking.
+- **Bridge shared-secret**: resolved as a single static token (`WEB_BRIDGE_SECRET`/`_DEV`, `wrangler secret put BRIDGE_SECRET`) — shipped this way in Phase B and carried through Phase D unchanged, no short-lived signed-token scheme was needed at this scale.
+- **DEV/PROD tunnel sharing**: resolved as fully separate tunnels — DEV keeps Cloudflare's free quick tunnel (a human restarts it by hand), PROD got a named tunnel (`bridge-prod.qapbot.uk`, Phase D) since it needs a stable hostname that survives unattended reboots.
 
 ---
 
