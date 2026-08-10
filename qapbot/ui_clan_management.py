@@ -811,7 +811,22 @@ class ClanManagementView(discord.ui.View):
         )
         member_clans_button.callback = self._on_config_manage_member_clans  # type: ignore[assignment]
         self.add_item(member_clans_button)  # type: ignore[arg-type]
-        
+
+        # Button 5 (row 3's last slot, Discord's per-row cap): Select Timezone — deliberately
+        # placed next to "Select Language" (project owner's explicit request, CWL_ROSTER_PLANNING_PLAN.md):
+        # a per-guild UTC-offset setting needed specifically because the CWL Management screen's
+        # monospaced table can't use Discord's native per-viewer <t:...> timestamp markup (not
+        # parsed inside code blocks at all) — this is the one place in the codebase that still
+        # needs a guild-wide time setting rather than per-viewer-local.
+        select_timezone_button = discord.ui.Button(
+            label=t('ui_components.basic_config.button_select_timezone', guild_id=guild_id_int),
+            style=discord.ButtonStyle.primary,
+            custom_id="config_select_timezone",
+            row=3
+        )
+        select_timezone_button.callback = self._on_select_timezone  # type: ignore[assignment]
+        self.add_item(select_timezone_button)  # type: ignore[arg-type]
+
         # Row 4: 2 activation buttons (secondary actions)
         # Button 1: Activate/Deactivate Registration Message
         guild_config = {}
@@ -2422,7 +2437,27 @@ class ClanManagementView(discord.ui.View):
         
         # Store the message so it can be deleted after applying
         language_config_view.config_message = msg
-    
+
+    async def _on_select_timezone(self, interaction: discord.Interaction) -> None:
+        """Open the UTC-offset configuration modal. Modals must be the interaction's first
+        response (unlike LanguageConfigurationView above, which opens via followup.send() after
+        deferring) — no defer() call here."""
+        if not await self._check_admin_permission(interaction):
+            return
+        if not interaction.guild:
+            return
+
+        from qapbot.cache_manager import CACHE
+
+        guild_id_str = str(interaction.guild.id)
+        current_offset = CACHE.server_config.get(guild_id_str, {}).get("timezone_offset_minutes", 0)
+        modal = TimezoneConfigurationModal(
+            clan_management_view=self,
+            guild_id=interaction.guild.id,
+            current_offset_minutes=current_offset,
+        )
+        await interaction.response.send_modal(modal)
+
     async def _on_select_threshold(self, interaction: discord.Interaction) -> None:
         """Open notification threshold configuration view."""
         if not await self._check_admin_permission(interaction):
@@ -2941,6 +2976,60 @@ class LanguageConfigurationView(discord.ui.View):
                 logging.debug("No permission to delete language config message")
             except Exception as e:
                 logging.error(f"Failed to delete language config message: {e}")
+
+
+class TimezoneConfigurationModal(discord.ui.Modal):
+    """Single-field UTC-offset picker, opened via "Select Timezone" next to "Select Language"
+    in Basic Config. Free-text TextInput rather than a Select/RadioGroup dropdown because
+    neither can hold every real-world UTC offset (Select caps at 25 options, RadioGroup at 10;
+    ~38 distinct offsets are in use today including half/quarter-hour ones like +5:30/+5:45).
+
+    This setting exists specifically for the CWL Management screen's monospaced clan table,
+    which can't use Discord's native per-viewer <t:...> timestamp markup — Discord doesn't parse
+    that markup inside a code block at all, regardless of format. Every other timestamp display
+    in the codebase still prefers native per-viewer markup over a guild-wide setting like this.
+    """
+
+    def __init__(self, clan_management_view: 'ClanManagementView', guild_id: int, current_offset_minutes: int):
+        from qapbot.i18n import t
+        from QBhelperfunctions import format_utc_offset
+
+        super().__init__(title=t('ui_components.basic_config.timezone_modal_title', guild_id=guild_id))
+        self.clan_management_view = clan_management_view
+        self.guild_id = guild_id
+
+        self.offset_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
+            label=t('ui_components.basic_config.timezone_modal_label', guild_id=guild_id),
+            placeholder="+0",
+            default=format_utc_offset(current_offset_minutes),
+            max_length=6,
+            required=True,
+        )
+        self.add_item(self.offset_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        from qapbot.cache_manager import CACHE
+        from qapbot.i18n import t
+        from QBhelperfunctions import parse_utc_offset
+
+        offset_minutes = parse_utc_offset(self.offset_input.value)
+        if offset_minutes is None:
+            await interaction.response.send_message(
+                t('ui_components.basic_config.timezone_invalid', guild_id=self.guild_id, user_id=str(interaction.user.id)),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        if not interaction.guild:
+            return
+
+        guild_id_str = str(self.guild_id)
+        config = CACHE.server_config.setdefault(guild_id_str, {})
+        config["timezone_offset_minutes"] = offset_minutes
+        await CACHE.persist_server_config(guild_id_str)
+
+        await self.clan_management_view._refresh_config_view(interaction)  # type: ignore[attr-defined]
 
 
 class NotificationThresholdConfigurationView(discord.ui.View):

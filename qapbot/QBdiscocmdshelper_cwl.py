@@ -14,13 +14,14 @@ shown in two places, per the plan's Phase 1 design.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import discord
 
 from qapbot.cache_manager import CACHE
 from qapbot.constants import CWL_LEAGUE_ORDER
+from QBhelperfunctions import format_utc_offset
 
 
 def cwl_league_rank(tier: Optional[str]) -> int:
@@ -33,6 +34,30 @@ def cwl_league_rank(tier: Optional[str]) -> int:
         return CWL_LEAGUE_ORDER.index(tier)
     except ValueError:
         return -1
+
+
+def cwl_start_at_compact(cwl_start_at: Optional[str], offset_minutes: int = 0) -> Optional[str]:
+    """Compact fixed "YY-MM-DD HH:MM" rendering of a stored UTC cwl_start_at, shifted by
+    offset_minutes (the guild's configured timezone_offset_minutes), or None if unset/
+    unparseable. Used by the CWL Management embed's monospaced clan table
+    (format_clan_management_cwl_management()), where a code-block table needs one consistent
+    column width/format for every row — incompatible with Discord's native per-viewer
+    <t:unix:style> markup (cwl_start_at_discord_timestamp() below), which Discord doesn't even
+    parse inside a code block in the first place, and whose rendered format Discord controls
+    (no style matches "YY-MM-DD HH:MM"). Since a single shared table can't show each viewer
+    their own local time, it shows the guild's one configured offset instead — a per-guild
+    setting (see the "Select Timezone" button next to "Select Language" in Basic Config) is a
+    deliberate exception to the CWL_CLAN_CONFIG_ACTIVITY_PLAN.md item 9 "never a guild-wide
+    timezone setting" decision, made necessary specifically by the code-block incompatibility
+    above — everywhere else in the codebase still prefers native per-viewer markup."""
+    if not cwl_start_at:
+        return None
+    try:
+        naive = datetime.strptime(cwl_start_at.rstrip("Z"), "%Y-%m-%dT%H:%M")
+    except ValueError:
+        return None
+    shifted = naive + timedelta(minutes=offset_minutes)
+    return shifted.strftime("%y-%m-%d %H:%M")
 
 
 def cwl_start_at_discord_timestamp(cwl_start_at: Optional[str], style: str = "f") -> Optional[str]:
@@ -218,22 +243,40 @@ async def format_clan_management_cwl_management(
     if not clans:
         clans_block = t('cwl.management.no_clans_configured', guild_id=guild_id_int)
     else:
-        lines = []
+        # Monospaced code-block table, not bullet lines (project owner's explicit "clean table
+        # like design" ask) — clan tag/"League"/"roster slots" text all dropped here to keep rows
+        # short enough for large families to fit on one screen. cwl_start_at_compact() (not the
+        # native <t:...> markup used elsewhere) renders a fixed "YY-MM-DD HH:MM", shifted by the
+        # guild's configured timezone_offset_minutes (Basic Config's "Select Timezone", next to
+        # "Select Language") — Discord doesn't parse <t:...> markup inside code blocks at all, so
+        # a code-block table can't use native per-viewer timestamps regardless of format.
+        offset_minutes = CACHE.server_config.get(str(guild_id_int), {}).get("timezone_offset_minutes", 0)
+        header_clan = t('cwl.management.table_header_clan', guild_id=guild_id_int)
+        header_tier = t('cwl.management.table_header_tier', guild_id=guild_id_int)
+        header_roster = t('cwl.management.table_header_roster', guild_id=guild_id_int)
+        header_start = f"{t('cwl.management.table_header_start', guild_id=guild_id_int)} (UTC{format_utc_offset(offset_minutes) if offset_minutes else ''})"
+
+        rows = []
         for clan in clans:
             clan_name = CACHE.get_clan_name(clan["clan_tag"], clan["clan_tag"])
             tier = _tier_for(clan) or t('cwl.management.tier_unset', guild_id=guild_id_int)
-            # Discord renders <t:unix:f> in each viewer's own local timezone automatically —
-            # see cwl_start_at_discord_timestamp()'s docstring.
+            tier_short = tier.replace(" League", "")
             start_display = (
-                cwl_start_at_discord_timestamp(clan.get("cwl_start_at"))
+                cwl_start_at_compact(clan.get("cwl_start_at"), offset_minutes)
                 or t('cwl.management.start_time_unset', guild_id=guild_id_int)
             )
-            lines.append(
-                f"• **{clan_name}** ({clan['clan_tag']}) — {tier}, "
-                f"{clan['roster_size']} {t('cwl.management.roster_slots', guild_id=guild_id_int)}, "
-                f"{t('cwl.management.start_label', guild_id=guild_id_int)}: {start_display}"
-            )
-        clans_block = "\n".join(lines)
+            rows.append((clan_name, tier_short, str(clan["roster_size"]), start_display))
+
+        name_w = max(len(header_clan), *(len(r[0]) for r in rows))
+        tier_w = max(len(header_tier), *(len(r[1]) for r in rows))
+        roster_w = max(len(header_roster), *(len(r[2]) for r in rows))
+
+        table_lines = [
+            f"{header_clan.ljust(name_w)}  {header_tier.ljust(tier_w)}  {header_roster.ljust(roster_w)}  {header_start}",
+        ]
+        for name, tier_short, roster, start_display in rows:
+            table_lines.append(f"{name.ljust(name_w)}  {tier_short.ljust(tier_w)}  {roster.ljust(roster_w)}  {start_display}")
+        clans_block = "```\n" + "\n".join(table_lines) + "\n```"
     embed.add_field(
         name=t('cwl.management.clans_block_title', guild_id=guild_id_int),
         value=clans_block,

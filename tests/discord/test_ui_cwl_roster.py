@@ -422,7 +422,7 @@ def test_resolve_selected_cwl_season_falls_back_without_persisted_selection():
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_format_clan_management_cwl_management_sorts_by_tier_and_uses_discord_timestamp(db):
+async def test_format_clan_management_cwl_management_sorts_by_tier_and_renders_compact_table(db):
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_management
 
@@ -448,8 +448,43 @@ async def test_format_clan_management_cwl_management_sorts_by_tier_and_uses_disc
     clans_field = next(f for f in embed.fields if "Clan" in f.name)
     # Champion (higher tier) must be listed before Bronze.
     assert clans_field.value.index("Champion Clan") < clans_field.value.index("Bronze Clan")
-    # Discord's native per-viewer timestamp markup, not a raw UTC string.
-    assert "<t:" in clans_field.value and ":f>" in clans_field.value
+    # Monospaced code-block table, not bullet lines.
+    assert clans_field.value.startswith("```") and clans_field.value.endswith("```")
+    # Clan tag dropped, "League" dropped from the per-clan tier value (but not the "League"
+    # column header itself), compact "YY-MM-DD HH:MM" start time (UTC by default).
+    assert "#CLAN1" not in clans_field.value and "#CLAN2" not in clans_field.value
+    assert "Champion League I" not in clans_field.value and "Bronze League III" not in clans_field.value
+    assert "Champion I" in clans_field.value
+    assert "CWL Start (UTC)" in clans_field.value
+    assert "26-05-01 08:00" in clans_field.value
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_format_clan_management_cwl_management_shifts_start_time_by_guild_offset(db):
+    """The table can't use Discord's native per-viewer <t:...> markup (not parsed inside code
+    blocks), so it falls back to the guild's one configured timezone_offset_minutes instead."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_management
+
+    await _seed_guild_and_clans(db, "6544", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha", "war_league": "Master League I"}}
+    CACHE.server_config["6544"] = {"timezone_offset_minutes": 330}  # UTC+5:30
+
+    event_id = db.create_cwl_event_sync("6544", "2026-05", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#CLAN1", "roster_size": 15, "cwl_start_at": "2026-05-01T10:00Z", "participating": True},
+    ])
+
+    guild = MagicMock()
+    guild.id = 6544
+
+    embed, _, _, _ = await format_clan_management_cwl_management(guild)
+
+    clans_field = next(f for f in embed.fields if "Clan" in f.name)
+    assert "CWL Start (UTC+5:30)" in clans_field.value
+    assert "26-05-01 15:30" in clans_field.value  # 10:00 UTC + 5:30
 
 
 # ---------------------------------------------------------------------------

@@ -113,6 +113,46 @@ def coc_player_profile_url(player_tag: str) -> str:
     return coc_deep_link("OpenPlayerProfile", player_tag)
 
 
+_UTC_OFFSET_PATTERN = re.compile(r'^([+-])(\d{1,2})(?::(\d{2}))?$')
+# Real-world UTC offsets in use today span -12:00 to +14:00 (UTC-12 "anywhere on Earth" through
+# Kiribati's UTC+14) — anything outside that range is a typo, not a real timezone.
+_UTC_OFFSET_MIN_MINUTES = -12 * 60
+_UTC_OFFSET_MAX_MINUTES = 14 * 60
+
+
+def parse_utc_offset(text: str) -> Optional[int]:
+    """Parse a free-typed UTC offset ("+2", "-5", "+5:30") into total minutes, or None if the
+    input doesn't match or falls outside the real-world -12:00..+14:00 range. Free text rather
+    than a Select/RadioGroup dropdown because neither can hold every real-world offset (Select
+    caps at 25 options, RadioGroup at 10; ~38 distinct offsets are in use today including
+    half/quarter-hour ones like +5:30 India, +5:45 Nepal, +12:45 Chatham Islands)."""
+    if not text:
+        return None
+    match = _UTC_OFFSET_PATTERN.match(text.strip())
+    if not match:
+        return None
+    sign, hours_str, minutes_str = match.groups()
+    minutes_part = int(minutes_str or 0)
+    if minutes_part >= 60:
+        return None
+    total = int(hours_str) * 60 + minutes_part
+    if sign == "-":
+        total = -total
+    if total < _UTC_OFFSET_MIN_MINUTES or total > _UTC_OFFSET_MAX_MINUTES:
+        return None
+    return total
+
+
+def format_utc_offset(offset_minutes: int) -> str:
+    """Render a UTC-offset minute count back as "+2", "-5", "+5:30" — the inverse of
+    parse_utc_offset(), used both to pre-fill the timezone config modal's current value and to
+    label the CWL Management table's "CWL Start (UTC+2)"-style column header."""
+    sign = "-" if offset_minutes < 0 else "+"
+    total = abs(offset_minutes)
+    hours, minutes = divmod(total, 60)
+    return f"{sign}{hours}:{minutes:02d}" if minutes else f"{sign}{hours}"
+
+
 def calculate_content_hash(content: str) -> str:
     """
     Calculate a SHA-256 hash of normalized leaderboard content for change detection.

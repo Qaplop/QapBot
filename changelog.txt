@@ -1,6 +1,19 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (6)
+- Added (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md items 13-14): rebuilt the CWL Management embed's
+  "Participating Clans" list as a monospaced code-block table (headers Clan/League/Roster/CWL
+  Start, clan tag dropped, "League" dropped from the tier, roster shown as a bare figure, start
+  time compact "YY-MM-DD HH:MM"). This required giving up the native <t:...> per-viewer
+  timestamp markup for this one spot — Discord doesn't parse it inside code blocks at all — so
+  added a new per-guild "Select Timezone" setting next to "Select Language" in Basic Config
+  (`guild_config.timezone_offset_minutes`, free-text UTC-offset entry via a new modal since
+  neither a Select (25-option cap) nor a RadioGroup (10-option cap) can hold every real-world
+  offset) and shift the table's times by it instead. 33 new tests across
+  tests/unit/test_utc_offset.py, tests/discord/test_ui_clan_management_timezone.py, and
+  tests/discord/test_ui_cwl_roster.py; 1706 total tests pass.
+
 2026-08-10 (5)
 - Added (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md item 11): the clan-config Activity's per-clan start
   time picker now also enforces a ceiling — no later than 48h after the season's official 1st-
