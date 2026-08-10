@@ -89,19 +89,31 @@
         background: #1e1f22;
         border: 1px solid #3f4147;
         border-radius: 4px;
-        padding: 8px;
+        padding: 6px 8px;
         cursor: grab;
       }
       .player-card.dragging { opacity: 0.4; }
-      .player-name { font-size: 0.85rem; margin-bottom: 6px; }
+      .player-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 5px;
+      }
+      .player-name {
+        font-size: 0.85rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
       .signup-badge {
         display: inline-block;
+        flex-shrink: 0;
         font-size: 0.7rem;
         padding: 2px 6px;
         border-radius: 3px;
         background: #3f4147;
         color: #949ba4;
-        margin-bottom: 6px;
       }
       .signup-badge.signup-confirmed { background: #1c3a2a; color: #23a55a; }
       .signup-badge.signup-pending { background: #3a3620; color: #e3b341; }
@@ -113,7 +125,7 @@
         color: #f2f3f5;
         border: none;
         border-radius: 4px;
-        padding: 5px 8px;
+        padding: 4px 8px;
         font-size: 0.75rem;
         cursor: pointer;
       }

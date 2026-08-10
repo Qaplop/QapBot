@@ -144,7 +144,10 @@ export function renderEnrollmentBoard(
     })
     card.addEventListener('dragend', () => card.classList.remove('dragging'))
 
-    const name = document.createElement('div')
+    const row = document.createElement('div')
+    row.className = 'player-row'
+
+    const name = document.createElement('span')
     name.className = 'player-name'
     name.textContent = displayName(player)
 
@@ -152,13 +155,15 @@ export function renderEnrollmentBoard(
     badge.className = `signup-badge signup-${player.signup_status ?? 'none'}`
     badge.textContent = statusLabel(player.signup_status)
 
+    row.append(name, badge)
+
     const enrolled = ENROLLED_STATUSES.has(player.signup_status ?? '')
     const actionButton = document.createElement('button')
     actionButton.className = 'signup-toggle'
     actionButton.textContent = enrolled ? 'Withdraw' : 'Confirm'
     actionButton.addEventListener('click', () => handleSignupToggle(player))
 
-    card.append(name, badge, actionButton)
+    card.append(row, actionButton)
     return card
   }
 

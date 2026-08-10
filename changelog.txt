@@ -1,6 +1,17 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (16)
+- Fixed (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", live-testing feedback on the board
+  shipped in slice 4): each player card's name and signup-status badge were stacked on separate
+  lines with a full-width action button beneath, making cards taller than necessary. Now on one
+  row — name left (truncates with an ellipsis if too long), badge right-aligned — same
+  Confirm/Withdraw button below. `activity/client/index.html`/`enrollmentBoard.ts` only; no
+  backend change. Also: the DEV deploy of `activity/client` (a separate Cloudflare Pages
+  project from the Worker deployed in slice 3) had never actually been pushed after slice 4
+  shipped — "Manage Assignment" was opening the old clan-config table until this was caught
+  live and `npm run deploy:dev` run for real.
+
 2026-08-10 (15)
 - Added (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", slice 5 of 5 — button consolidation):
   the CWL Management screen's row-3 slot that used to hold a fixed "Start Enrollment" button
