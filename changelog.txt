@@ -1,6 +1,12 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (4)
+- Fixed (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md): tightened the clan-config Activity table's row
+  height (`th`/`td` vertical padding 8px→4px, select/date-input padding 6px→3px and font-size
+  0.9rem→0.85rem, checkbox 18px→16px) so large clan families fit on one screen without
+  scrolling. Rebuilt/typechecked and redeployed to `cwl-clan-config-dev.pages.dev`.
+
 2026-08-10 (3)
 - Added (CWL_ROSTER_PLANNING_PLAN.md Phase 2, slice 2 of 4 — DM confirm/opt-out buttons +
   "Start Enrollment"): the "Start Enrollment" button on the CWL Management screen is now real
