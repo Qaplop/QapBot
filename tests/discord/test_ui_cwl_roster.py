@@ -244,9 +244,9 @@ def test_cwl_management_hub_view_constructs_with_toggle_buttons():
     from qapbot.ui_cwl_roster import CwlManagementHubView
 
     view = CwlManagementHubView()
-    assert len(view.children) == 2
+    assert len(view.children) == 3
     custom_ids = {c.custom_id for c in view.children}  # type: ignore[attr-defined]
-    assert custom_ids == {"cwl_hub_mode_settings", "cwl_hub_mode_management"}
+    assert custom_ids == {"cwl_hub_mode_settings", "cwl_hub_mode_management", "cwl_hub_refresh"}
 
 
 @pytest.mark.discord
@@ -259,6 +259,37 @@ def test_cwl_management_hub_view_holds_no_per_guild_instance_state():
     view = CwlManagementHubView()
     assert not hasattr(view, "mode")
     assert not hasattr(view, "message")
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_management_hub_view_refresh_button_rerenders_current_mode(monkeypatch):
+    """Last-resort manual fallback (2026-08-10) — clicking it must re-render whichever mode is
+    currently shown, not always default back to cwl_management."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlManagementHubView
+
+    CACHE.db_manager = None
+    CACHE.server_config["778"] = {}
+
+    interaction = MagicMock()
+    interaction.guild = MagicMock()
+    interaction.guild.id = 778
+    interaction.response = AsyncMock()
+
+    async def _always_admin(*args, **kwargs):
+        return True
+
+    import qapbot.ui_cwl_roster as ui_cwl_roster_module
+    monkeypatch.setattr(ui_cwl_roster_module, "_check_cwl_admin_permission", _always_admin)
+
+    view = CwlManagementHubView()
+    view._render = AsyncMock()  # type: ignore[method-assign]
+    refresh_button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_hub_refresh")
+
+    await refresh_button.callback(interaction)  # type: ignore[misc]
+
+    view._render.assert_awaited_once_with(interaction, "cwl_management")
 
 
 @pytest.mark.discord
@@ -1225,3 +1256,45 @@ def test_find_active_cwl_participation_returns_empty_without_db_manager():
 
     CACHE.db_manager = None
     assert find_active_cwl_participation("1", {"#CLAN1"}) == {}
+
+
+# ---------------------------------------------------------------------------
+# ClanManagementView.refresh_cwl_view — Hub auto-refresh (2026-08-10 fix)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_management_view_refresh_cwl_view_also_refreshes_the_hub(monkeypatch):
+    """A CWL change made through /clan management (entry point a) must not leave the anchored
+    CWL Management Hub message (entry point b) stale — this is the actual live-testing gap the
+    project owner reported."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper import format_clan_management_message
+    from qapbot.ui_clan_management import ClanManagementView
+
+    CACHE.server_config["9210"] = {}
+    CACHE.db_manager = None
+
+    guild = MagicMock()
+    guild.id = 9210
+    sent_message = AsyncMock(guild=guild)
+
+    view = ClanManagementView(
+        clan_tag="#CLAN1", guild_clans=["#CLAN1"], unlinked_players=[],
+        sent_message=sent_message, mode="cwl_management", timeout=300,
+    )
+
+    async def _fake_format(*args, **kwargs):
+        return MagicMock(), None, [], []
+
+    monkeypatch.setattr("qapbot.QBdiscocmdshelper.format_clan_management_message", _fake_format)
+
+    hub_refresh = AsyncMock()
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", hub_refresh)
+
+    interaction = MagicMock()
+    interaction.guild = guild
+
+    await view.refresh_cwl_view(interaction, "cwl_management")
+
+    hub_refresh.assert_awaited_once_with(9210, "cwl_management")

@@ -2319,6 +2319,13 @@ class ClanManagementView(discord.ui.View):
         The equivalent method on CwlManagementHubView (entry point b) resolves and edits that
         guild's anchored message directly instead, since that view is a single shared instance
         across every guild rather than one instance per open /clan management session.
+
+        Also pushes a refresh to the guild's anchored CWL Management Hub message (entry point b)
+        if one exists (2026-08-10 fix) — the two shells show the same underlying data, and a
+        change made through this one (entry point a) must not leave the other looking stale
+        until someone happens to click something on it. No-ops harmlessly if the guild has no
+        Hub message configured/tracked. Mirrors the same call the web bridge already makes after
+        an Activity save (web_bridge.py) and CwlManagementHubView's own self-refresh.
         """
         from qapbot.QBdiscocmdshelper import format_clan_management_message
 
@@ -2345,6 +2352,10 @@ class ClanManagementView(discord.ui.View):
             )
         except Exception as e:
             logging.error(f"Failed to refresh CWL view ({mode}): {e}")
+
+        if mode in ("cwl_settings", "cwl_management"):
+            from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+            await refresh_cwl_management_hub_message(interaction.guild.id, mode)
 
     async def _on_select_channels(self, interaction: discord.Interaction) -> None:
         """Open channel configuration view."""
@@ -4524,6 +4535,12 @@ class CwlLineupRemovalConfirmView(discord.ui.View):
             for clan_tag, event_season_pairs in self.cwl_conflicts.items():
                 for event_id, _season in event_season_pairs:
                     db.deactivate_cwl_event_clan_sync(event_id, clan_tag)
+
+        # The CWL Management Hub's "Participating Clans" table just lost one or more clans —
+        # push a refresh so it doesn't sit stale until someone happens to click it.
+        if self.cwl_conflicts and interaction.guild:
+            from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+            await refresh_cwl_management_hub_message(interaction.guild.id, "cwl_management")
 
         try:
             await interaction.delete_original_response()

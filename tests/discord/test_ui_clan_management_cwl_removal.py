@@ -173,6 +173,35 @@ async def test_confirm_view_yes_applies_and_deactivates_cwl_participation(db, mo
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_confirm_view_yes_refreshes_the_hub_message(db, mock_interaction, monkeypatch):
+    """The Hub's "Participating Clans" table just lost a clan — must not sit stale."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_clan_management import CwlLineupRemovalConfirmView
+
+    await _seed_guild_and_clan(db, "9306", "#CLAN1")
+    CACHE.db_manager = db
+    event_id = db.create_cwl_event_sync("9306", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    mock_interaction.guild.id = 9306
+
+    member_clans_view = MagicMock()
+    member_clans_view._apply_member_clans_changes = AsyncMock()
+
+    hub_refresh = AsyncMock()
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", hub_refresh)
+
+    confirm_view = CwlLineupRemovalConfirmView(
+        member_clans_view=member_clans_view,
+        cwl_conflicts={"#CLAN1": [(event_id, "2026-09")]},
+    )
+
+    await confirm_view._on_confirm(mock_interaction)
+
+    hub_refresh.assert_awaited_once_with(9306, "cwl_management")
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_confirm_view_cancel_applies_nothing(db, mock_interaction):
     from qapbot.cache_manager import CACHE
     from qapbot.ui_clan_management import CwlLineupRemovalConfirmView

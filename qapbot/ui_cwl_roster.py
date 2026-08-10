@@ -970,6 +970,27 @@ class CwlManagementHubView(discord.ui.View):
         management_button.callback = self._on_select_management  # type: ignore[assignment]
         self.add_item(management_button)
 
+        # Last-resort manual fallback (2026-08-10): most CWL-data changes now auto-refresh this
+        # Hub message on their own (see refresh_cwl_management_hub_message() call sites in
+        # ClanManagementView.refresh_cwl_view() / the web bridge / CwlLineupRemovalConfirmView),
+        # but this covers whatever edge case doesn't — or simply "I don't trust it, show me the
+        # current state" — same role ClanManagementView._add_refresh_button() plays there.
+        from qapbot.i18n import t
+
+        refresh_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('ui_components.clan_management.button_refresh', guild_id=None),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_hub_refresh",
+            row=0,
+        )
+        refresh_button.callback = self._make_refresh_callback(active_mode)  # type: ignore[assignment]
+        self.add_item(refresh_button)
+
+    def _make_refresh_callback(self, mode: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            await self._render(interaction, mode)
+        return callback
+
     async def _render(self, interaction: discord.Interaction, mode: str) -> None:
         if not await _check_cwl_admin_permission(interaction):
             return

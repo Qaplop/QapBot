@@ -1,6 +1,15 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (10)
+- Fixed (CWL_ROSTER_PLANNING_PLAN.md, a third live-testing gap): changes made via
+  `/clan management` (entry point a) never propagated to the anchored CWL Management Hub
+  message (entry point b) — each shell only refreshed itself. `ClanManagementView.refresh_cwl_view()`
+  and the new clan-removal cascade (`CwlLineupRemovalConfirmView._on_confirm()`) now both push a
+  Hub refresh too, the same call the web bridge already made after Activity saves. Also added a
+  manual "🔄 Refresh" button directly on the Hub message as a last-resort fallback. 3 new tests;
+  1698 total tests pass.
+
 2026-08-10 (9)
 - Fixed (CWL_ROSTER_PLANNING_PLAN.md, two live-testing gaps): "Start Enrollment" seeded zero
   signups for a clan with no tracked CWL war history, even though it had real, known members —
