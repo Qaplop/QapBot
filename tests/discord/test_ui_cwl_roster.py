@@ -461,16 +461,16 @@ async def test_format_clan_management_cwl_management_sorts_by_tier_and_renders_c
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_format_clan_management_cwl_management_shifts_start_time_by_guild_offset(db):
+async def test_format_clan_management_cwl_management_shifts_start_time_by_guild_timezone(db):
     """The table can't use Discord's native per-viewer <t:...> markup (not parsed inside code
-    blocks), so it falls back to the guild's one configured timezone_offset_minutes instead."""
+    blocks), so it falls back to the guild's one configured timezone_name instead."""
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_management
 
     await _seed_guild_and_clans(db, "6544", {"#CLAN1": "Alpha"})
     CACHE.db_manager = db
     CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha", "war_league": "Master League I"}}
-    CACHE.server_config["6544"] = {"timezone_offset_minutes": 330}  # UTC+5:30
+    CACHE.server_config["6544"] = {"timezone_name": "Asia/Kolkata"}  # fixed UTC+5:30, no DST
 
     event_id = db.create_cwl_event_sync("6544", "2026-05", "discordid1")
     db.set_cwl_event_clans_sync(event_id, [
@@ -483,8 +483,40 @@ async def test_format_clan_management_cwl_management_shifts_start_time_by_guild_
     embed, _, _, _ = await format_clan_management_cwl_management(guild)
 
     clans_field = next(f for f in embed.fields if "Clan" in f.name)
-    assert "CWL Start (UTC+5:30)" in clans_field.value
+    assert "CWL Start (Asia/Kolkata)" in clans_field.value
     assert "26-05-01 15:30" in clans_field.value  # 10:00 UTC + 5:30
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_format_clan_management_cwl_management_applies_dst_correctly(db):
+    """The whole point of a real IANA zone (over a raw UTC offset) is DST-awareness — a summer
+    start (CEST, UTC+2) and a winter start (CET, UTC+1) in the same zone must shift differently."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_management
+
+    await _seed_guild_and_clans(db, "6545", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {
+        "#CLAN1": {"name": "Alpha", "war_league": "Master League I"},
+        "#CLAN2": {"name": "Bravo", "war_league": "Master League I"},
+    }
+    CACHE.server_config["6545"] = {"timezone_name": "Europe/Berlin"}
+
+    event_id = db.create_cwl_event_sync("6545", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#CLAN1", "roster_size": 15, "cwl_start_at": "2026-09-01T10:00Z", "participating": True},  # CEST (+2)
+        {"clan_tag": "#CLAN2", "roster_size": 15, "cwl_start_at": "2026-11-01T10:00Z", "participating": True},  # CET (+1)
+    ])
+
+    guild = MagicMock()
+    guild.id = 6545
+
+    embed, _, _, _ = await format_clan_management_cwl_management(guild)
+
+    clans_field = next(f for f in embed.fields if "Clan" in f.name)
+    assert "26-09-01 12:00" in clans_field.value  # summer: UTC+2
+    assert "26-11-01 11:00" in clans_field.value  # winter: UTC+1
 
 
 # ---------------------------------------------------------------------------

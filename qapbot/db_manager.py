@@ -1696,7 +1696,7 @@ class WarHistoryDB:
                 cwl_management_message_last_bump_iso TEXT,
                 cwl_retention_months INTEGER NOT NULL DEFAULT 0,
                 cwl_selected_season TEXT,
-                timezone_offset_minutes INTEGER NOT NULL DEFAULT 0,
+                timezone_name TEXT NOT NULL DEFAULT 'UTC',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
@@ -1974,7 +1974,7 @@ class WarHistoryDB:
         await self._add_column_if_missing("guild_config", "cwl_management_message_last_bump_iso", "TEXT")
         await self._add_column_if_missing("guild_config", "cwl_retention_months", "INTEGER NOT NULL DEFAULT 0")
         await self._add_column_if_missing("guild_config", "cwl_selected_season", "TEXT")
-        await self._add_column_if_missing("guild_config", "timezone_offset_minutes", "INTEGER NOT NULL DEFAULT 0")
+        await self._add_column_if_missing("guild_config", "timezone_name", "TEXT NOT NULL DEFAULT 'UTC'")
         await self._add_column_if_missing("cwl_event_clans", "participating", "INTEGER NOT NULL DEFAULT 1")
 
         logging.debug("[DB-SCHEMA] Maindata schema created/verified")
@@ -5714,7 +5714,7 @@ class WarHistoryDB:
             "cwl_management_message_last_bump_iso": row["cwl_management_message_last_bump_iso"],
             "cwl_retention_months": row["cwl_retention_months"] if row["cwl_retention_months"] is not None else 0,
             "cwl_selected_season": row["cwl_selected_season"],
-            "timezone_offset_minutes": row["timezone_offset_minutes"] if row["timezone_offset_minutes"] is not None else 0,
+            "timezone_name": row["timezone_name"] if row["timezone_name"] is not None else "UTC",
         }
     
     async def save_guild_config(self, guild_id: str, config: Dict[str, Any]) -> None:
@@ -5758,7 +5758,7 @@ class WarHistoryDB:
                  cwl_hub_channel_id, cwl_hub_message_id, cwl_hub_message_enabled, cwl_hub_message_last_bump_iso,
                  cwl_management_channel_id, cwl_management_message_id, cwl_management_message_enabled,
                  cwl_management_message_last_bump_iso, cwl_retention_months, cwl_selected_season,
-                 timezone_offset_minutes)
+                 timezone_name)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     language = excluded.language,
@@ -5792,7 +5792,7 @@ class WarHistoryDB:
                     cwl_management_message_last_bump_iso = excluded.cwl_management_message_last_bump_iso,
                     cwl_retention_months = excluded.cwl_retention_months,
                     cwl_selected_season = excluded.cwl_selected_season,
-                    timezone_offset_minutes = excluded.timezone_offset_minutes
+                    timezone_name = excluded.timezone_name
             """, (
                 guild_id,
                 config.get("language", "en"),
@@ -5826,7 +5826,7 @@ class WarHistoryDB:
                 config.get("cwl_management_message_last_bump_iso"),
                 config.get("cwl_retention_months", 0),
                 config.get("cwl_selected_season"),
-                config.get("timezone_offset_minutes", 0),
+                config.get("timezone_name", "UTC"),
             ))
             
             # Delete existing member families and clans

@@ -4738,7 +4738,13 @@ async def _format_clan_management_config(guild: discord.Guild) -> Tuple[discord.
     
     # Format language block
     language_block = f"⠀\n{t('ui_components.basic_config.config_language_block', guild_id=guild_id_int, language_name=language_display)}"
-    
+
+    # Format timezone block — CWL Management's monospaced clan table can't use Discord's native
+    # per-viewer <t:...> timestamp markup (not parsed inside code blocks), so it falls back to
+    # this one guild-wide setting instead (see ui_clan_management.py's TimezoneConfigurationView).
+    current_timezone = guild_config.get("timezone_name", "UTC")
+    timezone_block = f"⠀\n{t('ui_components.basic_config.config_timezone_block', guild_id=guild_id_int, timezone_name=current_timezone)}"
+
     # Format registration message block
     registration_status_emoji = "🟢" if registration_enabled else "🔴"
     if registration_channel_id:
@@ -4862,7 +4868,13 @@ async def _format_clan_management_config(guild: discord.Guild) -> Tuple[discord.
         value=language_block,
         inline=False
     )
-    
+
+    embed.add_field(
+        name="",
+        value=timezone_block,
+        inline=False
+    )
+
     embed.add_field(
         name="",
         value=welcome_block,

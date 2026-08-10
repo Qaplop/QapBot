@@ -1,6 +1,20 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (7)
+- Changed (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md items 14-15): replaced the freshly-added free-text
+  UTC-offset timezone setting with a real IANA timezone picker (`guild_config.timezone_name`,
+  25 curated zones via a new `TimezoneConfigurationView` Select next to "Select Language" in
+  Basic Config) so European daylight-saving transitions shift the CWL Management table's times
+  correctly (stdlib `zoneinfo`, DST-aware by construction — a raw offset can't do this). The
+  offset-based columns/helpers from a few hours earlier today were deleted outright rather than
+  deprecated, since they were never live in PROD. Added `tzdata` to requirements.txt/venv — a
+  hard runtime dependency, since Windows (unlike Linux/the NAS) has no OS-level IANA tz database
+  and `zoneinfo` raises without it. Also added: a "🕒 Server Timezone: {name}" line in the Basic
+  Config embed, between the language and registration-message sections; and a dashed
+  header/data separator row in the CWL Management table, matching `/leaderboard`'s own
+  text-table style. All backend tests pass (1681, `not live`).
+
 2026-08-10 (6)
 - Added (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md items 13-14): rebuilt the CWL Management embed's
   "Participating Clans" list as a monospaced code-block table (headers Clan/League/Roster/CWL

@@ -2439,24 +2439,36 @@ class ClanManagementView(discord.ui.View):
         language_config_view.config_message = msg
 
     async def _on_select_timezone(self, interaction: discord.Interaction) -> None:
-        """Open the UTC-offset configuration modal. Modals must be the interaction's first
-        response (unlike LanguageConfigurationView above, which opens via followup.send() after
-        deferring) — no defer() call here."""
+        """Open timezone configuration view — same shape as _on_select_language above."""
         if not await self._check_admin_permission(interaction):
             return
-        if not interaction.guild:
-            return
+
+        await interaction.response.defer(thinking=False, ephemeral=False)
 
         from qapbot.cache_manager import CACHE
 
+        if not interaction.guild:
+            return
+
         guild_id_str = str(interaction.guild.id)
-        current_offset = CACHE.server_config.get(guild_id_str, {}).get("timezone_offset_minutes", 0)
-        modal = TimezoneConfigurationModal(
+        current_timezone = CACHE.server_config.get(guild_id_str, {}).get("timezone_name", "UTC")
+
+        timezone_config_view = TimezoneConfigurationView(
             clan_management_view=self,
             guild_id=interaction.guild.id,
-            current_offset_minutes=current_offset,
+            current_timezone=current_timezone,
+            timeout=300,
         )
-        await interaction.response.send_modal(modal)
+
+        header_msg = f"🕒 **Timezone Configuration**\n\nCurrent Timezone: **{current_timezone}**"
+
+        msg = await interaction.followup.send(
+            header_msg,
+            view=timezone_config_view,
+            ephemeral=True
+        )
+
+        timezone_config_view.config_message = msg
 
     async def _on_select_threshold(self, interaction: discord.Interaction) -> None:
         """Open notification threshold configuration view."""
@@ -2978,58 +2990,117 @@ class LanguageConfigurationView(discord.ui.View):
                 logging.error(f"Failed to delete language config message: {e}")
 
 
-class TimezoneConfigurationModal(discord.ui.Modal):
-    """Single-field UTC-offset picker, opened via "Select Timezone" next to "Select Language"
-    in Basic Config. Free-text TextInput rather than a Select/RadioGroup dropdown because
-    neither can hold every real-world UTC offset (Select caps at 25 options, RadioGroup at 10;
-    ~38 distinct offsets are in use today including half/quarter-hour ones like +5:30/+5:45).
+# Curated IANA zone list for the "Select Timezone" picker — real DST-aware zones (via stdlib
+# zoneinfo), not raw UTC offsets. Exactly 25 entries (discord.ui.Select's hard cap) spanning
+# every populated region; a RadioGroup (10-option cap) or a full ~400-zone IANA list (needs
+# pagination) were both considered and rejected as worse fits for a one-shot server setting.
+# Europe/Berlin covers CET/CEST for most of continental Europe (Germany, France, Italy, Spain,
+# Poland, etc. all share the same transition dates), per the project owner's explicit ask that
+# European daylight-saving shifts be handled correctly.
+COMMON_TIMEZONES: List[Tuple[str, str]] = [
+    ("UTC", "UTC"),
+    ("Europe/London", "London (GMT/BST)"),
+    ("Europe/Berlin", "Berlin/Paris/Rome/Madrid (CET/CEST)"),
+    ("Europe/Helsinki", "Helsinki/Athens (EET/EEST)"),
+    ("Europe/Moscow", "Moscow (MSK)"),
+    ("Europe/Istanbul", "Istanbul (TRT)"),
+    ("Africa/Cairo", "Cairo (EET)"),
+    ("Africa/Johannesburg", "Johannesburg (SAST)"),
+    ("Asia/Dubai", "Dubai (GST)"),
+    ("Asia/Kolkata", "Mumbai/Delhi (IST)"),
+    ("Asia/Dhaka", "Dhaka (+6)"),
+    ("Asia/Bangkok", "Bangkok (ICT)"),
+    ("Asia/Shanghai", "Beijing/Shanghai (CST)"),
+    ("Asia/Tokyo", "Tokyo (JST)"),
+    ("Asia/Seoul", "Seoul (KST)"),
+    ("Australia/Sydney", "Sydney (AEST/AEDT)"),
+    ("Australia/Perth", "Perth (AWST)"),
+    ("Pacific/Auckland", "Auckland (NZST/NZDT)"),
+    ("America/Sao_Paulo", "São Paulo (BRT)"),
+    ("America/New_York", "New York (EST/EDT)"),
+    ("America/Chicago", "Chicago (CST/CDT)"),
+    ("America/Denver", "Denver (MST/MDT)"),
+    ("America/Los_Angeles", "Los Angeles (PST/PDT)"),
+    ("America/Anchorage", "Anchorage (AKST/AKDT)"),
+    ("Pacific/Honolulu", "Honolulu (HST)"),
+]
+
+
+class TimezoneConfigurationView(discord.ui.View):
+    """Server-timezone picker, opened via "Select Timezone" next to "Select Language" in Basic
+    Config — same shape as LanguageConfigurationView above (a Select, auto-applies on pick).
 
     This setting exists specifically for the CWL Management screen's monospaced clan table,
     which can't use Discord's native per-viewer <t:...> timestamp markup — Discord doesn't parse
     that markup inside a code block at all, regardless of format. Every other timestamp display
     in the codebase still prefers native per-viewer markup over a guild-wide setting like this.
+    A real IANA zone (via stdlib zoneinfo, backed by the tzdata package on Windows) rather than a
+    raw UTC offset, so European daylight-saving transitions shift the displayed time correctly.
     """
 
-    def __init__(self, clan_management_view: 'ClanManagementView', guild_id: int, current_offset_minutes: int):
-        from qapbot.i18n import t
-        from QBhelperfunctions import format_utc_offset
-
-        super().__init__(title=t('ui_components.basic_config.timezone_modal_title', guild_id=guild_id))
+    def __init__(
+        self,
+        clan_management_view: 'ClanManagementView',
+        guild_id: int,
+        current_timezone: str = "UTC",
+        timeout: int = 300
+    ):
+        super().__init__(timeout=timeout)
         self.clan_management_view = clan_management_view
         self.guild_id = guild_id
+        self.selected_timezone = current_timezone
+        self.config_message: Optional[discord.Message] = None
 
-        self.offset_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
-            label=t('ui_components.basic_config.timezone_modal_label', guild_id=guild_id),
-            placeholder="+0",
-            default=format_utc_offset(current_offset_minutes),
-            max_length=6,
-            required=True,
-        )
-        self.add_item(self.offset_input)
+        self._add_timezone_select()
 
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        from qapbot.cache_manager import CACHE
+    def _add_timezone_select(self):
         from qapbot.i18n import t
-        from QBhelperfunctions import parse_utc_offset
 
-        offset_minutes = parse_utc_offset(self.offset_input.value)
-        if offset_minutes is None:
-            await interaction.response.send_message(
-                t('ui_components.basic_config.timezone_invalid', guild_id=self.guild_id, user_id=str(interaction.user.id)),
-                ephemeral=True,
-            )
-            return
+        options = [
+            discord.SelectOption(label=label, value=tz_id, default=(tz_id == self.selected_timezone))
+            for tz_id, label in COMMON_TIMEZONES
+        ]
 
+        timezone_select = discord.ui.Select(
+            placeholder=t('ui_components.basic_config.timezone_select_placeholder', guild_id=self.guild_id),
+            min_values=1,
+            max_values=1,
+            options=options,  # type: ignore[arg-type]
+            custom_id="config_timezone_select",
+            row=0
+        )
+        timezone_select.callback = self._on_timezone_select  # type: ignore[assignment]
+        self.add_item(timezone_select)  # type: ignore[arg-type]
+
+    async def _on_timezone_select(self, interaction: discord.Interaction) -> None:
+        """Handle timezone selection - auto-apply immediately."""
         await interaction.response.defer(thinking=False, ephemeral=False)
+
+        from qapbot.cache_manager import CACHE
+
         if not interaction.guild:
             return
 
-        guild_id_str = str(self.guild_id)
+        selected_timezone = interaction.data['values'][0]  # type: ignore[index]
+        self.selected_timezone = selected_timezone
+
+        guild_id_str = str(interaction.guild.id)
         config = CACHE.server_config.setdefault(guild_id_str, {})
-        config["timezone_offset_minutes"] = offset_minutes
+        config["timezone_name"] = selected_timezone
         await CACHE.persist_server_config(guild_id_str)
 
         await self.clan_management_view._refresh_config_view(interaction)  # type: ignore[attr-defined]
+
+        if self.config_message:
+            try:
+                await self.config_message.delete()
+                logging.info("Timezone config message deleted successfully")
+            except discord.NotFound:
+                logging.debug("Timezone config message already deleted")
+            except discord.Forbidden:
+                logging.debug("No permission to delete timezone config message")
+            except Exception as e:
+                logging.error(f"Failed to delete timezone config message: {e}")
 
 
 class NotificationThresholdConfigurationView(discord.ui.View):
