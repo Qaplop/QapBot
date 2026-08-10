@@ -1157,16 +1157,71 @@ class TestCwlSignupResponseButton:
 
 
 # ---------------------------------------------------------------------------
-# _resolve_template_season_for_event — Start Enrollment's template-season default
+# find_active_cwl_participation — the guild-clan-removal safety check
+# (CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10 fix)
 # ---------------------------------------------------------------------------
 
-def test_resolve_template_season_for_event_subtracts_one_month():
-    from qapbot.QBdiscocmdshelper_cwl import _resolve_template_season_for_event
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_find_active_cwl_participation_flags_participating_clan(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import find_active_cwl_participation
 
-    assert _resolve_template_season_for_event("2026-08") == "2026-07"
+    await _seed_guild_and_clans(db, "9201", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    event_id = db.create_cwl_event_sync("9201", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+
+    conflicts = find_active_cwl_participation("9201", {"#CLAN1"})
+    assert conflicts == {"#CLAN1": [(event_id, "2026-09")]}
 
 
-def test_resolve_template_season_for_event_rolls_over_year_boundary():
-    from qapbot.QBdiscocmdshelper_cwl import _resolve_template_season_for_event
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_find_active_cwl_participation_ignores_deactivated_clan(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import find_active_cwl_participation
 
-    assert _resolve_template_season_for_event("2026-01") == "2025-12"
+    await _seed_guild_and_clans(db, "9202", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    event_id = db.create_cwl_event_sync("9202", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": False}])
+
+    assert find_active_cwl_participation("9202", {"#CLAN1"}) == {}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_find_active_cwl_participation_ignores_cancelled_events(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import find_active_cwl_participation
+
+    await _seed_guild_and_clans(db, "9203", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    event_id = db.create_cwl_event_sync("9203", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    db.update_cwl_event_status_sync(event_id, "cancelled")
+
+    assert find_active_cwl_participation("9203", {"#CLAN1"}) == {}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_find_active_cwl_participation_no_conflict_for_unrelated_clan(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import find_active_cwl_participation
+
+    await _seed_guild_and_clans(db, "9204", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    event_id = db.create_cwl_event_sync("9204", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+
+    assert find_active_cwl_participation("9204", {"#CLAN2"}) == {}
+
+
+def test_find_active_cwl_participation_returns_empty_without_db_manager():
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import find_active_cwl_participation
+
+    CACHE.db_manager = None
+    assert find_active_cwl_participation("1", {"#CLAN1"}) == {}

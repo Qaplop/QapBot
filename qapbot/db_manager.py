@@ -2851,6 +2851,33 @@ class WarHistoryDB:
                 conn.rollback()
                 return False
 
+    def deactivate_cwl_event_clan_sync(self, event_id: int, clan_tag: str) -> bool:
+        """Mark one clan as no longer participating in one event — the cascade half of the
+        "clan removed from guild while still in the active CWL lineup" confirmation flow
+        (ui_clan_management.py's MemberClansConfigurationView). Narrower than
+        set_cwl_event_clans_sync() (which replaces the event's whole clan set): only flips
+        `participating`, leaving roster_size/cwl_start_at/target_league_rank/tier_order intact —
+        same "keep the row, just stop counting it" convention as manual deactivation."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "UPDATE cwl_event_clans SET participating = 0 WHERE event_id = ? AND clan_tag = ?",
+                        (event_id, clan_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] deactivate_cwl_event_clan_sync failed for event {event_id} clan {clan_tag}: {e}")
+                conn.rollback()
+                return False
+
     def get_cwl_event_clans_sync(self, event_id: int) -> List[Dict[str, Any]]:
         """Return an event's participating clans, ordered by tier (0 = highest tier first)."""
         import sqlite3
@@ -2927,20 +2954,24 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] get_previous_cwl_event_clans_sync failed for guild {guild_id}: {e}")
                 return []
 
-    def get_previous_cwl_participants_sync(
-        self, clan_tags: List[str], template_season: str
-    ) -> List[Dict[str, Any]]:
-        """Return the previous season's CWL participants for the given clans — the template-copy
-        seed for Phase 2's "Start Enrollment" action. One dict per player, sourced from
-        get_cwl_roster_sync() per clan (deduplicated by player_tag if the same account somehow
-        appears in more than one clan's most recent roster row) and cross-referenced in a single
-        batched query against user_players to resolve discord_id/verified/opt-out/preferred rank.
+    def get_current_clan_members_sync(self, clan_tags: List[str]) -> List[Dict[str, Any]]:
+        """Return every linked account currently tracked as a member of one of clan_tags — the
+        seed for Start Enrollment's signup pool (CWL_ROSTER_PLANNING_PLAN.md Phase 2, corrected
+        2026-08-10). Sourced from user_players.current_clan_tag (the bot's own live membership
+        tracking, kept fresh by the regular clan-data cycle — not a CoC API call here) rather
+        than from prior CWL war history (the original design, get_cwl_roster_sync-based): a clan
+        with no tracked CWL wars yet — brand new to the bot, or simply never played CWL before —
+        would otherwise seed zero signups even though it has real, known members today. A
+        departed member (current_clan_tag no longer matching) is correctly excluded, unlike a
+        "last season's roster" source would have included them.
 
-        Returns dicts with: player_tag, player_name, clan_tag, discord_id (None if unlinked),
-        verified (False if unlinked), cwl_permanent_optout, preferred_league_rank. Callers decide
-        what to do with opted-out/unlinked accounts (this function only resolves data, it does not
-        filter) — per the confirmed design, opt-out exclusion and DM-eligibility are Start
-        Enrollment's concerns, not this query's.
+        Returns one dict per player_tag: player_tag, player_name, clan_tag, discord_id (None if
+        the sentinel 'UNASSIGNED' or unset — no real linked account to DM), verified,
+        cwl_permanent_optout, preferred_league_rank. If the same player_tag is linked by more
+        than one Discord account (disputed ownership), the verified one wins. Callers decide what
+        to do with opted-out/unlinked accounts — this function only resolves data, it does not
+        filter, matching the same division of responsibility get_previous_cwl_participants_sync
+        (removed) used to have.
         """
         import sqlite3
 
@@ -2949,59 +2980,42 @@ class WarHistoryDB:
         if not clan_tags:
             return []
 
-        participants: List[Dict[str, Any]] = []
-        seen_player_tags: set = set()
-        for clan_tag in clan_tags:
-            for row in self.get_cwl_roster_sync(clan_tag, template_season):
-                player_tag = row["player_tag"]
-                if player_tag in seen_player_tags:
-                    continue
-                seen_player_tags.add(player_tag)
-                participants.append(
-                    {
-                        "player_tag": player_tag,
-                        "player_name": row["player_name"],
-                        "clan_tag": clan_tag,
-                        "discord_id": None,
-                        "verified": False,
-                        "cwl_permanent_optout": False,
-                        "preferred_league_rank": None,
-                    }
-                )
-        if not participants:
-            return participants
-
         with self._sync_conn() as conn:
             try:
-                placeholders = ",".join("?" for _ in participants)
+                placeholders = ",".join("?" for _ in clan_tags)
                 rows = conn.execute(
                     f"""
-                    SELECT player_tag, discord_id, verified, cwl_permanent_optout,
-                           cwl_default_preferred_league_rank
+                    SELECT player_tag, player_name, current_clan_tag, discord_id, verified,
+                           cwl_permanent_optout, cwl_default_preferred_league_rank
                     FROM user_players
-                    WHERE player_tag IN ({placeholders})
+                    WHERE current_clan_tag IN ({placeholders})
                     ORDER BY verified DESC
                     """,
-                    [p["player_tag"] for p in participants],
+                    clan_tags,
                 ).fetchall()
             except sqlite3.Error as e:
-                logging.error(f"[DB-QUERY-SYNC] get_previous_cwl_participants_sync failed: {e}")
-                return participants
+                logging.error(f"[DB-QUERY-SYNC] get_current_clan_members_sync failed: {e}")
+                return []
 
-        # ORDER BY verified DESC means the first row seen per player_tag is the verified one,
-        # if any exists — an unverified/disputed second linker never overwrites it.
-        linked_by_tag: Dict[str, sqlite3.Row] = {}
+        # ORDER BY verified DESC means the first row seen per player_tag is the verified one, if
+        # any exists — an unverified/disputed second linker never overwrites it.
+        members_by_tag: Dict[str, sqlite3.Row] = {}
         for row in rows:
-            linked_by_tag.setdefault(row["player_tag"], row)
+            members_by_tag.setdefault(row["player_tag"], row)
 
-        for participant in participants:
-            linked = linked_by_tag.get(participant["player_tag"])
-            if linked is not None:
-                participant["discord_id"] = linked["discord_id"]
-                participant["verified"] = bool(linked["verified"])
-                participant["cwl_permanent_optout"] = bool(linked["cwl_permanent_optout"])
-                participant["preferred_league_rank"] = linked["cwl_default_preferred_league_rank"]
-        return participants
+        members: List[Dict[str, Any]] = []
+        for player_tag, row in members_by_tag.items():
+            discord_id = row["discord_id"]
+            members.append({
+                "player_tag": player_tag,
+                "player_name": row["player_name"],
+                "clan_tag": row["current_clan_tag"],
+                "discord_id": discord_id if discord_id and discord_id != "UNASSIGNED" else None,
+                "verified": bool(row["verified"]),
+                "cwl_permanent_optout": bool(row["cwl_permanent_optout"]),
+                "preferred_league_rank": row["cwl_default_preferred_league_rank"],
+            })
+        return members
 
     def bulk_create_cwl_signups_sync(self, event_id: int, signups: List[Dict[str, Any]]) -> bool:
         """Bulk-insert cwl_signups rows for Start Enrollment's template-copy step. Idempotent via

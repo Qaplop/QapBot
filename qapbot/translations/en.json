@@ -391,6 +391,9 @@
       "button_toggle_clan_roles_disable": "🔴 Disable Clan Roles",
       "button_toggle_clan_roles_enable": "🟢 Enable Clan Roles",
       "button_member_clans": "⚔️ Member Clans",
+      "cwl_removal_conflict_prompt": "⚠️ This change removes the following clan(s), but they're still marked participating in an active CWL lineup:\n{clans}\n\nRemove them from the server **and** from the CWL lineup? This cannot be undone.",
+      "button_confirm_cwl_removal": "Yes, remove from server and CWL",
+      "button_cancel_cwl_removal": "Cancel — change nothing",
       "button_create_family": "➕ Create Family",
       "button_edit_family": "✏️ Edit Family",
       "button_delete_family": "🗑️ Delete Family"

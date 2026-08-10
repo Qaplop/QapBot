@@ -390,6 +390,9 @@
       "button_toggle_clan_roles_disable": "🔴 Clan-Rollen deaktivieren",
       "button_toggle_clan_roles_enable": "🟢 Clan-Rollen aktivieren",
       "button_member_clans": "⚔️ Mitglieds-Clans",
+      "cwl_removal_conflict_prompt": "⚠️ Diese Änderung entfernt folgende(n) Clan(s), die aber noch als teilnehmend in einer aktiven CWL-Saison markiert sind:\n{clans}\n\nSollen sie sowohl vom Server **als auch** aus der CWL-Aufstellung entfernt werden? Dies kann nicht rückgängig gemacht werden.",
+      "button_confirm_cwl_removal": "Ja, vom Server und aus der CWL entfernen",
+      "button_cancel_cwl_removal": "Abbrechen — nichts ändern",
       "button_create_family": "➕ Familie erstellen",
       "button_edit_family": "✏️ Familie bearbeiten",
       "button_delete_family": "🗑️ Familie löschen"

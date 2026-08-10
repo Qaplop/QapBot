@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (9)
+- Fixed (CWL_ROSTER_PLANNING_PLAN.md, two live-testing gaps): "Start Enrollment" seeded zero
+  signups for a clan with no tracked CWL war history, even though it had real, known members —
+  confirmed via direct DB inspection (the test clan had zero `is_cwl=1` war rows but 10 linked
+  `user_players` accounts). `start_cwl_enrollment()` now seeds from each participating clan's
+  *current* membership (`user_players.current_clan_tag`, new `get_current_clan_members_sync()`)
+  instead of last season's CWL war-attacker history — the now-unused
+  `get_previous_cwl_participants_sync()`/`_resolve_template_season_for_event()` were removed.
+  Separately: removing a clan from `/clan management`'s "Member Clans" (or a family covering it)
+  left it lingering in the CWL Management table with no warning at all. `MemberClansConfigurationView`
+  now blocks the *entire* removal behind a confirmation whenever a removed clan is still marked
+  participating in a non-cancelled CWL season (new `find_active_cwl_participation()`); confirming
+  applies the change and also deactivates the clan in every affected season (new
+  `deactivate_cwl_event_clan_sync()`), cancelling changes nothing at all. 21 new/rewritten tests
+  across `tests/unit/test_db_manager_cwl_roster.py`, `tests/integration/test_cwl_start_enrollment.py`,
+  `tests/discord/test_ui_cwl_roster.py`, and new `tests/discord/test_ui_clan_management_cwl_removal.py`.
+  1695 total tests pass.
+
 2026-08-10 (8)
 - Fixed (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md item 16): the CWL Management table's "CWL Start
   (Europe/Berlin)" header wrapped onto a second line inside Discord's code-block width, breaking

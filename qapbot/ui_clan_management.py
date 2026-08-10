@@ -4209,18 +4209,78 @@ class MemberClansConfigurationView(discord.ui.View):
         )
     
     async def _on_apply(self, interaction: discord.Interaction):
-        """Apply changes and save to cache."""
+        """Apply changes — but first, block the whole operation if it would remove a clan that's
+        still marked participating in an active (non-cancelled) CWL lineup, and let the admin
+        confirm or cancel entirely (CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10 fix: a live test
+        showed a removed clan lingering in the CWL Management table with no warning at all)."""
         await interaction.response.defer(thinking=False, ephemeral=True)
-        
+
         from qapbot.cache_manager import CACHE
-        from qapbot.QBdiscocmdshelper import format_clan_management_message
-        
+
         if not interaction.guild:
             return
-        
+
+        guild_id = str(interaction.guild.id)
+        old_member_clans: List[str] = list(CACHE.server_config.get(guild_id, {}).get("member_clans", []))
+        old_member_families: List[str] = list(CACHE.server_config.get(guild_id, {}).get("member_families", []))
+
+        new_clans_set = set(self.member_clans)
+        old_clans_set = set(old_member_clans)
+        new_families_set = set(self.member_families)
+        old_families_set = set(old_member_families)
+
+        still_covered: set[str] = set(new_clans_set)
+        for kept_family_id in new_families_set:
+            still_covered.update(CACHE.clan_families.get(kept_family_id, {}).get("clans", []))
+
+        removed_tags: set[str] = (old_clans_set - new_clans_set) - still_covered
+        for removed_family_id in old_families_set - new_families_set:
+            for clan_tag in CACHE.clan_families.get(removed_family_id, {}).get("clans", []):
+                if clan_tag not in still_covered:
+                    removed_tags.add(clan_tag)
+
+        cwl_conflicts: Dict[str, List[Any]] = {}
+        if removed_tags:
+            from qapbot.QBdiscocmdshelper_cwl import find_active_cwl_participation
+            cwl_conflicts = find_active_cwl_participation(guild_id, removed_tags)  # type: ignore[assignment]
+
+        if cwl_conflicts:
+            from qapbot.i18n import t
+
+            lines = [
+                f"• {CACHE.get_clan_name(tag, tag)} ({tag}) — {', '.join(season for _, season in pairs)}"  # type: ignore[union-attr]
+                for tag, pairs in cwl_conflicts.items()
+            ]
+            confirm_view = CwlLineupRemovalConfirmView(
+                member_clans_view=self,
+                cwl_conflicts=cwl_conflicts,
+            )
+            await interaction.followup.send(
+                t(
+                    'ui_components.clan_management.cwl_removal_conflict_prompt',
+                    guild_id=interaction.guild.id,
+                    clans="\n".join(lines),
+                ),
+                view=confirm_view,
+                ephemeral=True,
+            )
+            return
+
+        await self._apply_member_clans_changes(interaction)
+
+    async def _apply_member_clans_changes(self, interaction: discord.Interaction):
+        """The actual apply (unchanged from the original single-method _on_apply) — called
+        directly when there's no CWL conflict, or from CwlLineupRemovalConfirmView after the
+        admin explicitly confirms one."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.QBdiscocmdshelper import format_clan_management_message
+
+        if not interaction.guild:
+            return
+
         try:
             guild_id = str(interaction.guild.id)
-            
+
             # Capture old clan/family lists before updating (for clan-role sync)
             old_member_clans: List[str] = list(CACHE.server_config.get(guild_id, {}).get("member_clans", []))
             old_member_families: List[str] = list(CACHE.server_config.get(guild_id, {}).get("member_families", []))
@@ -4412,6 +4472,71 @@ class MemberClansConfigurationView(discord.ui.View):
             error_msg = t('ui_components.errors.error_saving_configuration', user_id=user_id, guild_id=guild_id)
             await interaction.followup.send(error_msg, ephemeral=True)
             logging.error(f"Error saving member clans configuration: {e}", exc_info=True)
+
+
+class CwlLineupRemovalConfirmView(discord.ui.View):
+    """Shown when MemberClansConfigurationView._on_apply() detects the pending clan/family
+    removal would drop a clan that's still marked participating in an active CWL lineup.
+    Confirm applies the member-clan change AND deactivates the clan in every affected
+    cwl_events row; Cancel aborts the whole operation — nothing is applied at all, per the
+    project owner's explicit choice (over the alternative of applying the guild-membership
+    change regardless and only asking about the CWL cleanup separately)."""
+
+    def __init__(
+        self,
+        member_clans_view: 'MemberClansConfigurationView',
+        cwl_conflicts: Dict[str, List[Any]],
+        timeout: int = 60,
+    ):
+        super().__init__(timeout=timeout)
+        self.member_clans_view = member_clans_view
+        self.cwl_conflicts = cwl_conflicts
+
+        from qapbot.i18n import t
+
+        guild_id = member_clans_view.clan_management_view.sent_message.guild.id if member_clans_view.clan_management_view.sent_message and member_clans_view.clan_management_view.sent_message.guild else None
+
+        confirm_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('ui_components.clan_management.button_confirm_cwl_removal', guild_id=guild_id),
+            style=discord.ButtonStyle.danger,
+            custom_id="cwl_removal_conflict_confirm",
+        )
+        confirm_button.callback = self._on_confirm  # type: ignore[assignment]
+        self.add_item(confirm_button)
+
+        cancel_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('ui_components.clan_management.button_cancel_cwl_removal', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_removal_conflict_cancel",
+        )
+        cancel_button.callback = self._on_cancel  # type: ignore[assignment]
+        self.add_item(cancel_button)
+
+    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=True)
+
+        from qapbot.cache_manager import CACHE
+
+        await self.member_clans_view._apply_member_clans_changes(interaction)
+
+        db = CACHE.db_manager
+        if db is not None:
+            for clan_tag, event_season_pairs in self.cwl_conflicts.items():
+                for event_id, _season in event_season_pairs:
+                    db.deactivate_cwl_event_clan_sync(event_id, clan_tag)
+
+        try:
+            await interaction.delete_original_response()
+        except discord.NotFound:
+            pass
+
+    async def _on_cancel(self, interaction: discord.Interaction) -> None:
+        """Aborts the whole operation — the member-clan/family change is never applied."""
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        try:
+            await interaction.delete_original_response()
+        except discord.NotFound:
+            pass
 
 
 class CreateFamilyModal(discord.ui.Modal, title="Create Clan Family"):

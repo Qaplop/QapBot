@@ -28,31 +28,6 @@ async def _seed_guild_and_clan(db: WarHistoryDB, guild_id: str = "111", clan_tag
     await db.conn.commit()
 
 
-async def _seed_cwl_roster_war(
-    db: WarHistoryDB, clan_tag: str, cwl_season: str, players: list, war_id: str = None,
-) -> None:
-    """Seed a minimal war_summary + war_attacks pair so get_cwl_roster_sync (and therefore
-    get_previous_cwl_participants_sync) has something to read. players: list of
-    (player_tag, player_name, th_level, map_position) tuples."""
-    war_id = war_id or f"war_{clan_tag}_{cwl_season}"
-    await db.conn.execute(
-        """
-        INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date)
-        VALUES (?, ?, ?, 1, ?, ?)
-        """,
-        (war_id, clan_tag, "#OPP", cwl_season, "2026-08-01 08:00:00"),
-    )
-    for player_tag, player_name, th_level, map_position in players:
-        await db.conn.execute(
-            """
-            INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-            """,
-            (war_id, clan_tag, "2026-08-01 08:00:00", player_name, player_tag, th_level, map_position),
-        )
-    await db.conn.commit()
-
-
 async def _seed_user_player(
     db: WarHistoryDB,
     discord_id: str,
@@ -61,15 +36,16 @@ async def _seed_user_player(
     verified: bool = True,
     cwl_permanent_optout: bool = False,
     cwl_default_preferred_league_rank: str = None,
+    current_clan_tag: str = None,
 ) -> None:
     await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
     await db.conn.execute(
         """
         INSERT INTO user_players
-            (discord_id, player_tag, player_name, verified, cwl_permanent_optout, cwl_default_preferred_league_rank)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (discord_id, player_tag, player_name, verified, cwl_permanent_optout, cwl_default_preferred_league_rank, current_clan_tag)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (discord_id, player_tag, player_name, 1 if verified else 0, 1 if cwl_permanent_optout else 0, cwl_default_preferred_league_rank),
+        (discord_id, player_tag, player_name, 1 if verified else 0, 1 if cwl_permanent_optout else 0, cwl_default_preferred_league_rank, current_clan_tag),
     )
     await db.conn.commit()
 
@@ -141,6 +117,31 @@ class TestCwlEventClans:
         assert [c["clan_tag"] for c in clans] == ["#CLAN1", "#CLAN2"]  # ordered by tier_order
         assert clans[0]["roster_size"] == 15
         assert clans[1]["roster_size"] == 30
+
+    @pytest.mark.integration
+    async def test_deactivate_cwl_event_clan_sync_flips_participating_only(self, db):
+        """Narrower than set_cwl_event_clans_sync (which replaces the whole set) — must leave
+        roster_size/tier_order/cwl_start_at untouched, only participating flips."""
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [
+            {"clan_tag": "#CLAN1", "roster_size": 30, "tier_order": 2, "cwl_start_at": "2026-08-01T08:00Z", "participating": True},
+        ])
+
+        assert db.deactivate_cwl_event_clan_sync(event_id, "#CLAN1") is True
+
+        clan = db.get_cwl_event_clans_sync(event_id)[0]
+        assert clan["participating"] == 0
+        assert clan["roster_size"] == 30
+        assert clan["tier_order"] == 2
+        assert clan["cwl_start_at"] == "2026-08-01T08:00Z"
+
+    @pytest.mark.integration
+    async def test_deactivate_cwl_event_clan_sync_nonexistent_row_is_a_noop(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
+        assert db.deactivate_cwl_event_clan_sync(event_id, "#NEVER") is True
+        assert db.get_cwl_event_clans_sync(event_id) == []
 
     @pytest.mark.integration
     async def test_set_event_clans_replaces_not_appends(self, db):
@@ -390,73 +391,92 @@ class TestCwlSignupsCrud:
         assert db.get_cwl_signup_sync(event_id, "#NOPE") is None
 
 
-class TestGetPreviousCwlParticipants:
-    @pytest.mark.integration
-    async def test_returns_empty_for_no_clans(self, db):
-        assert db.get_previous_cwl_participants_sync([], "2026-07") == []
+class TestGetCurrentClanMembers:
+    """get_current_clan_members_sync() replaced get_previous_cwl_participants_sync() on
+    2026-08-10 after a live DEV test showed Start Enrollment seeding zero signups for a clan
+    with no tracked CWL war history — current membership (user_players.current_clan_tag) is the
+    right source, not last season's CWL attacker list."""
 
     @pytest.mark.integration
-    async def test_returns_empty_when_no_roster_data_exists(self, db):
+    async def test_returns_empty_for_no_clans(self, db):
+        assert db.get_current_clan_members_sync([]) == []
+
+    @pytest.mark.integration
+    async def test_returns_empty_when_no_members_tracked(self, db):
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
-        assert db.get_previous_cwl_participants_sync(["#CLAN1"], "2026-07") == []
+        assert db.get_current_clan_members_sync(["#CLAN1"]) == []
 
     @pytest.mark.integration
     async def test_resolves_linked_discord_id_and_preferences(self, db):
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
-        await _seed_cwl_roster_war(db, "#CLAN1", "2026-07", [("#P1", "Alpha", 15, 1)])
-        await _seed_user_player(db, "d1", "#P1", cwl_default_preferred_league_rank="Champion League I")
+        await _seed_user_player(
+            db, "d1", "#P1", cwl_default_preferred_league_rank="Champion League I",
+            current_clan_tag="#CLAN1",
+        )
 
-        participants = db.get_previous_cwl_participants_sync(["#CLAN1"], "2026-07")
-        assert len(participants) == 1
-        p = participants[0]
-        assert p["player_tag"] == "#P1"
-        assert p["clan_tag"] == "#CLAN1"
-        assert p["discord_id"] == "d1"
-        assert p["verified"] is True
-        assert p["cwl_permanent_optout"] is False
-        assert p["preferred_league_rank"] == "Champion League I"
+        members = db.get_current_clan_members_sync(["#CLAN1"])
+        assert len(members) == 1
+        m = members[0]
+        assert m["player_tag"] == "#P1"
+        assert m["clan_tag"] == "#CLAN1"
+        assert m["discord_id"] == "d1"
+        assert m["verified"] is True
+        assert m["cwl_permanent_optout"] is False
+        assert m["preferred_league_rank"] == "Champion League I"
 
     @pytest.mark.integration
-    async def test_unlinked_player_has_none_discord_id(self, db):
+    async def test_unassigned_sentinel_has_none_discord_id(self, db):
+        """The 'UNASSIGNED' discord_id is the bot's own placeholder for a tracked-but-unlinked
+        account (QBdiscocmdshelper.py) — not a real Discord user, must resolve to None so
+        start_cwl_enrollment() correctly counts it as skipped_unlinked rather than trying to DM
+        the literal string 'UNASSIGNED'."""
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
-        await _seed_cwl_roster_war(db, "#CLAN1", "2026-07", [("#P1", "Alpha", 15, 1)])
+        await _seed_user_player(db, "UNASSIGNED", "#P1", verified=False, current_clan_tag="#CLAN1")
 
-        participants = db.get_previous_cwl_participants_sync(["#CLAN1"], "2026-07")
-        assert len(participants) == 1
-        assert participants[0]["discord_id"] is None
-        assert participants[0]["verified"] is False
-        assert participants[0]["cwl_permanent_optout"] is False
+        members = db.get_current_clan_members_sync(["#CLAN1"])
+        assert len(members) == 1
+        assert members[0]["discord_id"] is None
 
     @pytest.mark.integration
-    async def test_dedups_player_appearing_in_multiple_clans_rosters(self, db):
+    async def test_departed_member_is_excluded(self, db):
+        """A player whose current_clan_tag no longer matches (they left, or the bot's tracking
+        moved them elsewhere) must not show up — unlike a "last season's roster" source, which
+        would have kept including them after they left."""
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
         await _seed_guild_and_clan(db, guild_id="111", clan_tag="#CLAN2")
-        await _seed_cwl_roster_war(db, "#CLAN1", "2026-07", [("#P1", "Alpha", 15, 1)])
-        await _seed_cwl_roster_war(db, "#CLAN2", "2026-07", [("#P1", "Alpha", 15, 1)])
+        await _seed_user_player(db, "d1", "#P1", current_clan_tag="#CLAN2")  # now in a different clan
 
-        participants = db.get_previous_cwl_participants_sync(["#CLAN1", "#CLAN2"], "2026-07")
-        assert len(participants) == 1
-        assert participants[0]["clan_tag"] == "#CLAN1"  # first clan in the list wins
+        assert db.get_current_clan_members_sync(["#CLAN1"]) == []
+        assert len(db.get_current_clan_members_sync(["#CLAN2"])) == 1
 
     @pytest.mark.integration
     async def test_prefers_verified_link_when_multiple_accounts_claim_the_same_tag(self, db):
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
-        await _seed_cwl_roster_war(db, "#CLAN1", "2026-07", [("#P1", "Alpha", 15, 1)])
-        await _seed_user_player(db, "d_unverified", "#P1", verified=False)
-        await _seed_user_player(db, "d_verified", "#P1", verified=True)
+        await _seed_user_player(db, "d_unverified", "#P1", verified=False, current_clan_tag="#CLAN1")
+        await _seed_user_player(db, "d_verified", "#P1", verified=True, current_clan_tag="#CLAN1")
 
-        participants = db.get_previous_cwl_participants_sync(["#CLAN1"], "2026-07")
-        assert participants[0]["discord_id"] == "d_verified"
-        assert participants[0]["verified"] is True
+        members = db.get_current_clan_members_sync(["#CLAN1"])
+        assert len(members) == 1
+        assert members[0]["discord_id"] == "d_verified"
+        assert members[0]["verified"] is True
 
     @pytest.mark.integration
     async def test_permanent_optout_is_surfaced_not_filtered(self, db):
-        """This query only resolves data — filtering opted-out accounts out of the
-        template copy is Start Enrollment's responsibility, not this query's."""
+        """This query only resolves data — filtering opted-out accounts out of the seed pool
+        is Start Enrollment's responsibility, not this query's."""
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
-        await _seed_cwl_roster_war(db, "#CLAN1", "2026-07", [("#P1", "Alpha", 15, 1)])
-        await _seed_user_player(db, "d1", "#P1", cwl_permanent_optout=True)
+        await _seed_user_player(db, "d1", "#P1", cwl_permanent_optout=True, current_clan_tag="#CLAN1")
 
-        participants = db.get_previous_cwl_participants_sync(["#CLAN1"], "2026-07")
-        assert len(participants) == 1
-        assert participants[0]["cwl_permanent_optout"] is True
+        members = db.get_current_clan_members_sync(["#CLAN1"])
+        assert len(members) == 1
+        assert members[0]["cwl_permanent_optout"] is True
+
+    @pytest.mark.integration
+    async def test_multiple_members_across_multiple_clans(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_guild_and_clan(db, guild_id="111", clan_tag="#CLAN2")
+        await _seed_user_player(db, "d1", "#P1", current_clan_tag="#CLAN1")
+        await _seed_user_player(db, "d2", "#P2", current_clan_tag="#CLAN2")
+
+        members = db.get_current_clan_members_sync(["#CLAN1", "#CLAN2"])
+        assert {m["player_tag"] for m in members} == {"#P1", "#P2"}

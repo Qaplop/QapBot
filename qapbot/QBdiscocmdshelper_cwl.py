@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import discord
@@ -155,6 +155,34 @@ def get_current_cwl_event_sync(guild_id: int) -> Optional[Dict[str, Any]]:
             if event["status"] == status:
                 return event
     return events[0]  # list_cwl_events_sync already orders by cwl_season DESC
+
+
+def find_active_cwl_participation(
+    guild_id: str, clan_tags: Iterable[str]
+) -> Dict[str, List[Tuple[int, str]]]:
+    """For each clan_tag in clan_tags, return the (event_id, cwl_season) pairs — of this guild's
+    non-cancelled cwl_events — where it's currently marked participating. The safety check behind
+    MemberClansConfigurationView's "you're about to remove a clan that's still in an active CWL
+    lineup" confirmation (ui_clan_management.py): the event_id lets the confirm view deactivate
+    the clan there too (deactivate_cwl_event_clan_sync) without a second lookup, and the season
+    string is what gets shown to the admin. A clan absent from the returned dict has no
+    active-CWL entanglement and can be removed from the guild without touching cwl_event_clans at
+    all. "Non-cancelled" deliberately includes announced/finalized events too, not just
+    draft/signup_open — an admin removing a clan after assignments were made or DMs were sent
+    still needs to know, even though nothing downstream currently acts on 'finalized'/'announced'
+    (those phases aren't built yet)."""
+    db = CACHE.db_manager
+    if db is None or not clan_tags:
+        return {}
+    clan_tag_set = set(clan_tags)
+    conflicts: Dict[str, List[Tuple[int, str]]] = {}
+    for event in db.list_cwl_events_sync(str(guild_id)):
+        if event["status"] == "cancelled":
+            continue
+        for clan in db.get_cwl_event_clans_sync(event["id"]):
+            if clan["clan_tag"] in clan_tag_set and clan.get("participating", 1):
+                conflicts.setdefault(clan["clan_tag"], []).append((event["id"], event["cwl_season"]))
+    return conflicts
 
 
 async def format_clan_management_cwl_settings(
@@ -328,29 +356,19 @@ async def format_clan_management_cwl_management(
     return embed, None, [], []
 
 
-def _resolve_template_season_for_event(current_season: str) -> Optional[str]:
-    """The season Start Enrollment copies as a template: the calendar month immediately before
-    current_season ("YYYY-MM"). CWL is played every month regardless of whether a cwl_events
-    planning row exists for it — war_summary/war_attacks are populated by the bot's regular war-
-    tracking cycle, independent of this feature — so "last calendar month" is the right template
-    source, not "this guild's most recent prior cwl_events row" (which could be many months
-    stale, or simply never used the bot for planning before)."""
-    try:
-        year_str, month_str = current_season.split("-")
-        year, month = int(year_str), int(month_str)
-    except (ValueError, AttributeError):
-        return None
-    if month == 1:
-        return f"{year - 1}-12"
-    return f"{year}-{month - 1:02d}"
-
-
 async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     """The single "Start Enrollment" admin action (CWL_ROSTER_PLANNING_PLAN.md Phase 2): seeds
-    cwl_signups from last season's roster, sends the confirm/opt-out DM blast to every resolved
-    account, and transitions the event draft -> signup_open. Re-fetches the event fresh by
-    guild_id+season rather than trusting a caller-held event dict/id, matching the re-read
-    discipline used everywhere else in this feature for actions gated behind a confirmation step.
+    cwl_signups from the participating clans' *current* membership, sends the confirm/opt-out DM
+    blast to every resolved account, and transitions the event draft -> signup_open. Re-fetches
+    the event fresh by guild_id+season rather than trusting a caller-held event dict/id, matching
+    the re-read discipline used everywhere else in this feature for actions gated behind a
+    confirmation step.
+
+    Corrected 2026-08-10 (live-tested in DEV): the original design seeded from last season's CWL
+    war-attacker history (get_previous_cwl_participants_sync, since removed) — a clan with no
+    tracked CWL wars yet (new to the bot, or simply hasn't played CWL before) seeded zero signups
+    even though it has real, known members today. Now seeds from get_current_clan_members_sync()
+    (user_players.current_clan_tag) instead — "who's actually in this clan right now."
 
     Returns a summary dict the caller renders back to the admin: ok, error (reason string if not
     ok), seeded (signup rows created), contacted (DMs actually sent), skipped_optout,
@@ -390,11 +408,7 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
         summary["error"] = "no_clans"
         return summary
 
-    template_season = _resolve_template_season_for_event(event["cwl_season"])
-    participants = (
-        db.get_previous_cwl_participants_sync(participating_clan_tags, template_season)
-        if template_season else []
-    )
+    participants = db.get_current_clan_members_sync(participating_clan_tags)
 
     signups_to_create: List[Dict[str, Any]] = []
     dm_targets: List[Dict[str, Any]] = []

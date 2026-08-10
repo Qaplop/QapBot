@@ -1,6 +1,12 @@
 """Tests for start_cwl_enrollment() (CWL_ROSTER_PLANNING_PLAN.md Phase 2, slice 2):
-the template-copy seed, the confirm/opt-out DM blast, the DEV-mode DM recipient guard
-(operational directive added 2026-08-10), and the draft -> signup_open transition.
+seeding from participating clans' current membership, the confirm/opt-out DM blast, the
+DEV-mode DM recipient guard (operational directive added 2026-08-10), and the draft ->
+signup_open transition.
+
+Corrected 2026-08-10: the seed source was originally last season's CWL war-attacker history
+(get_previous_cwl_participants_sync) — a live DEV test showed this seeds zero signups for any
+clan with no tracked CWL wars yet, even with real known members. Now seeds from
+user_players.current_clan_tag (get_current_clan_members_sync) instead.
 """
 from __future__ import annotations
 
@@ -32,28 +38,15 @@ async def _seed_guild_and_clan(db: WarHistoryDB, guild_id: str, clan_tag: str = 
     await db.conn.commit()
 
 
-async def _seed_cwl_roster_war(db: WarHistoryDB, clan_tag: str, cwl_season: str, players) -> None:
-    war_id = f"war_{clan_tag}_{cwl_season}"
-    await db.conn.execute(
-        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) VALUES (?, ?, ?, 1, ?, ?)",
-        (war_id, clan_tag, "#OPP", cwl_season, "2026-07-01 08:00:00"),
-    )
-    for player_tag, player_name, th_level, map_position in players:
-        await db.conn.execute(
-            "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
-            (war_id, clan_tag, "2026-07-01 08:00:00", player_name, player_tag, th_level, map_position),
-        )
-    await db.conn.commit()
-
-
-async def _seed_user_player(
-    db: WarHistoryDB, discord_id: str, player_tag: str, verified: bool = True, cwl_permanent_optout: bool = False,
+async def _seed_current_clan_member(
+    db: WarHistoryDB, discord_id: str, player_tag: str, clan_tag: str = "#CLAN1",
+    verified: bool = True, cwl_permanent_optout: bool = False,
 ) -> None:
     await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
     await db.conn.execute(
-        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, cwl_permanent_optout) VALUES (?, ?, ?, ?, ?)",
-        (discord_id, player_tag, "Player", 1 if verified else 0, 1 if cwl_permanent_optout else 0),
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, cwl_permanent_optout, current_clan_tag) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (discord_id, player_tag, "Player", 1 if verified else 0, 1 if cwl_permanent_optout else 0, clan_tag),
     )
     await db.conn.commit()
 
@@ -105,7 +98,7 @@ async def test_rejects_when_no_participating_clans(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_no_prior_season_still_opens_enrollment_with_zero_seeded(db, monkeypatch):
+async def test_no_tracked_members_still_opens_enrollment_with_zero_seeded(db, monkeypatch):
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
 
@@ -132,9 +125,8 @@ async def test_seeds_signups_and_dms_linked_confirmed_accounts(db, monkeypatch):
 
     await _seed_guild_and_clan(db, "1005")
     monkeypatch.setattr(CACHE, "db_manager", db)
-    await _seed_cwl_roster_war(db, "#CLAN1", "2026-07", [("#P1", "Alpha", 15, 1), ("#P2", "Bravo", 14, 2)])
-    await _seed_user_player(db, "d1", "#P1")  # linked, not opted out
-    # #P2 stays unlinked (no user_players row)
+    await _seed_current_clan_member(db, "d1", "#P1")  # linked, not opted out
+    await _seed_current_clan_member(db, "UNASSIGNED", "#P2")  # tracked but not linked to a real account
     await _make_event(db, "1005", "2026-08")
 
     sent_dms = []
@@ -162,14 +154,33 @@ async def test_seeds_signups_and_dms_linked_confirmed_accounts(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_departed_member_is_not_seeded(db, monkeypatch):
+    """A player currently in a different clan (or no clan at all) must not be pulled into this
+    clan's enrollment, even if they were previously in it — matches live membership only."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    await _seed_guild_and_clan(db, "1009", clan_tag="#CLAN1")
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHER_CLAN', 'Other Clan')")
+    await db.conn.commit()
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(db, "d1", "#P1", clan_tag="#OTHER_CLAN")
+    await _make_event(db, "1009", "2026-08", clan_tag="#CLAN1")
+
+    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+
+    summary = await start_cwl_enrollment(1009, "2026-08")
+    assert summary["seeded"] == 0
+
+
+@pytest.mark.asyncio
 async def test_skips_permanently_opted_out_accounts(db, monkeypatch):
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
 
     await _seed_guild_and_clan(db, "1006")
     monkeypatch.setattr(CACHE, "db_manager", db)
-    await _seed_cwl_roster_war(db, "#CLAN1", "2026-07", [("#P1", "Alpha", 15, 1)])
-    await _seed_user_player(db, "d1", "#P1", cwl_permanent_optout=True)
+    await _seed_current_clan_member(db, "d1", "#P1", cwl_permanent_optout=True)
     await _make_event(db, "1006", "2026-08")
 
     monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
@@ -196,9 +207,8 @@ async def test_dev_mode_guard_only_dms_the_configured_server_admin(db, monkeypat
 
     await _seed_guild_and_clan(db, "1007")
     monkeypatch.setattr(CACHE, "db_manager", db)
-    await _seed_cwl_roster_war(db, "#CLAN1", "2026-07", [("#P1", "Alpha", 15, 1), ("#P2", "Bravo", 14, 2)])
-    await _seed_user_player(db, "d1", "#P1")  # matches server_admin -> DMed
-    await _seed_user_player(db, "d2", "#P2")  # does not match -> guarded/skipped
+    await _seed_current_clan_member(db, "d1", "#P1")  # matches server_admin -> DMed
+    await _seed_current_clan_member(db, "d2", "#P2")  # does not match -> guarded/skipped
     await _make_event(db, "1007", "2026-08")
 
     sent_to = []
@@ -228,9 +238,8 @@ async def test_prod_mode_is_unaffected_by_dev_guard(db, monkeypatch):
 
     await _seed_guild_and_clan(db, "1008")
     monkeypatch.setattr(CACHE, "db_manager", db)
-    await _seed_cwl_roster_war(db, "#CLAN1", "2026-07", [("#P1", "Alpha", 15, 1), ("#P2", "Bravo", 14, 2)])
-    await _seed_user_player(db, "d1", "#P1")
-    await _seed_user_player(db, "d2", "#P2")
+    await _seed_current_clan_member(db, "d1", "#P1")
+    await _seed_current_clan_member(db, "d2", "#P2")
     await _make_event(db, "1008", "2026-08")
 
     sent_to = []
