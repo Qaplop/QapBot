@@ -1923,6 +1923,48 @@ async def check_admin_permissions(
                 return True
     return _is_configured_admin(interaction.user, server_admin)
 
+
+async def check_admin_or_leader_permission(
+    interaction: discord.Interaction,
+    server_admin: str,
+    guild_config: Dict[str, Any],
+    resolved_guild_id: Optional[int] = None,
+) -> bool:
+    """
+    Check if user has administrator permissions, is the configured bot admin, OR currently
+    holds the guild's Leader or Co-Leader Discord role (the CoC-rank auto-role feature —
+    guild_config["coc_role_leader_id"]/["coc_role_coleader_id"], one shared pair of roles per
+    guild, not per-clan; a leader/co-leader of *any* of the guild's tracked clans qualifies).
+    Built for CWL Management's "Manage Assignment" screen specifically — every other
+    admin-gated CWL action stays on check_admin_permissions() alone, unchanged.
+
+    Args:
+        interaction: Discord interaction object
+        server_admin: Configured bot admin — numeric Discord user ID (preferred) or username (legacy)
+        guild_config: CACHE.server_config.get(guild_id_str, {}) — read directly rather than a DB
+            round-trip, matching how guild_role_manager.py already reads these two fields.
+        resolved_guild_id: passed straight through to check_admin_permissions() for the DM-
+            invocation case. The Leader/Co-Leader role check itself only applies when
+            interaction.user is already a discord.Member (guild-invoked) — a DM caller has no
+            role list to check against and fails closed for that half, same as every other
+            guild-role-based check in this codebase.
+
+    Returns:
+        bool: True if admin, configured bot admin, or a Leader/Co-Leader role holder.
+    """
+    if await check_admin_permissions(interaction, server_admin, resolved_guild_id=resolved_guild_id):
+        return True
+    if isinstance(interaction.user, discord.Member):
+        leader_role_id = guild_config.get("coc_role_leader_id")
+        coleader_role_id = guild_config.get("coc_role_coleader_id")
+        member_role_ids = {role.id for role in interaction.user.roles}
+        if leader_role_id and int(leader_role_id) in member_role_ids:
+            return True
+        if coleader_role_id and int(coleader_role_id) in member_role_ids:
+            return True
+    return False
+
+
 def check_bot_admin_only(interaction: discord.Interaction, server_admin: str) -> bool:
     """
     Check if user is the bot server admin (stricter than Discord server admin).

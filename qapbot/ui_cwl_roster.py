@@ -864,6 +864,32 @@ async def _check_cwl_admin_permission(interaction: discord.Interaction) -> bool:
     return True
 
 
+async def _check_cwl_admin_or_leader_permission(interaction: discord.Interaction) -> bool:
+    """Permission re-check for the "Manage Assignment" launch button specifically — admin,
+    configured bot admin, OR a current holder of the guild's Leader/Co-Leader Discord role
+    (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", 2026-08-10). Every other CWL Management
+    button stays on _check_cwl_admin_permission() (admin-only), unchanged."""
+    from qapbot.config import CONFIG
+    from qapbot.QBdiscocmdshelper import check_admin_or_leader_permission
+    from qapbot.i18n import t
+
+    resolved_guild_id = interaction.guild.id if interaction.guild else None
+    guild_config = CACHE.server_config.get(str(resolved_guild_id), {}) if resolved_guild_id else {}
+    if not await check_admin_or_leader_permission(
+        interaction, CONFIG.server_admin, guild_config, resolved_guild_id=resolved_guild_id
+    ):
+        msg = t('commands.errors.admin_required', guild_id=resolved_guild_id)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(msg, ephemeral=True)
+            else:
+                await interaction.followup.send(msg, ephemeral=True)
+        except Exception:
+            pass
+        return False
+    return True
+
+
 async def _refresh_parent(view: discord.ui.View, interaction: discord.Interaction, mode: str) -> None:
     """Duck-typed refresh: both ClanManagementView and CwlManagementHubView implement
     refresh_cwl_view(interaction, mode) — this is what lets the same "Configure Participating

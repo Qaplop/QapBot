@@ -66,6 +66,85 @@ def _fake_admin_bot(guild_id: int, discord_user_id: int, is_admin: bool = True):
     return bot
 
 
+def _fake_role_bot(guild_id: int, discord_user_id: int, role_ids):
+    """Fake QBcore.bot whose guild has exactly one resolvable, non-admin member holding
+    the given Discord role IDs — for testing the Leader/Co-Leader path independent of
+    _resolve_admin()'s own guild-admin/super-admin checks."""
+    member = MagicMock()
+    member.guild_permissions.administrator = False
+    member.roles = [MagicMock(id=rid) for rid in role_ids]
+
+    guild = MagicMock()
+    guild.get_member = MagicMock(return_value=member)
+    guild.fetch_member = AsyncMock(return_value=member)
+
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    return bot
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_resolve_admin_or_leader_allows_guild_admin(monkeypatch):
+    from qapbot.web_bridge import _resolve_admin_or_leader
+    import QBcore
+
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(1, 2, is_admin=True))
+    assert await _resolve_admin_or_leader(1, 2) is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_resolve_admin_or_leader_allows_leader_role_holder(monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.web_bridge import _resolve_admin_or_leader
+    import QBcore
+
+    monkeypatch.setattr(QBcore, "bot", _fake_role_bot(1, 2, role_ids=[1001]))
+    CACHE.server_config["1"] = {"coc_role_leader_id": "1001"}
+
+    assert await _resolve_admin_or_leader(1, 2) is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_resolve_admin_or_leader_allows_coleader_role_holder(monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.web_bridge import _resolve_admin_or_leader
+    import QBcore
+
+    monkeypatch.setattr(QBcore, "bot", _fake_role_bot(1, 2, role_ids=[1002]))
+    CACHE.server_config["1"] = {"coc_role_coleader_id": "1002"}
+
+    assert await _resolve_admin_or_leader(1, 2) is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_resolve_admin_or_leader_rejects_regular_member(monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.web_bridge import _resolve_admin_or_leader
+    import QBcore
+
+    monkeypatch.setattr(QBcore, "bot", _fake_role_bot(1, 2, role_ids=[9999]))  # unrelated role
+    CACHE.server_config["1"] = {"coc_role_leader_id": "1001", "coc_role_coleader_id": "1002"}
+
+    assert await _resolve_admin_or_leader(1, 2) is False
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_resolve_admin_or_leader_rejects_when_guild_unresolvable(monkeypatch):
+    from qapbot.web_bridge import _resolve_admin_or_leader
+    import QBcore
+
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=None)
+    monkeypatch.setattr(QBcore, "bot", bot)
+
+    assert await _resolve_admin_or_leader(1, 2) is False
+
+
 @pytest.mark.discord
 @pytest.mark.asyncio
 async def test_health_does_not_require_secret(client):

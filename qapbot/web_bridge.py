@@ -57,6 +57,39 @@ async def _resolve_admin(guild_id: int, discord_user_id: int) -> bool:
     return bool(member.guild_permissions.administrator)
 
 
+async def _resolve_admin_or_leader(guild_id: int, discord_user_id: int) -> bool:
+    """_resolve_admin() above, extended with the Leader/Co-Leader Discord role check for the
+    "Manage Enrollment" screen (CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10) — same defense-in-depth
+    re-derivation the bridge already does independently of the Discord-side gate
+    (_check_cwl_admin_or_leader_permission in ui_cwl_roster.py). guild_config["coc_role_leader_id"]/
+    ["coc_role_coleader_id"] is one shared pair of roles per guild, not per-clan.
+    """
+    import QBcore
+
+    if await _resolve_admin(guild_id, discord_user_id):
+        return True
+
+    guild = QBcore.bot.get_guild(guild_id)
+    if guild is None:
+        return False
+    member = guild.get_member(discord_user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(discord_user_id)
+        except (discord.NotFound, discord.HTTPException):
+            return False
+
+    guild_config = CACHE.server_config.get(str(guild_id), {})
+    leader_role_id = guild_config.get("coc_role_leader_id")
+    coleader_role_id = guild_config.get("coc_role_coleader_id")
+    member_role_ids = {role.id for role in member.roles}
+    if leader_role_id and int(leader_role_id) in member_role_ids:
+        return True
+    if coleader_role_id and int(coleader_role_id) in member_role_ids:
+        return True
+    return False
+
+
 async def _build_clan_config_payload(guild_id: int) -> Dict[str, Any]:
     """Build the GET response for whichever season is currently selected on the guild's CWL
     Management screen (the season select there, CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase E.3) —

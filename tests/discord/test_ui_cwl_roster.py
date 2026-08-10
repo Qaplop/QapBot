@@ -1381,3 +1381,8 @@ def test_resolve_prior_cwl_assignments_returns_empty_for_no_clans():
     from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
 
     assert resolve_prior_cwl_assignments([]) == {}
+
+# _check_cwl_admin_or_leader_permission() tests live in
+# tests/unit/test_check_admin_or_leader_permission.py — this file's module-level autouse
+# _bypass_cwl_admin_check fixture forces check_admin_permissions() to always return True for
+# every test here, which would silently defeat any test of the leader-role-holder path.

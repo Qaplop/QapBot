@@ -1,6 +1,19 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (12)
+- Added (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", slice 2 of 5 — permission check):
+  new `check_admin_or_leader_permission()` (`QBdiscocmdshelper.py`) — admin, configured bot
+  admin, or a current holder of the guild's Leader/Co-Leader Discord role (the existing CoC-rank
+  auto-role feature). Thin wrappers added for the Discord side (`_check_cwl_admin_or_leader_permission`,
+  `ui_cwl_roster.py`) and the web bridge (`_resolve_admin_or_leader`, `web_bridge.py`), each
+  matching their file's existing admin-only check exactly. Nothing calls these yet — pure
+  infrastructure for the "Manage Assignment" launch button and its bridge endpoints, still to
+  come. Also found (test-infra only, not a code bug): `test_ui_cwl_roster.py`'s autouse admin-
+  bypass fixture was silently defeating the leader-role tests since the new check calls
+  `check_admin_permissions()` internally — moved those tests to a dedicated file without the
+  bypass. 22 new tests; 1731 total tests pass.
+
 2026-08-10 (11)
 - Added (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", slice 1 of 5 — DB layer): data-layer
   groundwork for the new "Manage Assignment" drag-and-drop board that replaces the old
