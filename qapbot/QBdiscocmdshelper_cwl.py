@@ -66,6 +66,24 @@ def cwl_start_at_compact(cwl_start_at: Optional[str], timezone_name: str = "UTC"
     return local.strftime("%y-%m-%d %H:%M")
 
 
+def timezone_abbreviation(timezone_name: str, cwl_season: str) -> str:
+    """Short abbreviation ("CEST", "UTC", "IST") for timezone_name, used in the CWL Management
+    table's "CWL Start (CEST)" header — the full IANA zone name ("Europe/Berlin") reliably wraps
+    the header onto a second line inside Discord's code-block width, breaking the table's column
+    alignment. Resolved against cwl_season's own official start (1st of that month, 08:00 UTC)
+    rather than "now", since the abbreviation should reflect the season being displayed, not
+    whatever DST state happens to be current when the embed is rendered. A season's actual
+    per-clan start times are all within a 48h window of that reference point (the Activity's own
+    picker enforces this), so in practice every row shares this same abbreviation; on the rare
+    case a table straddles a DST transition, only the header label is approximate — each row's
+    own HH:MM (cwl_start_at_compact() above) is always individually correct regardless."""
+    try:
+        reference = datetime.strptime(f"{cwl_season}-01T08:00", "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc)
+        return reference.astimezone(ZoneInfo(timezone_name)).tzname() or timezone_name
+    except Exception:
+        return timezone_name
+
+
 def cwl_start_at_discord_timestamp(cwl_start_at: Optional[str], style: str = "f") -> Optional[str]:
     """Convert a stored UTC "YYYY-MM-DDTHH:MMZ" cwl_start_at into Discord's `<t:unix:style>`
     timestamp markup, or None if unset/unparseable.
@@ -256,14 +274,16 @@ async def format_clan_management_cwl_management(
         # the guild's configured timezone_name (Basic Config's "Select Timezone", next to "Select
         # Language") — Discord doesn't parse <t:...> markup inside code blocks at all, so a
         # code-block table can't use native per-viewer timestamps regardless of format. The
-        # header shows the zone name rather than a live UTC offset/abbreviation, since a
-        # multi-row table can straddle a DST transition (different rows would need different
-        # abbreviations) while each row's own HH:MM is always individually correct.
+        # header shows a short abbreviation ("CEST") rather than the full IANA zone name
+        # ("Europe/Berlin") — the latter reliably wraps the header row inside Discord's
+        # code-block width, breaking the table's column alignment. See timezone_abbreviation()'s
+        # docstring for why it's resolved against the season's own start, not "now".
         timezone_name = CACHE.server_config.get(str(guild_id_int), {}).get("timezone_name", "UTC")
+        tz_abbr = timezone_abbreviation(timezone_name, event["cwl_season"])
         header_clan = t('cwl.management.table_header_clan', guild_id=guild_id_int)
         header_tier = t('cwl.management.table_header_tier', guild_id=guild_id_int)
         header_roster = t('cwl.management.table_header_roster', guild_id=guild_id_int)
-        header_start = f"{t('cwl.management.table_header_start', guild_id=guild_id_int)} ({timezone_name})"
+        header_start = f"{t('cwl.management.table_header_start', guild_id=guild_id_int)} ({tz_abbr})"
 
         rows = []
         for clan in clans:

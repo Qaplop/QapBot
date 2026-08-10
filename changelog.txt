@@ -1,6 +1,13 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (8)
+- Fixed (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md item 16): the CWL Management table's "CWL Start
+  (Europe/Berlin)" header wrapped onto a second line inside Discord's code-block width, breaking
+  the table's alignment. New `timezone_abbreviation()` in `QBdiscocmdshelper_cwl.py` shows the
+  short form instead ("CWL Start (CEST)"), resolved against the season's own official start so
+  it reflects the season being displayed rather than "now". 4 new tests; 1683 total tests pass.
+
 2026-08-10 (7)
 - Changed (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md items 14-15): replaced the freshly-added free-text
   UTC-offset timezone setting with a real IANA timezone picker (`guild_config.timezone_name`,

@@ -398,6 +398,22 @@ def test_cwl_start_at_discord_timestamp_renders_native_markup():
     assert cwl_start_at_discord_timestamp("not a date") is None
 
 
+def test_timezone_abbreviation_reflects_dst_state_at_season_start():
+    from qapbot.QBdiscocmdshelper_cwl import timezone_abbreviation
+
+    assert timezone_abbreviation("Europe/Berlin", "2026-09") == "CEST"  # summer -> DST active
+    assert timezone_abbreviation("Europe/Berlin", "2026-12") == "CET"   # winter -> DST inactive
+    assert timezone_abbreviation("Asia/Kolkata", "2026-09") == "IST"    # no DST, fixed +5:30
+    assert timezone_abbreviation("UTC", "2026-09") == "UTC"
+
+
+def test_timezone_abbreviation_falls_back_to_the_raw_name_on_bad_input():
+    from qapbot.QBdiscocmdshelper_cwl import timezone_abbreviation
+
+    assert timezone_abbreviation("Not/A_Real_Zone", "2026-09") == "Not/A_Real_Zone"
+    assert timezone_abbreviation("UTC", "not-a-season") == "UTC"
+
+
 @pytest.mark.discord
 def test_resolve_selected_cwl_season_prefers_persisted_selection(db):
     from qapbot.cache_manager import CACHE
@@ -483,7 +499,7 @@ async def test_format_clan_management_cwl_management_shifts_start_time_by_guild_
     embed, _, _, _ = await format_clan_management_cwl_management(guild)
 
     clans_field = next(f for f in embed.fields if "Clan" in f.name)
-    assert "CWL Start (Asia/Kolkata)" in clans_field.value
+    assert "CWL Start (IST)" in clans_field.value  # abbreviation, not the full zone name
     assert "26-05-01 15:30" in clans_field.value  # 10:00 UTC + 5:30
 
 
