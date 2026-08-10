@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-10 (1)
+- Fixed (NAS ops, no code change): the PROD `cloudflared` tunnel's binary and credentials
+  (`/usr/local/bin/cloudflared`, `/root/.cloudflared/`) lived outside `/volume1`, the same
+  at-risk category that lost Entware's `/opt` install to a prior DSM upgrade (see
+  `instructions.txt`). Moved both onto `/volume1/@cloudflared/` and symlinked back, and added
+  the same `[ -L path ] || ln -sf ...` self-healing guard Entware's own boot task already uses,
+  so a future DSM upgrade restores the symlinks automatically instead of silently breaking the
+  Activity bridge again. Verified live: killed the running tunnel, confirmed both symlinks
+  resolve, fresh `cloudflared tunnel run` through the new paths connected cleanly. A full NAS
+  reboot then confirmed the existing `sleep 15` boot-script margin covers the new `/volume1`-mount
+  timing dependency this migration introduced, not just the network-readiness one it was
+  originally written for — bridge and tunnel both came up with zero manual steps, verified
+  externally via `/api/health`. Documented in `activity/README.md` ("Survive a DSM upgrade") and
+  `qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` Phase D; `backlog.txt`'s matching item closed.
+  Still genuinely untested: the guard lines' *recreation* branch (this reboot found the symlinks
+  already in place, so only the no-op branch ran) — only a real DSM upgrade, or manually deleting
+  the symlinks first, exercises that path.
+
 2026-08-09 (37)
 - Shipped: CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase D (PROD rollout) complete and verified live.
   PROD Worker/Pages deployed, a named `cloudflared` tunnel (`bridge-prod.qapbot.uk`, via a

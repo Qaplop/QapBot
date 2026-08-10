@@ -207,9 +207,32 @@ ambiguity about which credentials/config to use), redirecting output to
 `/var/log/cloudflared-prod-bridge.log` (DSM's own Task Scheduler "View Result" panel showed
 nothing useful without a configured output-log folder — the script logging itself sidesteps
 that entirely). Re-verified via **Action → Run** showing a clean tunnel startup and an external
-`/api/health` check succeeding; a second full reboot to double-confirm the timing fix survives
-a genuine cold boot (vs. just a manual re-run of the same task) is a reasonable follow-up but
-non-blocking.
+`/api/health` check succeeding. **The follow-up cold-reboot double-check happened as part of the
+persistent-storage hardening below** (2026-08-10) — confirmed the timing fix survives a genuine
+reboot, not just a manual re-run of the same task.
+
+**A second, related hardening pass, same day**: this NAS already has one documented incident
+where a DSM upgrade wiped everything outside `/volume1` (Entware's `/opt` install — see
+`instructions.txt`; the `Entware sichern` boot task exists specifically because of it).
+`/usr/local/bin/cloudflared` and `/root/.cloudflared/` (credentials, `config.yml`) are both in
+that same at-risk category and had no equivalent protection. Fixed by mirroring Entware's own
+pattern exactly: moved both onto `/volume1/@cloudflared/` and symlinked back
+(`/usr/local/bin/cloudflared` → `/volume1/@cloudflared/bin/cloudflared`, `/root/.cloudflared` →
+`/volume1/@cloudflared/dotcloudflared`), then added the same `[ -L path ] || ln -sf ...`
+self-healing idiom to the boot script so a future DSM upgrade that wipes the symlinks gets them
+restored automatically on the next boot rather than requiring another manual fix. Verified live:
+killed the running tunnel process, confirmed both symlinks resolved correctly, and a fresh
+`cloudflared tunnel run` through the new paths connected cleanly. Full details and the exact
+script in `activity/README.md`'s "Survive a DSM upgrade" step.
+
+This migration introduced a boot-time dependency the original script didn't have — `/volume1`
+must be mounted before the symlinks resolve to anything real, which is a documented DSM
+possibility distinct from the network-readiness race the `sleep 15` was originally written for.
+**Resolved by a real reboot test (2026-08-10)**: a full NAS restart brought both the bridge and
+the tunnel up cleanly with the existing `sleep 15`, no manual intervention, verified externally
+via `/api/health` right after boot — the same margin covers both timing risks in practice on
+this NAS. `activity/README.md` still documents a more defensive wait-for-the-actual-dependency
+version as a fallback, kept for a slower/busier future boot, but it isn't currently needed.
 
 Full chain confirmed live in a real PROD guild: Activity launches, clan-config table loads real
 data, Save round-trips through Worker → tunnel → bridge → `cwl_events`/`cwl_event_clans`.

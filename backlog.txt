@@ -1,7 +1,19 @@
 Project Backlog, Improvement Ideas and General Remarks
 
 Immediate next steps:
-- Check what happens with cloudflared on the NAS when a new DSM version is installed!
+- [Fixed and reboot-tested 2026-08-10] cloudflared on the NAS when a new DSM version is
+  installed: same risk as the earlier Entware /opt incident (see instructions.txt) — anything
+  outside /volume1 isn't guaranteed to survive a DSM upgrade. Fixed by moving the cloudflared
+  binary and /root/.cloudflared/ (credentials, config.yml) onto /volume1/@cloudflared and
+  symlinking back, plus self-healing `[ -L path ] || ln -sf ...` guards in the boot Task
+  Scheduler script — mirrors Entware's own /opt pattern exactly. A full NAS reboot confirmed the
+  bridge and tunnel both come up cleanly with no manual steps, and that the existing `sleep 15`
+  margin covers the new /volume1-mount timing dependency this migration introduced, not just the
+  original network-readiness one. See activity/README.md's "Survive a DSM upgrade" step. Still
+  genuinely untested: the guard lines' *recreation* branch specifically (this reboot found the
+  symlinks already correctly in place, so only the "already fine, no-op" branch actually ran) —
+  that only gets exercised for real on an actual DSM upgrade that wipes them, or by manually
+  deleting the symlinks and re-running the task to simulate one.
 - Check the difference of /analyse cwl_group on DEV and PROD
 - Known lower-priority follow-up (not fixed,
   admin-only/rarely invoked, no crash risk): the `/admin` CWL-group-backfill

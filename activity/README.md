@@ -105,14 +105,80 @@ restarts, at the cost of needing one domain in the same Cloudflare account.
    ```
 6. **Test it**: `cloudflared tunnel run qapbot-prod-bridge` (with the PROD bot already running
    and its bridge listening on `127.0.0.1:8789`), confirm `https://bridge.<your-domain>/api/health`
-   responds, then stop it and set up auto-start so it survives NAS reboots — on Synology DSM,
-   **Control Panel → Task Scheduler → Create → Triggered Task → Boot-up**, running
-   `cloudflared tunnel run qapbot-prod-bridge` (or `cloudflared service install` if your DSM
-   version supports installing it as a proper background service — check first, it's cleaner
-   than a boot-trigger script when available).
-7. **Wire the Worker to it**: `cd activity/server && npx wrangler secret put BRIDGE_URL --env prod`
+   responds, then stop it and set up auto-start — on Synology DSM,
+   **Control Panel → Task Scheduler → Create → Triggered Task → User-defined script**, trigger
+   **Boot-up**, user **root** (must be root — a non-root user can't read `/root/.cloudflared/`'s
+   credentials at all, confirmed the hard way). Run command:
+   ```sh
+   sleep 15
+   HOME=/root /usr/local/bin/cloudflared tunnel --config /root/.cloudflared/config.yml run qapbot-prod-bridge >> /var/log/cloudflared-prod-bridge.log 2>&1
+   ```
+   The `sleep 15` and explicit `HOME`/`--config` aren't optional — DSM's Boot-up trigger can fire
+   before the network is fully up, and `cloudflared`'s default `~/.cloudflared/` lookup isn't
+   reliable that early either (see "Survive a DSM upgrade" below for a second, related timing
+   gotcha this same design has to account for). Redirecting output to a file was necessary
+   because DSM's own Task Scheduler "View Result" panel shows nothing useful unless you've
+   separately configured an output-log folder in Task Scheduler's settings — the script logging
+   itself sidesteps that entirely and is what actually revealed the underlying bug the first
+   time this failed silently on a real reboot.
+7. **Survive a DSM upgrade** (same reasoning as this project's own `Entware sichern` boot task —
+   see `backlog.txt`): anything outside `/volume1` (the actual data volume) is *not* guaranteed
+   to survive a DSM upgrade — that's a documented incident on this NAS already (a prior DSM
+   upgrade wiped Entware's `/opt` install). `/usr/local/bin/cloudflared` and `/root/.cloudflared/`
+   (cert, tunnel credentials, `config.yml`) are both in that same at-risk category. Move both
+   onto `/volume1` and symlink back, mirroring Entware's exact `/opt` → `/volume1/@entware`
+   pattern:
+   ```sh
+   mkdir -p /volume1/@cloudflared/bin
+   mv /usr/local/bin/cloudflared /volume1/@cloudflared/bin/cloudflared
+   ln -sf /volume1/@cloudflared/bin/cloudflared /usr/local/bin/cloudflared
+
+   mv /root/.cloudflared /volume1/@cloudflared/dotcloudflared
+   ln -sf /volume1/@cloudflared/dotcloudflared /root/.cloudflared
+   ```
+   The credentials directory is the more important half to protect — losing the binary just
+   needs a re-download, but losing `/root/.cloudflared/` means redoing
+   `tunnel login`/`create`/`route dns` and updating the Worker's `BRIDGE_URL` secret again. Then
+   make the boot script self-healing (same `[ -L path ] || ln -sf ...` idiom as `Entware
+   sichern`'s own script) so a future DSM upgrade that wipes the symlinks gets them back
+   automatically on the next boot, before the tunnel start line from step 6:
+   ```sh
+   [ -L /usr/local/bin/cloudflared ] || ln -sf /volume1/@cloudflared/bin/cloudflared /usr/local/bin/cloudflared
+   [ -L /root/.cloudflared ] || ln -sf /volume1/@cloudflared/dotcloudflared /root/.cloudflared
+   sleep 15
+   HOME=/root /usr/local/bin/cloudflared tunnel --config /root/.cloudflared/config.yml run qapbot-prod-bridge >> /var/log/cloudflared-prod-bridge.log 2>&1
+   ```
+   **Resolved by a real reboot test (2026-08-10)**: this migration added a new boot-time
+   dependency the original script didn't have — `/volume1` must actually be mounted before these
+   symlinks resolve to anything real, and DSM's Boot-up trigger firing before that happens was a
+   documented possibility, not just a network-readiness question. The plain `sleep 15` above had
+   only ever been validated against the network-timing bug (via a warm Task Scheduler
+   "Ausführen" run, not a genuine cold boot); a full NAS restart with this exact script confirmed
+   it covers the volume-mount timing too — both the bridge and the tunnel came up cleanly with no
+   manual intervention, verified externally via `/api/health` immediately after boot. The
+   wait-for-the-actual-dependency version below is therefore unnecessary in practice on this NAS,
+   but is kept here as a more defensive fallback in case a slower/busier boot ever pushes past the
+   `sleep 15` margin:
+   ```sh
+   for i in $(seq 1 30); do
+     [ -e /volume1/@cloudflared/bin/cloudflared ] && break
+     sleep 1
+   done
+   [ -L /usr/local/bin/cloudflared ] || ln -sf /volume1/@cloudflared/bin/cloudflared /usr/local/bin/cloudflared
+   [ -L /root/.cloudflared ] || ln -sf /volume1/@cloudflared/dotcloudflared /root/.cloudflared
+   sleep 15
+   HOME=/root /usr/local/bin/cloudflared tunnel --config /root/.cloudflared/config.yml run qapbot-prod-bridge >> /var/log/cloudflared-prod-bridge.log 2>&1
+   ```
+   Entware's own boot task has the identical theoretical gap (no wait for `/volume1` before its
+   `ln -sf`) but has never hit it in practice — its script only *restores a pointer*, it doesn't
+   try to *use* anything through it in the same script, so a momentarily-dangling symlink at
+   boot is harmless there (whatever eventually calls `zstd` runs much later, by which point
+   `/volume1` is certainly mounted). `cloudflared`'s script is different because it tries to
+   start a service through the symlink immediately, in the same script — that's what makes the
+   timing actually matter here.
+8. **Wire the Worker to it**: `cd activity/server && npx wrangler secret put BRIDGE_URL --env prod`
    → `https://bridge.<your-domain>`.
-8. **Smoke test**: launch the Activity from a real PROD guild, confirm the clan-config table
+9. **Smoke test**: launch the Activity from a real PROD guild, confirm the clan-config table
    loads real data and Save round-trips through the whole chain.
 
 ## Status
