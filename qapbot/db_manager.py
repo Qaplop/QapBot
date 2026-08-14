@@ -1197,10 +1197,45 @@ class WarHistoryDB:
             self.conn = None
             raise RuntimeError(f"Database reconnection failed: {e}") from e
     
+    async def _create_index_if_missing(self, schema: str, index_name: str, table_name: str, index_sql: str) -> None:
+        """Creates an index, logging before/after when it doesn't already exist so a slow
+        first-time build on a multi-million-row table (war_attacks/war_summary) shows up as
+        visible progress instead of a long silent gap.
+
+        2026-08-14 incident: an operator watching a silent multi-minute gap during exactly
+        this build (only ``idx_wa_player_tag_date`` had before/after logging; the other 8
+        indices didn't) assumed the process had hung and sent SIGINT mid-build. That raced
+        the still-running, uninterruptible background ``CREATE INDEX`` call against
+        ``asyncio.run()``'s shutdown-time task cancellation, crashing the aiosqlite worker
+        thread with "Event loop is closed" once the index finally finished building against
+        an already-closed loop. See ``_close_bot_after_signal`` in QapBot.py for the other
+        half of that fix (it now waits out ``QBcore.db_maintenance_mode`` instead of forcing
+        a close after a fixed 60s). This function addresses the root cause: give the operator
+        something to watch instead of a silent gap, so there's no reason to Ctrl+C at all.
+
+        ``schema`` is ``""`` for main or ``"history."`` for the attached history DB — used to
+        query the right sqlite_master for the existence check.
+        """
+        cur = await self._conn.execute(
+            f"SELECT 1 FROM {schema}sqlite_master WHERE type='index' AND name=?", (index_name,)
+        )
+        row = await cur.fetchone()
+        if row is not None:
+            await self._conn.execute(index_sql)  # already exists — cheap IF NOT EXISTS no-op
+            return
+
+        logging.info(
+            f"[DB-SCHEMA] Building {index_name} on {schema or 'main.'}{table_name} for the first "
+            f"time — this can take minutes on a multi-million-row table..."
+        )
+        _t0 = _time.monotonic()
+        await self._conn.execute(index_sql)
+        logging.info(f"[DB-SCHEMA] {index_name} built in {_time.monotonic() - _t0:.1f}s")
+
     async def _create_schema(self) -> None:
         """
         Create database schema (idempotent).
-        
+
         Creates war_attacks, war_summary and other tables if they don't exist.
         Safe to call multiple times (CREATE TABLE IF NOT EXISTS).
         """
@@ -1240,20 +1275,24 @@ class WarHistoryDB:
                 UNIQUE(war_id, player_tag, attack_order)
             )
         """)
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_wa_player_tag ON war_attacks(player_tag)"
+        await self._create_index_if_missing(
+            "", "idx_wa_player_tag", "war_attacks",
+            "CREATE INDEX IF NOT EXISTS idx_wa_player_tag ON war_attacks(player_tag)",
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_wa_war_clan ON war_attacks(war_id, clan_tag)"
+        await self._create_index_if_missing(
+            "", "idx_wa_war_clan", "war_attacks",
+            "CREATE INDEX IF NOT EXISTS idx_wa_war_clan ON war_attacks(war_id, clan_tag)",
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_wa_clan_date ON war_attacks(clan_tag, date)"
+        await self._create_index_if_missing(
+            "", "idx_wa_clan_date", "war_attacks",
+            "CREATE INDEX IF NOT EXISTS idx_wa_clan_date ON war_attacks(clan_tag, date)",
         )
         # Partial index on missed-attack rows (attack_order = 0). Used by
         # get_global_db_statistics_sync() to compute attacks_count cheaply:
         #   total_rows - COUNT(WHERE attack_order = 0)  →  no full-table scan.
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_wa_zero_attacks ON war_attacks(attack_order) WHERE attack_order = 0"
+        await self._create_index_if_missing(
+            "", "idx_wa_zero_attacks", "war_attacks",
+            "CREATE INDEX IF NOT EXISTS idx_wa_zero_attacks ON war_attacks(attack_order) WHERE attack_order = 0",
         )
         # Composite (player_tag, date) — get_player_attack_history_sync (leaderboard
         # scope="all") filters by both; without date in the index, SQLite would
@@ -1270,13 +1309,10 @@ class WarHistoryDB:
         # concurrently writing to the DB while this builds, and a slow first build no
         # longer shares a timeout budget with anything else. Every restart after the
         # first is a cheap IF-NOT-EXISTS check.
-        _t0_idx = _time.monotonic()
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_wa_player_tag_date ON war_attacks(player_tag, date)"
+        await self._create_index_if_missing(
+            "", "idx_wa_player_tag_date", "war_attacks",
+            "CREATE INDEX IF NOT EXISTS idx_wa_player_tag_date ON war_attacks(player_tag, date)",
         )
-        _idx_elapsed = _time.monotonic() - _t0_idx
-        if _idx_elapsed > 5.0:
-            logging.info(f"[DB-SCHEMA] idx_wa_player_tag_date (main) built in {_idx_elapsed:.1f}s (first run after schema change)")
 
         # ── war_summary: one row per war per actively tracked clan ──
         logging.info("[DB-SCHEMA] Verifying war_summary table + indexes...")
@@ -1310,17 +1346,21 @@ class WarHistoryDB:
                 UNIQUE(war_id, clan_tag)
             )
         """)
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ws_clan_tag ON war_summary(clan_tag)"
+        await self._create_index_if_missing(
+            "", "idx_ws_clan_tag", "war_summary",
+            "CREATE INDEX IF NOT EXISTS idx_ws_clan_tag ON war_summary(clan_tag)",
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ws_clan_date ON war_summary(clan_tag, date)"
+        await self._create_index_if_missing(
+            "", "idx_ws_clan_date", "war_summary",
+            "CREATE INDEX IF NOT EXISTS idx_ws_clan_date ON war_summary(clan_tag, date)",
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ws_cwl_season ON war_summary(clan_tag, cwl_season)"
+        await self._create_index_if_missing(
+            "", "idx_ws_cwl_season", "war_summary",
+            "CREATE INDEX IF NOT EXISTS idx_ws_cwl_season ON war_summary(clan_tag, cwl_season)",
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ws_war_id ON war_summary(war_id)"
+        await self._create_index_if_missing(
+            "", "idx_ws_war_id", "war_summary",
+            "CREATE INDEX IF NOT EXISTS idx_ws_war_id ON war_summary(war_id)",
         )
 
         # ── cwl_league_groups: 8-clan group membership per season ──────
@@ -1406,7 +1446,6 @@ class WarHistoryDB:
         if not self.conn:
             raise RuntimeError("Database not initialized. Call initialize() first.")
 
-        import time as _time
         _attached = {row["name"] async for row in await self._conn.execute("PRAGMA database_list")}  # type: ignore[misc]
         if "history" not in _attached:
             logging.debug("[DB-SCHEMA] No 'history' schema attached — skipping history.* table creation")
@@ -1439,17 +1478,21 @@ class WarHistoryDB:
                 UNIQUE(war_id, player_tag, attack_order)
             )
         """)
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS history.idx_wa_player_tag ON war_attacks(player_tag)"
+        await self._create_index_if_missing(
+            "history.", "idx_wa_player_tag", "war_attacks",
+            "CREATE INDEX IF NOT EXISTS history.idx_wa_player_tag ON war_attacks(player_tag)",
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS history.idx_wa_war_clan ON war_attacks(war_id, clan_tag)"
+        await self._create_index_if_missing(
+            "history.", "idx_wa_war_clan", "war_attacks",
+            "CREATE INDEX IF NOT EXISTS history.idx_wa_war_clan ON war_attacks(war_id, clan_tag)",
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS history.idx_wa_clan_date ON war_attacks(clan_tag, date)"
+        await self._create_index_if_missing(
+            "history.", "idx_wa_clan_date", "war_attacks",
+            "CREATE INDEX IF NOT EXISTS history.idx_wa_clan_date ON war_attacks(clan_tag, date)",
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS history.idx_wa_zero_attacks ON war_attacks(attack_order) WHERE attack_order = 0"
+        await self._create_index_if_missing(
+            "history.", "idx_wa_zero_attacks", "war_attacks",
+            "CREATE INDEX IF NOT EXISTS history.idx_wa_zero_attacks ON war_attacks(attack_order) WHERE attack_order = 0",
         )
         # See the matching comment in _create_schema() (main.war_attacks section) for
         # why building this here, inline, is safe: initialize_database() in QapBot.py
@@ -1458,13 +1501,10 @@ class WarHistoryDB:
         # writer and never shares a timeout budget with CoC login. This is the big
         # table (history.war_attacks, potentially millions of rows) — the one most
         # likely to actually take minutes on its first build.
-        _t0_idx_hist = _time.monotonic()
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS history.idx_wa_player_tag_date ON war_attacks(player_tag, date)"
+        await self._create_index_if_missing(
+            "history.", "idx_wa_player_tag_date", "war_attacks",
+            "CREATE INDEX IF NOT EXISTS history.idx_wa_player_tag_date ON war_attacks(player_tag, date)",
         )
-        _idx_hist_elapsed = _time.monotonic() - _t0_idx_hist
-        if _idx_hist_elapsed > 5.0:
-            logging.info(f"[DB-SCHEMA] idx_wa_player_tag_date (history) built in {_idx_hist_elapsed:.1f}s (first run after schema change)")
 
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS history.war_summary (
@@ -1496,17 +1536,21 @@ class WarHistoryDB:
                 UNIQUE(war_id, clan_tag)
             )
         """)
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS history.idx_ws_clan_tag ON war_summary(clan_tag)"
+        await self._create_index_if_missing(
+            "history.", "idx_ws_clan_tag", "war_summary",
+            "CREATE INDEX IF NOT EXISTS history.idx_ws_clan_tag ON war_summary(clan_tag)",
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS history.idx_ws_clan_date ON war_summary(clan_tag, date)"
+        await self._create_index_if_missing(
+            "history.", "idx_ws_clan_date", "war_summary",
+            "CREATE INDEX IF NOT EXISTS history.idx_ws_clan_date ON war_summary(clan_tag, date)",
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS history.idx_ws_cwl_season ON war_summary(clan_tag, cwl_season)"
+        await self._create_index_if_missing(
+            "history.", "idx_ws_cwl_season", "war_summary",
+            "CREATE INDEX IF NOT EXISTS history.idx_ws_cwl_season ON war_summary(clan_tag, cwl_season)",
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS history.idx_ws_war_id ON war_summary(war_id)"
+        await self._create_index_if_missing(
+            "history.", "idx_ws_war_id", "war_summary",
+            "CREATE INDEX IF NOT EXISTS history.idx_ws_war_id ON war_summary(war_id)",
         )
 
         await self._conn.execute("""

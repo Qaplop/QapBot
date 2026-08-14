@@ -284,17 +284,33 @@ async def _close_bot_after_signal() -> None:
     Instead: poll for QBcore.cleaned_up (set at the END of async_cleanup()) and
     only act as a fallback if periodic_main hasn't handled cleanup within 60 s.
 
+    2026-08-14: that flat 60 s budget didn't account for QBcore.db_maintenance_mode,
+    set for the whole duration of initialize_database() — including a first-run index
+    build on a multi-million-row table that can legitimately take several minutes (see
+    WarHistoryDB._create_index_if_missing in db_manager.py). A SIGINT arriving mid-build
+    let this fallback fire its 60 s force-close anyway, which raced asyncio.run()'s
+    shutdown-time task cancellation against the still-running, uninterruptible
+    background CREATE INDEX call — crashing the aiosqlite worker thread once it finally
+    finished, against an already-closed loop. Fix: time spent in db_maintenance_mode
+    doesn't count against the 60 s budget. initialize_database() already has its own
+    generous (30 min) watchdog, so once it actually finishes — success or failure —
+    db_maintenance_mode clears and the normal 60 s fallback countdown resumes.
+
     IMPORTANT: Always call bot.close() after cleanup so bot.run() / asyncio.run()
     can actually return.  In maintenance mode cleaned_up=True immediately (resources
     were closed by do_maintenance_shutdown), but bot.close() was never called —
     without it bot.start() blocks forever on the Discord WebSocket, preventing exit.
     """
-    for _ in range(600):  # 60 s in 0.1 s steps
+    _waited = 0.0
+    while _waited < 60.0:  # 60 s budget, paused while db_maintenance_mode is True
         await asyncio.sleep(0.1)
         if QBcore.cleaned_up or QBcore.bot.is_closed():
             break  # resources clean — fall through to close the Discord connection
+        if not QBcore.db_maintenance_mode:
+            _waited += 0.1
     else:
-        # Fallback: periodic_main did not finish in 60 s (not started or stuck)
+        # Fallback: periodic_main did not finish within 60 s of actual idle time
+        # (not started or stuck) — genuinely long DB maintenance doesn't count.
         if not QBcore.cleaned_up:
             try:
                 await async_cleanup()
