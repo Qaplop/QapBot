@@ -2,18 +2,6 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
 ===========
 
 2026-08-14 (14)
-- Investigated (`log_time_gaps.py`): analyzed the first live PROD update cycle after the
-  `has_active_subscriptions` scope fix (changelog (12)) to confirm it actually fixed the
-  incident. Worst gap dropped from 13m34s to 34s; the cycle completed in 306.8s. Remaining
-  pauses trace to three pre-existing, unrelated costs — not new regressions: (1)
-  `sync_roles_for_clan_members()` (`guild_role_manager.py`) awaits `sync_roles_for_user()` one
-  Discord user at a time in a plain loop, so a clan with many registered members burns real
-  wall-clock time serially through Discord's role-edit rate limit (34s/17.9s/17.8s/11.1s of the
-  cycle); (2) the one-time startup load of `player_name_index` (6.6M entries, ~36s) and
-  `clan_name_cache` (428,752 clans); (3) several 1-3.6s GC pauses from holding those caches in
-  memory. Parallelizing the role-sync loop (bounded concurrency, same pattern as Phase 1's fetch
-  semaphore) is the one clear follow-up optimization — deliberately deferred for now, not
-  tackled in this pass.
 - Fixed (`log_time_gaps.py`): crashed with `UnicodeEncodeError` on Windows consoles whenever a
   log line contained a character outside the console's codepage (emoji, non-ASCII names) — now
   reconfigures stdout with `errors="replace"` so a report always finishes. Added `--since-marker`
