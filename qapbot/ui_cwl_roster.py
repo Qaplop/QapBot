@@ -739,8 +739,17 @@ class CwlStartEnrollmentConfirmView(discord.ui.View):
     async def _on_confirm(self, interaction: discord.Interaction) -> None:
         if not await _check_cwl_admin_permission(interaction):
             return
-        await interaction.response.defer(thinking=False, ephemeral=True)
         from qapbot.i18n import t
+
+        # start_cwl_enrollment() below sends a real DM to every resolved member and does several
+        # DB writes — takes a few real seconds. A bare defer() leaves the Yes/Cancel buttons
+        # looking untouched the whole time, which invites a double-click; disable them and swap
+        # to a "processing" label immediately so the click has visible, instant feedback.
+        for item in self.children:
+            item.disabled = True  # type: ignore[union-attr]
+        await interaction.response.edit_message(
+            content=t('cwl.management.start_enrollment_processing', guild_id=self.guild_id), view=self
+        )
         from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
 
         summary = await start_cwl_enrollment(self.guild_id, self.season)

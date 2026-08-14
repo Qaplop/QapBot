@@ -1,6 +1,16 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-14 (2)
+- Fixed (CWL "Start Enrollment" confirm dialog, live-testing feedback): clicking "Yes, Start
+  Enrollment" deferred the interaction with no visible change to the message, so the Yes/Cancel
+  buttons stayed clickable-looking for the several real seconds `start_cwl_enrollment()` takes
+  to send every member's DM and write the DB — inviting a double-click. `_on_confirm` now
+  disables both buttons and edits the message to a "processing" state as its immediate
+  interaction response, before the slow work starts; the final summary/error replaces it same
+  as before. New `cwl.management.start_enrollment_processing` key (en/de). 1 test updated;
+  1762 total tests pass.
+
 2026-08-14 (1)
 - Changed (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", live-testing feedback): the board's
   Confirm/Withdraw signup toggle is removed entirely — a signup's status is exclusively the

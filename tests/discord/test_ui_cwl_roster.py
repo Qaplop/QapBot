@@ -1068,6 +1068,12 @@ async def test_start_enrollment_confirm_view_confirm_starts_enrollment_and_refre
     await confirm_view._on_confirm(mock_interaction)
 
     assert db.get_cwl_event_sync("9006", "2026-08")["status"] == "signup_open"
+    # Buttons disabled + a "processing" edit fired immediately (as the interaction response
+    # itself), before the slow DM-sending work — so a double-click can't re-trigger this.
+    mock_interaction.response.edit_message.assert_awaited_once()
+    _, processing_kwargs = mock_interaction.response.edit_message.call_args
+    assert processing_kwargs["view"] is confirm_view
+    assert all(item.disabled for item in confirm_view.children)  # type: ignore[union-attr]
     mock_interaction.edit_original_response.assert_awaited_once()
     _, kwargs = mock_interaction.edit_original_response.call_args
     assert kwargs["view"] is None

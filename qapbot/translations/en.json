@@ -799,6 +799,7 @@
       "add_season_carry_over_no": "No, start fresh",
       "button_confirm_start_enrollment": "Yes, Start Enrollment",
       "start_enrollment_confirm_body": "⚠️ Start enrollment for season **{season}**? This copies last season's roster as a template and sends every resolved member a confirm/opt-out DM. This cannot be undone.",
+      "start_enrollment_processing": "⏳ Starting enrollment — sending DMs, this can take a few seconds…",
       "start_enrollment_summary": "✅ Enrollment started.\nSeeded: {seeded}\nPre-assigned from last month's CWL: {assigned}\nContacted: {contacted}\nSkipped (opted out): {skipped_optout}\nSkipped (no linked account): {skipped_unlinked}\nSkipped (DEV-mode guard): {skipped_dev_guard}",
       "start_enrollment_error_no_database": "⚠️ Database not ready — try again shortly.",
       "start_enrollment_error_no_event": "⚠️ No CWL event found for this season anymore — it may have been deleted.",
