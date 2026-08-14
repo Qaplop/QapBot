@@ -2640,6 +2640,43 @@ class WarHistoryDB:
                 )
                 return []
 
+    def _find_cwl_war_id_sync(
+        self, conn: Any, clan_tag: str, cwl_season: Optional[str]
+    ) -> Optional[Tuple[str, str]]:
+        """Finds the war_id (+ its date) of a clan's most recent CWL war — optionally scoped to
+        one season — by querying `main.war_summary` and `history.war_summary` SEPARATELY and
+        picking whichever result is newer, rather than through a `WITH ws AS (SELECT * FROM main
+        UNION ALL SELECT * FROM history)` CTE.
+
+        2026-08-14 finding, measured against real DEV data: that CTE shape, referenced from
+        inside a correlated scalar subquery (`wa.war_id = (SELECT ws.war_id FROM ws WHERE ...)`),
+        made SQLite's planner give up on pushing the clan_tag/is_cwl filter into each UNION
+        branch — `EXPLAIN QUERY PLAN` showed `MATERIALIZE ws` followed by a plain `SCAN` of both
+        the full main.war_summary AND full history.war_summary tables, discarding
+        idx_ws_clan_date/idx_ws_cwl_season entirely, on EVERY call. ~9.5s per call at DEV's
+        current data size (regardless of season filter — cwl_season narrows the result, not the
+        scan). Querying each schema directly is a plain indexed SEARCH: ~0.5ms per call, a
+        >10,000x difference, confirmed via `resolve_prior_cwl_assignments()`'s 8-clan Start
+        Enrollment call dropping from ~77s to ~5ms with no change in the returned rows.
+        """
+        season_clause = "AND cwl_season = ?" if cwl_season is not None else ""
+        params: Tuple[Any, ...] = (clan_tag, cwl_season) if cwl_season is not None else (clan_tag,)
+        row_main = conn.execute(
+            f"SELECT war_id, date FROM main.war_summary "
+            f"WHERE clan_tag = ? AND is_cwl = 1 {season_clause} ORDER BY date DESC LIMIT 1",
+            params,
+        ).fetchone()
+        row_hist = conn.execute(
+            f"SELECT war_id, date FROM history.war_summary "
+            f"WHERE clan_tag = ? AND is_cwl = 1 {season_clause} ORDER BY date DESC LIMIT 1",
+            params,
+        ).fetchone()
+        candidates = [r for r in (row_main, row_hist) if r is not None]
+        if not candidates:
+            return None
+        best = max(candidates, key=lambda r: r["date"])
+        return (best["war_id"], best["date"])
+
     def get_cwl_roster_sync(
         self, clan_tag: str, cwl_season: str
     ) -> List[Dict[str, Any]]:
@@ -2660,28 +2697,18 @@ class WarHistoryDB:
 
         with self._sync_conn() as conn:
             try:
+                war = self._find_cwl_war_id_sync(conn, clan_tag, cwl_season)
+                if war is None:
+                    return []
+                war_id, _date = war
                 rows = conn.execute("""
-                    WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
-                    ), ws AS (
-                        SELECT * FROM main.war_summary
-                        UNION ALL SELECT * FROM history.war_summary
+                    SELECT player_tag, player_name, th_level, map_position FROM (
+                        SELECT * FROM main.war_attacks WHERE war_id = ? AND clan_tag = ?
+                        UNION ALL
+                        SELECT * FROM history.war_attacks WHERE war_id = ? AND clan_tag = ?
                     )
-                    SELECT wa.player_tag, wa.player_name,
-                           wa.th_level, wa.map_position
-                    FROM wa
-                    WHERE wa.clan_tag = ?
-                      AND wa.war_id = (
-                          SELECT ws.war_id FROM ws
-                          WHERE ws.clan_tag   = ?
-                            AND ws.cwl_season = ?
-                            AND ws.is_cwl     = 1
-                          ORDER BY ws.date DESC
-                          LIMIT 1
-                      )
-                    GROUP BY wa.player_tag
-                """, (clan_tag, clan_tag, cwl_season)).fetchall()
+                    GROUP BY player_tag
+                """, (war_id, clan_tag, war_id, clan_tag)).fetchall()
                 return [
                     {
                         "player_tag":   row["player_tag"],
@@ -2699,12 +2726,12 @@ class WarHistoryDB:
 
     def get_most_recent_cwl_war_roster_sync(self, clan_tag: str) -> List[Dict[str, Any]]:
         """Same shape as get_cwl_roster_sync() above, but finds this clan's own most recent
-        CWL war regardless of season (drops the `ws.cwl_season = ?` filter) and includes the
-        attack date. Used by the "Manage Enrollment" auto-assignment seed (resolve_prior_cwl_
-        assignments() in QBdiscocmdshelper_cwl.py): "if a clan didn't play CWL last month, fall
-        back to that clan's own most recent CWL season" — each clan resolved independently, not
-        against one shared season — and the date is needed to break ties when the same player
-        qualifies for more than one candidate clan (latest attack wins).
+        CWL war regardless of season (no cwl_season filter) and includes the attack date. Used
+        by the "Manage Enrollment" auto-assignment seed (resolve_prior_cwl_assignments() in
+        QBdiscocmdshelper_cwl.py): "if a clan didn't play CWL last month, fall back to that
+        clan's own most recent CWL season" — each clan resolved independently, not against one
+        shared season — and the date is needed to break ties when the same player qualifies for
+        more than one candidate clan (latest attack wins).
 
         Returns:
             List of dicts: player_tag, player_name, th_level, map_position, date
@@ -2716,27 +2743,18 @@ class WarHistoryDB:
 
         with self._sync_conn() as conn:
             try:
+                war = self._find_cwl_war_id_sync(conn, clan_tag, None)
+                if war is None:
+                    return []
+                war_id, _date = war
                 rows = conn.execute("""
-                    WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
-                    ), ws AS (
-                        SELECT * FROM main.war_summary
-                        UNION ALL SELECT * FROM history.war_summary
+                    SELECT player_tag, player_name, th_level, map_position, date FROM (
+                        SELECT * FROM main.war_attacks WHERE war_id = ? AND clan_tag = ?
+                        UNION ALL
+                        SELECT * FROM history.war_attacks WHERE war_id = ? AND clan_tag = ?
                     )
-                    SELECT wa.player_tag, wa.player_name,
-                           wa.th_level, wa.map_position, wa.date
-                    FROM wa
-                    WHERE wa.clan_tag = ?
-                      AND wa.war_id = (
-                          SELECT ws.war_id FROM ws
-                          WHERE ws.clan_tag = ?
-                            AND ws.is_cwl   = 1
-                          ORDER BY ws.date DESC
-                          LIMIT 1
-                      )
-                    GROUP BY wa.player_tag
-                """, (clan_tag, clan_tag)).fetchall()
+                    GROUP BY player_tag
+                """, (war_id, clan_tag, war_id, clan_tag)).fetchall()
                 return [
                     {
                         "player_tag":   row["player_tag"],
@@ -2752,6 +2770,66 @@ class WarHistoryDB:
                     f"[DB-QUERY-SYNC] get_most_recent_cwl_war_roster_sync failed for {clan_tag}: {e}"
                 )
                 return []
+
+    def get_last_real_cwl_attack_clan_sync(self, player_tags: List[str]) -> Dict[str, Tuple[str, str]]:
+        """For each of ``player_tags``, finds the clan_tag of their own single most recent REAL
+        CWL attack (``attack_order > 0`` — excludes the 0-attack "missed attack" sentinel rows
+        idx_wa_zero_attacks exists for) across ANY clan they've ever attacked for, any season —
+        not scoped to any particular clan or to clans currently participating in CWL. Used by
+        the "Manage Enrollment" auto-assignment seed (resolve_prior_cwl_assignments() in
+        QBdiscocmdshelper_cwl.py, redesigned 2026-08-14 per the project owner's spec: assign each
+        player to wherever they last actually attacked in a CWL war, not to whichever
+        currently-participating clan's own roster happens to still list them).
+
+        Batched across all of ``player_tags`` in 2 queries total (one per schema, `main` and
+        `history`) — NOT one query per player. Each is a plain indexed SEARCH on
+        idx_wa_player_tag joined to war_summary's own (war_id, clan_tag) unique index (verified
+        via EXPLAIN QUERY PLAN against real DEV data, 2026-08-14 — no SCAN anywhere, ~0.5-1s for
+        300 players). Deliberately NOT the earlier `WITH wa AS (SELECT * FROM main UNION ALL
+        SELECT * FROM history)`-CTE-plus-correlated-scalar-subquery shape used by
+        get_most_recent_cwl_war_roster_sync() before this same date's fix — that shape made
+        SQLite MATERIALIZE and SCAN the entire combined table on every call (~9.5s/clan measured
+        against this exact data). Querying each schema directly with GROUP BY player_tag relies
+        on SQLite's documented bare-column-with-MAX() behavior (the non-aggregated columns come
+        from the row that produced the MAX): https://sqlite.org/lang_select.html#bareagg
+
+        Returns:
+            Dict of player_tag -> (clan_tag, date) for players with at least one real CWL
+            attack on record. A player with none simply isn't in the dict.
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not player_tags:
+            return {}
+
+        result: Dict[str, Tuple[str, str]] = {}
+        with self._sync_conn() as conn:
+            try:
+                placeholders = ",".join("?" for _ in player_tags)
+                for schema in ("main", "history"):
+                    rows = conn.execute(
+                        f"""
+                        SELECT wa.player_tag, wa.clan_tag, MAX(wa.date) AS date
+                        FROM {schema}.war_attacks wa
+                        JOIN {schema}.war_summary ws
+                            ON ws.war_id = wa.war_id AND ws.clan_tag = wa.clan_tag
+                        WHERE wa.attack_order > 0 AND ws.is_cwl = 1
+                          AND wa.player_tag IN ({placeholders})
+                        GROUP BY wa.player_tag
+                        """,
+                        player_tags,
+                    ).fetchall()
+                    for row in rows:
+                        player_tag = row["player_tag"]
+                        existing = result.get(player_tag)
+                        if existing is None or row["date"] > existing[1]:
+                            result[player_tag] = (row["clan_tag"], row["date"])
+                return result
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_last_real_cwl_attack_clan_sync failed: {e}")
+                return {}
 
     def get_most_recent_th_levels_sync(self, player_tags: List[str]) -> Dict[str, int]:
         """Most recently recorded th_level per player_tag, from war_attacks (any war type — CWL

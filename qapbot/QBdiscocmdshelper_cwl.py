@@ -87,6 +87,25 @@ def compute_league_adjusted_skill_scores(player_tags: List[str]) -> Dict[str, fl
     return scores
 
 
+def compute_avg_stars_per_attack(player_tags: List[str]) -> Dict[str, float]:
+    """The "Manage Enrollment" board's other number-display option (2026-08-14, project owner's
+    spec: a second radio group lets the admin pick which number shows next to each player's
+    name — this, or the league-adjusted skill score above; defaults to this one). Plain,
+    unweighted average stars/attack over each player's last <=10 CWL attacks — the exact same
+    attack window compute_league_adjusted_skill_scores() uses, just without the league
+    weighting. Same "no data -> absent from the dict, never a fabricated 0" convention."""
+    db = CACHE.db_manager
+    if db is None or not player_tags:
+        return {}
+    attacks_by_tag = db.get_recent_cwl_attacks_with_league_sync(player_tags)
+    averages: Dict[str, float] = {}
+    for tag, attacks in attacks_by_tag.items():
+        if not attacks:
+            continue
+        averages[tag] = round(sum(a["stars"] for a in attacks) / len(attacks), 2)
+    return averages
+
+
 def cwl_start_at_compact(cwl_start_at: Optional[str], timezone_name: str = "UTC") -> Optional[str]:
     """Compact fixed "YY-MM-DD HH:MM" rendering of a stored UTC cwl_start_at, converted into
     timezone_name (the guild's configured timezone_name, an IANA zone id like "Europe/Berlin")
@@ -407,35 +426,58 @@ async def format_clan_management_cwl_management(
     return embed, None, [], []
 
 
-def resolve_prior_cwl_assignments(clan_tags: List[str]) -> Dict[str, str]:
-    """player_tag -> clan_tag, the "Manage Enrollment" auto-assignment seed (per-owner
-    confirmed algorithm, 2026-08-10): for each participating clan, pull its own most recent
-    CWL war's attackers (get_most_recent_cwl_war_roster_sync — independently per clan, so a
-    clan that skipped last month's CWL still resolves against whichever season it last actually
-    played, never a single shared "template season"). If the same player_tag qualifies for more
-    than one candidate clan (played CWL for clan A last month, but their most-recent-ever CWL
-    war was actually for clan B further back), the clan with the **latest** qualifying attack
-    date wins — a straight string comparison, since war_attacks.date is a sortable ISO-8601
-    string throughout the codebase (confirmed against get_clan_attack_history_sync's own
-    date-range comparisons).
+def resolve_guild_member_clan_tags(guild_id: int) -> List[str]:
+    """All of a guild's member clan tags — individually configured member_clans plus every clan
+    covered by a member_family — the same "is this clan actually relevant to this guild"
+    resolution QBdiscocmdshelper.py's is_player_in_member_clans() and cache_manager.py's
+    update_all_clan_subscription_statuses() already use, applied here to build the FULL set
+    instead of testing one candidate clan. Used as the CWL enrollment candidate pool (2026-08-14
+    redesign, project owner's spec): every current member of every guild member clan belongs in
+    the pool, regardless of whether that specific clan opted into this season's CWL — only the
+    auto-assignment TARGET (and the columns shown on the board) are restricted to clans actually
+    participating this season."""
+    config = CACHE.server_config.get(str(guild_id), {})
+    tags: List[str] = list(config.get("member_clans", []))
+    for family_id in config.get("member_families", []):
+        family_data = CACHE.clan_families.get(family_id, {})
+        for clan_tag in family_data.get("clans", []):
+            if clan_tag not in tags:
+                tags.append(clan_tag)
+    return tags
 
-    A player with no CWL history in any participating clan simply isn't in the returned dict —
-    the caller decides what "no prior assignment" means (in start_cwl_enrollment(), it just
-    means they start out in the Unassigned pool)."""
+
+def resolve_prior_cwl_assignments(player_tags: List[str], participating_clan_tags: List[str]) -> Dict[str, str]:
+    """player_tag -> clan_tag, the "Manage Enrollment" auto-assignment seed. Redesigned
+    2026-08-14 (project owner's spec, replacing the 2026-08-10 per-clan-roster original): for
+    each of ``player_tags`` (the full candidate pool — every current member of every guild
+    member clan, not just clans participating in CWL this season), finds their own single most
+    recent REAL CWL attack across ANY clan they've ever attacked for
+    (get_last_real_cwl_attack_clan_sync — "last attack" literally, not merely being listed on a
+    war's roster; a 0-attack sentinel row doesn't count), and assigns them to that clan — but
+    ONLY if that clan is actually participating this season (``participating_clan_tags``), since
+    that's the only set of clans with a column on the board to assign them into. A player whose
+    last real CWL attack was for a clan that isn't participating this season is therefore left
+    unassigned, same as a player with no CWL history at all — there's nowhere to put them.
+
+    Assignment is independent of the player's CURRENT clan — a player who attacked for clan A
+    last CWL and has since transferred to clan B is still assigned to clan A if clan A is
+    participating, matching "assign to wherever they last actually played," not "wherever
+    they're currently rostered."
+
+    A player with no real CWL attack on record anywhere simply isn't in the returned dict — the
+    caller decides what "no prior assignment" means (in start_cwl_enrollment(), it just means
+    they start out in the Unassigned pool)."""
     db = CACHE.db_manager
-    if db is None or not clan_tags:
+    if db is None or not player_tags:
         return {}
 
-    candidates: Dict[str, Tuple[str, str]] = {}  # player_tag -> (clan_tag, date)
-    for clan_tag in clan_tags:
-        for row in db.get_most_recent_cwl_war_roster_sync(clan_tag):
-            player_tag = row["player_tag"]
-            date = row["date"]
-            existing = candidates.get(player_tag)
-            if existing is None or date > existing[1]:
-                candidates[player_tag] = (clan_tag, date)
-
-    return {player_tag: clan_tag for player_tag, (clan_tag, _date) in candidates.items()}
+    participating = set(participating_clan_tags)
+    last_attack_clan = db.get_last_real_cwl_attack_clan_sync(player_tags)
+    return {
+        player_tag: clan_tag
+        for player_tag, (clan_tag, _date) in last_attack_clan.items()
+        if clan_tag in participating
+    }
 
 
 async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
@@ -516,16 +558,26 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
         db.bulk_create_cwl_signups_sync(event["id"], signups_to_create)
         summary["seeded"] = len(signups_to_create)
 
-    # Auto-assignment seed — the initial "who probably plays where" suggestion, from last
-    # month's CWL activity (or each clan's own most recent CWL season if it skipped last
-    # month). Runs once, here; every later change happens via manual drag-and-drop on the
-    # Manage Enrollment board (assignment_source='admin_override', locked=True there).
-    current_member_tags = {p["player_tag"] for p in participants}
-    prior_assignments = resolve_prior_cwl_assignments(participating_clan_tags)
+    # Auto-assignment seed — the initial "who probably plays where" suggestion, from each
+    # player's own last real CWL attack, anywhere (2026-08-14 redesign — see
+    # resolve_prior_cwl_assignments()'s docstring). Runs once, here; every later change happens
+    # via manual drag-and-drop on the Manage Enrollment board (assignment_source='admin_override',
+    # locked=True there). Scoped to the guild's FULL member-clan roster, not just this season's
+    # participating clans — the auto-assign target is still restricted to participating clans
+    # (nothing else has a column), but the candidate pool it draws players from is every current
+    # member of every guild clan, so a player whose real clan didn't opt into CWL this season (or
+    # who transferred since their last CWL war) is still correctly resolved and assignable.
+    all_member_clan_tags = resolve_guild_member_clan_tags(guild_id)
+    all_members = db.get_current_clan_members_sync(all_member_clan_tags)
+    current_member_tags = {p["player_tag"] for p in all_members}
+    # resolve_prior_cwl_assignments() only ever resolves entries for the player_tags it was
+    # given, so prior_assignments' keys are already a subset of current_member_tags — no extra
+    # membership filter needed here (unlike the pre-2026-08-14 design, which queried clan
+    # rosters independently of current membership and needed one).
+    prior_assignments = resolve_prior_cwl_assignments(list(current_member_tags), participating_clan_tags)
     assignments_to_create = [
         {"player_tag": player_tag, "assigned_clan_tag": clan_tag}
         for player_tag, clan_tag in prior_assignments.items()
-        if player_tag in current_member_tags  # exclude a departed player's stale CWL history
     ]
     if assignments_to_create:
         db.bulk_create_cwl_assignments_sync(event["id"], assignments_to_create)

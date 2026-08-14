@@ -205,12 +205,20 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
     participating clans as columns, and a merged player list combining cwl_signups (whatever's
     already been recorded) with get_current_clan_members_sync() (so a current member who never
     got/answered the template DM still shows up, ready for a 1-click sign-up rather than being
-    invisible until they act first — same reasoning start_cwl_enrollment() already uses for its
-    seed pool). Each player is annotated with their current assignment, if any (None = the
-    Unassigned pool)."""
+    invisible until they act first). Each player is annotated with their current assignment, if
+    any (None = the Unassigned pool).
+
+    2026-08-14 (project owner's spec): the player pool is every current member of every guild
+    member clan, not just this season's participating clans — "really ALL players of ALL member
+    clans should be in the pool" — so an admin can manually drag in a player from a clan that
+    isn't participating this season. Only the clan COLUMNS themselves stay restricted to
+    participating clans (see resolve_prior_cwl_assignments()'s docstring for why the same split
+    applies to auto-assignment)."""
     from qapbot.QBdiscocmdshelper_cwl import (
+        compute_avg_stars_per_attack,
         compute_league_adjusted_skill_scores,
         cwl_league_rank,
+        resolve_guild_member_clan_tags,
         resolve_selected_cwl_season,
     )
     from qapbot.emojis import th_icon_url
@@ -244,6 +252,7 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
             "clan_tag": c["clan_tag"],
             "name": CACHE.get_clan_name(c["clan_tag"], c["clan_tag"]),
             "tier": _tier_for(c),
+            "roster_size": c["roster_size"],
         }
         for c in participating_clans
     ]
@@ -259,10 +268,17 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
     # user_players.th_level (2026-08-14: now kept fresh for every current member, linked or not
     # — see coc_cache.py's update_player_info_in_user_accounts) is the primary TH source: live
     # from the CoC API, not dependent on the player ever having made a tracked war attack.
+    # Pool is every guild member clan (not just this season's participating ones) — see this
+    # function's docstring.
+    all_member_clan_tags = resolve_guild_member_clan_tags(guild_id)
     live_th_by_tag: Dict[str, int] = {}
-    for member in db.get_current_clan_members_sync(participating_clan_tags):
+    optout_by_tag: Dict[str, bool] = {}
+    current_clan_by_tag: Dict[str, str] = {}
+    for member in db.get_current_clan_members_sync(all_member_clan_tags):
         if member.get("th_level") is not None:
             live_th_by_tag[member["player_tag"]] = member["th_level"]
+        optout_by_tag[member["player_tag"]] = bool(member["cwl_permanent_optout"])
+        current_clan_by_tag[member["player_tag"]] = member["clan_tag"]
         if member["player_tag"] not in players_by_tag:
             players_by_tag[member["player_tag"]] = {
                 "player_tag": member["player_tag"],
@@ -281,12 +297,22 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
     fallback_tags = [tag for tag in players_by_tag if tag not in live_th_by_tag]
     th_levels_by_tag = db.get_most_recent_th_levels_sync(fallback_tags)
     skill_scores_by_tag = compute_league_adjusted_skill_scores(list(players_by_tag.keys()))
+    avg_stars_by_tag = compute_avg_stars_per_attack(list(players_by_tag.keys()))
     for player_tag, player in players_by_tag.items():
         player["assigned_clan_tag"] = assigned_clan_by_tag.get(player_tag)
         th_level = live_th_by_tag.get(player_tag, th_levels_by_tag.get(player_tag))
         player["th_level"] = th_level
         player["th_icon_url"] = th_icon_url(th_level) if th_level is not None else None
         player["skill_score"] = skill_scores_by_tag.get(player_tag)
+        player["avg_stars"] = avg_stars_by_tag.get(player_tag)
+        # Default False for a player only known via an old cwl_signups row who's since left
+        # every guild clan (get_current_clan_members_sync no longer covers them) — same
+        # fallback-tolerant shape as the th_level lookup just above.
+        player["cwl_permanent_optout"] = optout_by_tag.get(player_tag, False)
+        # None for the same reason — lets the board tell "no current clan on record" apart from
+        # "currently in a different clan than their assignment" (same-clan/different-clan
+        # highlighting, 2026-08-14).
+        player["current_clan_tag"] = current_clan_by_tag.get(player_tag)
 
     players = sorted(players_by_tag.values(), key=lambda p: (p["player_name"] or p["player_tag"]).lower())
 
@@ -303,12 +329,21 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def handle_get_cwl_screen(request: web.Request) -> web.Response:
-    """Pops the pending-screen hint recorded by whichever Discord button fired LAUNCH_ACTIVITY
-    (CACHE.pending_cwl_activity_screen — see its field docstring in cache_manager.py for the
-    full "no reliable way to pass this through Discord's own launch mechanism" design history).
-    No admin/leader re-check here — it reveals nothing sensitive (just which of two already
-    permission-gated screens to fetch next), and the caller doesn't know which permission level
-    even applies until this returns.
+    """Returns the screen hint recorded by whichever Discord button most recently fired
+    LAUNCH_ACTIVITY for this (guild, user) (CACHE.pending_cwl_activity_screen — see its field
+    docstring in cache_manager.py for the full "no reliable way to pass this through Discord's
+    own launch mechanism" design history). No admin/leader re-check here — it reveals nothing
+    sensitive (just which of two already permission-gated screens to fetch next), and the
+    caller doesn't know which permission level even applies until this returns.
+
+    2026-08-14: reads (not pops) the recorded value — it used to be popped on read, but Discord's
+    "pop out" button (opens the Activity in its own separate window) re-runs main.ts's initial
+    fetch sequence, including this call, a second time for the SAME logical launch. Popping meant
+    that second call always found nothing left and fell back to "clan_config", landing the
+    popped-out window on the wrong screen even though the user never clicked a different button.
+    Reading non-destructively fixes that — the value now simply persists until the NEXT distinct
+    button click overwrites it, which is exactly the "which screen was most recently requested"
+    semantics this was always meant to have.
     """
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
@@ -318,7 +353,7 @@ async def handle_get_cwl_screen(request: web.Request) -> web.Response:
     except (KeyError, ValueError):
         return web.json_response({"error": "missing/invalid guild_id or discord_user_id"}, status=400)
 
-    screen = CACHE.pending_cwl_activity_screen.pop((guild_id_str, discord_user_id_str), "clan_config")
+    screen = CACHE.pending_cwl_activity_screen.get((guild_id_str, discord_user_id_str), "clan_config")
     return web.json_response({"screen": screen})
 
 

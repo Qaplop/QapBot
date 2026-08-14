@@ -582,25 +582,54 @@ async def _seed_current_clan_member(
 
 
 # ---------------------------------------------------------------------------
-# GET /api/cwl/screen — "Manage Enrollment" pending-screen picker (2026-08-10)
+# GET /api/cwl/screen — "Manage Enrollment" pending-screen picker (2026-08-10, made
+# non-destructive 2026-08-14 — see handle_get_cwl_screen's docstring)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_screen_get_pops_recorded_value(bridge_config, client):
+async def test_screen_get_returns_recorded_value_and_does_not_clear_it(bridge_config, client):
+    """Must NOT pop — Discord's "pop out" button re-runs main.ts's initial fetch sequence
+    (including this call) a second time for the same logical launch. A destructive read
+    left that second call with nothing recorded, silently falling back to clan_config even
+    though the user never clicked a different button — this is the regression test for
+    that live bug."""
     from qapbot.cache_manager import CACHE
 
     CACHE.pending_cwl_activity_screen[("1", "2")] = "enrollment"
+
+    for _ in range(2):  # simulates the original launch's fetch, then the popped-out window's
+        resp = await client.get(
+            "/api/cwl/screen",
+            params={"guild_id": "1", "discord_user_id": "2"},
+            headers={"X-Bridge-Secret": "test-secret"},
+        )
+        assert resp.status == 200
+        assert (await resp.json())["screen"] == "enrollment"
+    assert CACHE.pending_cwl_activity_screen[("1", "2")] == "enrollment"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_screen_get_reflects_a_new_click_overwriting_an_older_one(bridge_config, client):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.pending_cwl_activity_screen[("1", "2")] = "enrollment"
+    await client.get(
+        "/api/cwl/screen",
+        params={"guild_id": "1", "discord_user_id": "2"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    # A later, different button click overwrites the old recorded value...
+    CACHE.pending_cwl_activity_screen[("1", "2")] = "clan_config"
 
     resp = await client.get(
         "/api/cwl/screen",
         params={"guild_id": "1", "discord_user_id": "2"},
         headers={"X-Bridge-Secret": "test-secret"},
     )
-    assert resp.status == 200
-    assert (await resp.json())["screen"] == "enrollment"
-    # Popped — gone after being read once.
-    assert ("1", "2") not in CACHE.pending_cwl_activity_screen
+    # ...and the next fetch must reflect that, not the earlier value.
+    assert (await resp.json())["screen"] == "clan_config"
 
 
 @pytest.mark.discord
@@ -691,7 +720,7 @@ async def test_enrollment_get_returns_merged_players_and_clans(db, bridge_config
     body = await resp.json()
     assert body["season"] == season
     assert body["event_status"] == "draft"
-    assert body["clans"] == [{"clan_tag": "#CLAN1", "name": "Alpha", "tier": "Crystal League I"}]
+    assert body["clans"] == [{"clan_tag": "#CLAN1", "name": "Alpha", "tier": "Crystal League I", "roster_size": 15}]
 
     players_by_tag = {p["player_tag"]: p for p in body["players"]}
     assert players_by_tag["#P1"]["signup_status"] == "pending"
@@ -703,9 +732,126 @@ async def test_enrollment_get_returns_merged_players_and_clans(db, bridge_config
     assert players_by_tag["#P2"]["th_level"] is None
     assert players_by_tag["#P2"]["th_icon_url"] is None
     # Neither player has any CWL-league-tracked attack history seeded in this test — skill_score
-    # must be absent-as-None, never a fabricated 0 (see compute_league_adjusted_skill_scores).
+    # and avg_stars must both be absent-as-None, never a fabricated 0 (see
+    # compute_league_adjusted_skill_scores / compute_avg_stars_per_attack).
     assert players_by_tag["#P1"]["skill_score"] is None
     assert players_by_tag["#P2"]["skill_score"] is None
+    assert players_by_tag["#P1"]["avg_stars"] is None
+    assert players_by_tag["#P2"]["avg_stars"] is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_includes_members_of_non_participating_member_clans(db, bridge_config, client, monkeypatch):
+    """2026-08-14 (project owner's spec): the pool is every current member of every guild member
+    clan, not just clans participating in CWL this season — so an admin can drag in a player
+    from a clan that opted out, or that just never opted in. #CLAN2 is a guild member clan but
+    NOT participating this event; #P2 (a #CLAN2 member) must still show up in the payload,
+    unassigned (no column exists for #CLAN2 to be assigned into)."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "791", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}, "#CLAN2": {"name": "Bravo"}}
+    CACHE.server_config["791"] = {"member_clans": ["#CLAN1", "#CLAN2"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("791", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    await _seed_current_clan_member(db, "10", "#P1", "#CLAN1")
+    await _seed_current_clan_member(db, "11", "#P2", "#CLAN2")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(791, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "791", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    # Only #CLAN1 gets a column — #CLAN2 isn't participating this season.
+    assert [c["clan_tag"] for c in body["clans"]] == ["#CLAN1"]
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+    assert "#P2" in players_by_tag
+    assert players_by_tag["#P2"]["assigned_clan_tag"] is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_includes_cwl_permanent_optout_flag(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "792", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.server_config["792"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("792", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('10', '10')")
+    await db.conn.execute(
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag, cwl_permanent_optout) "
+        "VALUES ('10', '#P1', 'Player', 1, '#CLAN1', 1)"
+    )
+    await db.conn.commit()
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(792, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "792", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+    assert players_by_tag["#P1"]["cwl_permanent_optout"] is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_includes_current_clan_tag(db, bridge_config, client, monkeypatch):
+    """current_clan_tag (2026-08-14, same-clan/different-clan card highlighting) is
+    user_players.current_clan_tag — distinct from assigned_clan_tag, which is the CWL
+    assignment. Absent (null) for a player only known via an old signup who's since left every
+    guild clan, so get_current_clan_members_sync() no longer covers them."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "793", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}, "#CLAN2": {"name": "Bravo"}}
+    CACHE.server_config["793"] = {"member_clans": ["#CLAN1", "#CLAN2"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("793", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    # #P1 is currently in #CLAN2 but assigned to #CLAN1 — a real transfer-pending case.
+    await _seed_current_clan_member(db, "10", "#P1", "#CLAN2")
+    db.upsert_cwl_assignment_sync(event_id, "#P1", "#CLAN1")
+    # #P2 has a signup row but has since left every guild clan entirely.
+    db.upsert_cwl_signup_sync(event_id, "#P2", "Bravo2", "11", None, "template_confirm", "pending")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(793, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "793", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+    assert players_by_tag["#P1"]["current_clan_tag"] == "#CLAN2"
+    assert players_by_tag["#P1"]["assigned_clan_tag"] == "#CLAN1"
+    assert players_by_tag["#P2"]["current_clan_tag"] is None
 
 
 @pytest.mark.discord

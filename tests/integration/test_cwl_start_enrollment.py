@@ -35,9 +35,16 @@ async def db(tmp_path):
 
 
 async def _seed_guild_and_clan(db: WarHistoryDB, guild_id: str, clan_tag: str = "#CLAN1") -> None:
+    from qapbot.cache_manager import CACHE
+
     await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
     await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
     await db.conn.commit()
+    # resolve_guild_member_clan_tags() (2026-08-14 auto-assignment redesign) reads the guild's
+    # member clans from CACHE.server_config, not the DB directly (matching production — that
+    # cache is normally kept in sync by save_guild_config()) — mirror it here so
+    # start_cwl_enrollment()'s broadened candidate pool actually includes this seeded clan.
+    CACHE.server_config[guild_id] = {"member_clans": [clan_tag], "member_families": []}
 
 
 async def _seed_current_clan_member(
@@ -60,6 +67,8 @@ async def _make_event(db: WarHistoryDB, guild_id: str, season: str, clan_tag: st
 
 
 async def _seed_cwl_war(db: WarHistoryDB, clan_tag: str, players: list, date: str = "2026-07-01T08:00") -> None:
+    """attack_order=1 (a real attack) — get_last_real_cwl_attack_clan_sync's auto-assignment
+    source excludes 0-attack "missed attack" sentinel rows, see its own docstring."""
     war_id = f"war_{clan_tag}_{date}"
     await db.conn.execute(
         "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) VALUES (?, ?, ?, 1, ?, ?)",
@@ -67,8 +76,9 @@ async def _seed_cwl_war(db: WarHistoryDB, clan_tag: str, players: list, date: st
     )
     for player_tag, player_name in players:
         await db.conn.execute(
-            "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
-            "VALUES (?, ?, ?, ?, ?, 15, 1, 0)",
+            "INSERT INTO war_attacks "
+            "(war_id, clan_tag, date, player_name, player_tag, th_level, map_position, attack_order, stars) "
+            "VALUES (?, ?, ?, ?, ?, 15, 1, 1, 0)",
             (war_id, clan_tag, date, player_name, player_tag),
         )
     await db.conn.commit()

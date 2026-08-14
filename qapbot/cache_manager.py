@@ -210,10 +210,12 @@ class CacheManager:
         self.last_cwl_recovery_summary: str = ""  # Summary of last completed recovery batch
         # "Manage Enrollment" web-Activity screen picker (CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10):
         # (guild_id_str, discord_user_id_str) -> "clan_config" | "enrollment", set by whichever
-        # Discord button fired LAUNCH_ACTIVITY, popped by the bridge's GET /api/cwl/screen on the
-        # Activity's very first fetch. Deliberately ephemeral/unpersisted (a single-use launch
-        # hint, not state) and pop-on-read self-cleaning — see web_bridge.py's handler docstring
-        # for why no TTL/eviction is needed beyond that.
+        # Discord button most recently fired LAUNCH_ACTIVITY, read (non-destructively, since
+        # 2026-08-14 — see web_bridge.py's handler docstring for why a plain pop broke Discord's
+        # "pop out" button) by the bridge's GET /api/cwl/screen on the Activity's initial fetch.
+        # Deliberately ephemeral/unpersisted (an in-memory launch hint, not real state) — a bot
+        # restart just falls back to the "clan_config" default, same as an entry that was never
+        # recorded at all.
         self.pending_cwl_activity_screen: Dict[Tuple[str, str], str] = {}
         self.last_db_maintenance: Optional[datetime] = None  # UTC timestamp of last nightly DB maintenance run
         self.last_history_migration: Optional[datetime] = None  # UTC timestamp of last monthly hot->history DB migration

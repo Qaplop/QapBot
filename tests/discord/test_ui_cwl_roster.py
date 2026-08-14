@@ -1373,10 +1373,16 @@ async def test_clan_management_view_refresh_cwl_view_also_refreshes_the_hub(monk
 
 # ---------------------------------------------------------------------------
 # resolve_prior_cwl_assignments — "Manage Enrollment" auto-assignment seed
-# (CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10)
+# (CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10; redesigned player-centric 2026-08-14)
 # ---------------------------------------------------------------------------
 
-async def _seed_cwl_war(db, clan_tag: str, players: list, date: str = "2026-07-01T08:00", war_id: str = None) -> None:
+async def _seed_cwl_war(
+    db, clan_tag: str, players: list, date: str = "2026-07-01T08:00", war_id: str = None,
+    attack_order: int = 1,
+) -> None:
+    """Seeds one CWL war_summary row plus one war_attacks row per player. attack_order defaults
+    to 1 (a real attack) — pass 0 to seed a "missed attack" sentinel row instead, which
+    get_last_real_cwl_attack_clan_sync's attack_order > 0 filter must exclude."""
     war_id = war_id or f"war_{clan_tag}_{date}"
     await db.conn.execute(
         "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) VALUES (?, ?, ?, 1, ?, ?)",
@@ -1384,9 +1390,10 @@ async def _seed_cwl_war(db, clan_tag: str, players: list, date: str = "2026-07-0
     )
     for player_tag, player_name, th_level, map_position in players:
         await db.conn.execute(
-            "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
-            (war_id, clan_tag, date, player_name, player_tag, th_level, map_position),
+            "INSERT INTO war_attacks "
+            "(war_id, clan_tag, date, player_name, player_tag, th_level, map_position, attack_order, stars) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, attack_order),
         )
     await db.conn.commit()
 
@@ -1401,28 +1408,29 @@ async def test_resolve_prior_cwl_assignments_single_clan(db):
     CACHE.db_manager = db
     await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha", 15, 1), ("#P2", "Bravo", 14, 2)])
 
-    assert resolve_prior_cwl_assignments(["#CLAN1"]) == {"#P1": "#CLAN1", "#P2": "#CLAN1"}
+    assert resolve_prior_cwl_assignments(["#P1", "#P2"], ["#CLAN1"]) == {"#P1": "#CLAN1", "#P2": "#CLAN1"}
 
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_resolve_prior_cwl_assignments_clan_with_no_history_contributes_nothing(db):
+async def test_resolve_prior_cwl_assignments_player_with_no_history_contributes_nothing(db):
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
 
     await _seed_guild_and_clans(db, "9302", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
     CACHE.db_manager = db
     await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha", 15, 1)])
-    # #CLAN2 has never played CWL — contributes no candidates, doesn't error.
+    # #P2 has never played a CWL war — contributes no candidate, doesn't error.
 
-    assert resolve_prior_cwl_assignments(["#CLAN1", "#CLAN2"]) == {"#P1": "#CLAN1"}
+    assert resolve_prior_cwl_assignments(["#P1", "#P2"], ["#CLAN1", "#CLAN2"]) == {"#P1": "#CLAN1"}
 
 
 @pytest.mark.discord
 @pytest.mark.asyncio
 async def test_resolve_prior_cwl_assignments_conflict_latest_attack_wins(db):
-    """A player who attacked for #CLAN1 more recently than for #CLAN2 must resolve to #CLAN1,
-    even if #CLAN2's own most-recent-CWL-war lookup also surfaces them."""
+    """A player with real CWL attacks for both #CLAN1 and #CLAN2 must resolve to whichever one
+    is more recent — a straight per-player "last real attack, any clan" resolution now, not a
+    per-clan roster lookup."""
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
 
@@ -1431,13 +1439,65 @@ async def test_resolve_prior_cwl_assignments_conflict_latest_attack_wins(db):
     await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha", 15, 1)], date="2026-07-01T08:00")
     await _seed_cwl_war(db, "#CLAN2", [("#P1", "Alpha", 15, 1)], date="2026-05-01T08:00")
 
-    assert resolve_prior_cwl_assignments(["#CLAN1", "#CLAN2"]) == {"#P1": "#CLAN1"}
+    assert resolve_prior_cwl_assignments(["#P1"], ["#CLAN1", "#CLAN2"]) == {"#P1": "#CLAN1"}
 
     # Reversed dates -> reversed winner, confirming it's genuinely date-driven, not insertion-order.
     await _seed_guild_and_clans(db, "9304", {"#CLAN3": "Charlie", "#CLAN4": "Delta"})
     await _seed_cwl_war(db, "#CLAN3", [("#P2", "Bravo", 15, 1)], date="2026-05-01T08:00")
     await _seed_cwl_war(db, "#CLAN4", [("#P2", "Bravo", 15, 1)], date="2026-07-01T08:00")
-    assert resolve_prior_cwl_assignments(["#CLAN3", "#CLAN4"]) == {"#P2": "#CLAN4"}
+    assert resolve_prior_cwl_assignments(["#P2"], ["#CLAN3", "#CLAN4"]) == {"#P2": "#CLAN4"}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_resolve_prior_cwl_assignments_excludes_zero_attack_sentinel_rows(db):
+    """A player merely listed on a war's roster with no real attack (attack_order=0) must NOT
+    resolve to that clan — "last attack" means an actual attack, per the project owner's spec."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
+
+    await _seed_guild_and_clans(db, "9305", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha", 15, 1)], attack_order=0)
+
+    assert resolve_prior_cwl_assignments(["#P1"], ["#CLAN1"]) == {}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_resolve_prior_cwl_assignments_ignores_non_participating_target_clan(db):
+    """A player's last real CWL attack was for #CLAN1, but only #CLAN2 is participating this
+    season — there's no column to place them in, so they must be left unassigned rather than
+    forced into a clan they didn't play for."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
+
+    await _seed_guild_and_clans(db, "9306", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
+    CACHE.db_manager = db
+    await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha", 15, 1)])
+
+    assert resolve_prior_cwl_assignments(["#P1"], ["#CLAN2"]) == {}
+    # Once #CLAN1 also participates, the very same history resolves them there.
+    assert resolve_prior_cwl_assignments(["#P1"], ["#CLAN1", "#CLAN2"]) == {"#P1": "#CLAN1"}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_resolve_prior_cwl_assignments_independent_of_current_clan(db):
+    """A player's last real CWL attack was for #CLAN1 — they resolve there even though the
+    caller's player_tags pool (their current membership) is nothing to do with #CLAN1 here;
+    resolve_prior_cwl_assignments() itself has no notion of "current clan" at all, only the
+    caller decides who's even in the candidate pool."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
+
+    await _seed_guild_and_clans(db, "9307", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
+    CACHE.db_manager = db
+    await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha", 15, 1)])
+
+    # #P1 is passed in as a candidate (e.g. currently a member of #CLAN2) — still resolves to
+    # #CLAN1, the clan of their last real attack, exactly as the spec requires.
+    assert resolve_prior_cwl_assignments(["#P1"], ["#CLAN1"]) == {"#P1": "#CLAN1"}
 
 
 def test_resolve_prior_cwl_assignments_returns_empty_without_db_manager():
@@ -1445,13 +1505,51 @@ def test_resolve_prior_cwl_assignments_returns_empty_without_db_manager():
     from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
 
     CACHE.db_manager = None
-    assert resolve_prior_cwl_assignments(["#CLAN1"]) == {}
+    assert resolve_prior_cwl_assignments(["#P1"], ["#CLAN1"]) == {}
 
 
-def test_resolve_prior_cwl_assignments_returns_empty_for_no_clans():
+def test_resolve_prior_cwl_assignments_returns_empty_for_no_players():
     from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
 
-    assert resolve_prior_cwl_assignments([]) == {}
+    assert resolve_prior_cwl_assignments([], ["#CLAN1"]) == {}
+
+
+# ---------------------------------------------------------------------------
+# resolve_guild_member_clan_tags — CWL enrollment's candidate-pool source (2026-08-14)
+# ---------------------------------------------------------------------------
+
+def test_resolve_guild_member_clan_tags_individual_and_family(monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_guild_member_clan_tags
+
+    monkeypatch.setitem(
+        CACHE.server_config, "9401",
+        {"member_clans": ["#CLAN1"], "member_families": ["FAM1"]},
+    )
+    monkeypatch.setitem(CACHE.clan_families, "FAM1", {"clans": ["#CLAN2", "#CLAN3"]})
+
+    assert resolve_guild_member_clan_tags(9401) == ["#CLAN1", "#CLAN2", "#CLAN3"]
+
+
+def test_resolve_guild_member_clan_tags_dedupes_clan_in_both_direct_and_family(monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_guild_member_clan_tags
+
+    monkeypatch.setitem(
+        CACHE.server_config, "9402",
+        {"member_clans": ["#CLAN1"], "member_families": ["FAM1"]},
+    )
+    monkeypatch.setitem(CACHE.clan_families, "FAM1", {"clans": ["#CLAN1", "#CLAN2"]})
+
+    assert resolve_guild_member_clan_tags(9402) == ["#CLAN1", "#CLAN2"]
+
+
+def test_resolve_guild_member_clan_tags_unknown_guild_returns_empty(monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_guild_member_clan_tags
+
+    monkeypatch.delitem(CACHE.server_config, "9403", raising=False)
+    assert resolve_guild_member_clan_tags(9403) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1580,6 +1678,69 @@ def test_compute_league_adjusted_skill_scores_returns_empty_without_db_manager()
 
     CACHE.db_manager = None
     assert compute_league_adjusted_skill_scores(["#P1"]) == {}
+
+
+# ---------------------------------------------------------------------------
+# compute_avg_stars_per_attack — board's other number-display option (2026-08-14):
+# unweighted, same attack window as compute_league_adjusted_skill_scores above.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_compute_avg_stars_per_attack_ignores_league_weighting(db):
+    """Same setup as the league-weighted test above — Legend and Bronze III both earned a
+    3-star, but this metric must score them identically since it isn't league-adjusted."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import compute_avg_stars_per_attack
+
+    await _seed_guild_and_clans(db, "9313", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    await _seed_cwl_attack_with_league(db, "#CLAN1", "2026-05", "Legend League", "#P1", stars=3, date="2026-05-01T08:00", war_id="w1")
+    await _seed_cwl_attack_with_league(db, "#CLAN1", "2026-07", "Bronze League III", "#P2", stars=3, date="2026-07-01T08:00", war_id="w2")
+
+    averages = compute_avg_stars_per_attack(["#P1", "#P2"])
+    assert averages["#P1"] == pytest.approx(3.0)
+    assert averages["#P2"] == pytest.approx(3.0)
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_compute_avg_stars_per_attack_caps_at_last_ten_attacks(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import compute_avg_stars_per_attack
+
+    await _seed_guild_and_clans(db, "9314", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    # 11 attacks, all 3-star except the oldest (11th, 1-star) — must be excluded from the average.
+    for i in range(11):
+        stars = 1 if i == 0 else 3
+        await _seed_cwl_attack_with_league(
+            db, "#CLAN1", f"2026-{i + 1:02d}", "Bronze League III", "#P1", stars=stars,
+            date=f"2026-{i + 1:02d}-01T08:00", war_id=f"war{i}",
+        )
+
+    averages = compute_avg_stars_per_attack(["#P1"])
+    assert averages["#P1"] == pytest.approx(3.0)  # only the ten 3-star attacks counted
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_compute_avg_stars_per_attack_absent_for_player_with_no_cwl_history(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import compute_avg_stars_per_attack
+
+    await _seed_guild_and_clans(db, "9315", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+
+    assert compute_avg_stars_per_attack(["#NEVERPLAYED"]) == {}
+
+
+def test_compute_avg_stars_per_attack_returns_empty_without_db_manager():
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import compute_avg_stars_per_attack
+
+    CACHE.db_manager = None
+    assert compute_avg_stars_per_attack(["#P1"]) == {}
 
 
 # _check_cwl_admin_or_leader_permission() tests live in

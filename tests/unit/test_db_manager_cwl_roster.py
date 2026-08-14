@@ -30,9 +30,11 @@ async def _seed_guild_and_clan(db: WarHistoryDB, guild_id: str = "111", clan_tag
 
 async def _seed_cwl_war(
     db: WarHistoryDB, clan_tag: str, cwl_season: str, players: list, date: str = "2026-07-01T08:00", war_id: str = None,
+    attack_order: int = 1,
 ) -> None:
     """Seed a minimal is_cwl=1 war_summary + war_attacks pair. players: list of
-    (player_tag, player_name, th_level, map_position) tuples. All attacks share `date`."""
+    (player_tag, player_name, th_level, map_position) tuples. All attacks share `date`.
+    attack_order defaults to 1 (a real attack) — pass 0 to seed a "missed attack" sentinel row."""
     war_id = war_id or f"war_{clan_tag}_{cwl_season}_{date}"
     await db.conn.execute(
         "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) VALUES (?, ?, ?, 1, ?, ?)",
@@ -40,9 +42,10 @@ async def _seed_cwl_war(
     )
     for player_tag, player_name, th_level, map_position in players:
         await db.conn.execute(
-            "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
-            (war_id, clan_tag, date, player_name, player_tag, th_level, map_position),
+            "INSERT INTO war_attacks "
+            "(war_id, clan_tag, date, player_name, player_tag, th_level, map_position, attack_order, stars) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, attack_order),
         )
     await db.conn.commit()
 
@@ -560,6 +563,65 @@ class TestGetMostRecentCwlWarRoster:
         roster = db.get_most_recent_cwl_war_roster_sync("#CLAN1")
         assert {r["player_tag"]: r["date"] for r in roster} == {
             "#P1": "2026-07-01T08:00", "#P2": "2026-07-01T08:00",
+        }
+
+
+class TestGetLastRealCwlAttackClan:
+    """get_last_real_cwl_attack_clan_sync() — the player-centric auto-assignment source
+    (2026-08-14 redesign): each player's own most recent REAL CWL attack, any clan, any season."""
+
+    @pytest.mark.integration
+    async def test_empty_input_returns_empty_without_querying(self, db):
+        assert db.get_last_real_cwl_attack_clan_sync([]) == {}
+
+    @pytest.mark.integration
+    async def test_player_with_no_history_absent_from_result(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        assert db.get_last_real_cwl_attack_clan_sync(["#NEVERSEEN"]) == {}
+
+    @pytest.mark.integration
+    async def test_excludes_zero_attack_sentinel_rows(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_cwl_war(db, "#CLAN1", "2026-07", [("#P1", "Alpha", 15, 1)], attack_order=0)
+        assert db.get_last_real_cwl_attack_clan_sync(["#P1"]) == {}
+
+    @pytest.mark.integration
+    async def test_excludes_non_cwl_wars(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await db.conn.execute(
+            "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
+            "VALUES ('regular_war', '#CLAN1', '#OPP', 0, '', '2026-07-15T10:00')"
+        )
+        await db.conn.execute(
+            "INSERT INTO war_attacks "
+            "(war_id, clan_tag, date, player_name, player_tag, th_level, map_position, attack_order, stars) "
+            "VALUES ('regular_war', '#CLAN1', '2026-07-15T10:00', 'Alpha', '#P1', 15, 1, 1, 3)"
+        )
+        await db.conn.commit()
+        assert db.get_last_real_cwl_attack_clan_sync(["#P1"]) == {}
+
+    @pytest.mark.integration
+    async def test_picks_most_recent_across_clans(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_guild_and_clan(db, guild_id="111", clan_tag="#CLAN2")
+        await _seed_cwl_war(db, "#CLAN1", "2026-05", [("#P1", "Alpha", 15, 1)], date="2026-05-01T08:00")
+        await _seed_cwl_war(db, "#CLAN2", "2026-07", [("#P1", "Alpha", 15, 1)], date="2026-07-01T08:00")
+
+        result = db.get_last_real_cwl_attack_clan_sync(["#P1"])
+        assert result["#P1"] == ("#CLAN2", "2026-07-01T08:00")
+
+    @pytest.mark.integration
+    async def test_resolves_multiple_players_independently(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_cwl_war(
+            db, "#CLAN1", "2026-07",
+            [("#P1", "Alpha", 15, 1), ("#P2", "Bravo", 14, 2)],
+            date="2026-07-01T08:00",
+        )
+        result = db.get_last_real_cwl_attack_clan_sync(["#P1", "#P2", "#NEVERSEEN"])
+        assert result == {
+            "#P1": ("#CLAN1", "2026-07-01T08:00"),
+            "#P2": ("#CLAN1", "2026-07-01T08:00"),
         }
 
 
