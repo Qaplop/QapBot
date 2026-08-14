@@ -606,6 +606,16 @@ async def test_enrollment_get_returns_merged_players_and_clans(db, bridge_config
     await _seed_current_clan_member(db, "10", "#P1", "#CLAN1")
     await _seed_current_clan_member(db, "11", "#P2", "#CLAN1")
     db.upsert_cwl_assignment_sync(event_id, "#P1", "#CLAN1")
+    # #P1 has a tracked war attack (TH15) to show up in the board; #P2 has none at all.
+    await db.conn.execute(
+        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
+        "VALUES ('war1', '#CLAN1', '#OPP', 0, '', '2026-07-15T10:00')"
+    )
+    await db.conn.execute(
+        "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
+        "VALUES ('war1', '#CLAN1', '2026-07-15T10:00', 'Alpha1', '#P1', 15, 1, 0)"
+    )
+    await db.conn.commit()
 
     import QBcore
     monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(777, 42, is_admin=True))
@@ -624,8 +634,12 @@ async def test_enrollment_get_returns_merged_players_and_clans(db, bridge_config
     players_by_tag = {p["player_tag"]: p for p in body["players"]}
     assert players_by_tag["#P1"]["signup_status"] == "pending"
     assert players_by_tag["#P1"]["assigned_clan_tag"] == "#CLAN1"
+    assert players_by_tag["#P1"]["th_level"] == 15
+    assert players_by_tag["#P1"]["th_icon_url"] == "https://cdn.discordapp.com/emojis/1470128241271640075.png"
     assert players_by_tag["#P2"]["signup_status"] is None
     assert players_by_tag["#P2"]["assigned_clan_tag"] is None
+    assert players_by_tag["#P2"]["th_level"] is None
+    assert players_by_tag["#P2"]["th_icon_url"] is None
 
 
 @pytest.mark.discord

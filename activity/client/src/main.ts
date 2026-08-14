@@ -94,17 +94,6 @@ async function setup(): Promise<void> {
       renderEnrollmentBoard(
         root,
         payload,
-        async (playerTag: string, action: 'confirm' | 'withdraw') => {
-          const response = await fetch('/api/cwl/enrollment/signup', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
-            body: JSON.stringify({ guild_id: guildId, player_tag: playerTag, action }),
-          })
-          if (!response.ok) {
-            const body = await response.text()
-            throw new Error(`${response.status}: ${body}`)
-          }
-        },
         async (playerTag: string, clanTag: string | null) => {
           const response = await fetch('/api/cwl/enrollment/assign', {
             method: 'POST',

@@ -45,8 +45,14 @@ export type EnrollmentPlayer = {
   player_tag: string
   player_name: string | null
   discord_id: string | null
+  // The board only ever displays pending/confirmed/declined — the true statuses a member's own
+  // DM response can produce. 'withdrawn' remains a value the bridge can send (legacy data, or a
+  // future non-board caller of POST /api/cwl/enrollment/signup) but the board treats it the same
+  // as null/unknown rather than giving it its own badge — see enrollmentBoard.ts's statusLabel().
   signup_status: 'pending' | 'confirmed' | 'declined' | 'withdrawn' | null
   assigned_clan_tag: string | null
+  th_level: number | null
+  th_icon_url: string | null
 }
 
 export type EnrollmentPayload = {

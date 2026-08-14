@@ -2709,6 +2709,49 @@ class WarHistoryDB:
                 )
                 return []
 
+    def get_most_recent_th_levels_sync(self, player_tags: List[str]) -> Dict[str, int]:
+        """Most recently recorded th_level per player_tag, from war_attacks (any war type — CWL
+        or regular alike, whichever is more recent) — used by the "Manage Enrollment" board
+        (CWL_ROSTER_PLANNING_PLAN.md) to show each player's current Town Hall next to their
+        name. Bounded strictly to the given `player_tags` (never the whole war_attacks table —
+        the `SELECT player_tag, MAX(th_level) ... GROUP BY player_tag` shape this deliberately
+        avoids is flagged as a full-table-scan anti-pattern in DATABASE_ARCHITECTURE.md), and
+        scoped across both the hot and history DBs like the rest of this file's CWL queries.
+
+        Returns: Dict[player_tag, th_level]. A player_tag with no tracked war_attacks row at
+        all (e.g. brand new to the bot) is simply absent from the returned dict.
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not player_tags:
+            return {}
+
+        with self._sync_conn() as conn:
+            try:
+                placeholders = ",".join("?" for _ in player_tags)
+                rows = conn.execute(f"""
+                    WITH wa AS (
+                        SELECT * FROM main.war_attacks
+                        UNION ALL SELECT * FROM history.war_attacks
+                    )
+                    SELECT player_tag, th_level, date
+                    FROM wa
+                    WHERE player_tag IN ({placeholders})
+                    ORDER BY player_tag, date DESC
+                """, player_tags).fetchall()
+                result: Dict[str, int] = {}
+                for row in rows:
+                    # ORDER BY date DESC above means the first row seen per player_tag is
+                    # already its most recent — later duplicates for the same tag are skipped.
+                    if row["player_tag"] not in result:
+                        result[row["player_tag"]] = int(row["th_level"])
+                return result
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_most_recent_th_levels_sync failed: {e}")
+                return {}
+
     # --- CWL roster planning (CWL_ROSTER_PLANNING_PLAN.md Phase 1) -------------------------
     # Sync CRUD, matching get_cwl_roster_sync's style above — called from UI callbacks, not
     # the async polling loop.

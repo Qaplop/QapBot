@@ -866,9 +866,10 @@ class CwlSignupResponseButton(
         )
 
         response_key = 'cwl.template.confirmed_msg' if self.action == "confirm" else 'cwl.template.declined_msg'
+        player_name = signup.get("player_name") or self.player_tag
         try:
             await interaction.response.edit_message(
-                content=t(response_key, user_id=user_id_str, guild_id=guild_id), view=None
+                content=t(response_key, user_id=user_id_str, guild_id=guild_id, player_name=player_name), view=None
             )
         except discord.NotFound as e:
             if getattr(e, "code", None) == 10062:

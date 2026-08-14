@@ -1,6 +1,25 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-14 (1)
+- Changed (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", live-testing feedback): the board's
+  Confirm/Withdraw signup toggle is removed entirely — a signup's status is exclusively the
+  member's own doing via their DM response; the clan lead only ever drags players between
+  clans on this screen, never alters signup status from it. The badge now only ever shows
+  Pending/Confirmed/Declined (the legacy "Withdrawn" state, only ever reachable via the
+  now-removed button, is no longer shown). Each card also now shows the player's Town Hall
+  (number + icon, sourced from their most recent tracked attack in any war type — new
+  `get_most_recent_th_levels_sync()` in `db_manager.py`, bounded to the requested player_tags
+  per `DATABASE_ARCHITECTURE.md`'s anti-pattern guidance — plus new `emoji_cdn_url()`/
+  `th_icon_url()` helpers in `qapbot/emojis.py` since Discord's native emoji markup can't
+  render inside this plain-HTML iframe). The template-copy DM's Confirm/Opt Out button now
+  names the specific player in its edited confirmation message (`{player_name}` added to
+  `cwl.template.confirmed_msg`/`declined_msg`) — needed since one Discord account can have
+  multiple linked players. Also fixed: `activity/client` had never actually been redeployed
+  after slice 4 shipped (only the Worker was), so "Manage Assignment" was silently still
+  opening the old clan-config table until caught live. 15 new/updated tests; 1762 total tests
+  pass.
+
 2026-08-10 (16)
 - Fixed (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", live-testing feedback on the board
   shipped in slice 4): each player card's name and signup-status badge were stacked on separate

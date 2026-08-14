@@ -1,17 +1,14 @@
 import type { EnrollmentPayload, EnrollmentPlayer } from './types'
 
-type SignupAction = 'confirm' | 'withdraw'
-
-// The board only ever offers a binary Confirm/Withdraw toggle (matching the bridge's
-// POST /api/cwl/enrollment/signup, which only accepts those two actions) — "declined" only
-// happens via a member's own DM response and isn't reachable from here.
-const ENROLLED_STATUSES = new Set(['pending', 'confirmed'])
-
 function displayName(player: EnrollmentPlayer): string {
   return player.player_name || player.player_tag
 }
 
-function statusLabel(status: EnrollmentPlayer['signup_status']): string {
+// Only the three statuses a member's own DM response can actually produce are shown — the board
+// never lets the clan lead alter a signup status itself (live-testing feedback, 2026-08-14:
+// assignment is drag-and-drop only now, see renderEnrollmentBoard's docstring). Anything else
+// (no signup row yet, or a legacy 'withdrawn' value) reads the same as "no status to show".
+function statusLabel(status: EnrollmentPlayer['signup_status']): string | null {
   switch (status) {
     case 'pending':
       return 'Pending'
@@ -19,27 +16,25 @@ function statusLabel(status: EnrollmentPlayer['signup_status']): string {
       return 'Confirmed'
     case 'declined':
       return 'Declined'
-    case 'withdrawn':
-      return 'Withdrawn'
     default:
-      return 'Not signed up'
+      return null
   }
 }
 
 /**
  * Renders the CWL "Manage Assignment" board — participating clans as drag-and-drop columns plus
- * an "Unassigned" pool, each player a card with a 1-click Confirm/Withdraw signup toggle
- * (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment" slice 4).
+ * an "Unassigned" pool, each player a compact card: TH icon + level, name, and a read-only
+ * signup-status badge (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment" slice 4).
  *
- * Unlike clanConfigTable's batched Save/Cancel, every action here is live: a signup toggle or a
- * drag-and-drop move calls the bridge immediately. The working copy is updated optimistically
- * before the network call resolves (instant visual feedback) and reverted with an inline error
- * if the call fails — there is no separate Save step to catch a failure at.
+ * There is no Confirm/Withdraw control here — a signup's status is entirely the member's own
+ * doing via their DM response, never something the clan lead sets on their behalf from this
+ * screen. The only action available is moving a card between columns, which calls the bridge
+ * immediately with an optimistic UI update that reverts (with an inline error) if the call fails
+ * — there is no separate Save step to catch a failure at.
  */
 export function renderEnrollmentBoard(
   container: HTMLElement,
   payload: EnrollmentPayload,
-  onSignupAction: (playerTag: string, action: SignupAction) => Promise<void>,
   onAssignAction: (playerTag: string, clanTag: string | null) => Promise<void>,
   onClose: (reason: string) => void,
 ): void {
@@ -86,51 +81,20 @@ export function renderEnrollmentBoard(
       .sort((a, b) => displayName(a).localeCompare(displayName(b)))
   }
 
-  async function runAction(revert: () => void, action: () => Promise<void>): Promise<void> {
-    status.textContent = ''
-    status.className = 'save-status'
-    renderBoard()
-    try {
-      await action()
-    } catch (err) {
-      console.error(err)
-      revert()
-      renderBoard()
-      status.textContent = `Action failed: ${(err as Error).message}`
-      status.className = 'save-status error'
-    }
-  }
-
-  function handleSignupToggle(player: EnrollmentPlayer): void {
-    const enrolled = ENROLLED_STATUSES.has(player.signup_status ?? '')
-    const nextAction: SignupAction = enrolled ? 'withdraw' : 'confirm'
-    const previousStatus = player.signup_status
-    const previousAssignment = player.assigned_clan_tag
-    player.signup_status = nextAction === 'confirm' ? 'confirmed' : 'withdrawn'
-    // Mirrors the bridge's own cascade (handle_post_cwl_enrollment_signup): withdrawing also
-    // clears any assignment, so a withdrawn player never lingers assigned to a clan column.
-    if (nextAction === 'withdraw') {
-      player.assigned_clan_tag = null
-    }
-    void runAction(
-      () => {
-        player.signup_status = previousStatus
-        player.assigned_clan_tag = previousAssignment
-      },
-      () => onSignupAction(player.player_tag, nextAction),
-    )
-  }
-
   function handleDrop(player: EnrollmentPlayer, targetClanTag: string | null): void {
     if (player.assigned_clan_tag === targetClanTag) return
     const previousAssignment = player.assigned_clan_tag
     player.assigned_clan_tag = targetClanTag
-    void runAction(
-      () => {
-        player.assigned_clan_tag = previousAssignment
-      },
-      () => onAssignAction(player.player_tag, targetClanTag),
-    )
+    status.textContent = ''
+    status.className = 'save-status'
+    renderBoard()
+    onAssignAction(player.player_tag, targetClanTag).catch((err: unknown) => {
+      console.error(err)
+      player.assigned_clan_tag = previousAssignment
+      renderBoard()
+      status.textContent = `Action failed: ${(err as Error).message}`
+      status.className = 'save-status error'
+    })
   }
 
   function buildCard(player: EnrollmentPlayer): HTMLElement {
@@ -147,23 +111,37 @@ export function renderEnrollmentBoard(
     const row = document.createElement('div')
     row.className = 'player-row'
 
+    if (player.th_level != null) {
+      const th = document.createElement('span')
+      th.className = 'th-badge'
+      if (player.th_icon_url) {
+        const icon = document.createElement('img')
+        icon.className = 'th-icon'
+        icon.src = player.th_icon_url
+        icon.alt = `TH${player.th_level}`
+        // Some Activity CSPs may not allow cdn.discordapp.com images — degrade to the plain
+        // number rather than showing a broken-image icon.
+        icon.addEventListener('error', () => icon.remove())
+        th.appendChild(icon)
+      }
+      th.append(String(player.th_level))
+      row.appendChild(th)
+    }
+
     const name = document.createElement('span')
     name.className = 'player-name'
     name.textContent = displayName(player)
+    row.appendChild(name)
 
-    const badge = document.createElement('span')
-    badge.className = `signup-badge signup-${player.signup_status ?? 'none'}`
-    badge.textContent = statusLabel(player.signup_status)
+    const label = statusLabel(player.signup_status)
+    if (label) {
+      const badge = document.createElement('span')
+      badge.className = `signup-badge signup-${player.signup_status}`
+      badge.textContent = label
+      row.appendChild(badge)
+    }
 
-    row.append(name, badge)
-
-    const enrolled = ENROLLED_STATUSES.has(player.signup_status ?? '')
-    const actionButton = document.createElement('button')
-    actionButton.className = 'signup-toggle'
-    actionButton.textContent = enrolled ? 'Withdraw' : 'Confirm'
-    actionButton.addEventListener('click', () => handleSignupToggle(player))
-
-    card.append(row, actionButton)
+    card.appendChild(row)
     return card
   }
 

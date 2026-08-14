@@ -1158,6 +1158,10 @@ class TestCwlSignupResponseButton:
         mock_interaction.response.edit_message.assert_awaited_once()
         _, kwargs = mock_interaction.response.edit_message.call_args
         assert kwargs["view"] is None
+        # The confirmation must name whose sign-up this was — the DM only ever mentions one
+        # player_tag, but a Discord account can have several linked accounts, so restating the
+        # name avoids any ambiguity about which one just got confirmed.
+        assert "Alpha" in kwargs["content"]
 
     @pytest.mark.discord
     @pytest.mark.asyncio
@@ -1181,6 +1185,9 @@ class TestCwlSignupResponseButton:
         signup = db.get_cwl_signup_sync(event_id, "#P1")
         assert signup["status"] == "declined"
         assert signup["source"] == "template_optout"
+        mock_interaction.response.edit_message.assert_awaited_once()
+        _, kwargs = mock_interaction.response.edit_message.call_args
+        assert "Alpha" in kwargs["content"]
 
     @pytest.mark.discord
     @pytest.mark.asyncio

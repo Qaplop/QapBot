@@ -550,6 +550,54 @@ class TestGetMostRecentCwlWarRoster:
         }
 
 
+class TestGetMostRecentThLevels:
+    """get_most_recent_th_levels_sync() — the "Manage Enrollment" board's per-player TH lookup
+    (live-testing feedback, 2026-08-14). Unlike get_most_recent_cwl_war_roster_sync, this reads
+    *any* war type, not just CWL — a player's TH is the same fact regardless of which war it was
+    last observed in."""
+
+    @pytest.mark.integration
+    async def test_empty_input_returns_empty_without_querying(self, db):
+        assert db.get_most_recent_th_levels_sync([]) == {}
+
+    @pytest.mark.integration
+    async def test_missing_player_absent_from_result(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        assert db.get_most_recent_th_levels_sync(["#NEVERSEEN"]) == {}
+
+    @pytest.mark.integration
+    async def test_returns_th_level_from_regular_war_not_just_cwl(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await db.conn.execute(
+            "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
+            "VALUES ('regular_war', '#CLAN1', '#OPP', 0, '', '2026-07-15T10:00')"
+        )
+        await db.conn.execute(
+            "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
+            "VALUES ('regular_war', '#CLAN1', '2026-07-15T10:00', 'Alpha', '#P1', 15, 1, 0)"
+        )
+        await db.conn.commit()
+        assert db.get_most_recent_th_levels_sync(["#P1"]) == {"#P1": 15}
+
+    @pytest.mark.integration
+    async def test_picks_the_most_recent_attack_across_multiple_wars(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        # Same player, two wars, TH upgraded in between — the later date must win.
+        await _seed_cwl_war(db, "#CLAN1", "2026-05", [("#P1", "Alpha", 14, 1)], date="2026-05-01T08:00", war_id="war_old")
+        await _seed_cwl_war(db, "#CLAN1", "2026-07", [("#P1", "Alpha", 15, 1)], date="2026-07-01T08:00", war_id="war_new")
+        assert db.get_most_recent_th_levels_sync(["#P1"]) == {"#P1": 15}
+
+    @pytest.mark.integration
+    async def test_scoped_to_only_the_requested_player_tags(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_cwl_war(
+            db, "#CLAN1", "2026-07",
+            [("#P1", "Alpha", 15, 1), ("#P2", "Bravo", 12, 2)],
+            date="2026-07-01T08:00",
+        )
+        assert db.get_most_recent_th_levels_sync(["#P1"]) == {"#P1": 15}
+
+
 class TestCwlAssignmentsCrud:
     @pytest.mark.integration
     async def test_upsert_creates_then_overwrites(self, db):

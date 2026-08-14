@@ -153,6 +153,7 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
     seed pool). Each player is annotated with their current assignment, if any (None = the
     Unassigned pool)."""
     from qapbot.QBdiscocmdshelper_cwl import cwl_league_rank, resolve_selected_cwl_season
+    from qapbot.emojis import th_icon_url
 
     db = CACHE.db_manager
     season = resolve_selected_cwl_season(guild_id)
@@ -207,8 +208,15 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
     assigned_clan_by_tag = {
         a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event["id"])
     }
+    # Bounded to just this payload's own player_tags (never the whole war_attacks table — see
+    # DATABASE_ARCHITECTURE.md's query anti-patterns) — the board shows each player's TH next to
+    # their name (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", live-testing feedback).
+    th_levels_by_tag = db.get_most_recent_th_levels_sync(list(players_by_tag.keys()))
     for player_tag, player in players_by_tag.items():
         player["assigned_clan_tag"] = assigned_clan_by_tag.get(player_tag)
+        th_level = th_levels_by_tag.get(player_tag)
+        player["th_level"] = th_level
+        player["th_icon_url"] = th_icon_url(th_level) if th_level is not None else None
 
     players = sorted(players_by_tag.values(), key=lambda p: (p["player_name"] or p["player_tag"]).lower())
 

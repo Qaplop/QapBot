@@ -6,9 +6,11 @@ ensures consistency across the codebase.
 
 Usage:
     from qapbot.emojis import BotEmojis
-    
+
     message = f"{BotEmojis.ENABLED} Notifications enabled"
 """
+import re
+from typing import Optional
 
 
 class BotEmojis:
@@ -60,3 +62,25 @@ class BotEmojis:
     HERO_RC = "<:hero_RC:1470127680698712084>"
     HERO_MP = "<:hero_MP:1470127934084743211>"
     HERO_DD = "<:hero_DD:1499710549322240200>"
+
+
+_CUSTOM_EMOJI_RE = re.compile(r"^<a?:\w+:(\d+)>$")
+
+
+def emoji_cdn_url(emoji: str) -> Optional[str]:
+    """Discord's own CDN URL for a `<:name:id>`/`<a:name:id>` custom emoji string (one of the
+    BotEmojis constants above) — for contexts that can't render Discord's native emoji markup
+    at all, e.g. plain HTML in the CWL "Manage Enrollment" web Activity board
+    (CWL_ROSTER_PLANNING_PLAN.md). Returns None if `emoji` isn't a recognizable custom-emoji
+    string (a plain unicode emoji, for instance)."""
+    match = _CUSTOM_EMOJI_RE.match(emoji)
+    if not match:
+        return None
+    return f"https://cdn.discordapp.com/emojis/{match.group(1)}.png"
+
+
+def th_icon_url(th_level: int) -> Optional[str]:
+    """CDN image URL for a Town Hall level's icon, or None if no BotEmojis.THxx constant exists
+    for it (e.g. a level newer than the last one QapBot's emoji set covers)."""
+    emoji = getattr(BotEmojis, f"TH{th_level:02d}", None)
+    return emoji_cdn_url(emoji) if emoji else None

@@ -96,11 +96,20 @@
       .player-row {
         display: flex;
         align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-        margin-bottom: 5px;
+        gap: 6px;
       }
+      .th-badge {
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        flex-shrink: 0;
+        font-size: 0.75rem;
+        color: #949ba4;
+      }
+      .th-icon { width: 16px; height: 16px; }
       .player-name {
+        flex: 1;
+        min-width: 0;
         font-size: 0.85rem;
         white-space: nowrap;
         overflow: hidden;
@@ -117,19 +126,7 @@
       }
       .signup-badge.signup-confirmed { background: #1c3a2a; color: #23a55a; }
       .signup-badge.signup-pending { background: #3a3620; color: #e3b341; }
-      .signup-badge.signup-declined, .signup-badge.signup-withdrawn { background: #3a2226; color: #f23f42; }
-      .signup-toggle {
-        display: block;
-        width: 100%;
-        background: #3f4147;
-        color: #f2f3f5;
-        border: none;
-        border-radius: 4px;
-        padding: 4px 8px;
-        font-size: 0.75rem;
-        cursor: pointer;
-      }
-      .signup-toggle:hover { background: #4a4d54; }
+      .signup-badge.signup-declined { background: #3a2226; color: #f23f42; }
     </style>
   </head>
   <body>
