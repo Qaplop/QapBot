@@ -225,6 +225,10 @@ export function renderEnrollmentBoard(
       row.appendChild(skill)
     }
 
+    // Mutually exclusive: a player with no linked Discord account can never actually respond to
+    // the template DM, so "Not Linked" replaces whatever signup-status icon would otherwise show
+    // (almost always "Pending", since that's the only status such a player could ever be seeded
+    // with) rather than displaying alongside it.
     if (player.discord_id == null) {
       const icon = document.createElement('img')
       icon.className = 'status-icon'
@@ -232,9 +236,7 @@ export function renderEnrollmentBoard(
       icon.alt = UNLINKED_LABEL
       icon.title = UNLINKED_LABEL
       row.appendChild(icon)
-    }
-
-    if (isVisibleStatus(player.signup_status)) {
+    } else if (isVisibleStatus(player.signup_status)) {
       const icon = document.createElement('img')
       icon.className = 'status-icon'
       icon.src = STATUS_ICON[player.signup_status]

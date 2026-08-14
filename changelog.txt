@@ -1,6 +1,13 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-14 (6)
+- Fixed (CWL Manage Enrollment board): the new "Not Linked" icon (round (5) above) was showing
+  alongside the signup-status icon rather than replacing it — a player with no linked Discord
+  account can never actually respond to the template DM, so their signup_status is meaningless
+  noise once "Not Linked" already explains why. Now mutually exclusive: "Not Linked" replaces
+  whatever status icon would otherwise show.
+
 2026-08-14 (5)
 - Changed (CWL Manage Enrollment board, third live-testing pass): title/legend order swapped
   (title stays top-left, legend follows it — was reversed); the event-status caption is now
