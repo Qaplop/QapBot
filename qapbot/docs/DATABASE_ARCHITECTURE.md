@@ -171,11 +171,25 @@ requirement for it.
 runtime (`_explicit_column_list()`, reading `PRAGMA main.table_info(<table>)`) and use it on both
 sides of the `INSERT ... SELECT`, instead of `SELECT *`. This stops any *new* row from being
 corrupted on its next migration, and turns a future genuine schema divergence into a loud SQL
-error (`no such column`) instead of silent misalignment. **Repair of the already-migrated
-historical rows is a separate, not-yet-executed effort** — see the session notes / recovery plan
-for status before trusting any `history.war_attacks`/`war_summary` column beyond `id`, `war_id`,
-`clan_tag`, `date`(war_attacks only — `war_summary.date` IS affected), `player_name`,
-`player_tag`, `th_level`.
+error (`no such column`) instead of silent misalignment.
+
+**Repair tool: `qapbot/scripts/repair_history_schema_drift.py`** (added 2026-08-14). Detects drift
+per table by comparing `main`'s and `history`'s actual on-disk column order, and — only for a
+table where they actually differ — builds a correctly-labeled `<table>_repaired` copy (reading
+every row positionally and re-inserting it under the right names), verifies it (row counts, a
+random sample checked for plausible values), then swaps it in and preserves the original as
+`<table>_corrupted_backup` (never dropped). Defaults to a dry run that always rolls back (the file
+is untouched) — pass `--apply` to actually commit, only if verification passed. `--db`/
+`--history-db` default to `CONFIG.db_path`/`CONFIG.history_db_path`, the same DEV/PROD
+auto-resolution `run_history_migration_now.py`/`run_db_maintenance_now.py` already use. 5 tests in
+`tests/unit/test_repair_history_schema_drift.py`, including one using the exact real-world 11-column
+`war_summary` drift shape (not just a simplified case) end to end.
+
+**Status as of 2026-08-14**: fix shipped and tested; the repair script is written and tested
+against synthetic drift but has **not yet been run against any real `history.db`** (DEV or PROD) —
+that's a deliberate, separate, explicitly-authorized step. Until then, don't trust any
+`history.war_attacks`/`war_summary` column beyond `id`, `war_id`, `clan_tag`, `date` (war_attacks
+only — `war_summary.date` IS affected), `player_name`, `player_tag`, `th_level`.
 
 📖 Prevention rule: `.github/copilot-instructions.md` Cardinal Rule 1.
 

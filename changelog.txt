@@ -1,6 +1,22 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-14 (8)
+- Added: `qapbot/scripts/repair_history_schema_drift.py`, the repair tool for the hot/history
+  schema-drift incident (see changelog (7) above). Detects drift per table by comparing `main`'s
+  and `history`'s actual on-disk column order, builds a correctly-labeled `<table>_repaired`
+  copy for any affected table, verifies it (row counts + random-sample plausibility checks —
+  e.g. `war_tag` shaped like a real CoC tag, `stars` in 0-3), then swaps it in and preserves the
+  original as `<table>_corrupted_backup` (never dropped). Defaults to a dry run that always
+  rolls back — the DB file is provably untouched unless `--apply` is passed, and even then only
+  if verification passed. `--db`/`--history-db` auto-resolve to DEV/PROD via `CONFIG.db_path`/
+  `CONFIG.history_db_path`, matching the existing `run_history_migration_now.py`/
+  `run_db_maintenance_now.py` ops scripts' convention. 5 new tests — including one against the
+  exact real-world 11-column `war_summary` drift shape end to end, not just a simplified case.
+  1793 total tests pass. **Not yet run against any real `history.db`** — written and verified
+  against synthetic data only; running it for real (DEV first) is a separate, deliberate next
+  step.
+
 2026-08-14 (7)
 - Fixed (CRITICAL — hot/history DB schema drift, found while investigating why the CWL board's
   player-skill score returned nothing): `main.war_attacks`/`war_summary` and
