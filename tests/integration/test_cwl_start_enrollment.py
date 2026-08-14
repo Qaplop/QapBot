@@ -1,7 +1,9 @@
 """Tests for start_cwl_enrollment() (CWL_ROSTER_PLANNING_PLAN.md Phase 2, slice 2):
 seeding from participating clans' current membership, the confirm/opt-out DM blast, the
-DEV-mode DM recipient guard (operational directive added 2026-08-10), and the draft ->
-signup_open transition.
+CWL DM recipient guard (operational directive added 2026-08-10, made an independent
+DEV/PROD-toggleable CONFIG.cwl_dm_restrict_to_admin flag on 2026-08-14 so it can also be
+enabled on PROD while the roster-assignment feature is still under live testing there),
+and the draft -> signup_open transition.
 
 Corrected 2026-08-10: the seed source was originally last season's CWL war-attacker history
 (get_previous_cwl_participants_sync) — a live DEV test showed this seeds zero signups for any
@@ -135,8 +137,12 @@ async def test_seeds_signups_and_dms_linked_confirmed_accounts(db, monkeypatch):
     from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
 
     # Deterministic regardless of this machine's own .env (DEV checkouts have is_dev_mode=True
-    # ambiently) — the DEV-mode guard itself is exercised separately below.
-    monkeypatch.setattr(config_module, "CONFIG", dataclasses.replace(config_module.CONFIG, is_dev_mode=False))
+    # ambiently, and cwl_dm_restrict_to_admin defaults True everywhere) — the DM guard itself
+    # is exercised separately below.
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
 
     await _seed_guild_and_clan(db, "1005")
     monkeypatch.setattr(CACHE, "db_manager", db)
@@ -218,14 +224,18 @@ async def test_skips_permanently_opted_out_accounts(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_dev_mode_guard_only_dms_the_configured_server_admin(db, monkeypatch):
+async def test_dm_guard_only_dms_the_configured_server_admin_in_dev(db, monkeypatch):
     """Operational directive (CWL_ROSTER_PLANNING_PLAN.md, added 2026-08-10): while testing
-    Phase 2 in DEV, a bulk DM blast must only ever reach the project owner's own account."""
+    Phase 2 in DEV, a bulk DM blast must only ever reach the project owner's own account.
+    The guard is CONFIG.cwl_dm_restrict_to_admin (independent of is_dev_mode since 2026-08-14) —
+    this exercises it with is_dev_mode=True to confirm DEV behavior is unchanged."""
     from qapbot import config as config_module
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
 
-    fake_config = dataclasses.replace(config_module.CONFIG, is_dev_mode=True, server_admin="d1")
+    fake_config = dataclasses.replace(
+        config_module.CONFIG, is_dev_mode=True, server_admin="d1", cwl_dm_restrict_to_admin=True,
+    )
     monkeypatch.setattr(config_module, "CONFIG", fake_config)
 
     await _seed_guild_and_clan(db, "1007")
@@ -246,17 +256,54 @@ async def test_dev_mode_guard_only_dms_the_configured_server_admin(db, monkeypat
 
     assert summary["seeded"] == 2  # both signup rows are still created — only DM delivery is guarded
     assert summary["contacted"] == 1
-    assert summary["skipped_dev_guard"] == 1
+    assert summary["skipped_dm_guard"] == 1
     assert sent_to == ["d1"]
 
 
 @pytest.mark.asyncio
-async def test_prod_mode_is_unaffected_by_dev_guard(db, monkeypatch):
+async def test_dm_guard_only_dms_the_configured_server_admin_in_prod(db, monkeypatch):
+    """2026-08-14: the DM guard is now independent of is_dev_mode specifically so it can also
+    be enabled on PROD while the roster-assignment feature is still being live-tested there —
+    this is the scenario that motivated splitting it out of the is_dev_mode check."""
     from qapbot import config as config_module
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
 
-    fake_config = dataclasses.replace(config_module.CONFIG, is_dev_mode=False, server_admin="d1")
+    fake_config = dataclasses.replace(
+        config_module.CONFIG, is_dev_mode=False, server_admin="d1", cwl_dm_restrict_to_admin=True,
+    )
+    monkeypatch.setattr(config_module, "CONFIG", fake_config)
+
+    await _seed_guild_and_clan(db, "1009")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(db, "d1", "#P1")
+    await _seed_current_clan_member(db, "d2", "#P2")
+    await _make_event(db, "1009", "2026-08")
+
+    sent_to = []
+
+    async def fake_send_user_dm(user_id, message, view=None, embed=None):
+        sent_to.append(user_id)
+        return True
+
+    monkeypatch.setattr(CACHE, "send_user_dm", fake_send_user_dm)
+
+    summary = await start_cwl_enrollment(1009, "2026-08")
+
+    assert summary["contacted"] == 1
+    assert summary["skipped_dm_guard"] == 1
+    assert sent_to == ["d1"]
+
+
+@pytest.mark.asyncio
+async def test_prod_mode_is_unaffected_when_dm_guard_disabled(db, monkeypatch):
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    fake_config = dataclasses.replace(
+        config_module.CONFIG, is_dev_mode=False, server_admin="d1", cwl_dm_restrict_to_admin=False,
+    )
     monkeypatch.setattr(config_module, "CONFIG", fake_config)
 
     await _seed_guild_and_clan(db, "1008")
@@ -276,7 +323,7 @@ async def test_prod_mode_is_unaffected_by_dev_guard(db, monkeypatch):
     summary = await start_cwl_enrollment(1008, "2026-08")
 
     assert summary["contacted"] == 2
-    assert summary["skipped_dev_guard"] == 0
+    assert summary["skipped_dm_guard"] == 0
     assert sorted(sent_to) == ["d1", "d2"]
 
 

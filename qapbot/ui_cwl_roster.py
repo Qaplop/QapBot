@@ -764,7 +764,7 @@ class CwlStartEnrollmentConfirmView(discord.ui.View):
                 contacted=summary["contacted"],
                 skipped_optout=summary["skipped_optout"],
                 skipped_unlinked=summary["skipped_unlinked"],
-                skipped_dev_guard=summary["skipped_dev_guard"],
+                skipped_dm_guard=summary["skipped_dm_guard"],
             )
         try:
             await interaction.edit_original_response(content=content, view=None)

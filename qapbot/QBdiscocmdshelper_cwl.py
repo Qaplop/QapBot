@@ -454,20 +454,21 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
 
     Returns a summary dict the caller renders back to the admin: ok, error (reason string if not
     ok), seeded (signup rows created), contacted (DMs actually sent), skipped_optout,
-    skipped_unlinked, skipped_dev_guard.
+    skipped_unlinked, skipped_dm_guard.
 
-    DEV-mode safety (operational directive, CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10): while
-    CONFIG.is_dev_mode is True, only CONFIG.server_admin's own Discord account is actually
-    DMed — every other resolved recipient is counted in skipped_dev_guard instead of contacted.
-    This lets the whole flow be exercised live in DEV without risking a DM blast to real clan
-    members while the feature is still being built. PROD (CONFIG.is_dev_mode is False) is
-    unaffected — the guard never activates there.
+    DM safety toggle (operational directive, CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10, extended
+    2026-08-14): while CONFIG.cwl_dm_restrict_to_admin is True, only CONFIG.server_admin's own
+    Discord account is actually DMed — every other resolved recipient is counted in
+    skipped_dm_guard instead of contacted. This lets the whole flow be exercised live — in DEV
+    or PROD — without risking a DM blast to real clan members while the feature is still being
+    built. The toggle is independent of CONFIG.is_dev_mode (set separately per host from the
+    shared .env file) precisely so it can also be enabled on PROD while live-testing there.
     """
     from qapbot.config import CONFIG
 
     summary: Dict[str, Any] = {
         "ok": False, "error": None, "seeded": 0, "contacted": 0, "assigned": 0,
-        "skipped_optout": 0, "skipped_unlinked": 0, "skipped_dev_guard": 0,
+        "skipped_optout": 0, "skipped_unlinked": 0, "skipped_dm_guard": 0,
     }
 
     db = CACHE.db_manager
@@ -531,8 +532,8 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
         summary["assigned"] = len(assignments_to_create)
 
     for participant in dm_targets:
-        if CONFIG.is_dev_mode and str(participant["discord_id"]) != CONFIG.server_admin:
-            summary["skipped_dev_guard"] += 1
+        if CONFIG.cwl_dm_restrict_to_admin and str(participant["discord_id"]) != CONFIG.server_admin:
+            summary["skipped_dm_guard"] += 1
             continue
         sent = await _send_cwl_signup_template_dm(event["id"], guild_id, season, participant)
         if sent:

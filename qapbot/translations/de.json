@@ -799,7 +799,7 @@
       "button_confirm_start_enrollment": "Ja, Anmeldephase starten",
       "start_enrollment_confirm_body": "⚠️ Anmeldephase für Saison **{season}** starten? Dabei wird der Kader der letzten Saison als Vorlage übernommen und jedem zuordenbaren Mitglied eine Bestätigen/Absagen-DM gesendet. Dies kann nicht rückgängig gemacht werden.",
       "start_enrollment_processing": "⏳ Anmeldephase wird gestartet — DMs werden versendet, dies kann einige Sekunden dauern…",
-      "start_enrollment_summary": "✅ Anmeldephase gestartet.\nAngelegt: {seeded}\nVorbelegt aus dem letzten CWL-Monat: {assigned}\nKontaktiert: {contacted}\nÜbersprungen (abgemeldet): {skipped_optout}\nÜbersprungen (kein verknüpfter Account): {skipped_unlinked}\nÜbersprungen (DEV-Modus-Schutz): {skipped_dev_guard}",
+      "start_enrollment_summary": "✅ Anmeldephase gestartet.\nAngelegt: {seeded}\nVorbelegt aus dem letzten CWL-Monat: {assigned}\nKontaktiert: {contacted}\nÜbersprungen (abgemeldet): {skipped_optout}\nÜbersprungen (kein verknüpfter Account): {skipped_unlinked}\nÜbersprungen (DM-Schutz): {skipped_dm_guard}",
       "start_enrollment_error_no_database": "⚠️ Datenbank nicht bereit — bitte gleich erneut versuchen.",
       "start_enrollment_error_no_event": "⚠️ Für diese Saison wurde kein CWL-Event mehr gefunden — es wurde möglicherweise gelöscht.",
       "start_enrollment_error_not_draft": "⚠️ Die Anmeldephase für diese Saison wurde bereits gestartet.",
