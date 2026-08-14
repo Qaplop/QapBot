@@ -302,6 +302,6 @@ Each phase gets its own changelog entry and commit, per the project's establishe
 ## Explicitly out of scope for this plan
 
 - The 50-player roster/sign-up/assignment screens (Phases 2-4 of `CWL_ROSTER_PLANNING_PLAN.md`) — a future Activity extension, not this one.
-- Any change to QapBot's core `db_manager.py`/`CACHE` architecture — the bridge API is purely a new *read/write client* of the existing layer, per Cardinal Rule 2 (CACHE-only data access).
+- Any change to QapBot's core `db_manager.py`/`CACHE` architecture — the bridge API is purely a new *read/write client* of the existing layer, per Cardinal Rule 3 (CACHE-only data access).
 
 (Note: this section originally also listed "removing or deprecating the native `CwlEventSetupView` flow" as out of scope — Phase E superseded that and removed it entirely; see Phase E.1 above.)

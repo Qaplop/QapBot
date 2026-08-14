@@ -6829,6 +6829,32 @@ class WarHistoryDB:
     # it reintroduces per-batch random-I/O stalls.
     _MIGRATION_CHECKPOINT_INTERVAL_BATCHES = 20
 
+    async def _explicit_column_list(self, table: str) -> str:
+        """Comma-joined column names for `table`, read from `main`'s own schema via
+        `PRAGMA table_info` — used to build `INSERT INTO history.x (cols) SELECT cols FROM
+        main.x` migrations with EXPLICIT column names on both sides, never bare `SELECT *`.
+
+        This exists because of a real incident (found 2026-08-14): `main.war_attacks` and
+        `history.war_attacks` — likewise `war_summary` — have identical column *names* but
+        their physical on-disk column *order* had silently diverged over time, because each
+        schema's columns were added via separate `ALTER TABLE ADD COLUMN` sequences at
+        different points in this project's history. `CREATE TABLE IF NOT EXISTS` does NOT
+        retroactively reorder an already-existing table to match newer code, so the two
+        schemas' CREATE TABLE text looking identical today proves nothing about a live,
+        long-running DB file's actual column order. A bare `SELECT *` migration matches
+        columns by POSITION, not by name — so every migrated row silently landed in the wrong
+        columns from cid 7 (war_attacks) / cid 14 (war_summary) onward, corrupting roughly a
+        dozen columns (including `stars`, `date`, and `war_tag`) for every row that ever aged
+        into history. See the cardinal rule in `.github/copilot-instructions.md` ("hot/history
+        schemas must never drift") for the prevention half of this fix — this function is the
+        detection-proof half: explicit columns either migrate correctly by name, or fail
+        loudly (`no such column`) the moment a schema really does diverge, instead of silently
+        scrambling data again.
+        """
+        cur = await self._conn.execute(f"PRAGMA main.table_info({table})")
+        rows = await cur.fetchall()
+        return ", ".join(row["name"] for row in rows)
+
     async def _migrate_table_batch_by_date(
         self,
         table: str,
@@ -6891,11 +6917,13 @@ class WarHistoryDB:
                 break
             ids = [r["id"] for r in rows]
             placeholders = ",".join("?" * len(ids))
+            columns = await self._explicit_column_list(table)
             await self._write_lock.acquire()
             try:
                 await self._conn.execute("BEGIN")
                 await self._conn.execute(
-                    f"INSERT OR IGNORE INTO history.{table} SELECT * FROM main.{table} WHERE id IN ({placeholders})",
+                    f"INSERT OR IGNORE INTO history.{table} ({columns}) "
+                    f"SELECT {columns} FROM main.{table} WHERE id IN ({placeholders})",
                     ids,
                 )
                 await self._conn.execute(
@@ -6950,6 +6978,7 @@ class WarHistoryDB:
 
         total_moved = 0
         completed = True
+        columns = await self._explicit_column_list(table)
         for season in old_seasons:
             if deadline is not None and _monotonic() >= deadline:
                 logging.info(f"[HIST-MIGRATE] {table}: time budget reached — stopping early (total {total_moved} this run)")
@@ -6959,7 +6988,8 @@ class WarHistoryDB:
             try:
                 await self._conn.execute("BEGIN")
                 await self._conn.execute(
-                    f"INSERT OR IGNORE INTO history.{table} SELECT * FROM main.{table} WHERE cwl_season = ?",
+                    f"INSERT OR IGNORE INTO history.{table} ({columns}) "
+                    f"SELECT {columns} FROM main.{table} WHERE cwl_season = ?",
                     (season,),
                 )
                 del_cur = await self._conn.execute(

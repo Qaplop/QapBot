@@ -873,7 +873,7 @@ Point 6 above.
 ## Architecture Notes
 
 ### Modal Class Pattern (CRITICAL)
-See Cardinal Rule 9 (`.github/copilot-instructions.md`) and `../qapbot/docs/CODE_STRUCTURE.md`
+See Cardinal Rule 10 (`.github/copilot-instructions.md`) and `../qapbot/docs/CODE_STRUCTURE.md`
 § Discord.py Patterns for the full pattern + code example. One nuance specific to this flow
 worth calling out here: only the `TextInput.placeholder` gets translated after `super().__init__()`
 — the `label` stays hardcoded English (discord.py's Modal lifecycle requires TextInput labels as

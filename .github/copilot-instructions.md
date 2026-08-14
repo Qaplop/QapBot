@@ -9,24 +9,32 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 
 ## 🔴 CARDINAL RULES (Override Everything)
 
-### 1) Account protection: never bypass security
+### 1) Hot/history schema parity: NEVER let `main` and `history` schemas drift
+- DO: Whenever you `ALTER TABLE main.x ADD COLUMN ...` (or otherwise change a table's schema), apply the byte-for-byte identical change to `history.x` in the **same commit**, in the same order, immediately.
+- DO: Any cross-schema copy (`INSERT INTO history.x (...) SELECT (...) FROM main.x`) MUST list columns explicitly by name on both sides.
+- DON'T: **EVER** write a bare `SELECT *` (or `INSERT INTO x SELECT *`) that copies rows from one schema to the other.
+- DON'T: Assume identical `CREATE TABLE` text in code means two existing tables share a physical column layout. `CREATE TABLE IF NOT EXISTS` never retroactively reorders an already-existing table — so two schemas whose columns were added via different `ALTER TABLE ADD COLUMN` sequences at different points in time can have the same column *names* sitting at completely different physical positions (`cid`), even when their CREATE TABLE source text matches today. Verify with `PRAGMA main.table_info(x)` vs `PRAGMA <history-db>.table_info(x)` (opened as a second connection) if there's ever any doubt — never assume from source text alone.
+- WHY: A 2026-08-14 incident found `main.war_attacks`/`war_summary` and `history.war_attacks`/`war_summary` had silently diverged exactly this way. The monthly hot→history migration (`_migrate_table_batch_by_date`/`_migrate_cwl_table_by_season` in `db_manager.py`) used `SELECT *`, which matches columns by *position*, not name — so every row that ever migrated to history landed roughly a dozen values in the wrong columns (including `stars`, `date`, and `war_tag`) with **no error at any point**, for the entire lifetime of the history DB. This is the same root mechanism as Rule 14's positional-row-access incident below (`ALTER TABLE` appends at the end of physical storage, not the `CREATE TABLE`'s logical position) — that incident already proved this exact pitfall existed for one symptom; this one is the same pitfall for a different symptom (cross-schema bulk copy instead of app-code row access), so the lesson needed generalizing, not just patching once.
+📖 Details: ../qapbot/docs/DATABASE_ARCHITECTURE.md § Hot/History Schema Parity Incident (2026-08-14)
+
+### 2) Account protection: never bypass security
 - DO: Check `get_verified_player_owner()` and `get_any_player_owner()` before linking/re-linking.
 - DON'T: Remove verified accounts without explicit bot-admin confirmation.
 - WHY: Prevent account hijacking.
 📖 Details: ../qapbot/docs/CODE_STRUCTURE.md § Account Protection Architecture
 
-### 2) Single source of truth: CACHE only
+### 3) Single source of truth: CACHE only
 - DO: Use `CACHE.*` for all runtime data.
 - DON'T: Create shadow dicts/lists outside CACHE.
 - WHY: Prevent data divergence.
 📖 Details: ../qapbot/docs/CODE_STRUCTURE.md § Cache Management
 
-### 3) Search before creating
+### 4) Search before creating
 - DO: Search the codebase for an existing implementation before adding a new helper (use whatever search tool your environment provides — grep/ripgrep, semantic search, etc.).
 - DON'T: Create near-duplicates.
 - WHY: Avoid inconsistent behavior.
 
-### 4) Environment awareness: DEV vs PROD
+### 5) Environment awareness: DEV vs PROD
 - DO: Confirm environment before any file ops.
 - PROD bot root: `<PROD_BOT_ROOT>` (set via `PROD_BOT_ROOT` in your environment)
 - PROD data/archive (eSATA SSD): `${PROD_DATA_DIR}/data` (set via `PROD_DATA_DIR` in your environment)
@@ -36,7 +44,7 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 - WHY: Avoid corrupting prod data.
 📖 Details: ../README.md § Deployment Locations
 
-### 5) i18n: no hardcoded user-facing strings
+### 6) i18n: no hardcoded user-facing strings
 - DO: Use `t('key', ...)` for Discord-visible text.
   - Ephemeral/DM: pass both `user_id=str(interaction.user.id)` and `guild_id`.
   - Public: pass `guild_id`.
@@ -44,51 +52,51 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 - WHY: Multi-language support.
 📖 Details: ../qapbot/docs/CODE_STRUCTURE.md § Discord.py Patterns
 
-### 6) Discord interaction lifecycle
+### 7) Discord interaction lifecycle
 - DO: Modal submit: `await interaction.response.defer(...)` then `await interaction.followup.send(...)`.
 - DON'T: Call `response.send_message()` after a response is consumed.
 - WHY: Prevent “interaction already responded”.
 📖 Details: ../qapbot/docs/CODE_STRUCTURE.md § Discord Interaction Pitfall
 
-### 7) Select dropdown persistence
+### 8) Select dropdown persistence
 - DO: When rebuilding selects, set `default=True` on the selected option.
 - DON'T: Expect a `default_values` API for string selects.
 - WHY: Avoid selection reset after edits.
 
-### 8) External API calls through cache_manager only
+### 9) External API calls through cache_manager only
 - DO: All Discord/CoC API calls go via cache_manager wrappers / cache objects.
 - DON'T: Call Discord/CoC APIs directly from business logic/modules.
 - WHY: Central rate limiting, caching, boundaries.
 📖 Details: ../qapbot/docs/RATE_LIMITING_IMPLEMENTATION.md
 
-### 9) discord.py modal pattern
+### 10) discord.py modal pattern
 - DO: `class MyModal(discord.ui.Modal, title="..."):` + TextInput as class attributes.
 - DON'T: Pass `title=` to `super().__init__()` or create TextInputs in `__init__`.
 - WHY: Required by discord.py lifecycle.
 📖 Details: ../qapbot/docs/CODE_STRUCTURE.md § Discord.py Patterns
 
-### 10) Database access through db_manager only
+### 11) Database access through db_manager only
 - DO: Use `CACHE.db_manager.*`.
 - DON'T: Raw SQL / sqlite access in runtime modules.
 - WHY: Central abstraction + error handling.
 📖 Details: ../qapbot/docs/DATABASE_ARCHITECTURE.md
 
-### 11) DB operations must be idempotent
+### 12) DB operations must be idempotent
 - DO: Use `INSERT OR IGNORE`, `CREATE TABLE IF NOT EXISTS`, etc.
 - DON'T: Write migrations that fail on re-run.
 - WHY: Safe recovery and reruns.
 📖 Details: ../qapbot/docs/DATABASE_ARCHITECTURE.md § Migration Principles
 
-### 12) Documentation references: plain text paths only
+### 13) Documentation references: plain text paths only
 - DO: Use `../path/to/file.md § Section`.
 - DON'T: Markdown links inside docs.
 - WHY: Avoid markdown lint/format drift.
 
-### 13) DB rows: ALWAYS use named column access
+### 14) DB rows: ALWAYS use named column access
 - DO: Set `conn.row_factory = aiosqlite.Row` (async) or `conn.row_factory = sqlite3.Row` (sync). Access rows as `row["column_name"]`.
 - DO: Alias aggregate columns: `SELECT COUNT(*) AS cnt` → `row["cnt"]`.
 - DON'T: **EVER** use `row[0]`, `row[1]`, `row[N]` positional index on DB rows.
-- WHY: ALTER TABLE migrations append columns at the end of the physical storage order, not the CREATE TABLE definition order. Positional indices silently read the **wrong column** with no error — this caused `coc_role_enabled` to always read `created_at` (a non-empty string) and return `True` on every bot restart, re-activating disabled features.
+- WHY: ALTER TABLE migrations append columns at the end of the physical storage order, not the CREATE TABLE definition order. Positional indices silently read the **wrong column** with no error — this caused `coc_role_enabled` to always read `created_at` (a non-empty string) and return `True` on every bot restart, re-activating disabled features. Rule 1 above is this same lesson applied to cross-schema bulk copies, not just single-row app-code access.
   ```python
   # WRONG – breaks silently after any ALTER TABLE migration:
   "coc_role_enabled": bool(row[12])  # was actually reading created_at!
@@ -96,7 +104,7 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
   "coc_role_enabled": bool(row["coc_role_enabled"])
   ```
 
-### 14) Keep docs current — a stale doc is a bug, not a formatting nit
+### 15) Keep docs current — a stale doc is a bug, not a formatting nit
 - DO: When a change touches something already documented (in this file or `../qapbot/docs/*.md`), update that documentation in the **same** change — not as a follow-up.
 - DO: When adding a significant feature or doing a significant refactor, add a new doc under `../qapbot/docs/` (or a new section in an existing one) if nothing already covers it.
 - DO: When adding, removing, or changing the behavior/options of a `/` slash command, update its `/help` entry (`help()` in `QBdiscordcmds.py`) in the same change, plus the command list in `../README.md` if it's listed there.
@@ -104,16 +112,16 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 - WHY: This file's own Changelog Management section pointed at `backlog.txt` long after that convention moved to `changelog.txt` — a leftover from when both lived in one file that was later split, and nobody updated the doc when the split happened. A stale doc actively misleads (worse than no doc), and any tool/model following it reproduces the mistake as project practice.
 📖 Where: cardinal rules/patterns → this file. Architecture deep-dives → `../qapbot/docs/*.md`.
 
-### 15) Never commit real infrastructure details — placeholders only
+### 16) Never commit real infrastructure details — placeholders only
 - DO: Use the established placeholder convention for anything about the production
   environment: `<PROD_BOT_ROOT>`, `${PROD_DATA_DIR}`, `<PROD_SSD_UNC>`, `HOST-NAME`,
-  "server-machine", etc. — see Rule 4.
+  "server-machine", etc. — see Rule 5.
 - DON'T: Write a real hostname, IP address, UNC path, hardware/vendor/model name, or
   credential into any tracked file (docs, changelog, code comments, commit messages).
 - OK to reference directly: in-game/Discord identifiers (clan tags/names, player tags,
   guild/channel IDs) — these are public data, not infrastructure, and don't need scrubbing.
 - WHY: The project owner deliberately keeps hosting details out of the repo (which is or may
-  become public) — that's *why* Rule 4's placeholders exist. Before syncing a batch of doc
+  become public) — that's *why* Rule 5's placeholders exist. Before syncing a batch of doc
   changes, a 2026-07-26 sweep confirmed no leaks had occurred, but it was a manual check with
   no rule backing it — this makes the expectation explicit instead of relying on catching it
   after the fact each time.
@@ -146,7 +154,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 2) Workflow message clutter → prefer `edit_message()` single-message flows; cleanup old responses.
 3) Hardcoded English → always use `t()`; ephemeral/DM must pass both `user_id` and `guild_id`.
 4) Interaction already responded → modal submit: defer then followup; buttons/selects: check `is_done()`.
-5) Duplicate helpers → search the codebase before adding (Cardinal Rule 3).
+5) Duplicate helpers → search the codebase before adding (Cardinal Rule 4).
 6) Missing context/flags → thread `guild_id`, `user_id`, admin flags, and CONFIG values through signatures.
 7) Losing fields in CACHE dicts → update in-place or preserve unknown keys when rebuilding.
 8) Thinking indicator stuck → use `thinking=False` when only editing; `thinking=True` only with followup.
@@ -171,7 +179,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 ## Implementation Workflow
 
 ### Before Writing Code
-1. **Search for existing functionality** (Cardinal Rule 3)
+1. **Search for existing functionality** (Cardinal Rule 4)
 2. **Read relevant module docs** (../qapbot/docs/CODE_STRUCTURE.md for responsibilities)
 3. **Identify data flow** (what CACHE properties are involved?)
 4. **Check environment** (dev vs prod paths if file operations)
@@ -185,7 +193,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
    backlog before every edit, but this step only requires noticing when a match applies.
 
 ### While Writing Code
-- Follow Cardinal Rules 1, 2, 5, 9 (account protection, CACHE, i18n, modal pattern)
+- Follow Cardinal Rules 2, 3, 6, 10 (account protection, CACHE, i18n, modal pattern)
 - Meet the Code Quality Standards below (type hints, docstrings, comments, error handling)
 - Log with appropriate level (DEBUG for verbose, INFO for actions)
 
@@ -194,7 +202,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 - Check integration: Do dependent functions still work?
 - Verify cache consistency: Are save/load operations paired?
 - Test error paths: Are failures handled gracefully?
-- Update documentation per Cardinal Rule 14 if the change touches anything documented
+- Update documentation per Cardinal Rule 15 if the change touches anything documented
 - **Run tests with:** `.\run_tests.ps1` — NEVER construct a raw pytest command.
   Pass extra filters as trailing args: `.\run_tests.ps1 -k my_test` or `--lf`.
   The script encodes the canonical deselects; calling it directly keeps the
@@ -233,7 +241,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 - **Position**: New entries go at the very TOP of the file, immediately after the `===========` header line.
 - **Format**: `YYYY-MM-DD (N)` heading using TODAY's real date — `N` increments per entry added that day (1, 2, 3, ... do not reuse or renumber older entries, even across days).
 - **Content**: Short and crisp — a few lines stating what changed (Fixed/Added/Changed) and why, plus the file(s) touched and the test result. Not a multi-paragraph blow-by-blow of every branch/file touched.
-- **Documentation Updates**: See Cardinal Rule 14 — update the relevant doc(s) in the same pass, not as a follow-up.
+- **Documentation Updates**: See Cardinal Rule 15 — update the relevant doc(s) in the same pass, not as a follow-up.
 - **Tests**: Run `.\run_tests.ps1` (see "After Writing Code" above) and report the real pass count in the entry — never a raw `pytest` count, which misreports deliberately-deselected tests as failures.
 
 **Example** (see `changelog.txt` itself for the full live convention):

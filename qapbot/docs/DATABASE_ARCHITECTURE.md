@@ -100,6 +100,85 @@ Verification trick: after the fix, a `<historydb>.db-wal` file should appear and
 writes. Its ABSENCE while writes are happening is the tell-tale sign the schema is still on
 rollback-journal mode.
 
+### Incident: silent column-order divergence corrupted every migrated `war_attacks`/`war_summary` row (2026-08-14)
+
+**Root cause.** `main.war_attacks`/`war_summary` and `history.war_attacks`/`war_summary` have
+identical column *names* today, but their columns physically sit at different `cid` positions —
+because each schema's `CREATE TABLE` text in `db_manager.py` looks the same now, but the two
+actual on-disk tables were extended via *separate* `ALTER TABLE ADD COLUMN` sequences at
+different points in the project's history, and SQLite always appends a new column at the end of
+physical storage regardless of where the `CREATE TABLE` source text places it logically.
+`CREATE TABLE IF NOT EXISTS` never retroactively reorders an already-existing table to match
+newer code, so nothing about matching CREATE TABLE text today proves the two live tables agree.
+
+`_migrate_table_batch_by_date()`/`_migrate_cwl_table_by_season()` moved rows with
+`INSERT INTO history.<table> SELECT * FROM main.<table> WHERE ...` — a bare `SELECT *` matches
+source and destination columns by **position**, not name. Every row ever migrated therefore had
+its trailing columns written into the wrong destination column, silently, with no error — for the
+entire lifetime of the history DB (confirmed 2026-08-14: 100% of `is_cwl=1` `war_summary` rows in
+`history` had `war_tag` holding the war *result* string `'win'/'loss'/'draw'` instead of a real
+CoC war tag).
+
+**Exact shift, `war_summary`** (`cid` 0-13 — `id` through `cwl_season` — are unaffected; the two
+schemas happen to agree up to there):
+
+| cid | `main` column (true meaning) | `history` column label (what actually got written there) |
+|-----|-------------------------------|-------------------------------------------------------------|
+| 14  | `result`                     | `war_tag` |
+| 15  | `date`                        | `end_time` |
+| 16  | `clan_lineup_json`            | `state` |
+| 17  | `opp_lineup_json`              | `result` |
+| 18  | `created_at`                   | `date` |
+| 19  | `clan_attacks_used`            | `clan_lineup_json` |
+| 20  | `opp_attacks_used`             | `opp_lineup_json` |
+| 21  | `war_tag`                      | `clan_attacks_used` |
+| 22  | `end_time`                     | `opp_attacks_used` |
+| 23  | `state`                        | `round_number` |
+| 24  | `round_number`                 | `created_at` |
+
+**Exact shift, `war_attacks`** (`cid` 0-6 — `id` through `th_level` — are unaffected):
+
+| cid | `main` column (true meaning) | `history` column label (what actually got written there) |
+|-----|-------------------------------|-------------------------------------------------------------|
+| 7   | `attack_order`                | `map_position` |
+| 8   | `stars`                        | `attack_order` |
+| 9   | `destruction`                  | `stars` |
+| 10  | `defender_tag`                 | `destruction` |
+| 11  | `max_attacks`                  | `defender_tag` |
+| 12  | `missed_attacks`               | `defender_th` |
+| 13  | `defensive_stars`              | `defender_map_position` |
+| 14  | `created_at`                    | `duration` |
+| 15  | `map_position`                 | `is_fresh` |
+| 16  | `defender_th`                  | `times_defended` |
+| 17  | `defender_map_position`        | `best_def_destruction` |
+| 18  | `duration`                      | `max_attacks` |
+| 19  | `is_fresh`                      | `missed_attacks` |
+| 20  | `times_defended`                | `defensive_stars` |
+| 21  | `best_def_destruction`          | `created_at` |
+
+`cwl_league_groups`/`cwl_league_rounds` (the other two migrated tables) were checked the same way
+and are **not** affected — their two schemas happen to still agree column-for-column. That was
+luck, not a property the code ever verified; see Cardinal Rule 1.
+
+**Why this is recoverable, not lost.** The shift is a pure, deterministic position swap — every
+value is still present in the row, just filed under the wrong column name. Nothing needs
+reconstructing from an external source for a row that already migrated; each row can be repaired
+in place by reading it positionally and rewriting the values under their correct names. A backup
+predating this bug (if one exists) is a good independent cross-check for the repair, not a
+requirement for it.
+
+**Fix shipped 2026-08-14**: both migration functions now build an explicit, named column list at
+runtime (`_explicit_column_list()`, reading `PRAGMA main.table_info(<table>)`) and use it on both
+sides of the `INSERT ... SELECT`, instead of `SELECT *`. This stops any *new* row from being
+corrupted on its next migration, and turns a future genuine schema divergence into a loud SQL
+error (`no such column`) instead of silent misalignment. **Repair of the already-migrated
+historical rows is a separate, not-yet-executed effort** — see the session notes / recovery plan
+for status before trusting any `history.war_attacks`/`war_summary` column beyond `id`, `war_id`,
+`clan_tag`, `date`(war_attacks only — `war_summary.date` IS affected), `player_name`,
+`player_tag`, `th_level`.
+
+📖 Prevention rule: `.github/copilot-instructions.md` Cardinal Rule 1.
+
 ### On-demand ops scripts
 
 `qapbot/scripts/run_history_migration_now.py` and `qapbot/scripts/run_db_maintenance_now.py` let
@@ -466,7 +545,7 @@ Copy-Item "data\qapbot_backup_YYYYMMDD_HHMMSS.db" "data\qapbot.db"
 ### Database Size
 
 **⏱ Time-sensitive figures — verified 2026-07-26, not code-change-triggered.** Unlike most of
-this doc (kept current via the "update docs in the same change" rule — see Cardinal Rule 14 in
+this doc (kept current via the "update docs in the same change" rule — see Cardinal Rule 15 in
 `.github/copilot-instructions.md`), these numbers grow purely with usage over time, with no
 single code change to hang an update on. The previous version of this section (~98K attack
 rows, ~500 KB maindata) was many months stale before this refresh. Don't treat the numbers

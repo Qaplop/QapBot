@@ -1,6 +1,26 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-14 (7)
+- Fixed (CRITICAL — hot/history DB schema drift, found while investigating why the CWL board's
+  player-skill score returned nothing): `main.war_attacks`/`war_summary` and
+  `history.war_attacks`/`war_summary` had silently diverged in physical column order — same
+  column names, different `cid` positions, because each schema's columns were added via
+  separate `ALTER TABLE ADD COLUMN` sequences over the project's history and `CREATE TABLE IF
+  NOT EXISTS` never retroactively reorders an existing table. The monthly hot→history migration
+  used a bare `SELECT *`, which matches by position, not name — so every row ever migrated had
+  ~11-15 trailing columns (including `stars`, `date`, and `war_tag`) silently written into the
+  wrong destination column, for the entire lifetime of the history DB, with no error at any
+  point. `cwl_league_groups`/`cwl_league_rounds` (the other two migrated tables) were checked
+  and are NOT affected. Fix: both migration functions now build an explicit, named column list
+  at runtime (new `_explicit_column_list()`) instead of `SELECT *` — stops any further
+  corruption immediately; a genuine future schema divergence now fails loudly instead of
+  silently misaligning. New Cardinal Rule 1 in `.github/copilot-instructions.md` (hot/history
+  schemas must never drift; existing rules renumbered 2-16) plus a full incident writeup in
+  `qapbot/docs/DATABASE_ARCHITECTURE.md`. 2 new regression tests proving the fix survives a
+  genuine column-order divergence; 1788 total tests pass. **Repair of the already-migrated
+  historical rows is a separate, not-yet-executed effort — recovery plan in progress.**
+
 2026-08-14 (6)
 - Fixed (CWL Manage Enrollment board): the new "Not Linked" icon (round (5) above) was showing
   alongside the signup-status icon rather than replacing it — a player with no linked Discord
