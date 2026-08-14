@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -119,4 +119,10 @@ async def test_update_player_info_updates_and_persists_only_affected_users():
     p1 = cache_manager.user_accounts["111"]["players"][0]
     assert p1["th_level"] == 16
     assert p1["current_clan_tag"] == "#CLAN"
-    persist_user.assert_awaited_once_with("111")
+    # #P1 is (inconsistently) tracked under both "111" and UNASSIGNED here — since 2026-08-14
+    # the UNASSIGNED pool is no longer skipped by the periodic sync, so its stale duplicate gets
+    # refreshed too rather than staying frozen forever.
+    p1_unassigned = cache_manager.user_accounts["UNASSIGNED"]["players"][0]
+    assert p1_unassigned["th_level"] == 16
+    assert p1_unassigned["current_clan_tag"] == "#CLAN"
+    assert persist_user.await_args_list == [call("111"), call("UNASSIGNED")]

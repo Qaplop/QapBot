@@ -56,15 +56,16 @@ async def _seed_user_player(
     cwl_permanent_optout: bool = False,
     cwl_default_preferred_league_rank: str = None,
     current_clan_tag: str = None,
+    th_level: int = None,
 ) -> None:
     await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
     await db.conn.execute(
         """
         INSERT INTO user_players
-            (discord_id, player_tag, player_name, verified, cwl_permanent_optout, cwl_default_preferred_league_rank, current_clan_tag)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (discord_id, player_tag, player_name, verified, cwl_permanent_optout, cwl_default_preferred_league_rank, current_clan_tag, th_level)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (discord_id, player_tag, player_name, 1 if verified else 0, 1 if cwl_permanent_optout else 0, cwl_default_preferred_league_rank, current_clan_tag),
+        (discord_id, player_tag, player_name, 1 if verified else 0, 1 if cwl_permanent_optout else 0, cwl_default_preferred_league_rank, current_clan_tag, th_level),
     )
     await db.conn.commit()
 
@@ -442,6 +443,18 @@ class TestGetCurrentClanMembers:
         assert m["verified"] is True
         assert m["cwl_permanent_optout"] is False
         assert m["preferred_league_rank"] == "Champion League I"
+
+    @pytest.mark.integration
+    async def test_returns_th_level(self, db):
+        """th_level is kept fresh for every current member (linked or not) by coc_cache.py's
+        per-clan poll cycle (2026-08-14) — the Manage Enrollment board's primary TH source."""
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_user_player(db, "d1", "#P1", current_clan_tag="#CLAN1", th_level=15)
+        await _seed_user_player(db, "d2", "#P2", current_clan_tag="#CLAN1")  # never synced yet
+
+        members_by_tag = {m["player_tag"]: m for m in db.get_current_clan_members_sync(["#CLAN1"])}
+        assert members_by_tag["#P1"]["th_level"] == 15
+        assert members_by_tag["#P2"]["th_level"] is None
 
     @pytest.mark.integration
     async def test_unassigned_sentinel_has_none_discord_id(self, db):

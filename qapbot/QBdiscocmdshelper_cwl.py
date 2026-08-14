@@ -483,7 +483,7 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
         if CONFIG.is_dev_mode and str(participant["discord_id"]) != CONFIG.server_admin:
             summary["skipped_dev_guard"] += 1
             continue
-        sent = await _send_cwl_signup_template_dm(event["id"], guild_id, participant)
+        sent = await _send_cwl_signup_template_dm(event["id"], guild_id, season, participant)
         if sent:
             summary["contacted"] += 1
 
@@ -492,7 +492,7 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     return summary
 
 
-async def _send_cwl_signup_template_dm(event_id: int, guild_id: int, participant: Dict[str, Any]) -> bool:
+async def _send_cwl_signup_template_dm(event_id: int, guild_id: int, season: str, participant: Dict[str, Any]) -> bool:
     """Send one template-copy confirm/opt-out DM. Kept as its own function so start_cwl_enrollment
     stays readable — this is the only place that builds the DM's content+view pair."""
     from qapbot.i18n import t
@@ -503,7 +503,8 @@ async def _send_cwl_signup_template_dm(event_id: int, guild_id: int, participant
         'cwl.template.dm_body',
         guild_id=guild_id,
         user_id=discord_id,
+        season=season,
         player_name=participant["player_name"] or participant["player_tag"],
     )
-    view = build_cwl_signup_response_view(event_id, participant["player_tag"])
+    view = build_cwl_signup_response_view(event_id, participant["player_tag"], guild_id)
     return await CACHE.send_user_dm(str(discord_id), message, view=view)

@@ -1,36 +1,66 @@
+import gcheckIconUrl from './assets/gcheck.svg'
+import pendingIconUrl from './assets/pending.svg'
+import redxIconUrl from './assets/redx.svg'
 import type { EnrollmentPayload, EnrollmentPlayer } from './types'
+
+type SortOrder = 'th' | 'skill' | 'alpha'
+
+type VisibleStatus = 'pending' | 'confirmed' | 'declined'
+
+// Only the three statuses a member's own DM response can actually produce are ever shown — the
+// board never lets the clan lead alter a signup status itself (live-testing feedback,
+// 2026-08-14: assignment is drag-and-drop only, see renderEnrollmentBoard's docstring).
+// Anything else (no signup row yet, or a legacy 'withdrawn' value) shows no icon at all.
+const STATUS_ICON: Record<VisibleStatus, string> = {
+  pending: pendingIconUrl,
+  confirmed: gcheckIconUrl,
+  declined: redxIconUrl,
+}
+const STATUS_LABEL: Record<VisibleStatus, string> = {
+  pending: 'Pending',
+  confirmed: 'Confirmed',
+  declined: 'Declined',
+}
+
+function isVisibleStatus(status: EnrollmentPlayer['signup_status']): status is VisibleStatus {
+  return status === 'pending' || status === 'confirmed' || status === 'declined'
+}
 
 function displayName(player: EnrollmentPlayer): string {
   return player.player_name || player.player_tag
 }
 
-// Only the three statuses a member's own DM response can actually produce are shown — the board
-// never lets the clan lead alter a signup status itself (live-testing feedback, 2026-08-14:
-// assignment is drag-and-drop only now, see renderEnrollmentBoard's docstring). Anything else
-// (no signup row yet, or a legacy 'withdrawn' value) reads the same as "no status to show".
-function statusLabel(status: EnrollmentPlayer['signup_status']): string | null {
-  switch (status) {
-    case 'pending':
-      return 'Pending'
-    case 'confirmed':
-      return 'Confirmed'
-    case 'declined':
-      return 'Declined'
-    default:
-      return null
-  }
+function sortPlayers(players: EnrollmentPlayer[], order: SortOrder): EnrollmentPlayer[] {
+  const byName = (a: EnrollmentPlayer, b: EnrollmentPlayer) => displayName(a).localeCompare(displayName(b))
+  return [...players].sort((a, b) => {
+    if (order === 'th') {
+      const diff = (b.th_level ?? -1) - (a.th_level ?? -1)
+      return diff !== 0 ? diff : byName(a, b)
+    }
+    if (order === 'skill') {
+      const diff = (b.skill_score ?? -1) - (a.skill_score ?? -1)
+      return diff !== 0 ? diff : byName(a, b)
+    }
+    return byName(a, b)
+  })
 }
+
+const COLUMN_DRAG_TYPE = 'application/x-cwl-column-index'
 
 /**
  * Renders the CWL "Manage Assignment" board — participating clans as drag-and-drop columns plus
- * an "Unassigned" pool, each player a compact card: TH icon + level, name, and a read-only
- * signup-status badge (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment" slice 4).
+ * an "Unassigned" pool, each player a compact card: TH icon + level, name, skill score, and a
+ * read-only signup-status icon (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment" slice 4).
  *
  * There is no Confirm/Withdraw control here — a signup's status is entirely the member's own
  * doing via their DM response, never something the clan lead sets on their behalf from this
- * screen. The only action available is moving a card between columns, which calls the bridge
- * immediately with an optimistic UI update that reverts (with an inline error) if the call fails
- * — there is no separate Save step to catch a failure at.
+ * screen. Two things are draggable: player cards (move a player between clans/Unassigned — the
+ * bridge call is optimistic, reverting with an inline error if it fails) and column headers
+ * (reorder the columns themselves — client-side only, so the Unassigned pool can be dragged next
+ * to whichever clan is currently being filled instead of always sitting at the far end).
+ *
+ * The title/legend/sort-order block is a `position: sticky` header so it stays in view while a
+ * long roster scrolls (each column also scrolls internally past a height cap).
  */
 export function renderEnrollmentBoard(
   container: HTMLElement,
@@ -40,13 +70,45 @@ export function renderEnrollmentBoard(
 ): void {
   const working: EnrollmentPlayer[] = payload.players.map((p) => ({ ...p }))
   const byTag = new Map(working.map((p) => [p.player_tag, p]))
+  let sortOrder: SortOrder = 'th'
+  // Column order: participating clans (already tier-sorted by the bridge, highest league
+  // first — see _build_enrollment_payload), Unassigned pool last. Mutable so column headers can
+  // be dragged to reorder — a purely client-side arrangement, not persisted.
+  let columnOrder: (string | null)[] = [...payload.clans.map((c) => c.clan_tag), null]
 
   container.innerHTML = ''
+
+  const topBar = document.createElement('div')
+  topBar.className = 'board-topbar'
+  container.appendChild(topBar)
+
+  const titleRow = document.createElement('div')
+  titleRow.className = 'title-row'
+  topBar.appendChild(titleRow)
+
+  const legend = document.createElement('div')
+  legend.className = 'legend'
+  legend.append(
+    buildLegendItem(pendingIconUrl, STATUS_LABEL.pending),
+    buildLegendItem(gcheckIconUrl, STATUS_LABEL.confirmed),
+    buildLegendItem(redxIconUrl, STATUS_LABEL.declined),
+  )
+  titleRow.appendChild(legend)
 
   const header = document.createElement('div')
   header.className = 'header'
   header.textContent = `Season ${payload.season} — ${payload.event_status ?? 'draft'}`
-  container.appendChild(header)
+  titleRow.appendChild(header)
+
+  const sortRow = document.createElement('div')
+  sortRow.className = 'sort-row'
+  sortRow.appendChild(
+    buildSortSelector(sortOrder, (next) => {
+      sortOrder = next
+      renderBoard()
+    }),
+  )
+  topBar.appendChild(sortRow)
 
   const board = document.createElement('div')
   board.className = 'board'
@@ -65,20 +127,19 @@ export function renderEnrollmentBoard(
   footer.append(closeButton, status)
   container.appendChild(footer)
 
-  // Column order: participating clans (already tier-sorted by the bridge — see
-  // _build_enrollment_payload), Unassigned pool last.
-  const columnClanTags: (string | null)[] = [...payload.clans.map((c) => c.clan_tag), null]
-
   function columnTitle(clanTag: string | null): string {
     if (clanTag === null) return 'Unassigned'
     const clan = payload.clans.find((c) => c.clan_tag === clanTag)
-    return clan ? `${clan.name ?? clan.clan_tag} (${clan.clan_tag})` : clanTag
+    if (!clan) return clanTag
+    const tierSuffix = clan.tier ? ` · ${clan.tier}` : ''
+    return `${clan.name ?? clan.clan_tag} (${clan.clan_tag})${tierSuffix}`
   }
 
   function playersFor(clanTag: string | null): EnrollmentPlayer[] {
-    return working
-      .filter((p) => p.assigned_clan_tag === clanTag)
-      .sort((a, b) => displayName(a).localeCompare(displayName(b)))
+    return sortPlayers(
+      working.filter((p) => p.assigned_clan_tag === clanTag),
+      sortOrder,
+    )
   }
 
   function handleDrop(player: EnrollmentPlayer, targetClanTag: string | null): void {
@@ -95,6 +156,13 @@ export function renderEnrollmentBoard(
       status.textContent = `Action failed: ${(err as Error).message}`
       status.className = 'save-status error'
     })
+  }
+
+  function handleColumnReorder(fromIndex: number, toIndex: number): void {
+    if (fromIndex === toIndex || fromIndex < 0 || fromIndex >= columnOrder.length) return
+    const [moved] = columnOrder.splice(fromIndex, 1)
+    columnOrder.splice(toIndex, 0, moved)
+    renderBoard()
   }
 
   function buildCard(player: EnrollmentPlayer): HTMLElement {
@@ -133,19 +201,28 @@ export function renderEnrollmentBoard(
     name.textContent = displayName(player)
     row.appendChild(name)
 
-    const label = statusLabel(player.signup_status)
-    if (label) {
-      const badge = document.createElement('span')
-      badge.className = `signup-badge signup-${player.signup_status}`
-      badge.textContent = label
-      row.appendChild(badge)
+    if (player.skill_score != null) {
+      const skill = document.createElement('span')
+      skill.className = 'skill-score'
+      skill.textContent = player.skill_score.toFixed(1)
+      skill.title = 'Player skill score'
+      row.appendChild(skill)
+    }
+
+    if (isVisibleStatus(player.signup_status)) {
+      const icon = document.createElement('img')
+      icon.className = 'status-icon'
+      icon.src = STATUS_ICON[player.signup_status]
+      icon.alt = STATUS_LABEL[player.signup_status]
+      icon.title = STATUS_LABEL[player.signup_status]
+      row.appendChild(icon)
     }
 
     card.appendChild(row)
     return card
   }
 
-  function buildColumn(clanTag: string | null): HTMLElement {
+  function buildColumn(clanTag: string | null, index: number): HTMLElement {
     const column = document.createElement('div')
     column.className = clanTag === null ? 'column column-unassigned' : 'column'
 
@@ -154,6 +231,13 @@ export function renderEnrollmentBoard(
     const columnHeader = document.createElement('div')
     columnHeader.className = 'column-header'
     columnHeader.textContent = `${columnTitle(clanTag)} (${players.length})`
+    columnHeader.draggable = true
+    columnHeader.addEventListener('dragstart', (e) => {
+      e.dataTransfer?.setData(COLUMN_DRAG_TYPE, String(index))
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
+      column.classList.add('dragging')
+    })
+    columnHeader.addEventListener('dragend', () => column.classList.remove('dragging'))
     column.appendChild(columnHeader)
 
     const cardList = document.createElement('div')
@@ -172,6 +256,10 @@ export function renderEnrollmentBoard(
     column.addEventListener('drop', (e) => {
       e.preventDefault()
       column.classList.remove('drop-target')
+      if (e.dataTransfer?.types.includes(COLUMN_DRAG_TYPE)) {
+        handleColumnReorder(Number(e.dataTransfer.getData(COLUMN_DRAG_TYPE)), index)
+        return
+      }
       const playerTag = e.dataTransfer?.getData('text/plain')
       if (!playerTag) return
       const player = byTag.get(playerTag)
@@ -183,10 +271,52 @@ export function renderEnrollmentBoard(
 
   function renderBoard(): void {
     board.innerHTML = ''
-    for (const clanTag of columnClanTags) {
-      board.appendChild(buildColumn(clanTag))
-    }
+    columnOrder.forEach((clanTag, index) => {
+      board.appendChild(buildColumn(clanTag, index))
+    })
   }
 
   renderBoard()
+}
+
+function buildLegendItem(iconUrl: string, label: string): HTMLElement {
+  const item = document.createElement('span')
+  item.className = 'legend-item'
+  const icon = document.createElement('img')
+  icon.className = 'legend-icon'
+  icon.src = iconUrl
+  icon.alt = label
+  item.append(icon, label)
+  return item
+}
+
+function buildSortSelector(initial: SortOrder, onChange: (order: SortOrder) => void): HTMLElement {
+  const wrap = document.createElement('div')
+  wrap.className = 'sort-selector'
+
+  const label = document.createElement('span')
+  label.className = 'sort-label'
+  label.textContent = 'Sort by:'
+  wrap.appendChild(label)
+
+  const options: { value: SortOrder; label: string }[] = [
+    { value: 'th', label: 'TH Level' },
+    { value: 'skill', label: 'Player Skill' },
+    { value: 'alpha', label: 'Alphabetical' },
+  ]
+  for (const option of options) {
+    const optionLabel = document.createElement('label')
+    optionLabel.className = 'sort-option'
+    const radio = document.createElement('input')
+    radio.type = 'radio'
+    radio.name = 'cwl-sort-order'
+    radio.value = option.value
+    radio.checked = option.value === initial
+    radio.addEventListener('change', () => {
+      if (radio.checked) onChange(option.value)
+    })
+    optionLabel.append(radio, option.label)
+    wrap.appendChild(optionLabel)
+  }
+  return wrap
 }

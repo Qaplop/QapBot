@@ -48,11 +48,14 @@ export type EnrollmentPlayer = {
   // The board only ever displays pending/confirmed/declined — the true statuses a member's own
   // DM response can produce. 'withdrawn' remains a value the bridge can send (legacy data, or a
   // future non-board caller of POST /api/cwl/enrollment/signup) but the board treats it the same
-  // as null/unknown rather than giving it its own badge — see enrollmentBoard.ts's statusLabel().
+  // as null/unknown rather than giving it its own icon — see enrollmentBoard.ts's isVisibleStatus().
   signup_status: 'pending' | 'confirmed' | 'declined' | 'withdrawn' | null
   assigned_clan_tag: string | null
   th_level: number | null
   th_icon_url: string | null
+  // League-adjusted average stars/attack over the player's last 10 CWL attacks. Null until the
+  // backend computes it (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment" — player-skill sort).
+  skill_score: number | null
 }
 
 export type EnrollmentPayload = {

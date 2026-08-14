@@ -15,7 +15,7 @@ Memory Usage:
 import asyncio
 import logging
 import sys
-from typing import Dict, Any, List, Optional, TYPE_CHECKING
+from typing import Dict, Any, List, Optional, Set, TYPE_CHECKING
 from datetime import datetime, timezone
 
 import coc  # type: ignore[import-untyped]
@@ -496,38 +496,48 @@ class CoCClanCache:
     
     async def update_player_info_in_user_accounts(self, clan_obj: 'coc.Clan', cache_manager: 'CacheManager') -> None:
         """
-        Update TH level and clan info for all players in user_accounts who are in this clan.
-        
-        This keeps user_accounts current with player TH levels and clan membership
-        without requiring individual API calls per player.
-        
+        Update TH level and clan info for every player this clan-info API response mentions —
+        registered accounts and the UNASSIGNED pool alike (2026-08-14: UNASSIGNED used to be
+        skipped here entirely, so an unlinked player's th_level/current_clan_tag/name/coc_role
+        froze at whatever it was when last linked/unlinked and was never refreshed again by the
+        regular clan-poll cycle — only a one-off get_player() call at re-link time kept it
+        current at all, per the comment this fixes in QBdiscocmdshelper.py's UNASSIGNED-restore
+        path). Also creates a fresh UNASSIGNED-pool entry for any clan member this bot has never
+        tracked in ANY account before, so a player who's never been linked by anyone still gets
+        a user_players row with real TH/name data instead of remaining invisible until someone
+        links them — "never waste info the CoC API already gave us."
+
+        This keeps user_players current with player TH levels and clan membership without
+        requiring individual API calls per player.
+
         Args:
             clan_obj: CoC Clan object with member data
             cache_manager: CacheManager instance with user_accounts data
         """
         # Build lookup: player_tag -> member data
         clan_members = {member.tag: member for member in clan_obj.members}  # type: ignore[misc, attr-defined]
-        
+
         # Track changes
         changes_made = False
         affected_user_ids: List[str] = []
         name_changes: List[tuple[str, str]] = []  # (player_tag, new_name) for index update
-        
-        # Update all registered players who are in this clan
+        tracked_tags: Set[str] = set()
+
+        # Update all registered players who are in this clan (including the UNASSIGNED pool —
+        # see the docstring above for why that's no longer skipped)
         for user_id, user_data in cache_manager.user_accounts.items():
-            # Skip UNASSIGNED pseudo-user
-            if user_id == "UNASSIGNED":
-                continue
             # Skip invalid entries (shouldn't happen after validation)
             if not isinstance(user_data, dict):  # type: ignore[misc]
                 continue
-            
+
             players = user_data.get("players", [])
             for player in players:
                 if not isinstance(player, dict):
                     continue
-                
+
                 player_tag = player.get("player_tag")  # type: ignore[union-attr]
+                if player_tag:
+                    tracked_tags.add(player_tag)
                 if player_tag in clan_members:
                     member = clan_members[player_tag]
                     
@@ -589,8 +599,6 @@ class CoCClanCache:
         # clan role and a fresh get_player() can set the correct new clan on next cycle.
         clan_tag_str: str = str(clan_obj.tag)  # type: ignore[attr-defined]
         for user_id, user_data in cache_manager.user_accounts.items():
-            if user_id == "UNASSIGNED":
-                continue
             if not isinstance(user_data, dict):  # type: ignore[misc]
                 continue
             for player in user_data.get("players", []):
@@ -607,6 +615,34 @@ class CoCClanCache:
                     changes_made = True
                     if user_id not in affected_user_ids:
                         affected_user_ids.append(user_id)
+
+        # Any clan member this bot has never tracked in any account (registered or UNASSIGNED)
+        # gets a brand-new UNASSIGNED-pool entry — the only way a never-linked player ends up
+        # with a user_players row at all, so features like get_current_clan_members_sync() (the
+        # "Manage Enrollment" board's player pool) can find them from day one.
+        new_tags = [tag for tag in clan_members if tag not in tracked_tags]
+        if new_tags:
+            unassigned_entry = cache_manager.user_accounts.setdefault(
+                "UNASSIGNED", {"display_name": "UNASSIGNED", "players": []}
+            )
+            unassigned_players = unassigned_entry.setdefault("players", [])  # type: ignore[union-attr]
+            for tag in new_tags:
+                member = clan_members[tag]
+                raw_role = getattr(member, "role", None)
+                raw_role_name = getattr(raw_role, "name", None) if raw_role else None
+                new_coc_role = ("coLeader" if raw_role_name == "co_leader" else raw_role_name) if raw_role_name else None
+                unassigned_players.append({
+                    "player_tag": tag,
+                    "player_name": member.name,  # type: ignore[attr-defined]
+                    "verified": False,
+                    "th_level": member.town_hall,  # type: ignore[attr-defined]
+                    "current_clan_tag": clan_obj.tag,  # type: ignore[attr-defined]
+                    "coc_role": new_coc_role,
+                })
+                logging.info(f"[USER-ACCOUNTS-UPDATE] {tag}: newly tracked from clan {clan_tag_str} (never seen before)")
+            changes_made = True
+            if "UNASSIGNED" not in affected_user_ids:
+                affected_user_ids.append("UNASSIGNED")
 
         # Save affected users (write-through: persist only changed users)
         if changes_made:

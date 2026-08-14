@@ -812,7 +812,7 @@
     "template": {
       "confirm_button": "Confirm",
       "optout_button": "Opt Out",
-      "dm_body": "You were on last season's CWL roster. Are you playing again this season, **{player_name}**? Tap Confirm to join the roster pool, or Opt Out to sit this one out.",
+      "dm_body": "📋 Sign-up for CWL season **{season}**!\nDo you want to play this CWL with **{player_name}**?",
       "confirmed_msg": "✅ Thanks — **{player_name}** is confirmed for this season's CWL roster pool.",
       "declined_msg": "👍 Got it — **{player_name}** has opted out of this season's CWL roster pool.",
       "no_longer_valid": "⚠️ This sign-up is no longer valid (the season may have been deleted).",

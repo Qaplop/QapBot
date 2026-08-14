@@ -63,6 +63,23 @@
       .save-status.success { color: #23a55a; }
       .save-status.error { color: #f23f42; }
 
+      .board-topbar {
+        position: sticky;
+        top: 0;
+        z-index: 5;
+        background: #313338;
+        padding-top: 2px;
+        padding-bottom: 8px;
+      }
+      .title-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 6px; }
+      .legend { display: flex; align-items: center; gap: 12px; }
+      .legend-item { display: flex; align-items: center; gap: 4px; font-size: 0.75rem; color: #949ba4; }
+      .legend-icon { width: 16px; height: 16px; }
+      .sort-selector { display: flex; align-items: center; gap: 14px; font-size: 0.8rem; color: #949ba4; }
+      .sort-label { color: #949ba4; }
+      .sort-option { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+      .sort-option input { accent-color: #5865f2; cursor: pointer; }
+
       .board { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px; }
       .column {
         flex: 0 0 220px;
@@ -75,6 +92,7 @@
       }
       .column.column-unassigned { border-color: #4a4d54; }
       .column.drop-target { border-color: #5865f2; background: #32354b; }
+      .column.dragging { opacity: 0.4; }
       .column-header {
         padding: 8px 10px;
         font-size: 0.8rem;
@@ -83,8 +101,9 @@
         text-transform: uppercase;
         letter-spacing: 0.02em;
         border-bottom: 1px solid #3f4147;
+        cursor: grab;
       }
-      .card-list { padding: 8px; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+      .card-list { padding: 8px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
       .player-card {
         background: #1e1f22;
         border: 1px solid #3f4147;
@@ -115,18 +134,8 @@
         overflow: hidden;
         text-overflow: ellipsis;
       }
-      .signup-badge {
-        display: inline-block;
-        flex-shrink: 0;
-        font-size: 0.7rem;
-        padding: 2px 6px;
-        border-radius: 3px;
-        background: #3f4147;
-        color: #949ba4;
-      }
-      .signup-badge.signup-confirmed { background: #1c3a2a; color: #23a55a; }
-      .signup-badge.signup-pending { background: #3a3620; color: #e3b341; }
-      .signup-badge.signup-declined { background: #3a2226; color: #f23f42; }
+      .skill-score { flex-shrink: 0; font-size: 0.75rem; color: #949ba4; }
+      .status-icon { width: 16px; height: 16px; flex-shrink: 0; display: block; }
     </style>
   </head>
   <body>

@@ -3066,11 +3066,13 @@ class WarHistoryDB:
 
         Returns one dict per player_tag: player_tag, player_name, clan_tag, discord_id (None if
         the sentinel 'UNASSIGNED' or unset — no real linked account to DM), verified,
-        cwl_permanent_optout, preferred_league_rank. If the same player_tag is linked by more
-        than one Discord account (disputed ownership), the verified one wins. Callers decide what
-        to do with opted-out/unlinked accounts — this function only resolves data, it does not
-        filter, matching the same division of responsibility get_previous_cwl_participants_sync
-        (removed) used to have.
+        cwl_permanent_optout, preferred_league_rank, th_level (kept fresh for every current
+        member — linked or not — by coc_cache.py's per-clan poll cycle; None if this row
+        predates that cycle ever running, e.g. immediately after a fresh DB import). If the same
+        player_tag is linked by more than one Discord account (disputed ownership), the verified
+        one wins. Callers decide what to do with opted-out/unlinked accounts — this function only
+        resolves data, it does not filter, matching the same division of responsibility
+        get_previous_cwl_participants_sync (removed) used to have.
         """
         import sqlite3
 
@@ -3085,7 +3087,7 @@ class WarHistoryDB:
                 rows = conn.execute(
                     f"""
                     SELECT player_tag, player_name, current_clan_tag, discord_id, verified,
-                           cwl_permanent_optout, cwl_default_preferred_league_rank
+                           cwl_permanent_optout, cwl_default_preferred_league_rank, th_level
                     FROM user_players
                     WHERE current_clan_tag IN ({placeholders})
                     ORDER BY verified DESC
@@ -3113,6 +3115,7 @@ class WarHistoryDB:
                 "verified": bool(row["verified"]),
                 "cwl_permanent_optout": bool(row["cwl_permanent_optout"]),
                 "preferred_league_rank": row["cwl_default_preferred_league_rank"],
+                "th_level": row["th_level"],
             })
         return members
 

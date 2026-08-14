@@ -811,7 +811,7 @@
     "template": {
       "confirm_button": "Bestätigen",
       "optout_button": "Abmelden",
-      "dm_body": "Du warst letzte Saison im CWL-Kader. Spielst du diese Saison wieder mit, **{player_name}**? Tippe auf Bestätigen, um dem Kader-Pool beizutreten, oder auf Abmelden, um diese Saison auszusetzen.",
+      "dm_body": "📋 Anmeldung zur CWL Saison **{season}**!\nMöchtest du mit **{player_name}** an dieser CWL teilnehmen?",
       "confirmed_msg": "✅ Danke — **{player_name}** ist für den CWL-Kader-Pool dieser Saison bestätigt.",
       "declined_msg": "👍 Verstanden — **{player_name}** hat sich für den CWL-Kader-Pool dieser Saison abgemeldet.",
       "no_longer_valid": "⚠️ Diese Anmeldung ist nicht mehr gültig (die Saison wurde möglicherweise gelöscht).",

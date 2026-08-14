@@ -25,6 +25,62 @@ from qapbot.cache_manager import CACHE
 _runner: Optional[web.AppRunner] = None
 
 
+def _bridge_log_label(kind: str, raw_id: Any) -> str:
+    """"Name (id)" for a guild_id/discord_user_id on a bridge request, resolved via the bot's
+    own gateway cache — falls back to the bare id if unresolvable (bot not ready yet, guild/user
+    not in cache) rather than failing the request over a logging nicety."""
+    if not raw_id:
+        return "-"
+    try:
+        numeric_id = int(raw_id)
+    except (TypeError, ValueError):
+        return str(raw_id)
+
+    import QBcore
+
+    bot = getattr(QBcore, "bot", None)
+    name = None
+    if bot is not None:
+        if kind == "guild":
+            guild = bot.get_guild(numeric_id)
+            name = guild.name if guild else None
+        else:
+            user = bot.get_user(numeric_id)
+            name = user.name if user else None
+    return f"{name} ({numeric_id})" if name else str(numeric_id)
+
+
+@web.middleware
+async def _access_log_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
+    """Replaces aiohttp's default combined-log-format access log (IP, duplicate embedded
+    timestamp, raw numeric IDs) with one line naming the guild/user the request was actually
+    for — the bridge's only two identity fields, present as query params on every GET and as
+    JSON body fields on every POST. See start_web_bridge()'s access_log=None, which turns the
+    default logger off so this doesn't just add a second line."""
+    response = await handler(request)
+    try:
+        guild_id_raw = request.query.get("guild_id")
+        discord_user_id_raw = request.query.get("discord_user_id")
+        if guild_id_raw is None or discord_user_id_raw is None:
+            # Already fully read by the handler by this point — aiohttp caches the raw body on
+            # the Request object, so re-reading it here for logging purposes is free.
+            try:
+                body = await request.json()
+            except Exception:
+                body = None
+            if isinstance(body, dict):
+                guild_id_raw = guild_id_raw or body.get("guild_id")
+                discord_user_id_raw = discord_user_id_raw or body.get("discord_user_id")
+        logging.info(
+            f"[WEB-BRIDGE] {request.method} {request.path} "
+            f"guild={_bridge_log_label('guild', guild_id_raw)} "
+            f"user={_bridge_log_label('user', discord_user_id_raw)} -> {response.status}"
+        )
+    except Exception:
+        logging.debug("[WEB-BRIDGE] access-log middleware failed", exc_info=True)
+    return response
+
+
 def _check_secret(request: web.Request) -> bool:
     from qapbot.config import CONFIG
 
@@ -196,7 +252,13 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
             "discord_id": signup["discord_id"],
             "signup_status": signup["status"],
         }
+    # user_players.th_level (2026-08-14: now kept fresh for every current member, linked or not
+    # — see coc_cache.py's update_player_info_in_user_accounts) is the primary TH source: live
+    # from the CoC API, not dependent on the player ever having made a tracked war attack.
+    live_th_by_tag: Dict[str, int] = {}
     for member in db.get_current_clan_members_sync(participating_clan_tags):
+        if member.get("th_level") is not None:
+            live_th_by_tag[member["player_tag"]] = member["th_level"]
         if member["player_tag"] not in players_by_tag:
             players_by_tag[member["player_tag"]] = {
                 "player_tag": member["player_tag"],
@@ -208,15 +270,18 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
     assigned_clan_by_tag = {
         a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event["id"])
     }
-    # Bounded to just this payload's own player_tags (never the whole war_attacks table — see
-    # DATABASE_ARCHITECTURE.md's query anti-patterns) — the board shows each player's TH next to
-    # their name (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", live-testing feedback).
-    th_levels_by_tag = db.get_most_recent_th_levels_sync(list(players_by_tag.keys()))
+    # Fallback only for player_tags live_th_by_tag didn't cover (e.g. a signed-up player who has
+    # since left every participating clan, so get_current_clan_members_sync no longer returns
+    # them) — bounded to just this payload's own player_tags (never the whole war_attacks table,
+    # see DATABASE_ARCHITECTURE.md's query anti-patterns).
+    fallback_tags = [tag for tag in players_by_tag if tag not in live_th_by_tag]
+    th_levels_by_tag = db.get_most_recent_th_levels_sync(fallback_tags)
     for player_tag, player in players_by_tag.items():
         player["assigned_clan_tag"] = assigned_clan_by_tag.get(player_tag)
-        th_level = th_levels_by_tag.get(player_tag)
+        th_level = live_th_by_tag.get(player_tag, th_levels_by_tag.get(player_tag))
         player["th_level"] = th_level
         player["th_icon_url"] = th_icon_url(th_level) if th_level is not None else None
+        player["skill_score"] = None
 
     players = sorted(players_by_tag.values(), key=lambda p: (p["player_name"] or p["player_tag"]).lower())
 
@@ -467,7 +532,7 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
 
 
 def create_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[_access_log_middleware])
     app.router.add_get("/api/health", handle_health)
     app.router.add_get("/api/cwl/clan-config", handle_get_clan_config)
     app.router.add_post("/api/cwl/clan-config", handle_post_clan_config)
@@ -492,7 +557,10 @@ async def start_web_bridge() -> None:
         return
 
     app = create_app()
-    _runner = web.AppRunner(app)
+    # access_log=None: the custom _access_log_middleware above replaces aiohttp's default
+    # combined-log-format line (IP, duplicate embedded timestamp, raw numeric IDs) with one that
+    # names the guild/user instead — this just stops it from also logging the old line.
+    _runner = web.AppRunner(app, access_log=None)
     await _runner.setup()
     site = web.TCPSite(_runner, "127.0.0.1", CONFIG.web_bridge_port)
     await site.start()

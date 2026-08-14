@@ -140,6 +140,10 @@ async def test_seeds_signups_and_dms_linked_confirmed_accounts(db, monkeypatch):
 
     await _seed_guild_and_clan(db, "1005")
     monkeypatch.setattr(CACHE, "db_manager", db)
+    # German guild — the DM text AND its button labels must both localize (2026-08-14 fix: the
+    # buttons used to always render in the default language because guild_id was never passed
+    # through to build_cwl_signup_response_view()).
+    CACHE.server_config["1005"] = {"language": "de"}
     await _seed_current_clan_member(db, "d1", "#P1")  # linked, not opted out
     await _seed_current_clan_member(db, "UNASSIGNED", "#P2")  # tracked but not linked to a real account
     await _make_event(db, "1005", "2026-08")
@@ -161,7 +165,11 @@ async def test_seeds_signups_and_dms_linked_confirmed_accounts(db, monkeypatch):
     assert summary["skipped_optout"] == 0
     assert len(sent_dms) == 1
     assert sent_dms[0][0] == "d1"
-    assert sent_dms[0][2] is not None  # a view (the confirm/opt-out buttons) was attached
+    assert "2026-08" in sent_dms[0][1]  # the new dm_body names the season
+    view = sent_dms[0][2]
+    assert view is not None  # a view (the confirm/opt-out buttons) was attached
+    button_labels = {item.item.label for item in view.children}  # type: ignore[union-attr]
+    assert button_labels == {"Bestätigen", "Abmelden"}  # German labels, not the English default
 
     signup = db.get_cwl_signup_sync(db.get_cwl_event_sync("1005", "2026-08")["id"], "#P1")
     assert signup["status"] == "pending"

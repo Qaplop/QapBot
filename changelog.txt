@@ -1,6 +1,40 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-14 (3)
+- Fixed (CWL Manage Enrollment board, TH-level pipeline — root cause traced before touching
+  anything, since it sits next to account-protection code): a clan member showed no Town Hall
+  on the board. `coc_cache.py`'s `update_player_info_in_user_accounts()` — the only place that
+  writes `user_players.th_level` from the live CoC API — categorically skipped the "UNASSIGNED"
+  shadow pool (unlinked-but-previously-seen players), so an unlinked player's TH/name/clan/role
+  froze forever. Fixed: UNASSIGNED is no longer skipped. Also: a genuinely never-linked clan
+  member had no `user_players` row at all — the same function now creates a fresh
+  UNASSIGNED-pool entry for any clan member the API mentions that isn't tracked anywhere yet
+  ("never waste info the API already gave us"). `get_current_clan_members_sync()` now also
+  selects `th_level` (silently missing before, despite the column existing); the board prefers
+  this live value over the previous polish round's war_attacks-derived fallback.
+- Fixed (CWL template-copy sign-up DM): the Confirm/Opt Out buttons always rendered in the
+  default language regardless of the guild's configured language — `guild_id` was never passed
+  through to `build_cwl_signup_response_view()` despite being right there in scope. Also
+  reworded the DM body to "Sign-up for CWL season **{season}**! Do you want to play this CWL
+  with **{player_name}**?" (en/de).
+- Fixed (CWL Start Enrollment confirm dialog): clicking "Yes, Start Enrollment" gave no visible
+  feedback for the several seconds the DM blast takes, inviting a double-click — the dialog now
+  disables its buttons and shows a "processing" state immediately.
+- Changed (CWL Manage Enrollment board, second live-testing pass): card spacing halved; signup
+  status now shown as icons (new `pending.svg` alongside the existing `gcheck.svg`/`redx.svg`)
+  with a legend next to the title; the title/legend/sort-selector bar is now sticky while the
+  roster scrolls; added a TH/Skill/Alphabetical sort selector (skill sorting not live yet — see
+  below); clan columns now show their league tier; column headers are now draggable so the
+  Unassigned pool can be repositioned next to whichever clan is being filled.
+- Added: a custom bridge access-log middleware (`web_bridge.py`) replacing aiohttp's default
+  log line (raw IP, redundant timestamp, bare numeric IDs) with one naming the guild/user
+  instead, IDs kept in parentheses.
+- Proposed, not yet implemented: a league-tier-adjusted player-skill score for the board's
+  "Player Skill" sort option — see CWL_ROSTER_PLANNING_PLAN.md's "Post-ship polish round 2" for
+  the formula proposal and data-availability findings, pending sign-off before building it.
+  20 new/updated tests; 1772 total tests pass.
+
 2026-08-14 (2)
 - Fixed (CWL "Start Enrollment" confirm dialog, live-testing feedback): clicking "Yes, Start
   Enrollment" deferred the interaction with no visible change to the message, so the Yes/Cancel

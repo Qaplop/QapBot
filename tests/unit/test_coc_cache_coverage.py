@@ -385,21 +385,107 @@ class TestUpdatePlayerInfo:
         cm.persist_user.assert_awaited()
 
     @pytest.mark.asyncio
-    async def test_skips_unassigned(self):
+    async def test_unassigned_pool_member_gets_th_level_refreshed(self):
+        """2026-08-14 fix: UNASSIGNED used to be skipped entirely here, so an unlinked player's
+        th_level/current_clan_tag/coc_role froze at whatever it was when last linked/unlinked
+        and was never refreshed again by the regular clan-poll cycle."""
         c = CoCClanCache()
         cm = MagicMock()
         cm.persist_user = AsyncMock()
         cm.user_accounts = {
-            "UNASSIGNED": {"players": [{"player_tag": "#P1", "player_name": "#P1", "th_level": 10}]},
-            "100": {"players": [{"player_tag": "#P2", "player_name": "#P2", "th_level": 14, "current_clan_tag": "#CLAN1"}]},
+            "UNASSIGNED": {"players": [
+                {"player_tag": "#P1", "player_name": "#P1", "th_level": 10, "current_clan_tag": "#CLAN1"}
+            ]},
         }
         clan_mock = MagicMock()
         clan_mock.tag = "#CLAN1"
-        clan_mock.members = [self._make_member("#P2", th=15)]
+        clan_mock.members = [self._make_member("#P1", th=16)]
 
         await c.update_player_info_in_user_accounts(clan_mock, cm)
-        # Only user "100" should be persisted
-        cm.persist_user.assert_awaited_once_with("100")
+        assert cm.user_accounts["UNASSIGNED"]["players"][0]["th_level"] == 16
+        cm.persist_user.assert_awaited_once_with("UNASSIGNED")
+
+    @pytest.mark.asyncio
+    async def test_unassigned_pool_member_departure_clears_clan_tag(self):
+        c = CoCClanCache()
+        cm = MagicMock()
+        cm.persist_user = AsyncMock()
+        cm.user_accounts = {
+            "UNASSIGNED": {"players": [
+                {"player_tag": "#P1", "player_name": "#P1", "th_level": 10, "current_clan_tag": "#CLAN1"}
+            ]},
+        }
+        clan_mock = MagicMock()
+        clan_mock.tag = "#CLAN1"
+        clan_mock.members = []  # P1 left
+
+        await c.update_player_info_in_user_accounts(clan_mock, cm)
+        assert cm.user_accounts["UNASSIGNED"]["players"][0]["current_clan_tag"] is None
+
+    @pytest.mark.asyncio
+    async def test_never_tracked_member_gets_shadow_unassigned_entry(self):
+        """"Never waste info the CoC API already gave us" (2026-08-14, CWL board live-testing
+        feedback): a clan member nobody has ever linked to a Discord account previously had NO
+        user_players row at all — now gets one via a new UNASSIGNED-pool entry, so it's
+        immediately visible to anything that reads current clan membership."""
+        c = CoCClanCache()
+        cm = MagicMock()
+        cm.persist_user = AsyncMock()
+        cm.user_accounts = {}
+        clan_mock = MagicMock()
+        clan_mock.tag = "#CLAN1"
+        clan_mock.members = [self._make_member("#NEW1", th=13)]
+
+        await c.update_player_info_in_user_accounts(clan_mock, cm)
+
+        unassigned_players = cm.user_accounts["UNASSIGNED"]["players"]
+        assert len(unassigned_players) == 1
+        entry = unassigned_players[0]
+        assert entry["player_tag"] == "#NEW1"
+        assert entry["th_level"] == 13
+        assert entry["current_clan_tag"] == "#CLAN1"
+        assert entry["verified"] is False
+        cm.persist_user.assert_awaited_once_with("UNASSIGNED")
+
+    @pytest.mark.asyncio
+    async def test_never_tracked_member_appended_to_existing_unassigned_pool(self):
+        c = CoCClanCache()
+        cm = MagicMock()
+        cm.persist_user = AsyncMock()
+        cm.user_accounts = {
+            "UNASSIGNED": {"players": [
+                {"player_tag": "#OLD", "player_name": "#OLD", "th_level": 5, "current_clan_tag": None}
+            ]},
+        }
+        clan_mock = MagicMock()
+        clan_mock.tag = "#CLAN1"
+        clan_mock.members = [self._make_member("#NEW1", th=13)]
+
+        await c.update_player_info_in_user_accounts(clan_mock, cm)
+
+        tags = {p["player_tag"] for p in cm.user_accounts["UNASSIGNED"]["players"]}
+        assert tags == {"#OLD", "#NEW1"}
+
+    @pytest.mark.asyncio
+    async def test_already_tracked_member_gets_no_duplicate_shadow_entry(self):
+        c = CoCClanCache()
+        cm = MagicMock()
+        cm.persist_user = AsyncMock()
+        cm.user_accounts = {
+            "100": {"players": [
+                {"player_tag": "#P1", "player_name": "#P1", "th_level": 15, "current_clan_tag": "#CLAN1", "coc_role": "member"}
+            ]},
+        }
+        clan_mock = MagicMock()
+        clan_mock.tag = "#CLAN1"
+        clan_mock.members = [self._make_member("#P1", th=15)]
+
+        await c.update_player_info_in_user_accounts(clan_mock, cm)
+
+        # No changes at all (TH/name/clan/role already match) -> nothing persisted, and
+        # certainly no UNASSIGNED entry invented for an already-tracked player.
+        assert "UNASSIGNED" not in cm.user_accounts
+        cm.persist_user.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_changes_no_persist(self):

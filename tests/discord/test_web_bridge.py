@@ -153,6 +153,66 @@ async def test_health_does_not_require_secret(client):
     assert (await resp.json())["ok"] is True
 
 
+# ---------------------------------------------------------------------------
+# _access_log_middleware — replaces aiohttp's default access log with one naming the
+# guild/user instead of raw IDs (2026-08-14, live-testing feedback)
+# ---------------------------------------------------------------------------
+
+def test_bridge_log_label_resolves_name_from_bot_cache(monkeypatch):
+    from qapbot.web_bridge import _bridge_log_label
+    import QBcore
+
+    guild = MagicMock()
+    guild.name = "The QCrew"
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    monkeypatch.setattr(QBcore, "bot", bot)
+
+    assert _bridge_log_label("guild", "1145641080621109312") == "The QCrew (1145641080621109312)"
+
+
+def test_bridge_log_label_falls_back_to_bare_id_when_unresolvable(monkeypatch):
+    from qapbot.web_bridge import _bridge_log_label
+    import QBcore
+
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=None)
+    monkeypatch.setattr(QBcore, "bot", bot)
+
+    assert _bridge_log_label("guild", "12345") == "12345"
+
+
+def test_bridge_log_label_returns_dash_for_missing_id():
+    from qapbot.web_bridge import _bridge_log_label
+
+    assert _bridge_log_label("guild", None) == "-"
+    assert _bridge_log_label("user", "") == "-"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_access_log_middleware_logs_resolved_names_not_raw_ids(client, monkeypatch, caplog):
+    import QBcore
+
+    guild = MagicMock()
+    guild.name = "The QCrew"
+    user = MagicMock()
+    user.name = "Qaplop"
+    bot = MagicMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    bot.get_user = MagicMock(return_value=user)
+    monkeypatch.setattr(QBcore, "bot", bot)
+
+    with caplog.at_level("INFO"):
+        await client.get("/api/cwl/screen", params={"guild_id": "1", "discord_user_id": "2"})
+
+    log_line = next(r.message for r in caplog.records if "GET /api/cwl/screen" in r.message)
+    assert "The QCrew (1)" in log_line
+    assert "Qaplop (2)" in log_line
+    assert "127.0.0.1" not in log_line
+    assert "guild_id=1" not in log_line  # the raw id alone must not appear unresolved
+
+
 @pytest.mark.discord
 @pytest.mark.asyncio
 async def test_clan_config_get_rejects_missing_secret(bridge_config, client):
@@ -510,11 +570,13 @@ async def test_clan_config_post_targets_the_selected_season(db, bridge_config, c
     assert db.get_cwl_event_clans_sync(other_event["id"]) == []
 
 
-async def _seed_current_clan_member(db: WarHistoryDB, discord_id: str, player_tag: str, clan_tag: str, verified: bool = True) -> None:
+async def _seed_current_clan_member(
+    db: WarHistoryDB, discord_id: str, player_tag: str, clan_tag: str, verified: bool = True, th_level: int = None
+) -> None:
     await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
     await db.conn.execute(
-        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) VALUES (?, ?, ?, ?, ?)",
-        (discord_id, player_tag, "Player", 1 if verified else 0, clan_tag),
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag, th_level) VALUES (?, ?, ?, ?, ?, ?)",
+        (discord_id, player_tag, "Player", 1 if verified else 0, clan_tag, th_level),
     )
     await db.conn.commit()
 
@@ -640,6 +702,49 @@ async def test_enrollment_get_returns_merged_players_and_clans(db, bridge_config
     assert players_by_tag["#P2"]["assigned_clan_tag"] is None
     assert players_by_tag["#P2"]["th_level"] is None
     assert players_by_tag["#P2"]["th_icon_url"] is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_prefers_live_th_level_over_war_attacks_fallback(db, bridge_config, client, monkeypatch):
+    """user_players.th_level (kept fresh by coc_cache.py's per-clan poll, 2026-08-14) must win
+    over the war_attacks-derived fallback when both exist — the live value is always at least as
+    fresh, and doesn't require the player to have ever made a tracked war attack."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "790", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["790"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("790", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    # Stale war_attacks history (TH14) vs a fresher live user_players.th_level (TH16, e.g. the
+    # player upgraded since that war).
+    await db.conn.execute(
+        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
+        "VALUES ('war1', '#CLAN1', '#OPP', 0, '', '2026-06-01T10:00')"
+    )
+    await db.conn.execute(
+        "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
+        "VALUES ('war1', '#CLAN1', '2026-06-01T10:00', 'Alpha1', '#P1', 14, 1, 0)"
+    )
+    await db.conn.commit()
+    await _seed_current_clan_member(db, "10", "#P1", "#CLAN1", th_level=16)
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(790, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "790", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+    assert players_by_tag["#P1"]["th_level"] == 16
 
 
 @pytest.mark.discord
