@@ -259,11 +259,41 @@ class TestUpdateClanMetadata:
         cc.cache_manager.persist_clan.assert_awaited()
 
     @pytest.mark.asyncio
-    async def test_delegates_to_warlog_and_player_update(self):
+    async def test_delegates_to_warlog_and_player_update_when_subscribed(self):
+        """2026-08-14: update_player_info_in_user_accounts must only run for clans a guild
+        actually configured (has_active_subscriptions — member_clans/member_families/channel
+        subscriptions, see update_all_clan_subscription_statuses()) — not every clan this
+        process's shared get_clan() cache happens to touch (e.g. CWL opponents). Confirmed live
+        on PROD: without this gate, the O(len(user_accounts)) scan inside
+        update_player_info_in_user_accounts ran on every one of ~380K cached clans instead of
+        just the guild's own member clans, both polluting user_players with non-member accounts
+        and making every clan fetch drastically slower."""
         cc = self._coc_cache()
+        cc.cache_manager.clan_name_cache["#CLAN1"] = {
+            "name": "TestClan",
+            "has_active_subscriptions": True,
+            "last_war_update": None,
+            "warlog_is_public": True,
+            "last_checked_via_api": datetime.now(timezone.utc).isoformat(),
+        }
         now = datetime.now(timezone.utc)
         clan = self._clan_obj()
         await cc._update_clan_metadata(clan, now)
         cc._update_warlog_status.assert_awaited_once()
         cc.update_player_info_in_user_accounts.assert_awaited_once()
+        cc._schedule_role_sync_for_clan.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_skips_player_update_when_not_subscribed(self):
+        """A clan with no guild configuration behind it (has_active_subscriptions=False —
+        e.g. a CWL opponent or family-harvested clan this process merely happened to see)
+        must NOT trigger update_player_info_in_user_accounts. Covers both a never-before-seen
+        clan (defaults has_active_subscriptions=False on creation) and an existing,
+        never-subscribed one."""
+        cc = self._coc_cache()
+        now = datetime.now(timezone.utc)
+        clan = self._clan_obj()
+        await cc._update_clan_metadata(clan, now)  # brand-new clan — defaults to False
+        cc._update_warlog_status.assert_awaited_once()
+        cc.update_player_info_in_user_accounts.assert_not_awaited()
         cc._schedule_role_sync_for_clan.assert_called_once()

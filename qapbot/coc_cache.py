@@ -313,9 +313,29 @@ class CoCClanCache:
         
         # Update war log public status (has its own dirty check inside)
         await self._update_warlog_status(clan_obj)
-        
-        # Update player info in user_accounts
-        await self.update_player_info_in_user_accounts(clan_obj, self.cache_manager)  # type: ignore[arg-type]
+
+        # Update player info in user_accounts — restricted to clans actually relevant to some
+        # guild (member_clans/member_families or a channel subscription; see
+        # update_all_clan_subscription_statuses()'s tracked_tags computation, which is exactly
+        # what has_active_subscriptions reflects here).
+        #
+        # 2026-08-14 incident: this call used to run unconditionally for EVERY clan_obj this
+        # process's shared get_clan() cache ever touches — which includes every CWL opponent
+        # and family-harvested clan it happens to see (~380K entries in PROD's
+        # clan_name_cache), not just a guild's actual member clans. Two consequences, live on
+        # PROD within the first cycle after this scope bug shipped: (1) update_player_info_in_
+        # user_accounts() does a full O(len(user_accounts)) scan of every registered player
+        # TWICE per call, plus a persist_user() DB write for any clan with never-before-seen
+        # members — multiplying that cost across thousands of one-off opponent clans instead of
+        # a small member-clan set turned every single clan fetch (not just member clans) into a
+        # slow operation, observed as "fetching clan data is super slow" and, because
+        # periodic_main()'s Phase 1 only checks the shutdown event BETWEEN full cycles (not
+        # mid-cycle), made a SIGTERM/kill look unresponsive since a cycle now took far longer to
+        # finish; (2) real clan members of clans the guild never configured (e.g. CWL
+        # opponents) got auto-added to the UNASSIGNED pool, polluting user_players with accounts
+        # nobody asked to track. Gating on has_active_subscriptions fixes both at once.
+        if clan_data.get("has_active_subscriptions"):  # type: ignore[union-attr]
+            await self.update_player_info_in_user_accounts(clan_obj, self.cache_manager)  # type: ignore[arg-type]
 
         # Schedule background CoC/clan role sync for all guilds that have this clan
         self._schedule_role_sync_for_clan(clan_obj)
