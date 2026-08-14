@@ -1453,6 +1453,135 @@ def test_resolve_prior_cwl_assignments_returns_empty_for_no_clans():
 
     assert resolve_prior_cwl_assignments([]) == {}
 
+
+# ---------------------------------------------------------------------------
+# _league_weight / compute_league_adjusted_skill_scores — "Manage Enrollment" board's
+# player-skill sort (live-testing feedback, 2026-08-14; formula/growth_rate confirmed with the
+# project owner: 1.4x per league group, +3%/step within a group)
+# ---------------------------------------------------------------------------
+
+def test_league_weight_baseline_for_bronze_iii():
+    from qapbot.QBdiscocmdshelper_cwl import _league_weight
+
+    assert _league_weight("Bronze League III") == pytest.approx(1.0)
+
+
+def test_league_weight_legend_is_about_ten_and_a_half_times_bronze():
+    from qapbot.QBdiscocmdshelper_cwl import _league_weight
+
+    assert _league_weight("Legend League") == pytest.approx(1.4 ** 7, rel=1e-9)
+
+
+def test_league_weight_one_group_step_is_1_4x():
+    from qapbot.QBdiscocmdshelper_cwl import _league_weight
+
+    champion_ii = _league_weight("Champion League II")
+    master_ii = _league_weight("Master League II")
+    assert champion_ii / master_ii == pytest.approx(1.4, rel=1e-9)
+
+
+def test_league_weight_subtier_bonus_orders_i_above_ii_above_iii():
+    from qapbot.QBdiscocmdshelper_cwl import _league_weight
+
+    w3 = _league_weight("Gold League III")
+    w2 = _league_weight("Gold League II")
+    w1 = _league_weight("Gold League I")
+    assert w3 < w2 < w1
+
+
+def test_league_weight_unknown_tier_returns_baseline():
+    from qapbot.QBdiscocmdshelper_cwl import _league_weight
+
+    assert _league_weight(None) == 1.0
+    assert _league_weight("Not A Real League") == 1.0
+
+
+async def _seed_cwl_attack_with_league(
+    db, clan_tag: str, cwl_season: str, league_rank: str, player_tag: str, stars: int,
+    date: str = "2026-07-01T08:00", war_id: str = None, league_group_id: str = None,
+) -> None:
+    """Seeds one CWL war_attacks row plus the league-reconstruction chain
+    (cwl_league_rounds -> cwl_league_groups) get_recent_cwl_attacks_with_league_sync() needs."""
+    war_id = war_id or f"war_{clan_tag}_{date}"
+    league_group_id = league_group_id or f"group_{cwl_season}_{clan_tag}"
+    await db.conn.execute(
+        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date, war_tag) VALUES (?, ?, ?, 1, ?, ?, ?)",
+        (war_id, clan_tag, "#OPP", cwl_season, date, war_id),
+    )
+    await db.conn.execute(
+        "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (war_id, clan_tag, date, player_tag, player_tag, 15, 1, stars),
+    )
+    await db.conn.execute(
+        "INSERT INTO cwl_league_rounds (war_tag, cwl_season, cwl_round, league_group_id) VALUES (?, ?, 1, ?)",
+        (war_id, cwl_season, league_group_id),
+    )
+    await db.conn.execute(
+        "INSERT OR IGNORE INTO cwl_league_groups (league_group_id, cwl_season, clan_tag, league_rank) VALUES (?, ?, ?, ?)",
+        (league_group_id, cwl_season, clan_tag, league_rank),
+    )
+    await db.conn.commit()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_compute_league_adjusted_skill_scores_weights_by_league(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import compute_league_adjusted_skill_scores
+
+    await _seed_guild_and_clans(db, "9310", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    # Same 3-star attack, but one earned in Legend, one in Bronze III — Legend must score higher.
+    await _seed_cwl_attack_with_league(db, "#CLAN1", "2026-05", "Legend League", "#P1", stars=3, date="2026-05-01T08:00", war_id="w1")
+    await _seed_cwl_attack_with_league(db, "#CLAN1", "2026-07", "Bronze League III", "#P2", stars=3, date="2026-07-01T08:00", war_id="w2")
+
+    scores = compute_league_adjusted_skill_scores(["#P1", "#P2"])
+    assert scores["#P1"] > scores["#P2"]
+    assert scores["#P2"] == pytest.approx(3.0)  # Bronze III weight is exactly 1.0
+    assert scores["#P1"] == pytest.approx(3 * (1.4 ** 7), abs=0.01)  # rounded to 2dp
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_compute_league_adjusted_skill_scores_caps_at_last_ten_attacks(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import compute_league_adjusted_skill_scores
+
+    await _seed_guild_and_clans(db, "9311", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    # 11 attacks, all 3-star except the oldest (11th, 1-star) — must be excluded from the average.
+    for i in range(11):
+        stars = 1 if i == 0 else 3
+        await _seed_cwl_attack_with_league(
+            db, "#CLAN1", f"2026-{i + 1:02d}", "Bronze League III", "#P1", stars=stars,
+            date=f"2026-{i + 1:02d}-01T08:00", war_id=f"war{i}",
+        )
+
+    scores = compute_league_adjusted_skill_scores(["#P1"])
+    assert scores["#P1"] == pytest.approx(3.0)  # only the ten 3-star attacks counted
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_compute_league_adjusted_skill_scores_absent_for_player_with_no_cwl_history(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import compute_league_adjusted_skill_scores
+
+    await _seed_guild_and_clans(db, "9312", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+
+    assert compute_league_adjusted_skill_scores(["#NEVERPLAYED"]) == {}
+
+
+def test_compute_league_adjusted_skill_scores_returns_empty_without_db_manager():
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import compute_league_adjusted_skill_scores
+
+    CACHE.db_manager = None
+    assert compute_league_adjusted_skill_scores(["#P1"]) == {}
+
+
 # _check_cwl_admin_or_leader_permission() tests live in
 # tests/unit/test_check_admin_or_leader_permission.py — this file's module-level autouse
 # _bypass_cwl_admin_check fixture forces check_admin_permissions() to always return True for

@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-14 (4)
+- Added (CWL Manage Enrollment board, "Player Skill" sort): league-tier-adjusted player-skill
+  score, formula confirmed with the project owner — average stars/attack over each player's
+  last 10 CWL attacks, weighted exponentially by the league tier each attack was earned in
+  (1.4x per league group Bronze..Legend, +3%/step for I/II/III within a group), so a 3-star in
+  a higher league counts for meaningfully more than one in a lower league. New
+  `_league_weight()`/`compute_league_adjusted_skill_scores()` (`QBdiscocmdshelper_cwl.py`) and
+  `get_recent_cwl_attacks_with_league_sync()` (`db_manager.py`) — historical league tier isn't
+  a stored column, so it's reconstructed via `war_summary.war_tag -> cwl_league_rounds ->
+  cwl_league_groups.league_rank`, joined on `league_group_id` (matching the existing
+  `get_war_tag_leagues()`'s approach) rather than per-clan, and queried per schema (never a
+  UNION ALL CTE JOIN — the documented full-table-scan anti-pattern). Wired into
+  `_build_enrollment_payload` as the board's `skill_score` field. 15 new tests; 1786 total
+  tests pass. Not yet confirmed live against real season history.
+
 2026-08-14 (3)
 - Fixed (CWL Manage Enrollment board, TH-level pipeline — root cause traced before touching
   anything, since it sits next to account-protection code): a clan member showed no Town Hall

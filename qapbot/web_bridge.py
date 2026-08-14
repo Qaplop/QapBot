@@ -208,7 +208,11 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
     invisible until they act first — same reasoning start_cwl_enrollment() already uses for its
     seed pool). Each player is annotated with their current assignment, if any (None = the
     Unassigned pool)."""
-    from qapbot.QBdiscocmdshelper_cwl import cwl_league_rank, resolve_selected_cwl_season
+    from qapbot.QBdiscocmdshelper_cwl import (
+        compute_league_adjusted_skill_scores,
+        cwl_league_rank,
+        resolve_selected_cwl_season,
+    )
     from qapbot.emojis import th_icon_url
 
     db = CACHE.db_manager
@@ -276,12 +280,13 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
     # see DATABASE_ARCHITECTURE.md's query anti-patterns).
     fallback_tags = [tag for tag in players_by_tag if tag not in live_th_by_tag]
     th_levels_by_tag = db.get_most_recent_th_levels_sync(fallback_tags)
+    skill_scores_by_tag = compute_league_adjusted_skill_scores(list(players_by_tag.keys()))
     for player_tag, player in players_by_tag.items():
         player["assigned_clan_tag"] = assigned_clan_by_tag.get(player_tag)
         th_level = live_th_by_tag.get(player_tag, th_levels_by_tag.get(player_tag))
         player["th_level"] = th_level
         player["th_icon_url"] = th_icon_url(th_level) if th_level is not None else None
-        player["skill_score"] = None
+        player["skill_score"] = skill_scores_by_tag.get(player_tag)
 
     players = sorted(players_by_tag.values(), key=lambda p: (p["player_name"] or p["player_tag"]).lower())
 

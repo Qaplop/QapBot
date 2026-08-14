@@ -611,6 +611,117 @@ class TestGetMostRecentThLevels:
         assert db.get_most_recent_th_levels_sync(["#P1"]) == {"#P1": 15}
 
 
+async def _seed_cwl_attack_with_league(
+    db, clan_tag: str, cwl_season: str, league_rank: str, player_tag: str, stars: int,
+    date: str = "2026-07-01T08:00", war_id: str = None, league_group_id: str = None,
+) -> None:
+    """Seeds one CWL war_attacks row plus the league-reconstruction chain
+    (cwl_league_rounds -> cwl_league_groups) get_recent_cwl_attacks_with_league_sync() needs.
+    war_summary.war_tag must be set explicitly — it's a distinct column from war_id, defaults to
+    '' if omitted, and is exactly what the league-tier join keys off."""
+    war_id = war_id or f"war_{clan_tag}_{date}"
+    league_group_id = league_group_id or f"group_{cwl_season}_{clan_tag}"
+    await db.conn.execute(
+        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date, war_tag) VALUES (?, ?, ?, 1, ?, ?, ?)",
+        (war_id, clan_tag, "#OPP", cwl_season, date, war_id),
+    )
+    await db.conn.execute(
+        "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (war_id, clan_tag, date, player_tag, player_tag, 15, 1, stars),
+    )
+    await db.conn.execute(
+        "INSERT INTO cwl_league_rounds (war_tag, cwl_season, cwl_round, league_group_id) VALUES (?, ?, 1, ?)",
+        (war_id, cwl_season, league_group_id),
+    )
+    await db.conn.execute(
+        "INSERT OR IGNORE INTO cwl_league_groups (league_group_id, cwl_season, clan_tag, league_rank) VALUES (?, ?, ?, ?)",
+        (league_group_id, cwl_season, clan_tag, league_rank),
+    )
+    await db.conn.commit()
+
+
+class TestGetRecentCwlAttacksWithLeague:
+    """get_recent_cwl_attacks_with_league_sync() — the raw per-attack data source behind
+    compute_league_adjusted_skill_scores() (QBdiscocmdshelper_cwl.py). Its own tests there cover
+    the weighting/averaging/10-attack-cap behavior end to end; these focus on this function's own
+    contract: shape, ordering, and the league_group_id join specifically."""
+
+    @pytest.mark.integration
+    async def test_returns_empty_for_no_player_tags(self, db):
+        assert db.get_recent_cwl_attacks_with_league_sync([]) == {}
+
+    @pytest.mark.integration
+    async def test_returns_empty_when_no_cwl_attacks_exist(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        assert db.get_recent_cwl_attacks_with_league_sync(["#P1"]) == {}
+
+    @pytest.mark.integration
+    async def test_returns_stars_and_league_rank_most_recent_first(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_cwl_attack_with_league(db, "#CLAN1", "2026-05", "Bronze League III", "#P1", stars=1, date="2026-05-01T08:00", war_id="w1")
+        await _seed_cwl_attack_with_league(db, "#CLAN1", "2026-07", "Master League II", "#P1", stars=3, date="2026-07-01T08:00", war_id="w2")
+
+        attacks = db.get_recent_cwl_attacks_with_league_sync(["#P1"])["#P1"]
+        assert [a["stars"] for a in attacks] == [3, 1]  # most recent first
+        assert attacks[0]["league_rank"] == "Master League II"
+        assert attacks[1]["league_rank"] == "Bronze League III"
+
+    @pytest.mark.integration
+    async def test_resolves_league_via_shared_group_not_just_one_clan_row(self, db):
+        """Two clans sharing one league_group_id (the normal case — a CWL league group is
+        several clans) must both resolve to the same league_rank, joined via league_group_id
+        rather than requiring a cwl_league_groups row for the specific attacking clan."""
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_guild_and_clan(db, guild_id="111", clan_tag="#CLAN2")
+        # Both clans in the same group_id/season; #CLAN1's own row is the one carrying
+        # league_rank, but #CLAN2's attack must resolve it too via the shared group.
+        await db.conn.execute(
+            "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date, war_tag) "
+            "VALUES ('w1', '#CLAN1', '#OPP', 1, '2026-07', '2026-07-01T08:00', 'w1')"
+        )
+        await db.conn.execute(
+            "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
+            "VALUES ('w1', '#CLAN1', '2026-07-01T08:00', '#P1', '#P1', 15, 1, 2)"
+        )
+        await db.conn.execute(
+            "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date, war_tag) "
+            "VALUES ('w2', '#CLAN2', '#OPP', 1, '2026-07', '2026-07-01T08:00', 'w2')"
+        )
+        await db.conn.execute(
+            "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
+            "VALUES ('w2', '#CLAN2', '2026-07-01T08:00', '#P2', '#P2', 15, 1, 2)"
+        )
+        await db.conn.execute(
+            "INSERT INTO cwl_league_rounds (war_tag, cwl_season, cwl_round, league_group_id) VALUES ('w1', '2026-07', 1, 'grp')"
+        )
+        await db.conn.execute(
+            "INSERT INTO cwl_league_rounds (war_tag, cwl_season, cwl_round, league_group_id) VALUES ('w2', '2026-07', 1, 'grp')"
+        )
+        await db.conn.execute(
+            "INSERT INTO cwl_league_groups (league_group_id, cwl_season, clan_tag, league_rank) VALUES ('grp', '2026-07', '#CLAN1', 'Titan League I')"
+        )
+        await db.conn.execute(
+            "INSERT INTO cwl_league_groups (league_group_id, cwl_season, clan_tag, league_rank) VALUES ('grp', '2026-07', '#CLAN2', 'Titan League I')"
+        )
+        await db.conn.commit()
+
+        result = db.get_recent_cwl_attacks_with_league_sync(["#P1", "#P2"])
+        assert result["#P1"][0]["league_rank"] == "Titan League I"
+        assert result["#P2"][0]["league_rank"] == "Titan League I"
+
+    @pytest.mark.integration
+    async def test_truncates_to_attack_limit_per_player(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        for i in range(3):
+            await _seed_cwl_attack_with_league(
+                db, "#CLAN1", f"2026-{i + 1:02d}", "Bronze League III", "#P1", stars=2,
+                date=f"2026-{i + 1:02d}-01T08:00", war_id=f"w{i}",
+            )
+        attacks = db.get_recent_cwl_attacks_with_league_sync(["#P1"], attack_limit=2)["#P1"]
+        assert len(attacks) == 2
+
+
 class TestCwlAssignmentsCrud:
     @pytest.mark.integration
     async def test_upsert_creates_then_overwrites(self, db):

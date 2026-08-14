@@ -702,6 +702,10 @@ async def test_enrollment_get_returns_merged_players_and_clans(db, bridge_config
     assert players_by_tag["#P2"]["assigned_clan_tag"] is None
     assert players_by_tag["#P2"]["th_level"] is None
     assert players_by_tag["#P2"]["th_icon_url"] is None
+    # Neither player has any CWL-league-tracked attack history seeded in this test — skill_score
+    # must be absent-as-None, never a fabricated 0 (see compute_league_adjusted_skill_scores).
+    assert players_by_tag["#P1"]["skill_score"] is None
+    assert players_by_tag["#P2"]["skill_score"] is None
 
 
 @pytest.mark.discord

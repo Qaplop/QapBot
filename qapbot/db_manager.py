@@ -2752,6 +2752,76 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] get_most_recent_th_levels_sync failed: {e}")
                 return {}
 
+    def get_recent_cwl_attacks_with_league_sync(
+        self, player_tags: List[str], attack_limit: int = 10
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Each requested player's last `attack_limit` CWL attacks (most recent first), each
+        annotated with the CWL league tier their attacking clan was in for that round. Feeds the
+        "Manage Enrollment" board's league-adjusted player-skill score
+        (QBdiscocmdshelper_cwl.py's compute_league_adjusted_skill_scores).
+
+        No war_summary/war_attacks column stores league tier directly — it's reconstructed via
+        war_summary.war_tag -> cwl_league_rounds -> cwl_league_groups.league_rank, joined on
+        `league_group_id` (mirroring the existing async get_war_tag_leagues()'s proven approach)
+        rather than `(cwl_season, clan_tag)` — every clan in a league group shares the same
+        league by CWL's own design, so this needs no clan_tag at all and can't miss a row just
+        because the *attacking* clan's own cwl_league_groups entry happens to be the one still
+        unpopulated. `SELECT DISTINCT` collapses the one-row-per-group-member duplication that
+        joining through league_group_id (rather than a single clan_tag) produces.
+
+        Queried per schema (main, then history) with plain table JOINs — never against a UNION
+        ALL CTE (DATABASE_ARCHITECTURE.md's query anti-patterns: SQLite must fully materialize a
+        compound subquery used as a JOIN target) — then merged, sorted, and truncated to
+        `attack_limit` per player in Python.
+
+        Returns Dict[player_tag, [{"stars": int, "league_rank": str|None, "date": str}, ...]] —
+        a player_tag with zero resolvable CWL-attack-with-league rows (never played CWL, or
+        cwl_league_rounds/cwl_league_groups aren't populated for those seasons) is simply absent.
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not player_tags:
+            return {}
+
+        placeholders = ",".join("?" for _ in player_tags)
+        select_cols = "DISTINCT wa.player_tag, wa.stars, wa.date, clg.league_rank"
+        where = f"WHERE wa.player_tag IN ({placeholders}) AND ws.is_cwl = 1"
+        main_sql = f"""
+            SELECT {select_cols}
+            FROM war_attacks wa
+            JOIN war_summary ws ON wa.war_id = ws.war_id
+            JOIN cwl_league_rounds clr ON clr.war_tag = ws.war_tag
+            JOIN cwl_league_groups clg ON clg.league_group_id = clr.league_group_id
+            {where}
+        """
+        history_sql = f"""
+            SELECT {select_cols}
+            FROM history.war_attacks wa
+            JOIN history.war_summary ws ON wa.war_id = ws.war_id
+            JOIN history.cwl_league_rounds clr ON clr.war_tag = ws.war_tag
+            JOIN history.cwl_league_groups clg ON clg.league_group_id = clr.league_group_id
+            {where}
+        """
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(main_sql, player_tags).fetchall()
+                rows += conn.execute(history_sql, player_tags).fetchall()
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_recent_cwl_attacks_with_league_sync failed: {e}")
+                return {}
+
+        by_tag: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            by_tag.setdefault(row["player_tag"], []).append(
+                {"stars": int(row["stars"]), "league_rank": row["league_rank"], "date": row["date"]}
+            )
+        for tag, attacks in by_tag.items():
+            attacks.sort(key=lambda a: a["date"], reverse=True)
+            by_tag[tag] = attacks[:attack_limit]
+        return by_tag
+
     # --- CWL roster planning (CWL_ROSTER_PLANNING_PLAN.md Phase 1) -------------------------
     # Sync CRUD, matching get_cwl_roster_sync's style above — called from UI callbacks, not
     # the async polling loop.

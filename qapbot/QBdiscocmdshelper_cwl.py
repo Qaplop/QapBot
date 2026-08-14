@@ -36,6 +36,57 @@ def cwl_league_rank(tier: Optional[str]) -> int:
         return -1
 
 
+def _league_weight(tier: Optional[str], growth_rate: float = 1.4) -> float:
+    """Weight for one CWL attack's league tier, feeding the "Manage Enrollment" board's
+    league-adjusted player-skill score (live-testing feedback, 2026-08-14; formula/growth_rate
+    confirmed with the project owner). Exponential across the 8 league *groups* (Bronze..Legend)
+    rather than linear across all 22 fine-grained tiers, since skill differentiation compounds
+    going up leagues — Champion beating Master should count for meaningfully more than Silver
+    beating Bronze does, not the same flat bonus either way. A small +3%/step bonus for I > II >
+    III within a group keeps sub-tier ordering meaningful without letting it dominate the
+    group-to-group jump. `growth_rate=1.4` means Legend-league stars count ~10.5x Bronze-league
+    stars, and each single group step (e.g. Master -> Champion) is worth 1.4x on its own.
+
+    CWL_LEAGUE_ORDER is laid out in perfect groups of 3 (Bronze III, Bronze II, Bronze I, Silver
+    III, ...) with "Legend League" as a lone 22nd entry — so `index // 3` is the group (0=Bronze
+    .. 6=Titan, 7=Legend) and `index % 3` is the sub-tier bonus (0=III, 1=II, 2=I; always 0 for
+    Legend, which has no sub-tier) with no string parsing needed.
+
+    Unknown/unresolvable tier -> baseline weight 1.0 (never zero/negative — a player whose
+    league can't be resolved still gets counted, just unweighted, rather than zeroed out)."""
+    index = cwl_league_rank(tier)
+    if index < 0:
+        return 1.0
+    group_index = index // 3
+    subtier_bonus = index % 3
+    return (growth_rate ** group_index) * (1 + 0.03 * subtier_bonus)
+
+
+def compute_league_adjusted_skill_scores(player_tags: List[str]) -> Dict[str, float]:
+    """Player-skill score for the "Manage Enrollment" board's TH/Skill/Alphabetical sort option:
+    league-adjusted average stars/attack over each player's last 10 CWL attacks. Each attack's
+    raw stars is weighted by _league_weight() above (the league its attacking clan was in for
+    that CWL round) before averaging — a 3-star earned in Champion League counts for meaningfully
+    more than a 3-star in Master League. Rounded to 2dp.
+
+    A player_tag with no resolvable CWL-attack-with-league data (never played CWL, or league
+    data isn't populated for those seasons — get_recent_cwl_attacks_with_league_sync's own
+    docstring covers why that can happen) is simply absent from the returned dict — never a
+    fabricated 0, matching the same "None means no data, not zero" convention
+    compute_roster_stats_sync (QBhelperfunctions.py) already uses."""
+    db = CACHE.db_manager
+    if db is None or not player_tags:
+        return {}
+    attacks_by_tag = db.get_recent_cwl_attacks_with_league_sync(player_tags)
+    scores: Dict[str, float] = {}
+    for tag, attacks in attacks_by_tag.items():
+        if not attacks:
+            continue
+        weighted_total = sum(a["stars"] * _league_weight(a["league_rank"]) for a in attacks)
+        scores[tag] = round(weighted_total / len(attacks), 2)
+    return scores
+
+
 def cwl_start_at_compact(cwl_start_at: Optional[str], timezone_name: str = "UTC") -> Optional[str]:
     """Compact fixed "YY-MM-DD HH:MM" rendering of a stored UTC cwl_start_at, converted into
     timezone_name (the guild's configured timezone_name, an IANA zone id like "Europe/Berlin")
