@@ -1,6 +1,62 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-14 (14)
+- Investigated (`log_time_gaps.py`): analyzed the first live PROD update cycle after the
+  `has_active_subscriptions` scope fix (changelog (12)) to confirm it actually fixed the
+  incident. Worst gap dropped from 13m34s to 34s; the cycle completed in 306.8s. Remaining
+  pauses trace to three pre-existing, unrelated costs — not new regressions: (1)
+  `sync_roles_for_clan_members()` (`guild_role_manager.py`) awaits `sync_roles_for_user()` one
+  Discord user at a time in a plain loop, so a clan with many registered members burns real
+  wall-clock time serially through Discord's role-edit rate limit (34s/17.9s/17.8s/11.1s of the
+  cycle); (2) the one-time startup load of `player_name_index` (6.6M entries, ~36s) and
+  `clan_name_cache` (428,752 clans); (3) several 1-3.6s GC pauses from holding those caches in
+  memory. Parallelizing the role-sync loop (bounded concurrency, same pattern as Phase 1's fetch
+  semaphore) is the one clear follow-up optimization — deliberately deferred for now, not
+  tackled in this pass.
+- Fixed (`log_time_gaps.py`): crashed with `UnicodeEncodeError` on Windows consoles whenever a
+  log line contained a character outside the console's codepage (emoji, non-ASCII names) — now
+  reconfigures stdout with `errors="replace"` so a report always finishes. Added `--since-marker`
+  to scope a report to lines at/after the LAST match of a substring (e.g. `"QapBot started."`),
+  so a multi-restart log file can be analyzed one restart at a time instead of mixing gaps from
+  unrelated earlier runs/days into the same top-N report.
+
+2026-08-14 (13)
+- Added: `CONFIG.cwl_dm_restrict_to_admin` (`config.py`) — an independent, DEV/PROD-toggleable
+  safety flag (`CWL_DM_RESTRICT_TO_ADMIN_DEV`/`CWL_DM_RESTRICT_TO_ADMIN`, defaults true on both)
+  restricting CWL-related DMs to `CONFIG.server_admin`'s own account while the roster-assignment
+  feature is still under active development. Replaces the old `is_dev_mode`-only guard in
+  `start_cwl_enrollment()` (`QBdiscocmdshelper_cwl.py`), which never protected PROD recipients —
+  needed now that the project owner is testing on PROD as well as DEV. Summary key renamed
+  `skipped_dev_guard` -> `skipped_dm_guard` throughout (`ui_cwl_roster.py`, EN/DE i18n).
+  1797 total tests pass.
+
+2026-08-14 (12)
+- Fixed (CRITICAL, live PROD incident, caught on the first update cycle after deploying
+  changelog (11)): `update_player_info_in_user_accounts()` (`coc_cache.py`) ran unconditionally
+  for every clan the shared `get_clan()` cache ever touched — CWL opponents and family-harvested
+  clans included, not just a guild's actual member clans (~380K cached clans in PROD). Each call
+  does two O(len(user_accounts)) scans plus a DB write for any never-before-seen player, so this
+  turned every clan fetch into slow work — observed as "fetching clan data is super slow" and a
+  SIGTERM that looked unresponsive (`periodic_main()` only checks the shutdown flag between full
+  cycles, and cycles now took far longer). Also polluted `user_players` with accounts from clans
+  nobody configured, contrary to the intent of the CWL enrollment feature that added this call.
+  Gated the call on `has_active_subscriptions`, which already reflects "covered by some guild's
+  member_clans/member_families/subscriptions" (see `update_all_clan_subscription_statuses()`).
+  1797 total tests pass.
+
+2026-08-14 (11)
+- Fixed (`db_manager.py`, `QapBot.py`): a first-run index build on a large history DB (missing
+  9 of 10 `war_attacks`/`war_summary` indexes after the schema-drift repair, changelog (7)-(10))
+  had no progress logging for 8 of those 9 indexes, so a multi-minute silent gap looked hung and
+  invited a SIGINT mid-build. New `_create_index_if_missing()` now logs before/after any index
+  it actually has to build. Separately, `_close_bot_after_signal()`'s 60s force-close fallback
+  didn't account for `QBcore.db_maintenance_mode` (set for the whole `initialize_database()`
+  call), so that SIGINT could still force a `bot.close()` while the background aiosqlite thread
+  was mid-build — crashing it with "Event loop is closed" once the (uninterruptible) CREATE
+  INDEX finally finished against an already-closed loop. The fallback now pauses its countdown
+  while `db_maintenance_mode` is active. 1797 total tests pass.
+
 2026-08-14 (10)
 - Fixed (`repair_history_schema_drift.py`, caught immediately from live user feedback): the
   default ("dry run") mode built the full `<table>_repaired` copy for real — writing real data
