@@ -1,6 +1,19 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-14 (5)
+- Changed (CWL Manage Enrollment board, third live-testing pass): title/legend order swapped
+  (title stays top-left, legend follows it — was reversed); the event-status caption is now
+  human-readable ("Signup Open" instead of the raw `signup_open`); card padding's right side
+  halved so the trailing icon sits closer to the edge; new 4th icon (`unlinked.svg`, matching
+  the other three's style) shown for any player with no linked Discord account — a real case
+  that was previously silently unexplained (such a player can never respond to the template DM,
+  so was stuck at "Pending" forever with no visible reason).
+- Investigated, no code change: "Player Skill" sort/display reported as not working — confirmed
+  the frontend logic is correct; the payload's `skill_score` was still null for every player
+  because the DEV bot process hadn't yet been restarted to pick up the prior entry's backend
+  code. Flagged for a live re-check after restart.
+
 2026-08-14 (4)
 - Added (CWL Manage Enrollment board, "Player Skill" sort): league-tier-adjusted player-skill
   score, formula confirmed with the project owner — average stars/attack over each player's

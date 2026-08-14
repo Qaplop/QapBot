@@ -1,0 +1,8 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- Neutral grey rounded square with moderate padding, matching gcheck.svg/redx.svg/pending.svg's style -->
+  <rect x="10" y="10" width="44" height="44" rx="10" fill="#5b5e66"/>
+  <!-- White person silhouette (head + shoulders), crossed out to indicate no linked Discord account -->
+  <circle cx="32" cy="25" r="6.5" fill="white"/>
+  <path d="M 20 46 C 20 37 25 33 32 33 C 39 33 44 37 44 46 Z" fill="white"/>
+  <line x1="16" y1="48" x2="48" y2="16" stroke="white" stroke-width="4.5" stroke-linecap="round"/>
+</svg>

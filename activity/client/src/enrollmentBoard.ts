@@ -1,6 +1,7 @@
 import gcheckIconUrl from './assets/gcheck.svg'
 import pendingIconUrl from './assets/pending.svg'
 import redxIconUrl from './assets/redx.svg'
+import unlinkedIconUrl from './assets/unlinked.svg'
 import type { EnrollmentPayload, EnrollmentPlayer } from './types'
 
 type SortOrder = 'th' | 'skill' | 'alpha'
@@ -20,6 +21,20 @@ const STATUS_LABEL: Record<VisibleStatus, string> = {
   pending: 'Pending',
   confirmed: 'Confirmed',
   declined: 'Declined',
+}
+const UNLINKED_LABEL = 'Not Linked'
+
+const EVENT_STATUS_LABEL: Record<string, string> = {
+  draft: 'Draft',
+  signup_open: 'Signup Open',
+  finalized: 'Finalized',
+  announced: 'Announced',
+  cancelled: 'Cancelled',
+}
+
+function formatEventStatus(status: string | null): string {
+  if (!status) return EVENT_STATUS_LABEL.draft
+  return EVENT_STATUS_LABEL[status] ?? status
 }
 
 function isVisibleStatus(status: EnrollmentPlayer['signup_status']): status is VisibleStatus {
@@ -86,19 +101,20 @@ export function renderEnrollmentBoard(
   titleRow.className = 'title-row'
   topBar.appendChild(titleRow)
 
+  const header = document.createElement('div')
+  header.className = 'header'
+  header.textContent = `Season ${payload.season} — ${formatEventStatus(payload.event_status)}`
+  titleRow.appendChild(header)
+
   const legend = document.createElement('div')
   legend.className = 'legend'
   legend.append(
     buildLegendItem(pendingIconUrl, STATUS_LABEL.pending),
     buildLegendItem(gcheckIconUrl, STATUS_LABEL.confirmed),
     buildLegendItem(redxIconUrl, STATUS_LABEL.declined),
+    buildLegendItem(unlinkedIconUrl, UNLINKED_LABEL),
   )
   titleRow.appendChild(legend)
-
-  const header = document.createElement('div')
-  header.className = 'header'
-  header.textContent = `Season ${payload.season} — ${payload.event_status ?? 'draft'}`
-  titleRow.appendChild(header)
 
   const sortRow = document.createElement('div')
   sortRow.className = 'sort-row'
@@ -207,6 +223,15 @@ export function renderEnrollmentBoard(
       skill.textContent = player.skill_score.toFixed(1)
       skill.title = 'Player skill score'
       row.appendChild(skill)
+    }
+
+    if (player.discord_id == null) {
+      const icon = document.createElement('img')
+      icon.className = 'status-icon'
+      icon.src = unlinkedIconUrl
+      icon.alt = UNLINKED_LABEL
+      icon.title = UNLINKED_LABEL
+      row.appendChild(icon)
     }
 
     if (isVisibleStatus(player.signup_status)) {
