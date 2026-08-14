@@ -1,6 +1,23 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-14 (9)
+- Fixed (`repair_history_schema_drift.py`, caught on the first real run): building
+  `<table>_repaired` was one giant unbatched transaction — against real `history.war_attacks`
+  (tens of millions of rows) this grew the WAL file to 6.5GB+ within ~2 minutes with zero
+  progress output, the same failure mode `_migrate_table_batch_by_date` was already hardened
+  against after the 2026-08-01 incident, and had to be killed. Now batched (20,000 rows/commit
+  by default, configurable via `--batch-size`), checkpoints every 20 batches
+  (`--checkpoint-every-batches`), logs progress every batch, and resumes from `MAX(id)` already
+  present in `<table>_repaired` if interrupted — safe to re-run the exact same command after a
+  Ctrl+C or crash. Dry run semantics changed accordingly: it now builds `<table>_repaired` for
+  real (still never touches the original table's name or values) instead of wrapping everything
+  in a since-infeasible single rolled-back transaction. Also fixed a related resume-path bug the
+  new resumability test caught immediately: the repaired table's `CREATE TABLE` didn't force
+  `IF NOT EXISTS`, so re-running after a partial build failed outright instead of resuming.
+  1 new resumability test (updated the dry-run test's assertions for the new semantics);
+  1794 total tests pass.
+
 2026-08-14 (8)
 - Added: `qapbot/scripts/repair_history_schema_drift.py`, the repair tool for the hot/history
   schema-drift incident (see changelog (7) above). Detects drift per table by comparing `main`'s

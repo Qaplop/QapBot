@@ -26,24 +26,43 @@ affected, or one that's already been repaired.
 The originals are NEVER dropped — only renamed to `<table>_corrupted_backup` once the repaired
 copy is verified, and only when --apply is given.
 
-DRY RUN vs --apply:
-  - Without --apply (default): builds and verifies the repaired tables inside a transaction that
-    is ALWAYS ROLLED BACK at the end, success or failure — the database file is byte-for-byte
-    unchanged when this exits, no matter what happens. Prints a full verification report (row
-    counts, sample before/after rows for the columns that actually moved) so you can review it
-    before ever risking a real write.
-  - With --apply: the exact same build+verify pass, but if (and only if) verification passes,
-    commits the repaired tables and renames the originals to `<table>_corrupted_backup` (kept)
-    and the repaired copies into the real table names, then recreates the original named indexes
-    against the now-correctly-named table (the backup table's own indexes are dropped first, to
-    free up the names — the backup is a fallback reference copy, not meant to be queried hot).
-    If verification fails for ANY table, the whole run aborts and rolls back regardless of
-    --apply — this flag lowers the bar for nothing.
+BATCHED, CHECKPOINTED, AND RESUMABLE (2026-08-14, after a first real run against a
+tens-of-millions-of-rows `history.war_attacks` grew the WAL to 6.5GB+ in under 2 minutes with zero
+progress visibility and had to be killed): the copy into `<table>_repaired` is done in batches of
+`--batch-size` rows (default 20,000), each its own committed transaction, with a `PRAGMA
+wal_checkpoint(PASSIVE)` every `--checkpoint-every-batches` batches (default 20) — the exact same
+pattern `_migrate_table_batch_by_date` in `db_manager.py` already uses for the live monthly
+migration, and for the same reason (see that function's own docstring: an earlier uncheckpointed
+multi-hour run once filled the disk). Progress is logged every batch. If interrupted (Ctrl+C,
+crash, or a deliberate stop), nothing is lost or corrupted — every completed batch is already
+committed, and re-running this script picks up from `MAX(id)` already present in `<table>_repaired`
+instead of starting over.
+
+Because the build step now commits incrementally, it can no longer live inside one big
+rolled-back-by-default transaction. DRY RUN vs --apply now means:
+  - Without --apply (default): builds `<table>_repaired` for real (committed, batched, resumable
+    — see above) and verifies it, but NEVER touches the original table names — `history.<table>`
+    itself is guaranteed untouched, queryable, and unaffected the whole time, in dry run or apply
+    alike. Prints a full verification report (row counts, sample rows) before you ever risk the
+    swap. The `_repaired` table(s) are left on disk afterward for inspection; harmless clutter,
+    not "real" data anything else reads.
+  - With --apply: same build+verify, and if (and only if) verification passes, renames the
+    originals to `<table>_corrupted_backup` (kept, not dropped) and the repaired copies into the
+    real table names, then recreates the original named indexes against the now-correctly-named
+    table (the backup table's own indexes are dropped first, to free up the names — the backup is
+    a fallback reference copy, not meant to be queried hot). This swap step itself is small, fast,
+    and fully atomic (one transaction) regardless of how large the table was to build. If
+    verification fails for ANY table, nothing is swapped for ANY table, regardless of --apply.
 
 IMPORTANT:
   - The bot MUST be stopped before running with --apply — this script opens its own
     WarHistoryDB connection, separate from the running bot's, and the table renames need
-    exclusive access to the `history` schema.
+    exclusive access to the `history` schema. The (much longer) build phase can safely run with
+    the bot live, since it never touches the real table names — but expect it to compete for the
+    same write lock as the bot's normal write cycle, so stopping the bot first is still simplest.
+  - Make sure there is enough free disk space for a full copy of the affected table(s) before
+    starting — `<table>_repaired` is a complete second copy of `<table>` until the swap step
+    (which drops nothing; the old data just gets renamed).
   - --db/--history-db default to CONFIG.db_path/CONFIG.history_db_path, which already resolve
     to the correct DEV or PROD location automatically (same convention as
     run_history_migration_now.py/run_db_maintenance_now.py) — this script does not need its own
@@ -52,15 +71,14 @@ IMPORTANT:
     itself — running --apply against a PROD-resolved path is a separate, explicit decision the
     operator must make deliberately, not something to do as a side effect of "it auto-detected
     PROD."
-  - Safe to re-run: a leftover `<table>_repaired` from a previous dry run (or a failed --apply,
-    which never gets that far) is dropped and rebuilt fresh every run. Refuses --apply for a
-    table whose `<table>_corrupted_backup` already exists (that table has already been repaired)
-    unless --force is also given.
+  - Refuses --apply for a table whose `<table>_corrupted_backup` already exists (that table has
+    already been repaired) unless --force is also given.
 
 Usage:
     python qapbot/scripts/repair_history_schema_drift.py                  # dry run, prints report
     python qapbot/scripts/repair_history_schema_drift.py --apply          # actually repairs
     python qapbot/scripts/repair_history_schema_drift.py --db ... --history-db ... --apply
+    python qapbot/scripts/repair_history_schema_drift.py --batch-size 50000 --checkpoint-every-batches 10
     python qapbot/scripts/repair_history_schema_drift.py --sample-size 50 # more spot-check rows
 """
 from __future__ import annotations
@@ -71,6 +89,7 @@ import logging
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
@@ -82,6 +101,9 @@ from qapbot.db_manager import WarHistoryDB  # noqa: E402
 # The only 4 tables ever mirrored between `main` and `history` — see
 # DATABASE_ARCHITECTURE.md's "Hot/History DB Split" section.
 MIGRATED_TABLES = ("war_attacks", "war_summary", "cwl_league_groups", "cwl_league_rounds")
+
+DEFAULT_BATCH_SIZE = 20_000
+DEFAULT_CHECKPOINT_EVERY_BATCHES = 20
 
 
 def _configure_logging(log_file: Optional[str]) -> None:
@@ -160,6 +182,11 @@ def _repaired_create_sql(create_sql: str, table: str) -> str:
     already has it — the schema itself isn't wrong, only which row-values landed under which
     column.
 
+    Always forces `IF NOT EXISTS` onto the rewritten statement, regardless of whether the
+    original had it — this is what makes resuming an interrupted build safe: the build step
+    re-issues this CREATE every call, and a plain `CREATE TABLE` (no `IF NOT EXISTS`) would fail
+    outright the second time the table already exists from a prior partial run.
+
     `sqlite_master.sql` does NOT retain a schema-qualifying prefix on the table name (schema
     membership comes from which schema's own sqlite_master the row is listed in, not from text
     in the SQL itself) — so the rewritten name must be explicitly qualified with `history.`
@@ -170,26 +197,74 @@ def _repaired_create_sql(create_sql: str, table: str) -> str:
         rf"CREATE TABLE\s+(IF NOT EXISTS\s+)?(history\.)?{re.escape(table)}\b", re.IGNORECASE
     )
     new_sql, count = pattern.subn(
-        lambda m: f"CREATE TABLE {m.group(1) or ''}history.{table}_repaired", create_sql, count=1
+        lambda m: f"CREATE TABLE IF NOT EXISTS history.{table}_repaired", create_sql, count=1
     )
     if count != 1:
         raise RuntimeError(f"Could not locate table name in CREATE TABLE sql for {table}: {create_sql!r}")
     return new_sql
 
 
-async def _build_repaired_table(conn: Any, plan: TablePlan) -> None:
+async def _build_repaired_table_batched(
+    conn: Any, plan: TablePlan, batch_size: int, checkpoint_every_batches: int
+) -> int:
+    """Populates `<table>_repaired` in committed batches with periodic WAL checkpoints — see the
+    module docstring's "BATCHED, CHECKPOINTED, AND RESUMABLE" section for why. Resumes from
+    `MAX(id)` already present in `_repaired` rather than starting over, so an interrupted run
+    just needs the same command run again.
+
+    Returns the number of rows inserted THIS run (not the table's total)."""
     repaired_name = f"{plan.table}_repaired"
-    await conn.execute(f"DROP TABLE IF EXISTS history.{repaired_name}")
     await conn.execute(_repaired_create_sql(plan.create_sql, plan.table))
+    await conn.commit()
+
+    cur = await conn.execute(f"SELECT COALESCE(MAX(id), 0) AS m FROM history.{repaired_name}")
+    resume_from = (await cur.fetchone())["m"]
+    if resume_from:
+        print(f"  [{plan.table}] resuming — {repaired_name} already has rows up to id={resume_from}")
 
     # history_cols[k] is the CURRENT (mislabeled) column holding the value that actually
     # belongs under main_cols[k] — see the module docstring's "HOW IT WORKS".
     select_list = ", ".join(f"{h} AS {m}" for h, m in zip(plan.history_cols, plan.main_cols))
     insert_cols = ", ".join(plan.main_cols)
-    await conn.execute(
-        f"INSERT INTO history.{repaired_name} ({insert_cols}) "
-        f"SELECT {select_list} FROM history.{plan.table}"
-    )
+
+    total_moved = 0
+    batches_since_checkpoint = 0
+    cursor = resume_from
+    t_start = time.monotonic()
+    while True:
+        await conn.execute("BEGIN")
+        cur = await conn.execute(
+            f"INSERT INTO history.{repaired_name} ({insert_cols}) "
+            f"SELECT {select_list} FROM history.{plan.table} "
+            f"WHERE id > ? ORDER BY id LIMIT ?",
+            (cursor, batch_size),
+        )
+        moved_this_batch = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        if moved_this_batch == 0:
+            await conn.commit()
+            break
+
+        cur2 = await conn.execute(
+            f"SELECT MAX(id) AS m FROM history.{repaired_name}"
+        )
+        cursor = (await cur2.fetchone())["m"]
+        await conn.commit()
+
+        total_moved += moved_this_batch
+        batches_since_checkpoint += 1
+        elapsed = time.monotonic() - t_start
+        rate = total_moved / elapsed if elapsed > 0 else 0
+        print(f"  [{plan.table}] moved batch of {moved_this_batch} rows (total this run: {total_moved:,}, "
+              f"~{rate:,.0f} rows/sec, up to id={cursor})")
+
+        if batches_since_checkpoint >= checkpoint_every_batches:
+            batches_since_checkpoint = 0
+            try:
+                await conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except Exception as e:
+                print(f"  [{plan.table}] WARNING: periodic checkpoint failed: {e}")
+
+    return total_moved
 
 
 @dataclass
@@ -286,93 +361,97 @@ async def _swap_in(conn: Any, plan: TablePlan) -> None:
                             if "IF NOT EXISTS" not in index_sql else index_sql)
 
 
-async def _run(db_path: str, history_db_path: str, apply: bool, sample_size: int, force: bool) -> bool:
+async def _run(
+    db_path: str, history_db_path: str, apply: bool, sample_size: int, force: bool,
+    batch_size: int = DEFAULT_BATCH_SIZE, checkpoint_every_batches: int = DEFAULT_CHECKPOINT_EVERY_BATCHES,
+) -> bool:
     print(f"Hot DB     : {db_path}")
     print(f"History DB : {history_db_path}")
-    print(f"Mode       : {'APPLY (will write)' if apply else 'DRY RUN (no changes will persist)'}")
+    print(f"Mode       : {'APPLY (will write)' if apply else 'DRY RUN (build+verify only, originals untouched)'}")
+    print(f"Batching   : {batch_size:,} rows/batch, checkpoint every {checkpoint_every_batches} batches")
     print()
 
     db = WarHistoryDB()
     await db.initialize(db_path, history_db_path)
     conn = db._conn
-    all_ok = True
     try:
+        plans = []
+        for table in MIGRATED_TABLES:
+            plan = await _plan_for_table(conn, table)
+            if not plan.needs_repair:
+                print(f"[{table}] no drift detected — main/history column order already agree. Skipping.")
+                continue
+            plans.append(plan)
+            print(f"[{table}] DRIFT DETECTED:")
+            print(f"  main    order: {plan.main_cols}")
+            print(f"  history order: {plan.history_cols}")
+
+            if apply and not force:
+                cur = await conn.execute(
+                    "SELECT 1 FROM history.sqlite_master WHERE type='table' AND name=?",
+                    (f"{table}_corrupted_backup",),
+                )
+                if await cur.fetchone():
+                    raise RuntimeError(
+                        f"{table}_corrupted_backup already exists — this table looks already "
+                        f"repaired. Pass --force to re-run anyway (it will resume/rebuild "
+                        f"{table}_repaired; the existing backup is left alone)."
+                    )
+
+        if not plans:
+            print()
+            print("Nothing to repair. Exiting.")
+            return True
+
+        print()
+        print("Building repaired copies (batched, resumable — safe to interrupt and re-run)...")
+        for plan in plans:
+            moved = await _build_repaired_table_batched(conn, plan, batch_size, checkpoint_every_batches)
+            print(f"  [{plan.table}] done — {moved:,} row(s) moved this run.")
+
+        print()
+        print("Verifying...")
+        all_ok = True
+        for plan in plans:
+            result = await _verify_table(conn, plan, sample_size)
+            print(f"[{plan.table}] rows: original={result.original_count} repaired={result.repaired_count}")
+            print(f"[{plan.table}] {len(result.samples)} sample row(s) after repair:")
+            for line in result.samples:
+                print(f"    {line}")
+            if result.problems:
+                all_ok = False
+                print(f"[{plan.table}] *** VERIFICATION PROBLEMS ***")
+                for p in result.problems:
+                    print(f"    - {p}")
+            else:
+                print(f"[{plan.table}] verification OK.")
+            print()
+
+        if not all_ok:
+            print("Verification FAILED for at least one table. The *_repaired table(s) are left")
+            print("on disk for inspection, but nothing has been swapped — history.<table> is")
+            print("completely unaffected either way.")
+            return False
+
+        if not apply:
+            print("Dry run complete, verification passed.")
+            print("history.<table> is unaffected — *_repaired table(s) left on disk for inspection.")
+            print("Re-run with --apply to swap the repaired copies in for real.")
+            return True
+
+        print("Verification passed — swapping repaired tables in (fast, atomic)...")
         await conn.execute("BEGIN")
         try:
-            plans = []
-            for table in MIGRATED_TABLES:
-                plan = await _plan_for_table(conn, table)
-                if not plan.needs_repair:
-                    print(f"[{table}] no drift detected — main/history column order already agree. Skipping.")
-                    continue
-                plans.append(plan)
-                print(f"[{table}] DRIFT DETECTED:")
-                print(f"  main    order: {plan.main_cols}")
-                print(f"  history order: {plan.history_cols}")
-
-                if apply and not force:
-                    cur = await conn.execute(
-                        "SELECT 1 FROM history.sqlite_master WHERE type='table' AND name=?",
-                        (f"{table}_corrupted_backup",),
-                    )
-                    if await cur.fetchone():
-                        raise RuntimeError(
-                            f"{table}_corrupted_backup already exists — this table looks already "
-                            f"repaired. Pass --force to re-run anyway (it will DROP and rebuild "
-                            f"{table}_repaired only; the existing backup is left alone)."
-                        )
-
-            if not plans:
-                print()
-                print("Nothing to repair. Rolling back (no-op) and exiting.")
-                await conn.execute("ROLLBACK")
-                return True
-
-            print()
-            print("Building repaired copies...")
-            for plan in plans:
-                await _build_repaired_table(conn, plan)
-                print(f"  [{plan.table}] {plan.table}_repaired built.")
-
-            print()
-            print("Verifying...")
-            for plan in plans:
-                result = await _verify_table(conn, plan, sample_size)
-                print(f"[{plan.table}] rows: original={result.original_count} repaired={result.repaired_count}")
-                print(f"[{plan.table}] {len(result.samples)} sample row(s) after repair:")
-                for line in result.samples:
-                    print(f"    {line}")
-                if result.problems:
-                    all_ok = False
-                    print(f"[{plan.table}] *** VERIFICATION PROBLEMS ***")
-                    for p in result.problems:
-                        print(f"    - {p}")
-                else:
-                    print(f"[{plan.table}] verification OK.")
-                print()
-
-            if not all_ok:
-                print("Verification FAILED for at least one table — rolling back. Nothing was changed.")
-                await conn.execute("ROLLBACK")
-                return False
-
-            if not apply:
-                print("Dry run complete, verification passed. Rolling back (no changes persisted).")
-                print("Re-run with --apply to actually repair the database.")
-                await conn.execute("ROLLBACK")
-                return True
-
-            print("Verification passed — swapping repaired tables in...")
             for plan in plans:
                 await _swap_in(conn, plan)
                 print(f"  [{plan.table}] swapped in. Original preserved as {plan.table}_corrupted_backup.")
-            await conn.execute("COMMIT")
-            print()
-            print("APPLY complete. Repair committed.")
-            return True
+            await conn.commit()
         except Exception:
             await conn.execute("ROLLBACK")
             raise
+        print()
+        print("APPLY complete. Repair committed.")
+        return True
     finally:
         await db.close()
 
@@ -383,12 +462,19 @@ def main() -> None:
     parser.add_argument("--history-db", default=getattr(CONFIG, "history_db_path", None),
                          help="Path to qapbot_history.db (default: CONFIG.history_db_path)")
     parser.add_argument("--apply", action="store_true",
-                         help="Actually commit the repair (default: dry run, always rolled back).")
+                         help="Actually swap the repaired tables in (default: dry run — builds and "
+                              "verifies but never touches the original table names).")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+                         help=f"Rows per committed batch while building *_repaired (default: {DEFAULT_BATCH_SIZE:,}). "
+                              "Larger = faster but more WAL accumulated per batch.")
+    parser.add_argument("--checkpoint-every-batches", type=int, default=DEFAULT_CHECKPOINT_EVERY_BATCHES,
+                         help=f"PRAGMA wal_checkpoint(PASSIVE) every N batches (default: {DEFAULT_CHECKPOINT_EVERY_BATCHES}). "
+                              "Lower this if the WAL file is still growing too large between checkpoints.")
     parser.add_argument("--sample-size", type=int, default=20,
                          help="Number of random rows per table to spot-check during verification (default: 20).")
     parser.add_argument("--force", action="store_true",
                          help="Allow --apply even if <table>_corrupted_backup already exists for a table "
-                              "(i.e. it looks already repaired). Rebuilds <table>_repaired fresh regardless.")
+                              "(i.e. it looks already repaired).")
     parser.add_argument("--log-file", default=os.path.join(CONFIG.data_dir, "logs", "repair_history_schema_drift.log"),
                          help="Also write progress to this file, not just stdout. Pass an empty string to disable.")
     parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt (only asked for --apply).")
@@ -406,7 +492,10 @@ def main() -> None:
             print("Aborted. Nothing was changed.")
             sys.exit(1)
 
-    ok = asyncio.run(_run(args.db, args.history_db, args.apply, args.sample_size, args.force))
+    ok = asyncio.run(_run(
+        args.db, args.history_db, args.apply, args.sample_size, args.force,
+        args.batch_size, args.checkpoint_every_batches,
+    ))
     if not ok:
         sys.exit(1)
 

@@ -78,7 +78,12 @@ async def _seed_corrupted_row(
 
 @pytest.mark.asyncio
 class TestRepairHistorySchemaDrift:
-    async def test_dry_run_reports_but_does_not_persist(self, tmp_path):
+    async def test_dry_run_builds_repaired_copy_but_never_touches_original(self, tmp_path):
+        """2026-08-14: dry run used to wrap everything in one big rolled-back transaction, but
+        that's incompatible with batched/checkpointed building (needed after a real run against
+        tens of millions of rows grew the WAL to 6.5GB+ in under 2 minutes). Dry run now builds
+        <table>_repaired for real (committed) but must still leave the ORIGINAL table's name and
+        values completely untouched — only --apply ever renames anything."""
         db = WarHistoryDB()
         db_path = str(tmp_path / "dry.db")
         history_db_path = str(tmp_path / "dry_history.db")
@@ -91,8 +96,6 @@ class TestRepairHistorySchemaDrift:
             ok = await repair_module._run(db_path, history_db_path, apply=False, sample_size=5, force=False)
             assert ok is True
 
-            # Dry run must leave the file completely unchanged — no _repaired/_corrupted_backup
-            # tables, and the original row still shows the corrupted (swapped) raw values.
             db2 = WarHistoryDB()
             await db2.initialize(db_path, history_db_path)
             try:
@@ -100,14 +103,24 @@ class TestRepairHistorySchemaDrift:
                     "SELECT name FROM history.sqlite_master WHERE type='table' AND name LIKE 'war_summary%'"
                 )
                 names = {r["name"] for r in await cur.fetchall()}
-                assert names == {"war_summary"}, f"dry run left extra tables behind: {names}"
+                # war_summary_repaired IS expected now (dry run builds it for real); no swap
+                # happened, so no _corrupted_backup and the plain "war_summary" name still
+                # refers to the ORIGINAL (still-corrupted) table.
+                assert names == {"war_summary", "war_summary_repaired"}, f"unexpected tables: {names}"
 
                 cur = await db2._conn.execute("SELECT war_tag, end_time FROM history.war_summary WHERE war_id='war_1'")
                 row = await cur.fetchone()
-                # Still corrupted — dry run changed nothing: war_tag holds the end_time value
-                # and vice versa, exactly as seeded.
+                # Original untouched — still shows the corrupted (swapped) raw values.
                 assert row["war_tag"] == "2020-01-01T20:00"
                 assert row["end_time"] == "#REALTAG1"
+
+                # The repaired copy exists on disk with the CORRECT values, for inspection.
+                cur = await db2._conn.execute(
+                    "SELECT war_tag, end_time FROM history.war_summary_repaired WHERE war_id='war_1'"
+                )
+                repaired_row = await cur.fetchone()
+                assert repaired_row["war_tag"] == "#REALTAG1"
+                assert repaired_row["end_time"] == "2020-01-01T20:00"
             finally:
                 await db2.close()
         finally:
@@ -274,6 +287,49 @@ class TestRepairHistorySchemaDrift:
                     assert row[col] == expected, f"column {col}: expected {expected!r}, got {row[col]!r}"
             finally:
                 await db2.close()
+        finally:
+            if db.conn:
+                await db.conn.close()
+
+    async def test_build_resumes_after_simulated_interruption(self, tmp_path):
+        """Proves the resumability claim directly: build the repaired copy, simulate an
+        interrupted run by deleting some already-committed rows back out of it (as if the
+        process had been killed after committing fewer batches), then build again and confirm
+        it picks up from MAX(id) rather than starting over or duplicating rows."""
+        db = WarHistoryDB()
+        db_path = str(tmp_path / "resume.db")
+        history_db_path = str(tmp_path / "resume_history.db")
+        await db.initialize(db_path, history_db_path)
+        try:
+            await _rebuild_history_war_summary_with_swapped_columns(db)
+            for i in range(5):
+                await _seed_corrupted_row(
+                    db, f"war_{i}", real_war_tag=f"#REALTAG{i}", real_end_time=f"2020-0{i + 1}-01T20:00",
+                )
+
+            plan = await repair_module._plan_for_table(db._conn, "war_summary")
+            assert plan.needs_repair
+
+            moved = await repair_module._build_repaired_table_batched(db._conn, plan, batch_size=2, checkpoint_every_batches=100)
+            assert moved == 5
+
+            # Simulate an interrupted prior run: only 2 of the 5 repaired rows actually
+            # committed before the process died.
+            await db._conn.execute("DELETE FROM history.war_summary_repaired WHERE id > 2")
+            await db._conn.commit()
+            cur = await db._conn.execute("SELECT COUNT(*) AS n FROM history.war_summary_repaired")
+            assert (await cur.fetchone())["n"] == 2
+
+            # Re-running the build must resume from id=2, not restart from scratch or duplicate.
+            moved_again = await repair_module._build_repaired_table_batched(db._conn, plan, batch_size=2, checkpoint_every_batches=100)
+            assert moved_again == 3  # only the missing 3 rows
+
+            cur = await db._conn.execute("SELECT COUNT(*) AS n FROM history.war_summary_repaired")
+            assert (await cur.fetchone())["n"] == 5
+
+            cur = await db._conn.execute("SELECT war_tag FROM history.war_summary_repaired WHERE war_id='war_4'")
+            row = await cur.fetchone()
+            assert row["war_tag"] == "#REALTAG4"
         finally:
             if db.conn:
                 await db.conn.close()
