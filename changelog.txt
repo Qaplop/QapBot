@@ -1,6 +1,221 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-14 (27)
+- Added (Activity — "Manage Enrollment" board, project owner's spec): a second, independent
+  "Show:" radio group (Avg Stars/Attack — default — or Skill Score) controls which number
+  displays next to each player's name, separate from the existing "Sort by:" group (sorting by
+  "Player Skill" still always uses the real league-adjusted score regardless of this choice).
+  New `compute_avg_stars_per_attack()` (`QBdiscocmdshelper_cwl.py`) — plain, unweighted average
+  stars/attack over the same ≤10-attack window `compute_league_adjusted_skill_scores()` already
+  uses — new `avg_stars` field on the enrollment payload/`EnrollmentPlayer`. The footer's
+  explainer caption now updates to describe whichever metric is currently shown.
+- Fixed (same live-testing pass): Unassigned column cards didn't line up with clan-column cards
+  row for row — the last remaining conditionally-rendered slot in `buildCard()` (the skill/
+  avg-stars number itself) was omitted entirely for a player with no CWL-attack data, and
+  Unassigned's pool skews heavily toward players who've never played CWL at all. Now always
+  reserved (invisible placeholder when null), matching the th-badge/status-icon fix from (26).
+  `qapbot/QBdiscocmdshelper_cwl.py`, `qapbot/web_bridge.py`, `activity/client/src/{enrollmentBoard,types}.ts`.
+  8 new/updated backend tests; 1817 total tests pass; frontend typecheck/build clean. Backend
+  change needs a bot restart to take effect; frontend already deployed to DEV.
+- Fixed (live-testing feedback): roster-band gray darkened two more steps (`#84868d` ->
+  `#5c5e65` -> `#34363d`). `activity/client/index.html`.
+
+2026-08-14 (26)
+- Fixed (Activity — "Manage Enrollment" board, live-testing feedback): player cards no longer
+  lined up in rows across columns. Root cause wasn't the green/amber/placeholder coloring
+  itself (already identical) — `buildCard()`'s TH-badge and status-icon were each omitted
+  entirely for a player missing that data (no `th_level`, or a linked player with no visible
+  signup status), so those rows rendered shorter than every other row. Both slots are now always
+  present — an invisible same-sized spacer (icon-shaped `.th-icon`/`.status-icon` element, not
+  an `<img>` with no `src`, which some browsers still render as a visible broken-image glyph)
+  takes the slot when there's nothing real to show, matching `buildPlaceholderCard()`'s existing
+  approach. `.player-row` also got an explicit `height: 20px` (was content-derived) as a final
+  guarantee against any remaining sub-pixel text line-height rounding — every card, real or
+  placeholder, is now the identical height regardless of which optional data it has.
+  `activity/client/src/enrollmentBoard.ts`, `activity/client/index.html`. Frontend-only;
+  typecheck/build clean.
+
+2026-08-14 (25)
+- Fixed (CRITICAL for usability — Activity "pop out" button, live-testing feedback): using
+  Discord's own "pop out" button while on the CWL "Manage Assignment"/enrollment board landed on
+  the clan-config table instead. Root cause: `main.ts`'s initial fetch sequence (including
+  `GET /api/cwl/screen`, which resolves which of the two screens to render) runs a second time
+  for the popped-out window — same logical launch, fresh page load — and
+  `handle_get_cwl_screen()` used to **pop** `CACHE.pending_cwl_activity_screen`, so that second
+  call always found nothing left and silently fell back to the `"clan_config"` default, even
+  though the user never clicked a different button. Changed to a non-destructive read
+  (`.get()`, not `.pop()`) — the recorded screen now persists until the next distinct Discord
+  button click overwrites it, matching the "most recently requested screen" semantics this was
+  always meant to have; a bot restart still falls back to `"clan_config"` as before, since the
+  dict is in-memory only. `qapbot/web_bridge.py`, `qapbot/cache_manager.py`. 2 tests in
+  `test_web_bridge.py` rewritten/added for the new persist-until-overwritten behavior. 1813
+  total tests pass.
+- Fixed (Activity — "Manage Enrollment" board, live-testing feedback): roster-band gray
+  darkened two more steps (`#84868d` -> `#5c5e65`). `activity/client/index.html`.
+
+2026-08-14 (24)
+- Fixed (Activity — "Manage Enrollment" board, live-testing feedback on (23)'s fix): roster-band
+  gray darkened a step (`#9a9ca3` -> `#84868d`). `.placeholder-card` no longer guesses a
+  `min-height` — `buildPlaceholderCard()` now builds a real `.player-row` containing an invisible
+  (`visibility: hidden`) `.status-icon`-sized spacer, so a placeholder's height is driven by the
+  exact same markup/CSS as a real player card instead of a hardcoded pixel value that could drift
+  out of sync. `activity/client/src/enrollmentBoard.ts`, `activity/client/index.html`.
+  Frontend-only; typecheck/build clean.
+
+2026-08-14 (23)
+- Fixed (Activity — "Manage Enrollment" board, live-testing feedback): the starting-roster band
+  (white since (21)) read as visually harsh — changed to a light gray (`#9a9ca3`). Open roster
+  slots (fewer real starters than `roster_size`) are now padded out with new empty
+  `.placeholder-card` tiles (dashed border, not draggable) so the band always shows exactly
+  `roster_size` slots — some filled with real players, the rest visibly still open — instead of
+  shrinking to however many are assigned so far. The `(current/roster_size)` count next to each
+  clan name is now pinned to the header's right edge (`justify-content: space-between` between
+  the name and count, name ellipsis-truncated if it would otherwise crowd the count) instead of
+  trailing immediately after the name. `activity/client/src/enrollmentBoard.ts`,
+  `activity/client/index.html`. Frontend-only; typecheck/build clean.
+
+2026-08-14 (22)
+- Fixed (Activity — "Manage Enrollment" board column headers, live-testing feedback): the
+  clan-tag/tier text still wrapped unpredictably ("Name (#TAG) · Tier (count)" on one line),
+  which is what kept making column-header heights mismatch between columns. Restructured into
+  two fixed lines: clan name (+ count) on top, league tier below, dropping the `#TAG` and the
+  "·" separator entirely. Tier text also drops the word "League" (`formatTier()`: "Master League
+  I" -> "Master I") and `text-transform: uppercase` was removed from `.column-header` — both name
+  and tier now render in their natural casing instead of forced caps.
+  `activity/client/src/enrollmentBoard.ts`, `activity/client/index.html`. Frontend-only;
+  typecheck/build clean.
+
+2026-08-14 (21)
+- Fixed (Activity — "Manage Enrollment" board, live-testing feedback on (20)'s fix): the board's
+  column height was still a guessed fixed `420px`, wasting most of a taller window's space now
+  that the footer no longer depends on it — since the footer is `position: fixed` (pinned to the
+  true viewport bottom regardless of content height, from (20)), the board is now free to fill
+  whatever room is actually available instead. New `resizeBoard()` in `enrollmentBoard.ts`
+  measures the sticky topbar's and fixed footer's real rendered heights plus `window.innerHeight`
+  and sets `.board`'s own height to fill the remainder — `.column`'s default flex stretch then
+  makes every column span that full height (each column's own internal card-list scroll,
+  unchanged, still handles overflow). Re-run on window resize, not just first render.
+- Fixed (contrast, live-testing feedback): all muted gray text (`#949ba4` — tier labels, TH
+  badge numbers, skill score/explainer, legend/sort labels, column headers, save-status) changed
+  to the same near-white already used for primary text (`#f2f3f5`) — too little contrast against
+  the dark backgrounds. The starting-roster band (added in (18)) changed from a modest gray inset
+  box (its own padding + border-radius, visually read as a small floating box) to a near-white
+  background wash that bleeds via negative margins to fill the card-list's full width flush with
+  the column's edges, reading as one seamless zone instead of a nested box.
+  `activity/client/index.html`, `activity/client/src/enrollmentBoard.ts`. Frontend-only;
+  typecheck/build clean.
+
+2026-08-14 (20)
+- Fixed (Activity — "Manage Enrollment" board footer, still reproducing after (19)'s fix,
+  confirmed by a screenshot with a real tall Discord Activity window): the board itself was
+  correctly fixed-height, but the footer still floated far below it with a large gap — neither
+  plain document flow nor `position: sticky` actually pin an element to the viewport bottom
+  unless the page's own content height reaches the viewport height, which isn't reliably true
+  here (a short, now fixed-height board vs. a Discord Activity panel whose own height still
+  varies with the user's window). Switched to `position: fixed` (new `.footer-fixed`), which
+  pins purely to the true viewport bottom regardless of content or window height — `.board`
+  gained a `margin-bottom` to reserve room so the now out-of-flow footer doesn't sit on top of
+  its last row. `activity/client/src/enrollmentBoard.ts`, `activity/client/index.html`.
+  Frontend-only; typecheck/build clean.
+
+2026-08-14 (19)
+- Fixed (`clanConfigTable.ts`, select-all checkbox from (18), caught immediately on first live
+  use): clicking it only ever ended up checking the first row, leaving the header stuck on
+  `.indeterminate`. Root cause: the click handler's loop re-read the live
+  `selectAllCheckbox.checked` value on every row, but each row's dispatched `change` event
+  synchronously ran `updateSelectAllState()` too (attached to keep the header in sync with
+  manual row edits) — which recomputes and overwrites `selectAllCheckbox.checked` mid-loop,
+  since only a partial set of rows had been updated yet. Row 2 onward read that now-stale,
+  self-corrected value and un-did the toggle. Fixed by capturing the target state once before
+  the loop instead of re-reading the mutating property inside it.
+- Fixed (Activity — "Manage Enrollment" board footer, live-testing feedback on (18)'s fix): the
+  footer band's height was still varying with the Activity window's size — `.sticky-footer`
+  (`position: sticky; bottom: 0`) chases the *viewport's* bottom edge, and `.column`'s
+  `max-height: 70vh` meant the board itself also grew taller on a taller window, so a window
+  taller than the board's content left the footer floating further down rather than sitting
+  at a fixed position. `.column` now caps at a fixed `420px` (not a vh unit), and the board's
+  footer reverted to plain `.footer` (no sticky-to-viewport-bottom) — right after a now
+  fixed-height board, its position no longer depends on window size at all. Also swapped the
+  footer's layout back to Close-button-left (unchanged from before the skill caption existed)
+  with the skill-score caption moved to the right (`margin-left: auto`), per feedback that the
+  caption had displaced the button. `activity/client/src/{clanConfigTable,enrollmentBoard}.ts`,
+  `activity/client/index.html`. Frontend-only; typecheck/build clean, no backend change.
+
+2026-08-14 (18)
+- Added (Activity — "Manage Enrollment" board, live-testing feedback): each clan column now
+  shows its roster fill against target — header count changed from `(current)` to
+  `(current/roster_size)`, both numbers bold (`.column-count`, new `roster_size` field on the
+  bridge's `EnrollmentClan`/`_build_enrollment_payload`). The starting-roster slots (positions
+  1..roster_size, in whatever order the column is currently sorted) now sit in one continuous
+  lighter-shade box (`.roster-band`) inside the card list; backup/reserve players past that
+  point stay on the column's normal shade. Player cards are also now color-coded: green when an
+  assigned player's real current clan (new `current_clan_tag` field, `user_players.
+  current_clan_tag`) already matches their assignment, amber when it doesn't (assigned but
+  hasn't transferred yet) — Unassigned cards and players with no current clan on record keep the
+  plain shade. Added a short caption explaining the Skill Score number to the board's footer,
+  left of the Close button. Footer changed to the same `sticky-footer` class the clan-config
+  screen already used (`position: sticky; bottom: 0`, fixed padding) — previously it just sat at
+  the natural end of the page flow, so the leftover space below the (max-height-capped) board
+  varied with viewport height and made the button band look too tall or short depending on the
+  window. `activity/client/src/{enrollmentBoard,types}.ts`, `activity/client/index.html`,
+  `qapbot/web_bridge.py`. 1 new backend test (`current_clan_tag` round-trip); 1812 total tests
+  pass; frontend typecheck/build clean.
+- Added ("Configure Participating Clans" screen): a small select-all checkbox in the table
+  header, left of "Clan" and directly above the row checkboxes — reflects the rows' combined
+  state (checked / unchecked / native indeterminate for a mixed selection, the standard
+  convention for this control) and, when clicked, drives every row checkbox to match by
+  dispatching a real `change` event on each so the existing per-row listener (which updates
+  `clan.participating` and the row's disabled styling) does the actual work rather than
+  duplicating it. `activity/client/src/clanConfigTable.ts`.
+
+2026-08-14 (17)
+- Redesigned (CWL_ROSTER_PLANNING_PLAN.md "Auto-assignment + pool redesign", live-testing
+  feedback): "Manage Enrollment"'s candidate pool broadened from "current members of clans
+  participating in this season's CWL" to "current members of every guild member clan"
+  (`resolve_guild_member_clan_tags()`, new — individual `member_clans` + `member_families`
+  expanded), so a player from a clan that opted out of CWL this season is still visible/
+  draggable on the board, not invisible. Auto-assignment algorithm changed from "per
+  participating clan's own most-recent-CWL-war roster" to per-player: each candidate's own most
+  recent REAL CWL attack (`attack_order > 0`, excludes roster-only sentinel rows) across any
+  clan, assigned there only if that clan is participating this season (new
+  `get_last_real_cwl_attack_clan_sync()`; `resolve_prior_cwl_assignments()`'s signature changed
+  from `(clan_tags)` to `(player_tags, participating_clan_tags)`). Opted-out players
+  (`cwl_permanent_optout` or a `'declined'` signup) now always sort to the bottom of the
+  Unassigned column, regardless of TH/skill/alpha sort. `qapbot/QBdiscocmdshelper_cwl.py`,
+  `qapbot/db_manager.py`, `qapbot/web_bridge.py`, `activity/client/src/{enrollmentBoard,types}.ts`.
+- Fixed (performance, found while building the above): `get_most_recent_cwl_war_roster_sync`/
+  `get_cwl_roster_sync` (`db_manager.py`) used a `WITH wa AS (SELECT * FROM main.war_attacks
+  UNION ALL SELECT * FROM history.war_attacks), ws AS (...)` CTE referenced from a correlated
+  scalar subquery — `EXPLAIN QUERY PLAN` against real DEV data showed SQLite abandoning
+  `idx_ws_clan_date`/`idx_ws_cwl_season` and `MATERIALIZE`-ing + `SCAN`-ing the entire combined
+  `war_summary` table on every call: ~9.5s/clan (~77s for an 8-clan Start Enrollment run).
+  Rewrote both (and the new `get_last_real_cwl_attack_clan_sync` above) to query `main`/`history`
+  separately — each a plain indexed SEARCH — and merge in Python: ~5ms for the same 8 clans,
+  identical results. Also fixed `qapbot/scripts/log_time_gaps.py` crashing with
+  `UnicodeEncodeError` on Windows consoles and added `--since-marker` to scope a report to one
+  restart instead of a whole multi-day log file. 1811 total tests pass.
+
+2026-08-14 (16)
+- Fixed (Discord CWL Management, live-testing feedback): the "Manage Assignment" button label
+  changed to "Manage Teams" (`cwl.management.button_manage_assignment`, en/de — German "Zuweisung
+  verwalten" → "Teams verwalten") for clarity.
+
+2026-08-14 (15)
+- Fixed (Activity — "Configure Participating Clans" screen, live-testing feedback): the season
+  title, timezone note, and Save/Cancel footer scrolled out of view on a long clan list with no
+  way back short of scrolling all the way up/down; the table's column-header row (Clan/Tier/
+  Roster Size/Start Time) had the same problem. Title+timezone-note now share the same sticky
+  top-bar pattern the enrollment board already used (`position: sticky; top: 0`); the footer got
+  a new `.sticky-footer` class (`position: sticky; bottom: 0`, scoped to this screen only); the
+  column-header row is sticky too, offset below the title bar by its actual measured height
+  (read via `getBoundingClientRect()` at render time, not a hardcoded pixel guess that would
+  drift if the title text ever changes). Separately: the clan-name and "Unassigned" column
+  header boxes on the enrollment board could render different heights when a clan name wrapped
+  to two lines, misaligning where each column's card list started — `.column-header` now has a
+  `min-height` sized for two lines, with both header text and empty space vertically centered.
+  `activity/client/index.html`, `activity/client/src/clanConfigTable.ts`.
+
 2026-08-14 (14)
 - Fixed (`log_time_gaps.py`): crashed with `UnicodeEncodeError` on Windows consoles whenever a
   log line contained a character outside the console's codepage (emoji, non-ASCII names) — now
