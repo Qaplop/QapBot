@@ -3,7 +3,7 @@ Project Backlog, Improvement Ideas and General Remarks
 Immediate next steps:
 - Handling of DMs that can't be sent: e.g. notify the admin
 - Block players from CWL participation (just show an icon not a real technical blocking!) e.g. when players miss attack and are punished for that
-
+- After testing on PROD for the new CWL managaemnet features is complete we need to remove the feature toggle for the DM send guard on PROD. The DM send guard should only be effective on DEV after testing on PROD is finished.
 - Known lower-priority follow-up (not fixed,
   admin-only/rarely invoked, no crash risk): the `/admin` CWL-group-backfill
   handler in qapbot/QBdiscocmdshelper_admin_command.py
