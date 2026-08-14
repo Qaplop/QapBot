@@ -1,6 +1,18 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-14 (10)
+- Fixed (`repair_history_schema_drift.py`, caught immediately from live user feedback): the
+  default ("dry run") mode built the full `<table>_repaired` copy for real — writing real data
+  and growing `history.db` by multiple GB — even without `--apply`. "Dry run" must mean
+  literally zero bytes written, not "doesn't rename the originals". Redesigned into three
+  explicit stages: (no flags, default) **preview** — 100% read-only, samples what the repair
+  would produce via a live `SELECT`-only column remap against the original table, creates or
+  writes nothing at all; **`--build`** — actually builds `<table>_repaired` for real (the only
+  stage that writes substantial data) and verifies it, still never touching the original table's
+  name; **`--apply`** — builds if needed, verifies, and swaps. New test proves preview mode
+  leaves the history DB file's size completely unchanged. 1 new test; 1795 total tests pass.
+
 2026-08-14 (9)
 - Fixed (`repair_history_schema_drift.py`, caught on the first real run): building
   `<table>_repaired` was one giant unbatched transaction — against real `history.war_attacks`

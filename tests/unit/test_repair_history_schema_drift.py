@@ -78,22 +78,65 @@ async def _seed_corrupted_row(
 
 @pytest.mark.asyncio
 class TestRepairHistorySchemaDrift:
-    async def test_dry_run_builds_repaired_copy_but_never_touches_original(self, tmp_path):
-        """2026-08-14: dry run used to wrap everything in one big rolled-back transaction, but
-        that's incompatible with batched/checkpointed building (needed after a real run against
-        tens of millions of rows grew the WAL to 6.5GB+ in under 2 minutes). Dry run now builds
-        <table>_repaired for real (committed) but must still leave the ORIGINAL table's name and
-        values completely untouched — only --apply ever renames anything."""
+    async def test_preview_writes_absolutely_nothing(self, tmp_path):
+        """2026-08-14: the default mode used to build *_repaired for real even without --apply,
+        which surprised an operator watching history.db grow in size with no --apply given —
+        "the default" must mean writing no real data, not "doesn't rename the originals".
+
+        Checks the history DB file's SIZE, not a byte-exact hash: WarHistoryDB.initialize()'s
+        own schema-verification pass commits its own (logically no-op, CREATE-TABLE-IF-NOT-
+        EXISTS-shaped) transaction on every open, which bumps SQLite's internal per-transaction
+        change counter in the file header — genuinely harmless housekeeping unrelated to this
+        script, but it does mean two "nothing happened" runs are never byte-identical. File SIZE
+        is the meaningful signal here: real data (a *_repaired table's rows) makes the file
+        measurably bigger; a header counter bump does not change its size at all — and size
+        growth is exactly the symptom that gave the original bug away."""
         db = WarHistoryDB()
-        db_path = str(tmp_path / "dry.db")
-        history_db_path = str(tmp_path / "dry_history.db")
+        db_path = str(tmp_path / "preview.db")
+        history_db_path = str(tmp_path / "preview_history.db")
         await db.initialize(db_path, history_db_path)
         try:
             await _rebuild_history_war_summary_with_swapped_columns(db)
             await _seed_corrupted_row(db, "war_1", real_war_tag="#REALTAG1", real_end_time="2020-01-01T20:00")
             await db.close()
 
-            ok = await repair_module._run(db_path, history_db_path, apply=False, sample_size=5, force=False)
+            size_before = os.path.getsize(history_db_path)
+            ok = await repair_module._run(db_path, history_db_path, mode="preview", sample_size=5, force=False)
+            assert ok is True
+            size_after = os.path.getsize(history_db_path)
+
+            assert size_before == size_after, (
+                f"preview mode must not write real data to the history DB file "
+                f"(size {size_before} -> {size_after})"
+            )
+
+            db2 = WarHistoryDB()
+            await db2.initialize(db_path, history_db_path)
+            try:
+                cur = await db2._conn.execute(
+                    "SELECT name FROM history.sqlite_master WHERE type='table' AND name LIKE 'war_summary%'"
+                )
+                names = {r["name"] for r in await cur.fetchall()}
+                assert names == {"war_summary"}, f"preview created tables it shouldn't have: {names}"
+            finally:
+                await db2.close()
+        finally:
+            if db.conn:
+                await db.conn.close()
+
+    async def test_build_creates_repaired_copy_but_never_touches_original(self, tmp_path):
+        """--build writes the repaired copy for real but must still leave the ORIGINAL table's
+        name and values completely untouched — only --apply ever renames anything."""
+        db = WarHistoryDB()
+        db_path = str(tmp_path / "build.db")
+        history_db_path = str(tmp_path / "build_history.db")
+        await db.initialize(db_path, history_db_path)
+        try:
+            await _rebuild_history_war_summary_with_swapped_columns(db)
+            await _seed_corrupted_row(db, "war_1", real_war_tag="#REALTAG1", real_end_time="2020-01-01T20:00")
+            await db.close()
+
+            ok = await repair_module._run(db_path, history_db_path, mode="build", sample_size=5, force=False)
             assert ok is True
 
             db2 = WarHistoryDB()
@@ -103,7 +146,7 @@ class TestRepairHistorySchemaDrift:
                     "SELECT name FROM history.sqlite_master WHERE type='table' AND name LIKE 'war_summary%'"
                 )
                 names = {r["name"] for r in await cur.fetchall()}
-                # war_summary_repaired IS expected now (dry run builds it for real); no swap
+                # war_summary_repaired IS expected now (--build creates it for real); no swap
                 # happened, so no _corrupted_backup and the plain "war_summary" name still
                 # refers to the ORIGINAL (still-corrupted) table.
                 assert names == {"war_summary", "war_summary_repaired"}, f"unexpected tables: {names}"
@@ -138,7 +181,7 @@ class TestRepairHistorySchemaDrift:
             await _seed_corrupted_row(db, "war_2", real_war_tag="#REALTAG2", real_end_time="2020-02-01T20:00")
             await db.close()
 
-            ok = await repair_module._run(db_path, history_db_path, apply=True, sample_size=5, force=False)
+            ok = await repair_module._run(db_path, history_db_path, mode="apply", sample_size=5, force=False)
             assert ok is True
 
             db2 = WarHistoryDB()
@@ -193,11 +236,11 @@ class TestRepairHistorySchemaDrift:
             await _seed_corrupted_row(db, "war_1", real_war_tag="#REALTAG1", real_end_time="2020-01-01T20:00")
             await db.close()
 
-            ok = await repair_module._run(db_path, history_db_path, apply=True, sample_size=5, force=False)
+            ok = await repair_module._run(db_path, history_db_path, mode="apply", sample_size=5, force=False)
             assert ok is True
 
             with pytest.raises(RuntimeError, match="already exists"):
-                await repair_module._run(db_path, history_db_path, apply=True, sample_size=5, force=False)
+                await repair_module._run(db_path, history_db_path, mode="apply", sample_size=5, force=False)
         finally:
             if db.conn:
                 await db.conn.close()
@@ -273,7 +316,7 @@ class TestRepairHistorySchemaDrift:
             await db._conn.commit()
             await db.close()
 
-            ok = await repair_module._run(db_path, history_db_path, apply=True, sample_size=5, force=False)
+            ok = await repair_module._run(db_path, history_db_path, mode="apply", sample_size=5, force=False)
             assert ok is True
 
             db2 = WarHistoryDB()
@@ -344,7 +387,7 @@ class TestRepairHistorySchemaDrift:
         try:
             await db.close()
 
-            ok = await repair_module._run(db_path, history_db_path, apply=True, sample_size=5, force=False)
+            ok = await repair_module._run(db_path, history_db_path, mode="apply", sample_size=5, force=False)
             assert ok is True
 
             db2 = WarHistoryDB()

@@ -173,21 +173,43 @@ sides of the `INSERT ... SELECT`, instead of `SELECT *`. This stops any *new* ro
 corrupted on its next migration, and turns a future genuine schema divergence into a loud SQL
 error (`no such column`) instead of silent misalignment.
 
-**Repair tool: `qapbot/scripts/repair_history_schema_drift.py`** (added 2026-08-14). Detects drift
-per table by comparing `main`'s and `history`'s actual on-disk column order, and — only for a
-table where they actually differ — builds a correctly-labeled `<table>_repaired` copy (reading
-every row positionally and re-inserting it under the right names), verifies it (row counts, a
-random sample checked for plausible values), then swaps it in and preserves the original as
-`<table>_corrupted_backup` (never dropped). Defaults to a dry run that always rolls back (the file
-is untouched) — pass `--apply` to actually commit, only if verification passed. `--db`/
-`--history-db` default to `CONFIG.db_path`/`CONFIG.history_db_path`, the same DEV/PROD
-auto-resolution `run_history_migration_now.py`/`run_db_maintenance_now.py` already use. 5 tests in
-`tests/unit/test_repair_history_schema_drift.py`, including one using the exact real-world 11-column
-`war_summary` drift shape (not just a simplified case) end to end.
+**Repair tool: `qapbot/scripts/repair_history_schema_drift.py`** (added 2026-08-14, redesigned
+same day after the first two real runs). Detects drift per table by comparing `main`'s and
+`history`'s actual on-disk column order, and — only for a table where they actually differ —
+builds a correctly-labeled `<table>_repaired` copy (reading every row positionally and
+re-inserting it under the right names), verifies it (row counts, a random sample checked for
+plausible values), then swaps it in and preserves the original as `<table>_corrupted_backup`
+(never dropped). Three explicit stages, each a strictly bigger commitment than the last:
+- **(no flags, default) preview** — 100% read-only: schema comparison plus a `SELECT`-only sample
+  of what the repair would produce, applied live against the original table via column-alias,
+  never creating or writing anything. Verified by a test that checks the history DB file's size
+  is byte-for-byte unchanged (not a content hash — `WarHistoryDB.initialize()`'s own
+  schema-verification pass legitimately bumps SQLite's internal change counter on every open,
+  which is harmless housekeeping unrelated to this script but does mean two genuinely-idle runs
+  are never hash-identical; file *size* is the meaningful, bug-catching signal).
+- **`--build`** — actually builds `<table>_repaired` for real (the only stage that writes
+  substantial data), still never touching the original table's name, then verifies it. Batched
+  (`--batch-size`, default 20,000 rows/commit) with a periodic `PRAGMA wal_checkpoint(PASSIVE)`
+  (`--checkpoint-every-batches`, default 20) — the same pattern `_migrate_table_batch_by_date`
+  already uses, and for the same reason: the first real run against `history.war_attacks` (78.6M
+  rows) as one giant unbatched transaction grew the WAL to 6.5GB+ in under 2 minutes with zero
+  progress output and had to be killed. Resumable from `MAX(id)` already in `_repaired` if
+  interrupted.
+- **`--apply`** — builds if not already fully built (instant if it is), verifies, and only if
+  verification passes, swaps the repaired tables in (fast, atomic, one transaction) and recreates
+  the original named indexes.
 
-**Status as of 2026-08-14**: fix shipped and tested; the repair script is written and tested
-against synthetic drift but has **not yet been run against any real `history.db`** (DEV or PROD) —
-that's a deliberate, separate, explicitly-authorized step. Until then, don't trust any
+`--db`/`--history-db` default to `CONFIG.db_path`/`CONFIG.history_db_path`, the same DEV/PROD
+auto-resolution `run_history_migration_now.py`/`run_db_maintenance_now.py` already use. 7 tests in
+`tests/unit/test_repair_history_schema_drift.py`, including one using the exact real-world 11-column
+`war_summary` drift shape (not just a simplified case) end to end, and one proving resumability
+after a simulated interruption.
+
+**Status as of 2026-08-14**: fix shipped and tested; a real `--build` run against DEV's
+`history.db` (`war_attacks`: 78.6M rows, `war_summary`: 4.0M rows) was in progress as of this
+writing. `--apply` (the actual swap) has **not yet been run against any real `history.db`** (DEV
+or PROD) — that's a deliberate, separate, explicitly-authorized step once the build+verification
+output has been reviewed. Until then, don't trust any
 `history.war_attacks`/`war_summary` column beyond `id`, `war_id`, `clan_tag`, `date` (war_attacks
 only — `war_summary.date` IS affected), `player_name`, `player_tag`, `th_level`.
 
