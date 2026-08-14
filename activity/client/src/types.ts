@@ -35,6 +35,7 @@ export type EnrollmentClan = {
   clan_tag: string
   name: string | null
   tier: string | null
+  roster_size: number
 }
 
 /** `signup_status` is null when the player is a current clan member who hasn't signed up (or
@@ -56,6 +57,20 @@ export type EnrollmentPlayer = {
   // League-adjusted average stars/attack over the player's last 10 CWL attacks. Null until the
   // backend computes it (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment" — player-skill sort).
   skill_score: number | null
+  // Plain, unweighted average stars/attack over the same last <=10 CWL attacks skill_score uses
+  // — the board's other number-display option (2026-08-14), null under the same "no CWL attack
+  // history" condition as skill_score.
+  avg_stars: number | null
+  // user_players.cwl_permanent_optout — used to sort permanently-opted-out players to the
+  // bottom of the Unassigned column (2026-08-14). Distinct from signup_status === 'declined'
+  // (a one-season decline); both push a player to the bottom, see enrollmentBoard.ts's
+  // isOptedOut().
+  cwl_permanent_optout: boolean
+  // user_players.current_clan_tag — null if unknown (e.g. a signed-up player who's since left
+  // every guild clan). Compared against assigned_clan_tag to color a card green ("already in
+  // their assigned clan") or amber ("assigned elsewhere, hasn't moved yet") — see
+  // enrollmentBoard.ts's clanMatchClass().
+  current_clan_tag: string | null
 }
 
 export type EnrollmentPayload = {

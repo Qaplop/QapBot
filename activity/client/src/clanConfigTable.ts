@@ -83,29 +83,53 @@ export function renderClanConfigTable(
 
   container.innerHTML = ''
 
+  // Sticky top block (mirrors enrollmentBoard.ts's board-topbar) so the season/status title and
+  // timezone note stay in view while the clan table scrolls underneath — otherwise a long clan
+  // list scrolls both the title and the Save/Cancel footer out of view with no way back short of
+  // scrolling all the way up/down again.
+  const topBar = document.createElement('div')
+  topBar.className = 'board-topbar'
+  container.appendChild(topBar)
+
   const header = document.createElement('div')
   header.className = 'header'
   header.textContent = `Season ${payload.season} — ${payload.event_status ?? 'draft'}`
-  container.appendChild(header)
+  topBar.appendChild(header)
 
   const tzNote = document.createElement('div')
   tzNote.className = 'tz-note'
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone
   tzNote.textContent = `Times shown in your local timezone (${timeZone}) — saved as UTC automatically.`
-  container.appendChild(tzNote)
+  topBar.appendChild(tzNote)
 
   const table = document.createElement('table')
   const thead = document.createElement('thead')
-  thead.innerHTML = `
-    <tr>
-      <th></th>
-      <th>Clan</th>
-      <th>Tier</th>
-      <th>Roster Size</th>
-      <th>Start Time (local)</th>
-    </tr>
-  `
+  const theadRow = document.createElement('tr')
+
+  const selectAllCheckbox = document.createElement('input')
+  selectAllCheckbox.type = 'checkbox'
+  selectAllCheckbox.title = 'Select/deselect all clans'
+  selectAllCheckbox.setAttribute('aria-label', 'Select all clans')
+  const selectAllTh = document.createElement('th')
+  selectAllTh.appendChild(selectAllCheckbox)
+  theadRow.appendChild(selectAllTh)
+
+  for (const label of ['Clan', 'Tier', 'Roster Size', 'Start Time (local)']) {
+    const th = document.createElement('th')
+    th.textContent = label
+    theadRow.appendChild(th)
+  }
+  thead.appendChild(theadRow)
   table.appendChild(thead)
+
+  // Stick the column-header row directly beneath the topbar (not at the very top — that would
+  // overlap/hide under it) so it stays visible too, not just the title. `topBar` is already in
+  // the DOM at this point, so its rendered height is real, not a guessed/hardcoded pixel value
+  // that would silently drift if the title text or font ever changes.
+  const topBarHeight = topBar.getBoundingClientRect().height
+  thead.querySelectorAll('th').forEach((th) => {
+    ;(th as HTMLElement).style.top = `${topBarHeight}px`
+  })
 
   // CWL itself never starts before the 1st of the season's month at 08:00 UTC (the game's
   // static schedule) — clamp every row's picker to that floor so an admin can't accidentally
@@ -121,6 +145,39 @@ export function renderClanConfigTable(
   }
   table.appendChild(tbody)
   container.appendChild(table)
+
+  // Select-all header checkbox: reflects the row checkboxes' combined state (fully checked /
+  // fully unchecked / native `.indeterminate` for a mixed selection — the standard convention
+  // for this control) and, when clicked itself, drives every row checkbox to match by
+  // dispatching a real 'change' event on each — reuses buildRow()'s own listener (updates
+  // clan.participating + the row's disabled/inactive styling) rather than duplicating it here.
+  const rowCheckboxes = () => tbody.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')
+
+  function updateSelectAllState(): void {
+    const total = working.length
+    const checkedCount = working.filter((c) => c.participating).length
+    selectAllCheckbox.checked = total > 0 && checkedCount === total
+    selectAllCheckbox.indeterminate = checkedCount > 0 && checkedCount < total
+  }
+
+  selectAllCheckbox.addEventListener('change', () => {
+    // Capture the target state ONCE — updateSelectAllState() (called via each row's own
+    // 'change' listener as this loop dispatches events) mutates selectAllCheckbox.checked as a
+    // side effect after every single row, so re-reading it live inside the loop turned this
+    // into a feedback loop: after row 1 flipped to checked, the mid-loop recompute immediately
+    // set selectAllCheckbox.checked back to false (not everything matched yet), so row 2 read
+    // that stale false and got unchecked again — net effect, only the first row ever "stuck".
+    const shouldCheck = selectAllCheckbox.checked
+    rowCheckboxes().forEach((cb) => {
+      if (cb.checked !== shouldCheck) {
+        cb.checked = shouldCheck
+        cb.dispatchEvent(new Event('change'))
+      }
+    })
+    updateSelectAllState()
+  })
+  rowCheckboxes().forEach((cb) => cb.addEventListener('change', updateSelectAllState))
+  updateSelectAllState()
 
   const status = document.createElement('span')
   status.className = 'save-status'
@@ -154,7 +211,7 @@ export function renderClanConfigTable(
   })
 
   const footer = document.createElement('div')
-  footer.className = 'footer'
+  footer.className = 'footer sticky-footer'
   footer.appendChild(saveButton)
   footer.appendChild(cancelButton)
   footer.appendChild(status)

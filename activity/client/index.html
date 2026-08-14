@@ -15,13 +15,19 @@
       #app { padding: 16px; }
 
       .header { font-size: 1.1rem; font-weight: 600; margin-bottom: 4px; }
-      .tz-note { margin-bottom: 12px; font-size: 0.8rem; color: #949ba4; }
+      .tz-note { margin-bottom: 12px; font-size: 0.8rem; color: #f2f3f5; }
 
       table { border-collapse: collapse; width: 100%; }
       th, td { padding: 4px 12px; text-align: left; border-bottom: 1px solid #3f4147; }
-      th { color: #949ba4; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.02em; padding-top: 6px; padding-bottom: 6px; }
+      th { color: #f2f3f5; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.02em; padding-top: 6px; padding-bottom: 6px; }
+      thead th {
+        position: sticky;
+        /* top offset set inline per-render (clanConfigTable.ts) to the topbar's real height */
+        background: #313338;
+        z-index: 4;
+      }
       tr.inactive td:not(:first-child) { opacity: 0.5; }
-      .tier-cell { color: #949ba4; }
+      .tier-cell { color: #f2f3f5; }
 
       input[type="checkbox"] { width: 16px; height: 16px; accent-color: #5865f2; }
       select, input[type="date"] {
@@ -37,6 +43,35 @@
       .start-time-cell input[type="date"] { flex: 1; min-width: 0; }
 
       .footer { margin-top: 16px; display: flex; align-items: center; gap: 12px; }
+      .sticky-footer {
+        position: sticky;
+        bottom: 0;
+        background: #313338;
+        padding-top: 8px;
+        padding-bottom: 8px;
+        z-index: 5;
+      }
+      /* Genuinely fixed band, not sticky — position: sticky only pins an element once the
+         document's own scroll would otherwise carry it out of view, which requires the page's
+         content to actually be at least as tall as the viewport. The enrollment board's content
+         is capped short (.column's fixed max-height) and the surrounding Discord Activity
+         panel's height still varies with the user's own window — so on any window taller than
+         the (short, fixed) content, this footer just sat wherever plain document flow put it,
+         with no defined relationship to the viewport bottom at all. `position: fixed` sidesteps
+         document flow and content height entirely — this is always exactly a fixed-height band
+         glued to the true bottom of the viewport, independent of both. */
+      .footer-fixed {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        margin-top: 0;
+        background: #313338;
+        padding: 8px 16px;
+        box-sizing: border-box;
+        border-top: 1px solid #3f4147;
+        z-index: 5;
+      }
       .save-button {
         background: #5865f2;
         color: white;
@@ -59,9 +94,10 @@
         cursor: pointer;
       }
       .cancel-button:disabled { opacity: 0.6; cursor: default; }
-      .save-status { font-size: 0.85rem; color: #949ba4; }
+      .save-status { font-size: 0.85rem; color: #f2f3f5; }
       .save-status.success { color: #23a55a; }
       .save-status.error { color: #f23f42; }
+      .skill-explainer { font-size: 0.75rem; color: #f2f3f5; margin-left: auto; }
 
       .board-topbar {
         position: sticky;
@@ -73,13 +109,18 @@
       }
       .title-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 6px; }
       .legend { display: flex; align-items: center; gap: 12px; }
-      .legend-item { display: flex; align-items: center; gap: 4px; font-size: 0.75rem; color: #949ba4; }
+      .legend-item { display: flex; align-items: center; gap: 4px; font-size: 0.75rem; color: #f2f3f5; }
       .legend-icon { width: 16px; height: 16px; }
-      .sort-selector { display: flex; align-items: center; gap: 14px; font-size: 0.8rem; color: #949ba4; }
-      .sort-label { color: #949ba4; }
+      .sort-selector { display: flex; align-items: center; gap: 14px; font-size: 0.8rem; color: #f2f3f5; }
+      .sort-label { color: #f2f3f5; }
       .sort-option { display: flex; align-items: center; gap: 4px; cursor: pointer; }
       .sort-option input { accent-color: #5865f2; cursor: pointer; }
 
+      /* height is set inline by enrollmentBoard.ts's resizeBoard() — measured from the actual
+         rendered topbar/footer heights and window.innerHeight, so the board fills exactly
+         whatever room is really available (and stays correct across a window resize) instead
+         of a guessed constant. That already accounts for .footer-fixed's height, so no separate
+         margin-bottom reservation is needed here. */
       .board { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px; }
       .column {
         flex: 0 0 220px;
@@ -88,22 +129,63 @@
         border-radius: 6px;
         display: flex;
         flex-direction: column;
-        max-height: 70vh;
+        /* No max-height of its own — .board's explicit (JS-computed) height above, combined
+           with flexbox's default align-items: stretch, makes every column (short or tall) span
+           the full available height; each column's own .card-list overflow-y: auto (below)
+           handles internal scrolling for whichever ones have more players than fit. */
       }
       .column.column-unassigned { border-color: #4a4d54; }
       .column.drop-target { border-color: #5865f2; background: #32354b; }
       .column.dragging { opacity: 0.4; }
       .column-header {
         padding: 8px 10px;
-        font-size: 0.8rem;
-        font-weight: 600;
-        color: #949ba4;
-        text-transform: uppercase;
-        letter-spacing: 0.02em;
+        min-height: 50px;
+        box-sizing: border-box;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 2px;
+        color: #f2f3f5;
         border-bottom: 1px solid #3f4147;
         cursor: grab;
       }
+      /* No text-transform: uppercase here — clan names shown exactly as entered, tier shown
+         Title Case as the backend already has it ("Master I", not "MASTER I"). */
+      .column-header-name {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 6px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        line-height: 1.3;
+      }
+      /* Truncates a long clan name with an ellipsis instead of pushing the count (pinned to the
+         right edge via the flex row above) out past the column's fixed width. */
+      .column-header-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+      .column-header-tier { font-size: 0.72rem; font-weight: 400; line-height: 1.2; }
+      .column-count { font-weight: 700; flex-shrink: 0; }
       .card-list { padding: 8px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
+      /* Starting-roster band (positions 1..roster_size) — a light-gray background wash filling
+         the full width of the card list for that many slots; backup/reserve cards past it sit
+         on the column's normal (current) shade. Open slots (fewer real starters than
+         roster_size) are padded out with .placeholder-card tiles so the band always shows all
+         roster_size slots. The negative margin + matching extra width cancels out .card-list's
+         own 8px padding on three sides, so this reads as one seamless region flush with the
+         column's edges rather than a separate inset box (live-testing feedback, 2026-08-14 —
+         earlier versions used a modest gray with its own padding/border-radius, which read as a
+         small floating box, and then plain white, which read as visually harsh). See
+         enrollmentBoard.ts's buildColumn(). */
+      .roster-band {
+        background: #34363d;
+        margin: -8px -8px 0 -8px;
+        width: calc(100% + 16px);
+        padding: 8px;
+        box-sizing: border-box;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
       .player-card {
         background: #1e1f22;
         border: 1px solid #3f4147;
@@ -111,11 +193,30 @@
         padding: 6px 4px 6px 8px;
         cursor: grab;
       }
+      /* Assigned player's real current clan vs their assignment (2026-08-14) — green already
+         moved, amber still needs to transfer. Unassigned cards / unknown current clan keep the
+         plain shade above (see enrollmentBoard.ts's clanMatchClass()). */
+      .player-card.same-clan { background: #1f3d2a; border-color: #2d6a45; }
+      .player-card.different-clan { background: #4a3a1a; border-color: #8a6a2a; }
       .player-card.dragging { opacity: 0.4; }
+      /* Open roster slot — no player assigned yet. Not draggable (see buildPlaceholderCard()),
+         just a quiet placeholder so the roster band always shows all roster_size slots. No
+         height of its own — the invisible .status-icon spacer inside its real .player-row
+         (buildPlaceholderCard()) makes it size identically to an actual player card. */
+      .placeholder-card {
+        background: rgba(0, 0, 0, 0.12);
+        border: 1px dashed rgba(255, 255, 255, 0.35);
+        cursor: default;
+      }
       .player-row {
         display: flex;
         align-items: center;
         gap: 6px;
+        /* Explicit, not content-derived — every row now has the same DOM shape (see
+           buildCard()'s always-reserved th-badge/status-icon slots), but pinning the height too
+           removes any remaining dependency on sub-pixel text line-height rounding, so every
+           card (real, green, amber, or placeholder) is byte-for-byte the same height. */
+        height: 20px;
       }
       .th-badge {
         display: flex;
@@ -123,7 +224,7 @@
         gap: 2px;
         flex-shrink: 0;
         font-size: 0.75rem;
-        color: #949ba4;
+        color: #f2f3f5;
       }
       .th-icon { width: 16px; height: 16px; }
       .player-name {
@@ -134,7 +235,7 @@
         overflow: hidden;
         text-overflow: ellipsis;
       }
-      .skill-score { flex-shrink: 0; font-size: 0.75rem; color: #949ba4; }
+      .skill-score { flex-shrink: 0; font-size: 0.75rem; color: #f2f3f5; }
       .status-icon { width: 16px; height: 16px; flex-shrink: 0; display: block; }
     </style>
   </head>

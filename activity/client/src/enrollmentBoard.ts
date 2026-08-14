@@ -6,6 +6,20 @@ import type { EnrollmentPayload, EnrollmentPlayer } from './types'
 
 type SortOrder = 'th' | 'skill' | 'alpha'
 
+// Which number shows next to each player's name — plain average stars/attack (default) or the
+// league-adjusted skill score (2026-08-14, project owner's spec: a second, independent radio
+// group from the Sort-by one above). Sorting by "Player Skill" always uses the actual
+// league-adjusted score regardless of this choice — this only controls what's *displayed*.
+type DisplayMetric = 'avg_stars' | 'skill'
+
+function metricValue(player: EnrollmentPlayer, metric: DisplayMetric): number | null {
+  return metric === 'avg_stars' ? player.avg_stars : player.skill_score
+}
+
+function metricLabel(metric: DisplayMetric): string {
+  return metric === 'avg_stars' ? 'Average stars/attack (last ≤10 CWL attacks)' : 'League-adjusted skill score'
+}
+
 type VisibleStatus = 'pending' | 'confirmed' | 'declined'
 
 // Only the three statuses a member's own DM response can actually produce are ever shown — the
@@ -43,6 +57,22 @@ function isVisibleStatus(status: EnrollmentPlayer['signup_status']): status is V
 
 function displayName(player: EnrollmentPlayer): string {
   return player.player_name || player.player_tag
+}
+
+// Permanent opt-out (user_players.cwl_permanent_optout) or a this-season decline both mean "not
+// playing" — either way they always sort to the bottom of the Unassigned pool (2026-08-14,
+// project owner's spec), regardless of the chosen TH/skill/alpha sort order.
+function isOptedOut(player: EnrollmentPlayer): boolean {
+  return player.cwl_permanent_optout || player.signup_status === 'declined'
+}
+
+// Green when an assigned player's real current clan already matches their assignment, amber
+// when it doesn't (assigned but hasn't transferred yet) — null (no extra class, default card
+// shade) for an Unassigned player or one whose current clan isn't on record at all, since
+// neither case is a meaningful match/mismatch to flag.
+function clanMatchClass(player: EnrollmentPlayer): 'same-clan' | 'different-clan' | null {
+  if (player.assigned_clan_tag === null || player.current_clan_tag === null) return null
+  return player.assigned_clan_tag === player.current_clan_tag ? 'same-clan' : 'different-clan'
 }
 
 function sortPlayers(players: EnrollmentPlayer[], order: SortOrder): EnrollmentPlayer[] {
@@ -86,6 +116,7 @@ export function renderEnrollmentBoard(
   const working: EnrollmentPlayer[] = payload.players.map((p) => ({ ...p }))
   const byTag = new Map(working.map((p) => [p.player_tag, p]))
   let sortOrder: SortOrder = 'th'
+  let displayMetric: DisplayMetric = 'avg_stars'
   // Column order: participating clans (already tier-sorted by the bridge, highest league
   // first — see _build_enrollment_payload), Unassigned pool last. Mutable so column headers can
   // be dragged to reorder — a purely client-side arrangement, not persisted.
@@ -124,6 +155,15 @@ export function renderEnrollmentBoard(
       renderBoard()
     }),
   )
+  // Independent of the Sort-by group above — this only changes which number is *displayed* on
+  // each card, not the sort order itself (2026-08-14, project owner's spec).
+  sortRow.appendChild(
+    buildMetricSelector(displayMetric, (next) => {
+      displayMetric = next
+      updateSkillExplainer()
+      renderBoard()
+    }),
+  )
   topBar.appendChild(sortRow)
 
   const board = document.createElement('div')
@@ -138,24 +178,64 @@ export function renderEnrollmentBoard(
   closeButton.className = 'cancel-button'
   closeButton.addEventListener('click', () => onClose('Closed'))
 
+  const skillExplainer = document.createElement('span')
+  skillExplainer.className = 'skill-explainer'
+  // Kept in sync with displayMetric (updateSkillExplainer(), called on init and whenever the
+  // "Show:" selector changes) so it always describes whichever number the cards are currently
+  // showing, not just the skill score.
+  function updateSkillExplainer(): void {
+    skillExplainer.textContent = displayMetric === 'avg_stars'
+      ? 'Avg Stars/Attack = plain average stars per attack over each player’s last ≤10 CWL attacks.'
+      : 'Skill Score = league-weighted average stars/attack over each player’s last ≤10 CWL attacks.'
+  }
+  updateSkillExplainer()
+
+  // .footer-fixed (position: fixed, not sticky — see its CSS comment in index.html): plain
+  // flow and sticky positioning both turned out to depend on the page's total content height
+  // actually reaching the viewport height, which isn't reliably true here — position: fixed
+  // sidesteps that entirely, always pinning this exactly to the viewport's bottom edge
+  // regardless of content/window height.
+  // Close stays first/left (unchanged position); skillExplainer moves last with margin-left:
+  // auto so it's pushed to the right edge instead of sitting immediately after Close.
   const footer = document.createElement('div')
-  footer.className = 'footer'
-  footer.append(closeButton, status)
+  footer.className = 'footer footer-fixed'
+  footer.append(closeButton, status, skillExplainer)
   container.appendChild(footer)
 
-  function columnTitle(clanTag: string | null): string {
-    if (clanTag === null) return 'Unassigned'
-    const clan = payload.clans.find((c) => c.clan_tag === clanTag)
-    if (!clan) return clanTag
-    const tierSuffix = clan.tier ? ` · ${clan.tier}` : ''
-    return `${clan.name ?? clan.clan_tag} (${clan.clan_tag})${tierSuffix}`
+  // Now that the footer is pinned independently of content height (position: fixed above), the
+  // board itself is free to actually fill whatever room is really available instead of guessing
+  // a constant — a fixed pixel cap wasted most of the window on anything taller than that guess
+  // (live-testing feedback, 2026-08-14). Measures the two things that box in the available
+  // height (the sticky topbar's real rendered height, the fixed footer's real rendered height)
+  // and sets .board's own height to fill the rest — .column's default flex stretch then makes
+  // every column, short or tall, span that full height, with each column's own internal
+  // .card-list scroll (unchanged) handling whichever ones have more players than fit. Re-run on
+  // resize so the board keeps matching the actual window, not just its size at first render.
+  function resizeBoard(): void {
+    const available = window.innerHeight
+      - topBar.getBoundingClientRect().height
+      - footer.getBoundingClientRect().height
+      - 32 // breathing room: #app's own top+bottom padding
+    board.style.height = `${Math.max(200, available)}px`
+  }
+  resizeBoard()
+  window.addEventListener('resize', resizeBoard)
+
+  // Backend tier strings are e.g. "Master League I" / "Champion League II" — drop the word
+  // "League" so the header just reads "Master I" / "Champion II".
+  function formatTier(tier: string | null): string | null {
+    return tier ? tier.replace(' League', '') : null
   }
 
   function playersFor(clanTag: string | null): EnrollmentPlayer[] {
-    return sortPlayers(
+    const sorted = sortPlayers(
       working.filter((p) => p.assigned_clan_tag === clanTag),
       sortOrder,
     )
+    if (clanTag !== null) return sorted
+    // Unassigned only — opted-out players always sort last (Array.sort is stable, so each
+    // partition keeps the order sortPlayers() already gave it).
+    return [...sorted.filter((p) => !isOptedOut(p)), ...sorted.filter(isOptedOut)]
   }
 
   function handleDrop(player: EnrollmentPlayer, targetClanTag: string | null): void {
@@ -184,6 +264,8 @@ export function renderEnrollmentBoard(
   function buildCard(player: EnrollmentPlayer): HTMLElement {
     const card = document.createElement('div')
     card.className = 'player-card'
+    const matchClass = clanMatchClass(player)
+    if (matchClass) card.classList.add(matchClass)
     card.draggable = true
     card.addEventListener('dragstart', (e) => {
       e.dataTransfer?.setData('text/plain', player.player_tag)
@@ -195,9 +277,17 @@ export function renderEnrollmentBoard(
     const row = document.createElement('div')
     row.className = 'player-row'
 
+    // TH-badge and status-icon slots are ALWAYS added, even when this particular player has
+    // nothing to show there (invisible spacer instead) — they used to be omitted entirely,
+    // which meant a player missing th_level, or a linked player with no visible signup status
+    // (null/'withdrawn'), rendered a shorter row than everyone else. That's what actually broke
+    // row-height/alignment across columns (live-testing feedback, 2026-08-14) — not the
+    // green/amber/placeholder coloring itself, which was already identical. Reserving both
+    // slots unconditionally means every card, real or placeholder, has the exact same DOM shape
+    // and therefore the exact same height, full stop.
+    const th = document.createElement('span')
+    th.className = 'th-badge'
     if (player.th_level != null) {
-      const th = document.createElement('span')
-      th.className = 'th-badge'
       if (player.th_icon_url) {
         const icon = document.createElement('img')
         icon.className = 'th-icon'
@@ -209,26 +299,47 @@ export function renderEnrollmentBoard(
         th.appendChild(icon)
       }
       th.append(String(player.th_level))
-      row.appendChild(th)
+    } else {
+      // No real TH data — reserve the exact same shape (icon-sized box + 2-digit text) an
+      // actual badge would take, just invisible, rather than an empty span with nothing to
+      // give it a size (an empty .th-badge has no forced width/height of its own).
+      const iconSpacer = document.createElement('span')
+      iconSpacer.className = 'th-icon'
+      th.appendChild(iconSpacer)
+      th.append('00')
+      th.style.visibility = 'hidden'
     }
+    row.appendChild(th)
 
     const name = document.createElement('span')
     name.className = 'player-name'
     name.textContent = displayName(player)
     row.appendChild(name)
 
-    if (player.skill_score != null) {
-      const skill = document.createElement('span')
-      skill.className = 'skill-score'
-      skill.textContent = player.skill_score.toFixed(1)
-      skill.title = 'Player skill score'
-      row.appendChild(skill)
+    // Always reserved, like th-badge/status-icon above (invisible placeholder text when this
+    // player has no CWL-attack data for either metric) — Unassigned's pool skews heavily toward
+    // players who've never played CWL at all, so leaving this slot out entirely for them was
+    // the last remaining reason its cards didn't line up with clan-column cards row for row
+    // (live-testing feedback, 2026-08-14).
+    const metricScore = metricValue(player, displayMetric)
+    const skill = document.createElement('span')
+    skill.className = 'skill-score'
+    if (metricScore != null) {
+      skill.textContent = metricScore.toFixed(1)
+      skill.title = metricLabel(displayMetric)
+    } else {
+      skill.textContent = '0.0'
+      skill.style.visibility = 'hidden'
     }
+    row.appendChild(skill)
 
     // Mutually exclusive: a player with no linked Discord account can never actually respond to
     // the template DM, so "Not Linked" replaces whatever signup-status icon would otherwise show
     // (almost always "Pending", since that's the only status such a player could ever be seeded
-    // with) rather than displaying alongside it.
+    // with) rather than displaying alongside it. A <span> (not an <img> with no src, which some
+    // browsers render as a visible broken-image glyph even under visibility: hidden) reserves
+    // the identical .status-icon-sized slot when there's nothing to actually show — same
+    // approach buildPlaceholderCard() already uses for its own spacer.
     if (player.discord_id == null) {
       const icon = document.createElement('img')
       icon.className = 'status-icon'
@@ -243,8 +354,32 @@ export function renderEnrollmentBoard(
       icon.alt = STATUS_LABEL[player.signup_status]
       icon.title = STATUS_LABEL[player.signup_status]
       row.appendChild(icon)
+    } else {
+      const spacer = document.createElement('span')
+      spacer.className = 'status-icon'
+      spacer.style.visibility = 'hidden'
+      row.appendChild(spacer)
     }
 
+    card.appendChild(row)
+    return card
+  }
+
+  // An empty starting-roster slot — not a real player, not draggable/droppable onto. Shown so
+  // the roster band always reads as "roster_size tiles" (some filled, some still open) rather
+  // than shrinking to however many starters happen to be assigned yet (2026-08-14, project
+  // owner's spec). Contains an invisible .status-icon-sized spacer inside a real .player-row,
+  // rather than a guessed min-height, so its height always matches an actual player card's
+  // exactly — same markup/CSS driving both, nothing to keep in sync by hand.
+  function buildPlaceholderCard(): HTMLElement {
+    const card = document.createElement('div')
+    card.className = 'player-card placeholder-card'
+    const row = document.createElement('div')
+    row.className = 'player-row'
+    const spacer = document.createElement('span')
+    spacer.className = 'status-icon'
+    spacer.style.visibility = 'hidden'
+    row.appendChild(spacer)
     card.appendChild(row)
     return card
   }
@@ -254,10 +389,40 @@ export function renderEnrollmentBoard(
     column.className = clanTag === null ? 'column column-unassigned' : 'column'
 
     const players = playersFor(clanTag)
+    const clan = clanTag === null ? null : payload.clans.find((c) => c.clan_tag === clanTag)
+    const rosterSize = clan?.roster_size ?? null
 
+    // Two lines: clan name (+ count) on top, league tier below — no clan tag, no "·" separator
+    // (live-testing feedback, 2026-08-14: the old single-line "Name (#TAG) · Tier (count)" text
+    // wrapped unpredictably depending on name/tag length, which is what made column-header
+    // heights mismatch between columns in the first place). Neither name nor tier is forced to
+    // uppercase (see the removed text-transform on .column-header in index.html) — shown exactly
+    // as the data has them, tier already arrives "Title Case" from the backend.
     const columnHeader = document.createElement('div')
     columnHeader.className = 'column-header'
-    columnHeader.textContent = `${columnTitle(clanTag)} (${players.length})`
+
+    // Name and count are separate flex children (space-between) so the count sits pinned to the
+    // header's right edge instead of immediately trailing the name (live-testing feedback).
+    const nameLine = document.createElement('div')
+    nameLine.className = 'column-header-name'
+    const nameSpan = document.createElement('span')
+    nameSpan.className = 'column-header-name-text'
+    nameSpan.textContent = clanTag === null ? 'Unassigned' : (clan?.name ?? clanTag)
+    nameLine.appendChild(nameSpan)
+    const countSpan = document.createElement('span')
+    countSpan.className = 'column-count'
+    countSpan.textContent = rosterSize !== null ? `(${players.length}/${rosterSize})` : `(${players.length})`
+    nameLine.appendChild(countSpan)
+    columnHeader.appendChild(nameLine)
+
+    const tierText = formatTier(clan?.tier ?? null)
+    if (tierText) {
+      const tierLine = document.createElement('div')
+      tierLine.className = 'column-header-tier'
+      tierLine.textContent = tierText
+      columnHeader.appendChild(tierLine)
+    }
+
     columnHeader.draggable = true
     columnHeader.addEventListener('dragstart', (e) => {
       e.dataTransfer?.setData(COLUMN_DRAG_TYPE, String(index))
@@ -269,8 +434,36 @@ export function renderEnrollmentBoard(
 
     const cardList = document.createElement('div')
     cardList.className = 'card-list'
-    for (const player of players) {
-      cardList.appendChild(buildCard(player))
+    if (rosterSize !== null) {
+      // Starting-roster slots (positions 1..rosterSize, in whatever order this column is
+      // currently sorted) get a visibly lighter background band; anything beyond that — backup/
+      // reserve players — sits on the column's normal (current) shade. One box per zone, not
+      // per-card, so it reads as a continuous band rather than individually-colored tiles.
+      // Slots the roster still has open (fewer assigned starters than rosterSize) are padded out
+      // with placeholder tiles, so the band always shows exactly rosterSize slots — some filled,
+      // some still open — rather than shrinking to however many are assigned so far (2026-08-14,
+      // project owner's spec).
+      const starters = players.slice(0, rosterSize)
+      const backups = players.slice(rosterSize)
+      const openSlots = rosterSize - starters.length
+      if (starters.length > 0 || openSlots > 0) {
+        const rosterBand = document.createElement('div')
+        rosterBand.className = 'roster-band'
+        for (const player of starters) {
+          rosterBand.appendChild(buildCard(player))
+        }
+        for (let i = 0; i < openSlots; i++) {
+          rosterBand.appendChild(buildPlaceholderCard())
+        }
+        cardList.appendChild(rosterBand)
+      }
+      for (const player of backups) {
+        cardList.appendChild(buildCard(player))
+      }
+    } else {
+      for (const player of players) {
+        cardList.appendChild(buildCard(player))
+      }
     }
     column.appendChild(cardList)
 
@@ -337,6 +530,36 @@ function buildSortSelector(initial: SortOrder, onChange: (order: SortOrder) => v
     const radio = document.createElement('input')
     radio.type = 'radio'
     radio.name = 'cwl-sort-order'
+    radio.value = option.value
+    radio.checked = option.value === initial
+    radio.addEventListener('change', () => {
+      if (radio.checked) onChange(option.value)
+    })
+    optionLabel.append(radio, option.label)
+    wrap.appendChild(optionLabel)
+  }
+  return wrap
+}
+
+function buildMetricSelector(initial: DisplayMetric, onChange: (metric: DisplayMetric) => void): HTMLElement {
+  const wrap = document.createElement('div')
+  wrap.className = 'sort-selector'
+
+  const label = document.createElement('span')
+  label.className = 'sort-label'
+  label.textContent = 'Show:'
+  wrap.appendChild(label)
+
+  const options: { value: DisplayMetric; label: string }[] = [
+    { value: 'avg_stars', label: 'Avg Stars/Attack' },
+    { value: 'skill', label: 'Skill Score' },
+  ]
+  for (const option of options) {
+    const optionLabel = document.createElement('label')
+    optionLabel.className = 'sort-option'
+    const radio = document.createElement('input')
+    radio.type = 'radio'
+    radio.name = 'cwl-display-metric'
     radio.value = option.value
     radio.checked = option.value === initial
     radio.addEventListener('change', () => {
