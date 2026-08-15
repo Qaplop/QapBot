@@ -1,6 +1,32 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-15 (28)
+- Fixed: PROD Activity "Setup failed: failed to resolve screen (404)" — the
+  `cwl-clan-config-server-prod` Cloudflare Worker (the OAuth/proxy layer in front of the bridge)
+  hadn't been code-redeployed since 2026-08-09, a day before the Manage Enrollment routes
+  (`/cwl/screen`, `/cwl/enrollment`, etc., commit `7d63cc4`, 2026-08-10) were written — only
+  secret-value changes had happened on PROD since, confirmed via `wrangler deployments list`
+  (DEV had been kept current via repeated CLI `wrangler deploy` runs; PROD hadn't). Fixed with
+  `npm run deploy:prod` in `activity/server` (code only, no secrets touched).
+- Fixed: PROD Activity "Setup failed: failed to resolve screen (500)" surfacing immediately
+  after the above — root-caused to the PROD `cloudflared` tunnel (`bridge-prod.qapbot.uk`,
+  Phase D) being down (`ps aux` showed no process; external `/api/health` returned Cloudflare's
+  530 "tunnel not connected") while the bridge itself stayed healthy the whole time
+  (`127.0.0.1:8789/api/health` on the NAS returned `{"ok": true}`) — so the outage was invisible
+  from the bot's own side. Traced via the tunnel's own log
+  (`/var/log/cloudflared-prod-bridge.log`) to `cloudflared`'s own autoupdate (on by default,
+  ~daily) replacing its binary and exiting at `2026-08-14 05:55 UTC`; DSM Task Scheduler's
+  Boot-up-only trigger never restarts a script that exits mid-uptime for any other reason, so it
+  silently stayed down ~26h until manually restarted. Fixed by replacing the direct `cloudflared
+  tunnel ... run ...` Task Scheduler command with a restart-on-exit supervisor script
+  (`cloudflared-supervisor.sh`, kept in the same DSM-upgrade-protected `/volume1/@cloudflared/`
+  as the binary/credentials) — autoupdate deliberately left on, since the supervisor now makes
+  its self-exit harmless. Verified live: a hard `kill -9` of `cloudflared`'s own PID triggered an
+  automatic restart within seconds; a full NAS reboot also came back up clean. Full incident
+  narrative and the supervisor script in `qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` (Phase D)
+  and `activity/README.md` ("Supervise it" step).
+
 2026-08-14 (27)
 - Added (Activity — "Manage Enrollment" board, project owner's spec): a second, independent
   "Show:" radio group (Avg Stars/Attack — default — or Skill Score) controls which number

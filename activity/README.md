@@ -176,10 +176,79 @@ restarts, at the cost of needing one domain in the same Cloudflare account.
    `/volume1` is certainly mounted). `cloudflared`'s script is different because it tries to
    start a service through the symlink immediately, in the same script — that's what makes the
    timing actually matter here.
-8. **Wire the Worker to it**: `cd activity/server && npx wrangler secret put BRIDGE_URL --env prod`
+8. **Supervise it** (2026-08-14 incident + 2026-08-15 fix — see
+   `../qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md`'s Phase D section for the full narrative):
+   step 6's raw `cloudflared tunnel ... run ...` line dies silently whenever `cloudflared`'s own
+   autoupdate replaces its binary and exits (on by default, ~daily) — DSM's Boot-up trigger
+   doesn't notice or restart it, so a routine autoupdate meant 26h of downtime the one time it
+   happened. Fixed by never running `cloudflared` directly from Task Scheduler again — instead
+   run a small supervisor script that restarts it on any exit:
+   ```sh
+   sudo vim /volume1/@cloudflared/cloudflared-supervisor.sh
+   ```
+   ```sh
+   #!/bin/bash
+   # Supervises the qapbot-prod-bridge cloudflared tunnel: restarts it on ANY exit
+   # (crash, OOM, or a routine "cloudflared has been updated" self-shutdown -- autoupdate
+   # is deliberately left ON) so a silent exit no longer means ~26h of downtime like
+   # 2026-08-14. Boot-up-triggered by DSM Task Scheduler; this loop is what actually keeps
+   # it alive between exits, not just across reboots.
+   #
+   # To stop deliberately: kill THIS script's PID (written to $PIDFILE below), NOT
+   # cloudflared's PID directly -- killing cloudflared alone just gets it restarted.
+
+   LOG=/var/log/cloudflared-prod-bridge.log
+   PIDFILE=/volume1/@cloudflared/supervisor.pid
+   STOP=0
+   CF_PID=
+
+   echo $$ > "$PIDFILE"
+   trap 'STOP=1; echo "$(date -Iseconds) INF supervisor got stop signal, killing cloudflared" >> "$LOG"; [ -n "$CF_PID" ] && kill "$CF_PID" 2>/dev/null' TERM INT
+
+   for i in $(seq 1 30); do
+     [ -e /volume1/@cloudflared/bin/cloudflared ] && break
+     sleep 1
+   done
+   [ -L /usr/local/bin/cloudflared ] || ln -sf /volume1/@cloudflared/bin/cloudflared /usr/local/bin/cloudflared
+   [ -L /root/.cloudflared ] || ln -sf /volume1/@cloudflared/dotcloudflared /root/.cloudflared
+   sleep 15
+
+   while [ "$STOP" -eq 0 ]; do
+     echo "$(date -Iseconds) INF supervisor starting cloudflared" >> "$LOG"
+     HOME=/root /usr/local/bin/cloudflared tunnel --config /root/.cloudflared/config.yml run qapbot-prod-bridge >> "$LOG" 2>&1 &
+     CF_PID=$!
+     wait "$CF_PID"
+     if [ "$STOP" -eq 0 ]; then
+       echo "$(date -Iseconds) WRN cloudflared exited unexpectedly -- restarting in 5s" >> "$LOG"
+       sleep 5
+     fi
+   done
+
+   rm -f "$PIDFILE"
+   echo "$(date -Iseconds) INF supervisor stopped intentionally" >> "$LOG"
+   ```
+   ```sh
+   sudo chmod +x /volume1/@cloudflared/cloudflared-supervisor.sh
+   ```
+   Kept in `/volume1/@cloudflared/` — same DSM-upgrade-protected location as the binary/
+   credentials from step 7, not `/root`. Then edit the DSM Task Scheduler task from step 6
+   (**Control Panel → Task Scheduler**, same task, still triggered on **Boot-up**) to run the
+   supervisor instead of `cloudflared` directly:
+   ```sh
+   bash /volume1/@cloudflared/cloudflared-supervisor.sh
+   ```
+   **To stop the tunnel intentionally** (maintenance etc.): `kill $(cat
+   /volume1/@cloudflared/supervisor.pid)` — killing `cloudflared`'s own PID directly does *not*
+   count as intentional and just gets it restarted, by design (the supervisor only traps a
+   signal sent to *itself*). **Verified live 2026-08-15**: `sudo kill -9 $(pgrep -f "cloudflared
+   tunnel --config")` (simulating a hard crash, not just autoupdate's own graceful exit) →
+   supervisor logged `WRN cloudflared exited unexpectedly -- restarting in 5s` and a fresh tunnel
+   reconnected within seconds; a full NAS reboot afterward also came back up clean through the
+   same Boot-up trigger, now pointing at the supervisor.
+9. **Wire the Worker to it**: `cd activity/server && npx wrangler secret put BRIDGE_URL --env prod`
    → `https://bridge.<your-domain>`.
-9. **Smoke test**: launch the Activity from a real PROD guild, confirm the clan-config table
-   loads real data and Save round-trips through the whole chain.
+10. **Smoke test**: launch the Activity from a real PROD guild, confirm the clan-config table
+    loads real data and Save round-trips through the whole chain.
 
 ## Status
 

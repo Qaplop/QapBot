@@ -237,6 +237,39 @@ version as a fallback, kept for a slower/busier future boot, but it isn't curren
 Full chain confirmed live in a real PROD guild: Activity launches, clan-config table loads real
 data, Save round-trips through Worker → tunnel → bridge → `cwl_events`/`cwl_event_clans`.
 
+**Silent 26h outage from `cloudflared`'s own autoupdate (2026-08-14), fixed with a supervisor
+loop (2026-08-15)**: the tunnel died at `05:55 UTC` on 2026-08-14 — not a crash, not an OOM-kill,
+but `cloudflared`'s own autoupdate (`Autoupdate frequency ... autoupdateFreq=86400000`, on by
+default) doing exactly what it's documented to do: swap its binary, log
+`cloudflared has been updated`/`Initiating shutdown`, and exit, trusting something else to
+restart it. DSM's Task Scheduler entry from step 6 above is a **Boot-up-only** trigger, not a
+supervised/restart-on-exit service — so nothing did, until a human noticed the Activity was
+broken and manually reran the task the next morning (`07:47 UTC` on 2026-08-15, ~26h later).
+Went unnoticed that long specifically because the bridge itself (the bot's aiohttp server on
+`127.0.0.1:8789`) stayed healthy the entire time — only the tunnel was down — so nothing else
+about the bot looked wrong.
+
+Fixed by wrapping the tunnel in a restart-on-exit supervisor loop rather than running it
+directly from Task Scheduler, and pointing the same Boot-up trigger at the wrapper instead:
+`cloudflared-supervisor.sh`, kept in `/volume1/@cloudflared/` (same DSM-upgrade-protected
+location as the binary/credentials from the previous step — not `/root`, which isn't guaranteed
+to survive a DSM upgrade). It re-runs step 6's exact startup sequence (symlink self-heal,
+`sleep 15`, `HOME=/root .../cloudflared tunnel --config ... run qapbot-prod-bridge`) inside a
+`while` loop, restarting after any exit for any reason (autoupdate, crash, OOM — the loop
+doesn't distinguish). Autoupdate was deliberately left **on** rather than pinning the version
+with `no-autoupdate: true` — the supervisor makes autoupdate's self-exit harmless (just another
+"restart in 5s"), so disabling it would only trade automatic updates for manual maintenance with
+no safety benefit. Distinguishing an intentional stop from an unexpected exit: the script traps
+`SIGTERM`/`SIGINT` sent to **its own** PID (written to `/volume1/@cloudflared/supervisor.pid`)
+and exits cleanly instead of restarting; killing `cloudflared`'s own PID directly does *not*
+count as intentional and gets it restarted, by design — `kill $(cat
+/volume1/@cloudflared/supervisor.pid)` is the correct way to stop it on purpose. Verified live:
+`sudo kill -9 $(pgrep -f "cloudflared tunnel --config")` (a hard, uncatchable kill — closer to a
+real crash than autoupdate's own graceful exit) produced a `WRN cloudflared exited unexpectedly
+-- restarting in 5s` log line and a fresh tunnel registered within seconds; a full NAS reboot
+afterward also came up clean via the same Boot-up trigger, now pointing at the supervisor. Full
+script in `activity/README.md`'s "Supervise it" step.
+
 ### Phase E — Workflow redesign (web Activity becomes the sole clan-config entry point)
 Five-part follow-up requested once Phase C was verified live, replacing the native/web dual-path design with the web Activity as the only way to configure CWL clans:
 

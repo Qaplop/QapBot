@@ -1,8 +1,11 @@
 Project Backlog, Improvement Ideas and General Remarks
 
 Immediate next steps:
-- The roster band 1 step lighter again. It became too dark now.
-- The box line alignment still fails where the roster band ends and the backup band starts.
+- The roster band 1 step lighter again. It became too dark now
+- The box line alignment still fails where the roster band ends and the backup band starts
+- Buttons in the Clan Participation Management view that allow clan leads to invite guest clans and individual guest users to the CWL
+- Also add an option whether to include ALL player accounts or guild member accounts only (Qaplop, Killer vs. Butterblume, Sir etc.)
+- New commands /feature and /bug that allow users to file feature requests and bug reports
 - Parallelize role sync (found via log_time_gaps.py against the first PROD cycle after the
   2026-08-14 has_active_subscriptions fix — changelog (12)): `sync_roles_for_clan_members()`
   in guild_role_manager.py awaits `sync_roles_for_user()` one Discord user at a time in a plain
