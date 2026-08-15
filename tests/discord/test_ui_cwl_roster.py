@@ -138,7 +138,8 @@ def test_clan_management_view_cwl_settings_mode_constructs_without_row_conflict(
         sent_message=sent_message, mode="cwl_settings", timeout=300,
     )
 
-    assert len(view.children) == 5  # mode select + refresh + channel/toggle/retention buttons
+    # mode select + refresh + channel/hub-toggle/retention/include-all-accounts-toggle buttons
+    assert len(view.children) == 6
 
 
 @pytest.mark.discord
@@ -813,19 +814,33 @@ async def test_add_season_offers_carry_over_prompt_when_previous_data_exists(db,
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_cwl_carry_over_prompt_yes_copies_previous_clans(db, mock_interaction):
+async def test_cwl_carry_over_prompt_yes_presets_participating_from_real_war_history(db, mock_interaction):
+    """2026-08-15 redesign: "Yes" no longer just copies the previous season's manually-toggled
+    participating flags — it looks up which family clans actually played CWL last season (real
+    war_summary data) and pre-sets true/false across the FULL family, while the other settings
+    (roster_size etc.) still carry over from the previous config where one existed."""
     from qapbot.cache_manager import CACHE
     from qapbot.ui_cwl_roster import CwlCarryOverPromptView
 
-    await _seed_guild_and_clans(db, "4444", {"#CLAN1": "Alpha"})
+    await _seed_guild_and_clans(db, "4444", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
     CACHE.db_manager = db
-    CACHE.server_config["4444"] = {}
+    CACHE.server_config["4444"] = {"member_clans": ["#CLAN1", "#CLAN2"]}
     mock_interaction.guild.id = 4444
 
-    previous_rows = [{
-        "clan_tag": "#CLAN1", "target_league_rank": "Master League II",
-        "roster_size": 30, "tier_order": 0, "cwl_start_at": "2026-01-01T08:00Z",
-    }]
+    # Previous season's admin-configured settings (roster_size etc.) — #CLAN1 only.
+    old_event_id = db.create_cwl_event_sync("4444", "2026-01", "discordid1")
+    db.set_cwl_event_clans_sync(old_event_id, [
+        {"clan_tag": "#CLAN1", "target_league_rank": "Master League II",
+         "roster_size": 30, "cwl_start_at": "2026-01-01T08:00Z", "participating": True},
+    ])
+    # Real CWL war history: #CLAN1 actually played last season, #CLAN2 didn't (no row at all).
+    await db.conn.execute(
+        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
+        "VALUES ('w1', '#CLAN1', '#OPP', 1, '2026-01', '2026-01-05T08:00')"
+    )
+    await db.conn.commit()
+
+    previous_rows = db.get_previous_cwl_event_clans_sync("4444")
     parent = MagicMock()
     parent.refresh_cwl_view = AsyncMock()
     prompt_view = CwlCarryOverPromptView(
@@ -836,10 +851,12 @@ async def test_cwl_carry_over_prompt_yes_copies_previous_clans(db, mock_interact
 
     event = db.get_cwl_event_sync("4444", "2026-02")
     assert event is not None
-    clans = db.get_cwl_event_clans_sync(event["id"])
-    assert clans[0]["clan_tag"] == "#CLAN1"
-    assert clans[0]["roster_size"] == 30
-    assert clans[0]["cwl_start_at"] == "2026-01-01T08:00Z"
+    clans = {c["clan_tag"]: c for c in db.get_cwl_event_clans_sync(event["id"])}
+    assert clans["#CLAN1"]["participating"] == 1  # played last season -> True
+    assert clans["#CLAN1"]["roster_size"] == 30  # settings still carried over
+    assert clans["#CLAN1"]["cwl_start_at"] == "2026-01-01T08:00Z"
+    assert clans["#CLAN2"]["participating"] == 0  # didn't play last season -> False
+    assert clans["#CLAN2"]["roster_size"] == 15  # never configured before -> plain default
     assert CACHE.server_config["4444"]["cwl_selected_season"] == "2026-02"
     mock_interaction.delete_original_response.assert_awaited_once()
     parent.refresh_cwl_view.assert_awaited_once()
@@ -853,7 +870,7 @@ async def test_cwl_carry_over_prompt_no_creates_without_copying(db, mock_interac
 
     await _seed_guild_and_clans(db, "5555", {"#CLAN1": "Alpha"})
     CACHE.db_manager = db
-    CACHE.server_config["5555"] = {}
+    CACHE.server_config["5555"] = {"member_clans": ["#CLAN1"]}
     mock_interaction.guild.id = 5555
 
     previous_rows = [{"clan_tag": "#CLAN1", "roster_size": 30, "cwl_start_at": "2026-01-01T08:00Z"}]

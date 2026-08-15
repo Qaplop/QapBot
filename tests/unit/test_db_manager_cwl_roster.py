@@ -50,6 +50,15 @@ async def _seed_cwl_war(
     await db.conn.commit()
 
 
+async def _seed_clan(db: WarHistoryDB, clan_tag: str, name: str = "Some Clan") -> None:
+    """user_players.current_clan_tag has a FK to clans — a clan must exist here before a
+    player_tag can be seeded as currently in it, even one this test deliberately keeps out of
+    any guild's member_clans/member_families (i.e. "known to the bot, but not this guild's own
+    family" — see get_all_players_for_discord_ids_sync's docstring)."""
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, name))
+    await db.conn.commit()
+
+
 async def _seed_user_player(
     db: WarHistoryDB,
     discord_id: str,
@@ -260,6 +269,44 @@ class TestCwlEventClans:
     async def test_get_previous_cwl_event_clans_sync_no_events_at_all(self, db):
         await _seed_guild_and_clan(db)
         assert db.get_previous_cwl_event_clans_sync("111") == []
+
+    @pytest.mark.integration
+    async def test_get_previous_cwl_season_sync_returns_most_recent_prior_season(self, db):
+        await _seed_guild_and_clan(db)
+        db.create_cwl_event_sync("111", "2026-06", "discordid1")
+        db.create_cwl_event_sync("111", "2026-07", "discordid1")
+        new_event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
+
+        assert db.get_previous_cwl_season_sync("111", exclude_event_id=new_event_id) == "2026-07"
+
+    @pytest.mark.integration
+    async def test_get_previous_cwl_season_sync_no_prior_event_returns_none(self, db):
+        await _seed_guild_and_clan(db)
+        event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
+        assert db.get_previous_cwl_season_sync("111", exclude_event_id=event_id) is None
+
+    @pytest.mark.integration
+    async def test_get_clans_with_cwl_data_for_season_sync_splits_played_and_did_not(self, db):
+        """The real-war-history pre-set source for CwlCarryOverPromptView._create_season
+        (ui_cwl_roster.py) — a batched version of has_cwl_season_data_sync."""
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_guild_and_clan(db, guild_id="111", clan_tag="#CLAN2")
+        await _seed_cwl_war(db, "#CLAN1", "2026-07", [("#P1", "Player One", 15, 1)])
+
+        played = db.get_clans_with_cwl_data_for_season_sync(["#CLAN1", "#CLAN2"], "2026-07")
+
+        assert played == {"#CLAN1"}
+
+    @pytest.mark.integration
+    async def test_get_clans_with_cwl_data_for_season_sync_ignores_other_seasons(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        await _seed_cwl_war(db, "#CLAN1", "2026-06", [("#P1", "Player One", 15, 1)])
+
+        assert db.get_clans_with_cwl_data_for_season_sync(["#CLAN1"], "2026-07") == set()
+
+    @pytest.mark.integration
+    async def test_get_clans_with_cwl_data_for_season_sync_empty_clan_list(self, db):
+        assert db.get_clans_with_cwl_data_for_season_sync([], "2026-07") == set()
 
 
 class TestCwlCascadeDelete:
@@ -855,3 +902,79 @@ class TestCwlAssignmentsCrud:
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
         event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
         assert db.delete_cwl_assignment_sync(event_id, "#NEVER") is True
+
+
+class TestGetAllPlayersForDiscordIds:
+    """get_all_players_for_discord_ids_sync — the account-wide expansion source for
+    guild_config.cwl_enrollment_include_all_linked_accounts (2026-08-15)."""
+
+    @pytest.mark.integration
+    async def test_returns_every_linked_player_regardless_of_clan(self, db):
+        await _seed_clan(db, "#MARINES")
+        await _seed_clan(db, "#QCREW")
+        await _seed_user_player(db, "d1", "#P1", current_clan_tag="#MARINES")
+        await _seed_user_player(db, "d1", "#P2", current_clan_tag="#QCREW")  # out-of-family clan
+        await _seed_user_player(db, "d2", "#P3", current_clan_tag="#MARINES")  # different account
+
+        players = db.get_all_players_for_discord_ids_sync(["d1"])
+
+        assert {p["player_tag"] for p in players} == {"#P1", "#P2"}
+        assert {p["clan_tag"] for p in players} == {"#MARINES", "#QCREW"}
+
+    @pytest.mark.integration
+    async def test_works_for_a_clan_this_guild_has_never_added_to_its_family(self, db):
+        """The whole point of this function — a clan the bot knows about (tracked for some
+        other guild, or just a subscription) but this guild never added to its own
+        member_clans/member_families still comes back fine."""
+        await _seed_clan(db, "#OUT_OF_FAMILY_CLAN")
+        await _seed_user_player(db, "d1", "#P1", current_clan_tag="#OUT_OF_FAMILY_CLAN")
+
+        players = db.get_all_players_for_discord_ids_sync(["d1"])
+
+        assert players == [{
+            "player_tag": "#P1", "player_name": "Player", "clan_tag": "#OUT_OF_FAMILY_CLAN",
+            "discord_id": "d1", "verified": True, "cwl_permanent_optout": False,
+            "preferred_league_rank": None, "th_level": None,
+        }]
+
+    @pytest.mark.integration
+    async def test_empty_discord_ids_returns_empty(self, db):
+        assert db.get_all_players_for_discord_ids_sync([]) == []
+
+    @pytest.mark.integration
+    async def test_verified_wins_on_disputed_player_tag(self, db):
+        await _seed_clan(db, "#A")
+        await _seed_clan(db, "#B")
+        await _seed_user_player(db, "d1", "#P1", current_clan_tag="#A", verified=False)
+        await _seed_user_player(db, "d2", "#P1", current_clan_tag="#B", verified=True)
+
+        players = db.get_all_players_for_discord_ids_sync(["d1", "d2"])
+
+        assert len(players) == 1
+        assert players[0]["discord_id"] == "d2"
+        assert players[0]["verified"] is True
+
+
+class TestGuildConfigIncludeAllLinkedAccounts:
+    """guild_config.cwl_enrollment_include_all_linked_accounts save/get roundtrip — the
+    persistent per-guild toggle for the account-wide expansion above (2026-08-15)."""
+
+    @pytest.mark.integration
+    async def test_defaults_to_false_for_a_guild_that_never_set_it(self, db):
+        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('111')")
+        await db.conn.commit()
+        config = await db.get_guild_config("111")
+        assert config["cwl_enrollment_include_all_linked_accounts"] is False
+
+    @pytest.mark.integration
+    async def test_save_and_get_roundtrip_true(self, db):
+        await db.save_guild_config("111", {"cwl_enrollment_include_all_linked_accounts": True})
+        config = await db.get_guild_config("111")
+        assert config["cwl_enrollment_include_all_linked_accounts"] is True
+
+    @pytest.mark.integration
+    async def test_save_and_get_roundtrip_false_after_true(self, db):
+        await db.save_guild_config("111", {"cwl_enrollment_include_all_linked_accounts": True})
+        await db.save_guild_config("111", {"cwl_enrollment_include_all_linked_accounts": False})
+        config = await db.get_guild_config("111")
+        assert config["cwl_enrollment_include_all_linked_accounts"] is False

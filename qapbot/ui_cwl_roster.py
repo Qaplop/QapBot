@@ -82,6 +82,24 @@ def add_cwl_settings_components(view: discord.ui.View, guild_id: int) -> None:
     retention_button.callback = _make_cwl_settings_retention_button_callback(view)  # type: ignore[assignment]
     view.add_item(retention_button)  # type: ignore[arg-type]
 
+    # 2026-08-15, project owner's spec: account-wide enrollment-pool expansion — a plain
+    # persistent per-guild toggle (guild_config.cwl_enrollment_include_all_linked_accounts,
+    # off by default), same simple activate/deactivate-button pattern as the Hub toggle above.
+    # See start_cwl_enrollment()'s docstring (QBdiscocmdshelper_cwl.py) for the actual mechanic.
+    include_all_accounts = bool(guild_config.get("cwl_enrollment_include_all_linked_accounts", False))
+    include_all_accounts_button: discord.ui.Button[Any] = discord.ui.Button(
+        label=(
+            t('cwl.settings.button_disable_include_all_accounts', guild_id=guild_id)
+            if include_all_accounts
+            else t('cwl.settings.button_enable_include_all_accounts', guild_id=guild_id)
+        ),
+        style=discord.ButtonStyle.success if include_all_accounts else discord.ButtonStyle.secondary,
+        custom_id="cwl_settings_toggle_include_all_accounts",
+        row=3,
+    )
+    include_all_accounts_button.callback = _make_cwl_settings_toggle_include_all_accounts_callback(view)  # type: ignore[assignment]
+    view.add_item(include_all_accounts_button)  # type: ignore[arg-type]
+
 
 def _make_cwl_settings_channels_callback(view: discord.ui.View):
     async def callback(interaction: discord.Interaction) -> None:
@@ -169,6 +187,24 @@ def _make_cwl_settings_retention_button_callback(view: discord.ui.View):
         guild_config = CACHE.server_config.get(str(interaction.guild.id), {})
         current_months = guild_config.get("cwl_retention_months", 0)
         await interaction.response.send_modal(CwlRetentionModal(view, interaction.guild.id, current_months))
+
+    return callback
+
+
+def _make_cwl_settings_toggle_include_all_accounts_callback(view: discord.ui.View):
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        if not interaction.guild:
+            return
+        guild_id_str = str(interaction.guild.id)
+        config = CACHE.server_config.setdefault(guild_id_str, {})
+        config["cwl_enrollment_include_all_linked_accounts"] = not bool(
+            config.get("cwl_enrollment_include_all_linked_accounts", False)
+        )
+        await CACHE.persist_server_config(guild_id_str)
+        await _refresh_parent(view, interaction, "cwl_settings")
 
     return callback
 
@@ -447,7 +483,18 @@ class CwlCarryOverPromptView(discord.ui.View):
     """Yes/No prompt shown by "Add New Season" when a previous season has participating clans
     to offer as a template (Phase E.4). Carry-over logic lives exclusively here — never in
     "Configure Participating Clans"/the web Activity, per the project owner's explicit
-    instruction that only this button creates seasons or takes over defaults."""
+    instruction that only this button creates seasons or takes over defaults.
+
+    "Yes" (2026-08-15 redesign, project owner's spec): the *participating* flag it pre-sets is
+    no longer copied from the previous season's manually-toggled cwl_event_clans rows (a clan
+    the admin forgot to flip on, or one added to the family since, silently stayed missing) —
+    it's looked up fresh from real CWL war history for every clan currently in the guild's
+    family, via get_clans_with_cwl_data_for_season_sync(). A clan that actually played last
+    season gets participating=True; every other family clan (played-but-not-last-season, or
+    never toggled at all) gets an explicit participating=False row. The other per-clan settings
+    (roster_size/target_league_rank/cwl_start_at/tier_order) still carry over from
+    previous_rows where available, since only the true/false participation call was wrong, not
+    those. See CwlCarryOverPromptView._create_season below."""
 
     def __init__(
         self,
@@ -493,16 +540,30 @@ class CwlCarryOverPromptView(discord.ui.View):
         guild_id_str = str(self.guild_id)
         event_id = db.create_cwl_event_sync(guild_id_str, self.target_season, str(discord_user_id))
         if event_id is not None and apply_carry_over:
+            from qapbot.QBdiscocmdshelper_cwl import resolve_guild_member_clan_tags
+
+            family_clan_tags = resolve_guild_member_clan_tags(self.guild_id)
+            previous_season = db.get_previous_cwl_season_sync(guild_id_str, exclude_event_id=event_id)
+            played_last_season = (
+                db.get_clans_with_cwl_data_for_season_sync(family_clan_tags, previous_season)
+                if previous_season else set()
+            )
+            # Non-participation settings (roster_size etc.) still come from the admin's last
+            # manual config where one exists — only the true/false participation call itself
+            # moved to real war history (previous_rows is participating=1-only, so a clan
+            # re-enrolled here via real history but never manually toggled on before just gets
+            # this dict's plain defaults, same as a brand-new family clan would).
+            previous_settings = {r["clan_tag"]: r for r in self.previous_rows}
             clan_configs = [
                 {
-                    "clan_tag": r["clan_tag"],
-                    "target_league_rank": r.get("target_league_rank"),
-                    "roster_size": r.get("roster_size", 15),
-                    "tier_order": r.get("tier_order", 0),
-                    "cwl_start_at": r.get("cwl_start_at"),
-                    "participating": True,
+                    "clan_tag": clan_tag,
+                    "target_league_rank": previous_settings.get(clan_tag, {}).get("target_league_rank"),
+                    "roster_size": previous_settings.get(clan_tag, {}).get("roster_size", 15),
+                    "tier_order": previous_settings.get(clan_tag, {}).get("tier_order", 0),
+                    "cwl_start_at": previous_settings.get(clan_tag, {}).get("cwl_start_at"),
+                    "participating": clan_tag in played_last_season,
                 }
-                for r in self.previous_rows
+                for clan_tag in family_clan_tags
             ]
             db.set_cwl_event_clans_sync(event_id, clan_configs)
         config = CACHE.server_config.setdefault(guild_id_str, {})

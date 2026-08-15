@@ -304,6 +304,19 @@ async def format_clan_management_cwl_settings(
         f"{t('cwl.settings.retention_value', guild_id=guild_id_int, value=retention_display)}"
     )
 
+    # 2026-08-15, project owner's spec: account-wide enrollment-pool expansion toggle — see
+    # start_cwl_enrollment()'s docstring (QBdiscocmdshelper_cwl.py) for the actual mechanic.
+    include_all_accounts = guild_config.get("cwl_enrollment_include_all_linked_accounts", False)
+    include_all_accounts_status_text = (
+        t('cwl.settings.status_enabled', guild_id=guild_id_int)
+        if include_all_accounts
+        else t('cwl.settings.status_disabled', guild_id=guild_id_int)
+    )
+    enrollment_pool_block = (
+        f"⠀\n**{t('cwl.settings.enrollment_pool_block_title', guild_id=guild_id_int)}**\n"
+        f"{t('cwl.settings.enrollment_pool_value', guild_id=guild_id_int, status=include_all_accounts_status_text)}"
+    )
+
     embed = discord.Embed(
         title=t('cwl.settings.title', guild_id=guild_id_int),
         description=t('cwl.settings.description', guild_id=guild_id_int, guild_name=guild.name),
@@ -311,6 +324,7 @@ async def format_clan_management_cwl_settings(
     )
     embed.add_field(name="", value=hub_block, inline=False)
     embed.add_field(name="", value=retention_block, inline=False)
+    embed.add_field(name="", value=enrollment_pool_block, inline=False)
 
     return embed, None, [], []
 
@@ -494,17 +508,37 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     even though it has real, known members today. Now seeds from get_current_clan_members_sync()
     (user_players.current_clan_tag) instead — "who's actually in this clan right now."
 
+    Account-wide expansion (guild_config.cwl_enrollment_include_all_linked_accounts, 2026-08-15,
+    project owner's spec, off by default): once the clan-scoped participant list above is
+    resolved, if the guild has opted in, every Discord account represented in it also has its
+    OTHER linked players pulled in — regardless of which clan those play for, including one this
+    guild has never added to its own family (tracked only via a different guild, or a bare
+    channel subscription). Example: an account with Player A in a participating clan and Player
+    B in some unrelated clan gets both seeded once this is on, where only Player A would be
+    without it. This only expands the *signup pool* for THIS event — the auto-assignment seed
+    (resolve_prior_cwl_assignments, below) is intentionally left untouched and still only draws
+    from resolve_guild_member_clan_tags()'s family-wide pool, so an expanded-in account always
+    starts Unassigned on the board rather than being silently auto-assigned somewhere.
+
     Returns a summary dict the caller renders back to the admin: ok, error (reason string if not
     ok), seeded (signup rows created), contacted (DMs actually sent), skipped_optout,
     skipped_unlinked, skipped_dm_guard.
 
     DM safety toggle (operational directive, CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10, extended
-    2026-08-14): while CONFIG.cwl_dm_restrict_to_admin is True, only CONFIG.server_admin's own
-    Discord account is actually DMed — every other resolved recipient is counted in
-    skipped_dm_guard instead of contacted. This lets the whole flow be exercised live — in DEV
-    or PROD — without risking a DM blast to real clan members while the feature is still being
-    built. The toggle is independent of CONFIG.is_dev_mode (set separately per host from the
-    shared .env file) precisely so it can also be enabled on PROD while live-testing there.
+    2026-08-14, extended again 2026-08-15): while CONFIG.cwl_dm_restrict_to_admin is True, only
+    two kinds of recipient are actually DMed — every other resolved recipient is counted in
+    skipped_dm_guard instead of contacted:
+      1. CONFIG.server_admin's own Discord account, always (DEV and PROD alike).
+      2. Anyone enrolled in CACHE.testers (the /admin MANAGE_TESTERS allowlist) — but only when
+         CONFIG.is_dev_mode is False. Testers exist to validate the real message on a real PROD
+         send without blasting the whole guild; in DEV, CACHE.testers is ignored and only
+         server_admin gets DMed, same as before testers existed — otherwise a DEV host (which
+         every dev machine runs by default) would DM real testers' accounts for routine local
+         testing that was never meant to reach them.
+    This lets the whole flow be exercised live — in DEV or PROD — without risking a DM blast to
+    real clan members while the feature is still being built. The toggle is independent of
+    CONFIG.is_dev_mode (set separately per host from the shared .env file) precisely so it can
+    also be enabled on PROD while live-testing there.
     """
     from qapbot.config import CONFIG
 
@@ -534,6 +568,25 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
         return summary
 
     participants = db.get_current_clan_members_sync(participating_clan_tags)
+
+    # Account-wide expansion (guild_config.cwl_enrollment_include_all_linked_accounts,
+    # 2026-08-15, project owner's spec): a Discord account that already qualifies via one
+    # participating-clan player also brings in its OTHER linked players, wherever they
+    # currently play — even a clan this guild's own family has never included. Off by default
+    # (existing guilds see no behavior change unless they opt in via /clan management's
+    # cwl_settings screen).
+    guild_config = CACHE.server_config.get(guild_id_str, {})
+    if guild_config.get("cwl_enrollment_include_all_linked_accounts", False):
+        qualifying_discord_ids = {
+            p["discord_id"] for p in participants if p["discord_id"]
+        }
+        if qualifying_discord_ids:
+            expanded = db.get_all_players_for_discord_ids_sync(list(qualifying_discord_ids))
+            existing_tags = {p["player_tag"] for p in participants}
+            for player in expanded:
+                if player["player_tag"] not in existing_tags:
+                    participants.append(player)
+                    existing_tags.add(player["player_tag"])
 
     signups_to_create: List[Dict[str, Any]] = []
     dm_targets: List[Dict[str, Any]] = []
@@ -584,7 +637,10 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
         summary["assigned"] = len(assignments_to_create)
 
     for participant in dm_targets:
-        if CONFIG.cwl_dm_restrict_to_admin and str(participant["discord_id"]) != CONFIG.server_admin:
+        participant_discord_id = str(participant["discord_id"])
+        is_admin = participant_discord_id == CONFIG.server_admin
+        is_prod_tester = not CONFIG.is_dev_mode and participant_discord_id in CACHE.testers
+        if CONFIG.cwl_dm_restrict_to_admin and not (is_admin or is_prod_tester):
             summary["skipped_dm_guard"] += 1
             continue
         sent = await _send_cwl_signup_template_dm(event["id"], guild_id, season, participant)

@@ -1,8 +1,7 @@
 Project Backlog, Improvement Ideas and General Remarks
 
 Immediate next steps:
-- The roster band 1 step lighter again. It became too dark now
-- The box line alignment still fails where the roster band ends and the backup band starts
+- Add Testers as an /admin bot admin exlusive command
 - Buttons in the Clan Participation Management view that allow clan leads to invite guest clans and individual guest users to the CWL
 - Also add an option whether to include ALL player accounts or guild member accounts only (Qaplop, Killer vs. Butterblume, Sir etc.)
 - New commands /feature and /bug that allow users to file feature requests and bug reports

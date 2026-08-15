@@ -367,6 +367,35 @@ async def test_admin_test_notify_rejects_dm(mock_interaction):
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_admin_manage_testers_rejects_dm(mock_interaction):
+    """MANAGE_TESTERS' picker is the same guild-scoped discord.ui.UserSelect as TEST_NOTIFY —
+    same DM-rejection requirement (2026-08-15)."""
+    mock_interaction.guild = None
+
+    await QBdiscordcmds.admin.callback(mock_interaction, action="MANAGE_TESTERS")  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited_once()
+    sent_text = mock_interaction.followup.send.await_args.args[0]
+    assert "server" in sent_text.lower() or "dm" in sent_text.lower()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_admin_manage_testers_rejects_non_bot_admin(mock_interaction, monkeypatch):
+    """Only the configured bot admin may open the tester picker — a guild administrator who
+    isn't the bot admin must still be rejected (stricter than check_admin_permissions)."""
+    mock_interaction.user.id = 111111111
+    monkeypatch.setattr(QBdiscordcmds, "SERVER_ADMIN", "123456789")  # doesn't match user.id
+
+    await QBdiscordcmds.admin.callback(mock_interaction, action="MANAGE_TESTERS")  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited_once()
+    sent_text = mock_interaction.followup.send.await_args.args[0]
+    assert "bot administrator" in sent_text.lower()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_admin_cleanup_messages_works_from_dm_for_bot_admin(mock_interaction, monkeypatch):
     """CLEANUP_MESSAGES has no modal (unlike REMOVE_CLAN/DEBUG_MESSAGE), so it's fully
     resolve_guild_context()-aware; a configured bot-admin must be able to run it from a DM."""
@@ -458,6 +487,56 @@ async def test_help_command_autocomplete_guild_includes_all():
 
     values = {c.value for c in choices}
     assert "subscribe" in values
+
+
+# ---------------------------------------------------------------------------
+# list() — Testers action (2026-08-15)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_list_testers_rejects_non_bot_admin(mock_interaction, monkeypatch):
+    mock_interaction.user.id = 111111111
+    monkeypatch.setattr(QBdiscordcmds, "SERVER_ADMIN", "123456789")  # doesn't match user.id
+
+    await QBdiscordcmds.list.callback(mock_interaction, action="TESTERS")  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited_once()
+    sent_text = mock_interaction.followup.send.await_args.args[0]
+    assert "bot administrator" in sent_text.lower()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_list_testers_shows_server_admin_and_testers_together(mock_interaction, monkeypatch):
+    """The bot admin always appears (never stored in CACHE.testers, see /admin MANAGE_TESTERS'
+    comment on why it's excluded there) alongside whoever's actually enrolled."""
+    mock_interaction.user.id = 123456789
+    monkeypatch.setattr(QBdiscordcmds, "SERVER_ADMIN", "123456789")
+    monkeypatch.setattr(QBdiscordcmds.CACHE, "testers", {"222", "333"})
+
+    await QBdiscordcmds.list.callback(mock_interaction, action="TESTERS")  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited_once()
+    embed = mock_interaction.followup.send.await_args.kwargs.get("embed")
+    assert embed is not None
+    assert "<@123456789>" in embed.description
+    assert "<@222>" in embed.description
+    assert "<@333>" in embed.description
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_list_testers_empty_when_nothing_configured(mock_interaction, monkeypatch):
+    mock_interaction.user.id = 123456789
+    monkeypatch.setattr(QBdiscordcmds, "SERVER_ADMIN", "123456789")
+    monkeypatch.setattr(QBdiscordcmds.CACHE, "testers", set())
+
+    await QBdiscordcmds.list.callback(mock_interaction, action="TESTERS")  # type: ignore[arg-type]
+
+    embed = mock_interaction.followup.send.await_args.kwargs.get("embed")
+    # server_admin still shows even with an empty tester set.
+    assert "<@123456789>" in embed.description
 
 
 # ---------------------------------------------------------------------------

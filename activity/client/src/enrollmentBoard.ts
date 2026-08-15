@@ -121,6 +121,9 @@ export function renderEnrollmentBoard(
   // first — see _build_enrollment_payload), Unassigned pool last. Mutable so column headers can
   // be dragged to reorder — a purely client-side arrangement, not persisted.
   let columnOrder: (string | null)[] = [...payload.clans.map((c) => c.clan_tag), null]
+  // buildColumn()/renderBoard() hand-off for sizing each column's roster-band-bg overlay — see
+  // buildColumn()'s comment on why this needs a second pass after DOM attachment.
+  let pendingBandSizing: { bg: HTMLElement; lastCard: HTMLElement }[] = []
 
   container.innerHTML = ''
 
@@ -437,25 +440,46 @@ export function renderEnrollmentBoard(
     if (rosterSize !== null) {
       // Starting-roster slots (positions 1..rosterSize, in whatever order this column is
       // currently sorted) get a visibly lighter background band; anything beyond that — backup/
-      // reserve players — sits on the column's normal (current) shade. One box per zone, not
-      // per-card, so it reads as a continuous band rather than individually-colored tiles.
-      // Slots the roster still has open (fewer assigned starters than rosterSize) are padded out
-      // with placeholder tiles, so the band always shows exactly rosterSize slots — some filled,
-      // some still open — rather than shrinking to however many are assigned so far (2026-08-14,
-      // project owner's spec).
+      // reserve players — sits on the column's normal (current) shade. Slots the roster still
+      // has open (fewer assigned starters than rosterSize) are padded out with placeholder
+      // tiles, so the band always shows exactly rosterSize slots — some filled, some still
+      // open — rather than shrinking to however many are assigned so far (2026-08-14, project
+      // owner's spec).
+      //
+      // Starters/placeholders and backups are all plain, direct .card-list children — one flat
+      // flex list, not a nested wrapper around just the starters — so every card (roster or
+      // backup) gets its width from the exact same flex-stretch computation. Two earlier
+      // attempts wrapped the starters in their own box and gave that box a background reaching
+      // into .card-list's padding (first via width:calc()+negative margin, then via box-shadow);
+      // both still left a hairline seam between the last roster card and the first backup card
+      // in live testing (2026-08-15) because the wrapper was a second, independently-computed
+      // width next to the backups' width, and the two could round a device-pixel apart. A flat
+      // list has no second computation to drift from the first, so the seam can't recur.
+      //
+      // The band itself is a `.roster-band-bg` div, absolutely positioned within .card-list
+      // (position: relative) and pinned with left/right/top: 0 — that's the padding-box edges,
+      // not a width computed from a percentage, so it's flush with the column's inner border by
+      // construction. Its height is set below, after this column is attached to the live board,
+      // by measuring where the last roster-slot card actually ends (offsetTop + offsetHeight,
+      // relative to .card-list since that's now the nearest positioned ancestor) — real pixels
+      // from the real layout, not a guessed/derived card-height constant.
       const starters = players.slice(0, rosterSize)
       const backups = players.slice(rosterSize)
       const openSlots = rosterSize - starters.length
       if (starters.length > 0 || openSlots > 0) {
-        const rosterBand = document.createElement('div')
-        rosterBand.className = 'roster-band'
+        const rosterBandBg = document.createElement('div')
+        rosterBandBg.className = 'roster-band-bg'
+        cardList.appendChild(rosterBandBg)
+        let lastRosterCard: HTMLElement | null = null
         for (const player of starters) {
-          rosterBand.appendChild(buildCard(player))
+          lastRosterCard = buildCard(player)
+          cardList.appendChild(lastRosterCard)
         }
         for (let i = 0; i < openSlots; i++) {
-          rosterBand.appendChild(buildPlaceholderCard())
+          lastRosterCard = buildPlaceholderCard()
+          cardList.appendChild(lastRosterCard)
         }
-        cardList.appendChild(rosterBand)
+        if (lastRosterCard) pendingBandSizing.push({ bg: rosterBandBg, lastCard: lastRosterCard })
       }
       for (const player of backups) {
         cardList.appendChild(buildCard(player))
@@ -491,9 +515,23 @@ export function renderEnrollmentBoard(
 
   function renderBoard(): void {
     board.innerHTML = ''
+    // Populated by buildColumn() while it builds each column's cards (still detached from the
+    // document at that point, so offsetTop/offsetHeight would read zero) — sized in a second
+    // pass below, once every column is actually attached to `board` and has real layout.
+    pendingBandSizing = []
     columnOrder.forEach((clanTag, index) => {
       board.appendChild(buildColumn(clanTag, index))
     })
+    for (const { bg, lastCard } of pendingBandSizing) {
+      // Ends halfway into the gap after the last roster card, not flush with its bottom edge
+      // (live-testing feedback, 2026-08-15) — flush-with-the-card made the color change land
+      // right on the card's own border line; centering it in the empty gap instead reads as a
+      // clean break between the two zones. Reads the real .card-list gap (its parent) rather
+      // than hardcoding half of the 4px in the CSS, so this can't drift out of sync with it.
+      const parent = bg.parentElement as HTMLElement | null
+      const gap = parent ? parseFloat(getComputedStyle(parent).rowGap) || 0 : 0
+      bg.style.height = `${lastCard.offsetTop + lastCard.offsetHeight + gap / 2}px`
+    }
   }
 
   renderBoard()

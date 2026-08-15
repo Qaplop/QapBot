@@ -1,6 +1,77 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-15 (32)
+- Added: CWL enrollment "account-wide expansion" — a new per-guild toggle (`guild_config.
+  cwl_enrollment_include_all_linked_accounts`, off by default) that, once a Discord account
+  qualifies for Start Enrollment's signup pool via one participating-clan player, also pulls in
+  that account's OTHER linked players regardless of which clan they currently play for — even
+  one this guild's own family never included (e.g. a player whose main is in a participating
+  clan but who also has an alt in an unrelated clan). New `db_manager.py`:
+  `get_all_players_for_discord_ids_sync()` (account-scoped, mirrors the shape of the existing
+  clan-scoped `get_current_clan_members_sync()`), plus the new `guild_config` column threaded
+  through `get_guild_config`/`save_guild_config`. Wired into `start_cwl_enrollment()`
+  (`QBdiscocmdshelper_cwl.py`) — expands only the signup pool, not the auto-assignment seed (an
+  expanded-in account always starts Unassigned on the board, never silently auto-assigned).
+  UI: a plain activate/deactivate button in `/clan management`'s CWL Settings screen
+  (`ui_cwl_roster.py`, `en.json`/`de.json`). Tests: `TestGetAllPlayersForDiscordIds` +
+  `TestGuildConfigIncludeAllLinkedAccounts` (`tests/unit/test_db_manager_cwl_roster.py`), 2 new
+  in `tests/integration/test_cwl_start_enrollment.py` (toggle off = no change, toggle on = the
+  Marines/QCrew scenario), `test_ui_cwl_roster.py`'s cwl_settings button-count regression test
+  updated. Docs: new dated section in `CWL_ROSTER_PLANNING_PLAN.md`.
+  `.\run_tests.ps1`: 1845 passed, 4 deselected.
+
+2026-08-15 (31)
+- Added: `/list` "Testers" action (bot admin only) — shows the *effective* full DM-testing
+  recipient list: `CONFIG.server_admin` (always included, DEV and PROD) plus everyone in
+  `CACHE.testers` (PROD only). Also hardened `/admin` MANAGE_TESTERS so the bot admin's own
+  account can no longer be added to or removed from `CACHE.testers` through that picker at all
+  (it was never meant to be stored there — the admin's DM eligibility comes from a separate
+  `is_admin` check in the guard, independent of the testers list) — selecting/deselecting
+  yourself there is now a silent no-op; `/list Testers` is the one place both are shown
+  together. `QBdiscordcmds.py`. Tests: 3 new for `/list Testers` (bot-admin gate, combined
+  listing, empty-testers-still-shows-admin) + 2 new for MANAGE_TESTERS' guild-only/bot-admin
+  gates, `tests/discord/test_dm_command_invocation.py`. `.\run_tests.ps1`: 1836 passed,
+  4 deselected.
+
+2026-08-15 (30)
+- Changed: testers (entry 29 below) now only receive DMs on a PROD host — a DEV host always DMs
+  only `CONFIG.server_admin`, same as before testers existed, even if `CACHE.testers` is
+  non-empty. `QBdiscocmdshelper_cwl.py`'s DM guard now checks `not CONFIG.is_dev_mode and
+  participant_discord_id in CACHE.testers` rather than just membership. `/admin` MANAGE_TESTERS'
+  picker message now says so explicitly. Tests: renamed
+  `test_dm_guard_also_dms_enrolled_testers` -> `..._in_prod`, added
+  `test_dm_guard_ignores_testers_in_dev` (`tests/integration/test_cwl_start_enrollment.py`).
+- Changed: "Add New Season"'s "carry over previous season?" Yes prompt now pre-sets each
+  participating flag from real CWL war history (which family clans actually played last
+  season), not the admin's last manually-toggled config — and covers every clan in the guild's
+  full CWL family, not just ones that already had a `cwl_event_clans` row. New
+  `db_manager.py`: `get_clans_with_cwl_data_for_season_sync()`, `get_previous_cwl_season_sync()`.
+  `ui_cwl_roster.py`'s `CwlCarryOverPromptView._create_season()` rewritten to resolve the full
+  family (`resolve_guild_member_clan_tags()`) and set true/false per clan from real history,
+  while still carrying over roster_size/target_league_rank/cwl_start_at/tier_order from the
+  previous config where one existed. Tests: 5 new in `tests/unit/test_db_manager_cwl_roster.py`,
+  `tests/discord/test_ui_cwl_roster.py`'s carry-over "Yes"/"No" tests updated (Yes rewritten to
+  cover the real-history split; both now seed `CACHE.server_config[...]["member_clans"]`, which
+  `resolve_guild_member_clan_tags()` requires and the old tests never set). Docs: new dated
+  section in `CWL_ROSTER_PLANNING_PLAN.md`. `.\run_tests.ps1`: 1831 passed, 4 deselected.
+
+2026-08-15 (29)
+- Added: `/admin` bot-admin-exclusive "Manage Testers" action — a `discord.ui.UserSelect`
+  multi-picker (mirrors TEST_NOTIFY's user-picker) that replaces the DM-testing allowlist with
+  whatever's selected, so enroll/remove is one control (deselect = remove). Persisted in a new
+  `bot_testers` table (`db_manager.py`: `_create_bot_testers_schema`/`get_testers`/
+  `add_tester`/`remove_tester`, global — not per-guild) and cached at `CACHE.testers`
+  (`cache_manager.py`: `load_testers()` wired into `load_all()`, write-through
+  `add_tester()`/`remove_tester()`). Extended the existing `cwl_dm_restrict_to_admin` DM guard
+  (`QBdiscocmdshelper_cwl.py`'s `start_cwl_enrollment()`) so anyone in `CACHE.testers` is DMed
+  alongside `CONFIG.server_admin` — the only current call site of that guard, so testers now see
+  the real CWL signup DM during live-testing the same way the project owner's own account does.
+  Tests: `tests/unit/test_db_manager_bot_testers.py` (new, DB CRUD + CACHE load/write-through),
+  `tests/integration/test_cwl_start_enrollment.py` (new `test_dm_guard_also_dms_enrolled_testers`),
+  `tests/unit/test_cache_manager_phase5.py` (added `load_testers` to `TestLoadAll`'s expected
+  loader calls). `.\run_tests.ps1`: 1825 passed, 4 deselected.
+
 2026-08-15 (28)
 - Fixed: PROD Activity "Setup failed: failed to resolve screen (404)" — the
   `cwl-clan-config-server-prod` Cloudflare Worker (the OAuth/proxy layer in front of the bridge)

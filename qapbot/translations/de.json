@@ -756,7 +756,11 @@
       "button_configure_channels": "Kanäle konfigurieren",
       "button_configure_retention": "Datenaufbewahrung konfigurieren",
       "button_activate_hub": "CWL-Verwaltungs-Hub-Nachricht aktivieren",
-      "button_deactivate_hub": "CWL-Verwaltungs-Hub-Nachricht deaktivieren"
+      "button_deactivate_hub": "CWL-Verwaltungs-Hub-Nachricht deaktivieren",
+      "enrollment_pool_block_title": "Anmeldepool",
+      "enrollment_pool_value": "Weitere Accounts eines angemeldeten Mitglieds einbeziehen (beliebiger Clan): {status}",
+      "button_enable_include_all_accounts": "Alle verknüpften Accounts einbeziehen",
+      "button_disable_include_all_accounts": "Alle verknüpften Accounts nicht mehr einbeziehen"
     },
     "management": {
       "title": "🏆 CWL-Verwaltung",

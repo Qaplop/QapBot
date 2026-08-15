@@ -1251,6 +1251,7 @@ async def do_maintenance_shutdown() -> None:
     app_commands.Choice(name="Check Data - Validate data consistency (bot admin)", value="CHECK_DATA"),
     app_commands.Choice(name="List All Subscriptions - View all subscriptions (bot admin)", value="LIST_ALL_SUBSCRIPTIONS"),
     app_commands.Choice(name="Test Notify - Test war notifications for a clan (bot admin)", value="TEST_NOTIFY"),
+    app_commands.Choice(name="Manage Testers - Add/remove users who receive live-testing DMs (bot admin)", value="MANAGE_TESTERS"),
     app_commands.Choice(name="Remove Clan - Remove a clan from tracking (admin)", value="REMOVE_CLAN"),
     app_commands.Choice(name="List all tracked Clans - List all tracked clans with names and tags (admin)", value="LIST_CLANS"),
     app_commands.Choice(name="Import Player Registration Data - Import player accounts from ClashPerk embed (bot admin)", value="IMPORT_DATA"),
@@ -1266,12 +1267,13 @@ async def do_maintenance_shutdown() -> None:
     app_commands.Choice(name="Maintenance End - Restart bot and resume normal operation (bot admin)", value="MAINTENANCE_END"),
 ])
 # DM-invokable (Phase 0b follow-up, CWL_ROSTER_PLANNING_PLAN.md) — per-sub-action review found 17 of
-# 19 sub-actions have no functional interaction.guild dependency at all (bot-wide/global effect via
-# check_bot_admin_only, or global CACHE data). Two sub-actions have a genuine, narrow guild scope and
-# are individually gated inside their own branch rather than blocking the whole command — see
+# 20 sub-actions have no functional interaction.guild dependency at all (bot-wide/global effect via
+# check_bot_admin_only, or global CACHE data). Three sub-actions have a genuine, narrow guild scope
+# and are individually gated inside their own branch rather than blocking the whole command — see
 # IMPORT_DATA (needs a specific guild channel's ClashPerk embed message — "current channel" is
-# meaningless in a DM) and TEST_NOTIFY (its user-picker uses discord.ui.UserSelect, a guild-scoped
-# component). REMOVE_CLAN/DEBUG_MESSAGE open a modal as their first response, which can't be preceded
+# meaningless in a DM) and TEST_NOTIFY/MANAGE_TESTERS (their user-picker uses discord.ui.UserSelect,
+# a guild-scoped component — MANAGE_TESTERS' allowlist itself is bot-wide, only its picker UI needs
+# a guild). REMOVE_CLAN/DEBUG_MESSAGE open a modal as their first response, which can't be preceded
 # by resolve_guild_context()'s ambiguous-guild picker (also a first response) — so their permission
 # check is deliberately left DM-narrower than the rest: bot-admins get full DM access as before,
 # guild-admins-only get the existing "you need admin permissions" rejection rather than a picker.
@@ -2352,6 +2354,141 @@ async def admin(
         view.message = await interaction.followup.send(
             "🧪 **Test Notification**\n\n"
             "Select a Discord user to send a mock-up war notification:",
+            view=view,
+            ephemeral=True
+        )
+        return
+
+    # Handle MANAGE_TESTERS action — stays guild-only: the user picker below is a
+    # discord.ui.UserSelect, a guild-scoped component (populated from a guild's member list; has
+    # no DM equivalent), same restriction as TEST_NOTIFY above. The allowlist it manages
+    # (CACHE.testers) is itself bot-wide, not guild-scoped — only the picker UI needs a guild.
+    if action_norm == "MANAGE_TESTERS":
+        if not await _safe_defer(interaction, thinking=True, ephemeral=True):
+            return
+        if interaction.guild is None:
+            await interaction.followup.send(t('commands.errors.dms_only_error', guild_id=None), ephemeral=True)
+            return
+        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+        if not check_bot_admin_only(interaction, SERVER_ADMIN):
+            await interaction.followup.send(
+                "🔒 This command is restricted to the bot administrator.\n"
+                "Only the configured bot admin can manage the tester list.",
+                ephemeral=True
+            )
+            return
+
+        from qapbot.cache_manager import CACHE
+        # SERVER_ADMIN is excluded here on purpose (2026-08-15, /list TESTERS follow-up): the bot
+        # admin's own account is already an always-on DM recipient via the separate `is_admin`
+        # check in every cwl_dm_restrict_to_admin-style guard — it was never added to
+        # CACHE.testers by this picker and never should be, so it can't be shown as toggleable
+        # here (and, symmetrically, selecting the admin's own account below is a silent no-op —
+        # see on_user_select). /list TESTERS is the place to see the *effective* full list
+        # (testers + the bot admin together).
+        current_tester_ids = sorted(CACHE.testers - {SERVER_ADMIN})
+
+        # Multi-select user picker for the bot-wide DM-testing allowlist (CACHE.testers) — the
+        # accounts every cwl_dm_restrict_to_admin-style guard treats as equivalent to
+        # CONFIG.server_admin. Pre-populated with the current list (default_values) so the admin
+        # sees who's already enrolled. Whatever is selected when the picker closes *replaces* the
+        # list (not an incremental add) — deselecting someone removes them, matching how a native
+        # multi-select naturally reads, and needing only one control for both enroll and remove.
+        class ManageTestersView(discord.ui.View):
+            def __init__(self, original_interaction: discord.Interaction, tester_ids: List[str]):
+                super().__init__(timeout=180)
+                self.original_interaction = original_interaction
+                self.message: Optional[discord.Message] = None
+                select_kwargs: Dict[str, Any] = dict(
+                    placeholder="Select every user who should receive live-testing DMs",
+                    min_values=0,
+                    max_values=25,
+                )
+                default_values = [discord.Object(id=int(tid)) for tid in tester_ids if tid.isdigit()]
+                if default_values:
+                    select_kwargs["default_values"] = default_values
+                self.user_select: discord.ui.UserSelect = discord.ui.UserSelect(**select_kwargs)  # type: ignore[var-annotated]
+                async def on_user_select_callback(select_interaction: discord.Interaction):
+                    return await self.on_user_select(select_interaction)
+                self.user_select.callback = on_user_select_callback  # type: ignore[method-assign]
+                self.add_item(self.user_select)  # type: ignore[arg-type]
+
+            async def on_timeout(self) -> None:
+                """Delete the message when the view times out."""
+                if self.message is not None:
+                    try:
+                        await self.message.delete()
+                    except Exception:
+                        pass
+
+            async def on_user_select(self, select_interaction: discord.Interaction):
+                """Replace CACHE.testers with whatever is currently selected."""
+                if not await _safe_defer(select_interaction, ephemeral=True):
+                    return
+
+                # Delete the picker message (standard procedure for consecutive ephemerals,
+                # matches TEST_NOTIFY above).
+                try:
+                    await self.original_interaction.delete_original_response()
+                except discord.NotFound:
+                    pass
+                except Exception as e:
+                    logging.warning(f"Failed to delete MANAGE_TESTERS selection message: {e}")
+
+                try:
+                    from qapbot.cache_manager import CACHE
+                    # SERVER_ADMIN is filtered out of both sides — selecting/deselecting the bot
+                    # admin's own account here is a silent no-op, since their DM eligibility never
+                    # actually depended on CACHE.testers (see the comment above where
+                    # current_tester_ids is built).
+                    new_ids = {str(u.id) for u in self.user_select.values} - {SERVER_ADMIN}  # type: ignore[attr-defined]
+                    previous_ids = set(CACHE.testers) - {SERVER_ADMIN}
+                    added = new_ids - previous_ids
+                    removed = previous_ids - new_ids
+
+                    for discord_id in added:
+                        await CACHE.add_tester(discord_id)
+                    for discord_id in removed:
+                        await CACHE.remove_tester(discord_id)
+
+                    lines = []
+                    if added:
+                        lines.append("✅ **Added:** " + ", ".join(f"<@{uid}>" for uid in sorted(added)))
+                    if removed:
+                        lines.append("❌ **Removed:** " + ", ".join(f"<@{uid}>" for uid in sorted(removed)))
+                    if not added and not removed:
+                        lines.append("No changes — selection matched the existing tester list.")
+                    if new_ids:
+                        lines.append("\n**Current testers (" + str(len(new_ids)) + "):** " + ", ".join(f"<@{uid}>" for uid in sorted(new_ids)))
+                    else:
+                        lines.append("\n**Current testers:** none")
+
+                    await select_interaction.followup.send("\n".join(lines), ephemeral=True)
+                    logging.info(
+                        f"ADMIN ACTION: {interaction.user} updated tester list: "
+                        f"+{sorted(added)} -{sorted(removed)}"
+                    )
+
+                except Exception as e:
+                    await select_interaction.followup.send(
+                        f"❌ Error updating tester list: {e}",
+                        ephemeral=True
+                    )
+                    logging.error(f"MANAGE_TESTERS failed: {e}", exc_info=True)
+
+        view = ManageTestersView(interaction, current_tester_ids)
+        current_list_text = ", ".join(f"<@{tid}>" for tid in current_tester_ids) if current_tester_ids else "none"
+        view.message = await interaction.followup.send(
+            "🧪 **Manage Testers**\n\n"
+            f"Currently enrolled: {current_list_text}\n\n"
+            "Select the Discord users who should receive DMs alongside the bot admin while a "
+            "feature is under live-testing restriction (e.g. CWL enrollment DMs while "
+            "CWL_DM_RESTRICT_TO_ADMIN is on). Whatever is selected replaces the list — deselect "
+            "someone to remove them.\n\n"
+            "⚠️ **PROD only** — this list is ignored on a DEV host; DEV always DMs only the "
+            "bot admin, same as before testers existed. The bot admin's own account always "
+            "receives these DMs and isn't managed here — see `/list Testers` for the full "
+            "effective recipient list.",
             view=view,
             ephemeral=True
         )
@@ -3593,6 +3730,7 @@ async def ping(interaction: discord.Interaction):
     app_commands.Choice(name="Families - List all clan families and their member clans", value="FAMILIES"),
     app_commands.Choice(name="Players - List all players for a given clan or family", value="PLAYERS"),
     app_commands.Choice(name="Tracked Clans - Chart of tracked clans per war league", value="TRACKED_CLANS"),
+    app_commands.Choice(name="Testers - List all DM-testing recipients (bot admin)", value="TESTERS"),
 ])
 # DM-invokable (Phase 0b, CWL_ROSTER_PLANNING_PLAN.md) — operates on global CACHE data, no admin gate, display-only guild_id.
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
@@ -3837,6 +3975,40 @@ async def list(
             ),
             file=discord.File(buf, "tracked_clans.jpg"),
         )
+        return
+
+    # Handle TESTERS action (bot admin only) — the *effective* full DM-testing recipient list:
+    # CACHE.testers (the /admin MANAGE_TESTERS allowlist, PROD-only) plus CONFIG.server_admin,
+    # who always receives these DMs (DEV and PROD alike) and isn't stored in CACHE.testers at
+    # all — MANAGE_TESTERS deliberately can't add/remove that account (see its comment above),
+    # so this is the only place that shows the two together as one list.
+    if action_norm == "TESTERS":
+        if not await _safe_defer(interaction, thinking=True, ephemeral=True):
+            return
+        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+        if not check_bot_admin_only(interaction, SERVER_ADMIN):
+            await interaction.followup.send(
+                "🔒 This command is restricted to the bot administrator.",
+                ephemeral=True
+            )
+            return
+
+        tester_ids = set(CACHE.testers) - {SERVER_ADMIN}
+        lines = []
+        if SERVER_ADMIN:
+            lines.append(f"<@{SERVER_ADMIN}> — bot admin, always included (DEV and PROD)")
+        for discord_id in sorted(tester_ids):
+            lines.append(f"<@{discord_id}> — tester, PROD only")
+
+        embed = discord.Embed(
+            title="DM Testers",
+            description=(
+                "\n".join(lines) if lines else "No DM-testing recipients configured."
+            ),
+            color=0x2B2D31,
+        )
+        embed.set_footer(text="Manage the tester list (excluding the bot admin) via /admin Manage Testers.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
 
 @list.autocomplete('clan')  # type: ignore[attr-defined]

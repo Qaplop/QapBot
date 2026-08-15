@@ -165,26 +165,49 @@
       .column-header-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
       .column-header-tier { font-size: 0.72rem; font-weight: 400; line-height: 1.2; }
       .column-count { font-weight: 700; flex-shrink: 0; }
-      .card-list { padding: 8px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
-      /* Starting-roster band (positions 1..roster_size) — a light-gray background wash filling
-         the full width of the card list for that many slots; backup/reserve cards past it sit
-         on the column's normal (current) shade. Open slots (fewer real starters than
-         roster_size) are padded out with .placeholder-card tiles so the band always shows all
-         roster_size slots. The negative margin + matching extra width cancels out .card-list's
-         own 8px padding on three sides, so this reads as one seamless region flush with the
-         column's edges rather than a separate inset box (live-testing feedback, 2026-08-14 —
-         earlier versions used a modest gray with its own padding/border-radius, which read as a
-         small floating box, and then plain white, which read as visually harsh). See
-         enrollmentBoard.ts's buildColumn(). */
-      .roster-band {
-        background: #34363d;
-        margin: -8px -8px 0 -8px;
-        width: calc(100% + 16px);
+      .card-list {
         padding: 8px;
-        box-sizing: border-box;
         display: flex;
         flex-direction: column;
         gap: 4px;
+        overflow-y: auto;
+        /* Containing block + local stacking context for .roster-band-bg below — position:
+           relative alone wouldn't be enough; z-index: 0 is what actually establishes the
+           stacking context, which keeps the band's negative z-index scoped to just this
+           card-list instead of escaping behind .column's own background. */
+        position: relative;
+        z-index: 0;
+      }
+      /* Starting-roster band (positions 1..roster_size) — a light-gray background wash behind
+         the starting-roster slots (position 1..roster_size in the column's current sort);
+         backup/reserve cards past it sit on the column's normal (current) shade. Open slots
+         (fewer real starters than roster_size) are padded out with .placeholder-card tiles so
+         the band always shows all roster_size slots.
+         This is a separate .roster-band-bg element absolutely positioned *behind* the cards
+         (z-index: -1) rather than a box that wraps just the starter cards — starters,
+         placeholders, and backups are now all plain siblings in one flat .card-list flex row
+         (see enrollmentBoard.ts's buildColumn()), so every card gets its width from the exact
+         same flex-stretch computation with nothing to independently round. Two earlier attempts
+         (width:calc(100%+16px)+negative-margin, then box-shadow, both on a wrapper around just
+         the starters) still left a hairline seam between the last roster card and the first
+         backup card in live testing (2026-08-15) — the wrapper's width was always a second,
+         independently-rounded computation next to the backups' width. left/right/top: 0 here
+         are the .card-list padding-box edges directly (no percentage/calc math at all), and its
+         height is set in JS from the real rendered position of the last roster-slot card, so
+         there's nothing left to drift. Shade lightened one step from the previous #34363d,
+         which read too dark in the same feedback round (earlier iterations used a modest gray
+         with its own padding/border-radius, which read as a small floating box, and before that
+         plain white, which read as visually harsh — 2026-08-14). */
+      .roster-band-bg {
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 0;
+        /* height set inline by enrollmentBoard.ts's renderBoard(), after the column is attached
+           to the live board and the last roster-slot card has real layout to measure. */
+        background: #3a3c43;
+        z-index: -1;
+        pointer-events: none;
       }
       .player-card {
         background: #1e1f22;

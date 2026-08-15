@@ -1414,6 +1414,10 @@ class WarHistoryDB:
         logging.info("[DB-SCHEMA] Verifying bot metadata table...")
         await self._create_bot_metadata_schema()
 
+        # Bot-level tester list (DM-testing allowlist, global — not per-guild)
+        logging.info("[DB-SCHEMA] Verifying bot testers table...")
+        await self._create_bot_testers_schema()
+
         # History schema (schema 'history', attached database) — hot/history DB split
         logging.info("[DB-SCHEMA] Verifying history.* tables + indexes...")
         await self._create_history_schema()
@@ -1740,6 +1744,7 @@ class WarHistoryDB:
                 cwl_management_message_last_bump_iso TEXT,
                 cwl_retention_months INTEGER NOT NULL DEFAULT 0,
                 cwl_selected_season TEXT,
+                cwl_enrollment_include_all_linked_accounts BOOLEAN NOT NULL DEFAULT 0,
                 timezone_name TEXT NOT NULL DEFAULT 'UTC',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -2018,6 +2023,7 @@ class WarHistoryDB:
         await self._add_column_if_missing("guild_config", "cwl_management_message_last_bump_iso", "TEXT")
         await self._add_column_if_missing("guild_config", "cwl_retention_months", "INTEGER NOT NULL DEFAULT 0")
         await self._add_column_if_missing("guild_config", "cwl_selected_season", "TEXT")
+        await self._add_column_if_missing("guild_config", "cwl_enrollment_include_all_linked_accounts", "BOOLEAN NOT NULL DEFAULT 0")
         await self._add_column_if_missing("guild_config", "timezone_name", "TEXT NOT NULL DEFAULT 'UTC'")
         await self._add_column_if_missing("cwl_event_clans", "participating", "INTEGER NOT NULL DEFAULT 1")
 
@@ -2064,7 +2070,44 @@ class WarHistoryDB:
                 (key, value),
             )
             await self._conn.commit()
-    
+
+    async def _create_bot_testers_schema(self) -> None:
+        """Create the bot_testers table (idempotent) — bot-wide (not per-guild) list of Discord
+        user IDs who receive DMs alongside CONFIG.server_admin while a feature is under the
+        cwl_dm_restrict_to_admin-style live-testing guard. See CACHE.testers/add_tester/
+        remove_tester (cache_manager.py) for the in-memory side."""
+        await self._ensure_connection()
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_testers (
+                discord_id TEXT PRIMARY KEY,
+                added_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        await self._conn.commit()
+        logging.debug("[DB-SCHEMA] bot_testers table verified")
+
+    async def get_testers(self) -> List[str]:
+        """Return every tester's Discord user ID."""
+        await self._ensure_connection()
+        cursor = await self._conn.execute("SELECT discord_id FROM bot_testers")
+        return [row["discord_id"] for row in await cursor.fetchall()]
+
+    async def add_tester(self, discord_id: str) -> None:
+        """Enroll a Discord user ID as a tester (no-op if already enrolled)."""
+        await self._ensure_connection()
+        async with self._write_lock:
+            await self._conn.execute(
+                "INSERT OR IGNORE INTO bot_testers (discord_id) VALUES (?)", (discord_id,)
+            )
+            await self._conn.commit()
+
+    async def remove_tester(self, discord_id: str) -> None:
+        """Remove a Discord user ID from the tester list (no-op if not enrolled)."""
+        await self._ensure_connection()
+        async with self._write_lock:
+            await self._conn.execute("DELETE FROM bot_testers WHERE discord_id = ?", (discord_id,))
+            await self._conn.commit()
+
     async def _ensure_clan_exists(self, clan_tag: str) -> None:
         """
         Ensure clan exists in database before saving child records.
@@ -3245,6 +3288,37 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] get_previous_cwl_event_clans_sync failed for guild {guild_id}: {e}")
                 return []
 
+    def get_previous_cwl_season_sync(
+        self, guild_id: str, exclude_event_id: Optional[int] = None
+    ) -> Optional[str]:
+        """Return this guild's most recent prior cwl_events.cwl_season — the same "most recent
+        prior event" resolution get_previous_cwl_event_clans_sync (above) uses, exposed here as
+        just the season string. Used alongside get_clans_with_cwl_data_for_season_sync to pre-set
+        a new season's participating clans from real CWL war history for that prior season,
+        across the guild's full family (not just clans that had a cwl_event_clans row before) —
+        see CwlCarryOverPromptView._create_season (ui_cwl_roster.py)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                if exclude_event_id is not None:
+                    row = conn.execute(
+                        "SELECT cwl_season FROM cwl_events WHERE guild_id = ? AND id != ? ORDER BY cwl_season DESC LIMIT 1",
+                        (guild_id, exclude_event_id),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT cwl_season FROM cwl_events WHERE guild_id = ? ORDER BY cwl_season DESC LIMIT 1",
+                        (guild_id,),
+                    ).fetchone()
+                return row["cwl_season"] if row else None
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_previous_cwl_season_sync failed for guild {guild_id}: {e}")
+                return None
+
     def get_current_clan_members_sync(self, clan_tags: List[str]) -> List[Dict[str, Any]]:
         """Return every linked account currently tracked as a member of one of clan_tags — the
         seed for Start Enrollment's signup pool (CWL_ROSTER_PLANNING_PLAN.md Phase 2, corrected
@@ -3310,6 +3384,66 @@ class WarHistoryDB:
                 "th_level": row["th_level"],
             })
         return members
+
+    def get_all_players_for_discord_ids_sync(self, discord_ids: List[str]) -> List[Dict[str, Any]]:
+        """Return every linked player_tag for discord_ids, regardless of current clan — the
+        account-wide expansion for guild_config.cwl_enrollment_include_all_linked_accounts
+        (2026-08-15, project owner's spec: an account that already qualifies for CWL enrollment
+        via one in-family player should also bring in its other characters, wherever they
+        currently play). Unlike get_current_clan_members_sync (clan-scoped, WHERE
+        current_clan_tag IN (...)), this is account-scoped — WHERE discord_id IN (...) — so a
+        returned clan_tag may belong to a clan that isn't part of THIS guild's own family at all
+        (tracked only via a different guild, or a bare channel subscription, or not tracked by
+        anyone right now — current_clan_tag has a FK to `clans`, so the clan itself must exist
+        there, even if this guild has never heard of it as a "member clan"). Callers already
+        treat an unrecognized clan_tag as best-effort display data, same as any other clan_tag.
+
+        Same row shape as get_current_clan_members_sync (player_tag, player_name, clan_tag,
+        discord_id, verified, cwl_permanent_optout, preferred_league_rank, th_level) so callers
+        can merge results from both uniformly."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not discord_ids:
+            return []
+
+        with self._sync_conn() as conn:
+            try:
+                placeholders = ",".join("?" for _ in discord_ids)
+                rows = conn.execute(
+                    f"""
+                    SELECT player_tag, player_name, current_clan_tag, discord_id, verified,
+                           cwl_permanent_optout, cwl_default_preferred_league_rank, th_level
+                    FROM user_players
+                    WHERE discord_id IN ({placeholders})
+                    ORDER BY verified DESC
+                    """,
+                    discord_ids,
+                ).fetchall()
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_all_players_for_discord_ids_sync failed: {e}")
+                return []
+
+        # Same verified-wins-per-player_tag dedup as get_current_clan_members_sync.
+        players_by_tag: Dict[str, sqlite3.Row] = {}
+        for row in rows:
+            players_by_tag.setdefault(row["player_tag"], row)
+
+        players: List[Dict[str, Any]] = []
+        for player_tag, row in players_by_tag.items():
+            discord_id = row["discord_id"]
+            players.append({
+                "player_tag": player_tag,
+                "player_name": row["player_name"],
+                "clan_tag": row["current_clan_tag"],
+                "discord_id": discord_id if discord_id and discord_id != "UNASSIGNED" else None,
+                "verified": bool(row["verified"]),
+                "cwl_permanent_optout": bool(row["cwl_permanent_optout"]),
+                "preferred_league_rank": row["cwl_default_preferred_league_rank"],
+                "th_level": row["th_level"],
+            })
+        return players
 
     def bulk_create_cwl_signups_sync(self, event_id: int, signups: List[Dict[str, Any]]) -> bool:
         """Bulk-insert cwl_signups rows for Start Enrollment's template-copy step. Idempotent via
@@ -4786,6 +4920,39 @@ class WarHistoryDB:
             logging.error(f"[DB-QUERY-SYNC] has_cwl_season_data_sync failed for {clan_tag}/{season}: {e}")
             return False
 
+    def get_clans_with_cwl_data_for_season_sync(self, clan_tags: List[str], season: str) -> Set[str]:
+        """Batched version of has_cwl_season_data_sync: return the subset of clan_tags that have
+        at least one real war_summary row with is_cwl=1 for `season` — "which of these clans
+        actually played CWL that season." Used to pre-set a new season's participating clans
+        from real war history across the guild's full CWL family (CwlCarryOverPromptView,
+        ui_cwl_roster.py — replaces the previous "was participating=1 last time I toggled it"
+        carry-over, so a clan added to the family since, or one the admin forgot to flip on/off,
+        still gets an accurate default)."""
+        import sqlite3
+
+        if not self.db_path or not clan_tags:
+            return set()
+
+        try:
+            with self._sync_conn() as conn:
+                placeholders = ",".join("?" * len(clan_tags))
+                rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT clan_tag FROM (
+                        SELECT clan_tag FROM main.war_summary
+                            WHERE is_cwl = 1 AND cwl_season = ? AND clan_tag IN ({placeholders})
+                        UNION ALL
+                        SELECT clan_tag FROM history.war_summary
+                            WHERE is_cwl = 1 AND cwl_season = ? AND clan_tag IN ({placeholders})
+                    )
+                    """,
+                    (season, *clan_tags, season, *clan_tags),
+                ).fetchall()
+                return {row["clan_tag"] for row in rows}
+        except sqlite3.Error as e:
+            logging.error(f"[DB-QUERY-SYNC] get_clans_with_cwl_data_for_season_sync failed for season {season}: {e}")
+            return set()
+
     def get_all_war_summaries_brief_sync(self) -> List[Tuple[str, str, str, int]]:
         """
         Get all (war_id, clan_tag, date, is_cwl) from war_summary (synchronous).
@@ -6152,6 +6319,7 @@ class WarHistoryDB:
             "cwl_management_message_last_bump_iso": row["cwl_management_message_last_bump_iso"],
             "cwl_retention_months": row["cwl_retention_months"] if row["cwl_retention_months"] is not None else 0,
             "cwl_selected_season": row["cwl_selected_season"],
+            "cwl_enrollment_include_all_linked_accounts": bool(row["cwl_enrollment_include_all_linked_accounts"]) if row["cwl_enrollment_include_all_linked_accounts"] is not None else False,
             "timezone_name": row["timezone_name"] if row["timezone_name"] is not None else "UTC",
         }
     
@@ -6196,8 +6364,8 @@ class WarHistoryDB:
                  cwl_hub_channel_id, cwl_hub_message_id, cwl_hub_message_enabled, cwl_hub_message_last_bump_iso,
                  cwl_management_channel_id, cwl_management_message_id, cwl_management_message_enabled,
                  cwl_management_message_last_bump_iso, cwl_retention_months, cwl_selected_season,
-                 timezone_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cwl_enrollment_include_all_linked_accounts, timezone_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     language = excluded.language,
                     newbie_role_id = excluded.newbie_role_id,
@@ -6230,6 +6398,7 @@ class WarHistoryDB:
                     cwl_management_message_last_bump_iso = excluded.cwl_management_message_last_bump_iso,
                     cwl_retention_months = excluded.cwl_retention_months,
                     cwl_selected_season = excluded.cwl_selected_season,
+                    cwl_enrollment_include_all_linked_accounts = excluded.cwl_enrollment_include_all_linked_accounts,
                     timezone_name = excluded.timezone_name
             """, (
                 guild_id,
@@ -6264,6 +6433,7 @@ class WarHistoryDB:
                 config.get("cwl_management_message_last_bump_iso"),
                 config.get("cwl_retention_months", 0),
                 config.get("cwl_selected_season"),
+                1 if config.get("cwl_enrollment_include_all_linked_accounts", False) else 0,
                 config.get("timezone_name", "UTC"),
             ))
             

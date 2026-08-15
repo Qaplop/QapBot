@@ -306,6 +306,80 @@ async def test_dm_guard_only_dms_the_configured_server_admin_in_prod(db, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_dm_guard_also_dms_enrolled_testers_in_prod(db, monkeypatch):
+    """2026-08-15 (/admin MANAGE_TESTERS): the guard's exception isn't just
+    CONFIG.server_admin any more — in PROD, anyone enrolled in CACHE.testers is treated the
+    same way, so a hand-picked group can see the real DM while the rest of the guild stays
+    guarded."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    fake_config = dataclasses.replace(
+        config_module.CONFIG, is_dev_mode=False, server_admin="d1", cwl_dm_restrict_to_admin=True,
+    )
+    monkeypatch.setattr(config_module, "CONFIG", fake_config)
+    monkeypatch.setattr(CACHE, "testers", {"d2"})
+
+    await _seed_guild_and_clan(db, "1010")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(db, "d1", "#P1")  # matches server_admin -> DMed
+    await _seed_current_clan_member(db, "d2", "#P2")  # matches a tester -> DMed
+    await _seed_current_clan_member(db, "d3", "#P3")  # neither -> guarded/skipped
+    await _make_event(db, "1010", "2026-08")
+
+    sent_to = []
+
+    async def fake_send_user_dm(user_id, message, view=None, embed=None):
+        sent_to.append(user_id)
+        return True
+
+    monkeypatch.setattr(CACHE, "send_user_dm", fake_send_user_dm)
+
+    summary = await start_cwl_enrollment(1010, "2026-08")
+
+    assert summary["contacted"] == 2
+    assert summary["skipped_dm_guard"] == 1
+    assert sorted(sent_to) == ["d1", "d2"]
+
+
+@pytest.mark.asyncio
+async def test_dm_guard_ignores_testers_in_dev(db, monkeypatch):
+    """2026-08-15 follow-up (project owner's spec): testers are a PROD-only concept — a DEV
+    host must keep DMing only CONFIG.server_admin, exactly as it did before testers existed,
+    even if CACHE.testers is non-empty (e.g. shared in-memory state from another guild/test)."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    fake_config = dataclasses.replace(
+        config_module.CONFIG, is_dev_mode=True, server_admin="d1", cwl_dm_restrict_to_admin=True,
+    )
+    monkeypatch.setattr(config_module, "CONFIG", fake_config)
+    monkeypatch.setattr(CACHE, "testers", {"d2"})
+
+    await _seed_guild_and_clan(db, "1011")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(db, "d1", "#P1")  # matches server_admin -> DMed
+    await _seed_current_clan_member(db, "d2", "#P2")  # a tester, but DEV mode -> guarded/skipped
+    await _make_event(db, "1011", "2026-08")
+
+    sent_to = []
+
+    async def fake_send_user_dm(user_id, message, view=None, embed=None):
+        sent_to.append(user_id)
+        return True
+
+    monkeypatch.setattr(CACHE, "send_user_dm", fake_send_user_dm)
+
+    summary = await start_cwl_enrollment(1011, "2026-08")
+
+    assert summary["contacted"] == 1
+    assert summary["skipped_dm_guard"] == 1
+    assert sent_to == ["d1"]
+
+
+@pytest.mark.asyncio
 async def test_prod_mode_is_unaffected_when_dm_guard_disabled(db, monkeypatch):
     from qapbot import config as config_module
     from qapbot.cache_manager import CACHE
@@ -399,3 +473,62 @@ async def test_no_cwl_history_leaves_player_unassigned(db, monkeypatch):
 
     assert summary["seeded"] == 1  # still seeded as a signup candidate
     assert summary["assigned"] == 0  # just not auto-assigned to any clan
+
+
+@pytest.mark.asyncio
+async def test_account_wide_expansion_off_by_default(db, monkeypatch):
+    """guild_config.cwl_enrollment_include_all_linked_accounts defaults False — an account's
+    out-of-family player must NOT be pulled in unless the guild opts in (2026-08-15)."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    await _seed_guild_and_clan(db, "1013")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    # d1 has one player in the participating clan (#CLAN1) and one in a clan this guild's own
+    # family never included (Qaplop/Marines+QCrew scenario) — still needs a `clans` row
+    # (user_players.current_clan_tag FK), just not in guild "1013"'s member_clans.
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#QCREW', 'QCrew')")
+    await db.conn.commit()
+    await _seed_current_clan_member(db, "d1", "#P1", clan_tag="#CLAN1")
+    await _seed_current_clan_member(db, "d1", "#P2", clan_tag="#QCREW")
+    await _make_event(db, "1013", "2026-08")
+
+    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+
+    summary = await start_cwl_enrollment(1013, "2026-08")
+
+    assert summary["seeded"] == 1  # only #P1 — #P2 stays invisible to this event
+    event_id = db.get_cwl_event_sync("1013", "2026-08")["id"]
+    assert db.get_cwl_signup_sync(event_id, "#P2") is None
+
+
+@pytest.mark.asyncio
+async def test_account_wide_expansion_pulls_in_other_clan_players_when_enabled(db, monkeypatch):
+    """With the toggle on, d1's #P2 (an out-of-family clan player) is seeded alongside #P1 —
+    the Marines/QCrew scenario from the project owner's own account."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    await _seed_guild_and_clan(db, "1014")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    CACHE.server_config["1014"]["cwl_enrollment_include_all_linked_accounts"] = True
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#QCREW', 'QCrew')")
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHER', 'Other')")
+    await db.conn.commit()
+    await _seed_current_clan_member(db, "d1", "#P1", clan_tag="#CLAN1")
+    await _seed_current_clan_member(db, "d1", "#P2", clan_tag="#QCREW")
+    # d2 has no player in the participating clan at all — must not qualify d2's own other
+    # players just because d2 happens to exist; only accounts already resolved as
+    # participants (via an in-family player) get expanded.
+    await _seed_current_clan_member(db, "d2", "#P3", clan_tag="#OTHER")
+    await _make_event(db, "1014", "2026-08")
+
+    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+
+    summary = await start_cwl_enrollment(1014, "2026-08")
+
+    assert summary["seeded"] == 2  # #P1 (in-family) + #P2 (expanded via d1's account)
+    event_id = db.get_cwl_event_sync("1014", "2026-08")["id"]
+    assert db.get_cwl_signup_sync(event_id, "#P1") is not None
+    assert db.get_cwl_signup_sync(event_id, "#P2") is not None
+    assert db.get_cwl_signup_sync(event_id, "#P3") is None  # d2 never qualified

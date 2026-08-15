@@ -161,6 +161,11 @@ class CacheManager:
         self.notification_state: Dict[str, Dict[str, Any]] = {}  # war_id -> {"notified_players": {player_tag: {...}}}
         # Server configuration for role management, welcome message, and war notifications (guild_id -> config)
         self.server_config: Dict[str, Dict[str, Any]] = {}  # guild_id -> {"role_system_enabled": bool, "newbie_role_id": str, "member_role_id": str, "member_clans": List[str], "member_families": List[str], "registration_channel_id": str, "registration_message_enabled": bool, "registration_message_id": str, "war_notification_channel_id": str, "channel_war_notifications_enabled": bool}
+        # Bot-wide (not per-guild) DM-testing allowlist — Discord user IDs who receive DMs
+        # alongside CONFIG.server_admin wherever a feature is gated behind a
+        # cwl_dm_restrict_to_admin-style live-testing guard. Managed via /admin's
+        # MANAGE_TESTERS action (bot-admin only). See load_testers()/add_tester()/remove_tester().
+        self.testers: Set[str] = set()
         # Temporary war stats and clan history for in-memory management
         self.temp_war_stats: Dict[str, Dict[str, Any]] = {}  # clan_tag -> player_tag -> stats
         # Lightweight war metadata cached alongside temp_war_stats (state, start_time, end_time, type, is_cwl, war_tag, opponent_tag)
@@ -1989,12 +1994,57 @@ class CacheManager:
             logging.error(f"[DB-READ] Failed to load notification state from database: {e}")
             raise SystemExit(1)
 
+    async def load_testers(self) -> None:
+        """Load the DM-testing allowlist (bot-wide, not per-guild) from database.
+
+        Raises:
+            SystemExit: On critical loading errors
+        """
+        if not self.db_manager:
+            raise RuntimeError("Database manager not initialized")
+
+        try:
+            self.testers = set(await self.db_manager.get_testers())
+            logging.info(f"[DB-READ] Loaded {len(self.testers)} tester(s) from database")
+        except Exception as e:
+            logging.error(f"[DB-READ] Failed to load testers from database: {e}")
+            raise SystemExit(1)
+
+    async def add_tester(self, discord_id: str) -> None:
+        """Enroll a Discord user ID as a tester, with immediate DB persistence (write-through).
+
+        Raises:
+            Exception: If database write fails (cache is still updated)
+        """
+        try:
+            self.testers.add(discord_id)
+            await self.db_manager.add_tester(discord_id)  # type: ignore[union-attr]
+            logging.info(f"[DB-WRITE-THROUGH] Enrolled tester: {discord_id}")
+        except Exception as e:
+            logging.error(f"[DB-WRITE-THROUGH] Failed to persist tester {discord_id}: {e}")
+            raise
+
+    async def remove_tester(self, discord_id: str) -> None:
+        """Remove a Discord user ID from the tester list, with immediate DB persistence
+        (write-through).
+
+        Raises:
+            Exception: If database write fails (cache is still updated)
+        """
+        try:
+            self.testers.discard(discord_id)
+            await self.db_manager.remove_tester(discord_id)  # type: ignore[union-attr]
+            logging.info(f"[DB-WRITE-THROUGH] Removed tester: {discord_id}")
+        except Exception as e:
+            logging.error(f"[DB-WRITE-THROUGH] Failed to remove tester {discord_id}: {e}")
+            raise
+
     async def load_server_config(self) -> None:
         """
         Load server configuration from database.
-        
+
         Structure: guild_id -> {"newbie_role_id": str, "member_role_id": str, "member_clans": List[str], "member_families": List[str]}
-        
+
         Raises:
             SystemExit: On critical loading errors
         """
@@ -2260,6 +2310,9 @@ class CacheManager:
         self._current_load_operation = "load_server_config"
         logging.info("Starting cache load_all() - loading server config...")
         await self.load_server_config()
+        self._current_load_operation = "load_testers"
+        logging.info("Starting cache load_all() - loading testers...")
+        await self.load_testers()
         self._current_load_operation = "validate_clan_cache_consistency"
         # Validate consistency between server_config and clan_name_cache
         logging.info("Starting cache load_all() - validating clan cache consistency...")
