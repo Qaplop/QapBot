@@ -247,6 +247,10 @@ instructions.txt
 activity/**/node_modules/
 activity/**/.wrangler/
 activity/**/dist/
+
+# wrangler CLI local cache/state (account id, deploy state) — created wherever `wrangler`/`npx
+# wrangler` is invoked from, not just inside activity/; never source, never commit.
+.wrangler/
 activity/**/.dev.vars
 activity/**/.env
 activity/**/.env.local
