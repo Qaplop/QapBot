@@ -1320,6 +1320,14 @@ class CacheManager:
                 return False
 
             await user.send(message, view=view, embed=embed)
+            # Single choke point for every DM this bot sends (2026-08-15, project owner's spec:
+            # "log when a DM is sent... so I can track when and to whom") — every real call site
+            # funnels through this one function, so one log line here covers all of them rather
+            # than needing a log line at each of the ~7 call sites individually. Preview is
+            # truncated, not the full message, to keep this readable and avoid logging anything
+            # sensitive (e.g. a confirm link) in full.
+            preview = message[:60] + ('…' if len(message) > 60 else '') if message else ''
+            logging.info(f"[DM-SENT] to user_id={user_id} ({user.name}): {preview!r}")
             return True
 
         except discord.Forbidden:

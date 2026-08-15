@@ -978,3 +978,76 @@ class TestGuildConfigIncludeAllLinkedAccounts:
         await db.save_guild_config("111", {"cwl_enrollment_include_all_linked_accounts": False})
         config = await db.get_guild_config("111")
         assert config["cwl_enrollment_include_all_linked_accounts"] is False
+
+
+class TestGetPlayerLinks:
+    """get_player_links_sync — the CWL Guests search's "is this hit DMable" lookup (2026-08-15).
+    Unlike get_current_clan_members_sync/get_all_players_for_discord_ids_sync, this looks up by
+    player_tag with no clan or discord_id context at all."""
+
+    @pytest.mark.integration
+    async def test_returns_link_info_for_known_tags_only(self, db):
+        await _seed_clan(db, "#A")
+        await _seed_user_player(db, "d1", "#P1", current_clan_tag="#A")
+
+        links = db.get_player_links_sync(["#P1", "#NEVER_LINKED"])
+
+        assert list(links.keys()) == ["#P1"]
+        assert links["#P1"] == {"player_name": "Player", "discord_id": "d1", "verified": True}
+
+    @pytest.mark.integration
+    async def test_empty_tags_returns_empty(self, db):
+        assert db.get_player_links_sync([]) == {}
+
+    @pytest.mark.integration
+    async def test_verified_wins_on_disputed_player_tag(self, db):
+        await _seed_clan(db, "#A")
+        await _seed_clan(db, "#B")
+        await _seed_user_player(db, "d1", "#P1", current_clan_tag="#A", verified=False)
+        await _seed_user_player(db, "d2", "#P1", current_clan_tag="#B", verified=True)
+
+        links = db.get_player_links_sync(["#P1"])
+
+        assert links["#P1"]["discord_id"] == "d2"
+        assert links["#P1"]["verified"] is True
+
+
+class TestGetCurrentClanTagsForPlayers:
+    """get_current_clan_tags_for_players_sync — the player-scoped (not clan-scoped) fallback
+    _build_enrollment_payload uses so a guest/account-wide-expanded player's real current clan
+    still resolves even when that clan is outside every filter set the board otherwise uses
+    (2026-08-15 bugfix — these players' cards were stuck plain/default forever, never green or
+    amber)."""
+
+    @pytest.mark.integration
+    async def test_resolves_a_clan_outside_any_filter_set(self, db):
+        await _seed_clan(db, "#OUT_OF_FAMILY_CLAN")
+        await _seed_user_player(db, "d1", "#P1", current_clan_tag="#OUT_OF_FAMILY_CLAN")
+
+        clan_tags = db.get_current_clan_tags_for_players_sync(["#P1"])
+
+        assert clan_tags == {"#P1": "#OUT_OF_FAMILY_CLAN"}
+
+    @pytest.mark.integration
+    async def test_unknown_player_tag_absent_not_none(self, db):
+        assert db.get_current_clan_tags_for_players_sync(["#NEVER"]) == {}
+
+    @pytest.mark.integration
+    async def test_player_with_no_current_clan_absent(self, db):
+        await _seed_user_player(db, "d1", "#P1", current_clan_tag=None)
+        assert db.get_current_clan_tags_for_players_sync(["#P1"]) == {}
+
+    @pytest.mark.integration
+    async def test_empty_tags_returns_empty(self, db):
+        assert db.get_current_clan_tags_for_players_sync([]) == {}
+
+    @pytest.mark.integration
+    async def test_verified_wins_on_disputed_player_tag(self, db):
+        await _seed_clan(db, "#A")
+        await _seed_clan(db, "#B")
+        await _seed_user_player(db, "d1", "#P1", current_clan_tag="#A", verified=False)
+        await _seed_user_player(db, "d2", "#P1", current_clan_tag="#B", verified=True)
+
+        clan_tags = db.get_current_clan_tags_for_players_sync(["#P1"])
+
+        assert clan_tags == {"#P1": "#B"}

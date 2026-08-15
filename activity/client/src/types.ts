@@ -10,6 +10,12 @@ export type ClanConfig = {
   /** UTC ISO-ish string ("YYYY-MM-DDTHH:MMZ", matching _parse_cwl_start_time()'s output format
    * on the bot side) or null if unset. */
   cwl_start_at: string | null
+  /** Cross-guild shared CWL clan status (2026-08-15), GET-only (never sent back on save — the
+   * backend derives it fresh, see qapbot/web_bridge.py's _build_clan_config_payload). Null when
+   * this clan isn't shared with anyone. `is_owner` gates whether the Evict action is offered —
+   * only the owner guild may remove another guild from a shared clan
+   * (CWL_ROSTER_PLANNING_PLAN.md). */
+  shared_with: { is_owner: boolean; other_guild_ids: string[]; other_guild_names: string[] } | null
 }
 
 /** Season selection lives entirely on the Discord-side CWL Management screen (its own season
@@ -71,6 +77,10 @@ export type EnrollmentPlayer = {
   // their assigned clan") or amber ("assigned elsewhere, hasn't moved yet") — see
   // enrollmentBoard.ts's clanMatchClass().
   current_clan_tag: string | null
+  // cwl_signups.source === 'guest_invite' — set only by the Guests search's individual-player
+  // invite (POST /api/cwl/enrollment/guest), never by any other signup path. Display-only badge,
+  // doesn't change pool/eligibility logic (2026-08-15).
+  is_guest: boolean
 }
 
 export type EnrollmentPayload = {
@@ -79,3 +89,20 @@ export type EnrollmentPayload = {
   clans: EnrollmentClan[]
   players: EnrollmentPlayer[]
 }
+
+/** One flat result from GET /api/cwl/guest-search — the Guests invite search on Configure
+ * Participating Clans (2026-08-15). A "clan" hit gets added straight into the same `clans` array
+ * ClanConfig already edits (POST /api/cwl/clan-config persists it, participating=true, exactly
+ * like any other clan — see qapbot/web_bridge.py's _search_cwl_guests docstring for why that
+ * needs no separate endpoint). A "player" hit is added via POST /api/cwl/enrollment/guest — its
+ * `discord_id` is null when the tag isn't linked to any Discord account yet, in which case
+ * "send DM now" isn't offered (there's nobody to DM).
+ *
+ * `already_shared_with` (clan hits only, 2026-08-15, cross-guild shared CWL clans): the display
+ * name of another guild already participating with this clan for the same season, or null if
+ * none. Never hides the hit — the admin can still add it, sharing the clan's roster with that
+ * other guild (CWL_ROSTER_PLANNING_PLAN.md) — this is just what drives the "already on X's
+ * roster, add anyway?" confirmation before the add actually happens. */
+export type GuestSearchResult =
+  | { type: 'clan'; clan_tag: string; clan_name: string; clan_tier: string | null; already_shared_with: string | null }
+  | { type: 'player'; player_tag: string; player_name: string; discord_id: string | null }

@@ -1,4 +1,4 @@
-import type { ClanConfig, ClanConfigPayload } from './types'
+import type { ClanConfig, ClanConfigPayload, GuestSearchResult } from './types'
 
 const ROSTER_SIZES = [5, 15, 30] as const
 
@@ -72,12 +72,31 @@ function localPartsToUtcString(date: string, time: string): string {
  *
  * `onClose(reason)` calls discordSdk.close(RPCCloseCodes.CLOSE_NORMAL, reason) — a real,
  * documented top-level SDK method, confirmed working live (both from Save and Cancel).
+ *
+ * "Guests" section (2026-08-15, project owner's spec — invite a clan or individual player from
+ * outside this guild's own family): a guest CLAN result is just appended to `working` and goes
+ * through the exact same `onSave` path as every other row — nothing guest-specific about it
+ * server-side (see qapbot/web_bridge.py's _search_cwl_guests docstring for why). A guest PLAYER
+ * result is a genuinely separate, immediate action via `onGuestPlayerAdd` — it doesn't touch
+ * `working` or `cwl_event_clans` at all, it writes straight to `cwl_signups`, so it can't be
+ * batched into the same Save button; it applies the moment "Add" is clicked, independent of
+ * whether the admin ever clicks Save on the clan table itself.
  */
 export function renderClanConfigTable(
   container: HTMLElement,
   payload: ClanConfigPayload,
   onSave: (clans: ClanConfig[]) => Promise<void>,
   onClose: (reason: string) => void,
+  onGuestSearch: (query: string) => Promise<GuestSearchResult[]>,
+  onGuestPlayerAdd: (
+    result: Extract<GuestSearchResult, { type: 'player' }>,
+    sendDmNow: boolean,
+  ) => Promise<{ dm_sent: boolean }>,
+  // Owner-only eviction (2026-08-15) — removes targetGuildId's participation in a shared clan.
+  // Independent of Save/onSave, same immediate-action shape as onGuestPlayerAdd: it doesn't
+  // touch `working` at all, so nothing here needs a page reload to reflect it beyond re-running
+  // this same render with a fresh payload (see main.ts's call site).
+  onEvict: (clanTag: string, targetGuildId: string) => Promise<void>,
 ): void {
   const working: ClanConfig[] = payload.clans.map((c) => ({ ...c }))
 
@@ -141,10 +160,25 @@ export function renderClanConfigTable(
 
   const tbody = document.createElement('tbody')
   for (const clan of working) {
-    tbody.appendChild(buildRow(clan, seasonStartUtc, seasonEndUtc))
+    tbody.appendChild(buildRow(clan, seasonStartUtc, seasonEndUtc, onEvict))
   }
   table.appendChild(tbody)
   container.appendChild(table)
+
+  // General read-only-settings notice (2026-08-15, live-testing feedback) — replaces the old
+  // per-row explanation (moved out specifically so every row stays the same height regardless of
+  // sharing status; see buildRow's own comment). Shown once, only while at least one row is
+  // actually a read-only follower of another guild's shared clan.
+  const readOnlyNotice = document.createElement('div')
+  readOnlyNotice.className = 'shared-clan-readonly-notice'
+  readOnlyNotice.textContent = '⚠️ For clans managed by another guild, roster size & start time are read-only!'
+  container.appendChild(readOnlyNotice)
+
+  function updateReadOnlyNoticeVisibility(): void {
+    const anyReadOnly = working.some((c) => c.shared_with !== null && !c.shared_with.is_owner)
+    readOnlyNotice.style.display = anyReadOnly ? '' : 'none'
+  }
+  updateReadOnlyNoticeVisibility()
 
   // Select-all header checkbox: reflects the row checkboxes' combined state (fully checked /
   // fully unchecked / native `.indeterminate` for a mixed selection — the standard convention
@@ -178,6 +212,211 @@ export function renderClanConfigTable(
   })
   rowCheckboxes().forEach((cb) => cb.addEventListener('change', updateSelectAllState))
   updateSelectAllState()
+
+  const existingClanTags = new Set(working.map((c) => c.clan_tag))
+  const guestsSection = document.createElement('div')
+  guestsSection.className = 'guests-section'
+
+  const guestsTitle = document.createElement('div')
+  guestsTitle.className = 'guests-title'
+  guestsTitle.textContent = 'Guests'
+  guestsSection.appendChild(guestsTitle)
+
+  const guestsHint = document.createElement('div')
+  guestsHint.className = 'guests-hint'
+  guestsHint.textContent =
+    'Invite a clan or an individual player who isn’t part of this guild’s own clan family. ' +
+    'A guest clan is added to the table above (Save to persist); a guest player is added to the ' +
+    'enrollment pool immediately.'
+  guestsSection.appendChild(guestsHint)
+
+  const guestsSearchRow = document.createElement('div')
+  guestsSearchRow.className = 'guests-search-row'
+  const guestsSearchInput = document.createElement('input')
+  guestsSearchInput.type = 'text'
+  guestsSearchInput.className = 'guests-search-input'
+  guestsSearchInput.placeholder = 'Search Discord user, player name/tag, or clan…'
+  guestsSearchRow.appendChild(guestsSearchInput)
+  const guestsDmLabel = document.createElement('label')
+  guestsDmLabel.className = 'guests-dm-label'
+  const guestsDmCheckbox = document.createElement('input')
+  guestsDmCheckbox.type = 'checkbox'
+  guestsDmLabel.appendChild(guestsDmCheckbox)
+  guestsDmLabel.append('Send enrollment DM immediately (players only)')
+  guestsSearchRow.appendChild(guestsDmLabel)
+  guestsSection.appendChild(guestsSearchRow)
+
+  const guestsResults = document.createElement('div')
+  guestsResults.className = 'guests-results'
+  guestsSection.appendChild(guestsResults)
+
+  const guestsStatus = document.createElement('div')
+  guestsStatus.className = 'guests-status'
+  guestsSection.appendChild(guestsStatus)
+
+  // Debounced (300ms) — a search fires on every keystroke otherwise, hammering the bridge for
+  // no benefit since the admin is still mid-word almost every time.
+  let searchDebounceHandle: ReturnType<typeof setTimeout> | undefined
+  let searchRequestId = 0
+
+  function renderGuestResults(results: GuestSearchResult[]): void {
+    guestsResults.innerHTML = ''
+    for (const result of results) {
+      const row = document.createElement('div')
+      row.className = 'guest-result'
+
+      const badge = document.createElement('span')
+      badge.className = `guest-result-badge ${result.type}`
+      badge.textContent = result.type
+      row.appendChild(badge)
+
+      const label = document.createElement('span')
+      label.className = 'guest-result-label'
+      const addButton = document.createElement('button')
+      addButton.className = 'guest-add-button'
+      addButton.textContent = 'Add'
+
+      if (result.type === 'clan') {
+        const clanResult = result
+        label.textContent = clanResult.already_shared_with
+          ? `${clanResult.clan_name} (${clanResult.clan_tag}) — already on ${clanResult.already_shared_with}'s roster`
+          : `${clanResult.clan_name} (${clanResult.clan_tag})`
+        if (clanResult.already_shared_with) row.classList.add('guest-result-shared')
+        row.appendChild(label)
+        row.appendChild(addButton)
+
+        const addClan = (): void => {
+          const newClan: ClanConfig = {
+            clan_tag: clanResult.clan_tag,
+            name: clanResult.clan_name,
+            tier: clanResult.clan_tier,
+            participating: true,
+            roster_size: 15,
+            // Same default a never-configured clan already gets from the backend payload
+            // (qapbot/web_bridge.py's _build_clan_config_payload: "1st of the season's month at
+            // 08:00 UTC") — null here left the date picker showing empty placeholders instead of
+            // a real default (live-testing feedback, 2026-08-15).
+            cwl_start_at: seasonStartUtc,
+            // Freshly added, not saved yet — no real cwl_shared_clans row exists for this
+            // clan/guild pairing until Save actually runs, so is_owner/other_guild_ids can't be
+            // known precisely yet (2026-08-15, project owner's spec: "no need to save first...
+            // just fetch the info about the added clan when 'add' is selected" — the guest
+            // search already told us this in already_shared_with, so show it immediately rather
+            // than discarding it until after Save). is_owner is always false here — a clan
+            // that's already someone else's roster can never make US the owner just by adding
+            // it as a guest; other_guild_ids stays empty since buildRow only ever reads it to
+            // build Evict buttons, which are is_owner-gated and so never render here anyway.
+            shared_with: clanResult.already_shared_with
+              ? { is_owner: false, other_guild_ids: [], other_guild_names: [clanResult.already_shared_with] }
+              : null,
+          }
+          working.push(newClan)
+          existingClanTags.add(clanResult.clan_tag)
+          const newRow = buildRow(newClan, seasonStartUtc, seasonEndUtc, onEvict)
+          tbody.appendChild(newRow)
+          newRow.querySelector<HTMLInputElement>('input[type="checkbox"]')?.addEventListener('change', updateSelectAllState)
+          updateSelectAllState()
+          updateReadOnlyNoticeVisibility()
+          guestsStatus.textContent = clanResult.already_shared_with
+            ? `Added ${clanResult.clan_name} — shared with ${clanResult.already_shared_with}. Click Save above to persist.`
+            : `Added ${clanResult.clan_name} — click Save above to persist.`
+          guestsStatus.className = 'guests-status success'
+          guestsSearchInput.value = ''
+          guestsResults.innerHTML = ''
+        }
+
+        addButton.addEventListener('click', () => {
+          if (existingClanTags.has(clanResult.clan_tag)) {
+            guestsStatus.textContent = `${clanResult.clan_name} is already on the list above.`
+            guestsStatus.className = 'guests-status error'
+            return
+          }
+          if (!clanResult.already_shared_with) {
+            addClan()
+            return
+          }
+          // Cross-guild shared-clan confirmation (2026-08-15, project owner's spec: "asked if he
+          // would like to add the clan to the own guild's clan roster nevertheless") — no
+          // window.confirm() (this runs in a sandboxed Activity iframe, and every other
+          // confirmation in this codebase is an inline UI element, never a browser dialog):
+          // swap the Add button for an inline Yes/Cancel pair instead.
+          addButton.remove()
+          const confirmLabel = document.createElement('span')
+          confirmLabel.className = 'guest-result-note'
+          confirmLabel.textContent = 'Add anyway?'
+          const yesButton = document.createElement('button')
+          yesButton.className = 'guest-add-button'
+          yesButton.textContent = 'Yes'
+          const cancelButton = document.createElement('button')
+          cancelButton.className = 'guest-add-button'
+          cancelButton.textContent = 'Cancel'
+          yesButton.addEventListener('click', addClan)
+          cancelButton.addEventListener('click', () => {
+            confirmLabel.remove()
+            yesButton.remove()
+            cancelButton.remove()
+            row.appendChild(addButton)
+          })
+          row.append(confirmLabel, yesButton, cancelButton)
+        })
+      } else {
+        const dmNote = result.discord_id ? '' : ' — not linked, can’t DM yet'
+        label.textContent = `${result.player_name} (${result.player_tag})${dmNote}`
+        row.appendChild(label)
+        row.appendChild(addButton)
+        addButton.addEventListener('click', async () => {
+          const sendDmNow = guestsDmCheckbox.checked && !!result.discord_id
+          addButton.disabled = true
+          guestsStatus.textContent = 'Adding…'
+          guestsStatus.className = 'guests-status'
+          try {
+            const { dm_sent } = await onGuestPlayerAdd(result, sendDmNow)
+            guestsStatus.textContent = dm_sent
+              ? `Added ${result.player_name} and sent the enrollment DM.`
+              : `Added ${result.player_name} to the enrollment pool.`
+            guestsStatus.className = 'guests-status success'
+            guestsSearchInput.value = ''
+            guestsResults.innerHTML = ''
+          } catch (err) {
+            console.error(err)
+            guestsStatus.textContent = `Failed to add ${result.player_name}: ${(err as Error).message}`
+            guestsStatus.className = 'guests-status error'
+            addButton.disabled = false
+          }
+        })
+      }
+
+      guestsResults.appendChild(row)
+    }
+  }
+
+  guestsSearchInput.addEventListener('input', () => {
+    if (searchDebounceHandle !== undefined) clearTimeout(searchDebounceHandle)
+    const query = guestsSearchInput.value.trim()
+    if (!query) {
+      guestsResults.innerHTML = ''
+      return
+    }
+    searchDebounceHandle = setTimeout(() => {
+      const thisRequestId = ++searchRequestId
+      onGuestSearch(query)
+        .then((results) => {
+          // A slower earlier request finishing after a faster later one would otherwise
+          // overwrite the results list with stale data — only the most recently *fired* request
+          // is allowed to render.
+          if (thisRequestId === searchRequestId) renderGuestResults(results)
+        })
+        .catch((err) => {
+          console.error(err)
+          if (thisRequestId === searchRequestId) {
+            guestsStatus.textContent = `Search failed: ${(err as Error).message}`
+            guestsStatus.className = 'guests-status error'
+          }
+        })
+    }, 300)
+  })
+
+  container.appendChild(guestsSection)
 
   const status = document.createElement('span')
   status.className = 'save-status'
@@ -218,7 +457,12 @@ export function renderClanConfigTable(
   container.appendChild(footer)
 }
 
-function buildRow(clan: ClanConfig, seasonStartUtc: string, seasonEndUtc: string): HTMLTableRowElement {
+function buildRow(
+  clan: ClanConfig,
+  seasonStartUtc: string,
+  seasonEndUtc: string,
+  onEvict: (clanTag: string, targetGuildId: string) => Promise<void>,
+): HTMLTableRowElement {
   const row = document.createElement('tr')
   const seasonStartMs = new Date(seasonStartUtc).getTime()
   const seasonEndMs = new Date(seasonEndUtc).getTime()
@@ -231,7 +475,53 @@ function buildRow(clan: ClanConfig, seasonStartUtc: string, seasonEndUtc: string
   checkbox.checked = clan.participating
 
   const nameCell = document.createElement('td')
-  nameCell.textContent = `${clan.name} (${clan.clan_tag})`
+  nameCell.append(`${clan.name} (${clan.clan_tag})`)
+
+  // Cross-guild shared-clan status (2026-08-15, live-testing feedback: a block-level badge
+  // wrapping onto its own line under the name made this row taller than its neighbors — even
+  // with every cell's vertical-align set to top, a taller row still visibly threw off its OWN
+  // internal alignment. Fixed by keeping the status text INLINE, directly after the clan
+  // name/tag on the very same line, so every row keeps identical height regardless of sharing
+  // status; the "read-only" explanation moved to a single general notice below the whole table
+  // (see renderClanConfigTable) instead of repeating per-row.
+  // Cross-guild shared-clan settings lock (2026-08-15 follow-up, project owner's spec): "one
+  // shared record," not two independently-edited copies — roster size & start time are the
+  // OWNER guild's alone to set; a follower's copy of this row must be visibly and functionally
+  // read-only, not just silently overridden server-side on save.
+  const isLockedByOwner = clan.shared_with !== null && !clan.shared_with.is_owner
+
+  if (clan.shared_with) {
+    const sharedWith = clan.shared_with
+    const label = document.createElement('span')
+    label.className = 'shared-clan-inline'
+    label.textContent = sharedWith.is_owner
+      ? ` 🔗 Shared with: ${sharedWith.other_guild_names.join(', ')}`
+      : ` 🔗 Managed by ${sharedWith.other_guild_names.join(', ')}`
+    nameCell.appendChild(label)
+
+    if (sharedWith.is_owner) {
+      for (let i = 0; i < sharedWith.other_guild_ids.length; i++) {
+        const targetGuildId = sharedWith.other_guild_ids[i]
+        const targetGuildName = sharedWith.other_guild_names[i]
+        const evictButton = document.createElement('button')
+        evictButton.className = 'evict-button'
+        evictButton.textContent = `Evict ${targetGuildName}`
+        evictButton.addEventListener('click', async () => {
+          evictButton.disabled = true
+          try {
+            await onEvict(clan.clan_tag, targetGuildId)
+            label.textContent = ` 🔗 Evicted ${targetGuildName} — reload to refresh this row.`
+            evictButton.remove()
+          } catch (err) {
+            console.error(err)
+            evictButton.disabled = false
+            evictButton.textContent = `Evict ${targetGuildName} (failed, retry?)`
+          }
+        })
+        nameCell.appendChild(evictButton)
+      }
+    }
+  }
 
   const tierCell = document.createElement('td')
   tierCell.textContent = clan.tier ?? '—'
@@ -284,11 +574,11 @@ function buildRow(clan: ClanConfig, seasonStartUtc: string, seasonEndUtc: string
   startCell.append(dateInput, timeSelect)
 
   function syncDisabledState(): void {
-    const disabled = !checkbox.checked
+    const disabled = !checkbox.checked || isLockedByOwner
     rosterSelect.disabled = disabled
     dateInput.disabled = disabled
     timeSelect.disabled = disabled
-    row.classList.toggle('inactive', disabled)
+    row.classList.toggle('inactive', !checkbox.checked)
   }
 
   function updateStartValue(): void {

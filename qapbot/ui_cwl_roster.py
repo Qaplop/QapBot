@@ -389,11 +389,18 @@ def _make_cwl_management_delete_callback(view: discord.ui.View):
         event = db.get_cwl_event_sync(str(interaction.guild.id), season) if db is not None else None
         if event is None:
             return
+
+        # Delete-season guard preview (2026-08-15) — read-only, so the admin sees which clans
+        # (if any) are shared with another guild BEFORE confirming, not after.
+        from qapbot.QBdiscocmdshelper_cwl import get_cwl_event_shared_clan_info_sync
+        shared_clan_info = get_cwl_event_shared_clan_info_sync(event["id"], interaction.guild.id, season)
+
         confirm_view = CwlDeleteSeasonConfirmView(
             parent_view=view,
             guild_id=interaction.guild.id,
             event_id=event["id"],
             season=event["cwl_season"],
+            shared_clan_info=shared_clan_info,
         )
         await interaction.followup.send(
             confirm_view._build_content(),  # type: ignore[attr-defined]
@@ -670,14 +677,24 @@ def _make_cwl_management_open_enrollment_web_callback(view: discord.ui.View):
 class CwlDeleteSeasonConfirmView(discord.ui.View):
     """Confirm/cancel dialog for deleting a CWL event outright, mirroring
     ui_registration.py's UnlinkConfirmView. Mainly for testing/starting over — deletion
-    cascades to cwl_event_clans/cwl_signups/cwl_assignments (ON DELETE CASCADE)."""
+    cascades to cwl_event_clans/cwl_signups/cwl_assignments (ON DELETE CASCADE).
 
-    def __init__(self, parent_view: discord.ui.View, guild_id: int, event_id: int, season: str, timeout: int = 60):
+    shared_clan_info (2026-08-15, delete-season guard): the read-only preview from
+    get_cwl_event_shared_clan_info_sync() (QBdiscocmdshelper_cwl.py), computed by the caller
+    before this view is even shown — surfaced in _build_content() as a warning, and reused
+    verbatim (not recomputed) once the admin actually confirms, so the preview and the real
+    action can never disagree about what's affected."""
+
+    def __init__(
+        self, parent_view: discord.ui.View, guild_id: int, event_id: int, season: str,
+        shared_clan_info: Optional[List[Dict[str, Any]]] = None, timeout: int = 60,
+    ):
         super().__init__(timeout=timeout)
         self.parent_view = parent_view
         self.guild_id = guild_id
         self.event_id = event_id
         self.season = season
+        self.shared_clan_info = shared_clan_info or []
 
         from qapbot.i18n import t
 
@@ -700,7 +717,17 @@ class CwlDeleteSeasonConfirmView(discord.ui.View):
     def _build_content(self) -> str:
         from qapbot.i18n import t
 
-        return t('cwl.management.delete_confirm_body', guild_id=self.guild_id, season=self.season)
+        content = t('cwl.management.delete_confirm_body', guild_id=self.guild_id, season=self.season)
+        # Only clans that STAY shared with someone else are worth warning about — a shared clan
+        # with no other guilds left attached is about to be genuinely, fully deleted, same as
+        # any other clan in this event, so it doesn't need special-casing in the warning.
+        clans_with_others = [info["clan_tag"] for info in self.shared_clan_info if info["other_guild_ids"]]
+        if clans_with_others:
+            content += t(
+                'cwl.management.delete_confirm_shared_clan_warning',
+                guild_id=self.guild_id, clans=", ".join(clans_with_others),
+            )
+        return content
 
     async def _on_confirm(self, interaction: discord.Interaction) -> None:
         if not await _check_cwl_admin_permission(interaction):
@@ -708,6 +735,13 @@ class CwlDeleteSeasonConfirmView(discord.ui.View):
         await interaction.response.defer(thinking=False, ephemeral=True)
         db = CACHE.db_manager
         if db is not None:
+            # Delete-season guard (2026-08-15) — MUST run before delete_cwl_event_sync(): repoints
+            # ownership away from this guild for any shared clan that still has another guild
+            # attached (preserving that clan's shared roster), and prunes the shared record
+            # outright only for a clan where this guild is the last one left. See
+            # prune_or_detach_shared_clans_before_deletion's docstring for the full rationale.
+            from qapbot.QBdiscocmdshelper_cwl import prune_or_detach_shared_clans_before_deletion
+            await prune_or_detach_shared_clans_before_deletion(self.guild_id, self.event_id, self.season)
             db.delete_cwl_event_sync(self.event_id)
         # The season select (Phase E.3) can't keep pointing at a season that no longer has an
         # event — clear the persisted selection so the next open falls back to
@@ -832,6 +866,15 @@ class CwlStartEnrollmentConfirmView(discord.ui.View):
         except discord.NotFound:
             pass
         if summary["ok"]:
+            # Cross-guild shared-clan notifications (2026-08-15) — one of the two trigger points
+            # (the other is handle_post_clan_config's guest-clan add, web_bridge.py). Best-effort,
+            # after the main summary is already shown — a notification failure must never mask
+            # the real Start Enrollment result.
+            for shared in summary["shared_clans"]:
+                await notify_cwl_clan_shared(
+                    self.guild_id, shared["clan_tag"], self.season, shared,
+                    acting_discord_id=interaction.user.id,
+                )
             await _refresh_parent(self.parent_view, interaction, "cwl_management")
 
     async def _on_cancel(self, interaction: discord.Interaction) -> None:
@@ -1067,6 +1110,91 @@ async def refresh_cwl_management_hub_message(guild_id: int, mode: str) -> None:
         logging.debug(f"[CWL] Hub message {message_id} not found in channel {channel_id} (guild {guild_id_str}) — will be reposted on the next repost_cwl_management_messages() cycle")
     except Exception as e:
         logging.warning(f"[CWL] refresh_cwl_management_hub_message() could not update message: {e}")
+
+
+async def _post_cwl_shared_clan_notice(guild_id: int, message: str, discord_id: Optional[int]) -> None:
+    """One guild's half of notify_cwl_clan_shared() below — a **new** message into that guild's
+    CWL Management Hub channel (if configured), distinct from refresh_cwl_management_hub_message
+    ()'s in-place status re-render (nobody would notice that as "something happened"), plus an
+    optional DM. Both best-effort: a missing Hub channel or an unreachable DM target never
+    raises, only logs — this must never fail the calling flow (a guest-clan add / Start
+    Enrollment) over a notification."""
+    import QBcore
+
+    guild_id_str = str(guild_id)
+    config = CACHE.server_config.get(guild_id_str, {})
+    channel_id = config.get("cwl_management_channel_id")
+    if channel_id:
+        channel = QBcore.bot.get_channel(int(channel_id))
+        if channel is not None and isinstance(channel, (discord.TextChannel, discord.Thread)):
+            try:
+                await channel.send(message)
+            except Exception as e:
+                logging.warning(f"[CWL] notify_cwl_clan_shared could not post to guild {guild_id_str}'s Hub channel: {e}")
+
+    if discord_id is not None:
+        try:
+            await CACHE.send_user_dm(str(discord_id), message)
+        except Exception as e:
+            logging.warning(f"[CWL] notify_cwl_clan_shared could not DM {discord_id}: {e}")
+
+
+async def notify_cwl_clan_shared(
+    acting_guild_id: int, clan_tag: str, season: str, sharing_result: Dict[str, Any],
+    acting_discord_id: Optional[int] = None,
+) -> None:
+    """Cross-guild notification for a shared CWL clan (2026-08-15, project owner's spec) —
+    called right after ensure_cwl_clan_sharing() (QBdiscocmdshelper_cwl.py) returns a non-None
+    result, from both trigger points (guest-clan add, Start Enrollment). There's no addressable
+    "guild admin list" anywhere in this bot (guild-admin = anyone holding Discord's
+    Administrator permission, an open/dynamic set, not stored) — so the acting guild gets a Hub-
+    channel post *and* a DM to the specific admin who triggered this (the one Discord ID we
+    always actually know), while every *other* affected guild only gets the Hub-channel post
+    (best-effort, only if one is configured — no reliable DM target for a guild we're not
+    currently acting on behalf of).
+
+    sharing_result is exactly what ensure_cwl_clan_sharing() returned: shared_clan_id,
+    owner_guild_id, is_new, other_guild_ids."""
+    import QBcore
+
+    owner_guild_id = sharing_result["owner_guild_id"]
+    other_guild_ids: List[str] = sharing_result["other_guild_ids"]
+    is_new = sharing_result["is_new"]
+    clan_name = CACHE.get_clan_name(clan_tag, clan_tag) or clan_tag
+    acting_guild_id_str = str(acting_guild_id)
+    is_acting_owner = owner_guild_id == acting_guild_id_str
+
+    def _guild_name(gid: str) -> str:
+        guild = QBcore.bot.get_guild(int(gid))
+        return guild.name if guild else gid
+
+    other_names = ", ".join(_guild_name(g) for g in other_guild_ids) or "another guild"
+
+    if is_new:
+        ownership_line = (
+            "Your guild is the recognized owner (real in-game Leader/Co-Leader) — only your "
+            "guild's admins can remove another guild from this clan's roster."
+            if is_acting_owner else
+            f"**{_guild_name(owner_guild_id)}** is the recognized owner (real in-game "
+            "Leader/Co-Leader) and can remove your guild from this clan's roster if needed."
+        )
+        acting_message = (
+            f"🔗 **Shared CWL Clan**\n{clan_name} ({clan_tag}) is now shared for season {season} "
+            f"with **{other_names}**. {ownership_line}"
+        )
+    else:
+        acting_message = (
+            f"🔗 {clan_name} ({clan_tag}) is a shared CWL clan for season {season} — your guild "
+            f"has joined its existing roster, shared with **{other_names}**."
+        )
+    await _post_cwl_shared_clan_notice(acting_guild_id, acting_message, acting_discord_id)
+
+    other_message = (
+        f"🔗 **Shared CWL Clan**\n{clan_name} ({clan_tag}) is now also managed by "
+        f"**{_guild_name(acting_guild_id_str)}** for season {season}."
+    )
+    for other_guild_id in other_guild_ids:
+        await _post_cwl_shared_clan_notice(int(other_guild_id), other_message, None)
 
 
 # ---------------------------------------------------------------------------

@@ -532,3 +532,53 @@ async def test_account_wide_expansion_pulls_in_other_clan_players_when_enabled(d
     assert db.get_cwl_signup_sync(event_id, "#P1") is not None
     assert db.get_cwl_signup_sync(event_id, "#P2") is not None
     assert db.get_cwl_signup_sync(event_id, "#P3") is None  # d2 never qualified
+
+
+@pytest.mark.asyncio
+async def test_start_enrollment_detects_and_reports_shared_clan(db, monkeypatch):
+    """2026-08-15 (cross-guild shared CWL clans): Start Enrollment is the second of the two
+    trigger points — a clan this guild has configured as participating might already be claimed
+    by another guild for the same season. summary['shared_clans'] must report it so the caller
+    (ui_cwl_roster.py) can notify."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    await _seed_guild_and_clan(db, "1015", clan_tag="#CLAN1")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+
+    # Guild 9999 already has #CLAN1 as a participating clan for the same season.
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('9999')")
+    await db.conn.commit()
+    other_event_id = db.create_cwl_event_sync("9999", "2026-08", "otherdiscordid")
+    db.set_cwl_event_clans_sync(other_event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+
+    await _make_event(db, "1015", "2026-08")
+    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+
+    summary = await start_cwl_enrollment(1015, "2026-08")
+
+    assert summary["ok"] is True
+    assert len(summary["shared_clans"]) == 1
+    assert summary["shared_clans"][0]["clan_tag"] == "#CLAN1"
+    assert summary["shared_clans"][0]["is_new"] is True
+    assert summary["shared_clans"][0]["other_guild_ids"] == ["9999"]
+
+    shared = db.get_cwl_shared_clan_sync("#CLAN1", "2026-08")
+    assert shared is not None
+    guild_ids = {g["guild_id"] for g in db.list_cwl_shared_clan_guilds_sync(shared["id"])}
+    assert guild_ids == {"1015", "9999"}
+
+
+@pytest.mark.asyncio
+async def test_start_enrollment_shared_clans_empty_when_nothing_shared(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    await _seed_guild_and_clan(db, "1016", clan_tag="#CLAN1")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _make_event(db, "1016", "2026-08")
+    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+
+    summary = await start_cwl_enrollment(1016, "2026-08")
+
+    assert summary["shared_clans"] == []

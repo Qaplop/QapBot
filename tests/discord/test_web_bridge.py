@@ -311,6 +311,7 @@ async def test_clan_config_get_returns_payload_for_admin(db, bridge_config, clie
         "participating": False,
         "roster_size": 15,
         "cwl_start_at": f"{season}-01T08:00Z",
+        "shared_with": None,
     }]
 
 
@@ -361,6 +362,93 @@ async def test_clan_config_post_persists_and_refreshes_hub(db, bridge_config, cl
     assert clans[0]["target_league_rank"] == "Master League II"
 
     refresh_mock.assert_awaited_once_with(666, "cwl_management")
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_config_post_triggers_sharing_for_newly_participating_shared_clan(db, bridge_config, client, monkeypatch):
+    """2026-08-15 (cross-guild shared CWL clans) — the first of the two trigger points. #CLAN1
+    is newly turned on to participating=True in this save, and another guild (9999) already has
+    it participating for the same season — must establish the shared-clan record and notify."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+
+    await _seed_guild_and_clans(db, "667", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.server_config["667"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    season = resolve_current_cwl_season()
+    db.create_cwl_event_sync("667", season, "discordid1")  # not participating yet
+
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('9999')")
+    await db.conn.commit()
+    other_event_id = db.create_cwl_event_sync("9999", season, "otherdiscordid")
+    db.set_cwl_event_clans_sync(other_event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(667, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+    notify_mock = AsyncMock()
+    monkeypatch.setattr("qapbot.ui_cwl_roster.notify_cwl_clan_shared", notify_mock)
+
+    resp = await client.post(
+        "/api/cwl/clan-config",
+        json={
+            "guild_id": 667,
+            "discord_user_id": 42,
+            "clans": [{"clan_tag": "#CLAN1", "participating": True, "roster_size": 15}],
+        },
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+
+    shared = db.get_cwl_shared_clan_sync("#CLAN1", season)
+    assert shared is not None
+    guild_ids = {g["guild_id"] for g in db.list_cwl_shared_clan_guilds_sync(shared["id"])}
+    assert guild_ids == {"667", "9999"}
+    notify_mock.assert_awaited_once()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_config_post_does_not_trigger_sharing_for_already_participating_clan(db, bridge_config, client, monkeypatch):
+    """Re-saving a clan that was ALREADY participating (e.g. just editing roster_size) must not
+    re-run the sharing check — only a clan newly turning on this save qualifies."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+
+    await _seed_guild_and_clans(db, "668", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.server_config["668"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    season = resolve_current_cwl_season()
+    event_id = db.create_cwl_event_sync("668", season, "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True, "roster_size": 15}])
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(668, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+    notify_mock = AsyncMock()
+    monkeypatch.setattr("qapbot.ui_cwl_roster.notify_cwl_clan_shared", notify_mock)
+
+    resp = await client.post(
+        "/api/cwl/clan-config",
+        json={
+            "guild_id": 668,
+            "discord_user_id": 42,
+            "clans": [{"clan_tag": "#CLAN1", "participating": True, "roster_size": 30}],
+        },
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    notify_mock.assert_not_awaited()
+    assert db.get_cwl_shared_clan_sync("#CLAN1", season) is None
 
 
 @pytest.mark.discord
@@ -777,6 +865,126 @@ async def test_enrollment_get_includes_members_of_non_participating_member_clans
     players_by_tag = {p["player_tag"]: p for p in body["players"]}
     assert "#P2" in players_by_tag
     assert players_by_tag["#P2"]["assigned_clan_tag"] is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_includes_guest_clan_roster(db, bridge_config, client, monkeypatch):
+    """2026-08-15 (Guests search, project owner's spec): a clan added to cwl_event_clans that
+    ISN'T in the guild's own member_clans/member_families (a "guest clan", added via the
+    Configure Participating Clans Guests search — see _search_cwl_guests's docstring) still gets
+    both a board column AND its current members pulled into the pool, exactly like a real family
+    clan — that's the whole "full participating clan treatment" the project owner asked for."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "792", {"#CLAN1": "Alpha", "#GUESTCLAN": "Guest Clan"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}, "#GUESTCLAN": {"name": "Guest Clan"}}
+    # #GUESTCLAN deliberately absent from member_clans/member_families — that's what makes it a
+    # guest rather than a normal family clan.
+    CACHE.server_config["792"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("792", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#CLAN1", "participating": True},
+        {"clan_tag": "#GUESTCLAN", "participating": True},
+    ])
+    await _seed_current_clan_member(db, "10", "#P1", "#CLAN1")
+    await _seed_current_clan_member(db, "20", "#PGUEST", "#GUESTCLAN")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(792, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "792", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert {c["clan_tag"] for c in body["clans"]} == {"#CLAN1", "#GUESTCLAN"}
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+    assert "#PGUEST" in players_by_tag  # pulled in via the union, not just resolve_guild_member_clan_tags
+    assert players_by_tag["#PGUEST"]["current_clan_tag"] == "#GUESTCLAN"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_marks_guest_invited_players(db, bridge_config, client, monkeypatch):
+    """A guest PLAYER (cwl_signups.source='guest_invite', from POST /api/cwl/enrollment/guest)
+    carries is_guest=True; a normal member/signup carries is_guest=False."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "793", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.server_config["793"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("793", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    await _seed_current_clan_member(db, "10", "#P1", "#CLAN1")
+    db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha1", "10", None, "template_confirm", "pending")
+    db.upsert_cwl_signup_sync(event_id, "#GUEST1", "GuestOne", "99", None, "guest_invite", "pending")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(793, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "793", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+    assert players_by_tag["#P1"]["is_guest"] is False
+    assert players_by_tag["#GUEST1"]["is_guest"] is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_resolves_current_clan_tag_outside_family_and_participating(db, bridge_config, client, monkeypatch):
+    """2026-08-15 bugfix (live-testing feedback): a guest/account-wide-expanded player's real
+    current clan can be outside BOTH the guild's own family AND every clan participating this
+    season — get_current_clan_members_sync(all_member_clan_tags) structurally can't see them,
+    which left current_clan_tag permanently null and their card stuck plain/default instead of
+    green/amber. #PGUEST is assigned to #CLAN1 (participating) but really still sits in
+    #OUTSIDE_CLAN (neither family nor participating) — must resolve to "different-clan" data,
+    i.e. current_clan_tag == #OUTSIDE_CLAN, not null."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "794", {"#CLAN1": "Alpha", "#OUTSIDE_CLAN": "Outside"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    # #OUTSIDE_CLAN deliberately absent from member_clans/member_families AND never configured
+    # as participating for this event — exactly the gap the fallback closes.
+    CACHE.server_config["794"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("794", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    await _seed_current_clan_member(db, "20", "#PGUEST", "#OUTSIDE_CLAN")
+    db.upsert_cwl_signup_sync(event_id, "#PGUEST", "GuestPlayer", "20", None, "guest_invite", "pending")
+    db.upsert_cwl_assignment_sync(event_id, "#PGUEST", "#CLAN1")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(794, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "794", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+    assert players_by_tag["#PGUEST"]["current_clan_tag"] == "#OUTSIDE_CLAN"
+    assert players_by_tag["#PGUEST"]["assigned_clan_tag"] == "#CLAN1"
 
 
 @pytest.mark.discord
@@ -1223,3 +1431,985 @@ async def test_enrollment_assign_rejects_non_admin_non_leader(bridge_config, cli
         headers={"X-Bridge-Secret": "test-secret"},
     )
     assert resp.status == 403
+
+
+# ---------------------------------------------------------------------------
+# Guests (2026-08-15) — GET /api/cwl/guest-search, POST /api/cwl/enrollment/guest. See
+# qapbot/web_bridge.py's _search_cwl_guests docstring: a guest CLAN hit is added via the
+# existing POST /api/cwl/clan-config (no separate endpoint), so only the search itself and the
+# guest-PLAYER add need coverage here.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_get_rejects_missing_secret(bridge_config, client):
+    resp = await client.get("/api/cwl/guest-search?guild_id=800&discord_user_id=42&q=foo")
+    assert resp.status == 403
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_get_rejects_non_admin(bridge_config, client, monkeypatch):
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(800, 42, is_admin=False))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=800&discord_user_id=42&q=foo",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 403
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_returns_clan_hits_excluding_already_participating(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "801", {"#CLAN1": "Marines", "#CLAN2": "QCrew"})
+    CACHE.db_manager = db
+    CACHE.server_config["801"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.clan_name_cache = {
+        "#CLAN1": {"name": "Marines"},
+        "#CLAN2": {"name": "QCrew"},
+        "#CLAN3": {"name": "Not A Match"},
+    }
+    CACHE.player_name_index = {}
+    CACHE.user_accounts = {}
+
+    event_id = db.create_cwl_event_sync("801", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(801, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=801&discord_user_id=42&q=cr",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    # #CLAN1 (Marines) already participates -> excluded even though "cr" isn't in its name;
+    # #CLAN2 (QCrew) matches "cr" and isn't participating -> included; #CLAN3 doesn't match "cr".
+    assert body["results"] == [
+        {"type": "clan", "clan_tag": "#CLAN2", "clan_name": "QCrew", "clan_tier": None, "already_shared_with": None}
+    ]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_highlights_clan_already_on_another_guilds_roster(db, bridge_config, client, monkeypatch):
+    """2026-08-15 (cross-guild shared CWL clans, project owner's spec): a clan already
+    participating in ANOTHER guild's event for the same season is still shown (never hidden),
+    annotated with already_shared_with so the frontend can highlight it and confirm before add."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+
+    await _seed_guild_and_clans(db, "811", {"#CLAN1": "Marines"})
+    CACHE.db_manager = db
+    CACHE.server_config["811"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Marines"}}
+    CACHE.player_name_index = {}
+    CACHE.user_accounts = {}
+
+    season = resolve_current_cwl_season()
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('9999')")
+    await db.conn.commit()
+    other_event_id = db.create_cwl_event_sync("9999", season, "otherdiscordid")
+    db.set_cwl_event_clans_sync(other_event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+
+    import QBcore
+    admin_member = MagicMock()
+    admin_member.guild_permissions.administrator = True
+    acting_guild = MagicMock()
+    acting_guild.get_member = MagicMock(return_value=admin_member)
+    acting_guild.fetch_member = AsyncMock(return_value=admin_member)
+    other_guild = MagicMock()
+    other_guild.name = "The Other Guild"
+
+    def _get_guild(gid):
+        return acting_guild if gid == 811 else (other_guild if gid == 9999 else None)
+
+    bot = MagicMock()
+    bot.get_guild = MagicMock(side_effect=_get_guild)
+    monkeypatch.setattr(QBcore, "bot", bot)
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=811&discord_user_id=42&q=marines",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == [
+        {
+            "type": "clan", "clan_tag": "#CLAN1", "clan_name": "Marines", "clan_tier": None,
+            "already_shared_with": "The Other Guild",
+        }
+    ]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_clan_hit_includes_live_tier(db, bridge_config, client, monkeypatch):
+    """2026-08-15 bugfix (live-testing feedback): a guest clan added via the search previously
+    always showed tier "—" until the next full page reload, because the search result never
+    carried CACHE's live war_league at all — the frontend just hardcoded tier: null when
+    constructing the new row."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "810", {"#CLAN1": "Marines"})
+    CACHE.db_manager = db
+    CACHE.server_config["810"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Marines", "war_league": "Master League I"}}
+    CACHE.player_name_index = {}
+    CACHE.user_accounts = {}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(810, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=810&discord_user_id=42&q=marines",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == [
+        {
+            "type": "clan", "clan_tag": "#CLAN1", "clan_name": "Marines", "clan_tier": "Master League I",
+            "already_shared_with": None,
+        }
+    ]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_returns_player_hit_by_name(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "802", {"#OUTSIDE_CLAN": "Outside"})
+    CACHE.db_manager = db
+    CACHE.server_config["802"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {}
+    CACHE.player_name_index = {"#GUEST1": "GuestPlayer"}
+    CACHE.user_accounts = {}
+    await _seed_current_clan_member(db, "555", "#GUEST1", "#OUTSIDE_CLAN")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(802, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=802&discord_user_id=42&q=guest",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == [
+        {"type": "player", "player_tag": "#GUEST1", "player_name": "Player", "discord_id": "555"}
+    ]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_returns_player_hit_via_discord_account_name(db, bridge_config, client, monkeypatch):
+    """Searching a Discord display name surfaces that account's linked players directly,
+    flattened — not a nested 'discord_user' result type (see _search_cwl_guests docstring)."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "803", {})
+    CACHE.db_manager = db
+    CACHE.server_config["803"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {}
+    CACHE.player_name_index = {}
+    CACHE.user_accounts = {
+        "777": {"display_name": "Qaplop", "players": [{"player_tag": "#Q1", "player_name": "Qaplop"}]},
+    }
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(803, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=803&discord_user_id=42&q=qap",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == [
+        {"type": "player", "player_tag": "#Q1", "player_name": "Qaplop", "discord_id": None}
+    ]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_raw_unindexed_tag_still_returned(db, bridge_config, client, monkeypatch):
+    """A tag the bot has genuinely never seen still comes back as a hit (name = the tag itself)
+    so the admin can add it directly — it just can't be DMed until it's real."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "804", {})
+    CACHE.db_manager = db
+    CACHE.server_config["804"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {}
+    CACHE.player_name_index = {}
+    CACHE.user_accounts = {}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(804, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=804&discord_user_id=42&q=%23NEVERSEEN",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == [
+        {"type": "player", "player_tag": "#NEVERSEEN", "player_name": "#NEVERSEEN", "discord_id": None}
+    ]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_empty_query_returns_empty(bridge_config, client, monkeypatch):
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(805, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=805&discord_user_id=42&q=",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == []
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_guest_creates_signup_row(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "806", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["806"] = {"member_clans": ["#CLAN1"], "member_families": []}
+
+    event_id = db.create_cwl_event_sync("806", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(806, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+    send_dm_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr("qapbot.QBdiscocmdshelper_cwl.send_cwl_signup_template_dm", send_dm_mock)
+
+    resp = await client.post(
+        "/api/cwl/enrollment/guest",
+        json={
+            "guild_id": 806, "discord_user_id": 42, "player_tag": "#guest1",
+            "player_name": "GuestOne", "discord_id": None, "send_dm_on_save": False,
+        },
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body == {"ok": True, "dm_sent": False}
+    signup = db.get_cwl_signup_sync(event_id, "#GUEST1")
+    assert signup is not None
+    assert signup["player_name"] == "GuestOne"
+    assert signup["source"] == "guest_invite"
+    assert signup["status"] == "pending"
+    send_dm_mock.assert_not_awaited()  # no discord_id given, and send_dm_on_save was False anyway
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_guest_sends_dm_when_requested_and_linked(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "807", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["807"] = {"member_clans": ["#CLAN1"], "member_families": []}
+
+    event_id = db.create_cwl_event_sync("807", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(807, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+    send_dm_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr("qapbot.QBdiscocmdshelper_cwl.send_cwl_signup_template_dm", send_dm_mock)
+
+    resp = await client.post(
+        "/api/cwl/enrollment/guest",
+        json={
+            "guild_id": 807, "discord_user_id": 42, "player_tag": "#GUEST2",
+            "player_name": "GuestTwo", "discord_id": "999", "send_dm_on_save": True,
+        },
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body == {"ok": True, "dm_sent": True}
+    send_dm_mock.assert_awaited_once()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_guest_no_event_returns_409(bridge_config, client, monkeypatch):
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(808, 42, is_admin=True))
+
+    resp = await client.post(
+        "/api/cwl/enrollment/guest",
+        json={
+            "guild_id": 808, "discord_user_id": 42, "player_tag": "#GUEST3",
+            "player_name": "GuestThree", "discord_id": None, "send_dm_on_save": False,
+        },
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 409
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_guest_rejects_non_admin(bridge_config, client, monkeypatch):
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(809, 42, is_admin=False))
+
+    resp = await client.post(
+        "/api/cwl/enrollment/guest",
+        json={
+            "guild_id": 809, "discord_user_id": 42, "player_tag": "#GUEST4",
+            "player_name": "GuestFour", "discord_id": None, "send_dm_on_save": False,
+        },
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 403
+
+
+# ---------------------------------------------------------------------------
+# Shared-clan owner-only eviction: POST /api/cwl/shared-clan/evict (2026-08-15)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_shared_clan_evict_owner_removes_target(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "820", {"#CLAN1": "Alpha"})
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('821')")
+    await db.conn.commit()
+    CACHE.db_manager = db
+    CACHE.server_config["820"] = {}
+
+    owner_event_id = db.create_cwl_event_sync("820", "2026-09", "111")
+    target_event_id = db.create_cwl_event_sync("821", "2026-09", "222")
+    db.set_cwl_event_clans_sync(owner_event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    db.set_cwl_event_clans_sync(target_event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    shared_clan_id = db.create_cwl_shared_clan_sync("#CLAN1", "2026-09", "820", owner_event_id, "unresolved_first_claimer")
+    db.add_guild_to_shared_clan_sync(shared_clan_id, "820", owner_event_id)
+    db.add_guild_to_shared_clan_sync(shared_clan_id, "821", target_event_id)
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(820, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    resp = await client.post(
+        "/api/cwl/shared-clan/evict",
+        json={"guild_id": 820, "discord_user_id": 42, "clan_tag": "#CLAN1", "target_guild_id": 821},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    remaining_guilds = {g["guild_id"] for g in db.list_cwl_shared_clan_guilds_sync(shared_clan_id)}
+    assert remaining_guilds == {"820"}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_shared_clan_evict_rejects_non_owner_guild(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "822", {"#CLAN1": "Alpha"})
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('823')")
+    await db.conn.commit()
+    CACHE.db_manager = db
+    CACHE.server_config["822"] = {}
+
+    # Guild 823 is the owner; guild 822 (a mere admin of a different, non-owner attached guild)
+    # tries to evict 823 — must be rejected even though 822's own admin check passes.
+    owner_event_id = db.create_cwl_event_sync("823", "2026-09", "111")
+    acting_event_id = db.create_cwl_event_sync("822", "2026-09", "222")
+    db.set_cwl_event_clans_sync(acting_event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    shared_clan_id = db.create_cwl_shared_clan_sync("#CLAN1", "2026-09", "823", owner_event_id, "unresolved_first_claimer")
+    db.add_guild_to_shared_clan_sync(shared_clan_id, "822", acting_event_id)
+    db.add_guild_to_shared_clan_sync(shared_clan_id, "823", owner_event_id)
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(822, 42, is_admin=True))
+
+    resp = await client.post(
+        "/api/cwl/shared-clan/evict",
+        json={"guild_id": 822, "discord_user_id": 42, "clan_tag": "#CLAN1", "target_guild_id": 823},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 403
+    remaining_guilds = {g["guild_id"] for g in db.list_cwl_shared_clan_guilds_sync(shared_clan_id)}
+    assert remaining_guilds == {"822", "823"}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_shared_clan_evict_rejects_non_admin(bridge_config, client, monkeypatch):
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(824, 42, is_admin=False))
+
+    resp = await client.post(
+        "/api/cwl/shared-clan/evict",
+        json={"guild_id": 824, "discord_user_id": 42, "clan_tag": "#CLAN1", "target_guild_id": 825},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 403
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_config_get_reports_shared_with_info(db, bridge_config, client, monkeypatch):
+    """The Configure Participating Clans GET payload's new shared_with field (2026-08-15) — used
+    by the frontend to show the shared badge and, for the owner, the evict affordance."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+
+    await _seed_guild_and_clans(db, "826", {"#CLAN1": "Alpha"})
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('827')")
+    await db.conn.commit()
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.server_config["826"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    season = resolve_current_cwl_season()
+    event_id = db.create_cwl_event_sync("826", season, "111")
+    other_event_id = db.create_cwl_event_sync("827", season, "222")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    db.set_cwl_event_clans_sync(other_event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    shared_clan_id = db.create_cwl_shared_clan_sync("#CLAN1", season, "826", event_id, "unresolved_first_claimer")
+    db.add_guild_to_shared_clan_sync(shared_clan_id, "826", event_id)
+    db.add_guild_to_shared_clan_sync(shared_clan_id, "827", other_event_id)
+
+    import QBcore
+    other_guild = MagicMock()
+    other_guild.name = "Sister Guild"
+    admin_member = MagicMock()
+    admin_member.guild_permissions.administrator = True
+    acting_guild = MagicMock()
+    acting_guild.get_member = MagicMock(return_value=admin_member)
+    acting_guild.fetch_member = AsyncMock(return_value=admin_member)
+    bot = MagicMock()
+    bot.get_guild = MagicMock(side_effect=lambda gid: acting_guild if gid == 826 else (other_guild if gid == 827 else None))
+    monkeypatch.setattr(QBcore, "bot", bot)
+
+    resp = await client.get(
+        "/api/cwl/clan-config",
+        params={"guild_id": "826", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["clans"][0]["shared_with"] == {
+        "is_owner": True, "other_guild_ids": ["827"], "other_guild_names": ["Sister Guild"],
+    }
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_config_get_shows_owners_roster_size_for_follower(db, bridge_config, client, monkeypatch):
+    """De-sync guard follow-up (2026-08-15, live-testing feedback): the Configure Participating
+    Clans screen used to read each guild's own local roster_size/cwl_start_at even for an
+    already-shared clan — unlike the Manage Enrollment board, which already deferred to the
+    owner. A follower must see the OWNER's canonical settings here too, never its own stale
+    local copy."""
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    CACHE.server_config["840"] = {"member_clans": [], "member_families": []}
+    CACHE.server_config["841"] = {"member_clans": [], "member_families": []}
+    await _seed_shared_clan_pair(db, "840", "841")  # owner=840 (roster_size 30), follower=841 (15)
+
+    import QBcore
+    admin_member = MagicMock()
+    admin_member.guild_permissions.administrator = True
+    follower_guild = MagicMock()
+    follower_guild.get_member = MagicMock(return_value=admin_member)
+    follower_guild.fetch_member = AsyncMock(return_value=admin_member)
+    owner_guild = MagicMock()
+    owner_guild.name = "Owner Guild"
+    bot = MagicMock()
+    bot.get_guild = MagicMock(side_effect=lambda gid: follower_guild if gid == 841 else (owner_guild if gid == 840 else None))
+    monkeypatch.setattr(QBcore, "bot", bot)
+
+    resp = await client.get(
+        "/api/cwl/clan-config", params={"guild_id": "841", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    clan = next(c for c in body["clans"] if c["clan_tag"] == "#CLAN1")
+    assert clan["roster_size"] == 30
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_config_post_from_follower_cannot_diverge_shared_settings(db, bridge_config, client, monkeypatch):
+    """The write-side half of the same guard: even if a follower's form somehow still submits a
+    different roster_size/cwl_start_at for an already-shared clan, the save must silently keep
+    the owner's canonical values — never persist a divergent local copy."""
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    CACHE.server_config["842"] = {"member_clans": [], "member_families": []}
+    CACHE.server_config["843"] = {"member_clans": [], "member_families": []}
+    shared_clan_id, owner_event_id, follower_event_id = await _seed_shared_clan_pair(db, "842", "843")
+
+    import QBcore
+    admin_member = MagicMock()
+    admin_member.guild_permissions.administrator = True
+    follower_guild = MagicMock()
+    follower_guild.get_member = MagicMock(return_value=admin_member)
+    follower_guild.fetch_member = AsyncMock(return_value=admin_member)
+    owner_guild = MagicMock()
+    owner_guild.name = "Owner Guild"
+    bot = MagicMock()
+    bot.get_guild = MagicMock(side_effect=lambda gid: follower_guild if gid == 843 else (owner_guild if gid == 842 else None))
+    monkeypatch.setattr(QBcore, "bot", bot)
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    resp = await client.post(
+        "/api/cwl/clan-config",
+        json={
+            "guild_id": 843, "discord_user_id": 42,
+            "clans": [{"clan_tag": "#CLAN1", "participating": True, "roster_size": 99, "cwl_start_at": "2026-09-05T12:00Z"}],
+        },
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    follower_row = db.get_cwl_event_clans_sync(follower_event_id)[0]
+    assert follower_row["roster_size"] == 30  # owner's value, not the submitted 99
+    assert follower_row["cwl_start_at"] != "2026-09-05T12:00Z"
+    # The owner's own row is untouched by the follower's save.
+    owner_row = db.get_cwl_event_clans_sync(owner_event_id)[0]
+    assert owner_row["roster_size"] == 30
+
+
+# ---------------------------------------------------------------------------
+# Live shared roster (slice 4, 2026-08-15) — both guilds' boards render the identical live
+# roster for a shared clan, and edits from either side apply to the same underlying data.
+# ---------------------------------------------------------------------------
+
+async def _seed_shared_clan_pair(db: WarHistoryDB, owner_guild_id: str, follower_guild_id: str, clan_tag: str = "#CLAN1"):
+    await _seed_guild_and_clans(db, owner_guild_id, {clan_tag: "Alpha"})
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (follower_guild_id,))
+    await db.conn.commit()
+    owner_event_id = db.create_cwl_event_sync(owner_guild_id, "2026-09", "111")
+    follower_event_id = db.create_cwl_event_sync(follower_guild_id, "2026-09", "222")
+    db.set_cwl_event_clans_sync(owner_event_id, [{"clan_tag": clan_tag, "participating": True, "roster_size": 30}])
+    db.set_cwl_event_clans_sync(follower_event_id, [{"clan_tag": clan_tag, "participating": True, "roster_size": 15}])
+    shared_clan_id = db.create_cwl_shared_clan_sync(clan_tag, "2026-09", owner_guild_id, owner_event_id, "unresolved_first_claimer")
+    db.add_guild_to_shared_clan_sync(shared_clan_id, owner_guild_id, owner_event_id)
+    db.add_guild_to_shared_clan_sync(shared_clan_id, follower_guild_id, follower_event_id)
+    return shared_clan_id, owner_event_id, follower_event_id
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_uses_owner_roster_size_for_shared_clan(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    CACHE.server_config["830"] = {"member_clans": [], "member_families": []}
+    CACHE.server_config["831"] = {"member_clans": [], "member_families": []}
+    await _seed_shared_clan_pair(db, "830", "831")  # owner=830 (roster_size 30), follower=831 (15)
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(831, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment", params={"guild_id": "831", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    # Follower's board shows the OWNER's roster_size (30), not its own local row's (15).
+    assert body["clans"][0]["roster_size"] == 30
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_shared_clan_add_remove_readd_flow_stays_consistent(db, bridge_config, client, monkeypatch):
+    """End-to-end regression test for the exact live-testing sequence that surfaced the ownership
+    bug (2026-08-15, project owner's spec: "check this flow that all statuses in each edge case...
+    get updated correctly"): guild 851 (1) adds a clan that's already guild 850's real home clan
+    and saves, (2) removes it and saves again, (3) starts its own enrollment (moving its event
+    past 'draft'), then (4) re-adds the same clan and saves once more. Ownership must stay with
+    850 (the real home guild) throughout, 851 must be cleanly detached after step 2 (not left
+    dangling as "still sharing" something it turned off), and the clan's current members must end
+    up visible with a real status after step 4 even though most of them have no prior CWL history
+    in this exact clan (the auto-assign-on-add visibility-seed fix)."""
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    CACHE.server_config["850"] = {"member_clans": ["#CLAN1"], "member_families": []}  # real home
+    CACHE.server_config["851"] = {"member_clans": [], "member_families": []}  # acting/guest guild
+
+    await _seed_guild_and_clans(db, "850", {"#CLAN1": "Alpha"})
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('851')")
+    await db.conn.commit()
+    home_event_id = db.create_cwl_event_sync("850", "2026-09", "1")
+    acting_event_id = db.create_cwl_event_sync("851", "2026-09", "2")
+    db.set_cwl_event_clans_sync(home_event_id, [{"clan_tag": "#CLAN1", "participating": True, "roster_size": 30}])
+
+    # A handful of current #CLAN1 members: #P1 has prior CWL history in this exact clan
+    # (qualifies for auto-assignment once the roster's empty); #P2/#P3 don't (visibility-seed
+    # only).
+    for tag, discord_id in (("#P1", "10"), ("#P2", "11"), ("#P3", "12")):
+        await _seed_current_clan_member(db, discord_id, tag, "#CLAN1")
+    await db.conn.execute(
+        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
+        "VALUES ('war1', '#CLAN1', '#OPP', 1, '2026-08', '2026-08-01T10:00')"
+    )
+    await db.conn.execute(
+        "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars, attack_order) "
+        "VALUES ('war1', '#CLAN1', '2026-08-01T10:00', 'P1', '#P1', 15, 1, 2, 1)"
+    )
+    await db.conn.commit()
+
+    # #LEADER is #CLAN1's real in-game Leader, linked, a Discord member of the HOME guild (850)
+    # only — never joins 851 at all, so ownership must resolve to 850 unambiguously.
+    await _seed_current_clan_member(db, "999", "#LEADER", "#CLAN1")
+    await db.conn.execute("UPDATE user_players SET verified = 1 WHERE player_tag = '#LEADER'")
+    await db.conn.commit()
+
+    import QBcore
+    fake_coc_cache = MagicMock()
+    fake_clan = MagicMock()
+    leader_role = MagicMock()
+    leader_role.name = "leader"
+    leader_member = MagicMock()
+    leader_member.tag = "#LEADER"
+    leader_member.role = leader_role
+    fake_clan.members = [leader_member]
+    fake_coc_cache.get_clan = AsyncMock(return_value=fake_clan)
+    monkeypatch.setattr(CACHE, "coc_clan_cache", fake_coc_cache)
+
+    admin_member = MagicMock()
+    admin_member.guild_permissions.administrator = True
+    acting_guild = MagicMock()
+    acting_guild.get_member = MagicMock(return_value=admin_member)
+    acting_guild.fetch_member = AsyncMock(return_value=admin_member)
+
+    def _home_get_member(discord_id):
+        return MagicMock() if str(discord_id) == "999" else None
+
+    home_guild = MagicMock()
+    home_guild.name = "Home Guild"
+    home_guild.get_member = MagicMock(side_effect=_home_get_member)
+    home_guild.fetch_member = AsyncMock(side_effect=_home_get_member)
+
+    bot = MagicMock()
+    bot.get_guild = MagicMock(side_effect=lambda gid: acting_guild if gid == 851 else (home_guild if gid == 850 else None))
+    monkeypatch.setattr(QBcore, "bot", bot)
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+    monkeypatch.setattr("qapbot.ui_cwl_roster.notify_cwl_clan_shared", AsyncMock())
+
+    async def _save(participating: bool) -> None:
+        resp = await client.post(
+            "/api/cwl/clan-config",
+            json={
+                "guild_id": 851, "discord_user_id": 42,
+                "clans": [{"clan_tag": "#CLAN1", "participating": participating, "roster_size": 15}],
+            },
+            headers={"X-Bridge-Secret": "test-secret"},
+        )
+        assert resp.status == 200
+
+    # Step 1: add #CLAN1 (still 'draft' — auto-assign doesn't run yet) and save.
+    await _save(True)
+    shared = db.get_cwl_shared_clan_sync("#CLAN1", "2026-09")
+    assert shared is not None
+    assert shared["owner_guild_id"] == "850"  # real home guild, not the acting one
+    guild_ids = {g["guild_id"] for g in db.list_cwl_shared_clan_guilds_sync(shared["id"])}
+    assert guild_ids == {"850", "851"}
+
+    # Step 2: remove (uncheck) #CLAN1 and save — 851 must cleanly detach.
+    await _save(False)
+    guild_ids = {g["guild_id"] for g in db.list_cwl_shared_clan_guilds_sync(shared["id"])}
+    assert guild_ids == {"850"}
+    still_shared = db.get_cwl_shared_clan_sync("#CLAN1", "2026-09")
+    assert still_shared is not None  # home guild still attached — record survives
+    assert still_shared["owner_guild_id"] == "850"  # unaffected, 851 was never the owner
+
+    # Step 3: 851 starts its own enrollment (moves its event past 'draft').
+    db.update_cwl_event_status_sync(acting_event_id, "signup_open")
+
+    # Step 4: re-add #CLAN1 and save — must re-attach, keep the SAME owner, apply the roster_size
+    # guard, and seed a status for every current member (auto-assigned or visibility-seeded).
+    await _save(True)
+    guild_ids = {g["guild_id"] for g in db.list_cwl_shared_clan_guilds_sync(shared["id"])}
+    assert guild_ids == {"850", "851"}
+    reattached = db.get_cwl_shared_clan_sync("#CLAN1", "2026-09")
+    assert reattached["owner_guild_id"] == "850"  # still the real home guild
+
+    # roster_size guard: 851 submitted 15, but 850 (owner) has 30 — 850's value wins.
+    acting_row = db.get_cwl_event_clans_sync(acting_event_id)[0]
+    assert acting_row["roster_size"] == 30
+
+    shared_players = {p["player_tag"]: p for p in db.get_cwl_shared_clan_players_sync(shared["id"])}
+    assert shared_players["#P1"]["status"] == "confirmed"  # prior CWL history in this exact clan
+    assert shared_players["#P1"]["source"] == "auto_assigned"
+    assert shared_players["#P2"]["status"] == "pending"  # visibility-seeded, no prior history
+    assert shared_players["#P2"]["source"] == "auto_seeded"
+    assert shared_players["#P3"]["status"] == "pending"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_foreign_guest_conversion_and_purge_end_to_end_through_real_endpoints(db, bridge_config, client, monkeypatch):
+    """Full HTTP-level regression test for the exact scenario the project owner described
+    (2026-08-15): guild 853 adds guild 852's real clan #CLAN1 as a guest, drags one of #CLAN1's
+    REAL members into its own private clan #PRIVATE, then detaches #CLAN1 — that player should
+    "become a guest player automatically" and linger in #PRIVATE (still visible, still assigned).
+    Only once #CLAN1's real owning guild (852) later reassigns that exact player elsewhere should
+    they disappear from guild 853's roster AND pool entirely — verified through the actual
+    POST /api/cwl/clan-config and POST /api/cwl/enrollment/assign endpoints, not by calling the
+    underlying helpers directly, to prove the wiring itself works end to end."""
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}, "#PRIVATE": {"name": "Beta"}}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    CACHE.server_config["852"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.server_config["853"] = {"member_clans": ["#PRIVATE"], "member_families": []}
+    shared_clan_id, owner_event_id, follower_event_id = await _seed_shared_clan_pair(db, "852", "853")
+    await _seed_guild_and_clans(db, "853", {"#PRIVATE": "Beta"})
+    db.set_cwl_event_clans_sync(follower_event_id, [
+        {"clan_tag": "#CLAN1", "participating": True}, {"clan_tag": "#PRIVATE", "participating": True},
+    ])
+    await _seed_current_clan_member(db, "77", "#REALMEMBER", "#CLAN1")  # real #CLAN1 member
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(853, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    # Step 1: guild 853 drags #REALMEMBER (a real #CLAN1 member) into its own private #PRIVATE.
+    resp = await client.post(
+        "/api/cwl/enrollment/assign",
+        json={"guild_id": 853, "discord_user_id": 42, "player_tag": "#REALMEMBER", "clan_tag": "#PRIVATE"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(follower_event_id)}
+    assert assignments["#REALMEMBER"] == "#PRIVATE"
+
+    # Step 2: guild 853 detaches #CLAN1 (unchecks it and saves).
+    resp = await client.post(
+        "/api/cwl/clan-config",
+        json={"guild_id": 853, "discord_user_id": 42, "clans": [
+            {"clan_tag": "#CLAN1", "participating": False, "roster_size": 15},
+            {"clan_tag": "#PRIVATE", "participating": True, "roster_size": 15},
+        ]},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    # Lingers, now as a guest — matches "that is ok from my view so far."
+    signup = db.get_cwl_signup_sync(follower_event_id, "#REALMEMBER")
+    assert signup is not None
+    assert signup["source"] == "guest_invite"
+    assert signup["origin_shared_clan_id"] == shared_clan_id
+    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(follower_event_id)}
+    assert assignments["#REALMEMBER"] == "#PRIVATE"  # still there
+
+    # Step 3: #CLAN1's real owning guild (852) reassigns #REALMEMBER elsewhere on ITS OWN board.
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(852, 43, is_admin=True))
+    resp = await client.post(
+        "/api/cwl/enrollment/assign",
+        json={"guild_id": 852, "discord_user_id": 43, "player_tag": "#REALMEMBER", "clan_tag": None},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+
+    # Guild 853's foreign placement is now gone entirely — not just unassigned.
+    assert db.get_cwl_signup_sync(follower_event_id, "#REALMEMBER") is None
+    assignments = {a["player_tag"] for a in db.get_cwl_assignments_sync(follower_event_id)}
+    assert "#REALMEMBER" not in assignments
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_shows_owners_signup_status_for_unassigned_shared_clan_member(
+    db, bridge_config, client, monkeypatch,
+):
+    """De-sync guard follow-up (2026-08-15, project owner's spec: "the enrollment status per
+    player is global... no harm to show the enrollment status also for players from other
+    clans/guilds") — a current member of a shared clan who isn't assigned into the shared roster
+    yet (so the roster-merge override below doesn't touch them) still sits in the general pool via
+    plain current-membership; if the OWNER guild's own cwl_signups already recorded a real status
+    for that same real player, show it instead of a hardcoded blank."""
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    CACHE.server_config["844"] = {"member_clans": [], "member_families": []}
+    CACHE.server_config["845"] = {"member_clans": [], "member_families": []}
+    shared_clan_id, owner_event_id, _ = await _seed_shared_clan_pair(db, "844", "845")
+    # #P1 is a current member of the shared clan and already confirmed via the OWNER guild's own
+    # Start Enrollment — but was never assigned into cwl_shared_clan_players (still unassigned).
+    db.upsert_cwl_signup_sync(owner_event_id, "#P1", "Alpha1", "999", None, "template_confirm", "confirmed")
+    await _seed_current_clan_member(db, "999", "#P1", "#CLAN1")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(845, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment", params={"guild_id": "845", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    player = next(p for p in body["players"] if p["player_tag"] == "#P1")
+    assert player["signup_status"] == "confirmed"
+    assert player["assigned_clan_tag"] is None  # still genuinely unassigned, just status-enriched
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_shows_identical_roster_from_either_guild(db, bridge_config, client, monkeypatch):
+    """The core claim of this feature: a player assigned to the shared clan via one guild's
+    board shows up identically when the OTHER guild builds its own payload."""
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    CACHE.server_config["832"] = {"member_clans": [], "member_families": []}
+    CACHE.server_config["833"] = {"member_clans": [], "member_families": []}
+    shared_clan_id, _, _ = await _seed_shared_clan_pair(db, "832", "833")
+    db.upsert_cwl_shared_clan_player_sync(shared_clan_id, "#P1", "Alpha1", "999", "confirmed", "guest_invite", "832")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(833, 42, is_admin=True))
+
+    # Fetching guild 833's (the follower's) own board.
+    resp = await client.get(
+        "/api/cwl/enrollment", params={"guild_id": "833", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    body = await resp.json()
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+    assert players_by_tag["#P1"]["assigned_clan_tag"] == "#CLAN1"
+    assert players_by_tag["#P1"]["signup_status"] == "confirmed"
+    assert players_by_tag["#P1"]["is_guest"] is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_signup_confirm_writes_to_shared_table_for_shared_clan_player(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    CACHE.server_config["834"] = {"member_clans": [], "member_families": []}
+    CACHE.server_config["835"] = {"member_clans": [], "member_families": []}
+    shared_clan_id, owner_event_id, follower_event_id = await _seed_shared_clan_pair(db, "834", "835")
+    db.upsert_cwl_shared_clan_player_sync(shared_clan_id, "#P1", "Alpha1", "999", "pending", "guest_invite", "834")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(835, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    # The FOLLOWER guild (835) confirms the player — must write to the shared table, not its
+    # own (empty) local cwl_signups.
+    resp = await client.post(
+        "/api/cwl/enrollment/signup",
+        json={"guild_id": 835, "discord_user_id": 42, "player_tag": "#P1", "action": "confirm"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    shared_players = {p["player_tag"]: p for p in db.get_cwl_shared_clan_players_sync(shared_clan_id)}
+    assert shared_players["#P1"]["status"] == "confirmed"
+    assert shared_players["#P1"]["added_by_guild_id"] == "835"
+    # De-sync guard (2026-08-15): the follower's own local cwl_signups now gets a mirrored
+    # placeholder row too, so any local-only feature that reads its cwl_signups directly (not via
+    # the shared-table merge) still knows this player exists — see
+    # sync_cwl_shared_clan_roster_to_local_pools's docstring.
+    mirrored = db.get_cwl_signup_sync(follower_event_id, "#P1")
+    assert mirrored["status"] == "confirmed"
+    assert mirrored["source"] == "guest_invite"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_assign_to_shared_clan_writes_to_shared_table(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    CACHE.server_config["836"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.server_config["837"] = {"member_clans": [], "member_families": []}
+    shared_clan_id, owner_event_id, follower_event_id = await _seed_shared_clan_pair(db, "836", "837")
+    await _seed_current_clan_member(db, "999", "#P1", "#CLAN1")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(836, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    resp = await client.post(
+        "/api/cwl/enrollment/assign",
+        json={"guild_id": 836, "discord_user_id": 42, "player_tag": "#P1", "clan_tag": "#CLAN1"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    shared_players = {p["player_tag"]: p for p in db.get_cwl_shared_clan_players_sync(shared_clan_id)}
+    assert shared_players["#P1"]["status"] == "confirmed"
+    assert shared_players["#P1"]["player_name"] == "Player"
+    # Never created a stale LOCAL assignment row for the owner's own event.
+    assert db.get_cwl_assignments_sync(owner_event_id) == []
+    # De-sync guard (2026-08-15): the FOLLOWER guild's own local cwl_signups gets a mirrored
+    # placeholder too, even though it never independently signed this player up.
+    mirrored = db.get_cwl_signup_sync(follower_event_id, "#P1")
+    assert mirrored["status"] == "confirmed"
+    assert mirrored["source"] == "guest_invite"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_assign_away_from_shared_clan_removes_shared_row(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    CACHE.server_config["838"] = {"member_clans": [], "member_families": []}
+    CACHE.server_config["839"] = {"member_clans": [], "member_families": []}
+    shared_clan_id, owner_event_id, _ = await _seed_shared_clan_pair(db, "838", "839")
+    db.upsert_cwl_shared_clan_player_sync(shared_clan_id, "#P1", "Alpha1", "999", "confirmed", "guest_invite", "838")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(838, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    # Drag to Unassigned (clan_tag: null).
+    resp = await client.post(
+        "/api/cwl/enrollment/assign",
+        json={"guild_id": 838, "discord_user_id": 42, "player_tag": "#P1", "clan_tag": None},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    assert db.get_cwl_shared_clan_players_sync(shared_clan_id) == []

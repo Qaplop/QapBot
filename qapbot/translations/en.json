@@ -759,7 +759,8 @@
       "button_activate_hub": "Activate CWL Management Hub Message",
       "button_deactivate_hub": "Deactivate CWL Management Hub Message",
       "enrollment_pool_block_title": "Enrollment Pool",
-      "enrollment_pool_value": "Include a signed-up account's other characters (any clan): {status}",
+      "enrollment_pool_status": "Status: {status}",
+      "enrollment_pool_description": "Include a signed-up member's other CoC accounts that currently are in clans that are not a member of this guild/family.",
       "button_enable_include_all_accounts": "Include All Linked Accounts",
       "button_disable_include_all_accounts": "Stop Including All Linked Accounts"
     },
@@ -792,6 +793,7 @@
       "button_confirm_delete": "Yes, Delete Season",
       "button_add_season": "Add New Season",
       "delete_confirm_body": "⚠️ Delete the **{season}** CWL season? This removes all participating-clan settings and sign-ups for it and cannot be undone.",
+      "delete_confirm_shared_clan_warning": "\n\n🔗 **{clans}** — shared with another guild for this season. Their roster will be preserved for the other guild; only your guild's participation is removed.",
       "open_web_fallback": "⚠️ Could not open the web view directly — try the /launch command instead.",
       "open_enrollment_fallback": "⚠️ Could not open the enrollment view directly — try the /launch command instead.",
       "season_select_placeholder": "Select CWL season:",

@@ -85,6 +85,9 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 - DO: Use `INSERT OR IGNORE`, `CREATE TABLE IF NOT EXISTS`, etc.
 - DON'T: Write migrations that fail on re-run.
 - WHY: Safe recovery and reruns.
+- DO: Any DDL on a newly-migrated column (an index, a constraint, anything) belongs immediately after that column's own `_add_column_if_missing()` call in the migration block — never placed inline right after the table's `CREATE TABLE IF NOT EXISTS`.
+- DON'T: Assume `CREATE TABLE IF NOT EXISTS` ever adds a column to an *existing* table — it's a guaranteed no-op there (the normal case on every DEV/PROD restart, not the exception), so DDL referencing a new column placed right after it will read "no such column" against any database that isn't brand new.
+- WHY: A 2026-08-15 incident placed `CREATE INDEX ... ON cwl_signups(origin_shared_clan_id, ...)` right after `CREATE TABLE IF NOT EXISTS cwl_signups (...)`, instead of after the migration block's `_add_column_if_missing("cwl_signups", "origin_shared_clan_id", ...)` call further down. Against any already-initialized database the table already existed (so the CREATE TABLE was a no-op and the column genuinely didn't exist yet at that point), and the index statement threw `no such column` — aborting the **entire** database initialization, so the bot couldn't start at all. Fixed by deleting the inline index (an identical, correctly-placed one already existed after the migration call).
 📖 Details: ../qapbot/docs/DATABASE_ARCHITECTURE.md § Migration Principles
 
 ### 13) Documentation references: plain text paths only

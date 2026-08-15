@@ -269,6 +269,13 @@ export function renderEnrollmentBoard(
     card.className = 'player-card'
     const matchClass = clanMatchClass(player)
     if (matchClass) card.classList.add(matchClass)
+    // Subtle left-border accent only (no new element, no height impact) — see .guest-card in
+    // index.html for why: this card grid's row-height parity across every column was hard-won
+    // (2026-08-14 fix history above), so a guest marker can't risk perturbing it.
+    if (player.is_guest) {
+      card.classList.add('guest-card')
+      card.title = 'Invited as a guest'
+    }
     card.draggable = true
     card.addEventListener('dragstart', (e) => {
       e.dataTransfer?.setData('text/plain', player.player_tag)
@@ -415,6 +422,12 @@ export function renderEnrollmentBoard(
     const countSpan = document.createElement('span')
     countSpan.className = 'column-count'
     countSpan.textContent = rosterSize !== null ? `(${players.length}/${rosterSize})` : `(${players.length})`
+    // Roster-filled indicator (live-testing feedback, 2026-08-15) — green once the column has
+    // reached or passed its target roster_size, amber while still short. Unassigned has no
+    // rosterSize (no target to measure against), so it stays the plain default color.
+    if (rosterSize !== null) {
+      countSpan.classList.add(players.length >= rosterSize ? 'count-met' : 'count-under')
+    }
     nameLine.appendChild(countSpan)
     columnHeader.appendChild(nameLine)
 

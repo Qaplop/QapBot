@@ -1,7 +1,183 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
-2026-08-15 (32)
+2026-08-15 (10)
+- Fixed: live DEV testing of the cross-guild shared-clan feature (entry 9) surfaced a real
+  ownership-resolution bug: `resolve_cwl_clan_owner`'s only tiebreak beyond role/verified was
+  iteration order over `affected_guild_ids`, which always lists the ACTING (newly-joining) guild
+  first — so a clan's real Leader/Co-Leader being a Discord member of more than one affected
+  guild (plausible: same admin account in their real clan's server AND a personal/test server)
+  let the acting guild win regardless of which one actually manages the clan. Fixed by ranking
+  "does this guild track the clan natively (member_clans/member_families)" ahead of iteration
+  order, plus a warning log when the bot process isn't even a member of one of the affected
+  guilds (silently excluded a guild from consideration with no other signal).
+- Fixed: the Configure Participating Clans screen (unlike Manage Enrollment, which already
+  deferred to the owner) was still reading AND writing each guild's own local roster_size/
+  cwl_start_at/target_league_rank for an already-shared clan. `_build_clan_config_payload` now
+  sources from the owner's row; `handle_post_clan_config` overrides a non-owner's submitted
+  values back to the owner's before saving; frontend shows read-only inputs + a "Managed by X"
+  hint. Surfaced a second bug in the same payload builder: a guest/shared clan's tag was never
+  unioned into `all_tags`, so it silently vanished from the table on every reload after the save
+  that added it.
+- Added: auto-assign-on-add + visibility seed (`auto_assign_prior_cwl_members_if_empty`) — a
+  clan added to the roster after Start Enrollment already ran (a guest clan, or any clan
+  reactivated later) now gets pre-filled with current members who have prior CWL history in
+  that exact clan (if the roster's still empty), and every OTHER current member gets a plain
+  'pending' placeholder so they show a status icon instead of nothing at all.
+- Added: enrollment status enrichment — a shared clan's current member who isn't assigned into
+  the shared roster yet now shows the sharing partner guild's real signup status instead of a
+  blank, when known.
+- Added: detach-on-deactivate (`detach_guild_from_shared_clan_on_deactivation`) — unchecking a
+  shared clan (not deleting the whole season) now cleanly detaches the guild from
+  `cwl_shared_clan_guilds` and repoints ownership if it was the owner, instead of leaving it
+  listed as "still sharing" forever. Verified end-to-end against the exact live-testing sequence
+  that surfaced the ownership bug above: add -> save -> remove -> save -> start enrollment ->
+  re-add -> save.
+- Added: foreign-guest conversion + purge — if a guild cross-assigns a shared clan's REAL member
+  into one of its own private clans, then detaches from that shared clan, the player now
+  "becomes a guest player automatically" (`cwl_signups.source='guest_invite'`, new nullable
+  `origin_shared_clan_id` column) instead of just silently lingering with no trace of where they
+  came from; once the clan's real owning guild reassigns that exact player elsewhere, the
+  foreign placement is now purged entirely (assignment + signup row), not just unassigned.
+- Fixed (PROD-risk, caught same day): the `origin_shared_clan_id` migration above initially
+  shipped with its `CREATE INDEX` placed inline right after `CREATE TABLE IF NOT EXISTS
+  cwl_signups`, which is a no-op against any pre-existing database — so on any already-
+  initialized DEV/PROD database the index statement ran before the column existed, throwing
+  "no such column" and aborting the ENTIRE database initialization (bot couldn't start at all).
+  Fixed by removing the inline index — the identical, correctly-placed one already existed right
+  after the real `_add_column_if_missing()` migration call. Verified against a scripted
+  pre-existing database that the fix migrates cleanly with zero data loss. General lesson
+  recorded in `.github/copilot-instructions.md` Rule 12 and `CWL_ROSTER_PLANNING_PLAN.md`.
+- Reverted: a purge hook was briefly added to `handle_post_cwl_enrollment_signup`'s withdraw
+  branch, then caught and removed — that endpoint's "1-click confirm/withdraw" board button was
+  already removed earlier this same session in favor of drag-and-drop-only, so it has no live
+  caller; the endpoint itself is still wired up but effectively orphaned (left as a known,
+  separate cleanup opportunity, not removed in this pass).
+- Fixed: today's changelog entries were numbered continuing yesterday's count (28)-(36) instead
+  of restarting at (1) for the new day — renumbered to (1)-(9); 2026-08-14's own numbering is
+  untouched.
+  `qapbot/QBdiscocmdshelper_cwl.py`, `qapbot/web_bridge.py`, `qapbot/db_manager.py`,
+  `activity/client/src/clanConfigTable.ts`, `index.html`. Tests: ~20 new/updated across
+  `tests/unit/test_cwl_clan_ownership.py`, `tests/discord/test_web_bridge.py`.
+  `.\run_tests.ps1`: 1935 passed, 4 deselected. `activity/client` redeployed to DEV after each
+  frontend-affecting change. Nothing from this entry committed, pushed, or deployed to PROD —
+  the schema change means the bot needs a restart to pick up the migration whenever deployed.
+
+2026-08-15 (9)
+- Added: Cross-guild shared CWL clans — a real-world clan can only actually play CWL for one
+  roster, but nothing previously stopped two independent guilds from each configuring the same
+  clan_tag into their own separate CWL events for the same season with zero coordination.
+  Confirmed with the project owner: don't block this, share it — both guilds manage ONE real
+  record instead of two fake independent ones. New tables `cwl_shared_clans`/
+  `cwl_shared_clan_guilds`/`cwl_shared_clan_players` (`db_manager.py`) — deliberately separate
+  from `cwl_event_clans`/`cwl_signups`/`cwl_assignments`, which are NEVER written on behalf of
+  another guild, so a bug in the sharing code can't leak/corrupt a different guild's private
+  roster. Ownership: whichever affected guild has a Discord-linked, guild-present account
+  holding the clan's real in-game Leader/Co-Leader rank (Leader beats Co-Leader, verified beats
+  unverified within a tier) is the "owner guild" (`resolve_cwl_clan_owner`, live CoC API lookup
+  via the existing `coc_clan_cache.get_clan()`); unresolvable falls back to first-claimer, never
+  blocks. Two trigger points call the shared orchestrator `ensure_cwl_clan_sharing`: adding a
+  guest clan already claimed elsewhere (`handle_post_clan_config`, with a "already on X's
+  roster — add anyway?" highlight+confirm in the Guests search) and Start Enrollment discovering
+  one of its own clans is already claimed (`start_cwl_enrollment`). Both guilds get notified
+  (new Hub-channel message + a DM to whichever admin actually triggered it — there's no
+  addressable "guild admin list" anywhere in this bot). Owner-only eviction
+  (`evict_guild_from_shared_clan`, `POST /api/cwl/shared-clan/evict`) removes another guild's
+  participation without touching the shared roster itself; a new Evict button appears on
+  Configure Participating Clans for the owner. Delete-season guard fixes a real data-loss risk:
+  deleting a season used to be instant/unconditional and would have cascade-wiped a shared
+  clan's roster out from under the other guild — now it repoints ownership (if the deleting
+  guild was the owner) and preserves the shared roster whenever another guild remains attached,
+  only actually deleting the shared record when the deleting guild was the last one left; the
+  delete confirmation dialog now warns which clan(s)/guild(s) are affected first.
+  Live merge (the actual "editing from either guild affects both"): `_build_enrollment_payload`
+  sources a shared clan's roster_size from the OWNER's settings and its player pool from
+  `cwl_shared_clan_players` instead of the per-guild tables; the signup-confirm and drag-and-drop
+  assign endpoints branch the same way on write. `qapbot/QBdiscocmdshelper_cwl.py`,
+  `qapbot/web_bridge.py`, `qapbot/ui_cwl_roster.py`, `qapbot/db_manager.py`. New Worker routes
+  in `activity/server/src/index.ts`. Frontend: `clanConfigTable.ts` highlights an already-shared
+  search hit and confirms before adding, shows a shared badge + owner-only Evict button per row.
+  Tests: 40+ new across `tests/unit/test_cwl_clan_ownership.py` (new file — ownership
+  resolution, orchestrator, delete-guard, eviction), `tests/unit/test_db_manager_cwl_shared_clans.py`
+  (new file — full CRUD for the 3 new tables), `tests/discord/test_web_bridge.py` (search
+  highlight, sharing triggers, eviction endpoint, `shared_with` payload field, and the live
+  merge itself — roster_size from the owner, identical roster from either guild's payload,
+  signup/assign writes routing to the shared table, removal on drag-away), `tests/integration/
+  test_cwl_start_enrollment.py`, `tests/discord/test_ui_cwl_roster.py` (delete-guard warning
+  text). `.\run_tests.ps1`: 1915 passed, 4 deselected. Frontend `npm run typecheck`/`build`
+  clean for both `activity/client` and `activity/server`. **Not yet verified live** — no DEV
+  click-through of this feature yet (needs two real test guilds sharing one clan tag).
+
+2026-08-15 (8)
+- Fixed: a guest clan added via the Guests search showed tier "—" and an empty start-time picker
+  until the next full page reload, instead of the same live-tier/season-default values every
+  other clan row gets. Root cause: the frontend constructed the new row locally with
+  `tier: null, cwl_start_at: null` hardcoded, and the guest-search result never carried CACHE's
+  live `war_league` at all to fill `tier` with. `web_bridge.py`'s `_search_cwl_guests` now
+  includes `clan_tier` (`CACHE.get_clan_war_league`) on every clan hit; `clanConfigTable.ts` uses
+  it for `tier` and reuses the same `seasonStartUtc` default
+  (`_build_clan_config_payload`'s "1st of the season's month, 08:00 UTC") for `cwl_start_at`
+  instead of `null`. Tests: 2 new/updated in `test_web_bridge.py`. `.\run_tests.ps1`: 1868
+  passed, 4 deselected. Frontend typecheck clean, deployed to DEV.
+
+2026-08-15 (7)
+- Fixed: a guest/account-wide-expanded player's card on the Manage Enrollment board was stuck on
+  the plain/default shade forever, never green ("moved to assigned clan") or amber ("hasn't
+  moved yet") — `_build_enrollment_payload`'s `current_clan_tag` resolution
+  (`get_current_clan_members_sync(all_member_clan_tags)`) is clan-scoped, so a player whose real
+  current clan is outside BOTH the guild's family AND every clan participating this season (the
+  exact case the new Guests/account-wide-expansion features create) could never get a
+  `current_clan_by_tag` entry at all. New player-scoped fallback,
+  `db_manager.get_current_clan_tags_for_players_sync()`, same pattern as the existing th_level
+  fallback right above it. `web_bridge.py`, `db_manager.py`. Tests: `TestGetCurrentClanTagsForPlayers`
+  (`tests/unit/test_db_manager_cwl_roster.py`), 1 new end-to-end case in `test_web_bridge.py`.
+- Changed: Manage Enrollment board — "Sort by:"/"Show:" now sit on one line with a modest gap
+  (`.sort-row` was an unstyled plain block div, so its two `.sort-selector` children stacked one
+  per line by default block flow; now `display: flex`). Each clan column's `(current/roster_size)`
+  count is now green once met/exceeded, amber while still short (`enrollmentBoard.ts`,
+  `index.html`, live-testing feedback).
+- Changed: CWL Settings' new "Enrollment Pool" block (entry 32) now matches every other
+  enable/disable setting's "Status: 🟢/🔴 Enabled/Disabled" line shape instead of squeezing the
+  status onto the same line as the description; description text reworded for clarity:
+  "Include a signed-up member's other CoC accounts that currently are in clans that are not a
+  member of this guild/family." `QBdiscocmdshelper_cwl.py`, `en.json`/`de.json`
+  (live-testing feedback).
+  `.\run_tests.ps1`: 1867 passed, 4 deselected. Frontend `npm run typecheck`/`build` clean;
+  deployed to DEV (client + Worker) for live testing — bot-side changes need the usual manual
+  PROD Python deploy/restart before the amber-color fix and settings text show up there.
+
+2026-08-15 (6)
+- Added: CWL "Guests" — invite a clan or individual player from outside this guild's own clan
+  family into the current season's enrollment, from a new search box on the Activity's Configure
+  Participating Clans screen. A guest CLAN is a full participating clan (board column, entire
+  current roster pulled in) — it's just appended to the same clan list the screen already edits
+  and saves via the existing `POST /api/cwl/clan-config`, no new persistence of its own. A guest
+  PLAYER is added directly to `cwl_signups` (source='guest_invite'), bypassing the "must already
+  be a current member of a participating clan" restriction the normal 1-click-signup endpoint
+  enforces, with an option to send the enrollment DM immediately (bypasses the
+  cwl_dm_restrict_to_admin bulk-safety guard — this is one admin deliberately DMing one person
+  right now, same category as `/admin` TEST_NOTIFY, not the blast that guard exists to catch).
+  Search is unified across Discord display name / CoC player name / player tag / clan name+tag,
+  backed by the existing `player_name_index` (already powers `/whois`) plus `CACHE.user_accounts`
+  and `CACHE.clan_name_cache` — a typed-but-unindexed tag still returns as a raw, addable hit.
+  New `db_manager.py`: `get_player_links_sync()`. New `web_bridge.py`: `_search_cwl_guests()`,
+  `GET /api/cwl/guest-search`, `POST /api/cwl/enrollment/guest`; `_build_enrollment_payload()`'s
+  player-pool clan set now unions `resolve_guild_member_clan_tags()` with the event's actual
+  `participating_clan_tags` (what makes a guest clan's roster show up), and each player now
+  carries `is_guest`. `QBdiscocmdshelper_cwl.py`: `_send_cwl_signup_template_dm` renamed to
+  `send_cwl_signup_template_dm` (dropped leading underscore — now called cross-module). New
+  Worker routes in `activity/server/src/index.ts` (`GET /cwl/guest-search`,
+  `POST /cwl/enrollment/guest`), same verify-then-proxy pattern as every other route there.
+  Frontend: new "Guests" section in `clanConfigTable.ts` (debounced search, typed result list,
+  per-result Add), `enrollmentBoard.ts`/`index.html` mark a guest-invited card with a subtle
+  left-accent (`box-shadow`, not a border/width change — the card grid's row-height/width parity
+  was hard-won, see the 2026-08-15 alignment-fix history above it in the same files).
+  Tests: 16 new (`tests/discord/test_web_bridge.py`'s guest-search/guest-signup/payload-wiring
+  cases, `tests/unit/test_db_manager_cwl_roster.py`'s `TestGetPlayerLinks`). Frontend
+  `npm run typecheck`/`build` clean for both `activity/client` and `activity/server`.
+  `.\run_tests.ps1`: 1861 passed, 4 deselected.
+
+2026-08-15 (5)
 - Added: CWL enrollment "account-wide expansion" — a new per-guild toggle (`guild_config.
   cwl_enrollment_include_all_linked_accounts`, off by default) that, once a Discord account
   qualifies for Start Enrollment's signup pool via one participating-clan player, also pulls in
@@ -21,7 +197,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   updated. Docs: new dated section in `CWL_ROSTER_PLANNING_PLAN.md`.
   `.\run_tests.ps1`: 1845 passed, 4 deselected.
 
-2026-08-15 (31)
+2026-08-15 (4)
 - Added: `/list` "Testers" action (bot admin only) — shows the *effective* full DM-testing
   recipient list: `CONFIG.server_admin` (always included, DEV and PROD) plus everyone in
   `CACHE.testers` (PROD only). Also hardened `/admin` MANAGE_TESTERS so the bot admin's own
@@ -34,7 +210,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   gates, `tests/discord/test_dm_command_invocation.py`. `.\run_tests.ps1`: 1836 passed,
   4 deselected.
 
-2026-08-15 (30)
+2026-08-15 (3)
 - Changed: testers (entry 29 below) now only receive DMs on a PROD host — a DEV host always DMs
   only `CONFIG.server_admin`, same as before testers existed, even if `CACHE.testers` is
   non-empty. `QBdiscocmdshelper_cwl.py`'s DM guard now checks `not CONFIG.is_dev_mode and
@@ -56,7 +232,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   `resolve_guild_member_clan_tags()` requires and the old tests never set). Docs: new dated
   section in `CWL_ROSTER_PLANNING_PLAN.md`. `.\run_tests.ps1`: 1831 passed, 4 deselected.
 
-2026-08-15 (29)
+2026-08-15 (2)
 - Added: `/admin` bot-admin-exclusive "Manage Testers" action — a `discord.ui.UserSelect`
   multi-picker (mirrors TEST_NOTIFY's user-picker) that replaces the DM-testing allowlist with
   whatever's selected, so enroll/remove is one control (deselect = remove). Persisted in a new
@@ -72,7 +248,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   `tests/unit/test_cache_manager_phase5.py` (added `load_testers` to `TestLoadAll`'s expected
   loader calls). `.\run_tests.ps1`: 1825 passed, 4 deselected.
 
-2026-08-15 (28)
+2026-08-15 (1)
 - Fixed: PROD Activity "Setup failed: failed to resolve screen (404)" — the
   `cwl-clan-config-server-prod` Cloudflare Worker (the OAuth/proxy layer in front of the bridge)
   hadn't been code-redeployed since 2026-08-09, a day before the Manage Enrollment routes

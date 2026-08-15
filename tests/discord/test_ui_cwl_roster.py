@@ -615,6 +615,49 @@ async def test_cwl_delete_season_confirm_view_confirm_deletes_and_refreshes(db, 
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_cwl_delete_season_confirm_view_warns_about_shared_clans(db, mock_interaction):
+    """2026-08-15 (delete-season guard) — a clan shared with another guild shows up in the
+    warning text, but deleting still proceeds: this guild's own event is fully removed while
+    the OTHER guild's attachment to the shared clan (and its roster) survives untouched."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import get_cwl_event_shared_clan_info_sync
+    from qapbot.ui_cwl_roster import CwlDeleteSeasonConfirmView
+
+    await _seed_guild_and_clans(db, "446", {"#CLAN1": "Alpha"})
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('447')")
+    await db.conn.commit()
+    CACHE.db_manager = db
+    CACHE.server_config["446"] = {}
+
+    event_id = db.create_cwl_event_sync("446", "2026-09", "discordid1")
+    other_event_id = db.create_cwl_event_sync("447", "2026-09", "otherdiscordid")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    shared_clan_id = db.create_cwl_shared_clan_sync("#CLAN1", "2026-09", "446", event_id, "unresolved_first_claimer")
+    db.add_guild_to_shared_clan_sync(shared_clan_id, "446", event_id)
+    db.add_guild_to_shared_clan_sync(shared_clan_id, "447", other_event_id)
+    db.upsert_cwl_shared_clan_player_sync(shared_clan_id, "#P1", "Player", "111", "confirmed", "guest_invite", "446")
+
+    shared_clan_info = get_cwl_event_shared_clan_info_sync(event_id, 446, "2026-09")
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+    confirm_view = CwlDeleteSeasonConfirmView(
+        parent_view=parent, guild_id=446, event_id=event_id, season="2026-09", shared_clan_info=shared_clan_info,
+    )
+    assert "#CLAN1" in confirm_view._build_content()
+
+    await confirm_view._on_confirm(mock_interaction)
+
+    assert db.get_cwl_event_sync("446", "2026-09") is None  # this guild's own event is gone
+    shared = db.get_cwl_shared_clan_by_id_sync(shared_clan_id)
+    assert shared is not None  # shared record survives — guild 447 still attached
+    assert shared["owner_guild_id"] == "447"  # repointed away from the deleting guild
+    remaining_guilds = {g["guild_id"] for g in db.list_cwl_shared_clan_guilds_sync(shared_clan_id)}
+    assert remaining_guilds == {"447"}
+    assert db.get_cwl_shared_clan_players_sync(shared_clan_id) != []  # roster preserved
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_cwl_delete_season_confirm_view_cancel_does_not_delete(db, mock_interaction):
     from qapbot.cache_manager import CACHE
     from qapbot.ui_cwl_roster import CwlDeleteSeasonConfirmView

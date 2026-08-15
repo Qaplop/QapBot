@@ -212,6 +212,72 @@ api.post('/cwl/enrollment/assign', async (c) => {
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 409 | 503)
 })
 
+// Guests (2026-08-15) — invite a guest clan/player into Configure Participating Clans' Guests
+// search. Same verify-identity-then-proxy pattern as everything above; guest CLANS never call
+// the guest endpoint (they're just added into the same `clans` array POST /cwl/clan-config
+// already saves) — only the search and the individual-guest-player add need new routes here.
+
+api.get('/cwl/guest-search', async (c) => {
+  const guildId = c.req.query('guild_id')
+  if (!guildId) return c.json({ error: 'missing guild_id' }, 400)
+  const q = c.req.query('q') ?? ''
+
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  const upstream = await fetch(
+    `${c.env.BRIDGE_URL}/api/cwl/guest-search?guild_id=${encodeURIComponent(guildId)}&discord_user_id=${encodeURIComponent(discordUserId)}&q=${encodeURIComponent(q)}`,
+    { headers: { 'X-Bridge-Secret': c.env.BRIDGE_SECRET } },
+  )
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
+})
+
+api.post('/cwl/enrollment/guest', async (c) => {
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  let body: Record<string, unknown>
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  const upstream = await fetch(`${c.env.BRIDGE_URL}/api/cwl/enrollment/guest`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': c.env.BRIDGE_SECRET },
+    body: JSON.stringify({ ...body, discord_user_id: discordUserId }),
+  })
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 409 | 503)
+})
+
+// Owner-only eviction (2026-08-15) — removes target_guild_id's participation in a shared clan.
+// Same proxy pattern; the real ownership check happens bridge-side (evict_guild_from_shared_clan).
+api.post('/cwl/shared-clan/evict', async (c) => {
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  let body: Record<string, unknown>
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  const upstream = await fetch(`${c.env.BRIDGE_URL}/api/cwl/shared-clan/evict`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': c.env.BRIDGE_SECRET },
+    body: JSON.stringify({ ...body, discord_user_id: discordUserId }),
+  })
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 503)
+})
+
 const app = new Hono<{ Bindings: Bindings }>()
 app.route('/api', api)
 app.route('/', api)

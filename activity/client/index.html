@@ -18,7 +18,15 @@
       .tz-note { margin-bottom: 12px; font-size: 0.8rem; color: #f2f3f5; }
 
       table { border-collapse: collapse; width: 100%; }
-      th, td { padding: 4px 12px; text-align: left; border-bottom: 1px solid #3f4147; }
+      /* vertical-align: top (2026-08-15, live-testing feedback: "the lines got broken" after
+         adding a shared clan) — a shared clan's name cell grows taller than its neighbors (the
+         badge wraps below the clan name), and without an explicit vertical-align every column
+         defaulted to its own alignment within that taller row — the roster-size select sank
+         toward the badge's line while start-time/checkbox stayed anchored near the top, so the
+         row's controls no longer lined up with each other or with the clan name. Top-aligning
+         every cell keeps all of a row's content anchored to the same line regardless of which
+         cell happens to be tallest. */
+      th, td { padding: 4px 12px; text-align: left; border-bottom: 1px solid #3f4147; vertical-align: top; }
       th { color: #f2f3f5; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.02em; padding-top: 6px; padding-bottom: 6px; }
       thead th {
         position: sticky;
@@ -29,8 +37,33 @@
       tr.inactive td:not(:first-child) { opacity: 0.5; }
       .tier-cell { color: #f2f3f5; }
 
+      /* Cross-guild shared-clan status (2026-08-15, kept inline after live-testing feedback: a
+         block-level badge wrapping onto its own line under the clan name made that row taller
+         than its neighbors, breaking the table's row alignment even with vertical-align: top —
+         staying on the same line as the name/tag keeps every row's height identical regardless
+         of sharing status) — plain inline text, no block wrapper; per-row "read-only" wording
+         moved to a single general notice below the whole table instead of repeating per-row. */
+      .shared-clan-inline { font-size: 0.75rem; color: #f0b232; }
+      .shared-clan-readonly-notice {
+        margin-top: 10px;
+        font-size: 0.8rem;
+        color: #f0b232;
+      }
+      .evict-button {
+        margin-left: 8px;
+        background: #3f4147;
+        color: #f2f3f5;
+        border: none;
+        border-radius: 4px;
+        padding: 2px 8px;
+        font-size: 0.7rem;
+        cursor: pointer;
+      }
+      .evict-button:hover:not(:disabled) { background: #f23f42; }
+      .evict-button:disabled { opacity: 0.5; cursor: default; }
+
       input[type="checkbox"] { width: 16px; height: 16px; accent-color: #5865f2; }
-      select, input[type="date"] {
+      select, input[type="date"], input[type="text"] {
         background: #1e1f22;
         color: #f2f3f5;
         border: 1px solid #3f4147;
@@ -41,6 +74,58 @@
       select:disabled, input:disabled { cursor: not-allowed; }
       .start-time-cell { display: flex; gap: 8px; align-items: center; }
       .start-time-cell input[type="date"] { flex: 1; min-width: 0; }
+
+      /* "Guests" invite section (2026-08-15) — Configure Participating Clans' search for
+         inviting a clan or individual player from outside this guild's own family. Sits below
+         the table, above the Save/Cancel footer, as its own block (not the sticky header — a
+         search box + growing results list doesn't belong in a region meant to stay short). */
+      .guests-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid #3f4147; }
+      .guests-title { font-size: 1rem; font-weight: 600; margin-bottom: 4px; }
+      .guests-hint { font-size: 0.8rem; color: #949ba4; margin-bottom: 10px; }
+      .guests-search-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+      .guests-search-input { flex: 1; min-width: 220px; }
+      .guests-dm-label { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: #f2f3f5; white-space: nowrap; }
+      .guests-results { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; }
+      .guest-result {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+        background: #1e1f22;
+        border: 1px solid #3f4147;
+        border-radius: 4px;
+      }
+      .guest-result-badge {
+        font-size: 0.7rem;
+        text-transform: uppercase;
+        letter-spacing: 0.02em;
+        padding: 2px 6px;
+        border-radius: 3px;
+        flex-shrink: 0;
+      }
+      .guest-result-badge.clan { background: #2b3a4a; color: #7fb3e0; }
+      .guest-result-badge.player { background: #2b3a2f; color: #8fce9d; }
+      /* Cross-guild shared-clan highlight (2026-08-15) — a hit already on another guild's
+         roster still shows up (never hidden), just visibly flagged before the admin confirms
+         adding it anyway. */
+      .guest-result.guest-result-shared { border-color: #f0b232; background: #2e2717; }
+      .guest-result-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.85rem; }
+      .guest-result-note { font-size: 0.75rem; color: #949ba4; flex-shrink: 0; }
+      .guest-add-button {
+        background: #3f4147;
+        color: #f2f3f5;
+        border: none;
+        border-radius: 4px;
+        padding: 4px 10px;
+        font-size: 0.8rem;
+        cursor: pointer;
+        flex-shrink: 0;
+      }
+      .guest-add-button:hover:not(:disabled) { background: #4a4d54; }
+      .guest-add-button:disabled { opacity: 0.5; cursor: default; }
+      .guests-status { font-size: 0.8rem; margin-top: 6px; min-height: 1em; }
+      .guests-status.success { color: #23a55a; }
+      .guests-status.error { color: #f23f42; }
 
       .footer { margin-top: 16px; display: flex; align-items: center; gap: 12px; }
       .sticky-footer {
@@ -111,7 +196,18 @@
       .legend { display: flex; align-items: center; gap: 12px; }
       .legend-item { display: flex; align-items: center; gap: 4px; font-size: 0.75rem; color: #f2f3f5; }
       .legend-icon { width: 16px; height: 16px; }
+      /* Was an unstyled plain block div — its two .sort-selector children (each display:flex,
+         but block-level themselves) stacked one per line by default block flow, with nothing
+         actually asking for that. flex here puts "Sort by:" and "Show:" on one line with a
+         modest gap between the two groups (live-testing feedback, 2026-08-15); flex-wrap keeps
+         it from overflowing on a narrow window. */
+      .sort-row { display: flex; align-items: center; gap: 28px; flex-wrap: wrap; }
       .sort-selector { display: flex; align-items: center; gap: 14px; font-size: 0.8rem; color: #f2f3f5; }
+      /* Vertical rule between "Sort by" and "Show" (2026-08-15, live-testing feedback: the plain
+         gap alone read as one continuous row of options, not two separate settings groups) —
+         border on every selector after the first rather than a one-off class, so a future third
+         group gets the same divider for free. */
+      .sort-selector:not(:first-child) { padding-left: 28px; border-left: 1px solid rgba(242, 243, 245, 0.25); }
       .sort-label { color: #f2f3f5; }
       .sort-option { display: flex; align-items: center; gap: 4px; cursor: pointer; }
       .sort-option input { accent-color: #5865f2; cursor: pointer; }
@@ -165,6 +261,11 @@
       .column-header-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
       .column-header-tier { font-size: 0.72rem; font-weight: 400; line-height: 1.2; }
       .column-count { font-weight: 700; flex-shrink: 0; }
+      /* Roster-filled indicator (2026-08-15) — green once (current/roster_size) is met or
+         exceeded, amber while still short. Unassigned's count keeps the plain default color
+         (no rosterSize class added there at all — see enrollmentBoard.ts's buildColumn()). */
+      .column-count.count-met { color: #23a55a; }
+      .column-count.count-under { color: #f0b232; }
       .card-list {
         padding: 8px;
         display: flex;
@@ -221,6 +322,12 @@
          plain shade above (see enrollmentBoard.ts's clanMatchClass()). */
       .player-card.same-clan { background: #1f3d2a; border-color: #2d6a45; }
       .player-card.different-clan { background: #4a3a1a; border-color: #8a6a2a; }
+      /* Guest-invite marker (2026-08-15) — an inset box-shadow, not a border-width change: this
+         card grid's row-height/width parity across every column took real work to get right (see
+         .roster-band-bg's own comment above), and box-shadow paints without touching the box
+         model at all, so this can't perturb any of that. Layers under same-clan/different-clan's
+         background override fine since box-shadow paints on top regardless of background color. */
+      .player-card.guest-card { box-shadow: inset 3px 0 0 0 #f0b232; }
       .player-card.dragging { opacity: 0.4; }
       /* Open roster slot — no player assigned yet. Not draggable (see buildPlaceholderCard()),
          just a quiet placeholder so the roster band always shows all roster_size slots. No

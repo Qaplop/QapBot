@@ -758,7 +758,8 @@
       "button_activate_hub": "CWL-Verwaltungs-Hub-Nachricht aktivieren",
       "button_deactivate_hub": "CWL-Verwaltungs-Hub-Nachricht deaktivieren",
       "enrollment_pool_block_title": "Anmeldepool",
-      "enrollment_pool_value": "Weitere Accounts eines angemeldeten Mitglieds einbeziehen (beliebiger Clan): {status}",
+      "enrollment_pool_status": "Status: {status}",
+      "enrollment_pool_description": "Weitere CoC-Accounts eines angemeldeten Mitglieds einbeziehen, die sich aktuell in Clans befinden, die nicht Teil dieses Servers/dieser Familie sind.",
       "button_enable_include_all_accounts": "Alle verknüpften Accounts einbeziehen",
       "button_disable_include_all_accounts": "Alle verknüpften Accounts nicht mehr einbeziehen"
     },
@@ -791,6 +792,7 @@
       "button_confirm_delete": "Ja, Saison löschen",
       "button_add_season": "Neue Saison hinzufügen",
       "delete_confirm_body": "⚠️ Die CWL-Saison **{season}** löschen? Dadurch werden alle Einstellungen der teilnehmenden Clans und alle Anmeldungen dafür entfernt und können nicht wiederhergestellt werden.",
+      "delete_confirm_shared_clan_warning": "\n\n🔗 **{clans}** — für diese Saison mit einem anderen Server geteilt. Deren Kader bleibt für den anderen Server erhalten; es wird nur die Teilnahme deines Servers entfernt.",
       "open_web_fallback": "⚠️ Die Web-Ansicht konnte nicht direkt geöffnet werden — versuche stattdessen den Befehl /launch.",
       "open_enrollment_fallback": "⚠️ Die Anmeldungs-Ansicht konnte nicht direkt geöffnet werden — versuche stattdessen den Befehl /launch.",
       "season_select_placeholder": "CWL-Saison auswählen:",

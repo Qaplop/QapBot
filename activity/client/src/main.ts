@@ -7,7 +7,7 @@
 import { DiscordSDK, RPCCloseCodes } from '@discord/embedded-app-sdk'
 import { renderClanConfigTable } from './clanConfigTable'
 import { renderEnrollmentBoard } from './enrollmentBoard'
-import type { ClanConfig, ClanConfigPayload, EnrollmentPayload, ScreenPayload } from './types'
+import type { ClanConfig, ClanConfigPayload, EnrollmentPayload, GuestSearchResult, ScreenPayload } from './types'
 
 const clientId = import.meta.env.VITE_CLIENT_ID as string | undefined
 
@@ -137,6 +137,47 @@ async function setup(): Promise<void> {
         }
       },
       closeActivity,
+      async (query: string) => {
+        const searchResponse = await fetch(
+          `/api/cwl/guest-search?guild_id=${encodeURIComponent(guildId)}&q=${encodeURIComponent(query)}`,
+          { headers: { Authorization: `Bearer ${accessToken}` } },
+        )
+        if (!searchResponse.ok) {
+          const body = await searchResponse.text()
+          throw new Error(`${searchResponse.status}: ${body}`)
+        }
+        const { results } = (await searchResponse.json()) as { results: GuestSearchResult[] }
+        return results
+      },
+      async (result, sendDmNow: boolean) => {
+        const guestResponse = await fetch('/api/cwl/enrollment/guest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+          body: JSON.stringify({
+            guild_id: guildId,
+            player_tag: result.player_tag,
+            player_name: result.player_name,
+            discord_id: result.discord_id,
+            send_dm_on_save: sendDmNow,
+          }),
+        })
+        if (!guestResponse.ok) {
+          const body = await guestResponse.text()
+          throw new Error(`${guestResponse.status}: ${body}`)
+        }
+        return (await guestResponse.json()) as { dm_sent: boolean }
+      },
+      async (clanTag: string, targetGuildId: string) => {
+        const evictResponse = await fetch('/api/cwl/shared-clan/evict', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+          body: JSON.stringify({ guild_id: guildId, clan_tag: clanTag, target_guild_id: targetGuildId }),
+        })
+        if (!evictResponse.ok) {
+          const body = await evictResponse.text()
+          throw new Error(`${evictResponse.status}: ${body}`)
+        }
+      },
     )
   } catch (err) {
     console.error(err)

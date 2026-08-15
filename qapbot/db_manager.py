@@ -1843,6 +1843,16 @@ class WarHistoryDB:
                 status                TEXT    NOT NULL DEFAULT 'pending',
                 responded_at          TEXT,
                 created_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+                -- Cross-guild shared-clan foreign-guest tracking (2026-08-15, project owner's
+                -- spec): set when a REAL member of some other guild's shared clan gets manually
+                -- cross-assigned into one of THIS guild's own (non-shared) clans, and that shared
+                -- clan is later detached from this guild — at that point they "become a guest
+                -- player automatically." NULL for every ordinary signup (the overwhelming
+                -- majority). Not an FK — the origin shared_clan row may itself be pruned later
+                -- (e.g. once no guild is left attached to it) without needing to touch every
+                -- guest row that ever pointed at it; find_cwl_signups_by_origin_shared_clan_sync
+                -- callers already tolerate a dangling id by simply finding nothing to purge.
+                origin_shared_clan_id INTEGER,
                 FOREIGN KEY (event_id) REFERENCES cwl_events(id) ON DELETE CASCADE,
                 UNIQUE (event_id, player_tag)
             )
@@ -1853,6 +1863,14 @@ class WarHistoryDB:
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cwl_signups_discord ON cwl_signups(discord_id)"
         )
+        # idx_cwl_signups_origin_shared_clan is created later, in the ALTER-TABLE migration block
+        # below (_add_column_if_missing("cwl_signups", "origin_shared_clan_id", ...)) — NOT here.
+        # This CREATE TABLE IF NOT EXISTS is a no-op against a pre-existing table (the common
+        # case on any already-initialized DEV/PROD database), so on such a database the
+        # origin_shared_clan_id column genuinely does not exist yet at this point in schema
+        # verification — an index on it here would fail with "no such column" and abort the
+        # ENTIRE database initialization, which is exactly the startup crash this comment is
+        # warning future editors away from reintroducing (2026-08-15 incident, live-tested).
 
         # CWL roster planning: the actual/suggested player -> clan mapping for an event.
         await self._conn.execute("""
@@ -1880,6 +1898,76 @@ class WarHistoryDB:
         )
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cwl_assignments_clan ON cwl_assignments(event_id, assigned_clan_tag)"
+        )
+
+        # Cross-guild shared CWL clans (2026-08-15, project owner's spec): a real-world clan can
+        # only actually play CWL for one roster, but nothing stops two independent guilds from
+        # each configuring the same clan_tag into their own separate cwl_events for the same
+        # season — this is the reconciliation layer for that. Deliberately its own tables, never
+        # redirecting cwl_signups/cwl_assignments/cwl_event_clans themselves (those stay scoped
+        # to one guild's whole event; redirecting per-clan inside them would mean every write
+        # path branches per-player on "which clan is this," and a bug there could leak/corrupt a
+        # *different* guild's private roster through tables every non-shared guild depends on).
+        # See CWL_ROSTER_PLANNING_PLAN.md for the full design.
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS cwl_shared_clans (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                clan_tag                TEXT    NOT NULL,
+                cwl_season              TEXT    NOT NULL,
+                owner_guild_id          TEXT    NOT NULL,
+                owner_event_id          INTEGER NOT NULL,
+                owner_resolution_method TEXT    NOT NULL,
+                owner_resolved_at       TEXT,
+                created_at              TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_at              TEXT    NOT NULL DEFAULT (datetime('now')),
+                UNIQUE (clan_tag, cwl_season)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_shared_clans_season_tag ON cwl_shared_clans(cwl_season, clan_tag)"
+        )
+
+        # Membership list — one row per guild currently participating in a shared clan (owner
+        # included). Used for eviction and "who's affected" lookups (notifications, the
+        # delete-season guard's repoint-or-prune decision).
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS cwl_shared_clan_guilds (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                shared_clan_id INTEGER NOT NULL,
+                guild_id       TEXT    NOT NULL,
+                event_id       INTEGER NOT NULL,
+                joined_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (shared_clan_id) REFERENCES cwl_shared_clans(id) ON DELETE CASCADE,
+                FOREIGN KEY (event_id) REFERENCES cwl_events(id) ON DELETE CASCADE,
+                UNIQUE (shared_clan_id, guild_id)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_shared_clan_guilds_shared_clan ON cwl_shared_clan_guilds(shared_clan_id)"
+        )
+
+        # The shared roster itself — mirrors cwl_signups' shape but keyed by shared_clan_id, not
+        # event_id, so it's visible identically from every attached guild's board. One clan per
+        # shared_clan_id, so status='confirmed' IS the assignment — no separate shared
+        # assignments table needed.
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS cwl_shared_clan_players (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                shared_clan_id    INTEGER NOT NULL,
+                player_tag        TEXT    NOT NULL,
+                player_name       TEXT,
+                discord_id        TEXT,
+                status            TEXT    NOT NULL DEFAULT 'pending',
+                source            TEXT    NOT NULL,
+                added_by_guild_id TEXT    NOT NULL,
+                responded_at      TEXT,
+                updated_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (shared_clan_id) REFERENCES cwl_shared_clans(id) ON DELETE CASCADE,
+                UNIQUE (shared_clan_id, player_tag)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_shared_clan_players_shared_clan ON cwl_shared_clan_players(shared_clan_id)"
         )
 
         # Guild welcome-message family selections (clan-link mode, multi-select, per-family toggle)
@@ -2026,6 +2114,11 @@ class WarHistoryDB:
         await self._add_column_if_missing("guild_config", "cwl_enrollment_include_all_linked_accounts", "BOOLEAN NOT NULL DEFAULT 0")
         await self._add_column_if_missing("guild_config", "timezone_name", "TEXT NOT NULL DEFAULT 'UTC'")
         await self._add_column_if_missing("cwl_event_clans", "participating", "INTEGER NOT NULL DEFAULT 1")
+        await self._add_column_if_missing("cwl_signups", "origin_shared_clan_id", "INTEGER")
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_signups_origin_shared_clan "
+            "ON cwl_signups(origin_shared_clan_id, player_tag) WHERE origin_shared_clan_id IS NOT NULL"
+        )
 
         logging.debug("[DB-SCHEMA] Maindata schema created/verified")
 
@@ -3445,6 +3538,86 @@ class WarHistoryDB:
             })
         return players
 
+    def get_player_links_sync(self, player_tags: List[str]) -> Dict[str, Dict[str, Any]]:
+        """player_tag -> {discord_id, player_name, verified} for whichever of player_tags are
+        linked to a Discord account (user_players), regardless of current clan — a player_tag
+        with no linked account simply isn't a key in the returned dict. Used by the CWL guest
+        search (web_bridge.py's _search_cwl_guests) to show whether a found player can actually
+        be DMed, without needing clan context the way get_current_clan_members_sync does."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not player_tags:
+            return {}
+
+        with self._sync_conn() as conn:
+            try:
+                placeholders = ",".join("?" for _ in player_tags)
+                rows = conn.execute(
+                    f"""
+                    SELECT player_tag, player_name, discord_id, verified
+                    FROM user_players
+                    WHERE player_tag IN ({placeholders})
+                    ORDER BY verified DESC
+                    """,
+                    player_tags,
+                ).fetchall()
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_player_links_sync failed: {e}")
+                return {}
+
+        # Same verified-wins-per-player_tag dedup as get_current_clan_members_sync.
+        links: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            if row["player_tag"] in links:
+                continue
+            discord_id = row["discord_id"]
+            links[row["player_tag"]] = {
+                "player_name": row["player_name"],
+                "discord_id": discord_id if discord_id and discord_id != "UNASSIGNED" else None,
+                "verified": bool(row["verified"]),
+            }
+        return links
+
+    def get_current_clan_tags_for_players_sync(self, player_tags: List[str]) -> Dict[str, str]:
+        """player_tag -> current_clan_tag for ANY player_tag, regardless of whether that clan is
+        in some caller-side filter set — unlike get_current_clan_members_sync (clan-scoped:
+        WHERE current_clan_tag IN a specific list), this is player-scoped, so it also resolves a
+        guest/account-wide-expanded player whose real current clan is entirely outside the
+        guild's own family AND isn't itself participating this season. Used as
+        _build_enrollment_payload's fallback for exactly that case (2026-08-15 bugfix — those
+        players' cards were silently stuck on the plain/default shade forever, never green or
+        amber, since get_current_clan_members_sync(all_member_clan_tags) can structurally never
+        return them). Same verified-wins-per-tag dedup as get_current_clan_members_sync."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not player_tags:
+            return {}
+
+        with self._sync_conn() as conn:
+            try:
+                placeholders = ",".join("?" for _ in player_tags)
+                rows = conn.execute(
+                    f"""
+                    SELECT player_tag, current_clan_tag, verified
+                    FROM user_players
+                    WHERE player_tag IN ({placeholders}) AND current_clan_tag IS NOT NULL
+                    ORDER BY verified DESC
+                    """,
+                    player_tags,
+                ).fetchall()
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_current_clan_tags_for_players_sync failed: {e}")
+                return {}
+
+        clan_tags: Dict[str, str] = {}
+        for row in rows:
+            clan_tags.setdefault(row["player_tag"], row["current_clan_tag"])
+        return clan_tags
+
     def bulk_create_cwl_signups_sync(self, event_id: int, signups: List[Dict[str, Any]]) -> bool:
         """Bulk-insert cwl_signups rows for Start Enrollment's template-copy step. Idempotent via
         ON CONFLICT(event_id, player_tag) DO NOTHING — safe to re-run without clobbering a row a
@@ -3580,6 +3753,109 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] get_cwl_signup_sync failed for event {event_id} player {player_tag}: {e}")
                 return None
 
+    def delete_cwl_signup_sync(self, event_id: int, player_tag: str) -> bool:
+        """Remove one cwl_signups row entirely — as opposed to upsert_cwl_signup_sync's
+        create-or-overwrite, this is a genuine removal (e.g. purging a foreign shared-clan guest
+        once their origin clan's owning guild reassigns them elsewhere — see
+        find_cwl_signups_by_origin_shared_clan_sync). Callers that want a player OUT of a clan
+        column but still visible in the pool should use delete_cwl_assignment_sync instead; this
+        makes them disappear from the pool entirely."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "DELETE FROM cwl_signups WHERE event_id = ? AND player_tag = ?",
+                        (event_id, player_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] delete_cwl_signup_sync failed for event {event_id} player {player_tag}: {e}")
+                conn.rollback()
+                return False
+
+    def mark_cwl_signup_as_shared_clan_guest_sync(
+        self, event_id: int, player_tag: str, player_name: Optional[str], discord_id: Optional[str], origin_shared_clan_id: int
+    ) -> bool:
+        """Cross-guild foreign-guest conversion (2026-08-15, project owner's spec): creates-or-
+        flips a cwl_signups row to source='guest_invite' (the same marker a manually invited
+        guest player already gets — is_guest is derived from source alone, so this is all the
+        frontend needs to show the guest badge) and stamps origin_shared_clan_id so
+        find_cwl_signups_by_origin_shared_clan_sync can find it again later if the clan's real
+        owning guild reassigns this exact player elsewhere.
+
+        A true upsert, not a plain UPDATE — a player dragged straight from the live-membership
+        pool onto a private clan column never gets a cwl_signups row at all (only a cwl_assignments
+        one; handle_post_cwl_enrollment_assign's private-clan branch doesn't touch cwl_signups),
+        so this is the ONLY row that will ever exist for such a player and must actually create
+        it, not silently no-op against a row that was never there. On conflict, only status is
+        preserved from any existing row (a real prior response shouldn't be reset to 'pending'
+        just because they're being reclassified as a guest) — everything else here always wins,
+        since this call is the freshest information about who this player is."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        """
+                        INSERT INTO cwl_signups
+                            (event_id, player_tag, player_name, discord_id, source, status, origin_shared_clan_id)
+                        VALUES (?, ?, ?, ?, 'guest_invite', 'pending', ?)
+                        ON CONFLICT(event_id, player_tag) DO UPDATE SET
+                            player_name = excluded.player_name,
+                            discord_id = excluded.discord_id,
+                            source = excluded.source,
+                            origin_shared_clan_id = excluded.origin_shared_clan_id
+                        """,
+                        (event_id, player_tag, player_name, discord_id, origin_shared_clan_id),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] mark_cwl_signup_as_shared_clan_guest_sync failed for event {event_id} player {player_tag}: {e}"
+                )
+                conn.rollback()
+                return False
+
+    def find_cwl_signups_by_origin_shared_clan_sync(self, origin_shared_clan_id: int, player_tag: str) -> List[Dict[str, Any]]:
+        """Every OTHER guild's local cwl_signups row that traces its placement of player_tag back
+        to a shared clan (see mark_cwl_signup_as_shared_clan_guest_sync) — scans ACROSS events/
+        guilds by design (unlike every other cwl_signups query in this file, which is always
+        event-scoped), since the whole point is finding foreign guests regardless of which guild
+        they ended up in. Used to purge them once the clan's real owning guild reassigns this
+        exact player elsewhere (project owner's spec: "removed from the guild clan's player
+        roster and player pool")."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM cwl_signups WHERE origin_shared_clan_id = ? AND player_tag = ?",
+                    (origin_shared_clan_id, player_tag),
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-QUERY-SYNC] find_cwl_signups_by_origin_shared_clan_sync failed for shared_clan "
+                    f"{origin_shared_clan_id} player {player_tag}: {e}"
+                )
+                return []
+
     def upsert_cwl_assignment_sync(
         self,
         event_id: int,
@@ -3707,6 +3983,357 @@ class WarHistoryDB:
                 return True
             except sqlite3.Error as e:
                 logging.error(f"[DB-WRITE-SYNC] delete_cwl_assignment_sync failed for event {event_id} player {player_tag}: {e}")
+                conn.rollback()
+                return False
+
+    # ------------------------------------------------------------------
+    # Cross-guild shared CWL clans (2026-08-15) — see cwl_shared_clans'
+    # CREATE TABLE comment above for the design rationale.
+    # ------------------------------------------------------------------
+
+    def find_cwl_clan_participation_across_guilds_sync(
+        self, clan_tag: str, season: str, exclude_guild_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Every OTHER guild currently participating with clan_tag for this season — scans
+        across ALL guilds' cwl_events for the season, not just the caller's own. This is the
+        "is this clan already claimed elsewhere" check both trigger points
+        (_search_cwl_guests/handle_post_clan_config, start_cwl_enrollment) use before deciding
+        whether to invoke ensure_cwl_clan_sharing(). Returns one dict per matching guild:
+        guild_id, event_id, participating (always 1 — non-participating rows never count as a
+        "claim")."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                if exclude_guild_id is not None:
+                    rows = conn.execute(
+                        """
+                        SELECT ce.guild_id AS guild_id, ce.id AS event_id, cec.participating AS participating
+                        FROM cwl_event_clans cec
+                        JOIN cwl_events ce ON ce.id = cec.event_id
+                        WHERE cec.clan_tag = ? AND ce.cwl_season = ? AND cec.participating = 1
+                              AND ce.guild_id != ?
+                        """,
+                        (clan_tag, season, exclude_guild_id),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT ce.guild_id AS guild_id, ce.id AS event_id, cec.participating AS participating
+                        FROM cwl_event_clans cec
+                        JOIN cwl_events ce ON ce.id = cec.event_id
+                        WHERE cec.clan_tag = ? AND ce.cwl_season = ? AND cec.participating = 1
+                        """,
+                        (clan_tag, season),
+                    ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-QUERY-SYNC] find_cwl_clan_participation_across_guilds_sync failed for {clan_tag}/{season}: {e}"
+                )
+                return []
+
+    def get_cwl_shared_clan_sync(self, clan_tag: str, season: str) -> Optional[Dict[str, Any]]:
+        """The cwl_shared_clans row for (clan_tag, season), or None if this clan isn't
+        (yet) shared for that season."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT * FROM cwl_shared_clans WHERE clan_tag = ? AND cwl_season = ?",
+                    (clan_tag, season),
+                ).fetchone()
+                return dict(row) if row else None
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_shared_clan_sync failed for {clan_tag}/{season}: {e}")
+                return None
+
+    def get_cwl_shared_clan_by_id_sync(self, shared_clan_id: int) -> Optional[Dict[str, Any]]:
+        """Same as get_cwl_shared_clan_sync but by primary key — used once a caller already has
+        a shared_clan_id (e.g. from list_cwl_shared_clan_guilds_sync) and needs the parent row's
+        owner_guild_id for a permission check."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT * FROM cwl_shared_clans WHERE id = ?", (shared_clan_id,)
+                ).fetchone()
+                return dict(row) if row else None
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_shared_clan_by_id_sync failed for id {shared_clan_id}: {e}")
+                return None
+
+    def create_cwl_shared_clan_sync(
+        self, clan_tag: str, season: str, owner_guild_id: str, owner_event_id: int, owner_resolution_method: str
+    ) -> Optional[int]:
+        """Create the cwl_shared_clans row the first time a clan becomes multi-guild for a
+        season. Callers must check get_cwl_shared_clan_sync() first — this is a plain INSERT,
+        not an upsert, since the (clan_tag, cwl_season) UNIQUE constraint means a second call
+        for the same pair is a caller bug, not a race to paper over silently (unlike most
+        upsert-style CRUD elsewhere in this feature). Returns the new row's id, or None on
+        failure."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO cwl_shared_clans
+                            (clan_tag, cwl_season, owner_guild_id, owner_event_id,
+                             owner_resolution_method, owner_resolved_at)
+                        VALUES (?, ?, ?, ?, ?, datetime('now'))
+                        """,
+                        (clan_tag, season, owner_guild_id, owner_event_id, owner_resolution_method),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                    return cursor.lastrowid
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] create_cwl_shared_clan_sync failed for {clan_tag}/{season}: {e}")
+                conn.rollback()
+                return None
+
+    def repoint_cwl_shared_clan_owner_sync(
+        self, shared_clan_id: int, new_owner_guild_id: str, new_owner_event_id: int, resolution_method: str
+    ) -> bool:
+        """Reassign ownership — used both by a fresh resolve_cwl_clan_owner() result and by the
+        delete-season guard's repoint-before-prune step when the current owner's guild is the
+        one leaving cwl_shared_clan_guilds."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        """
+                        UPDATE cwl_shared_clans
+                        SET owner_guild_id = ?, owner_event_id = ?, owner_resolution_method = ?,
+                            owner_resolved_at = datetime('now'), updated_at = datetime('now')
+                        WHERE id = ?
+                        """,
+                        (new_owner_guild_id, new_owner_event_id, resolution_method, shared_clan_id),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] repoint_cwl_shared_clan_owner_sync failed for id {shared_clan_id}: {e}")
+                conn.rollback()
+                return False
+
+    def add_guild_to_shared_clan_sync(self, shared_clan_id: int, guild_id: str, event_id: int) -> bool:
+        """Attach a guild to an already-shared clan's membership list — idempotent (a guild
+        re-saving its clan config, or Start Enrollment running again, must not error on an
+        already-attached guild)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        """
+                        INSERT INTO cwl_shared_clan_guilds (shared_clan_id, guild_id, event_id)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(shared_clan_id, guild_id) DO NOTHING
+                        """,
+                        (shared_clan_id, guild_id, event_id),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] add_guild_to_shared_clan_sync failed for shared_clan {shared_clan_id}: {e}")
+                conn.rollback()
+                return False
+
+    def list_cwl_shared_clan_guilds_sync(self, shared_clan_id: int) -> List[Dict[str, Any]]:
+        """Every guild currently attached to a shared clan (owner included) — used for eviction
+        eligibility, notification fan-out, and the delete-season guard's "am I the last one"
+        check."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM cwl_shared_clan_guilds WHERE shared_clan_id = ? ORDER BY joined_at",
+                    (shared_clan_id,),
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] list_cwl_shared_clan_guilds_sync failed for shared_clan {shared_clan_id}: {e}")
+                return []
+
+    def remove_guild_from_shared_clan_sync(self, shared_clan_id: int, target_guild_id: str) -> bool:
+        """Owner-only eviction's DB half — removes target_guild_id from a shared clan's
+        membership list. Never touches cwl_shared_clans/cwl_shared_clan_players (the shared
+        roster survives; only this guild's participation ends). The caller is responsible for
+        also flipping the target guild's own cwl_event_clans.participating to False (this
+        function only owns the shared-membership side) and, if target_guild_id was the owner,
+        for repointing ownership first via repoint_cwl_shared_clan_owner_sync — this function
+        does not check or care who the owner currently is."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "DELETE FROM cwl_shared_clan_guilds WHERE shared_clan_id = ? AND guild_id = ?",
+                        (shared_clan_id, target_guild_id),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] remove_guild_from_shared_clan_sync failed for shared_clan {shared_clan_id} guild {target_guild_id}: {e}"
+                )
+                conn.rollback()
+                return False
+
+    def delete_cwl_shared_clan_sync(self, shared_clan_id: int) -> bool:
+        """Fully deletes a shared clan record (cascades to cwl_shared_clan_guilds and
+        cwl_shared_clan_players) — only ever called by the delete-season guard, and only once
+        it's confirmed the deleting guild is the LAST one still attached (see
+        CWL_ROSTER_PLANNING_PLAN.md's delete-season guard). Never called as part of ordinary
+        eviction — see remove_guild_from_shared_clan_sync for that."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute("DELETE FROM cwl_shared_clans WHERE id = ?", (shared_clan_id,))
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] delete_cwl_shared_clan_sync failed for id {shared_clan_id}: {e}")
+                conn.rollback()
+                return False
+
+    def get_cwl_shared_clan_players_sync(self, shared_clan_id: int) -> List[Dict[str, Any]]:
+        """The shared roster for one shared clan — visible identically from every attached
+        guild's board (see _build_enrollment_payload's merge)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM cwl_shared_clan_players WHERE shared_clan_id = ? ORDER BY player_name",
+                    (shared_clan_id,),
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_shared_clan_players_sync failed for shared_clan {shared_clan_id}: {e}")
+                return []
+
+    def upsert_cwl_shared_clan_player_sync(
+        self,
+        shared_clan_id: int,
+        player_tag: str,
+        player_name: Optional[str],
+        discord_id: Optional[str],
+        status: str,
+        source: str,
+        added_by_guild_id: str,
+        responded_at: Optional[str] = None,
+    ) -> bool:
+        """Create or overwrite one shared-clan roster row — either attached guild's admin/
+        leader may call this (sharing is symmetric for editing; only eviction is owner-gated).
+        added_by_guild_id is audit-only, always overwritten to whichever guild's action most
+        recently touched the row (mirrors upsert_cwl_signup_sync's always-overwrite-on-conflict
+        semantics — the latest explicit action supersedes whatever was there before)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        """
+                        INSERT INTO cwl_shared_clan_players
+                            (shared_clan_id, player_tag, player_name, discord_id, status, source,
+                             added_by_guild_id, responded_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(shared_clan_id, player_tag) DO UPDATE SET
+                            player_name = excluded.player_name,
+                            discord_id = excluded.discord_id,
+                            status = excluded.status,
+                            source = excluded.source,
+                            added_by_guild_id = excluded.added_by_guild_id,
+                            responded_at = excluded.responded_at,
+                            updated_at = datetime('now')
+                        """,
+                        (shared_clan_id, player_tag, player_name, discord_id, status, source,
+                         added_by_guild_id, responded_at),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] upsert_cwl_shared_clan_player_sync failed for shared_clan {shared_clan_id} player {player_tag}: {e}"
+                )
+                conn.rollback()
+                return False
+
+    def delete_cwl_shared_clan_player_sync(self, shared_clan_id: int, player_tag: str) -> bool:
+        """Remove one player from a shared clan's roster — the shared-clan equivalent of
+        delete_cwl_assignment_sync's "drag to Unassigned" (a shared clan has no separate
+        assignments table, so removing the row IS unassigning them)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "DELETE FROM cwl_shared_clan_players WHERE shared_clan_id = ? AND player_tag = ?",
+                        (shared_clan_id, player_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] delete_cwl_shared_clan_player_sync failed for shared_clan {shared_clan_id} player {player_tag}: {e}"
+                )
                 conn.rollback()
                 return False
 
