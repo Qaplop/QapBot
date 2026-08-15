@@ -125,6 +125,14 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
   changes, a 2026-07-26 sweep confirmed no leaks had occurred, but it was a manual check with
   no rule backing it — this makes the expectation explicit instead of relying on catching it
   after the fact each time.
+- Related editor-workflow risk (not a commit issue, but same "secrets out of the repo's
+  reach" spirit): the Claude Code VS Code extension auto-attaches whatever file is currently
+  focused in the editor to chat context, and as of 2026-08 this bypasses both `.claudeignore`
+  and `settings.json` deny rules (tracked upstream: anthropics/claude-code#52419 — open,
+  unfixed). Workspace-level exclusion doesn't work around this. Practical mitigation until
+  it's fixed upstream: never leave `.env` (or any credential-bearing file) focused/open in a
+  VS Code window where Claude Code chat is active — edit it in a separate editor/window, or
+  use the terminal-only `claude` CLI for sessions touching this repo.
 
 ---
 
