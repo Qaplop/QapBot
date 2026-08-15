@@ -1,6 +1,9 @@
 Project Backlog, Improvement Ideas and General Remarks
 
 Immediate next steps:
+- Find and fix error: "Setup failed: token exchange failed: 502"
+- Re-adding a previously removed guest clan doesn't block the settings fields correctly and the warning message is misssing as well.
+- Managing a foreign clan still breaks the line in the Participating Clans Configuration view.
 - Add an option "Managed CWLs" to the /list command that asks for the cwl season and then gives a list of all guilds that have a managed cwl for that season. if no season is specified use the next upcoming one.
 - Refactor the discord user / coc player linking for admins with a nice web-ui.
 - Add a feature to DM users of the guild server to remind them to link their coc player accounts. the dm could contain a button that easily allows them to do the linking. The mail could be signed by a configurable server admin so that it is more convincing.
