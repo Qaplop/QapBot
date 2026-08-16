@@ -172,6 +172,36 @@ async function setup(): Promise<void> {
           clearInterval(pollTimer)
           await closeActivity(reason)
         },
+        // Hover pop-up progressive fetch (2026-08-16, project owner's spec: show the pop-up
+        // instantly with what's already loaded, then fill in a clan name it didn't already have).
+        // A failed lookup is silently swallowed (logged only) — the pop-up just keeps showing the
+        // raw tag, same as it would for a genuinely unknown clan.
+        async (tags: string[]) => {
+          const namesResponse = await fetch(
+            `/api/cwl/clan-names?guild_id=${encodeURIComponent(guildId)}&tags=${encodeURIComponent(tags.join(','))}`,
+            { headers: { Authorization: `Bearer ${accessToken}` } },
+          )
+          if (!namesResponse.ok) return {}
+          const { names } = (await namesResponse.json()) as { names: Record<string, string> }
+          return names
+        },
+        // Second half of the same progressive fetch (2026-08-16, project owner's spec: attacks/
+        // missed CWL attacks/attack-defense ratio over a player's last 3 CWL months, computed
+        // exactly as /leaderboard would). A failed lookup (or a player with no CWL history at
+        // all) just means the pop-up's stats section never grows.
+        async (playerTag: string) => {
+          const statsResponse = await fetch(
+            `/api/cwl/player-stats?guild_id=${encodeURIComponent(guildId)}&player_tag=${encodeURIComponent(playerTag)}`,
+            { headers: { Authorization: `Bearer ${accessToken}` } },
+          )
+          if (!statsResponse.ok) return { seasons: [], attacks: null, missed_attacks: null, attack_defense_ratio: null }
+          return (await statsResponse.json()) as {
+            seasons: string[]
+            attacks: number | null
+            missed_attacks: number | null
+            attack_defense_ratio: number | null
+          }
+        },
       )
 
       // Live-polling (2026-08-16, live-testing feedback: "would it be possible to auto-update

@@ -62,22 +62,41 @@ def _league_weight(tier: Optional[str], growth_rate: float = 1.4) -> float:
     return (growth_rate ** group_index) * (1 + 0.03 * subtier_bonus)
 
 
-def compute_league_adjusted_skill_scores(player_tags: List[str]) -> Dict[str, float]:
-    """Player-skill score for the "Manage Enrollment" board's TH/Skill/Alphabetical sort option:
-    league-adjusted average stars/attack over each player's last 10 CWL attacks. Each attack's
-    raw stars is weighted by _league_weight() above (the league its attacking clan was in for
-    that CWL round) before averaging — a 3-star earned in Champion League counts for meaningfully
-    more than a 3-star in Master League. Rounded to 2dp.
+def _cwl_stats_window_since_date(num_months: int = 3, now: Optional[datetime] = None) -> str:
+    """First day of the earliest of the trailing `num_months` calendar months (inclusive of the
+    current month), as a "YYYY-MM-DD" SQL lower bound — the exact same window boundary
+    get_recent_cwl_player_stats (QBhelperfunctions.py) computes via parse_month_argument for the
+    hover pop-up's own stats, duplicated here in single-date-string form since a bulk per-roster
+    query needs one SQL `>=` boundary rather than a per-month breakdown (2026-08-16, project
+    owner's spec: "use the 'last three months' logic for both" the pop-up and the player tiles).
+    `now` overridable for deterministic tests, same reason parse_month_argument() itself takes
+    `now` explicitly rather than calling datetime.now() internally."""
+    from QBhelperfunctions import parse_month_argument
 
-    A player_tag with no resolvable CWL-attack-with-league data (never played CWL, or league
-    data isn't populated for those seasons — get_recent_cwl_attacks_with_league_sync's own
-    docstring covers why that can happen) is simply absent from the returned dict — never a
-    fabricated 0, matching the same "None means no data, not zero" convention
-    compute_roster_stats_sync (QBhelperfunctions.py) already uses."""
+    month, year = parse_month_argument(f"-{num_months}", now or datetime.now(timezone.utc))[0]
+    return f"{year:04d}-{month:02d}-01"
+
+
+def compute_league_adjusted_skill_scores(player_tags: List[str], *, now: Optional[datetime] = None) -> Dict[str, float]:
+    """Player-skill score for the "Manage Enrollment" board's TH/Skill/Alphabetical sort option:
+    league-adjusted average stars/attack over each player's CWL attacks in the trailing 3
+    calendar months (2026-08-16, project owner's spec — previously the player's last 10 CWL
+    attacks; changed for consistency with the hover pop-up's own "last 3 months" stats, see
+    _cwl_stats_window_since_date's docstring). Each attack's raw stars is weighted by
+    _league_weight() above (the league its attacking clan was in for that CWL round) before
+    averaging — a 3-star earned in Champion League counts for meaningfully more than a 3-star in
+    Master League. Rounded to 2dp.
+
+    A player_tag with no resolvable CWL-attack-with-league data in the window (never played CWL,
+    played outside the window, or league data isn't populated for those seasons —
+    get_recent_cwl_attacks_with_league_sync's own docstring covers why that can happen) is simply
+    absent from the returned dict — never a fabricated 0, matching the same "None means no data,
+    not zero" convention compute_roster_stats_sync (QBhelperfunctions.py) already uses."""
     db = CACHE.db_manager
     if db is None or not player_tags:
         return {}
-    attacks_by_tag = db.get_recent_cwl_attacks_with_league_sync(player_tags)
+    since_date = _cwl_stats_window_since_date(now=now)
+    attacks_by_tag = db.get_recent_cwl_attacks_with_league_sync(player_tags, since_date=since_date)
     scores: Dict[str, float] = {}
     for tag, attacks in attacks_by_tag.items():
         if not attacks:
@@ -87,17 +106,18 @@ def compute_league_adjusted_skill_scores(player_tags: List[str]) -> Dict[str, fl
     return scores
 
 
-def compute_avg_stars_per_attack(player_tags: List[str]) -> Dict[str, float]:
+def compute_avg_stars_per_attack(player_tags: List[str], *, now: Optional[datetime] = None) -> Dict[str, float]:
     """The "Manage Enrollment" board's other number-display option (2026-08-14, project owner's
     spec: a second radio group lets the admin pick which number shows next to each player's
     name — this, or the league-adjusted skill score above; defaults to this one). Plain,
-    unweighted average stars/attack over each player's last <=10 CWL attacks — the exact same
-    attack window compute_league_adjusted_skill_scores() uses, just without the league
-    weighting. Same "no data -> absent from the dict, never a fabricated 0" convention."""
+    unweighted average stars/attack over each player's CWL attacks in the trailing 3 calendar
+    months — the exact same window compute_league_adjusted_skill_scores() uses, just without the
+    league weighting. Same "no data -> absent from the dict, never a fabricated 0" convention."""
     db = CACHE.db_manager
     if db is None or not player_tags:
         return {}
-    attacks_by_tag = db.get_recent_cwl_attacks_with_league_sync(player_tags)
+    since_date = _cwl_stats_window_since_date(now=now)
+    attacks_by_tag = db.get_recent_cwl_attacks_with_league_sync(player_tags, since_date=since_date)
     averages: Dict[str, float] = {}
     for tag, attacks in attacks_by_tag.items():
         if not attacks:
@@ -932,7 +952,7 @@ def assign_cwl_player_sync(
         )
 
 
-async def auto_assign_prior_cwl_members_if_empty(guild_id: int, event_id: int, season: str, clan_tag: str) -> None:
+async def auto_assign_prior_cwl_members(guild_id: int, event_id: int, season: str, clan_tag: str) -> None:
     """Fills a gap Start Enrollment's own bulk seed can't reach (2026-08-15, live-testing
     feedback, project owner's spec): that seed only ever runs ONCE, over whichever clans were
     participating at that exact moment — a clan added to the roster *afterwards* (a guest clan,
@@ -951,8 +971,19 @@ async def auto_assign_prior_cwl_members_if_empty(guild_id: int, event_id: int, s
        CURRENT membership in clan_tag, AND that same clan_tag was the destination of their own
        last real CWL attack, anywhere (get_last_real_cwl_attack_clan_sync — same signal
        resolve_prior_cwl_assignments uses for Start Enrollment's own seed, just pre-filtered to
-       this one clan). Only runs while the roster is still genuinely empty — never overwrites a
-       roster that already has anyone on it, manually assigned or not.
+       this one clan). Gated PER PLAYER, not on the whole roster being empty (2026-08-16,
+       live-testing feedback, project owner's spec, verbatim: "after removing staycalm as guest
+       clan and then re-adding it only the two players that were assigned manually are in
+       staycalm's roster. The re-add should also have done a re-auto-assign in case the guest
+       clan is not controlled by its own guild.") — a clan re-added after deactivation can already
+       carry over a couple of deliberately locked/admin_override placements (the ones
+       _cleanup_local_pool_for_plain_clan_deactivation_sync intentionally preserves), and the OLD
+       "roster non-empty -> skip everyone" gate wrongly treated those survivors as proof the whole
+       clan was "already handled," silently skipping every other genuinely-qualifying player too.
+       Only a player who is THEMSELVES already placed in clan_tag (assigned locally, or assigned=1
+       in the shared table) is skipped — assign_cwl_player_sync's own deliberate=False conflict
+       handling already protects anyone locked elsewhere from being evicted, so there was never a
+       need for this function to also gate on the aggregate roster state.
     2. Visibility seed (2026-08-15 follow-up, live-testing feedback: members without prior CWL
        history in this exact clan were showing with no status icon at all — no ?/✓/✗, not even
        "Not Linked" — since they never got ANY cwl_signups/cwl_shared_clan_players row, unlike a
@@ -960,29 +991,30 @@ async def auto_assign_prior_cwl_members_if_empty(guild_id: int, event_id: int, s
        gets seeded 'pending' regardless of history). Every OTHER current member without a status
        row yet gets a plain 'pending' placeholder too — same as Start Enrollment's own bulk seed
        gives every clan present at that time, just applied retroactively for a clan added later.
-       Unlike step 1, this isn't gated on "roster empty" — it's pure visibility, independent of
-       whether anyone's actually been assigned yet."""
+       Unlike step 1, this isn't gated on placement state at all — it's pure visibility,
+       independent of whether anyone's actually been assigned yet."""
     db = CACHE.db_manager
     if db is None:
         return
 
     shared = db.get_cwl_shared_clan_sync(clan_tag, season)
     if shared is not None:
-        already_shared = {p["player_tag"] for p in db.get_cwl_shared_clan_players_sync(shared["id"])}
-        roster_empty = not already_shared
+        shared_rows = db.get_cwl_shared_clan_players_sync(shared["id"])
+        already_shared = {p["player_tag"] for p in shared_rows}
+        already_placed = {p["player_tag"] for p in shared_rows if p.get("assigned")}
     else:
-        already_assigned = {a["player_tag"] for a in db.get_cwl_assignments_sync(event_id) if a["assigned_clan_tag"] == clan_tag}
-        roster_empty = not already_assigned
+        already_shared = set()
+        already_placed = {a["player_tag"] for a in db.get_cwl_assignments_sync(event_id) if a["assigned_clan_tag"] == clan_tag}
 
     current_members = db.get_current_clan_members_sync([clan_tag])
     if not current_members:
         return
     current_tags = [m["player_tag"] for m in current_members]
     last_attack_clan = db.get_last_real_cwl_attack_clan_sync(current_tags)
-    qualifying_tags = (
-        {tag for tag, (attack_clan_tag, _date) in last_attack_clan.items() if attack_clan_tag == clan_tag}
-        if roster_empty else set()
-    )
+    qualifying_tags = {
+        tag for tag, (attack_clan_tag, _date) in last_attack_clan.items()
+        if attack_clan_tag == clan_tag and tag not in already_placed
+    }
 
     members_by_tag = {m["player_tag"]: m for m in current_members}
     for tag in qualifying_tags:
@@ -1103,6 +1135,108 @@ async def prune_or_detach_shared_clans_before_deletion(guild_id: int, event_id: 
             db.delete_cwl_shared_clan_sync(info["shared_clan_id"])
 
 
+def _cleanup_local_pool_for_plain_clan_deactivation_sync(db: Any, guild_id: int, event_id: int, clan_tag: str) -> None:
+    """The LOCAL-table counterpart of the SHARED-clan orphaned-preservation/stale-mirror cleanup
+    in detach_guild_from_shared_clan_on_deactivation (see that function's own `shared is None`
+    branch for why this exists — 2026-08-16 follow-up, live-testing feedback). A plain guest clan
+    (never cross-guild shared) has no cwl_shared_clan_players table to read its roster from — the
+    roster IS the local cwl_signups/cwl_assignments rows directly — so this reads those instead,
+    but applies the exact same rule: a genuinely DELIBERATE placement (assignment_source==
+    'admin_override' AND locked) is preserved untouched (it's already a real local
+    cwl_assignments row pointing at clan_tag, so simply not deleting it is enough — unlike the
+    shared branch, nothing needs to be freshly materialized here, since there was never a
+    separate shared table to mirror FROM in the first place).
+
+    Discord-linked-account sweep (2026-08-16 follow-up, live-testing feedback, project owner's
+    spec, verbatim): "not only the staycalm members were added to The QCrew's player pool but
+    also [players from other, unrelated clans linked to the same Discord accounts]... I would say
+    to keep things easy only direct members of a guest clan are added and removed and not their
+    [linked-account] members... when removing a guest clan... we always remove all the players
+    that are linked to the removed clan's discord users. There is one exception... When a discord
+    user has linked players either in one of the guild's member clans or in another guest clan of
+    the guild then these players should remain." Root cause this closes: Start Enrollment's own
+    account-wide-linked-accounts expansion (guild_config.cwl_enrollment_include_all_linked_
+    accounts) doesn't distinguish a Discord account that qualified via a FAMILY clan member from
+    one that qualified via a GUEST clan member — either way, ALL of that account's other linked
+    players get swept into the pool, even ones in completely unrelated clans. The prior version of
+    this cleanup only ever considered clan_tag's own DIRECT current members, so those swept-in alt
+    accounts (never direct clan_tag members themselves) were silently left behind forever.
+
+    Two DIFFERENT protection rules, deliberately NOT symmetric (2026-08-16 second follow-up,
+    project owner's spec, verbatim, confirmed "guest clans only"): a Discord account with a
+    linked player in one of the guild's own FAMILY clans is ALWAYS protected in full,
+    unconditionally — family membership was never gated by the linked-accounts toggle on the
+    add side either, so it isn't here. A Discord account with a linked player in ANOTHER
+    currently-active GUEST clan is protected ONLY while guild_config.cwl_enrollment_include_all_
+    linked_accounts is currently True — mirrors exactly what a fresh Start Enrollment run would
+    produce for that other clan right now, given the CURRENT setting, not whatever was true when
+    these players were originally added (the toggle may well have changed since). Either way, a
+    player who is THEMSELVES a genuine DIRECT current member of a protective clan is always kept,
+    toggle or not — that's their own independent membership, nothing to do with account linkage.
+
+    Candidate set: every CURRENT live member of clan_tag (catches auto_seeded visibility-only
+    signups with no assignment at all) UNIONED with every player who already has a local
+    cwl_assignments row pointing at clan_tag (catches someone who's since left clan_tag in-game
+    but still has a stale local assignment from when they were a member) UNIONED with every OTHER
+    player sharing a Discord account with one of clan_tag's own direct members (the sweep)."""
+    current_members = db.get_current_clan_members_sync([clan_tag])
+    candidate_tags = {m["player_tag"] for m in current_members}
+    assignments_by_tag = {a["player_tag"]: a for a in db.get_cwl_assignments_sync(event_id) if a["assigned_clan_tag"] == clan_tag}
+    candidate_tags.update(assignments_by_tag.keys())
+    if not candidate_tags:
+        return
+
+    family_clan_tags = set(resolve_guild_member_clan_tags(guild_id))
+    other_active_guest_clan_tags = {
+        c["clan_tag"] for c in db.get_cwl_event_clans_sync(event_id)
+        if c.get("participating", 1) and c["clan_tag"] != clan_tag and c["clan_tag"] not in family_clan_tags
+    }
+    protective_clan_tags = family_clan_tags | other_active_guest_clan_tags
+    include_linked_accounts = bool(
+        CACHE.server_config.get(str(guild_id), {}).get("cwl_enrollment_include_all_linked_accounts", False)
+    )
+
+    discord_id_by_tag: Dict[str, Optional[str]] = {m["player_tag"]: m["discord_id"] for m in current_members}
+    discord_ids = {did for did in discord_id_by_tag.values() if did}
+    if discord_ids:
+        for p in db.get_all_players_for_discord_ids_sync(list(discord_ids)):
+            candidate_tags.add(p["player_tag"])
+            discord_id_by_tag.setdefault(p["player_tag"], p["discord_id"])
+
+    current_clan_by_tag = db.get_current_clan_tags_for_players_sync(list(candidate_tags))
+
+    # A discord_id is "family-protected" if ANY of its linked players directly sits in one of
+    # the guild's own family clans right now; "guest-protected" if any sits directly in another
+    # currently-active guest clan. Computed once, up front, so every candidate sharing that
+    # account gets the same answer regardless of iteration order.
+    family_protected_discord_ids = set()
+    guest_protected_discord_ids = set()
+    for tag in candidate_tags:
+        did = discord_id_by_tag.get(tag)
+        if not did:
+            continue
+        current_clan = current_clan_by_tag.get(tag)
+        if current_clan in family_clan_tags:
+            family_protected_discord_ids.add(did)
+        elif current_clan in other_active_guest_clan_tags:
+            guest_protected_discord_ids.add(did)
+
+    for tag in candidate_tags:
+        assignment = assignments_by_tag.get(tag)
+        if assignment is not None and assignment["assignment_source"] == "admin_override" and assignment["locked"]:
+            continue  # a genuine, deliberate drag-and-drop placement — preserved as-is, no write needed
+        if current_clan_by_tag.get(tag) in protective_clan_tags:
+            continue  # a genuine DIRECT current member of a family/other-active-guest clan — always kept
+        did = discord_id_by_tag.get(tag)
+        if did and did in family_protected_discord_ids:
+            continue  # linked to a genuine family-clan member — unconditional, toggle-independent
+        if did and include_linked_accounts and did in guest_protected_discord_ids:
+            continue  # linked to another active guest clan's direct member, AND the expansion
+                      # setting is currently on — matches what a fresh add would produce right now
+        db.delete_cwl_assignment_sync(event_id, tag)
+        db.delete_cwl_signup_sync(event_id, tag)
+
+
 async def detach_guild_from_shared_clan_on_deactivation(guild_id: int, event_id: int, season: str, clan_tag: str) -> None:
     """Narrower sibling of prune_or_detach_shared_clans_before_deletion, same detach/repoint/prune
     logic, but for a different trigger (2026-08-15, live-testing feedback): a guild turning a
@@ -1135,6 +1269,19 @@ async def detach_guild_from_shared_clan_on_deactivation(guild_id: int, event_id:
         return
     shared = db.get_cwl_shared_clan_sync(clan_tag, season)
     if shared is None:
+        # Plain (never cross-guild-shared) guest clan — 2026-08-16 follow-up, live-testing
+        # feedback, project owner's spec, verbatim: "I removed staycalm but their players were
+        # not removed from the qcrew's player pool as it should have. we fixed this earlier this
+        # day and now it's back." Not actually a regression of that earlier fix — this whole
+        # function (and every round of that fix) only ever operated on cwl_shared_clan_players,
+        # gated by this exact `if shared is None: return` a few lines up, so a clan that was
+        # NEVER cross-guild shared (this guild is the only one that ever configured it) hit this
+        # early return and got zero cleanup, the entire time. The same "preserve a deliberate
+        # placement, remove everything machine-seeded" rule the shared branch below implements
+        # applies equally here — this is that rule's LOCAL-table counterpart, needed because a
+        # plain guest clan's "roster" lives directly in cwl_signups/cwl_assignments with no
+        # cwl_shared_clan_players indirection to read it from.
+        _cleanup_local_pool_for_plain_clan_deactivation_sync(db, guild_id, event_id, clan_tag)
         return
     guild_id_str = str(guild_id)
     guilds = db.list_cwl_shared_clan_guilds_sync(shared["id"])
@@ -1179,7 +1326,7 @@ async def detach_guild_from_shared_clan_on_deactivation(guild_id: int, event_id:
     # project owner's spec, verbatim: "all players from that guest clan that are not already
     # assigned to a member clan player roster should be removed from the player pool
     # completely... only [the one deliberately drag-assigned player] should have stayed").
-    # auto_assign_prior_cwl_members_if_empty() seeds the REST of a newly-added clan's real
+    # auto_assign_prior_cwl_members() seeds the REST of a newly-added clan's real
     # current members as 'confirmed'/auto_assigned (prior CWL history) or 'pending'/auto_seeded
     # (pure visibility placeholder) purely so the clan doesn't look empty WHILE it's on the
     # roster — that's a passive side effect of the clan being added, not a deliberate cross-guild
@@ -1197,7 +1344,7 @@ async def detach_guild_from_shared_clan_on_deactivation(guild_id: int, event_id:
     # *while the clan was still active*.
     #
     # First attempt at recognizing a "stale mirror" checked local source == 'guest_invite' —
-    # turned out too narrow and still left players behind: auto_assign_prior_cwl_members_if_empty()
+    # turned out too narrow and still left players behind: auto_assign_prior_cwl_members()
     # writes LOCAL cwl_signups directly with source='auto_assigned'/'auto_seeded' whenever it runs
     # BEFORE this clan is detected as cross-guild shared (its `shared is None` branch) — a guest
     # clan added first as private, only later discovered to be shared with another guild, leaves
@@ -1451,7 +1598,18 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     # (nothing else has a column), but the candidate pool it draws players from is every current
     # member of every guild clan, so a player whose real clan didn't opt into CWL this season (or
     # who transferred since their last CWL war) is still correctly resolved and assignable.
-    all_member_clan_tags = resolve_guild_member_clan_tags(guild_id)
+    #
+    # Unioned with participating_clan_tags (2026-08-16, live-testing feedback: a guest clan added
+    # before Start Enrollment ran got a completely empty column despite several of its own current
+    # members having real prior-CWL-attack history for exactly that clan) — resolve_guild_member_
+    # clan_tags() only ever returns the guild's own family by definition, which structurally
+    # excludes every guest clan (the whole point of a guest clan is that it's NOT part of the
+    # family). Without this union, a guest clan's own current members were never even in the
+    # candidate pool to begin with, so resolve_prior_cwl_assignments() could never place them no
+    # matter how much real history they had — this is the exact same union
+    # _build_enrollment_payload() (web_bridge.py) already applies to its own player pool, for the
+    # identical underlying reason.
+    all_member_clan_tags = list(set(resolve_guild_member_clan_tags(guild_id)) | set(participating_clan_tags))
     all_members = db.get_current_clan_members_sync(all_member_clan_tags)
     current_member_tags = {p["player_tag"] for p in all_members}
     # resolve_prior_cwl_assignments() only ever resolves entries for the player_tags it was

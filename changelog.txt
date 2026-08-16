@@ -1,6 +1,269 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-16 (33)
+- Changed: hover pop-up now explicitly says "CWL Stats of last 3 Months: No data available"
+  for a player with zero CWL activity in the window (screenshot: Kuni), instead of silently
+  omitting the whole section — project owner's spec, verbatim: "for a player who has no cwl
+  data available for the last three months it should read: CWL stats of last 3 Months: No data
+  available." Skill Score/Avg-stars-per-attack are already known synchronously (part of the
+  initial payload, never fetched) so they're never "pending" — the only genuinely async piece is
+  the playerStats fetch (Attacks/Missed/Ratio). Added `settledPlayerStatsTags` (distinct from
+  the existing `attemptedPlayerStatsTags`, which flips the instant a fetch STARTS) so the pop-up
+  can tell "still waiting on the fetch" apart from "fetch settled, still nothing" and only shows
+  "No data available" once it's actually confirmed, never as a premature flash before the async
+  fetch lands. A failed fetch (network error) also now counts as settled, so a persistent error
+  doesn't leave the section missing forever. `activity/client/src/enrollmentBoard.ts`.
+  `npm run typecheck && npm run build`: clean. Deployed to DEV
+  (https://bbc956e7.cwl-clan-config-dev.pages.dev). Frontend-only — no backend change, no bot
+  restart needed.
+
+2026-08-16 (32)
+- Fixed: root-caused why the hover pop-up (31) showed Skill Score/Avg stars but no Attacks/
+  Missed-CWL-attacks/Attack-Defense-ratio for some players (reported: Butterblume). Not a pop-up
+  bug — a real data-correctness bug in the DB layer. Every sync/async query that combines
+  `main.<table>` and `history.<table>` into one result set via `WITH t AS (SELECT * FROM main.t
+  UNION ALL SELECT * FROM history.t)` matched columns by POSITION, not name; `main`/`history`
+  have identical column NAMES but a physically different on-disk column ORDER (confirmed against
+  DEV's real history DB), so any row actually read from `history` (any war old enough to be
+  archived) came back with `max_attacks`/`missed_attacks`/`defensive_stars`/etc. silently
+  misaligned. This is the READ-side counterpart of the 2026-08-14 hot/history schema-drift
+  incident (Cardinal Rule 1) — that fix only covered the migration WRITE path. The stored data
+  itself was fine; only these read queries were misinterpreting it.
+- Fixed ~20 call sites across `qapbot/db_manager.py` (sync + async), `QBhelperfunctions.py`
+  (`/whois` reliability/activity/skill), and `qapbot/QBdiscocmdshelper_admin_command.py`
+  (`/backfill_cwl_groups`) to name columns explicitly on both sides of every `main`/`history`
+  UNION, via new `WarHistoryDB._explicit_column_list_sync()` (sync counterpart of the existing
+  async `_explicit_column_list()`) + a public `explicit_column_list_sync()` alias.
+- Also found and fixed a second, still-live WRITE-path instance of the original 2026-08-14 bug:
+  `WarHistoryDB._bulk_move_chunk()` (the one-time/manual `fast_bulk_history_migration()` path,
+  `run_history_migration_now.py --fast`) used a bare `INSERT INTO history.<table> SELECT * FROM
+  main.<table> ...` — never covered by the 2026-08-14 fix, which only touched the normal monthly
+  migration path. Fixed the same way.
+- Added `WarHistoryDB.check_hot_history_schema_parity_sync()` — a standing guardrail, called once
+  at bot startup (`QapBot.py`, logged at CRITICAL if non-empty) and regression-tested, that flags
+  any of the 4 mirrored tables where `main`/`history` disagree on column SET (added/removed
+  column — not automatically recoverable). Pure column reordering is deliberately NOT flagged —
+  every affected query is now immune to it by design (explicit column names), so flagging it
+  would just be CI noise for a harmless, expected divergence.
+- Follow-up after being asked to confirm complete coverage: re-audited the ENTIRE repo (every
+  `SELECT *` anywhere, plus a separate pass for positional/non-named row access) rather than
+  trusting the original targeted grep. Found and fixed 3 more offenders, all in manually-invoked
+  diagnostic/audit scripts previously left as "lower priority": `qapbot/scripts/
+  analyze_cwl_rounds.py` (9 query blocks), `audit_cwl_league_rank.py` (1 — genuinely reads
+  drifted `state`/`result` columns, not just theoretically at risk), `harvest_cwl_war_tags.py`
+  (1). New shared `explicit_column_list_from_conn()` module-level helper in `db_manager.py`
+  (next to `attach_history_db`) so standalone scripts don't each duplicate the PRAGMA logic.
+  Confirmed via direct inspection that the only 2 other `history.`-touching scripts
+  (`backfill_group_track_war_updates.py`, `repromote_mid_season_clans.py`) already use fully
+  explicit column lists — no fix needed. Confirmed via `PRAGMA table_info` that only 4 tables
+  are ever mirrored to `history` at all (war_attacks, war_summary, cwl_league_groups,
+  cwl_league_rounds) — every other `SELECT *` in the repo targets a main-only table and is
+  inherently immune to this bug class. Every remaining `SELECT *`/`UNION ALL SELECT *` in the
+  codebase now targets either a single schema or a non-mirrored table.
+- Updated `.github/copilot-instructions.md` Cardinal Rule 1 and `qapbot/docs/
+  DATABASE_ARCHITECTURE.md` (new "Follow-up" section under Hot/History DB Split) to cover reads,
+  not just the migration write path.
+- Tests: new `tests/unit/test_hot_history_schema_parity.py` (5 tests) and `tests/unit/
+  test_hot_history_read_query_column_alignment.py` (2 tests, reproducing the exact real drift
+  shape found on DEV and proving `get_player_attack_history_sync`/`get_clan_attack_history_sync`
+  return correct values despite it — a `SELECT *`-based implementation would fail these).
+  `.\run_tests.ps1`: 1997 passed, 4 deselected (unchanged — the 3 newly-fixed scripts are
+  standalone CLI tools with no test coverage of their own). Verified directly against DEV's real
+  `data/qapbot.db`: Butterblume's `get_recent_cwl_player_stats` now returns
+  `{attacks: 14, missed_attacks: 0, attack_defense_ratio: 1.03}` (was all null), and
+  `check_hot_history_schema_parity_sync()` returns `[]` (no column-set drift). Python-only —
+  needs the bot process restarted on DEV/PROD to take effect.
+
+2026-08-16 (31)
+- Changed: hover pop-up layout reordered and regrouped, project owner's spec, verbatim: "sort the
+  output of the player stats in this order and add what's currently missing: CWL Stats of last 3
+  Months: Attacks: n (number of total attacks) Skill Score: Avg stars/attack: Attack/Defense
+  ratio: Missed CWL attacks: ...and Guest status as last line." Identity/status lines
+  (name/TH/current clan/assigned/Discord/response) stay first; a new "CWL Stats of last 3
+  Months:" header groups Attacks (new), Skill Score, Avg stars/attack, Attack/Defense ratio, and
+  Missed CWL attacks together — the header only renders once at least one of those five has data;
+  Guest status is now unconditionally the last line instead of sitting mid-list.
+- Fixed: the player TILE's own Skill Score/Avg stars/attack numbers used a completely different
+  window (last 10 CWL attacks, count-based) than the pop-up's other CWL stats (trailing 3
+  calendar months) — project owner's spec, verbatim: "our hover over pop-up info is inconsistent
+  to the way we calculate the stats for the player tile info. there we use the last 10 cwl
+  attaks. We should make this consistent and use the 'last three months' logic for both, the
+  pop-up info and the values for the player tiles." `get_recent_cwl_attacks_with_league_sync`
+  (db_manager.py) now takes a `since_date` SQL boundary instead of an `attack_limit` Python-side
+  truncation; `compute_league_adjusted_skill_scores`/`compute_avg_stars_per_attack`
+  (QBdiscocmdshelper_cwl.py) compute that boundary via a new `_cwl_stats_window_since_date()`
+  helper (same trailing-3-month math `get_recent_cwl_player_stats` already uses). The board's
+  sort-mode explainer text and tooltips updated from "last ≤10 CWL attacks" to "last 3 CWL
+  months" to match.
+- Added `attacks` (total real-attack count in the window) to `get_recent_cwl_player_stats`'s
+  response, backing the new "Attacks: n" pop-up line.
+  `QBhelperfunctions.py`, `qapbot/db_manager.py`, `qapbot/QBdiscocmdshelper_cwl.py`,
+  `activity/client/src/enrollmentBoard.ts`, `activity/client/src/main.ts`,
+  `activity/client/index.html`. Tests: replaced the old count-cap tests for
+  `get_recent_cwl_attacks_with_league_sync`/`compute_league_adjusted_skill_scores`/
+  `compute_avg_stars_per_attack` with date-window ones (both functions now take an optional `now`
+  override for determinism, same pattern `get_recent_cwl_player_stats` already established);
+  updated the `attacks` field into the existing `get_recent_cwl_player_stats`/`/api/cwl/
+  player-stats` test assertions. `.\run_tests.ps1`: 1990 passed, 4 deselected. Frontend
+  typecheck/build clean, deployed to DEV. Backend half also needs the bot process restarted on
+  DEV/PROD to take effect (manual, as always).
+
+2026-08-16 (30)
+- Fixed: the hover pop-up's missed-CWL-attacks/attack-defense-ratio numbers (29) didn't match
+  what `/leaderboard mode=missedattacks|attackdefratio cwl_only=true month=-3` shows for the same
+  player — project owner's spec, verbatim: "They should be calculated exactly as the /leaderboard
+  command would do it with the modes missedattacks and attackdefratio and with the options
+  cwl_only=true and month=-3", plus the follow-up "the option scope=ALL is also important." Root
+  cause: (29)'s version used a bespoke SQL query with a genuinely different windowing concept —
+  "the player's last 3 CWL seasons they have ANY history for" (adaptive, never shrinks for gaps,
+  not calendar-aligned) — instead of `/leaderboard`'s actual `month=-3` semantics: a FIXED trailing
+  3-calendar-month window that can contain 0-3 real CWL wars depending on recent activity, and
+  which also credits wars fought under any clan (scope=all), not just this guild's own.
+- New `get_recent_cwl_player_stats()` (QBhelperfunctions.py) replaces the old db_manager query —
+  it reuses `_load_history_rows()`/`_merge_entries()`, the exact two functions
+  `calculate_leaderboard()` itself calls, filtered the same way (`Max_Attacks == 1` for cwl_only,
+  scope="all" via `member_player_tags`), so this can never again silently disagree with what
+  `/leaderboard` actually shows for the same player. `GET /api/cwl/player-stats` now calls this
+  instead of the removed `db_manager.get_recent_cwl_stats_sync`. Response shape (`seasons`/
+  `missed_attacks`/`attack_defense_ratio`) is unchanged, so no frontend/Worker changes were needed
+  this round.
+  `QBhelperfunctions.py`, `qapbot/web_bridge.py`, `qapbot/db_manager.py` (old method removed).
+  Tests: removed the 5 now-obsolete `db_manager` tests for the old query; added 3 new tests for
+  `get_recent_cwl_player_stats` (no history, trailing-3-month sum with a non-CWL war correctly
+  excluded and scope=all explicitly guarded against falling back to per-clan history, zero-
+  defensive-stars ratio is None) plus updated the endpoint's own integration test to seed a war
+  anchored to "today" (the function's `now` isn't overridable through the HTTP layer, so a
+  hardcoded past date would eventually fall outside the real trailing-3-month window and start
+  failing). `.\run_tests.ps1`: 1989 passed, 4 deselected. Python-only change — needs the bot
+  process restarted on DEV/PROD to take effect (manual, as always).
+
+2026-08-16 (29)
+- Changed: the hover pop-up's "Current Clan:" line now shows `Name (#TAG)` once both are known —
+  project owner's spec, verbatim: "Current Clan: Clan_Name (#clan_tag)... If either name or tag is
+  missing just leave it out for the time being and fetch it and add it as soon as the fetch is
+  complete." Until the name lands, the line shows just the bare tag rather than blocking or
+  showing a placeholder — `resolveClanName()` now returns null (not the raw tag) when nothing's
+  resolved yet, so the pop-up can tell "not resolved" apart from "resolved, and the name happens
+  to equal the tag."
+- Added two more progressively-fetched stat lines, project owner's spec, verbatim: "get the number
+  of missed cwl attacks from the last three season's" / "add the attack / defense ratio from the
+  last three cwl seaons." New `get_recent_cwl_stats_sync(player_tag)` (db_manager.py) sums missed
+  attacks and computes total-attack-stars/total-defensive-stars over a player's own last 3 CWL
+  seasons (whichever 3 they actually have history for, any clan) — same duplicate-row-collapsing
+  MAX() shape compute_roster_stats_sync's own query already uses, for the same reason (a war can
+  have more than one war_attacks row per player). New `GET /api/cwl/player-stats` (bridge + Worker
+  proxy) exposes it; the pop-up fetches it per-hover alongside the clan-name lookup and adds both
+  lines once the fetch lands — omitted entirely for a player with no CWL history at all, or while
+  a ratio would divide by zero defensive stars.
+- Changed: an unlinked player's "Response:" line now reads "Not Linked" instead of "—" — project
+  owner's spec, verbatim: "For Unlinked players don't put -- to the response status but let it
+  say: Not Linked."
+  `qapbot/db_manager.py`, `qapbot/web_bridge.py`, `activity/server/src/index.ts`,
+  `activity/client/src/enrollmentBoard.ts`, `activity/client/src/main.ts`. Tests: 5 new for
+  `get_recent_cwl_stats_sync` (no history, non-CWL wars excluded, missed/ratio summed across
+  seasons, capped at the 3 most recent, ratio null with zero defensive stars) + 4 new for
+  `/api/cwl/player-stats`'s HTTP wiring (auth rejection, non-admin/leader rejection, no-history
+  null fields, real stats returned). `.\run_tests.ps1`: 1991 passed, 4 deselected. Frontend
+  typecheck/build clean, deployed to DEV (client + Worker). Backend half also needs the bot
+  process restarted on DEV/PROD to take effect (manual, as always).
+
+2026-08-16 (28)
+- Changed: the player-card hover info from (27) now renders as a real custom pop-up instead of
+  the browser's native `title` tooltip, and shows instantly with whatever's already loaded, then
+  patches in a proper clan name for a player's `current_clan_tag`/`assigned_clan_tag` if it wasn't
+  already one of this event's own columns — project owner's spec, verbatim: "show up the pop-up
+  as soon as possible (current mode) and then fetch more data from the db to update it as the
+  additional data comes in. I would start by fetching the clan name and adding the clan name
+  infront of the clan tag." A native `title` can't be live-updated once shown, which is why this
+  needed to become a real DOM element (`position: fixed`, appended to `document.body` so it isn't
+  clipped by the board's own scroll containers).
+- New `GET /api/cwl/clan-names?guild_id=&tags=` (bridge + Worker proxy) resolves clan_tag -> name
+  for any tag CACHE knows about anywhere, not just this guild's own clans — silently omits ones it
+  doesn't recognize, so the pop-up just keeps the raw tag for those. Same admin-or-leader gate as
+  the enrollment screen itself. Client caches both resolved names and already-attempted tags for
+  the life of the board render, so hovering different players sharing the same outside clan (or
+  re-hovering the same one) never re-fetches.
+  `qapbot/web_bridge.py`, `activity/server/src/index.ts`, `activity/client/src/enrollmentBoard.ts`,
+  `activity/client/src/main.ts`, `activity/client/index.html`. Tests: 4 new
+  (`/api/cwl/clan-names` auth rejection, non-admin/leader rejection, known-tags-resolved/
+  unknown-tags-omitted, empty-tags). `.\run_tests.ps1`: 1982 passed, 4 deselected. Frontend
+  typecheck/build clean, deployed to DEV (both the client and the Worker — this is the first
+  change this session needing a Worker redeploy, not just the client). Backend half also needs the
+  bot process restarted on DEV/PROD to take effect (manual, as always).
+
+2026-08-16 (27)
+- Added: hovering a player card on the Manage Enrollment board now shows a native browser tooltip
+  with player name/tag, TH level, current clan, assigned clan, Discord link status, response
+  status, avg stars/attack, skill score, and guest status — project owner's spec, verbatim: "a
+  small pop-up shows the clan the player belongs to along with some other info on the user that we
+  have in the DB." First pass deliberately uses only data already on `EnrollmentPlayer` (no new
+  backend field or fetch) — a follow-up could add anything not already loaded (attack history,
+  Discord username) at the cost of a real backend/payload change, but this covers the ask with
+  zero new complexity, reusing the same native-`title` pattern the guest badge/status icons
+  already used. `current_clan_tag`/`assigned_clan_tag` resolve to a display name only when that
+  tag is one of this board's own clans (payload.clans) — falls back to the raw tag otherwise
+  (e.g. a player who's since left every guild clan).
+  `activity/client/src/enrollmentBoard.ts`. Frontend typecheck/build clean, deployed to DEV.
+
+2026-08-16 (26)
+- Changed: sorting the Manage Enrollment board by "Player Skill" now breaks ties by TH level
+  (descending) before falling back to alphabetical — previously a skill-score tie went straight
+  to alphabetical, same as the "TH Level" sort's own existing tie-break, just not mirrored here.
+- Added a "User response:" label in front of the Pending/Confirmed/Declined legend group, plus a
+  trailing comma after "Not Linked" (live-testing feedback: the Guest swatch that follows doesn't
+  logically belong to the "User response" group either, and the comma marks that boundary).
+  `activity/client/src/enrollmentBoard.ts`, `activity/client/index.html`. Frontend
+  typecheck/build clean, deployed to DEV.
+
+2026-08-16 (25)
+- Changed: the "Guests" intelligent search on Configure Participating Clans buried Discord-user
+  results whenever a query matched a lot of clan names — project owner noticed searching "major"
+  seemingly found no Discord users, even though a linked account "Major Marti" genuinely matched;
+  confirmed live against the DEV DB the account WAS found, just pushed past the visible scroll
+  area behind 20 clan-name matches (clan hits were listed first, one combined 25-result cap
+  applied only at the very end).
+- Added two namespace-restricting prefixes, project owner's spec, verbatim: "when a given
+  expression starts with @ assume it is a discord user and only search in that name space.
+  similarly when the expression starts with a #, assume that we are talking about a clan, player
+  or family tag." `@needle` now searches ONLY Discord account display names; `#needle` now
+  matches ONLY clan_tag/player_tag substrings (no name-substring matching on either side).
+- Also (project owner's spec, verbatim: "Do the interleave, cap each type 12 / 12"): the
+  unrestricted/default search now caps clan hits and player hits at 12 each and interleaves them
+  one-of-each into the final list, so a broad query can no longer let one type crowd the other
+  out of the visible area.
+- `qapbot/web_bridge.py` (`_search_cwl_guests`). `activity/client/src/clanConfigTable.ts` (search
+  placeholder now hints at `@`/`#`). Tests: 3 new (`@`-restriction excludes clan/name-only
+  matches; `#`-restriction excludes name-only clan matches; interleave/cap-12 verified with 15
+  candidates of each type). `.\run_tests.ps1`: 1978 passed, 4 deselected. Frontend
+  typecheck/build clean, deployed to DEV. Backend change also needs the bot process restarted on
+  DEV/PROD to take effect (manual, as always).
+
+2026-08-16 (24)
+- Fixed: re-adding a guest clan after it had been removed only carried over the couple of players
+  who'd been deliberately drag-assigned before the removal — every other player who genuinely
+  qualified for auto-assignment (current member of that exact clan, with real prior CWL history
+  there) was silently skipped. Project owner's spec, verbatim: "after removing staycalm as guest
+  clan and then re-adding it only the two players that were assigned manually are in staycalm's
+  roster. The re-add should also have done a re-auto-assign in case the guest clan is not
+  controlled by its own guild." Root cause: `auto_assign_prior_cwl_members_if_empty()`'s top-level
+  "is the whole roster empty" gate treated the couple of intentionally-preserved locked survivors
+  (kept by (22)'s deactivation cleanup) as proof the entire clan was "already handled," and skipped
+  every other candidate outright instead of just leaving those specific players alone.
+- Renamed to `auto_assign_prior_cwl_members()` and reworked the gate to be PER PLAYER instead of
+  whole-roster: a player is now only skipped if THEY are already placed in this exact clan (locally
+  assigned there, or `assigned=1` in the shared table) — every other qualifying current member gets
+  seeded regardless of what else is already on the roster. `assign_cwl_player_sync`'s own
+  `deliberate=False` conflict handling already protects anyone locked elsewhere from being evicted,
+  so the old aggregate gate was redundant for that concern and only caused this bug.
+  `qapbot/QBdiscocmdshelper_cwl.py`, `qapbot/web_bridge.py` (call site rename only, same trigger
+  point/timing). Tests: replaced the old "never overwrites a non-empty roster" test (which asserted
+  the buggy all-or-nothing behavior) with one confirming a locked survivor stays untouched WHILE a
+  newly-qualifying player still gets seeded, plus a new test confirming a player already placed in
+  this exact clan is never re-written (lock/source preserved). `.\run_tests.ps1`: 1975 passed, 4
+  deselected. Python-only change — needs the bot process restarted on DEV/PROD to take effect
+  (manual, as always).
+
 2026-08-16 (10)
 - Fixed: the box-shadow-on-`<tr>` row-line fix (2026-08-16 (8)) rendered correctly on desktop
   Chrome/Firefox but not at all on iPad — WebKit (which every iOS browser runs on, including iPad
@@ -16,6 +279,81 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   Clans — the table's own last row already ends in a divider line, so a second one directly above
   read as redundant. Spacing (margin-top/padding-top) is unchanged. `index.html`. Frontend
   typecheck/build clean, deployed to DEV.
+
+2026-08-16 (23)
+- Fixed: deactivating a guest clan left its members' OTHER linked Discord accounts (alt characters
+  in completely unrelated clans) stranded in the local pool — the "STY"-prefixed players
+  live-testing kept surfacing weren't StayCalm members at all; they were linked alt accounts of
+  genuine StayCalm members, swept into the pool by Start Enrollment's own account-wide-linked-
+  accounts expansion (guild_config.cwl_enrollment_include_all_linked_accounts), which doesn't
+  distinguish a Discord account that qualified via a family-clan member from one that qualified
+  via a guest-clan member. (22)'s cleanup only ever considered clan_tag's own direct current
+  members, so these never-direct-member alt accounts were never candidates for removal at all.
+- `_cleanup_local_pool_for_plain_clan_deactivation_sync()` now also sweeps every OTHER player
+  sharing a Discord account with one of the removed clan's direct members. Two deliberately
+  asymmetric protection rules, project owner's spec confirmed explicitly: a linked account with a
+  player in one of the guild's own FAMILY clans is always protected, unconditionally (family
+  membership was never gated by the linked-accounts toggle on the add side either). A linked
+  account with a player in ANOTHER currently-active GUEST clan is protected only while
+  `cwl_enrollment_include_all_linked_accounts` is currently True — mirrors exactly what a fresh
+  Start Enrollment run would produce for that other clan right now, not whatever was true when
+  these players were originally added (the toggle may have changed since). A player who is
+  themselves a genuine direct member of a protective clan is always kept regardless of the toggle
+  — that's independent membership, nothing to do with account linkage. The existing admin_override
+  +locked protection is unaffected, an orthogonal OR condition.
+- `qapbot/QBdiscocmdshelper_cwl.py`. Tests: 4 new (unrelated-clan alt removed; family-linked alt
+  always kept; other-active-guest-clan-linked alt kept only with the toggle on, removed with it
+  off). `.\run_tests.ps1`: 1974 passed, 4 deselected. Python-only change — needs the bot process
+  restarted on DEV/PROD to take effect (manual, as always).
+
+2026-08-16 (22)
+- Fixed: deactivating a PLAIN guest clan (never cross-guild shared) left its auto-assigned/auto-
+  seeded players stuck in both "Assigned to other Guild" and "Unassigned" — the exact symptom
+  (16)/(11) already fixed, but back again, project owner's spec, verbatim: "I removed staycalm
+  but their players were not removed from the qcrew's player pool as it should have. we fixed
+  this earlier this day and now it's back." Not actually a regression: every round of that
+  earlier fix lived entirely inside `detach_guild_from_shared_clan_on_deactivation`'s SHARED-clan
+  branch, operating on `cwl_shared_clan_players` — gated behind that same function's
+  `if shared is None: return` a few lines up top. A clan that was never cross-guild shared (only
+  this one guild ever configured it) hit that early return and got zero cleanup the entire time;
+  the fix was simply never extended to the plain-clan case.
+- New `_cleanup_local_pool_for_plain_clan_deactivation_sync()` (`qapbot/QBdiscocmdshelper_cwl.py`)
+  is the LOCAL-table counterpart of that same rule: a genuinely deliberate placement
+  (`assignment_source='admin_override'` and `locked`) is preserved untouched (it's already a real
+  local `cwl_assignments` row — unlike the shared branch, nothing needs to be freshly
+  materialized, since there was never a separate shared table to mirror from); everything else
+  that only exists locally because of this clan (`auto_assigned`/`auto_seeded` from
+  `auto_assign_prior_cwl_members_if_empty`, or an even older stale mirror) is deleted outright,
+  unless the player is a genuine CURRENT member of one of this guild's own family clans. Wired
+  into `detach_guild_from_shared_clan_on_deactivation`'s `shared is None` branch, which previously
+  did nothing at all. Tests: 3 new (auto-placed players removed; a deliberate drag-and-drop
+  placement survives; a genuine family member's local record is never touched even with stale
+  guest-clan history). `.\run_tests.ps1`: 1970 passed, 4 deselected. Python-only change — needs
+  the bot process restarted on DEV/PROD to take effect (manual, as always).
+
+2026-08-16 (21)
+- Fixed a genuine pre-existing bug (independent of this session's other changes), project owner's
+  spec, verbatim: "after getting a fresh copy of prod data (with no active cwl seasons) i started
+  a season for the qcrew and added staycalm as a guest clan. staycalm didn't get the previous
+  month player auto-assignment." Root cause: `start_cwl_enrollment()`'s auto-assign candidate pool
+  was scoped to `resolve_guild_member_clan_tags(guild_id)` alone — which, by definition, only ever
+  returns the guild's own family clans, structurally excluding every guest clan (that's the whole
+  point of a guest clan: it's explicitly NOT part of the family). A guest clan added BEFORE Start
+  Enrollment runs (deliberately skipped by the separate "clan added after enrollment" auto-assign
+  path, since Start Enrollment's own comprehensive seed is supposed to cover it) had its own
+  current members silently excluded from the auto-assign CANDIDATE list entirely — no matter how
+  much real prior-CWL-attack history they had for exactly that clan, they were never even
+  considered, since resolve_prior_cwl_assignments() only resolves entries for player_tags it was
+  actually given. Confirmed against real prod-copy data: roughly a quarter of the guest clan's
+  current roster had a real, recent CWL attack recorded for that exact clan and should have been
+  auto-assigned but weren't.
+- Fixed by unioning `participating_clan_tags` into the candidate-pool clan-tag resolution — the
+  exact same union `_build_enrollment_payload()` (web_bridge.py) already applies to its own player
+  pool, for the identical underlying reason. `qapbot/QBdiscocmdshelper_cwl.py`. Tests: 1 new
+  integration test reproducing the exact reported scenario (a guest clan's own current member with
+  real prior-CWL-attack history for that clan gets correctly auto-assigned by Start Enrollment).
+  `.\run_tests.ps1`: 1967 passed, 4 deselected. Python-only change — needs the bot process
+  restarted on DEV/PROD to take effect (manual, as always).
 
 2026-08-16 (20)
 - Added: the "Manage Enrollment" board now polls for live updates every 12s while open, project

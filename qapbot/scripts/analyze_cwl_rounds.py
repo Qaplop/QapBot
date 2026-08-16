@@ -63,6 +63,7 @@ class _Tee(io.TextIOBase):
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from qapbot.config import CONFIG  # type: ignore[import]
 from qapbot.constants import normalize_cwl_season  # noqa: E402
+from qapbot.db_manager import explicit_column_list_from_conn  # noqa: E402
 
 
 class _WtInfo(TypedDict):
@@ -124,10 +125,11 @@ def query_war_distribution(
     total_wars    : total war_summary rows (= sum of war_count * clan_count).
     total_clans   : number of distinct clan_tags in war_summary for the season.
     """
+    ws_cols = explicit_column_list_from_conn(conn, "war_summary")
     rows = conn.execute(
-        """
+        f"""
         WITH ws AS (
-            SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary
+            SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary
         )
         SELECT war_count, COUNT(*) AS clan_count
         FROM (
@@ -172,14 +174,17 @@ def query_max_rounds_distribution(
     API (not in cwl_league_groups) are excluded; count them separately with
     count_clans_without_group_data().
     """
+    clg_cols = explicit_column_list_from_conn(conn, "cwl_league_groups")
+    clr_cols = explicit_column_list_from_conn(conn, "cwl_league_rounds")
+    ws_cols = explicit_column_list_from_conn(conn, "war_summary")
     rows = conn.execute(
-        """
+        f"""
         WITH clg AS (
-            SELECT * FROM main.cwl_league_groups UNION ALL SELECT * FROM history.cwl_league_groups
+            SELECT {clg_cols} FROM main.cwl_league_groups UNION ALL SELECT {clg_cols} FROM history.cwl_league_groups
         ), clr AS (
-            SELECT * FROM main.cwl_league_rounds UNION ALL SELECT * FROM history.cwl_league_rounds
+            SELECT {clr_cols} FROM main.cwl_league_rounds UNION ALL SELECT {clr_cols} FROM history.cwl_league_rounds
         ), ws AS (
-            SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary
+            SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary
         )
         SELECT gr.max_rounds, COUNT(*) AS clan_count
         FROM   clg
@@ -210,12 +215,14 @@ def count_clans_without_group_data(conn: sqlite3.Connection, season: str) -> int
     cwl_league_groups — i.e. their CWL group has never been fetched from
     the API.  Their max_rounds is unknown.
     """
+    ws_cols = explicit_column_list_from_conn(conn, "war_summary")
+    clg_cols = explicit_column_list_from_conn(conn, "cwl_league_groups")
     row = conn.execute(
-        """
+        f"""
         WITH ws AS (
-            SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary
+            SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary
         ), clg AS (
-            SELECT * FROM main.cwl_league_groups UNION ALL SELECT * FROM history.cwl_league_groups
+            SELECT {clg_cols} FROM main.cwl_league_groups UNION ALL SELECT {clg_cols} FROM history.cwl_league_groups
         )
         SELECT COUNT(*) AS cnt
         FROM (
@@ -279,12 +286,14 @@ def query_league_round_breakdown(
         leagues_ordered : league names present in data, sorted highest → lowest
         has_null_league : True if any rows have no cwl_league_groups entry
     """
+    ws_cols = explicit_column_list_from_conn(conn, "war_summary")
+    clg_cols = explicit_column_list_from_conn(conn, "cwl_league_groups")
     rows = conn.execute(
-        """
+        f"""
         WITH ws AS (
-            SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary
+            SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary
         ), clg AS (
-            SELECT * FROM main.cwl_league_groups UNION ALL SELECT * FROM history.cwl_league_groups
+            SELECT {clg_cols} FROM main.cwl_league_groups UNION ALL SELECT {clg_cols} FROM history.cwl_league_groups
         )
         SELECT ws.round_number,
                clg.league_rank,
@@ -517,10 +526,11 @@ def query_archive(
     Returns: {round_number_or_None: {bucket: count}}
     round_number=None means round_number IS NULL in the DB.
     """
+    ws_cols = explicit_column_list_from_conn(conn, "war_summary")
     cur = conn.execute(
-        """
+        f"""
         WITH ws AS (
-            SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary
+            SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary
         )
         SELECT round_number, state, COUNT(*) AS cnt
         FROM   ws
@@ -862,10 +872,11 @@ def _main_inner(args: argparse.Namespace) -> None:
         conn_diag.row_factory = sqlite3.Row
         attach_history_db(conn_diag, db_path, getattr(CONFIG, "history_db_path", None), read_only=True)
         try:
+            ws_cols = explicit_column_list_from_conn(conn_diag, "war_summary")
             outliers = conn_diag.execute(
-                """
+                f"""
                 WITH ws AS (
-                    SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary
+                    SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary
                 )
                 SELECT clan_tag, COUNT(*) AS war_count
                 FROM   ws
@@ -883,9 +894,9 @@ def _main_inner(args: argparse.Namespace) -> None:
                 ct = row["clan_tag"]
                 wc = row["war_count"]
                 detail = conn_diag.execute(
-                    """
+                    f"""
                     WITH ws AS (
-                        SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary
+                        SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary
                     )
                     SELECT war_id, war_type, war_tag, round_number,
                            opponent_tag, date, state
@@ -1006,8 +1017,11 @@ def _main_inner(args: argparse.Namespace) -> None:
     conn3.row_factory = sqlite3.Row
     attach_history_db(conn3, db_path, getattr(CONFIG, "history_db_path", None), read_only=True)
     try:
+        ws_cols = explicit_column_list_from_conn(conn3, "war_summary")
+        clg_cols = explicit_column_list_from_conn(conn3, "cwl_league_groups")
+        clr_cols = explicit_column_list_from_conn(conn3, "cwl_league_rounds")
         row = conn3.execute(
-            """
+            f"""
             -- true_max = MAX(cwl_league_rounds rounds, war_summary max round).
             -- cwl_league_rounds may be stale (e.g. fetched when only 5 rounds existed
             -- for the group) while war_summary already contains round 7.  Using plain
@@ -1018,11 +1032,11 @@ def _main_inner(args: argparse.Namespace) -> None:
             -- The WHERE uses < (not !=) so clans that somehow exceed the stale
             -- max_rounds are treated as complete, not missing.
             WITH ws_all AS (
-                SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary
+                SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary
             ), clg_all AS (
-                SELECT * FROM main.cwl_league_groups UNION ALL SELECT * FROM history.cwl_league_groups
+                SELECT {clg_cols} FROM main.cwl_league_groups UNION ALL SELECT {clg_cols} FROM history.cwl_league_groups
             ), clr_all AS (
-                SELECT * FROM main.cwl_league_rounds UNION ALL SELECT * FROM history.cwl_league_rounds
+                SELECT {clr_cols} FROM main.cwl_league_rounds UNION ALL SELECT {clr_cols} FROM history.cwl_league_rounds
             )
             SELECT
                 COUNT(*) AS incomplete_clans,

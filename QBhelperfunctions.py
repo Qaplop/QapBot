@@ -3892,6 +3892,9 @@ def compute_roster_stats_sync(
     with CACHE.db_manager.sync_conn() as conn:
         conn.row_factory = _sqlite3.Row  # type: ignore[attr-defined]
         ph = ','.join('?' * len(player_tags))
+        wa_cols = CACHE.db_manager.explicit_column_list_sync(conn, "war_attacks")
+        clg_cols = CACHE.db_manager.explicit_column_list_sync(conn, "cwl_league_groups")
+        clr_cols = CACHE.db_manager.explicit_column_list_sync(conn, "cwl_league_rounds")
 
         # ── Query 1: per-war totals (reliability + activity) ──────────────────
         # Groups all rows (actual + sentinel) by (player_tag, war_id, clan_tag).
@@ -3907,8 +3910,8 @@ def compute_roster_stats_sync(
         # for the incident this caused (59s query / OOM).
         war_rows_raw = conn.execute(f"""
             WITH wa AS (
-                SELECT * FROM main.war_attacks
-                UNION ALL SELECT * FROM history.war_attacks
+                SELECT {wa_cols} FROM main.war_attacks
+                UNION ALL SELECT {wa_cols} FROM history.war_attacks
             )
             SELECT
                 wa.player_tag,
@@ -3937,8 +3940,8 @@ def compute_roster_stats_sync(
         # ── Query 2: star distribution (CW / CWL skill) ───────────────────────
         dist_rows_raw = conn.execute(f"""
             WITH wa AS (
-                SELECT * FROM main.war_attacks
-                UNION ALL SELECT * FROM history.war_attacks
+                SELECT {wa_cols} FROM main.war_attacks
+                UNION ALL SELECT {wa_cols} FROM history.war_attacks
             )
             SELECT
                 wa.player_tag,
@@ -3972,13 +3975,13 @@ def compute_roster_stats_sync(
         }
         cwl_max_rounds: Dict[str, int] = {}
         for cwl_season, ctag in season_clan_pairs:
-            row = conn.execute("""
+            row = conn.execute(f"""
                 WITH clg AS (
-                    SELECT * FROM main.cwl_league_groups
-                    UNION ALL SELECT * FROM history.cwl_league_groups
+                    SELECT {clg_cols} FROM main.cwl_league_groups
+                    UNION ALL SELECT {clg_cols} FROM history.cwl_league_groups
                 ), clr AS (
-                    SELECT * FROM main.cwl_league_rounds
-                    UNION ALL SELECT * FROM history.cwl_league_rounds
+                    SELECT {clr_cols} FROM main.cwl_league_rounds
+                    UNION ALL SELECT {clr_cols} FROM history.cwl_league_rounds
                 )
                 SELECT COUNT(DISTINCT clr.cwl_round) AS max_rounds
                 FROM   clg
@@ -4461,6 +4464,82 @@ def parse_month_argument(spec: str, now: datetime, explicit_year: Optional[int] 
     pairs = [(m, base_year) for m in raw_months]
     pairs.sort(key=lambda p: p[1] * 100 + p[0])
     return pairs
+
+
+def get_recent_cwl_player_stats(player_tag: str, num_months: int = 3, *, now: Optional[datetime] = None) -> Dict[str, Any]:
+    """One player's missed-attack count and attack/defense star ratio, computed EXACTLY as
+    `/leaderboard mode=missedattacks|attackdefratio cwl_only=true month=-{num_months} scope=all`
+    would compute them for this player (2026-08-16, Manage Enrollment hover pop-up, project
+    owner's spec, verbatim: "They should be calculated exactly as the /leaderboard command would
+    do it with the modes missedattacks and attackdefratio and with the options cwl_only=true and
+    month=-3", plus the follow-up "the option scope=ALL is also important"). Replaces an earlier
+    version of this stat that used a different "last 3 CWL seasons this player has ANY history
+    for" window (a bespoke SQL query in db_manager.py) — the project owner reported the two didn't
+    agree, which is expected: that window doesn't shrink for gaps and isn't tied to calendar
+    months at all, while `month=-3` is a fixed trailing-3-calendar-month window that can easily
+    contain 0, 1, 2, or 3 real CWL wars for a given player depending on how recently they've
+    actually played.
+
+    Deliberately reuses `_load_history_rows()`/`_merge_entries()` — the exact two functions
+    `calculate_leaderboard()` itself calls — rather than re-deriving the aggregation
+    independently a second time, so this can never again silently drift from what `/leaderboard`
+    actually shows. `mode="currentwar"` is passed to `_merge_entries` only (never to
+    `calculate_leaderboard`, which would skip loading history entirely for that mode) purely to
+    get its own unconditional entries filter — every OTHER mode's filter drops players who don't
+    individually qualify THAT SPECIFIC MONTH (e.g. `attackdefratio`/`missedattacks` both require
+    a nonzero count that exact month), which would silently undercount a month where this player
+    has missed attacks or defensive stars recorded but made zero real attacks that month.
+
+    scope="all" (member_player_tags={player_tag}) — the command's own default — credits this
+    player for CWL wars fought under ANY clan, not just clans this guild still tracks, matching
+    `_load_history_rows`'s scope="all" dispatch to `get_player_attack_history_sync` exactly; the
+    `clan_tag` argument that function normally takes is irrelevant on that path (only scope="own"
+    reads it), so an empty string is passed rather than a real tag.
+
+    Doesn't fold in the CURRENTLY in-progress war's temp stats the way the live command does for
+    whichever month is "now" — there's no clan context available to look up an in-progress war for
+    a bare player_tag outside of a specific clan's context. Catches up automatically once that war
+    saves to history, same as the rest of this stat already lags real-time CoC state by one war.
+
+    Returns `{"seasons": [], "attacks": None, "missed_attacks": None, "attack_defense_ratio":
+    None}` when this player has zero CWL history anywhere in the window; otherwise `seasons` is
+    always the full `num_months`-long list of "YYYY-MM" strings requested (not just the ones with
+    data — this is a fixed calendar window, not an adaptive one), oldest first. `attacks` is the
+    total number of real attacks made in the window (2026-08-16 follow-up, project owner's spec:
+    "Attacks: n (number of total attacks)").
+
+    `now` defaults to the real current time; overridable for deterministic tests, same reason
+    parse_month_argument() itself takes `now` as an explicit argument rather than calling
+    datetime.now() internally."""
+    periods = parse_month_argument(f"-{num_months}", now or datetime.now(_tz.utc))
+
+    total_stars = 0
+    total_attacks = 0
+    total_missed = 0
+    total_defensive = 0
+    any_history = False
+    for month, year in periods:
+        rows = _load_history_rows("", month, year, None, scope="all", member_player_tags={player_tag})
+        rows = [r for r in rows if r.get("Max_Attacks", 2) == 1]  # cwl_only, matching calculate_leaderboard()
+        entry = _merge_entries(rows, {}, False, mode="currentwar").get(player_tag)
+        if entry is None:
+            continue
+        any_history = True
+        total_stars += entry.get("Stars", 0)
+        total_attacks += entry.get("Attacks", 0)
+        total_missed += entry.get("Missed_Attacks", 0)
+        total_defensive += entry.get("Defensive_Stars", 0)
+
+    if not any_history:
+        return {"seasons": [], "attacks": None, "missed_attacks": None, "attack_defense_ratio": None}
+
+    return {
+        "seasons": [f"{y:04d}-{m:02d}" for m, y in periods],
+        "attacks": total_attacks,
+        "missed_attacks": total_missed,
+        "attack_defense_ratio": round(total_stars / total_defensive, 2) if total_defensive > 0 else None,
+    }
+
 
 def generate_leaderboard_text(
     clan_tag: str,

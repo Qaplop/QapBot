@@ -1889,6 +1889,8 @@ async def _seed_cwl_attack_with_league(
 @pytest.mark.discord
 @pytest.mark.asyncio
 async def test_compute_league_adjusted_skill_scores_weights_by_league(db):
+    from datetime import datetime
+
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import compute_league_adjusted_skill_scores
 
@@ -1898,7 +1900,7 @@ async def test_compute_league_adjusted_skill_scores_weights_by_league(db):
     await _seed_cwl_attack_with_league(db, "#CLAN1", "2026-05", "Legend League", "#P1", stars=3, date="2026-05-01T08:00", war_id="w1")
     await _seed_cwl_attack_with_league(db, "#CLAN1", "2026-07", "Bronze League III", "#P2", stars=3, date="2026-07-01T08:00", war_id="w2")
 
-    scores = compute_league_adjusted_skill_scores(["#P1", "#P2"])
+    scores = compute_league_adjusted_skill_scores(["#P1", "#P2"], now=datetime(2026, 7, 15))
     assert scores["#P1"] > scores["#P2"]
     assert scores["#P2"] == pytest.approx(3.0)  # Bronze III weight is exactly 1.0
     assert scores["#P1"] == pytest.approx(3 * (1.4 ** 7), abs=0.01)  # rounded to 2dp
@@ -1906,22 +1908,32 @@ async def test_compute_league_adjusted_skill_scores_weights_by_league(db):
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_compute_league_adjusted_skill_scores_caps_at_last_ten_attacks(db):
+async def test_compute_league_adjusted_skill_scores_excludes_attacks_outside_trailing_three_months(db):
+    """2026-08-16, project owner's spec: "our hover over pop-up info is inconsistent to the way
+    we calculate the stats for the player tile info. there we use the last 10 cwl attacks. We
+    should make this consistent and use the 'last three months' logic for both" — replaces the
+    old count-based "last 10 attacks" cap with the same trailing-3-calendar-month window the
+    pop-up's own get_recent_cwl_player_stats uses."""
+    from datetime import datetime
+
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import compute_league_adjusted_skill_scores
 
     await _seed_guild_and_clans(db, "9311", {"#CLAN1": "Alpha"})
     CACHE.db_manager = db
-    # 11 attacks, all 3-star except the oldest (11th, 1-star) — must be excluded from the average.
-    for i in range(11):
-        stars = 1 if i == 0 else 3
+    # April 2026 — outside the trailing-3-month window ending July — 1-star, must be excluded.
+    await _seed_cwl_attack_with_league(
+        db, "#CLAN1", "2026-04", "Bronze League III", "#P1", stars=1, date="2026-04-01T08:00", war_id="war_apr",
+    )
+    # May/June/July 2026 — inside the window — 3-star each.
+    for month in ("05", "06", "07"):
         await _seed_cwl_attack_with_league(
-            db, "#CLAN1", f"2026-{i + 1:02d}", "Bronze League III", "#P1", stars=stars,
-            date=f"2026-{i + 1:02d}-01T08:00", war_id=f"war{i}",
+            db, "#CLAN1", f"2026-{month}", "Bronze League III", "#P1", stars=3,
+            date=f"2026-{month}-01T08:00", war_id=f"war{month}",
         )
 
-    scores = compute_league_adjusted_skill_scores(["#P1"])
-    assert scores["#P1"] == pytest.approx(3.0)  # only the ten 3-star attacks counted
+    scores = compute_league_adjusted_skill_scores(["#P1"], now=datetime(2026, 7, 15))
+    assert scores["#P1"] == pytest.approx(3.0)  # only the three in-window 3-star attacks counted
 
 
 @pytest.mark.discord
@@ -1954,6 +1966,8 @@ def test_compute_league_adjusted_skill_scores_returns_empty_without_db_manager()
 async def test_compute_avg_stars_per_attack_ignores_league_weighting(db):
     """Same setup as the league-weighted test above — Legend and Bronze III both earned a
     3-star, but this metric must score them identically since it isn't league-adjusted."""
+    from datetime import datetime
+
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import compute_avg_stars_per_attack
 
@@ -1962,29 +1976,33 @@ async def test_compute_avg_stars_per_attack_ignores_league_weighting(db):
     await _seed_cwl_attack_with_league(db, "#CLAN1", "2026-05", "Legend League", "#P1", stars=3, date="2026-05-01T08:00", war_id="w1")
     await _seed_cwl_attack_with_league(db, "#CLAN1", "2026-07", "Bronze League III", "#P2", stars=3, date="2026-07-01T08:00", war_id="w2")
 
-    averages = compute_avg_stars_per_attack(["#P1", "#P2"])
+    averages = compute_avg_stars_per_attack(["#P1", "#P2"], now=datetime(2026, 7, 15))
     assert averages["#P1"] == pytest.approx(3.0)
     assert averages["#P2"] == pytest.approx(3.0)
 
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_compute_avg_stars_per_attack_caps_at_last_ten_attacks(db):
+async def test_compute_avg_stars_per_attack_excludes_attacks_outside_trailing_three_months(db):
+    """Same fix/reasoning as compute_league_adjusted_skill_scores' own trailing-3-month test."""
+    from datetime import datetime
+
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import compute_avg_stars_per_attack
 
     await _seed_guild_and_clans(db, "9314", {"#CLAN1": "Alpha"})
     CACHE.db_manager = db
-    # 11 attacks, all 3-star except the oldest (11th, 1-star) — must be excluded from the average.
-    for i in range(11):
-        stars = 1 if i == 0 else 3
+    await _seed_cwl_attack_with_league(
+        db, "#CLAN1", "2026-04", "Bronze League III", "#P1", stars=1, date="2026-04-01T08:00", war_id="war_apr",
+    )
+    for month in ("05", "06", "07"):
         await _seed_cwl_attack_with_league(
-            db, "#CLAN1", f"2026-{i + 1:02d}", "Bronze League III", "#P1", stars=stars,
-            date=f"2026-{i + 1:02d}-01T08:00", war_id=f"war{i}",
+            db, "#CLAN1", f"2026-{month}", "Bronze League III", "#P1", stars=3,
+            date=f"2026-{month}-01T08:00", war_id=f"war{month}",
         )
 
-    averages = compute_avg_stars_per_attack(["#P1"])
-    assert averages["#P1"] == pytest.approx(3.0)  # only the ten 3-star attacks counted
+    averages = compute_avg_stars_per_attack(["#P1"], now=datetime(2026, 7, 15))
+    assert averages["#P1"] == pytest.approx(3.0)  # only the three in-window 3-star attacks counted
 
 
 @pytest.mark.discord

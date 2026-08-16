@@ -235,7 +235,7 @@ export function renderClanConfigTable(
   const guestsSearchInput = document.createElement('input')
   guestsSearchInput.type = 'text'
   guestsSearchInput.className = 'guests-search-input'
-  guestsSearchInput.placeholder = 'Search Discord user, player name/tag, or clan…'
+  guestsSearchInput.placeholder = 'Search name/tag, clan, @discord user, or #tag…'
   guestsSearchRow.appendChild(guestsSearchInput)
   const guestsDmLabel = document.createElement('label')
   guestsDmLabel.className = 'guests-dm-label'

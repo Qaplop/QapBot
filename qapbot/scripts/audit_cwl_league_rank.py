@@ -134,6 +134,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from qapbot.config import CONFIG  # noqa: E402
+from qapbot.db_manager import explicit_column_list_from_conn  # noqa: E402
 
 
 class Row:
@@ -302,9 +303,10 @@ def _bulk_group_war_stats(conn: sqlite3.Connection, season: str) -> Dict[str, Tu
     clan with at least one archived CWL war in *season* — computed offline from
     war_summary (main+history), no API calls."""
     has_hist = _has_history(conn)
-    ws_sql = "SELECT * FROM main.war_summary"
+    ws_cols = explicit_column_list_from_conn(conn, "war_summary")
+    ws_sql = f"SELECT {ws_cols} FROM main.war_summary"
     if has_hist:
-        ws_sql += " UNION ALL SELECT * FROM history.war_summary"
+        ws_sql += f" UNION ALL SELECT {ws_cols} FROM history.war_summary"
     rows = conn.execute(
         f"WITH ws AS ({ws_sql}) "
         "SELECT clan_tag, "

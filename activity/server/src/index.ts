@@ -179,6 +179,47 @@ api.get('/cwl/enrollment', async (c) => {
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
 })
 
+// Hover pop-up progressive fetch (2026-08-16) — resolves clan_tag -> name for tags the board's
+// initial payload didn't already carry a name for. Same verify-identity-then-proxy shape as
+// /cwl/enrollment above (which this is a companion to); `tags` is a plain comma-joined list, not
+// re-validated here — the bridge itself is tolerant of unknown/empty entries.
+api.get('/cwl/clan-names', async (c) => {
+  const guildId = c.req.query('guild_id')
+  if (!guildId) return c.json({ error: 'missing guild_id' }, 400)
+  const tags = c.req.query('tags') ?? ''
+
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  const upstream = await fetch(
+    `${c.env.BRIDGE_URL}/api/cwl/clan-names?guild_id=${encodeURIComponent(guildId)}&discord_user_id=${encodeURIComponent(discordUserId)}&tags=${encodeURIComponent(tags)}`,
+    { headers: { 'X-Bridge-Secret': c.env.BRIDGE_SECRET } },
+  )
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
+})
+
+// Second half of the hover pop-up's progressive fetch (2026-08-16) — missed CWL attacks +
+// attack/defense ratio for a single player, over their last 3 CWL seasons. Same
+// verify-identity-then-proxy shape as /cwl/clan-names above.
+api.get('/cwl/player-stats', async (c) => {
+  const guildId = c.req.query('guild_id')
+  const playerTag = c.req.query('player_tag')
+  if (!guildId || !playerTag) return c.json({ error: 'missing guild_id or player_tag' }, 400)
+
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  const upstream = await fetch(
+    `${c.env.BRIDGE_URL}/api/cwl/player-stats?guild_id=${encodeURIComponent(guildId)}&discord_user_id=${encodeURIComponent(discordUserId)}&player_tag=${encodeURIComponent(playerTag)}`,
+    { headers: { 'X-Bridge-Secret': c.env.BRIDGE_SECRET } },
+  )
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500 | 503)
+})
+
 api.post('/cwl/enrollment/signup', async (c) => {
   const discordUserId = await verifiedDiscordUserId(c)
   if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)

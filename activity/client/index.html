@@ -261,6 +261,7 @@
       }
       .title-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 6px; }
       .legend { display: flex; align-items: center; gap: 12px; }
+      .legend-label { font-size: 0.75rem; color: #f2f3f5; }
       .legend-item { display: flex; align-items: center; gap: 4px; font-size: 0.75rem; color: #f2f3f5; }
       .legend-icon { width: 16px; height: 16px; }
       /* Reproduces .guest-card's own inset box-shadow accent exactly (2026-08-16) — same swatch
@@ -412,6 +413,29 @@
          background override fine since box-shadow paints on top regardless of background color. */
       .player-card.guest-card { box-shadow: inset 3px 0 0 0 #f0b232; }
       .player-card.dragging { opacity: 0.4; }
+      /* Hover info pop-up (2026-08-16) — position: fixed + appended to document.body (not the
+         card itself) so it isn't clipped by .card-list's/.board's own overflow:auto, and its
+         coordinates are set directly in viewport pixels by positionTooltip() in
+         enrollmentBoard.ts. pointer-events: none so it can never itself become a drop target or
+         intercept the mouseleave that's meant to dismiss it. */
+      .player-hover-popup {
+        position: fixed;
+        z-index: 20;
+        background: #111214;
+        border: 1px solid #3f4147;
+        border-radius: 6px;
+        padding: 8px 10px;
+        font-size: 0.75rem;
+        color: #f2f3f5;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+        pointer-events: none;
+        max-width: 240px;
+      }
+      .hover-popup-name { font-weight: 600; margin-bottom: 4px; }
+      .hover-popup-line { color: #b5bac1; line-height: 1.5; }
+      /* CWL-stats section header (2026-08-16) — a touch of top margin separates it from the
+         identity/status lines above; otherwise matches .hover-popup-name's own weight/color. */
+      .hover-popup-header { font-weight: 600; margin-top: 6px; line-height: 1.5; }
       /* Open roster slot — no player assigned yet. Not draggable (see buildPlaceholderCard()),
          just a quiet placeholder so the roster band always shows all roster_size slots. No
          height of its own — the invisible .status-icon spacer inside its real .player-row

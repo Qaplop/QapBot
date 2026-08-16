@@ -1574,6 +1574,18 @@ async def handle_backfill_cwl_groups(cache: Any, season: str) -> str:
         _qbcore.backfill_idle_event.set()
 
 
+def _explicit_cols(conn: Any, table: str) -> str:
+    """Comma-joined column names for `table`, read from `main`'s own schema — see
+    WarHistoryDB._explicit_column_list_sync's docstring (qapbot/db_manager.py) for why every
+    `UNION ALL` between `main.<table>` and `history.<table>` must name columns explicitly
+    rather than using a bare `SELECT *` (2026-08-14 hot/history column-order-drift incident).
+    Duplicated here (rather than routed through CACHE.db_manager) because this function
+    deliberately uses its own short-lived, read-only, non-pooled connection — this helper only
+    needs a `main` schema attached, which that connection already has via attach_history_db."""
+    cur = conn.execute(f"PRAGMA main.table_info({table})")
+    return ", ".join(row["name"] for row in cur.fetchall())
+
+
 async def _handle_backfill_cwl_groups_inner(cache: Any, season: str) -> str:
     """Inner implementation of handle_backfill_cwl_groups (cycle guards handled by caller)."""
     import asyncio
@@ -1585,10 +1597,11 @@ async def _handle_backfill_cwl_groups_inner(cache: Any, season: str) -> str:
     from qapbot.db_manager import attach_history_db
     attach_history_db(conn, CONFIG.db_path, getattr(CONFIG, "history_db_path", None), read_only=True)
     try:
+        ws_cols = _explicit_cols(conn, "war_summary")
         short_clan_rows = conn.execute(
-            """
+            f"""
             WITH ws AS (
-                SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary
+                SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary
             )
             SELECT clan_tag
             FROM   ws
@@ -1665,16 +1678,19 @@ async def _handle_backfill_cwl_groups_inner(cache: Any, season: str) -> str:
         #   rounds_in_ws == rounds_in_group  → genuinely short group, nothing missing
         #   rounds_in_ws <  rounds_in_group  → some war_tags missing from war_summary
         #   rounds_in_group == 0             → API fetch failed, no group data
+        ws_cols2 = _explicit_cols(conn2, "war_summary")
+        clg_cols2 = _explicit_cols(conn2, "cwl_league_groups")
+        clr_cols2 = _explicit_cols(conn2, "cwl_league_rounds")
         analysis_rows = conn2.execute(
-            """
+            f"""
             WITH ws_all AS (
-                SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary
+                SELECT {ws_cols2} FROM main.war_summary UNION ALL SELECT {ws_cols2} FROM history.war_summary
             ),
             clg_all AS (
-                SELECT * FROM main.cwl_league_groups UNION ALL SELECT * FROM history.cwl_league_groups
+                SELECT {clg_cols2} FROM main.cwl_league_groups UNION ALL SELECT {clg_cols2} FROM history.cwl_league_groups
             ),
             clr_all AS (
-                SELECT * FROM main.cwl_league_rounds UNION ALL SELECT * FROM history.cwl_league_rounds
+                SELECT {clr_cols2} FROM main.cwl_league_rounds UNION ALL SELECT {clr_cols2} FROM history.cwl_league_rounds
             ),
             ws AS (
                 SELECT clan_tag, COUNT(*) AS rounds_in_ws

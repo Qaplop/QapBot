@@ -72,12 +72,13 @@ def load_incomplete_clans(db_path: str, season: str, tracked_only: bool) -> list
     """
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    from qapbot.db_manager import attach_history_db
+    from qapbot.db_manager import attach_history_db, explicit_column_list_from_conn
     attach_history_db(conn, db_path, read_only=True)
     try:
-        query = """
+        ws_cols = explicit_column_list_from_conn(conn, "war_summary")
+        query = f"""
             WITH ws AS (
-                SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary
+                SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary
             )
             SELECT wsc.clan_tag,
                    COALESCE(c.track_war_updates, 0) AS tracked

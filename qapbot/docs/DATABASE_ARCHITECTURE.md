@@ -215,6 +215,92 @@ only — `war_summary.date` IS affected), `player_name`, `player_tag`, `th_level
 
 📖 Prevention rule: `.github/copilot-instructions.md` Cardinal Rule 1.
 
+### Follow-up: the same bug existed on the READ side too (found + fixed 2026-08-16)
+
+The 2026-08-14 fix above only covered the *write* path — the monthly migration. While
+investigating why the "Manage Enrollment" hover pop-up showed a player's Skill Score but not
+their Attacks/Missed-Attacks/Attack-Defense-Ratio, the identical bug turned up on the *read*
+side: every sync/async method that reads BOTH `main.<table>` and `history.<table>` into one
+result set via `WITH x AS (SELECT * FROM main.t UNION ALL SELECT * FROM history.t)` also
+matched columns by **position**, not name — so any row actually contributed by `history` (i.e.
+any war old enough to have been archived) came back with `max_attacks`/`missed_attacks`/
+`defensive_stars`/`map_position`/etc. silently misaligned, for exactly the same reason as the
+write-path bug: `history`'s physical column order differs from `main`'s.
+
+Confirmed against DEV's real `data/qapbot_history.db`: a raw diagnostic `SELECT * FROM
+main.war_attacks UNION ALL SELECT * FROM history.war_attacks` for a real player showed
+`max_attacks` holding an opponent tag string for her older (archived) attacks — while a plain
+named-column `SELECT max_attacks, ... FROM history.war_attacks` against the same rows showed
+correct, sane values. This means the *stored* data itself was NOT corrupted (the 2026-08-14
+write-path fix was already doing its job) — only every one of these read queries was
+misinterpreting it on the way out.
+
+**Fix**: `WarHistoryDB._explicit_column_list_sync()` (sync counterpart of the existing async
+`_explicit_column_list()`) and a public `explicit_column_list_sync()` alias for other modules
+that share this class's `sync_conn()`. Every affected query — ~20 call sites across
+`qapbot/db_manager.py` (both sync and async), `QBhelperfunctions.py` (`/whois` reliability/
+activity/skill), and `qapbot/QBdiscocmdshelper_admin_command.py` (`/backfill_cwl_groups`) —
+now names its columns explicitly on both sides of every `main`/`history` `UNION ALL`, immune to
+physical order regardless of which schema a row actually comes from.
+
+A second, still-live **write**-path instance of the original bug was also found and fixed in
+the same pass: `WarHistoryDB._bulk_move_chunk()` (the one-time/manual `fast_bulk_history_
+migration()` path, invoked via `run_history_migration_now.py --fast` for large catch-up runs)
+used a bare `INSERT INTO history.<table> SELECT * FROM main.<table> ...` — never covered by the
+2026-08-14 fix, which only touched `_migrate_table_batch_by_date`/`_migrate_cwl_table_by_season`
+(the normal monthly-migration path). Fixed the same way.
+
+**Coverage confirmed complete (2026-08-16, second pass)**: after initially leaving 3 manually-
+invoked diagnostic/audit scripts unfixed as "lower priority," asked directly whether coverage
+was actually 100% — re-audited the whole repo rather than re-asserting confidence. Grepped every
+`SELECT *` in the entire codebase (not just the files already touched) and categorized each one;
+also checked for positional (non-named) row access as a separate risk category. Result: `qapbot/
+scripts/analyze_cwl_rounds.py` (9 query blocks), `qapbot/scripts/audit_cwl_league_rank.py` (1 —
+confirmed it genuinely reads the drifted `state`/`result` columns, not just theoretically
+exposed), and `qapbot/scripts/harvest_cwl_war_tags.py` (1) all needed the same fix, now applied
+via a new shared `explicit_column_list_from_conn()` module-level helper (next to
+`attach_history_db`) so standalone scripts share one implementation instead of each copy-pasting
+it. `qapbot/scripts/backfill_group_track_war_updates.py` and `repromote_mid_season_clans.py`
+(the other two scripts touching `history.*`) were directly inspected and confirmed to already
+use fully explicit column lists. Confirmed via `PRAGMA table_info`/direct file inspection that
+only 4 tables are ever physically present in `history.db` at all — every other `SELECT *`
+anywhere in the repo targets a main-only table and is structurally immune to this bug class,
+not just unaffected by luck.
+
+**New standing guardrail — `WarHistoryDB.check_hot_history_schema_parity_sync()`**: called once
+at bot startup (`QapBot.py`'s `initialize_database()`, logged at `CRITICAL` if non-empty).
+Compares `main.<table>` vs `history.<table>` column **SET** (not order — a pure reorder is now
+harmless everywhere, by design, and deliberately not flagged) for all 4 mirrored tables. A
+genuine column SET mismatch (one schema got a column the other didn't) is not automatically
+recoverable the way a reorder is, so this exists to fail loudly the moment a future migration
+introduces one, rather than surfacing as a `no such column` error or a silently-missing stat
+months later. Regression-tested in `tests/unit/test_hot_history_schema_parity.py`; the read-path
+fix itself is regression-tested in `tests/unit/test_hot_history_read_query_column_alignment.py`
+(reproduces the exact real drift shape found on DEV and proves the two most directly-implicated
+query functions — `get_player_attack_history_sync`, `get_clan_attack_history_sync` — return
+correct values despite it).
+
+📖 Prevention rule: `.github/copilot-instructions.md` Cardinal Rule 1 (extend it to cover reads,
+not just the migration write path, next time it's edited).
+
+**Verification methodology check (2026-08-16, third pass)**: asked whether limiting the grep to
+the literal string `SELECT *` was itself too narrow — a fair challenge, since it leaves two
+different gaps unchecked: (a) `SELECT`/`*` split across separate lines, which a plain line-based
+grep can't see, and (b) an explicit-column UNION where the two sides' column lists don't
+actually match each other (a hand-typo bug with the identical symptom, not a wildcard-drift bug
+at all). Checked both directly: a multiline-aware regex search for `SELECT` immediately followed
+by `*` (any whitespace/newlines between them) found nothing new; a script parsing every
+`SELECT {var} FROM main.T ... UNION ALL SELECT {var} FROM history.T` pattern this round's fixes
+introduced (51 instances, across single- and multi-line forms) confirmed 0 mismatches — every
+fix reused one Python variable on both sides rather than hand-typing two lists, so a copy-paste
+slip wasn't structurally possible for those. The handful of pre-existing hand-written
+explicit-column UNIONs that predate this session's fixes (`clan_tag`/`war_id`/
+`league_group_id`-only unions in `get_all_war_attacks_existing_sync`,
+`get_all_war_summary_keys_sync`, `get_all_war_clan_tags`, `get_global_db_statistics_sync`, and
+`_handle_backfill_cwl_groups_inner`) were checked by hand and also match. A final broad,
+case-insensitive, `DISTINCT`-aware `SELECT * FROM` scan across every file that even mentions
+`history.` turned up nothing beyond the two docstring lines that describe the incident in prose.
+
 ### On-demand ops scripts
 
 `qapbot/scripts/run_history_migration_now.py` and `qapbot/scripts/run_db_maintenance_now.py` let

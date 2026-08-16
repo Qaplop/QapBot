@@ -436,6 +436,44 @@ async def test_seeds_auto_assignments_from_last_months_cwl_activity(db, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_seeds_auto_assignments_for_a_guest_clans_own_current_members(db, monkeypatch):
+    """Confirmed live-testing bug (2026-08-16, project owner's spec, verbatim): "added staycalm
+    as a guest clan to the qcrew's clan roster... staycalm didn't get the previous month player
+    auto-assignment." A guest clan is by definition NOT part of the guild's own family
+    (resolve_guild_member_clan_tags() only ever returns the family) — the auto-assign candidate
+    pool must still include a guest clan's own current members (unioned with the family, matching
+    _build_enrollment_payload's own player pool), or resolve_prior_cwl_assignments() can never
+    place them into their own column no matter how much real prior-CWL-attack history they have,
+    since they were never even in the candidate list to begin with."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    guild_id = 10102
+    await _seed_guild_and_clan(db, str(guild_id), clan_tag="#CLAN1")  # "The QCrew" — the only family clan
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#GUESTCLAN', 'StayCalm')")
+    await db.conn.commit()
+    # #P1 is a current member of #GUESTCLAN only — never part of this guild's own family.
+    await _seed_current_clan_member(db, "d1", "#P1", "#GUESTCLAN")
+    await _seed_cwl_war(db, "#GUESTCLAN", [("#P1", "Alpha")])
+
+    event_id = db.create_cwl_event_sync(str(guild_id), "2026-08", "creator")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#CLAN1", "participating": True},
+        {"clan_tag": "#GUESTCLAN", "participating": True},
+    ])
+    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+
+    summary = await start_cwl_enrollment(guild_id, "2026-08")
+
+    assert summary["assigned"] == 1
+    assignments = db.get_cwl_assignments_sync(event_id)
+    assert len(assignments) == 1
+    assert assignments[0]["player_tag"] == "#P1"
+    assert assignments[0]["assigned_clan_tag"] == "#GUESTCLAN"
+
+
+@pytest.mark.asyncio
 async def test_departed_member_is_not_auto_assigned(db, monkeypatch):
     """A player with CWL history for this clan who is no longer a current member (per
     user_players.current_clan_tag) must not get auto-assigned — matches current membership."""

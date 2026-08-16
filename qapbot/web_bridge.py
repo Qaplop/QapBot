@@ -548,7 +548,31 @@ async def _search_cwl_guests(guild_id: int, query: str) -> List[Dict[str, Any]]:
     Every player hit is cross-referenced against get_player_links_sync() so the frontend knows
     upfront whether "send DM now" is even possible for it (discord_id present) — a never-linked
     tag typed in directly still works as a hit with discord_id=null, just can't be DMed until its
-    owner links a real account."""
+    owner links a real account.
+
+    Two namespace-restricting prefixes (2026-08-16, live-testing feedback, project owner's spec,
+    verbatim): "in discord when referring to another discord user you can start with an @ symbol,
+    e.g. @major, indicating that we are talking about a discord user. add this to the intelligent
+    search. when a given expression starts with @ assume it is a discord user and only search in
+    that name space. similarly when the expression starts with a #, assume that we are talking
+    about a clan, player or family tag."
+      - `@needle`: Discord-account display-name substring ONLY — no clan matching, no CoC
+        player-name matching. Returns every linked player of every matching account.
+      - `#needle`: TAG substring matching only (clan_tag / player_tag) — no name-substring
+        matching on either side. Still returns both clans and players, since a tag alone doesn't
+        say which.
+      - anything else: the original unrestricted default — name substrings for clans and
+        players, plus the Discord display-name pass, all merged together.
+
+    Interleaved clan/player ordering, each capped at 12 (2026-08-16 follow-up, live-testing
+    feedback, project owner's spec, verbatim: "Do the interleave, cap each type 12 / 12") — a
+    broad query can match dozens of clans (e.g. "major" matched 20 clan names in prod), which
+    under the old "all clan hits first, one combined 25-cap at the very end" ordering buried
+    every player/Discord hit past the visible scroll area, making the search look like it wasn't
+    finding Discord users at all when it actually was. Capping each type at 12 before merging (and
+    round-robining one-of-each into the final list) guarantees both kinds of matches are visible
+    without scrolling through a wall of same-type rows first. Doesn't apply to the `@`-restricted
+    path since that's single-type by construction."""
     from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
 
     db = CACHE.db_manager
@@ -565,38 +589,76 @@ async def _search_cwl_guests(guild_id: int, query: str) -> List[Dict[str, Any]]:
             c["clan_tag"] for c in db.get_cwl_event_clans_sync(event["id"]) if c.get("participating", 1)
         }
 
-    needle = query.lower()
-    results: List[Dict[str, Any]] = []
-
     import QBcore
 
+    def _discord_display_name_player_hits(needle: str) -> Dict[str, Dict[str, Any]]:
+        hits: Dict[str, Dict[str, Any]] = {}
+        for discord_id, account in CACHE.user_accounts.items():
+            if discord_id == "UNASSIGNED":
+                continue
+            display_name = account.get("display_name") or ""
+            if needle not in display_name.lower():
+                continue
+            for player in account.get("players", []):
+                tag = player.get("player_tag")
+                if not tag:
+                    continue
+                hits.setdefault(tag, {"player_tag": tag, "player_name": player.get("player_name") or tag})
+        return hits
+
+    def _finalize_player_hits(player_hits: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not player_hits:
+            return []
+        links = db.get_player_links_sync(list(player_hits.keys()))
+        out: List[Dict[str, Any]] = []
+        for tag, hit in player_hits.items():
+            link = links.get(tag, {})
+            out.append({
+                "type": "player",
+                "player_tag": tag,
+                "player_name": link.get("player_name") or hit["player_name"],
+                "discord_id": link.get("discord_id"),
+            })
+        return out
+
+    if query.startswith("@"):
+        needle = query[1:].strip().lower()
+        if not needle:
+            return []
+        return _finalize_player_hits(_discord_display_name_player_hits(needle))[:25]
+
+    tag_only_mode = query.startswith("#")
+
+    clan_hits: List[Dict[str, Any]] = []
     for clan_tag, _info in CACHE.clan_name_cache.items():
         if clan_tag in already_participating:
             continue
         name = CACHE.get_clan_name(clan_tag, clan_tag) or clan_tag
-        if needle in name.lower() or needle in clan_tag.lower():
-            # Cross-guild claim check (2026-08-15) — reported, never used to hide the hit.
-            already_shared_with = None
-            other_claims = db.find_cwl_clan_participation_across_guilds_sync(
-                clan_tag, season, exclude_guild_id=guild_id_str
-            )
-            if other_claims:
-                other_guild = QBcore.bot.get_guild(int(other_claims[0]["guild_id"]))
-                already_shared_with = other_guild.name if other_guild else other_claims[0]["guild_id"]
-            # Same live-tier source _build_clan_config_payload uses for every other row (never
-            # admin-set) — without this, a newly-added guest clan showed "—" for tier until the
-            # next full page reload picked it up from the payload builder instead (live-testing
-            # feedback, 2026-08-15).
-            results.append({
-                "type": "clan", "clan_tag": clan_tag, "clan_name": name,
-                "clan_tier": CACHE.get_clan_war_league(clan_tag),
-                "already_shared_with": already_shared_with,
-            })
+        if tag_only_mode:
+            if query.upper() not in clan_tag.upper():
+                continue
+        elif query.lower() not in name.lower() and query.lower() not in clan_tag.lower():
+            continue
+        # Cross-guild claim check (2026-08-15) — reported, never used to hide the hit.
+        already_shared_with = None
+        other_claims = db.find_cwl_clan_participation_across_guilds_sync(
+            clan_tag, season, exclude_guild_id=guild_id_str
+        )
+        if other_claims:
+            other_guild = QBcore.bot.get_guild(int(other_claims[0]["guild_id"]))
+            already_shared_with = other_guild.name if other_guild else other_claims[0]["guild_id"]
+        # Same live-tier source _build_clan_config_payload uses for every other row (never
+        # admin-set) — without this, a newly-added guest clan showed "—" for tier until the
+        # next full page reload picked it up from the payload builder instead (live-testing
+        # feedback, 2026-08-15).
+        clan_hits.append({
+            "type": "clan", "clan_tag": clan_tag, "clan_name": name,
+            "clan_tier": CACHE.get_clan_war_league(clan_tag),
+            "already_shared_with": already_shared_with,
+        })
 
     player_hits: Dict[str, Dict[str, Any]] = {}
-    for match in CACHE.search_player_names(query, limit=25):
-        player_hits[match["player_tag"]] = {"player_tag": match["player_tag"], "player_name": match["player_name"]}
-    if query.startswith("#"):
+    if tag_only_mode:
         upper_query = query.upper()
         for tag, name in CACHE.player_name_index.items():
             if tag.upper().startswith(upper_query):
@@ -606,31 +668,26 @@ async def _search_cwl_guests(guild_id: int, query: str) -> List[Dict[str, Any]]:
         # actually a real CoC tag is only found out once something tries to use it.
         if len(upper_query) >= 5 and upper_query not in player_hits:
             player_hits[upper_query] = {"player_tag": upper_query, "player_name": upper_query}
+    else:
+        for match in CACHE.search_player_names(query, limit=25):
+            player_hits[match["player_tag"]] = {"player_tag": match["player_tag"], "player_name": match["player_name"]}
+        player_hits.update({
+            tag: hit for tag, hit in _discord_display_name_player_hits(query.lower()).items()
+            if tag not in player_hits
+        })
 
-    for discord_id, account in CACHE.user_accounts.items():
-        if discord_id == "UNASSIGNED":
-            continue
-        display_name = account.get("display_name") or ""
-        if needle not in display_name.lower():
-            continue
-        for player in account.get("players", []):
-            tag = player.get("player_tag")
-            if not tag:
-                continue
-            player_hits.setdefault(tag, {"player_tag": tag, "player_name": player.get("player_name") or tag})
+    player_result_list = _finalize_player_hits(player_hits)
 
-    if player_hits:
-        links = db.get_player_links_sync(list(player_hits.keys()))
-        for tag, hit in player_hits.items():
-            link = links.get(tag, {})
-            results.append({
-                "type": "player",
-                "player_tag": tag,
-                "player_name": link.get("player_name") or hit["player_name"],
-                "discord_id": link.get("discord_id"),
-            })
+    capped_clans = clan_hits[:12]
+    capped_players = player_result_list[:12]
+    results: List[Dict[str, Any]] = []
+    for i in range(max(len(capped_clans), len(capped_players))):
+        if i < len(capped_clans):
+            results.append(capped_clans[i])
+        if i < len(capped_players):
+            results.append(capped_players[i])
 
-    return results[:25]
+    return results
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -679,6 +736,62 @@ async def handle_get_cwl_enrollment(request: web.Request) -> web.Response:
         return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
 
     return web.json_response(await _build_enrollment_payload(guild_id))
+
+
+async def handle_get_cwl_clan_names(request: web.Request) -> web.Response:
+    """Resolves clan_tag -> name for tags the Manage Enrollment board's hover pop-up doesn't
+    already know locally (2026-08-16, project owner's spec: "show the pop-up as soon as possible
+    with what we already have, then fetch more data... starting with the clan name"). Only a
+    player's `current_clan_tag` needs this — every clan actually on the board already carries its
+    own name in the initial enrollment payload (`EnrollmentClan.name`), so this is purely for a
+    player whose real current clan isn't one of this event's own columns (e.g. any clan CACHE has
+    ever seen, not just this guild's). Same admin-or-leader gate as the enrollment screen itself
+    since this is only ever called from that board. Silently omits any tag CACHE doesn't
+    recognize at all — the client already falls back to displaying the raw tag for those."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        guild_id = int(request.query["guild_id"])
+        discord_user_id = int(request.query["discord_user_id"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "missing/invalid guild_id or discord_user_id"}, status=400)
+    tags = [t for t in request.query.get("tags", "").split(",") if t]
+
+    if not await _resolve_admin_or_leader(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
+
+    names = {tag: CACHE.get_clan_name(tag, None) for tag in tags}
+    return web.json_response({"names": {tag: name for tag, name in names.items() if name is not None}})
+
+
+async def handle_get_cwl_player_stats(request: web.Request) -> web.Response:
+    """Backs the second half of the Manage Enrollment board's hover pop-up progressive fetch
+    (2026-08-16, project owner's spec, verbatim: "get the number of missed cwl attacks from the
+    last three season's" / "add the attack / defense ratio from the last three cwl seaons" —
+    refined after a live-testing mismatch report to: "calculated exactly as the /leaderboard
+    command would do it with the modes missedattacks and attackdefratio and with the options
+    cwl_only=true and month=-3" / "the option scope=ALL is also important"). Single-player, called
+    on-demand per hover — see get_recent_cwl_player_stats's own docstring (QBhelperfunctions.py)
+    for the full computation, which deliberately reuses /leaderboard's own aggregation functions
+    rather than a separate query, so the two can never disagree again. Same admin-or-leader gate
+    as the enrollment screen itself. A player with no CWL history at all still gets a 200 with
+    null fields (not a 404/error) — the client just leaves those pop-up lines out, same as it
+    already does for an unresolved clan name."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        guild_id = int(request.query["guild_id"])
+        discord_user_id = int(request.query["discord_user_id"])
+        player_tag = str(request.query["player_tag"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "missing/invalid guild_id, discord_user_id or player_tag"}, status=400)
+
+    if not await _resolve_admin_or_leader(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
+
+    from QBhelperfunctions import get_recent_cwl_player_stats
+
+    return web.json_response(get_recent_cwl_player_stats(player_tag))
 
 
 async def handle_post_cwl_enrollment_signup(request: web.Request) -> web.Response:
@@ -954,7 +1067,7 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
         return web.json_response({"error": "database not ready"}, status=503)
 
     from qapbot.QBdiscocmdshelper_cwl import (
-        auto_assign_prior_cwl_members_if_empty,
+        auto_assign_prior_cwl_members,
         detach_guild_from_shared_clan_on_deactivation,
         ensure_cwl_clan_sharing,
         resolve_selected_cwl_season,
@@ -1038,10 +1151,14 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
 
         # Auto-assign-on-add (2026-08-15, live-testing feedback, project owner's spec) — only
         # once enrollment has actually started (a still-draft event is about to get a
-        # comprehensive seed from Start Enrollment itself, which already covers this).
+        # comprehensive seed from Start Enrollment itself, which already covers this). Runs on
+        # every (re-)activation of the clan, including a re-add after a prior removal — gated per
+        # PLAYER, not per clan, so it correctly fills in any newly-qualifying members even when a
+        # couple of deliberately locked placements already survived the removal (2026-08-16, see
+        # auto_assign_prior_cwl_members's own docstring).
         if event["status"] != "draft":
             try:
-                await auto_assign_prior_cwl_members_if_empty(guild_id, event_id, season, clan_tag)
+                await auto_assign_prior_cwl_members(guild_id, event_id, season, clan_tag)
             except Exception as e:
                 logging.warning(f"[WEB-BRIDGE] Clan {clan_tag} added but prior-CWL auto-assign failed: {e}")
 
@@ -1155,6 +1272,8 @@ def create_app() -> web.Application:
     app.router.add_post("/api/cwl/clan-config", handle_post_clan_config)
     app.router.add_get("/api/cwl/screen", handle_get_cwl_screen)
     app.router.add_get("/api/cwl/enrollment", handle_get_cwl_enrollment)
+    app.router.add_get("/api/cwl/clan-names", handle_get_cwl_clan_names)
+    app.router.add_get("/api/cwl/player-stats", handle_get_cwl_player_stats)
     app.router.add_post("/api/cwl/enrollment/signup", handle_post_cwl_enrollment_signup)
     app.router.add_post("/api/cwl/enrollment/assign", handle_post_cwl_enrollment_assign)
     app.router.add_get("/api/cwl/guest-search", handle_get_cwl_guest_search)

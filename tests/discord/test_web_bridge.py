@@ -1719,6 +1719,105 @@ async def test_guest_search_raw_unindexed_tag_still_returned(db, bridge_config, 
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_guest_search_at_prefix_restricts_to_discord_display_name_only(db, bridge_config, client, monkeypatch):
+    """2026-08-16, live-testing feedback, project owner's spec, verbatim: "when a given
+    expression starts with @ assume it is a discord user and only search in that name space."
+    A clan name and a plain (non-linked-account) player name that both also match the needle must
+    be excluded — only players reached via a matching Discord display name come back."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "820", {})
+    CACHE.db_manager = db
+    CACHE.server_config["820"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {"#CLANQAP": {"name": "Qap Clan"}}
+    CACHE.player_name_index = {"#LONER": "Qaplike"}  # matches "qap" by name, but not linked
+    CACHE.user_accounts = {
+        "777": {"display_name": "Qaplop", "players": [{"player_tag": "#Q1", "player_name": "Qaplop"}]},
+    }
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(820, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=820&discord_user_id=42&q=%40qap",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == [
+        {"type": "player", "player_tag": "#Q1", "player_name": "Qaplop", "discord_id": None}
+    ]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_hash_prefix_restricts_to_tag_matching_only(db, bridge_config, client, monkeypatch):
+    """2026-08-16, live-testing feedback, project owner's spec, verbatim: "when the expression
+    starts with a # assume that we are talking about a clan, player or family tag." A clan whose
+    NAME matches the needle but whose tag doesn't must be excluded once # restricts to tag-only
+    matching."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "821", {})
+    CACHE.db_manager = db
+    CACHE.server_config["821"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {
+        "#QAPXYZ": {"name": "Something Else"},  # tag starts with #QAP -> matches
+        "#OTHERTAG": {"name": "Qap Warriors"},  # name contains Qap, tag doesn't -> excluded
+    }
+    CACHE.player_name_index = {}
+    CACHE.user_accounts = {}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(821, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=821&discord_user_id=42&q=%23qap",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == [
+        {"type": "clan", "clan_tag": "#QAPXYZ", "clan_name": "Something Else", "clan_tier": None, "already_shared_with": None}
+    ]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_interleaves_and_caps_clan_and_player_hits(db, bridge_config, client, monkeypatch):
+    """2026-08-16, live-testing feedback, project owner's spec, verbatim: "Do the interleave, cap
+    each type 12 / 12" — a broad query matching more than 12 of each type must not let one type
+    bury the other; the result alternates clan/player and stops at 12 of each (24 total here)."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "822", {})
+    CACHE.db_manager = db
+    CACHE.server_config["822"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {f"#CLAN{i:02d}": {"name": f"Test Clan {i:02d}"} for i in range(15)}
+    CACHE.player_name_index = {f"#PLAYER{i:02d}": f"Test Player {i:02d}" for i in range(15)}
+    CACHE.user_accounts = {}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(822, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=822&discord_user_id=42&q=test",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    results = body["results"]
+    assert len(results) == 24
+    types = [r["type"] for r in results]
+    assert types == ["clan", "player"] * 12
+    clan_tags = {r["clan_tag"] for r in results if r["type"] == "clan"}
+    player_tags = {r["player_tag"] for r in results if r["type"] == "player"}
+    assert len(clan_tags) == 12
+    assert len(player_tags) == 12
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_guest_search_empty_query_returns_empty(bridge_config, client, monkeypatch):
     import QBcore
     monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(805, 42, is_admin=True))
@@ -1730,6 +1829,167 @@ async def test_guest_search_empty_query_returns_empty(bridge_config, client, mon
     assert resp.status == 200
     body = await resp.json()
     assert body["results"] == []
+
+
+# ---------------------------------------------------------------------------
+# Clan-name lookup (2026-08-16) — GET /api/cwl/clan-names. Backs the Manage Enrollment board's
+# hover pop-up: it renders instantly with whatever's already loaded, then fetches a display name
+# for any current_clan_tag that isn't one of this event's own columns (project owner's spec:
+# "show up the pop-up as soon as possible... then fetch more data... starting with the clan
+# name"). Same admin-or-leader gate as the enrollment screen itself.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_names_get_rejects_missing_secret(bridge_config, client):
+    resp = await client.get("/api/cwl/clan-names?guild_id=830&discord_user_id=42&tags=%23CLAN1")
+    assert resp.status == 403
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_names_get_rejects_non_admin_non_leader(bridge_config, client, monkeypatch):
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(830, 42, is_admin=False))
+
+    resp = await client.get(
+        "/api/cwl/clan-names?guild_id=830&discord_user_id=42&tags=%23CLAN1",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 403
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_names_resolves_known_tags_and_omits_unknown_ones(bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Marines"}, "#CLAN2": {"name": "QCrew"}}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(831, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/clan-names?guild_id=831&discord_user_id=42&tags=%23CLAN1,%23CLAN2,%23NEVERSEEN",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    # #NEVERSEEN silently omitted — the client already falls back to the raw tag for those.
+    assert body["names"] == {"#CLAN1": "Marines", "#CLAN2": "QCrew"}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_clan_names_empty_tags_returns_empty(bridge_config, client, monkeypatch):
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(832, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/clan-names?guild_id=832&discord_user_id=42&tags=",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["names"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Player-stats lookup (2026-08-16) — GET /api/cwl/player-stats. The other half of the Manage
+# Enrollment board's hover pop-up progressive fetch: missed CWL attacks + attack/defense star
+# ratio, computed exactly as /leaderboard mode=missedattacks|attackdefratio cwl_only=true
+# month=-3 scope=all would (project owner's spec, verbatim: "They should be calculated exactly as
+# the /leaderboard command would do it..." / "the option scope=ALL is also important"). Same
+# admin-or-leader gate as the enrollment screen itself; see
+# tests/unit/test_leaderboard_scope_and_month_parsing.py's TestGetRecentCwlPlayerStats for the
+# underlying computation's own coverage (including a fixed `now`, so it's deterministic) — these
+# tests only check the HTTP wiring around it, so the seeded war's date is anchored to "today" to
+# stay inside the real, un-overridable trailing-3-month window the endpoint actually computes
+# against.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_stats_get_rejects_missing_secret(bridge_config, client):
+    resp = await client.get("/api/cwl/player-stats?guild_id=840&discord_user_id=42&player_tag=%23P1")
+    assert resp.status == 403
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_stats_get_rejects_non_admin_non_leader(bridge_config, client, monkeypatch):
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(840, 42, is_admin=False))
+
+    resp = await client.get(
+        "/api/cwl/player-stats?guild_id=840&discord_user_id=42&player_tag=%23P1",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 403
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_stats_no_history_returns_null_fields(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "841", {})
+    CACHE.db_manager = db
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(841, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/player-stats?guild_id=841&discord_user_id=42&player_tag=%23NEVERSEEN",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body == {"seasons": [], "attacks": None, "missed_attacks": None, "attack_defense_ratio": None}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_stats_returns_recent_cwl_stats(db, bridge_config, client, monkeypatch):
+    from datetime import datetime, timezone
+
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "842", {"#CLAN1": "Marines"})
+    CACHE.db_manager = db
+    now = datetime.now(timezone.utc)
+    date = now.strftime("%Y-%m-01T08:00")
+    # max_attacks=1 is what marks this a CWL war for the endpoint's own cwl_only filter — NOT
+    # war_summary.is_cwl (see get_recent_cwl_player_stats' own docstring for why: it mirrors
+    # calculate_leaderboard()'s cwl_only filter exactly, which reads Max_Attacks==1).
+    await db.conn.execute(
+        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
+        "VALUES ('w1', '#CLAN1', '#OPP', 1, ?, ?)",
+        (now.strftime("%Y-%m"), date),
+    )
+    await db.conn.execute(
+        "INSERT INTO war_attacks "
+        "(war_id, clan_tag, date, player_name, player_tag, th_level, map_position, attack_order, "
+        " stars, missed_attacks, defensive_stars, max_attacks) "
+        "VALUES ('w1', '#CLAN1', ?, 'Alpha', '#P1', 15, 1, 1, 3, 0, 1, 1)",
+        (date,),
+    )
+    await db.conn.commit()
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(842, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/player-stats?guild_id=842&discord_user_id=42&player_tag=%23P1",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["attacks"] == 1
+    assert body["missed_attacks"] == 0
+    assert body["attack_defense_ratio"] == 3.0
+    assert len(body["seasons"]) == 3
+    assert body["seasons"][-1] == now.strftime("%Y-%m")
 
 
 @pytest.mark.discord

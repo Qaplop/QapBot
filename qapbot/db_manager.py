@@ -245,6 +245,21 @@ def _create_history_schema_sync(conn: Any, build_expensive_indexes: bool = True)
     """)
 
 
+def explicit_column_list_from_conn(conn: Any, table: str) -> str:
+    """Module-level counterpart of `WarHistoryDB._explicit_column_list_sync` for standalone
+    scripts (`qapbot/scripts/*.py`) that open their own `sqlite3.connect()` + `attach_history_db()`
+    instead of going through a `WarHistoryDB` instance — same reason `attach_history_db` itself
+    exists as a free function rather than only a class method. See
+    `WarHistoryDB._explicit_column_list_sync`'s docstring for the full 2026-08-14/2026-08-16
+    hot/history column-order-drift incident writeup this exists to prevent: any query combining
+    `main.<table>` and `history.<table>` into one result set MUST name every column explicitly on
+    both sides of the `UNION`/`UNION ALL`, never a bare `SELECT *`, since the two schemas'
+    physical column order can (and does, for war_attacks/war_summary) differ even when their
+    column NAMES and CREATE TABLE source text agree."""
+    cur = conn.execute(f"PRAGMA main.table_info({table})")
+    return ", ".join(row["name"] for row in cur.fetchall())
+
+
 def attach_history_db(conn: Any, db_path: str, history_db_path: Optional[str] = None, read_only: bool = False) -> str:
     """Attach the history DB as schema ``history`` on a bare ``sqlite3`` connection.
 
@@ -583,6 +598,82 @@ class WarHistoryDB:
     def _should_commit(self) -> bool:
         """Return False when inside a ``sync_batch()`` with deferred commits."""
         return not getattr(self._tls, 'batch_deferred', False)
+
+    # The only tables ever mirrored between `main` and `history` — kept as a single source
+    # of truth so the schema-parity check (see check_hot_history_schema_parity_sync below)
+    # and any script/test that needs the list never drift from each other independently of
+    # the schemas themselves. Mirrors MIGRATED_TABLES in
+    # qapbot/scripts/repair_history_schema_drift.py (that script predates this constant and
+    # keeps its own copy deliberately, since it must run standalone against a DB with no
+    # guarantee this module version is the one installed).
+    _HOT_HISTORY_MIRRORED_TABLES: Tuple[str, ...] = (
+        "war_attacks", "war_summary", "cwl_league_groups", "cwl_league_rounds",
+    )
+
+    def _explicit_column_list_sync(self, conn: Any, table: str) -> str:
+        """Sync counterpart of `_explicit_column_list()` (see that method's docstring for the
+        full 2026-08-14 hot/history column-order-drift incident writeup) — comma-joined column
+        names for `table`, read from `main`'s own schema via `PRAGMA table_info`.
+
+        Every sync query that reads BOTH `main.<table>` and `history.<table>` into one result
+        set (a `UNION ALL` CTE, or an outer `SELECT col, col FROM (SELECT * FROM main.x UNION
+        ALL SELECT * FROM history.x)`) MUST use this explicit list on both sides instead of a
+        bare `SELECT *` — `UNION ALL SELECT *` matches columns by POSITION, not name, and
+        `main.<table>`/`history.<table>` have identical column NAMES but a physically
+        different on-disk column ORDER (separate `ALTER TABLE ADD COLUMN` histories). Naming
+        each column explicitly is immune to that regardless of which schema's physical order
+        it's read against, since SQLite resolves a named column reference by name, never by
+        position — this is the read-side counterpart to the write-side fix already in place
+        for the monthly migration itself.
+
+        Both schemas are asserted (via `check_hot_history_schema_parity_sync`) to have the
+        SAME SET of columns, just possibly reordered — so main's own column list is always a
+        safe, complete explicit list to use against `history.<table>` too.
+        """
+        cur = conn.execute(f"PRAGMA main.table_info({table})")
+        return ", ".join(row["name"] for row in cur.fetchall())
+
+    def explicit_column_list_sync(self, conn: Any, table: str) -> str:
+        """Public alias for `_explicit_column_list_sync` — same relationship as `sync_conn()`
+        is to `_sync_conn()`. Other modules (QBhelperfunctions.py,
+        QBdiscocmdshelper_admin_command.py) share this class's `sync_conn()` connection for
+        their own hot/history UNION queries and need this too, not just db_manager.py's own
+        methods."""
+        return self._explicit_column_list_sync(conn, table)
+
+    def check_hot_history_schema_parity_sync(self) -> List[str]:
+        """Returns the names of any `_HOT_HISTORY_MIRRORED_TABLES` table whose `main` and
+        `history` schemas currently disagree on column SET (added/removed column — a bug this
+        code cannot safely work around) — empty list means fully healthy. Column order
+        (rather than set) is explicitly NOT flagged here: `_explicit_column_list_sync`/
+        `_explicit_column_list` name every column explicitly, so a pure reordering is already
+        harmless and expected (that's exactly what the 2026-08-14 incident taught this
+        project to design around, rather than trying to keep two independently-ALTERed
+        schemas' physical order in lockstep forever).
+
+        Intended to be called once at bot startup (logged loudly if non-empty — a genuine
+        column SET mismatch is not automatically recoverable the way a reorder is) and by
+        `tests/unit/test_hot_history_schema_parity.py` as a regression guardrail so a future
+        migration that adds a column to one schema and not the other fails CI immediately
+        instead of surfacing as a silently-wrong stat months later.
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        mismatched: List[str] = []
+        with self._sync_conn() as conn:
+            for table in self._HOT_HISTORY_MIRRORED_TABLES:
+                try:
+                    main_cols = {row["name"] for row in conn.execute(f"PRAGMA main.table_info({table})").fetchall()}
+                    history_cols = {row["name"] for row in conn.execute(f"PRAGMA history.table_info({table})").fetchall()}
+                except sqlite3.Error as e:
+                    logging.error(f"[DB-SCHEMA-CHECK] check_hot_history_schema_parity_sync failed for {table}: {e}")
+                    continue
+                if main_cols != history_cols:
+                    mismatched.append(table)
+        return mismatched
 
     def _sync_write_fence(self) -> None:
         """Block the calling thread until any in-progress sync bulk write finishes.
@@ -2770,13 +2861,15 @@ class WarHistoryDB:
 
         with self._sync_conn() as conn:
             try:
+                wa_cols = self._explicit_column_list_sync(conn, "war_attacks")
+                ws_cols = self._explicit_column_list_sync(conn, "war_summary")
                 rows = conn.execute(f"""
                     WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
+                        SELECT {wa_cols} FROM main.war_attacks
+                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
                     ), ws AS (
-                        SELECT * FROM main.war_summary
-                        UNION ALL SELECT * FROM history.war_summary
+                        SELECT {ws_cols} FROM main.war_summary
+                        UNION ALL SELECT {ws_cols} FROM history.war_summary
                     )
                     SELECT wa.player_tag, wa.player_name,
                            wa.th_level AS attacker_th,
@@ -2872,11 +2965,12 @@ class WarHistoryDB:
                 if war is None:
                     return []
                 war_id, _date = war
-                rows = conn.execute("""
+                wa_cols = self._explicit_column_list_sync(conn, "war_attacks")
+                rows = conn.execute(f"""
                     SELECT player_tag, player_name, th_level, map_position FROM (
-                        SELECT * FROM main.war_attacks WHERE war_id = ? AND clan_tag = ?
+                        SELECT {wa_cols} FROM main.war_attacks WHERE war_id = ? AND clan_tag = ?
                         UNION ALL
-                        SELECT * FROM history.war_attacks WHERE war_id = ? AND clan_tag = ?
+                        SELECT {wa_cols} FROM history.war_attacks WHERE war_id = ? AND clan_tag = ?
                     )
                     GROUP BY player_tag
                 """, (war_id, clan_tag, war_id, clan_tag)).fetchall()
@@ -2918,11 +3012,12 @@ class WarHistoryDB:
                 if war is None:
                     return []
                 war_id, _date = war
-                rows = conn.execute("""
+                wa_cols = self._explicit_column_list_sync(conn, "war_attacks")
+                rows = conn.execute(f"""
                     SELECT player_tag, player_name, th_level, map_position, date FROM (
-                        SELECT * FROM main.war_attacks WHERE war_id = ? AND clan_tag = ?
+                        SELECT {wa_cols} FROM main.war_attacks WHERE war_id = ? AND clan_tag = ?
                         UNION ALL
-                        SELECT * FROM history.war_attacks WHERE war_id = ? AND clan_tag = ?
+                        SELECT {wa_cols} FROM history.war_attacks WHERE war_id = ? AND clan_tag = ?
                     )
                     GROUP BY player_tag
                 """, (war_id, clan_tag, war_id, clan_tag)).fetchall()
@@ -3024,10 +3119,11 @@ class WarHistoryDB:
         with self._sync_conn() as conn:
             try:
                 placeholders = ",".join("?" for _ in player_tags)
+                wa_cols = self._explicit_column_list_sync(conn, "war_attacks")
                 rows = conn.execute(f"""
                     WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
+                        SELECT {wa_cols} FROM main.war_attacks
+                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
                     )
                     SELECT player_tag, th_level, date
                     FROM wa
@@ -3046,12 +3142,24 @@ class WarHistoryDB:
                 return {}
 
     def get_recent_cwl_attacks_with_league_sync(
-        self, player_tags: List[str], attack_limit: int = 10
+        self, player_tags: List[str], *, since_date: Optional[str] = None
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """Each requested player's last `attack_limit` CWL attacks (most recent first), each
+        """Each requested player's CWL attacks on or after `since_date` (inclusive, "YYYY-MM-DD";
+        None means no lower bound at all — every CWL attack on record), most recent first, each
         annotated with the CWL league tier their attacking clan was in for that round. Feeds the
-        "Manage Enrollment" board's league-adjusted player-skill score
-        (QBdiscocmdshelper_cwl.py's compute_league_adjusted_skill_scores).
+        "Manage Enrollment" board's player-skill number (compute_league_adjusted_skill_scores,
+        QBdiscocmdshelper_cwl.py) and its plain-average counterpart (compute_avg_stars_per_attack)
+        — both callers pass the same trailing-3-calendar-month boundary the hover pop-up's own
+        get_recent_cwl_player_stats (QBhelperfunctions.py) uses, so the board tile's own number and
+        the pop-up's stats can never disagree on their time window again (2026-08-16, project
+        owner's spec, verbatim: "our hover over pop-up info is inconsistent to the way we
+        calculate the stats for the player tile info. there we use the last 10 cwl attacks. We
+        should make this consistent and use the 'last three months' logic for both").
+
+        Previously capped to each player's most recent 10 attacks (a COUNT-based window,
+        truncated in Python after fetching everything) — replaced with this SQL date filter (a
+        CALENDAR-based window, pushed into the query itself) now that both callers share a
+        calendar-month concept of "recent" rather than a fixed attack count.
 
         No war_summary/war_attacks column stores league tier directly — it's reconstructed via
         war_summary.war_tag -> cwl_league_rounds -> cwl_league_groups.league_rank, joined on
@@ -3064,12 +3172,12 @@ class WarHistoryDB:
 
         Queried per schema (main, then history) with plain table JOINs — never against a UNION
         ALL CTE (DATABASE_ARCHITECTURE.md's query anti-patterns: SQLite must fully materialize a
-        compound subquery used as a JOIN target) — then merged, sorted, and truncated to
-        `attack_limit` per player in Python.
+        compound subquery used as a JOIN target) — then merged and sorted in Python.
 
         Returns Dict[player_tag, [{"stars": int, "league_rank": str|None, "date": str}, ...]] —
-        a player_tag with zero resolvable CWL-attack-with-league rows (never played CWL, or
-        cwl_league_rounds/cwl_league_groups aren't populated for those seasons) is simply absent.
+        a player_tag with zero resolvable CWL-attack-with-league rows in the window (never played
+        CWL, played outside the window, or cwl_league_rounds/cwl_league_groups aren't populated
+        for those seasons) is simply absent.
         """
         import sqlite3
 
@@ -3079,8 +3187,9 @@ class WarHistoryDB:
             return {}
 
         placeholders = ",".join("?" for _ in player_tags)
+        date_clause = " AND wa.date >= ?" if since_date is not None else ""
         select_cols = "DISTINCT wa.player_tag, wa.stars, wa.date, clg.league_rank"
-        where = f"WHERE wa.player_tag IN ({placeholders}) AND ws.is_cwl = 1"
+        where = f"WHERE wa.player_tag IN ({placeholders}) AND ws.is_cwl = 1{date_clause}"
         main_sql = f"""
             SELECT {select_cols}
             FROM war_attacks wa
@@ -3097,10 +3206,11 @@ class WarHistoryDB:
             JOIN history.cwl_league_groups clg ON clg.league_group_id = clr.league_group_id
             {where}
         """
+        params: List[Any] = list(player_tags) + ([since_date] if since_date is not None else [])
         with self._sync_conn() as conn:
             try:
-                rows = conn.execute(main_sql, player_tags).fetchall()
-                rows += conn.execute(history_sql, player_tags).fetchall()
+                rows = conn.execute(main_sql, params).fetchall()
+                rows += conn.execute(history_sql, params).fetchall()
             except sqlite3.Error as e:
                 logging.error(f"[DB-QUERY-SYNC] get_recent_cwl_attacks_with_league_sync failed: {e}")
                 return {}
@@ -3110,9 +3220,8 @@ class WarHistoryDB:
             by_tag.setdefault(row["player_tag"], []).append(
                 {"stars": int(row["stars"]), "league_rank": row["league_rank"], "date": row["date"]}
             )
-        for tag, attacks in by_tag.items():
+        for attacks in by_tag.values():
             attacks.sort(key=lambda a: a["date"], reverse=True)
-            by_tag[tag] = attacks[:attack_limit]
         return by_tag
 
     # --- CWL roster planning (CWL_ROSTER_PLANNING_PLAN.md Phase 1) -------------------------
@@ -4554,11 +4663,12 @@ class WarHistoryDB:
 
         with self._sync_conn() as conn:
             try:
+                wa_cols = self._explicit_column_list_sync(conn, "war_attacks")
                 # Aggregate from war_attacks (attack_order > 0 = actual attacks)
                 cursor = conn.execute(f"""
                     WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
+                        SELECT {wa_cols} FROM main.war_attacks
+                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
                     )
                     SELECT war_id, date, player_name, player_tag, th_level,
                        SUM(stars)                                            AS stars,
@@ -4597,8 +4707,8 @@ class WarHistoryDB:
                 # Include players with 0 attacks (attack_order == 0 = missed all)
                 cursor2 = conn.execute(f"""
                     WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
+                        SELECT {wa_cols} FROM main.war_attacks
+                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
                     )
                     SELECT war_id, date, player_name, player_tag, th_level,
                            0 AS stars, 0 AS attacks,
@@ -4688,6 +4798,7 @@ class WarHistoryDB:
         tags_list = list(player_tags)
         with self._sync_conn() as conn:
             try:
+                wa_cols = self._explicit_column_list_sync(conn, "war_attacks")
                 for i in range(0, len(tags_list), _CHUNK):
                     chunk = tags_list[i:i + _CHUNK]
                     placeholders = ",".join("?" for _ in chunk)
@@ -4695,8 +4806,8 @@ class WarHistoryDB:
 
                     cursor = conn.execute(f"""
                         WITH wa AS (
-                            SELECT * FROM main.war_attacks
-                            UNION ALL SELECT * FROM history.war_attacks
+                            SELECT {wa_cols} FROM main.war_attacks
+                            UNION ALL SELECT {wa_cols} FROM history.war_attacks
                         )
                         SELECT clan_tag || '::' || war_id           AS composite_war_id,
                                date, player_name, player_tag, th_level,
@@ -4734,8 +4845,8 @@ class WarHistoryDB:
                     # Include players with 0 attacks (attack_order == 0 = missed all)
                     cursor2 = conn.execute(f"""
                         WITH wa AS (
-                            SELECT * FROM main.war_attacks
-                            UNION ALL SELECT * FROM history.war_attacks
+                            SELECT {wa_cols} FROM main.war_attacks
+                            UNION ALL SELECT {wa_cols} FROM history.war_attacks
                         )
                         SELECT clan_tag || '::' || war_id AS composite_war_id,
                                date, player_name, player_tag, th_level,
@@ -4804,16 +4915,17 @@ class WarHistoryDB:
             clauses.append("is_cwl = ?")
             params.append(1 if is_cwl else 0)
         where = " AND ".join(clauses) if clauses else "1=1"
-        sql = (
-            "WITH ws AS ("
-            "SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary"
-            f") SELECT * FROM ws WHERE {where} ORDER BY date ASC"
-        )
-        if limit:
-            sql += f" LIMIT {int(limit)}"
 
         with self._sync_conn() as conn:
             try:
+                ws_cols = self._explicit_column_list_sync(conn, "war_summary")
+                sql = (
+                    "WITH ws AS ("
+                    f"SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary"
+                    f") SELECT * FROM ws WHERE {where} ORDER BY date ASC"
+                )
+                if limit:
+                    sql += f" LIMIT {int(limit)}"
                 rows = conn.execute(sql, params).fetchall()
                 return [dict(row) for row in rows]
             except sqlite3.Error as e:
@@ -4852,14 +4964,16 @@ class WarHistoryDB:
 
         with self._sync_conn() as conn:
             try:
+                wa_cols = self._explicit_column_list_sync(conn, "war_attacks")
+                ws_cols = self._explicit_column_list_sync(conn, "war_summary")
                 # ── Our clan's attacks ───────────────────────────────────────────────
                 our_rows = conn.execute(f"""
                     WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
+                        SELECT {wa_cols} FROM main.war_attacks
+                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
                     ), ws AS (
-                        SELECT * FROM main.war_summary
-                        UNION ALL SELECT * FROM history.war_summary
+                        SELECT {ws_cols} FROM main.war_summary
+                        UNION ALL SELECT {ws_cols} FROM history.war_summary
                     )
                     SELECT wa.player_tag, wa.player_name,
                            wa.th_level          AS attacker_th,
@@ -4879,11 +4993,11 @@ class WarHistoryDB:
                 # ── Opponent clan's attacks (if opponent is also tracked) ────────────
                 opp_rows = conn.execute(f"""
                     WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
+                        SELECT {wa_cols} FROM main.war_attacks
+                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
                     ), ws AS (
-                        SELECT * FROM main.war_summary
-                        UNION ALL SELECT * FROM history.war_summary
+                        SELECT {ws_cols} FROM main.war_summary
+                        UNION ALL SELECT {ws_cols} FROM history.war_summary
                     )
                     SELECT wa_opp.player_tag, wa_opp.player_name,
                            wa_opp.th_level          AS attacker_th,
@@ -5050,10 +5164,11 @@ class WarHistoryDB:
         pattern = f"%{name_substring}%"
         with self._sync_conn() as conn:
             try:
-                rows = conn.execute("""
+                wa_cols = self._explicit_column_list_sync(conn, "war_attacks")
+                rows = conn.execute(f"""
                     WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
+                        SELECT {wa_cols} FROM main.war_attacks
+                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
                     )
                     SELECT player_tag, player_name
                     FROM (
@@ -5111,10 +5226,11 @@ class WarHistoryDB:
                 # (millions of rows) on every call, which caused multi-second queries and
                 # OOM crashes on prod. Joining each physical table directly lets SQLite use
                 # the UNIQUE(war_id, clan_tag) index for a cheap per-row lookup instead.
-                actual_rows = conn.execute("""
+                wa_cols = self._explicit_column_list_sync(conn, "war_attacks")
+                actual_rows = conn.execute(f"""
                     WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
+                        SELECT {wa_cols} FROM main.war_attacks
+                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
                     )
                     SELECT
                         wa.war_id,
@@ -5155,10 +5271,10 @@ class WarHistoryDB:
                 # ── Sentinel rows: missed ALL attacks ──
                 # Only include wars not already covered by actual_rows.
                 # (See the note above actual_rows — same MATERIALIZE-avoidance fix.)
-                sentinel_rows = conn.execute("""
+                sentinel_rows = conn.execute(f"""
                     WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
+                        SELECT {wa_cols} FROM main.war_attacks
+                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
                     )
                     SELECT
                         wa.war_id,
@@ -5302,10 +5418,11 @@ class WarHistoryDB:
                 # (not a UNION ALL 'ws' CTE) — SQLite forces full materialization of a
                 # compound subquery used as the right side of a LEFT JOIN, which turned
                 # this into a multi-million-row scan and caused OOM on prod.
-                total_row = conn.execute("""
+                wa_cols = self._explicit_column_list_sync(conn, "war_attacks")
+                total_row = conn.execute(f"""
                     WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
+                        SELECT {wa_cols} FROM main.war_attacks
+                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
                     )
                     SELECT
                         SUM(actual_attacks)                                                    AS total_attacks,
@@ -5338,10 +5455,10 @@ class WarHistoryDB:
                     return {}
 
                 # ── Star distribution: individual attack rows only (stars <= 3) ──
-                dist_row = conn.execute("""
+                dist_row = conn.execute(f"""
                     WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
+                        SELECT {wa_cols} FROM main.war_attacks
+                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
                     )
                     SELECT
                         SUM(CASE WHEN stars = 0 THEN 1 ELSE 0 END) AS zero_star,
@@ -5402,10 +5519,11 @@ class WarHistoryDB:
         tag = f"#{player_tag.upper().lstrip('#')}"
         with self._sync_conn() as conn:
             try:
-                rows = conn.execute("""
+                wa_cols = self._explicit_column_list_sync(conn, "war_attacks")
+                rows = conn.execute(f"""
                     WITH wa AS (
-                        SELECT * FROM main.war_attacks
-                        UNION ALL SELECT * FROM history.war_attacks
+                        SELECT {wa_cols} FROM main.war_attacks
+                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
                     )
                     SELECT
                         substr(wa.date, 1, 7)                                       AS month,
@@ -5472,16 +5590,18 @@ class WarHistoryDB:
             return {}
         try:
             with self._sync_conn() as conn:
+                clg_cols = self._explicit_column_list_sync(conn, "cwl_league_groups")
+                clr_cols = self._explicit_column_list_sync(conn, "cwl_league_rounds")
                 result: Dict[str, int] = {}
                 for cwl_season, clan_tag in season_clan_pairs:
                     row = conn.execute(
-                        """
+                        f"""
                         WITH clg AS (
-                            SELECT * FROM main.cwl_league_groups
-                            UNION ALL SELECT * FROM history.cwl_league_groups
+                            SELECT {clg_cols} FROM main.cwl_league_groups
+                            UNION ALL SELECT {clg_cols} FROM history.cwl_league_groups
                         ), clr AS (
-                            SELECT * FROM main.cwl_league_rounds
-                            UNION ALL SELECT * FROM history.cwl_league_rounds
+                            SELECT {clr_cols} FROM main.cwl_league_rounds
+                            UNION ALL SELECT {clr_cols} FROM history.cwl_league_rounds
                         )
                         SELECT COUNT(DISTINCT clr.cwl_round) AS max_rounds
                         FROM   clg
@@ -6191,14 +6311,16 @@ class WarHistoryDB:
             return {}
         await self._ensure_connection()
         placeholders = ",".join("?" * len(war_tags))
+        clr_cols = await self._explicit_column_list("cwl_league_rounds")
+        clg_cols = await self._explicit_column_list("cwl_league_groups")
         cursor = await self._conn.execute(
             f"""
             WITH clr AS (
-                SELECT * FROM main.cwl_league_rounds
-                UNION ALL SELECT * FROM history.cwl_league_rounds
+                SELECT {clr_cols} FROM main.cwl_league_rounds
+                UNION ALL SELECT {clr_cols} FROM history.cwl_league_rounds
             ), clg AS (
-                SELECT * FROM main.cwl_league_groups
-                UNION ALL SELECT * FROM history.cwl_league_groups
+                SELECT {clg_cols} FROM main.cwl_league_groups
+                UNION ALL SELECT {clg_cols} FROM history.cwl_league_groups
             )
             SELECT clr.war_tag, clg.league_rank
               FROM clr
@@ -6331,10 +6453,11 @@ class WarHistoryDB:
         or None if no entry exists.
         """
         await self._ensure_connection()
+        clg_cols = await self._explicit_column_list("cwl_league_groups")
         # Find this clan's group_id for the season
         cursor = await self._conn.execute(
-            "WITH clg AS ("
-            "SELECT * FROM main.cwl_league_groups UNION ALL SELECT * FROM history.cwl_league_groups"
+            f"WITH clg AS ("
+            f"SELECT {clg_cols} FROM main.cwl_league_groups UNION ALL SELECT {clg_cols} FROM history.cwl_league_groups"
             ") "
             "SELECT league_group_id, cwl_ended, league_rank "
             "FROM clg WHERE cwl_season = ? AND clan_tag = ?",
@@ -6349,8 +6472,8 @@ class WarHistoryDB:
 
         # Fetch all rows for this group
         cursor2 = await self._conn.execute(
-            "WITH clg AS ("
-            "SELECT * FROM main.cwl_league_groups UNION ALL SELECT * FROM history.cwl_league_groups"
+            f"WITH clg AS ("
+            f"SELECT {clg_cols} FROM main.cwl_league_groups UNION ALL SELECT {clg_cols} FROM history.cwl_league_groups"
             ") "
             "SELECT clan_tag, league_rank, cwl_ended, group_rank, "
             "total_stars, total_destruction "
@@ -6370,9 +6493,10 @@ class WarHistoryDB:
     async def get_latest_cwl_season_for_clan(self, clan_tag: str) -> Optional[str]:
         """Return the most recent cwl_season that has a cwl_league_groups entry for clan_tag, or None."""
         await self._ensure_connection()
+        clg_cols = await self._explicit_column_list("cwl_league_groups")
         cursor = await self._conn.execute(
-            "WITH clg AS ("
-            "SELECT * FROM main.cwl_league_groups UNION ALL SELECT * FROM history.cwl_league_groups"
+            f"WITH clg AS ("
+            f"SELECT {clg_cols} FROM main.cwl_league_groups UNION ALL SELECT {clg_cols} FROM history.cwl_league_groups"
             ") "
             "SELECT cwl_season FROM clg WHERE clan_tag = ? "
             "ORDER BY cwl_season DESC LIMIT 1",
@@ -6403,9 +6527,10 @@ class WarHistoryDB:
         length first avoids that.
         """
         await self._ensure_connection()
+        clg_cols = await self._explicit_column_list("cwl_league_groups")
         cursor = await self._conn.execute(
-            "WITH clg AS ("
-            "SELECT * FROM main.cwl_league_groups UNION ALL SELECT * FROM history.cwl_league_groups"
+            f"WITH clg AS ("
+            f"SELECT {clg_cols} FROM main.cwl_league_groups UNION ALL SELECT {clg_cols} FROM history.cwl_league_groups"
             ") "
             "SELECT cwl_season FROM clg WHERE clan_tag = ? "
             "AND cwl_season LIKE ? ORDER BY LENGTH(cwl_season) ASC, cwl_season DESC LIMIT 1",
@@ -6428,10 +6553,11 @@ class WarHistoryDB:
         await self._ensure_connection()
         placeholders = ",".join("?" * len(clan_tags))
         params: Tuple[Any, ...] = (cwl_season, *clan_tags)
+        ws_cols = await self._explicit_column_list("war_summary")
 
         cursor = await self._conn.execute(
             f"WITH ws AS ("
-            f"SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary"
+            f"SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary"
             f") "
             f"SELECT clan_tag, "
             f"  SUM(clan_stars) + SUM(CASE WHEN result = 'win' THEN 10 ELSE 0 END) AS tot_stars, "
@@ -6448,7 +6574,7 @@ class WarHistoryDB:
 
         cursor2 = await self._conn.execute(
             f"WITH ws AS ("
-            f"SELECT * FROM main.war_summary UNION ALL SELECT * FROM history.war_summary"
+            f"SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary"
             f") "
             f"SELECT clan_tag, COUNT(*) AS ended_wars "
             f"FROM ws "
@@ -8303,12 +8429,20 @@ class WarHistoryDB:
         boundary_row = await cur.fetchone()
         boundary_id = boundary_row["id"] if boundary_row else None
 
+        # Explicit column list, not `SELECT *` — see _explicit_column_list()'s docstring
+        # (2026-08-14 hot/history column-order-drift incident). This call site predates that
+        # fix and wasn't covered by it (only _migrate_table_batch_by_date/
+        # _migrate_cwl_table_by_season were fixed at the time) — found 2026-08-16 while
+        # auditing every main/history query for the same class of bug.
+        columns = await self._explicit_column_list(table)
+
         await self._write_lock.acquire()
         try:
             await self._conn.execute("BEGIN")
             if boundary_id is not None:
                 await self._conn.execute(
-                    f"INSERT OR IGNORE INTO history.{table} SELECT * FROM main.{table} WHERE date < ? AND id <= ?",
+                    f"INSERT OR IGNORE INTO history.{table} ({columns}) "
+                    f"SELECT {columns} FROM main.{table} WHERE date < ? AND id <= ?",
                     (cutoff_date, boundary_id),
                 )
                 del_cur = await self._conn.execute(
@@ -8317,7 +8451,8 @@ class WarHistoryDB:
                 )
             else:
                 await self._conn.execute(
-                    f"INSERT OR IGNORE INTO history.{table} SELECT * FROM main.{table} WHERE date < ?",
+                    f"INSERT OR IGNORE INTO history.{table} ({columns}) "
+                    f"SELECT {columns} FROM main.{table} WHERE date < ?",
                     (cutoff_date,),
                 )
                 del_cur = await self._conn.execute(

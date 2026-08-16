@@ -779,8 +779,9 @@ async def _seed_cwl_attack_with_league(
 class TestGetRecentCwlAttacksWithLeague:
     """get_recent_cwl_attacks_with_league_sync() — the raw per-attack data source behind
     compute_league_adjusted_skill_scores() (QBdiscocmdshelper_cwl.py). Its own tests there cover
-    the weighting/averaging/10-attack-cap behavior end to end; these focus on this function's own
-    contract: shape, ordering, and the league_group_id join specifically."""
+    the weighting/averaging/trailing-3-month-window behavior end to end; these focus on this
+    function's own contract: shape, ordering, the league_group_id join, and the since_date filter
+    specifically."""
 
     @pytest.mark.integration
     async def test_returns_empty_for_no_player_tags(self, db):
@@ -846,15 +847,30 @@ class TestGetRecentCwlAttacksWithLeague:
         assert result["#P2"][0]["league_rank"] == "Titan League I"
 
     @pytest.mark.integration
-    async def test_truncates_to_attack_limit_per_player(self, db):
+    async def test_since_date_excludes_older_attacks(self, db):
+        """2026-08-16 (replaces the old attack_limit count-based cap with a calendar-date
+        filter, for consistency with the hover pop-up's own trailing-3-month window — see
+        compute_league_adjusted_skill_scores' own docstring)."""
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
         for i in range(3):
             await _seed_cwl_attack_with_league(
                 db, "#CLAN1", f"2026-{i + 1:02d}", "Bronze League III", "#P1", stars=2,
                 date=f"2026-{i + 1:02d}-01T08:00", war_id=f"w{i}",
             )
-        attacks = db.get_recent_cwl_attacks_with_league_sync(["#P1"], attack_limit=2)["#P1"]
-        assert len(attacks) == 2
+        attacks = db.get_recent_cwl_attacks_with_league_sync(["#P1"], since_date="2026-02-01")["#P1"]
+        assert len(attacks) == 2  # February and March; January excluded
+        assert all(a["date"] >= "2026-02-01" for a in attacks)
+
+    @pytest.mark.integration
+    async def test_since_date_none_returns_every_attack(self, db):
+        await _seed_guild_and_clan(db, clan_tag="#CLAN1")
+        for i in range(3):
+            await _seed_cwl_attack_with_league(
+                db, "#CLAN1", f"2026-{i + 1:02d}", "Bronze League III", "#P1", stars=2,
+                date=f"2026-{i + 1:02d}-01T08:00", war_id=f"w{i}",
+            )
+        attacks = db.get_recent_cwl_attacks_with_league_sync(["#P1"])["#P1"]
+        assert len(attacks) == 3
 
 
 class TestCwlAssignmentsCrud:

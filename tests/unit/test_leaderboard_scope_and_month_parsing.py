@@ -212,3 +212,87 @@ class TestCalculateLeaderboardScopeAll:
         result = calculate_leaderboard("#NEW", month=6, year=2026, mode="attack")
 
         assert result["#P1"]["Stars"] == 3  # the #OLD stint's 2 stars are NOT counted
+
+
+# ---------------------------------------------------------------------------
+# get_recent_cwl_player_stats — the Manage Enrollment hover pop-up's missed-attacks/
+# attack-defense-ratio stat (2026-08-16, project owner's spec, verbatim: "They should be
+# calculated exactly as the /leaderboard command would do it with the modes missedattacks and
+# attackdefratio and with the options cwl_only=true and month=-3" / "the option scope=ALL is
+# also important"). Reuses _load_history_rows()/_merge_entries() directly, so these tests mock
+# the exact same db.get_player_attack_history_sync() seam TestCalculateLeaderboardScopeAll above
+# already relies on for scope="all".
+# ---------------------------------------------------------------------------
+
+class TestGetRecentCwlPlayerStats:
+    NOW = datetime(2026, 7, 15)  # trailing 3 months -> May, June, July 2026
+
+    def test_no_history_returns_null_fields(self, monkeypatch):
+        db = MagicMock()
+        db.get_player_attack_history_sync = MagicMock(return_value=[])
+        monkeypatch.setattr("QBhelperfunctions.CACHE", _mock_cache(db_manager=db))
+        from QBhelperfunctions import get_recent_cwl_player_stats
+
+        result = get_recent_cwl_player_stats("#P1", now=self.NOW)
+        assert result == {"seasons": [], "attacks": None, "missed_attacks": None, "attack_defense_ratio": None}
+
+    def test_sums_across_trailing_three_months_cwl_only_scope_all(self, monkeypatch):
+        rows_by_period = {
+            (5, 2026): [
+                {"WarID": "#C::W5", "PlayerID": "#P1", "Player": "Alice", "Stars": 2,
+                 "Attacks": 1, "Missed_Attacks": 0, "Defensive_Stars": 1, "Max_Attacks": 1,
+                 "Date": "2026-05-01T08:00", "TH_lvl": 15},
+            ],
+            (6, 2026): [
+                # A missed real attack (sentinel row) — counts toward Missed_Attacks.
+                {"WarID": "#C::W6", "PlayerID": "#P1", "Player": "Alice", "Stars": 0,
+                 "Attacks": 0, "Missed_Attacks": 1, "Defensive_Stars": 2, "Max_Attacks": 1,
+                 "Date": "2026-06-01T08:00", "TH_lvl": 15},
+                # A regular (non-CWL) war the same month — cwl_only must exclude it entirely.
+                {"WarID": "#C::W6R", "PlayerID": "#P1", "Player": "Alice", "Stars": 10,
+                 "Attacks": 2, "Missed_Attacks": 0, "Defensive_Stars": 5, "Max_Attacks": 2,
+                 "Date": "2026-06-15T08:00", "TH_lvl": 15},
+            ],
+            (7, 2026): [
+                {"WarID": "#C::W7", "PlayerID": "#P1", "Player": "Alice", "Stars": 3,
+                 "Attacks": 1, "Missed_Attacks": 0, "Defensive_Stars": 0, "Max_Attacks": 1,
+                 "Date": "2026-07-01T08:00", "TH_lvl": 15},
+            ],
+        }
+
+        def fake_history(player_tags, month, year):
+            assert player_tags == ["#P1"]
+            return rows_by_period.get((month, year), [])
+
+        db = MagicMock()
+        db.get_player_attack_history_sync = MagicMock(side_effect=fake_history)
+        mock = _mock_cache(db_manager=db)
+        # scope="all" must never fall back to the per-clan path (that's the whole point of the
+        # project owner's follow-up: "the option scope=ALL is also important").
+        mock.get_clan_history = MagicMock(side_effect=AssertionError("scope=all must not use get_clan_history"))
+        monkeypatch.setattr("QBhelperfunctions.CACHE", mock)
+        from QBhelperfunctions import get_recent_cwl_player_stats
+
+        result = get_recent_cwl_player_stats("#P1", now=self.NOW)
+
+        assert result["seasons"] == ["2026-05", "2026-06", "2026-07"]
+        assert result["attacks"] == 2  # the two real attacks (May + July); the sentinel/regular-war rows don't count
+        assert result["missed_attacks"] == 1
+        # Attack stars = 2 + 0 + 3 = 5 (the regular war's 10 excluded);
+        # defensive stars = 1 + 2 + 0 = 3 (the regular war's 5 excluded) -> 5/3.
+        assert result["attack_defense_ratio"] == pytest.approx(1.67)
+
+    def test_ratio_is_none_when_no_defensive_stars_recorded(self, monkeypatch):
+        rows = [{"WarID": "#C::W7", "PlayerID": "#P1", "Player": "Alice", "Stars": 3,
+                 "Attacks": 1, "Missed_Attacks": 0, "Defensive_Stars": 0, "Max_Attacks": 1,
+                 "Date": "2026-07-01T08:00", "TH_lvl": 15}]
+        db = MagicMock()
+        db.get_player_attack_history_sync = MagicMock(
+            side_effect=lambda tags, m, y: rows if (m, y) == (7, 2026) else []
+        )
+        monkeypatch.setattr("QBhelperfunctions.CACHE", _mock_cache(db_manager=db))
+        from QBhelperfunctions import get_recent_cwl_player_stats
+
+        result = get_recent_cwl_player_stats("#P1", now=self.NOW)
+        assert result["missed_attacks"] == 0
+        assert result["attack_defense_ratio"] is None

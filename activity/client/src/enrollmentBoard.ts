@@ -17,7 +17,7 @@ function metricValue(player: EnrollmentPlayer, metric: DisplayMetric): number | 
 }
 
 function metricLabel(metric: DisplayMetric): string {
-  return metric === 'avg_stars' ? 'Average stars/attack (last ≤10 CWL attacks)' : 'League-adjusted skill score'
+  return metric === 'avg_stars' ? 'Average stars/attack (last 3 CWL months)' : 'League-adjusted skill score'
 }
 
 type VisibleStatus = 'pending' | 'confirmed' | 'declined'
@@ -75,6 +75,133 @@ function clanMatchClass(player: EnrollmentPlayer): 'same-clan' | 'different-clan
   return player.assigned_clan_tag === player.current_clan_tag ? 'same-clan' : 'different-clan'
 }
 
+// Progressively-fetched recent-CWL stats (2026-08-16, project owner's spec, verbatim: "get the
+// number of missed cwl attacks from the last three season's" / "add the attack / defense ratio
+// from the last three cwl seaons" / "Attacks: n (number of total attacks)") — matches GET
+// /api/cwl/player-stats' response shape exactly. `seasons` is always 3 long once there's ANY
+// data (a fixed trailing-3-calendar-month window, not adaptive); empty means no CWL history on
+// record at all, in which case every stat field is null and the pop-up shows none of them.
+type PlayerStats = {
+  seasons: string[]
+  attacks: number | null
+  missed_attacks: number | null
+  attack_defense_ratio: number | null
+}
+
+type TooltipLine = { text: string; kind: 'name' | 'header' | 'line' }
+
+// Hover info pop-up (2026-08-16, project owner's spec — "a small pop-up shows the clan the
+// player belongs to along with some other info on the user that we have in the DB", then
+// follow-up: "show up the pop-up as soon as possible... and then fetch more data... as it comes
+// in"). `resolveClanName` resolves a tag to its display name from whatever's known RIGHT NOW —
+// either one of this board's own clans (payload.clans) or a tag already fetched in via
+// onResolveClanNames — returning null (not the raw tag) when nothing's known yet, so the "Name
+// (#TAG)" line can tell "not resolved yet" apart from "resolved, and the name happens to be the
+// tag" and just show the bare tag until a real name lands (project owner's spec, verbatim: "If
+// either name or tag is missing just leave it out for the time being and fetch it and add it as
+// soon as the fetch is complete"). `playerStats` is undefined while its own fetch hasn't landed
+// yet (or was never requested) — the CWL-stats section grows in place once it does, same
+// "instant with what we have, patch in the rest" pattern as the clan name.
+//
+// Ordering (2026-08-16 follow-up, project owner's spec, verbatim — identity/status fields first,
+// then one grouped CWL-stats section, Guest status always last): Name/TH/Current Clan/Assigned
+// to/Discord/Response, then a "CWL Stats of last 3 Months:" header covering Attacks/Skill
+// Score/Avg stars per attack/Attack-Defense ratio/Missed CWL attacks — Skill Score and Avg
+// stars/attack moved here from their own standalone lines since they're now computed over the
+// SAME trailing-3-month window as the other three (see compute_league_adjusted_skill_scores'
+// own docstring for that consistency fix) — then Guest status, unconditionally last.
+function buildTooltipLines(
+  player: EnrollmentPlayer,
+  resolveClanName: (tag: string) => string | null,
+  playerStats: PlayerStats | undefined,
+  statsFetchSettled: boolean,
+): TooltipLine[] {
+  const currentClanLine = ((): string => {
+    if (player.current_clan_tag === null) return 'Current Clan: None on record'
+    const name = resolveClanName(player.current_clan_tag)
+    return name ? `Current Clan: ${name} (${player.current_clan_tag})` : `Current Clan: ${player.current_clan_tag}`
+  })()
+
+  const lines: TooltipLine[] = [{ text: `${displayName(player)} (${player.player_tag})`, kind: 'name' }]
+  const pushLine = (text: string): void => {
+    lines.push({ text, kind: 'line' })
+  }
+  if (player.th_level != null) pushLine(`Town Hall ${player.th_level}`)
+  pushLine(currentClanLine)
+  pushLine(
+    `Assigned to: ${
+      player.assigned_clan_tag !== null ? resolveClanName(player.assigned_clan_tag) ?? player.assigned_clan_tag : 'Unassigned'
+    }`,
+  )
+  pushLine(`Discord: ${player.discord_id != null ? 'Linked' : 'Not linked'}`)
+  pushLine(
+    `Response: ${
+      player.discord_id == null
+        ? UNLINKED_LABEL
+        : isVisibleStatus(player.signup_status) ? STATUS_LABEL[player.signup_status] : 'No response yet'
+    }`,
+  )
+
+  const statLines: string[] = []
+  if (playerStats && playerStats.attacks !== null) statLines.push(`Attacks: ${playerStats.attacks}`)
+  if (player.skill_score != null) statLines.push(`Skill Score: ${player.skill_score.toFixed(1)}`)
+  if (player.avg_stars != null) statLines.push(`Avg stars/attack: ${player.avg_stars.toFixed(1)}`)
+  if (playerStats && playerStats.attack_defense_ratio !== null) {
+    statLines.push(`Attack/Defense ratio: ${playerStats.attack_defense_ratio.toFixed(2)}`)
+  }
+  if (playerStats && playerStats.missed_attacks !== null) statLines.push(`Missed CWL attacks: ${playerStats.missed_attacks}`)
+  if (statLines.length > 0) {
+    lines.push({ text: 'CWL Stats of last 3 Months:', kind: 'header' })
+    for (const text of statLines) pushLine(text)
+  } else if (statsFetchSettled) {
+    // Skill Score/Avg-stars are already known synchronously (part of `player`, never fetched),
+    // so once the async playerStats fetch has also settled with nothing, every one of these
+    // five stats is confirmed absent — not just "not fetched yet" — so it's safe to say so
+    // explicitly instead of silently omitting the whole section (2026-08-16, project owner's
+    // spec, verbatim: "for a player who has no cwl data available for the last three months it
+    // should read: CWL stats of last 3 Months: No data available").
+    lines.push({ text: 'CWL Stats of last 3 Months:', kind: 'header' })
+    pushLine('No data available')
+  }
+
+  if (player.is_guest) pushLine('Guest (invited from another clan/guild)')
+
+  return lines
+}
+
+function renderTooltipLines(el: HTMLElement, lines: TooltipLine[]): void {
+  el.innerHTML = ''
+  const classForKind: Record<TooltipLine['kind'], string> = {
+    name: 'hover-popup-name',
+    header: 'hover-popup-header',
+    line: 'hover-popup-line',
+  }
+  for (const line of lines) {
+    const row = document.createElement('div')
+    row.className = classForKind[line.kind]
+    row.textContent = line.text
+    el.appendChild(row)
+  }
+}
+
+// Clamped to the viewport, not just "to the right of the card" — a card near the right or bottom
+// edge of the window would otherwise push the pop-up (partially) off-screen. Measured AFTER
+// appending to document.body (not the scrolling .board/.card-list containers — see
+// showTooltip's own comment on why) so getBoundingClientRect() reflects its real rendered size.
+function positionTooltip(el: HTMLElement, anchor: HTMLElement): void {
+  const anchorRect = anchor.getBoundingClientRect()
+  const popupRect = el.getBoundingClientRect()
+  const margin = 8
+  let left = anchorRect.right + margin
+  if (left + popupRect.width > window.innerWidth) left = anchorRect.left - popupRect.width - margin
+  left = Math.max(margin, left)
+  let top = anchorRect.top
+  if (top + popupRect.height > window.innerHeight) top = window.innerHeight - popupRect.height - margin
+  top = Math.max(margin, top)
+  el.style.left = `${left}px`
+  el.style.top = `${top}px`
+}
+
 function sortPlayers(players: EnrollmentPlayer[], order: SortOrder): EnrollmentPlayer[] {
   const byName = (a: EnrollmentPlayer, b: EnrollmentPlayer) => displayName(a).localeCompare(displayName(b))
   return [...players].sort((a, b) => {
@@ -84,7 +211,9 @@ function sortPlayers(players: EnrollmentPlayer[], order: SortOrder): EnrollmentP
     }
     if (order === 'skill') {
       const diff = (b.skill_score ?? -1) - (a.skill_score ?? -1)
-      return diff !== 0 ? diff : byName(a, b)
+      if (diff !== 0) return diff
+      const thDiff = (b.th_level ?? -1) - (a.th_level ?? -1)
+      return thDiff !== 0 ? thDiff : byName(a, b)
     }
     return byName(a, b)
   })
@@ -132,9 +261,38 @@ export function renderEnrollmentBoard(
   payload: EnrollmentPayload,
   onAssignAction: (playerTag: string, clanTag: string | null) => Promise<void>,
   onClose: (reason: string) => void,
+  // Progressive hover pop-up fetch (2026-08-16, project owner's spec: "show up the pop-up as
+  // soon as possible... then fetch more data... starting with the clan name") — resolves any
+  // clan tags the pop-up couldn't already label from payload.clans. Optional so tests/other
+  // callers that don't care about the pop-up's async half can omit it; the pop-up still renders
+  // fine with just the raw tag in that case.
+  onResolveClanNames?: (tags: string[]) => Promise<Record<string, string>>,
+  // Second half of the same progressive fetch (2026-08-16, project owner's spec: "get the number
+  // of missed cwl attacks from the last three season's" / "add the attack / defense ratio from
+  // the last three cwl seaons") — one player's own recent-CWL stats, fetched per-hover. Also
+  // optional, same reasoning as onResolveClanNames above.
+  onFetchPlayerStats?: (playerTag: string) => Promise<PlayerStats>,
 ): EnrollmentBoardHandle {
   const working: EnrollmentPlayer[] = payload.players.map((p) => ({ ...p }))
   const byTag = new Map(working.map((p) => [p.player_tag, p]))
+  // Hover pop-up clan-name cache, shared across every card for the life of this board render —
+  // `resolvedClanNames` holds names fetched in from outside payload.clans;
+  // `attemptedClanTags` remembers every tag already asked for (successful or not) so a clan
+  // CACHE genuinely doesn't know about isn't re-fetched on every single hover.
+  const resolvedClanNames = new Map<string, string>()
+  const attemptedClanTags = new Set<string>()
+  // Same shape, keyed by player_tag instead of clan_tag — `playerStatsCache` only ever holds an
+  // entry once its fetch actually resolves (with real data, seasons.length > 0), so a repeat
+  // hover over a player with zero CWL history keeps re-showing the pop-up without the stat lines
+  // rather than caching an empty result forever; `attemptedPlayerStatsTags` still prevents
+  // re-fetching on every single hover regardless of whether that fetch found anything.
+  const playerStatsCache = new Map<string, PlayerStats>()
+  const attemptedPlayerStatsTags = new Set<string>()
+  // Distinct from attemptedPlayerStatsTags (set synchronously the moment a fetch STARTS) — this
+  // is set only once the fetch actually SETTLES, so buildTooltipLines can tell "still waiting"
+  // apart from "confirmed no data in the window" and only show "No data available" once it's
+  // actually true, never as a premature flash before the async fetch lands.
+  const settledPlayerStatsTags = new Set<string>()
   // Set for the duration of any native HTML5 drag gesture (player card or column-header) — a
   // poll-triggered renderBoard() mid-drag would tear down the very DOM node the browser is
   // currently dragging, silently aborting the gesture (2026-08-16, live-testing feedback: polling
@@ -144,6 +302,10 @@ export function renderEnrollmentBoard(
   let sortOrder: SortOrder = 'th'
   let displayMetric: DisplayMetric = 'avg_stars'
   const knownClanTags = new Set(payload.clans.map((c) => c.clan_tag))
+  const clanNameByTag = new Map(payload.clans.map((c) => [c.clan_tag, c.name ?? c.clan_tag]))
+  // Returns null (not the raw tag) when nothing's resolved yet — see buildTooltipLines' own
+  // comment for why that distinction matters to the "Name (#TAG)" pop-up line.
+  const resolveClanName = (tag: string): string | null => clanNameByTag.get(tag) ?? resolvedClanNames.get(tag) ?? null
   const hasOrphanedAssignments = working.some(
     (p) => p.assigned_clan_tag !== null && !knownClanTags.has(p.assigned_clan_tag),
   )
@@ -163,6 +325,85 @@ export function renderEnrollmentBoard(
   // buildColumn()'s comment on why this needs a second pass after DOM attachment.
   let pendingBandSizing: { bg: HTMLElement; lastCard: HTMLElement }[] = []
 
+  // Hover pop-up (2026-08-16) — appended to document.body, not the card itself, so it isn't
+  // clipped by .card-list's/.board's own `overflow: auto` (a popover living inside a scrolling
+  // container gets cut off at that container's edge; document.body has no such boundary).
+  // Tracked by player_tag (not just the element) so a slow-landing clan-name fetch can check
+  // "is this still the card the user is hovering" before mutating anything — the user may have
+  // already moved to a different card, or away entirely, by the time the fetch resolves.
+  let activeTooltip: { el: HTMLElement; playerTag: string } | null = null
+
+  function hideTooltip(): void {
+    if (activeTooltip) {
+      activeTooltip.el.remove()
+      activeTooltip = null
+    }
+  }
+
+  // Re-renders the pop-up in place IF the user is still hovering the same player it was opened
+  // for — called after either progressive fetch below lands. A no-op once the user has moved to a
+  // different card or away entirely, so a slow-landing response can never resurrect or overwrite
+  // a pop-up that's already been dismissed or replaced by a different one.
+  // No fetch capability at all means nothing to wait for — treat as settled so a caller that
+  // never wires up onFetchPlayerStats (e.g. a test) still gets a definite answer instead of the
+  // section silently vanishing forever.
+  const statsSettled = (playerTag: string): boolean => !onFetchPlayerStats || settledPlayerStatsTags.has(playerTag)
+
+  function refreshTooltipIfStillShowing(player: EnrollmentPlayer, anchor: HTMLElement): void {
+    if (!activeTooltip || activeTooltip.playerTag !== player.player_tag) return
+    renderTooltipLines(
+      activeTooltip.el,
+      buildTooltipLines(player, resolveClanName, playerStatsCache.get(player.player_tag), statsSettled(player.player_tag)),
+    )
+    positionTooltip(activeTooltip.el, anchor)
+  }
+
+  function showTooltip(player: EnrollmentPlayer, anchor: HTMLElement): void {
+    hideTooltip()
+    const el = document.createElement('div')
+    el.className = 'player-hover-popup'
+    renderTooltipLines(
+      el,
+      buildTooltipLines(player, resolveClanName, playerStatsCache.get(player.player_tag), statsSettled(player.player_tag)),
+    )
+    document.body.appendChild(el)
+    positionTooltip(el, anchor)
+    activeTooltip = { el, playerTag: player.player_tag }
+
+    if (onResolveClanNames) {
+      const tagsToResolve = [...new Set([player.current_clan_tag, player.assigned_clan_tag])].filter(
+        (tag): tag is string => tag !== null && !clanNameByTag.has(tag) && !attemptedClanTags.has(tag),
+      )
+      if (tagsToResolve.length > 0) {
+        tagsToResolve.forEach((tag) => attemptedClanTags.add(tag))
+        onResolveClanNames(tagsToResolve)
+          .then((names) => {
+            for (const [tag, name] of Object.entries(names)) resolvedClanNames.set(tag, name)
+            refreshTooltipIfStillShowing(player, anchor)
+          })
+          .catch((err: unknown) => console.error('[cwl-activity] clan-name lookup failed:', err))
+      }
+    }
+
+    if (onFetchPlayerStats && !attemptedPlayerStatsTags.has(player.player_tag)) {
+      attemptedPlayerStatsTags.add(player.player_tag)
+      onFetchPlayerStats(player.player_tag)
+        .then((stats) => {
+          if (stats.seasons.length > 0) playerStatsCache.set(player.player_tag, stats)
+          settledPlayerStatsTags.add(player.player_tag)
+          refreshTooltipIfStillShowing(player, anchor)
+        })
+        .catch((err: unknown) => {
+          console.error('[cwl-activity] player-stats lookup failed:', err)
+          // A failed fetch still counts as "settled" — otherwise a persistent network error
+          // would leave the pop-up silently missing the CWL-stats section forever instead of
+          // ever showing "No data available".
+          settledPlayerStatsTags.add(player.player_tag)
+          refreshTooltipIfStillShowing(player, anchor)
+        })
+    }
+  }
+
   container.innerHTML = ''
 
   const topBar = document.createElement('div')
@@ -180,11 +421,20 @@ export function renderEnrollmentBoard(
 
   const legend = document.createElement('div')
   legend.className = 'legend'
+  const legendLabel = document.createElement('span')
+  legendLabel.className = 'legend-label'
+  legendLabel.textContent = 'User response:'
   legend.append(
+    legendLabel,
     buildLegendItem(pendingIconUrl, STATUS_LABEL.pending),
     buildLegendItem(gcheckIconUrl, STATUS_LABEL.confirmed),
     buildLegendItem(redxIconUrl, STATUS_LABEL.declined),
-    buildLegendItem(unlinkedIconUrl, UNLINKED_LABEL),
+    // Trailing comma appended to this item's own label text, not as a separate flex child
+    // (2026-08-16, live-testing feedback: the guest swatch below doesn't belong to the "User
+    // response:" group — a comma marks that boundary, but as a sibling flex item it'd pick up the
+    // row's own gap on both sides and float away from "Not Linked" instead of reading as one
+    // word).
+    buildLegendItem(unlinkedIconUrl, UNLINKED_LABEL, ','),
     // Guest indicator (2026-08-16, live-testing feedback: "what is the meaning of the small
     // yellow band" — the .guest-card left-accent already had a hover tooltip, but that's not
     // discoverable without hovering every card; a legend entry is) — a small swatch reproducing
@@ -232,8 +482,8 @@ export function renderEnrollmentBoard(
   // showing, not just the skill score.
   function updateSkillExplainer(): void {
     skillExplainer.textContent = displayMetric === 'avg_stars'
-      ? 'Avg Stars/Attack = plain average stars per attack over each player’s last ≤10 CWL attacks.'
-      : 'Skill Score = league-weighted average stars/attack over each player’s last ≤10 CWL attacks.'
+      ? 'Avg Stars/Attack = plain average stars per attack over each player’s CWL attacks in the last 3 months.'
+      : 'Skill Score = league-weighted average stars/attack over each player’s CWL attacks in the last 3 months.'
   }
   updateSkillExplainer()
 
@@ -319,10 +569,12 @@ export function renderEnrollmentBoard(
     // (2026-08-14 fix history above), so a guest marker can't risk perturbing it.
     if (player.is_guest) {
       card.classList.add('guest-card')
-      card.title = 'Invited as a guest'
     }
+    card.addEventListener('mouseenter', () => showTooltip(player, card))
+    card.addEventListener('mouseleave', hideTooltip)
     card.draggable = true
     card.addEventListener('dragstart', (e) => {
+      hideTooltip()
       e.dataTransfer?.setData('text/plain', player.player_tag)
       if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
       card.classList.add('dragging')
@@ -584,6 +836,11 @@ export function renderEnrollmentBoard(
   }
 
   function renderBoard(): void {
+    // Every card gets torn down and rebuilt below — a pop-up still anchored to one of the old
+    // (about to be removed) card elements would be left pointing at nothing. The next mouseenter
+    // (once the user moves the mouse again) shows a fresh one against the new card, same as a
+    // native browser tooltip would also disappear when its anchor element is replaced.
+    hideTooltip()
     board.innerHTML = ''
     // Populated by buildColumn() while it builds each column's cards (still detached from the
     // document at that point, so offsetTop/offsetHeight would read zero) — sized in a second
@@ -662,14 +919,14 @@ export function renderEnrollmentBoard(
   return { applyPolledUpdate }
 }
 
-function buildLegendItem(iconUrl: string, label: string): HTMLElement {
+function buildLegendItem(iconUrl: string, label: string, suffix = ''): HTMLElement {
   const item = document.createElement('span')
   item.className = 'legend-item'
   const icon = document.createElement('img')
   icon.className = 'legend-icon'
   icon.src = iconUrl
   icon.alt = label
-  item.append(icon, label)
+  item.append(icon, label + suffix)
   return item
 }
 

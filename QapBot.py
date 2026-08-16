@@ -383,6 +383,21 @@ async def initialize_database() -> None:
         )
         CACHE.db_manager = db_manager
         logging.info(f"[DB] Database initialized at {CONFIG.db_path} (history: {CONFIG.history_db_path})")
+
+        # Guardrail for the 2026-08-14 hot/history schema-drift incident class of bug (see
+        # check_hot_history_schema_parity_sync's docstring, qapbot/db_manager.py): a genuine
+        # column SET mismatch (not just reordering, which every affected query is now immune
+        # to) between main.<table> and history.<table> is not automatically recoverable, so
+        # it's surfaced loudly here rather than silently causing "no such column" failures or
+        # missing stats deep inside some later query.
+        mismatched_tables = await asyncio.to_thread(db_manager.check_hot_history_schema_parity_sync)
+        if mismatched_tables:
+            logging.critical(
+                "[DB-SCHEMA-CHECK] hot/history column SET mismatch detected for: "
+                f"{', '.join(mismatched_tables)} — a column exists in one schema but not the "
+                "other. Queries against these tables may fail or silently omit data. See "
+                "qapbot/scripts/repair_history_schema_drift.py / DATABASE_ARCHITECTURE.md."
+            )
     except asyncio.TimeoutError:
         logging.error("❌ Database initialization timed out after 30 minutes")
         raise RuntimeError("Database initialization timed out - bot cannot start")

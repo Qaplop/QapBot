@@ -610,10 +610,12 @@ async def test_sync_shared_roster_never_overwrites_an_existing_local_signup(db, 
 
 
 # ---------------------------------------------------------------------------
-# auto_assign_prior_cwl_members_if_empty — auto-assign-on-add (2026-08-15, live-testing
-# feedback): a clan added to the roster AFTER Start Enrollment already ran gets pre-filled with
-# its own current members who have prior CWL history in that exact clan, instead of sitting
-# permanently empty.
+# auto_assign_prior_cwl_members — auto-assign-on-add (2026-08-15, live-testing feedback): a clan
+# added to the roster AFTER Start Enrollment already ran gets pre-filled with its own current
+# members who have prior CWL history in that exact clan, instead of sitting permanently empty.
+# Gated per PLAYER (2026-08-16 follow-up), not on the whole roster being empty, so a re-add after
+# removal still seeds newly-qualifying members even when a couple of deliberately locked
+# placements survived the removal.
 # ---------------------------------------------------------------------------
 
 async def _seed_current_clan_member(db: WarHistoryDB, discord_id: str, player_tag: str, clan_tag: str) -> None:
@@ -643,7 +645,7 @@ async def _seed_real_cwl_attack(db: WarHistoryDB, war_id: str, clan_tag: str, pl
 @pytest.mark.asyncio
 async def test_auto_assign_fills_empty_clan_with_prior_cwl_members(db, monkeypatch):
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import auto_assign_prior_cwl_members_if_empty
+    from qapbot.QBdiscocmdshelper_cwl import auto_assign_prior_cwl_members
 
     monkeypatch.setattr(CACHE, "db_manager", db)
     await _seed_guild_and_clan(db, "300", "#CLAN1")
@@ -659,7 +661,7 @@ async def test_auto_assign_fills_empty_clan_with_prior_cwl_members(db, monkeypat
     await _seed_current_clan_member(db, "12", "#P3", "#OTHERCLAN")
     await _seed_real_cwl_attack(db, "war2", "#CLAN1", "#P3", "Gamma3")
 
-    await auto_assign_prior_cwl_members_if_empty(300, event_id, "2026-09", "#CLAN1")
+    await auto_assign_prior_cwl_members(300, event_id, "2026-09", "#CLAN1")
 
     assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event_id)}
     assert assignments == {"#P1": "#CLAN1"}
@@ -670,37 +672,72 @@ async def test_auto_assign_fills_empty_clan_with_prior_cwl_members(db, monkeypat
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_auto_assign_never_overwrites_a_non_empty_roster(db, monkeypatch):
+async def test_auto_assign_seeds_other_qualifying_members_even_when_some_already_placed(db, monkeypatch):
+    """2026-08-16, live-testing feedback, project owner's spec, verbatim: "after removing
+    staycalm as guest clan and then re-adding it only the two players that were assigned manually
+    are in staycalm's roster. The re-add should also have done a re-auto-assign in case the guest
+    clan is not controlled by its own guild." A re-added clan can already carry a couple of
+    deliberately locked survivors from before its removal — those must NOT block every other
+    genuinely-qualifying player from getting auto-assigned too."""
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import auto_assign_prior_cwl_members_if_empty
+    from qapbot.QBdiscocmdshelper_cwl import auto_assign_prior_cwl_members
 
     monkeypatch.setattr(CACHE, "db_manager", db)
     await _seed_guild_and_clan(db, "301", "#CLAN1")
     event_id = db.create_cwl_event_sync("301", "2026-09", "1")
     db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True, "roster_size": 15}])
     db.upsert_cwl_signup_sync(event_id, "#EXISTING", "Existing", "1", None, "admin_added", "confirmed")
-    db.upsert_cwl_assignment_sync(event_id, "#EXISTING", "#CLAN1")
+    db.upsert_cwl_assignment_sync(event_id, "#EXISTING", "#CLAN1", assignment_source="admin_override", locked=True)
     await _seed_current_clan_member(db, "10", "#P1", "#CLAN1")
     await _seed_real_cwl_attack(db, "war1", "#CLAN1", "#P1", "Alpha1")
 
-    await auto_assign_prior_cwl_members_if_empty(301, event_id, "2026-09", "#CLAN1")
+    await auto_assign_prior_cwl_members(301, event_id, "2026-09", "#CLAN1")
 
-    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event_id)}
-    assert assignments == {"#EXISTING": "#CLAN1"}  # #P1 was never added
+    assignments = {a["player_tag"]: a for a in db.get_cwl_assignments_sync(event_id)}
+    assert assignments["#EXISTING"]["assigned_clan_tag"] == "#CLAN1"
+    assert assignments["#EXISTING"]["assignment_source"] == "admin_override"  # untouched, still locked
+    assert assignments["#EXISTING"]["locked"] == 1
+    assert assignments["#P1"]["assigned_clan_tag"] == "#CLAN1"  # newly seeded despite #EXISTING already there
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_auto_assign_never_re_places_a_player_already_placed_in_this_clan(db, monkeypatch):
+    """The exclusion is per-player, keyed on THIS clan specifically — a player already assigned
+    to clan_tag (even if they'd otherwise also qualify via prior CWL history there) is left
+    completely alone, so a locked/admin_override placement is never silently downgraded to a
+    plain 'suggested' one by a later re-add."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import auto_assign_prior_cwl_members
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_guild_and_clan(db, "307", "#CLAN1")
+    event_id = db.create_cwl_event_sync("307", "2026-09", "1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True, "roster_size": 15}])
+    await _seed_current_clan_member(db, "10", "#P1", "#CLAN1")
+    await _seed_real_cwl_attack(db, "war1", "#CLAN1", "#P1", "Alpha1")
+    db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha1", "10", None, "admin_added", "confirmed")
+    db.upsert_cwl_assignment_sync(event_id, "#P1", "#CLAN1", assignment_source="admin_override", locked=True)
+
+    await auto_assign_prior_cwl_members(307, event_id, "2026-09", "#CLAN1")
+
+    assignment = next(a for a in db.get_cwl_assignments_sync(event_id) if a["player_tag"] == "#P1")
+    assert assignment["assignment_source"] == "admin_override"
+    assert assignment["locked"] == 1
 
 
 @pytest.mark.discord
 @pytest.mark.asyncio
 async def test_auto_assign_writes_to_shared_table_for_a_shared_clan(db, monkeypatch):
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import auto_assign_prior_cwl_members_if_empty
+    from qapbot.QBdiscocmdshelper_cwl import auto_assign_prior_cwl_members
 
     monkeypatch.setattr(CACHE, "db_manager", db)
     shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "302", "303")
     await _seed_current_clan_member(db, "10", "#P1", "#CLAN1")
     await _seed_real_cwl_attack(db, "war1", "#CLAN1", "#P1", "Alpha1")
 
-    await auto_assign_prior_cwl_members_if_empty(303, target_event_id, "2026-09", "#CLAN1")
+    await auto_assign_prior_cwl_members(303, target_event_id, "2026-09", "#CLAN1")
 
     shared_players = {p["player_tag"]: p for p in db.get_cwl_shared_clan_players_sync(shared_clan_id)}
     assert shared_players["#P1"]["assigned"] == 1
@@ -1097,3 +1134,241 @@ async def test_orphaned_assignment_gets_purged_when_owning_guild_reassigns_elsew
     assert db.get_cwl_signup_sync(target_event_id, "#STUCK") is None
     assignments = {a["player_tag"] for a in db.get_cwl_assignments_sync(target_event_id)}
     assert "#STUCK" not in assignments
+
+
+# ---------------------------------------------------------------------------
+# detach_guild_from_shared_clan_on_deactivation — the `shared is None` branch: a PLAIN guest clan
+# (never cross-guild shared with anyone else). 2026-08-16 follow-up, live-testing feedback,
+# project owner's spec, verbatim: "I removed staycalm but their players were not removed from
+# the qcrew's player pool as it should have. we fixed this earlier this day and now it's back."
+# Not actually a regression of that earlier fix — every round of it only ever operated on
+# cwl_shared_clan_players, gated behind this exact function's `if shared is None: return` a few
+# lines up top — a clan that was NEVER cross-guild shared hit that early return and got zero
+# cleanup the entire time. Same rule, applied to the local tables directly instead.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_plain_guest_clan_detach_removes_auto_assigned_and_auto_seeded_players(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "server_config", {"300": {"member_clans": [], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    await _seed_guild_and_clan(db, "300", "#GUESTCLAN")
+    event_id = db.create_cwl_event_sync("300", "2026-09", "111")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#GUESTCLAN", "participating": True}])
+    await _seed_current_clan_member(db, "10", "#AUTO_ASSIGNED", "#GUESTCLAN")
+    await _seed_current_clan_member(db, "20", "#AUTO_SEEDED", "#GUESTCLAN")
+    # #AUTO_ASSIGNED: auto_assign_prior_cwl_members_if_empty's step-1 seed (real prior history) —
+    # a passive machine placement, not a deliberate admin action.
+    db.upsert_cwl_signup_sync(event_id, "#AUTO_ASSIGNED", "Auto", "10", None, "auto_assigned", "pending")
+    db.upsert_cwl_assignment_sync(event_id, "#AUTO_ASSIGNED", "#GUESTCLAN", assignment_source="suggested", locked=False)
+    # #AUTO_SEEDED: step-2's pure visibility placeholder — pending, no assignment at all.
+    db.upsert_cwl_signup_sync(event_id, "#AUTO_SEEDED", "Seeded", "20", None, "auto_seeded", "pending")
+
+    await detach_guild_from_shared_clan_on_deactivation(300, event_id, "2026-09", "#GUESTCLAN")
+
+    assert db.get_cwl_signup_sync(event_id, "#AUTO_ASSIGNED") is None
+    assert db.get_cwl_signup_sync(event_id, "#AUTO_SEEDED") is None
+    assignments = {a["player_tag"] for a in db.get_cwl_assignments_sync(event_id)}
+    assert "#AUTO_ASSIGNED" not in assignments
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_plain_guest_clan_detach_preserves_deliberate_admin_override_assignment(db, monkeypatch):
+    """A genuine human drag-and-drop placement must survive — same "Assigned to other Guild"
+    treatment the shared-clan branch gives its own admin_override players, except here the local
+    cwl_assignments row already IS the real assignment (no shared table to mirror from), so
+    preserving it is simply not deleting it."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "server_config", {"301": {"member_clans": [], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    await _seed_guild_and_clan(db, "301", "#GUESTCLAN")
+    event_id = db.create_cwl_event_sync("301", "2026-09", "111")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#GUESTCLAN", "participating": True}])
+    await _seed_current_clan_member(db, "10", "#DRAGGED", "#GUESTCLAN")
+    db.upsert_cwl_signup_sync(event_id, "#DRAGGED", "Dragged", "10", None, "admin_added", "pending")
+    db.upsert_cwl_assignment_sync(event_id, "#DRAGGED", "#GUESTCLAN", assignment_source="admin_override", locked=True)
+
+    await detach_guild_from_shared_clan_on_deactivation(301, event_id, "2026-09", "#GUESTCLAN")
+
+    signup = db.get_cwl_signup_sync(event_id, "#DRAGGED")
+    assert signup is not None
+    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event_id)}
+    assert assignments.get("#DRAGGED") == "#GUESTCLAN"  # still "Assigned to other Guild" once deactivated
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_plain_guest_clan_detach_never_deletes_a_genuine_family_members_signup(db, monkeypatch):
+    """A player who is a CURRENT member of one of this guild's own family clans must never have
+    their local signup deleted, even if they also happen to carry old auto_assigned/auto_seeded
+    history from the guest clan (e.g. from before they moved into the family clan)."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "server_config", {"302": {"member_clans": ["#FAMILY_CLAN"], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    await _seed_guild_and_clan(db, "302", "#GUESTCLAN")
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#FAMILY_CLAN', 'Family Clan')")
+    await db.conn.commit()
+    event_id = db.create_cwl_event_sync("302", "2026-09", "111")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#GUESTCLAN", "participating": True}])
+    # Currently a real family-clan member, but they still carry a stale, non-deliberate local
+    # assignment pointing at the guest clan from before they moved into the family clan — this is
+    # what makes them a candidate at all (get_current_clan_members_sync([GUESTCLAN]) alone
+    # wouldn't find them, since they're no longer really a GUESTCLAN member).
+    await _seed_current_clan_member(db, "10", "#REAL_SIGNUP", "#FAMILY_CLAN")
+    db.upsert_cwl_signup_sync(event_id, "#REAL_SIGNUP", "Real", "10", None, "template_confirm", "confirmed")
+    db.upsert_cwl_assignment_sync(event_id, "#REAL_SIGNUP", "#GUESTCLAN", assignment_source="suggested", locked=False)
+
+    await detach_guild_from_shared_clan_on_deactivation(302, event_id, "2026-09", "#GUESTCLAN")
+
+    signup = db.get_cwl_signup_sync(event_id, "#REAL_SIGNUP")
+    assert signup is not None
+    assert signup["source"] == "template_confirm"
+    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event_id)}
+    assert assignments.get("#REAL_SIGNUP") == "#GUESTCLAN"  # left completely untouched
+
+
+# ---------------------------------------------------------------------------
+# Discord-linked-account sweep on plain-clan detach (2026-08-16 follow-up, live-testing
+# feedback, project owner's spec, verbatim): "not only the staycalm members were added to The
+# QCrew's player pool but also [alt accounts from completely unrelated clans, linked via the
+# same Discord user]... when removing a guest clan... we always remove all the players that are
+# linked to the removed clan's discord users. There is one exception... When a discord user has
+# linked players either in one of the guild's member clans or in another guest clan of the guild
+# then these players should remain." Follow-up refinement: protection via a FAMILY clan is
+# unconditional; protection via ANOTHER active GUEST clan only holds while
+# cwl_enrollment_include_all_linked_accounts is currently True (mirrors what a fresh Start
+# Enrollment run would produce for that other clan right now).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_plain_guest_clan_detach_removes_discord_linked_alt_in_unrelated_clan(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "server_config", {"303": {"member_clans": [], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    await _seed_guild_and_clan(db, "303", "#GUESTCLAN")
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#UNRELATED', 'Unrelated Clan')")
+    await db.conn.commit()
+    event_id = db.create_cwl_event_sync("303", "2026-09", "111")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#GUESTCLAN", "participating": True}])
+    # #P1 is a direct current member of the guest clan; #P2 is the SAME discord user's alt
+    # account, currently in a totally unrelated clan — neither family nor another guest clan.
+    await _seed_current_clan_member(db, "50", "#P1", "#GUESTCLAN")
+    await _seed_current_clan_member(db, "50", "#P2", "#UNRELATED")
+    db.upsert_cwl_signup_sync(event_id, "#P1", "P1", "50", None, "template_confirm", "pending")
+    db.upsert_cwl_signup_sync(event_id, "#P2", "P2", "50", None, "template_confirm", "pending")
+
+    await detach_guild_from_shared_clan_on_deactivation(303, event_id, "2026-09", "#GUESTCLAN")
+
+    assert db.get_cwl_signup_sync(event_id, "#P1") is None
+    assert db.get_cwl_signup_sync(event_id, "#P2") is None  # the alt gets swept too
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_plain_guest_clan_detach_keeps_discord_linked_alt_in_family_clan_unconditionally(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    # No cwl_enrollment_include_all_linked_accounts set at all — family protection must not
+    # depend on it.
+    monkeypatch.setattr(CACHE, "server_config", {"304": {"member_clans": ["#FAMILY_CLAN"], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    await _seed_guild_and_clan(db, "304", "#GUESTCLAN")
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#FAMILY_CLAN', 'Family Clan')")
+    await db.conn.commit()
+    event_id = db.create_cwl_event_sync("304", "2026-09", "111")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#GUESTCLAN", "participating": True}])
+    # #P1 is a direct guest-clan member; #P2 is the same discord user's OTHER account, currently
+    # a genuine family-clan member.
+    await _seed_current_clan_member(db, "60", "#P1", "#GUESTCLAN")
+    await _seed_current_clan_member(db, "60", "#P2", "#FAMILY_CLAN")
+    db.upsert_cwl_signup_sync(event_id, "#P1", "P1", "60", None, "template_confirm", "pending")
+    db.upsert_cwl_signup_sync(event_id, "#P2", "P2", "60", None, "template_confirm", "pending")
+
+    await detach_guild_from_shared_clan_on_deactivation(304, event_id, "2026-09", "#GUESTCLAN")
+
+    # BOTH survive — the whole linked account is protected once any of its players is a genuine
+    # family-clan member, unconditionally.
+    assert db.get_cwl_signup_sync(event_id, "#P1") is not None
+    assert db.get_cwl_signup_sync(event_id, "#P2") is not None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_plain_guest_clan_detach_keeps_discord_linked_alt_in_other_guest_clan_when_toggle_on(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "server_config", {
+        "305": {"member_clans": [], "member_families": [], "cwl_enrollment_include_all_linked_accounts": True},
+    })
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    await _seed_guild_and_clan(db, "305", "#GUESTCLAN")
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHERGUEST', 'Other Guest Clan')")
+    await db.conn.commit()
+    event_id = db.create_cwl_event_sync("305", "2026-09", "111")
+    # #OTHERGUEST stays active; #GUESTCLAN is the one being deactivated (matches the real
+    # handle_post_clan_config ordering — cwl_event_clans is persisted before detach runs).
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#GUESTCLAN", "participating": False},
+        {"clan_tag": "#OTHERGUEST", "participating": True},
+    ])
+    await _seed_current_clan_member(db, "70", "#P1", "#GUESTCLAN")
+    await _seed_current_clan_member(db, "70", "#P2", "#OTHERGUEST")
+    db.upsert_cwl_signup_sync(event_id, "#P1", "P1", "70", None, "template_confirm", "pending")
+    db.upsert_cwl_signup_sync(event_id, "#P2", "P2", "70", None, "template_confirm", "pending")
+
+    await detach_guild_from_shared_clan_on_deactivation(305, event_id, "2026-09", "#GUESTCLAN")
+
+    # BOTH survive: #P2 is a direct #OTHERGUEST member (unconditional); #P1 is only linked, but
+    # the expansion toggle is currently on, so it's protected too.
+    assert db.get_cwl_signup_sync(event_id, "#P1") is not None
+    assert db.get_cwl_signup_sync(event_id, "#P2") is not None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_plain_guest_clan_detach_removes_discord_linked_alt_in_other_guest_clan_when_toggle_off(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    # cwl_enrollment_include_all_linked_accounts left off (default False).
+    monkeypatch.setattr(CACHE, "server_config", {"306": {"member_clans": [], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    await _seed_guild_and_clan(db, "306", "#GUESTCLAN")
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHERGUEST', 'Other Guest Clan')")
+    await db.conn.commit()
+    event_id = db.create_cwl_event_sync("306", "2026-09", "111")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#GUESTCLAN", "participating": False},
+        {"clan_tag": "#OTHERGUEST", "participating": True},
+    ])
+    await _seed_current_clan_member(db, "80", "#P1", "#GUESTCLAN")
+    await _seed_current_clan_member(db, "80", "#P2", "#OTHERGUEST")
+    db.upsert_cwl_signup_sync(event_id, "#P1", "P1", "80", None, "template_confirm", "pending")
+    db.upsert_cwl_signup_sync(event_id, "#P2", "P2", "80", None, "template_confirm", "pending")
+
+    await detach_guild_from_shared_clan_on_deactivation(306, event_id, "2026-09", "#GUESTCLAN")
+
+    # #P2 still survives (direct #OTHERGUEST membership is unconditional), but #P1 — only ever
+    # linked, never a direct #OTHERGUEST member — is removed since the expansion toggle is off.
+    assert db.get_cwl_signup_sync(event_id, "#P1") is None
+    assert db.get_cwl_signup_sync(event_id, "#P2") is not None
