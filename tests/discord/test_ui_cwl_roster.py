@@ -809,6 +809,11 @@ async def test_add_season_creates_event_directly_when_no_previous_data(db, mock_
     assert CACHE.pending_cwl_activity_screen[("1111", "999")] == "clan_config"
     # No carry-over data existed, so no ephemeral prompt should have been sent either.
     mock_interaction.followup.send.assert_not_awaited()
+    # 2026-08-16 regression fix: the screen that hosted this button must refresh itself too, not
+    # rely solely on the Hub-only refresh POST /api/cwl/activity-closed triggers once the
+    # auto-launched Activity closes — see _make_cwl_management_add_season_callback's own comment.
+    parent.refresh_cwl_view.assert_awaited_once()
+    assert parent.refresh_cwl_view.await_args.args[1] == "cwl_management"
 
 
 @pytest.mark.discord
@@ -963,6 +968,11 @@ async def test_cwl_carry_over_prompt_yes_presets_participating_from_real_war_his
     _, kwargs = mock_interaction.client.http.request.await_args
     assert kwargs["json"] == {"type": 12, "data": {}}  # 12 = LAUNCH_ACTIVITY
     assert CACHE.pending_cwl_activity_screen[("4444", "999")] == "clan_config"
+    # 2026-08-16 regression fix: same as the direct-create path — the screen that hosted "Add New
+    # Season" (self.parent_view here) must refresh itself, not rely solely on the Hub-only
+    # activity-closed refresh.
+    parent.refresh_cwl_view.assert_awaited_once()
+    assert parent.refresh_cwl_view.await_args.args[1] == "cwl_management"
 
 
 @pytest.mark.discord

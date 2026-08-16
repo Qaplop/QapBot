@@ -1,6 +1,30 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-16 (37)
+- Fixed: after "Add New Season", the `/clan management` command's own "CWL Season Management"
+  screen kept showing "No CWL event has been configured yet for season X" — reported live on DEV
+  — even though the season really was created (the persistent CWL Management Hub message, when
+  the same button is clicked there instead, updates correctly). Root cause: "Add New Season"
+  auto-launches the web Activity (Configure Participating Clans) as the interaction's own
+  response, and relied solely on `POST /api/cwl/activity-closed` — fired once that Activity
+  closes — to refresh anything afterward. That endpoint calls
+  `refresh_cwl_management_hub_message()`, which can ONLY resolve and edit a guild's anchored Hub
+  message (via `cwl_management_channel_id`/`cwl_management_message_id` in `server_config`); it has
+  no idea the ephemeral `/clan management` message (`ClanManagementView`, entry point a) exists at
+  all, so that message was never touched — it just happened to look right when triggered from the
+  Hub message itself, since that message IS what the endpoint refreshes. Fixed by calling the
+  existing `_refresh_parent(view, interaction, "cwl_management")` duck-typed refresh (already used
+  by the season-select dropdown) right after the season is created, in both
+  `_make_cwl_management_add_season_callback` and `CwlCarryOverPromptView._finish` — safe to call
+  immediately before `_launch_cwl_activity` despite its "must be interaction's first response"
+  constraint, since neither view type's `refresh_cwl_view()` ever touches `interaction.response`
+  (both edit a message directly via the bot's REST client). The Hub message now gets refreshed
+  twice in the Hub-originated case (here, then again via activity-closed) — a harmless no-op
+  duplicate, not worth special-casing away. Added assertions to the existing direct-create and
+  carry-over-Yes tests confirming `refresh_cwl_view("cwl_management")` is awaited. 1997 tests
+  pass. Backend-only — needs a bot restart on PROD to take effect.
+
 2026-08-16 (36)
 - Fixed: (34)'s own fix regressed the same screen it fixed — reported live on PROD right after
   deploying (34): the clan-config table's header row rendered, but every clan row underneath was

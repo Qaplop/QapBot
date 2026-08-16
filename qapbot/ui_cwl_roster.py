@@ -543,6 +543,24 @@ def _make_cwl_management_add_season_callback(view: discord.ui.View):
         config = CACHE.server_config.setdefault(guild_id_str, {})
         config["cwl_selected_season"] = target_season
         await CACHE.persist_server_config(guild_id_str)
+        # Refresh the screen that hosted this button BEFORE auto-launching the Activity below
+        # (2026-08-16 regression fix, live-testing feedback: "/clan management"'s own CWL Season
+        # Management screen kept showing "No CWL event has been configured yet" after Add New
+        # Season, even though the persistent Hub message updated correctly). Root cause: this used
+        # to rely solely on POST /api/cwl/activity-closed's refresh_cwl_management_hub_message()
+        # call once the Activity closes — but that function ONLY knows how to resolve and edit a
+        # guild's anchored Hub message (channel_id/message_id from server_config); it has no idea
+        # the ephemeral "/clan management" message (ClanManagementView, entry point a) even exists,
+        # so that message was never touched. _refresh_parent() is safe to call here despite
+        # _launch_cwl_activity's "must be interaction's first response" constraint below — neither
+        # ClanManagementView.refresh_cwl_view() nor CwlManagementHubView.refresh_cwl_view() ever
+        # touch `interaction.response` (both edit a message directly via the bot's own REST client:
+        # self.sent_message.edit() / refresh_cwl_management_hub_message()'s channel.fetch_message()
+        # + .edit()), so this doesn't consume the interaction's one response slot. For the Hub
+        # message specifically this means it now gets refreshed twice (once here, once again via
+        # activity-closed) — a harmless no-op duplicate, not worth special-casing away just to
+        # avoid it, given the alternative is the ephemeral screen never refreshing at all.
+        await _refresh_parent(view, interaction, "cwl_management")
         # Auto-opens "Configure Participating Clans" as the logical next step (2026-08-16,
         # live-testing feedback, project owner's spec: "after adding a new season we should add a
         # logic that the Configure Participating Clans view is opened automatically as a logical
@@ -551,9 +569,7 @@ def _make_cwl_management_add_season_callback(view: discord.ui.View):
         # can still legitimately outlast this — LAUNCH_ACTIVITY has no deferred form (see
         # _launch_cwl_activity's docstring), so this remains the interaction's own first response;
         # _launch_cwl_activity already degrades gracefully (falls back to a plain text hint, then
-        # swallows the error) if the interaction expired while we were waiting. Replaces the old
-        # defer()+_refresh_parent() call: the Hub message no longer needs a separate refresh here
-        # since closing the Activity already triggers one via POST /api/cwl/activity-closed.
+        # swallows the error) if the interaction expired while we were waiting.
         await _launch_cwl_activity(interaction, guild_id_int, "clan_config")
 
     return callback
@@ -683,6 +699,12 @@ class CwlCarryOverPromptView(discord.ui.View):
         if not await _check_cwl_admin_permission(interaction):
             return
         await self._create_season(interaction.user.id, apply_carry_over)
+        # Refresh the screen that originally hosted "Add New Season" (self.parent_view) — same
+        # regression fix and same reasoning as _make_cwl_management_add_season_callback's own
+        # direct-create path above; see that comment for the full writeup. Safe here for the same
+        # reason: _refresh_parent() never touches `interaction.response`, so it doesn't consume
+        # the interaction's one response slot that _launch_cwl_activity below still needs.
+        await _refresh_parent(self.parent_view, interaction, "cwl_management")
         # Auto-opens "Configure Participating Clans" as the logical next step (2026-08-16,
         # live-testing feedback, project owner's spec — see _launch_cwl_activity's docstring for
         # the hard "must be this interaction's first response" constraint this relies on).
@@ -690,9 +712,7 @@ class CwlCarryOverPromptView(discord.ui.View):
         # defer()+delete_original_response() sequence — this Yes/No prompt message itself can no
         # longer be cleanly deleted afterward; it's left in place with its now-inert buttons
         # (Discord surfaces "This interaction failed" if clicked again) rather than skip the
-        # auto-launch to preserve that cleanup. The Hub message no longer needs a separate
-        # refresh here either — closing the Activity already triggers one via
-        # POST /api/cwl/activity-closed.
+        # auto-launch to preserve that cleanup.
         await _launch_cwl_activity(interaction, self.guild_id, "clan_config")
 
     async def _on_yes(self, interaction: discord.Interaction) -> None:
