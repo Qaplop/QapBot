@@ -24,8 +24,9 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   `.board` pattern, which solved this identical containing-block problem there first. This keeps
   every property (34) wanted: narrow windows still scroll the table sideways instead of wrapping,
   and the header still stays visibly pinned above the rows — just scrolling within the table's own
-  bounded region now, rather than tracking the whole page's scroll. Frontend-only — needs
-  redeploying to PROD (activity/client); no bot restart needed.
+  bounded region now, rather than tracking the whole page's scroll. Frontend-only — deployed to
+  both DEV (activity/client, https://e720b232.cwl-clan-config-dev.pages.dev) and PROD
+  (activity/client, https://33a8356c.cwl-clan-config-prod.pages.dev); no bot restart needed.
 
 2026-08-16 (35)
 - Fixed: a PROD incident right after (34)'s deploy — clicking "Add New Season" while the periodic
