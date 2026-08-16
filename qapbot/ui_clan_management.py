@@ -4532,9 +4532,15 @@ class CwlLineupRemovalConfirmView(discord.ui.View):
 
         db = CACHE.db_manager
         if db is not None:
-            for clan_tag, event_season_pairs in self.cwl_conflicts.items():
-                for event_id, _season in event_season_pairs:
-                    db.deactivate_cwl_event_clan_sync(event_id, clan_tag)
+            # Whole nested loop bundled into one asyncio.to_thread() hop (2026-08-16, Pitfall 26,
+            # COPILOT_PITFALLS_COOKBOOK.md) rather than one hop per event/clan pair — pure sync
+            # work, no `await` inside.
+            def _deactivate_all_sync() -> None:
+                for clan_tag, event_season_pairs in self.cwl_conflicts.items():
+                    for event_id, _season in event_season_pairs:
+                        db.deactivate_cwl_event_clan_sync(event_id, clan_tag)
+
+            await asyncio.to_thread(_deactivate_all_sync)
 
         # The CWL Management Hub's "Participating Clans" table just lost one or more clans —
         # push a refresh so it doesn't sit stale until someone happens to click it.

@@ -1,8 +1,6 @@
 Project Backlog, Improvement Ideas and General Remarks
 
 Immediate next steps:
-- Check if the web views can be open for two different guilds and/or for two different views in the same guild at the same time.
-- Participating Clans Configuration view: on PC when the window size is reduced the texts get split to multiple lines and thus the separator lines become broken again. Fix this.
 - Refactor the discord user / coc player linking for admins with a nice web-ui.
 - Add a feature to DM users of the guild server to remind them to link their coc player accounts. the dm could contain a button that easily allows them to do the linking. The mail could be signed by a configurable server admin so that it is more convincing.
 - New commands /feature and /bug that allow users to file feature requests and bug reports

@@ -1,6 +1,71 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-16 (36)
+- Fixed: (34)'s own fix regressed the same screen it fixed — reported live on PROD right after
+  deploying (34): the clan-config table's header row rendered, but every clan row underneath was
+  gone. Root cause: wrapping `<table>` in the new `.table-scroll` div (`overflow-x: auto`)
+  triggered a CSS Overflow spec rule most people never hit — when one axis's overflow is
+  `visible` and the other isn't, the `visible` one's USED value is forced to `auto` too, even
+  though nothing set it explicitly. That silently turned `.table-scroll` into the *sticky
+  positioning containing block* for the `<thead>`'s `th`s inside it, instead of the page (which
+  it was before this div existed) — but `.table-scroll`'s height was left `auto` (sized exactly
+  to its content), so it never actually scrolls internally, meaning a sticky child inside it has
+  nothing to react to and just renders at a permanent, fixed `top: <topbar's height>px` offset —
+  which pushed the header down on top of the first couple of rows, hiding them behind its opaque
+  background, on every render, at any window width or scroll position (not the (34) bug's
+  narrow-window trigger — reproduced identically at 1400px wide). Confirmed root cause and the
+  fix both empirically (Playwright against a throwaway harness rendering the real
+  `renderClanConfigTable()` with mock data — DOM inspection alone can't see a layout/paint bug
+  like this). Fix: `th`'s sticky `top` is now `0` (correct once `.table-scroll` — not the page —
+  is its containing block), and `.table-scroll` now gets an explicit JS-computed `max-height`
+  (viewport height minus the topbar's real height, recomputed on resize) so it becomes a genuine,
+  independently-scrolling container — mirroring `enrollmentBoard.ts`'s own `resizeBoard()`/
+  `.board` pattern, which solved this identical containing-block problem there first. This keeps
+  every property (34) wanted: narrow windows still scroll the table sideways instead of wrapping,
+  and the header still stays visibly pinned above the rows — just scrolling within the table's own
+  bounded region now, rather than tracking the whole page's scroll. Frontend-only — needs
+  redeploying to PROD (activity/client); no bot restart needed.
+
+2026-08-16 (35)
+- Fixed: a PROD incident right after (34)'s deploy — clicking "Add New Season" while the periodic
+  update cycle was mid-write produced "database is locked" and a `discord.errors.NotFound: 404
+  Unknown interaction`, and simultaneously froze totally unrelated CoC API calls for other guilds
+  (bunched at the exact same wall-clock timestamp). Root cause: `ui_cwl_roster.py`'s Add New
+  Season callback called a sync SQLite write DIRECTLY on the asyncio event loop thread; that
+  write acquires `db_manager.py`'s `_sync_write_lock` (a plain `threading.Lock`) then blocks up
+  to `PRAGMA busy_timeout=5000`, and while blocked ON THE EVENT LOOP THREAD, nothing else in the
+  whole bot process can run — not just this one interaction. Fixed the reported button, then
+  audited the entire CWL subsystem (asked to check thoroughly, since this pattern doesn't fix
+  itself) and found the same anti-pattern with zero `asyncio.to_thread()` usage anywhere in
+  `QBdiscocmdshelper_cwl.py`/`web_bridge.py`. Fixed all of it: every sync DB write call in
+  `ui_cwl_roster.py`, `ui_clan_management.py`, `QBdiscocmdshelper_cwl.py`, and `web_bridge.py`
+  (season create/delete/carry-over, cross-guild sharing/detach/evict, signup/assignment upserts,
+  Start Enrollment, the web Activity's clan-config save) now runs off the event loop thread —
+  bundled into one `asyncio.to_thread()` hop per atomic unit of work where the function was
+  already fully synchronous (to avoid introducing new race windows a per-call wrap would), or
+  wrapped call-by-call where a real `await` already sat in the middle of the sequence. Also added
+  `_respond_or_log()` so a response that arrives after Discord's 3s ack window logs a warning
+  instead of crashing with an unhandled 404. Full writeup: Pitfall 26,
+  `qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md`. Backend-only — needs a bot restart on PROD to take
+  effect. 1997 tests pass.
+
+2026-08-16 (34)
+- Fixed: CWL clan-config table (the web Activity's "Configure Participating Clans" screen) could
+  show visibly misaligned rows on a narrowed browser window — reported live on PROD right after
+  deploying (33): the Tier text and the date/time controls in a row would wrap onto a second
+  line, growing that row taller than its neighbors. This is a different bug from the hot/history
+  DB column-order fix in (32)/CWL_ROSTER_PLANNING_PLAN.md — same word ("misalignment"), unrelated
+  systems (browser table CSS vs. SQLite column ordering). Root-caused to the same "variable row
+  height from wrapped content" bug class already fixed once for the shared-clan badge but never
+  generalized: added `white-space: nowrap` to every table cell and wrapped the `<table>` in a new
+  `.table-scroll` (`overflow-x: auto`) container so an over-wide table scrolls sideways instead of
+  reflowing, mirroring `enrollmentBoard.ts`'s `.board`/`.column-header-name-text` pattern that
+  already solved this for the drag-and-drop board. `.start-time-cell`'s date input + time select
+  got `flex-shrink: 0` so they always stay side by side instead of shrinking unevenly. See
+  CWL_CLAN_CONFIG_ACTIVITY_PLAN.md item 17. Frontend-only — deployed to PROD
+  (activity/client, https://5a2d7651.cwl-clan-config-prod.pages.dev); no bot restart needed.
+
 2026-08-16 (33)
 - Changed: hover pop-up now explicitly says "CWL Stats of last 3 Months: No data available"
   for a player with zero CWL activity in the window (screenshot: Kuni), instead of silently

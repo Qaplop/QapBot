@@ -24,7 +24,16 @@
       .header { font-size: 1.1rem; font-weight: 600; margin-bottom: 4px; }
       .tz-note { margin-bottom: 12px; font-size: 0.8rem; color: #f2f3f5; }
 
+      /* Horizontal scroll instead of wrap (2026-08-16, live-testing feedback: narrowing the
+         window made the Tier text and the date/time controls wrap onto a second line, which
+         reintroduces the exact variable-row-height misalignment already fixed once for the
+         shared-clan badge below — same bug class, new trigger). `white-space: nowrap` on every
+         cell means content can never wrap a row taller than its neighbors regardless of viewport
+         width; `.table-scroll`'s overflow-x lets the table itself grow past the viewport and
+         scroll sideways instead, exactly like `.board`'s own overflow-x: auto further down. */
+      .table-scroll { overflow-x: auto; }
       table { border-collapse: collapse; width: 100%; }
+      th, td { white-space: nowrap; }
       /* height: 34px, vertical-align: middle (2026-08-16, live-testing feedback: the fixed
          height fixed the broken lines, but 40px read as too tall, and top-aligning content
          inside a now-UNIFORM row height just left everything pinned high with empty space below
@@ -134,8 +143,16 @@
         -webkit-text-fill-color: #f2f3f5;
         opacity: 1;
       }
-      .start-time-cell { display: flex; gap: 8px; align-items: center; }
-      .start-time-cell input[type="date"] { flex: 1; min-width: 0; }
+      /* flex-wrap: nowrap is the default already, but stated explicitly since this is precisely
+         the property that would silently reintroduce the wrap bug above if some future rule
+         changed the default; flex-shrink: 0 on both children means neither the date input nor
+         the time select ever shrinks under space pressure (that pressure no longer exists now
+         that the table scrolls instead of squeezing columns, but keeping both children at their
+         natural intrinsic width — rather than letting one shrink and not the other — is what
+         actually keeps every row's start-time cell visually identical). */
+      .start-time-cell { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
+      .start-time-cell input[type="date"],
+      .start-time-cell select { flex-shrink: 0; }
 
       /* "Guests" invite section (2026-08-15) — Configure Participating Clans' search for
          inviting a clan or individual player from outside this guild's own family. Sits below

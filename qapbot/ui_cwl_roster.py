@@ -12,6 +12,7 @@ render identically regardless of which shell opened them.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -455,23 +456,42 @@ def _make_cwl_management_add_season_callback(view: discord.ui.View):
         target_season = resolve_current_cwl_season()
 
         if db is None:
-            await interaction.response.send_message(
-                t('cwl.management.add_season_db_unavailable', guild_id=guild_id_int), ephemeral=True,
+            await _respond_or_log(
+                interaction, t('cwl.management.add_season_db_unavailable', guild_id=guild_id_int),
             )
             return
 
-        if db.get_cwl_event_sync(guild_id_str, target_season) is not None:
-            await interaction.response.send_message(
+        # Every db.*_sync() call below is asyncio.to_thread()-wrapped (2026-08-16, live-testing
+        # feedback: PROD incident — a real season-create here blocked on a periodic-update-cycle
+        # sync write that was mid-transaction, and because this call ran directly on the event
+        # loop thread, the WHOLE bot froze for ~5s waiting on _sync_write_lock/PRAGMA
+        # busy_timeout=5000 in db_manager.py — every other guild's concurrent CoC API call
+        # stalled in lockstep, and this interaction itself blew past Discord's 3s ack window and
+        # died as "Unknown interaction"). to_thread() genuinely fixes the whole-bot-freeze half of
+        # this (unlike COPILOT_PITFALLS_COOKBOOK.md Pitfall 16's gc.collect()/hashlib case, both
+        # threading.Lock.acquire() and CPython's sqlite3 busy-wait release the GIL while blocked,
+        # so the event loop keeps running other guilds' work) — it does NOT guarantee THIS
+        # interaction beats the 3s deadline if the wait is genuinely that long, which is why every
+        # response after one of these calls goes through _respond_or_log() instead of a bare
+        # interaction.response.send_message() call that would raise an unhandled 404 on a stale
+        # interaction.
+        existing_event = await asyncio.to_thread(db.get_cwl_event_sync, guild_id_str, target_season)
+        if existing_event is not None:
+            await _respond_or_log(
+                interaction,
                 t('cwl.management.add_season_already_exists', guild_id=guild_id_int, season=target_season),
-                ephemeral=True,
             )
             return
 
         # Carry-over-vs-defaults is decided exclusively here — never by "Configure Participating
         # Clans"/the web Activity (Phase E.3's explicit instruction).
-        previous_rows = db.get_previous_cwl_event_clans_sync(guild_id_str)
+        previous_rows = await asyncio.to_thread(db.get_previous_cwl_event_clans_sync, guild_id_str)
         if previous_rows:
-            await interaction.response.defer(thinking=False, ephemeral=True)
+            try:
+                await interaction.response.defer(thinking=False, ephemeral=True)
+            except discord.errors.NotFound:
+                logging.warning("[CWL] Add New Season: interaction expired before defer() (carry-over path)")
+                return
             prompt_view = CwlCarryOverPromptView(
                 parent_view=view, guild_id=guild_id_int, target_season=target_season, previous_rows=previous_rows,
             )
@@ -481,11 +501,11 @@ def _make_cwl_management_add_season_callback(view: discord.ui.View):
             return
 
         # No previous data to offer — create the season outright with plain defaults.
-        event_id = db.create_cwl_event_sync(guild_id_str, target_season, str(interaction.user.id))
+        event_id = await asyncio.to_thread(
+            db.create_cwl_event_sync, guild_id_str, target_season, str(interaction.user.id),
+        )
         if event_id is None:
-            await interaction.response.send_message(
-                t('cwl.management.add_season_failed', guild_id=guild_id_int), ephemeral=True,
-            )
+            await _respond_or_log(interaction, t('cwl.management.add_season_failed', guild_id=guild_id_int))
             return
         # Auto-enable every family clan (2026-08-16 follow-up, live-testing feedback, project
         # owner's spec: "if after the previous cwls no clan in the guild is enabled then
@@ -509,25 +529,31 @@ def _make_cwl_management_add_season_callback(view: discord.ui.View):
         family_clan_tags = resolve_guild_member_clan_tags(guild_id_int)
         if family_clan_tags:
             default_start_at = f"{target_season}-01T08:00Z"
-            db.set_cwl_event_clans_sync(event_id, [
-                {
-                    "clan_tag": clan_tag, "roster_size": 15, "tier_order": 0,
-                    "cwl_start_at": default_start_at, "participating": True,
-                }
-                for clan_tag in family_clan_tags
-            ])
+            await asyncio.to_thread(
+                db.set_cwl_event_clans_sync,
+                event_id,
+                [
+                    {
+                        "clan_tag": clan_tag, "roster_size": 15, "tier_order": 0,
+                        "cwl_start_at": default_start_at, "participating": True,
+                    }
+                    for clan_tag in family_clan_tags
+                ],
+            )
         config = CACHE.server_config.setdefault(guild_id_str, {})
         config["cwl_selected_season"] = target_season
         await CACHE.persist_server_config(guild_id_str)
         # Auto-opens "Configure Participating Clans" as the logical next step (2026-08-16,
         # live-testing feedback, project owner's spec: "after adding a new season we should add a
         # logic that the Configure Participating Clans view is opened automatically as a logical
-        # consequence of adding a new season") — all the DB work above is fast/synchronous, so it
-        # can finish before responding, letting this be the interaction's own first response
-        # (LAUNCH_ACTIVITY has no deferred form — see _launch_cwl_activity's docstring). Replaces
-        # the old defer()+_refresh_parent() call: the Hub message no longer needs a separate
-        # refresh here since closing the Activity already triggers one via
-        # POST /api/cwl/activity-closed.
+        # consequence of adding a new season") — the DB work above is now to_thread()-wrapped (see
+        # the comment above) so it no longer freezes the whole bot while waiting on a lock, but it
+        # can still legitimately outlast this — LAUNCH_ACTIVITY has no deferred form (see
+        # _launch_cwl_activity's docstring), so this remains the interaction's own first response;
+        # _launch_cwl_activity already degrades gracefully (falls back to a plain text hint, then
+        # swallows the error) if the interaction expired while we were waiting. Replaces the old
+        # defer()+_refresh_parent() call: the Hub message no longer needs a separate refresh here
+        # since closing the Activity already triggers one via POST /api/cwl/activity-closed.
         await _launch_cwl_activity(interaction, guild_id_int, "clan_config")
 
     return callback
@@ -588,18 +614,27 @@ class CwlCarryOverPromptView(discord.ui.View):
         return t('cwl.management.add_season_carry_over_prompt', guild_id=self.guild_id, season=self.target_season)
 
     async def _create_season(self, discord_user_id: int, apply_carry_over: bool) -> None:
+        # asyncio.to_thread()-wrapped for the same reason as
+        # _make_cwl_management_add_season_callback's direct-create path — see that comment for
+        # the full PROD-incident writeup. This path does strictly more sequential DB work than
+        # that one (an extra get_previous_cwl_season_sync/get_clans_with_cwl_data_for_season_sync
+        # round trip), so it's actually more exposed to the same risk, not less.
         db = CACHE.db_manager
         if db is None:
             return
         guild_id_str = str(self.guild_id)
-        event_id = db.create_cwl_event_sync(guild_id_str, self.target_season, str(discord_user_id))
+        event_id = await asyncio.to_thread(
+            db.create_cwl_event_sync, guild_id_str, self.target_season, str(discord_user_id),
+        )
         if event_id is not None and apply_carry_over:
             from qapbot.QBdiscocmdshelper_cwl import resolve_guild_member_clan_tags
 
             family_clan_tags = resolve_guild_member_clan_tags(self.guild_id)
-            previous_season = db.get_previous_cwl_season_sync(guild_id_str, exclude_event_id=event_id)
+            previous_season = await asyncio.to_thread(
+                db.get_previous_cwl_season_sync, guild_id_str, exclude_event_id=event_id,
+            )
             played_last_season = (
-                db.get_clans_with_cwl_data_for_season_sync(family_clan_tags, previous_season)
+                await asyncio.to_thread(db.get_clans_with_cwl_data_for_season_sync, family_clan_tags, previous_season)
                 if previous_season else set()
             )
             # Non-participation settings (roster_size etc.) still come from the admin's last
@@ -639,7 +674,7 @@ class CwlCarryOverPromptView(discord.ui.View):
             if family_clan_tags and not any(c["participating"] for c in clan_configs):
                 for config in clan_configs:
                     config["participating"] = True
-            db.set_cwl_event_clans_sync(event_id, clan_configs)
+            await asyncio.to_thread(db.set_cwl_event_clans_sync, event_id, clan_configs)
         config = CACHE.server_config.setdefault(guild_id_str, {})
         config["cwl_selected_season"] = self.target_season
         await CACHE.persist_server_config(guild_id_str)
@@ -665,6 +700,19 @@ class CwlCarryOverPromptView(discord.ui.View):
 
     async def _on_no(self, interaction: discord.Interaction) -> None:
         await self._finish(interaction, apply_carry_over=False)
+
+
+async def _respond_or_log(interaction: discord.Interaction, content: str) -> None:
+    """`interaction.response.send_message()`, but tolerant of an interaction that expired while a
+    to_thread()-wrapped DB call ahead of it was waiting on a lock (2026-08-16, PROD incident — see
+    the comment in `_make_cwl_management_add_season_callback`). Discord's ack window is ~3s;
+    to_thread() stops that wait from freezing the whole bot but can't make Discord's clock run
+    slower, so a genuinely slow write can still make this specific response arrive too late — that
+    should log, not crash the gateway's event dispatch with an unhandled 404."""
+    try:
+        await interaction.response.send_message(content, ephemeral=True)
+    except discord.errors.NotFound:
+        logging.warning(f"[CWL] Interaction expired before response could be sent: {content!r}")
 
 
 async def _launch_cwl_activity(interaction: discord.Interaction, guild_id: int, screen: str) -> None:
@@ -809,7 +857,12 @@ class CwlDeleteSeasonConfirmView(discord.ui.View):
             # prune_or_detach_shared_clans_before_deletion's docstring for the full rationale.
             from qapbot.QBdiscocmdshelper_cwl import prune_or_detach_shared_clans_before_deletion
             await prune_or_detach_shared_clans_before_deletion(self.guild_id, self.event_id, self.season)
-            db.delete_cwl_event_sync(self.event_id)
+            # to_thread()-wrapped even though this callback already deferred above (so THIS
+            # interaction is safe from the 3s ack deadline either way) — an un-wrapped sync write
+            # here would still freeze the whole event loop for every OTHER concurrent guild/
+            # interaction while it waits on _sync_write_lock/busy_timeout. See Pitfall 26,
+            # COPILOT_PITFALLS_COOKBOOK.md.
+            await asyncio.to_thread(db.delete_cwl_event_sync, self.event_id)
         # The season select (Phase E.3) can't keep pointing at a season that no longer has an
         # event — clear the persisted selection so the next open falls back to
         # resolve_selected_cwl_season()'s other-events/calendar-default resolution.
@@ -1058,8 +1111,8 @@ class CwlSignupResponseButton(
         # Never trust the reconstructed item's own state beyond routing (action/event_id/
         # player_tag) — always re-read cwl_signups/cwl_events live, since the event may have
         # moved to finalized/cancelled (or this row may no longer exist) since the DM was sent.
-        event = db.get_cwl_event_by_id_sync(self.event_id)
-        signup = db.get_cwl_signup_sync(self.event_id, self.player_tag)
+        event = await asyncio.to_thread(db.get_cwl_event_by_id_sync, self.event_id)
+        signup = await asyncio.to_thread(db.get_cwl_signup_sync, self.event_id, self.player_tag)
         guild_id = int(event["guild_id"]) if event is not None else None
 
         if event is None or signup is None:
@@ -1081,7 +1134,12 @@ class CwlSignupResponseButton(
         new_status = "confirmed" if self.action == "confirm" else "declined"
         source = "template_confirm" if self.action == "confirm" else "template_optout"
         responded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
-        db.upsert_cwl_signup_sync(
+        # to_thread()-wrapped (2026-08-16, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — this
+        # button is on a persistent DM, hit by every member responding to a CWL signup template,
+        # so an unwrapped write here is the highest-traffic instance of the whole-bot-freeze risk
+        # in this file.
+        await asyncio.to_thread(
+            db.upsert_cwl_signup_sync,
             self.event_id, self.player_tag, signup.get("player_name"), signup.get("discord_id"),
             signup.get("preferred_league_rank"), source, new_status, responded_at=responded_at,
         )

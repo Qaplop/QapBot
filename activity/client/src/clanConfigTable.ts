@@ -141,13 +141,13 @@ export function renderClanConfigTable(
   thead.appendChild(theadRow)
   table.appendChild(thead)
 
-  // Stick the column-header row directly beneath the topbar (not at the very top — that would
-  // overlap/hide under it) so it stays visible too, not just the title. `topBar` is already in
-  // the DOM at this point, so its rendered height is real, not a guessed/hardcoded pixel value
-  // that would silently drift if the title text or font ever changes.
-  const topBarHeight = topBar.getBoundingClientRect().height
+  // `top: 0` — NOT the topbar's height (2026-08-16 regression fix; see `.table-scroll`'s own
+  // comment below for the full root-cause). thead's sticky containing block is `.table-scroll`
+  // itself (below), not the page, so `top` is relative to *its* box, which already starts right
+  // where the table begins — offsetting by the topbar's height on top of that pushed the header
+  // down into the body rows, hiding them behind its opaque background.
   thead.querySelectorAll('th').forEach((th) => {
-    ;(th as HTMLElement).style.top = `${topBarHeight}px`
+    ;(th as HTMLElement).style.top = '0px'
   })
 
   // CWL itself never starts before the 1st of the season's month at 08:00 UTC (the game's
@@ -163,7 +163,35 @@ export function renderClanConfigTable(
     tbody.appendChild(buildRow(clan, seasonStartUtc, seasonEndUtc, onEvict))
   }
   table.appendChild(tbody)
-  container.appendChild(table)
+
+  // Scrolls sideways instead of letting cell content wrap on a narrow window — see the
+  // `.table-scroll`/`white-space: nowrap` comment in index.html for why wrapping is the thing
+  // that actually breaks row alignment, not narrowness itself.
+  //
+  // Bounded `max-height` + its own internal vertical scroll (2026-08-16 regression fix,
+  // discovered live-testing (34): giving `.table-scroll` any non-`visible` `overflow-x` makes
+  // browsers force its computed `overflow-y` to `auto` too — CSS Overflow's "one axis visible,
+  // one not" coupling rule, not a bug in this code — which silently turns `.table-scroll` itself
+  // into the sticky *containing block* for the `th`s inside it, instead of the page. The `th`s'
+  // `top: 0` above only works — i.e. only actually tracks scrolling and stays visible — if
+  // `.table-scroll` is a REAL scroll container (content taller than its own box) rather than an
+  // auto-height div that always fits its content exactly (which never scrolls internally, so a
+  // sticky child inside it never has anything to react to and just sits at a fixed offset,
+  // permanently — that's what hid the rows: `top: topBarHeight` used to be that fixed offset).
+  // Mirrors enrollmentBoard.ts's own `resizeBoard()`/`.board` pattern (same underlying problem,
+  // solved there first) — `max-height` rather than `.board`'s `height` since this table should
+  // still shrink to fit a short clan list instead of always claiming the full available space.
+  const tableScroll = document.createElement('div')
+  tableScroll.className = 'table-scroll'
+  tableScroll.appendChild(table)
+  container.appendChild(tableScroll)
+
+  function resizeTableScroll(): void {
+    const available = window.innerHeight - topBar.getBoundingClientRect().height - 32
+    tableScroll.style.maxHeight = `${Math.max(200, available)}px`
+  }
+  resizeTableScroll()
+  window.addEventListener('resize', resizeTableScroll)
 
   // General read-only-settings notice (2026-08-15, live-testing feedback) — replaces the old
   // per-row explanation (moved out specifically so every row stays the same height regardless of

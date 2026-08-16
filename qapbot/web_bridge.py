@@ -14,6 +14,7 @@ what makes it reachable from Cloudflare at all.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Set
 
@@ -794,6 +795,77 @@ async def handle_get_cwl_player_stats(request: web.Request) -> web.Response:
     return web.json_response(get_recent_cwl_player_stats(player_tag))
 
 
+def _apply_cwl_enrollment_signup_sync(
+    db: Any, event_id: int, season: str, player_tag: str, action: str, guild_id: int,
+) -> Dict[str, Any]:
+    """Synchronous unit of work for handle_post_cwl_enrollment_signup() — see that function's own
+    comment for why this is one atomic asyncio.to_thread() hop. Returns {"ok": True} on success,
+    or {"error": ..., "status": ...} for the one case this needs to report back as an HTTP error."""
+    from datetime import datetime, timezone
+
+    from qapbot.QBdiscocmdshelper_cwl import get_event_shared_clans_by_tag_sync, sync_cwl_shared_clan_roster_to_local_pools
+
+    # Cross-guild shared-clan write-path branch (2026-08-15, slice 4) — checked FIRST: a player
+    # already sitting in a shared clan's roster may exist ONLY there (e.g. this guild's own
+    # cwl_signups/get_current_clan_members_sync have never heard of them — they joined the
+    # roster via the OTHER attached guild), so this also doubles as this branch's own
+    # player_name/discord_id resolution rather than falling through to the normal one below and
+    # 404ing on a player this guild's own tables genuinely don't know about.
+    player_shared_clan = None
+    shared_roster_row = None
+    for shared in get_event_shared_clans_by_tag_sync(event_id, season).values():
+        match = next(
+            (p for p in db.get_cwl_shared_clan_players_sync(shared["id"]) if p["player_tag"] == player_tag), None
+        )
+        if match is not None:
+            player_shared_clan, shared_roster_row = shared, match
+            break
+
+    new_status = "confirmed" if action == "confirm" else "withdrawn"
+    responded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+
+    if player_shared_clan is not None:
+        # Status-only (2026-08-16, live-testing feedback, project owner's spec: confirmation and
+        # assignment must never be conflated) — confirming/withdrawing records the player's own
+        # genuine response and nothing else; whether they're actually placed in this clan's
+        # column (assigned) is a completely separate decision, left untouched either way.
+        db.set_cwl_shared_clan_player_status_sync(
+            player_shared_clan["id"], player_tag, shared_roster_row["player_name"], shared_roster_row["discord_id"],
+            new_status, "admin_added", str(guild_id), responded_at,
+        )
+        # De-sync guard (2026-08-15) — see sync_cwl_shared_clan_roster_to_local_pools's docstring:
+        # keeps every OTHER attached guild's own local cwl_signups pool aware of this player too.
+        sync_cwl_shared_clan_roster_to_local_pools(player_shared_clan["id"])
+    else:
+        existing = db.get_cwl_signup_sync(event_id, player_tag)
+        if existing is not None:
+            player_name = existing["player_name"]
+            discord_id = existing["discord_id"]
+            preferred_league_rank = existing["preferred_league_rank"]
+        else:
+            all_clans = db.get_cwl_event_clans_sync(event_id)
+            participating_clan_tags = [c["clan_tag"] for c in all_clans if c.get("participating", 1)]
+            member = next(
+                (m for m in db.get_current_clan_members_sync(participating_clan_tags) if m["player_tag"] == player_tag),
+                None,
+            )
+            if member is None:
+                return {"error": "player is not a current member of any participating clan", "status": 404}
+            player_name = member["player_name"]
+            discord_id = member["discord_id"]
+            preferred_league_rank = member["preferred_league_rank"]
+
+        db.upsert_cwl_signup_sync(
+            event_id, player_tag, player_name, discord_id, preferred_league_rank,
+            "admin_added", new_status, responded_at=responded_at,
+        )
+        # A withdrawn player shouldn't linger assigned to a clan column.
+        if action == "withdraw":
+            db.delete_cwl_assignment_sync(event_id, player_tag)
+
+    return {"ok": True}
+
+
 async def handle_post_cwl_enrollment_signup(request: web.Request) -> web.Response:
     """1-click sign-up/withdraw from the Manage Enrollment board. Never trusts client-supplied
     player_name/discord_id — both are resolved server-side (from the existing cwl_signups row if
@@ -820,81 +892,27 @@ async def handle_post_cwl_enrollment_signup(request: web.Request) -> web.Respons
     if db is None:
         return web.json_response({"error": "database not ready"}, status=503)
 
-    from datetime import datetime, timezone
-
-    from qapbot.QBdiscocmdshelper_cwl import (
-        get_event_shared_clans_by_tag_sync,
-        resolve_selected_cwl_season,
-        sync_cwl_shared_clan_roster_to_local_pools,
-    )
+    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
     from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
 
     season = resolve_selected_cwl_season(guild_id)
-    event = db.get_cwl_event_sync(str(guild_id), season)
+    event = await asyncio.to_thread(db.get_cwl_event_sync, str(guild_id), season)
     if event is None:
         return web.json_response(
             {"error": f"no CWL event exists yet for season {season}"}, status=409
         )
 
-    # Cross-guild shared-clan write-path branch (2026-08-15, slice 4) — checked FIRST: a player
-    # already sitting in a shared clan's roster may exist ONLY there (e.g. this guild's own
-    # cwl_signups/get_current_clan_members_sync have never heard of them — they joined the
-    # roster via the OTHER attached guild), so this also doubles as this branch's own
-    # player_name/discord_id resolution rather than falling through to the normal one below and
-    # 404ing on a player this guild's own tables genuinely don't know about.
-    player_shared_clan = None
-    shared_roster_row = None
-    for shared in get_event_shared_clans_by_tag_sync(event["id"], season).values():
-        match = next(
-            (p for p in db.get_cwl_shared_clan_players_sync(shared["id"]) if p["player_tag"] == player_tag), None
-        )
-        if match is not None:
-            player_shared_clan, shared_roster_row = shared, match
-            break
-
-    new_status = "confirmed" if action == "confirm" else "withdrawn"
-    responded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
-
-    if player_shared_clan is not None:
-        # Status-only (2026-08-16, live-testing feedback, project owner's spec: confirmation and
-        # assignment must never be conflated) — confirming/withdrawing records the player's own
-        # genuine response and nothing else; whether they're actually placed in this clan's
-        # column (assigned) is a completely separate decision, left untouched either way.
-        db.set_cwl_shared_clan_player_status_sync(
-            player_shared_clan["id"], player_tag, shared_roster_row["player_name"], shared_roster_row["discord_id"],
-            new_status, "admin_added", str(guild_id), responded_at,
-        )
-        # De-sync guard (2026-08-15) — see sync_cwl_shared_clan_roster_to_local_pools's docstring:
-        # keeps every OTHER attached guild's own local cwl_signups pool aware of this player too.
-        sync_cwl_shared_clan_roster_to_local_pools(player_shared_clan["id"])
-    else:
-        existing = db.get_cwl_signup_sync(event["id"], player_tag)
-        if existing is not None:
-            player_name = existing["player_name"]
-            discord_id = existing["discord_id"]
-            preferred_league_rank = existing["preferred_league_rank"]
-        else:
-            all_clans = db.get_cwl_event_clans_sync(event["id"])
-            participating_clan_tags = [c["clan_tag"] for c in all_clans if c.get("participating", 1)]
-            member = next(
-                (m for m in db.get_current_clan_members_sync(participating_clan_tags) if m["player_tag"] == player_tag),
-                None,
-            )
-            if member is None:
-                return web.json_response(
-                    {"error": "player is not a current member of any participating clan"}, status=404
-                )
-            player_name = member["player_name"]
-            discord_id = member["discord_id"]
-            preferred_league_rank = member["preferred_league_rank"]
-
-        db.upsert_cwl_signup_sync(
-            event["id"], player_tag, player_name, discord_id, preferred_league_rank,
-            "admin_added", new_status, responded_at=responded_at,
-        )
-        # A withdrawn player shouldn't linger assigned to a clan column.
-        if action == "withdraw":
-            db.delete_cwl_assignment_sync(event["id"], player_tag)
+    # Whole read/write sequence bundled into one asyncio.to_thread() hop (2026-08-16, Pitfall 26,
+    # COPILOT_PITFALLS_COOKBOOK.md) — this bridge handler runs on the SAME event loop as the
+    # Discord gateway/interactions (see module docstring), so a sync DB call made directly here
+    # freezes the whole bot exactly like an un-wrapped Discord interaction callback would. No
+    # `await` happens between the first DB read and the last DB write below, so one hop preserves
+    # today's atomicity instead of introducing new interleaving windows a per-line wrap would.
+    result = await asyncio.to_thread(
+        _apply_cwl_enrollment_signup_sync, db, event["id"], season, player_tag, action, guild_id,
+    )
+    if result.get("error"):
+        return web.json_response({"error": result["error"]}, status=result["status"])
 
     try:
         await refresh_cwl_management_hub_message(guild_id, "cwl_management")
@@ -929,7 +947,7 @@ async def handle_post_cwl_enrollment_assign(request: web.Request) -> web.Respons
     from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
 
     season = resolve_selected_cwl_season(guild_id)
-    event = db.get_cwl_event_sync(str(guild_id), season)
+    event = await asyncio.to_thread(db.get_cwl_event_sync, str(guild_id), season)
     if event is None:
         return web.json_response(
             {"error": f"no CWL event exists yet for season {season}"}, status=409
@@ -941,8 +959,11 @@ async def handle_post_cwl_enrollment_assign(request: web.Request) -> web.Respons
     # conflict-purge (evicting the player from any OTHER shared clan they're already confirmed in)
     # can never be skipped here or by any other write path. See assign_cwl_player_sync's own
     # docstring for the full purge/write logic this used to duplicate inline.
-    assign_cwl_player_sync(
-        guild_id, event["id"], season, player_tag, clan_tag,
+    # asyncio.to_thread()-wrapped (2026-08-16, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — this
+    # bridge handler shares the bot's event loop (see module docstring), so an un-wrapped sync
+    # write here freezes the whole bot exactly like an interaction callback would.
+    await asyncio.to_thread(
+        assign_cwl_player_sync, guild_id, event["id"], season, player_tag, clan_tag,
         source="admin_override", locked=True,
     )
 
@@ -1004,14 +1025,16 @@ async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response
     from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
 
     season = resolve_selected_cwl_season(guild_id)
-    event = db.get_cwl_event_sync(str(guild_id), season)
+    event = await asyncio.to_thread(db.get_cwl_event_sync, str(guild_id), season)
     if event is None:
         return web.json_response(
             {"error": f"no CWL event exists yet for season {season}"}, status=409
         )
 
-    db.upsert_cwl_signup_sync(
-        event["id"], player_tag, player_name, guest_discord_id, None,
+    # asyncio.to_thread()-wrapped (2026-08-16, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — see
+    # handle_post_cwl_enrollment_signup's comment for why this matters on this bridge specifically.
+    await asyncio.to_thread(
+        db.upsert_cwl_signup_sync, event["id"], player_tag, player_name, guest_discord_id, None,
         source="guest_invite", status="pending",
     )
 
@@ -1048,43 +1071,25 @@ async def handle_get_clan_config(request: web.Request) -> web.Response:
     return web.json_response(await _build_clan_config_payload(guild_id))
 
 
-async def handle_post_clan_config(request: web.Request) -> web.Response:
-    if not _check_secret(request):
-        return web.json_response({"error": "forbidden"}, status=403)
-    try:
-        body = await request.json()
-        guild_id = int(body["guild_id"])
-        discord_user_id = int(body["discord_user_id"])
-        clans_in = body["clans"]
-    except (KeyError, ValueError, TypeError):
-        return web.json_response({"error": "invalid request body"}, status=400)
-
-    if not await _resolve_admin(guild_id, discord_user_id):
-        return web.json_response({"error": "not an admin of this guild"}, status=403)
-
-    db = CACHE.db_manager
-    if db is None:
-        return web.json_response({"error": "database not ready"}, status=503)
-
-    from qapbot.QBdiscocmdshelper_cwl import (
-        auto_assign_prior_cwl_members,
-        detach_guild_from_shared_clan_on_deactivation,
-        ensure_cwl_clan_sharing,
-        resolve_selected_cwl_season,
-    )
-    from qapbot.ui_cwl_roster import notify_cwl_clan_shared, refresh_cwl_management_hub_message
-
+def _prepare_and_save_clan_config_sync(db: Any, guild_id: int, season: str, clans_in: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Synchronous unit of work for handle_post_clan_config() — everything from the initial event
+    lookup through set_cwl_event_clans_sync() has no `await` between any of it today, so it's
+    bundled into one atomic asyncio.to_thread() hop (2026-08-16, Pitfall 26,
+    COPILOT_PITFALLS_COOKBOOK.md) rather than wrapped call-by-call, which would introduce new
+    interleaving windows a concurrent save for the same event could race through. Returns
+    {"error": ..., "status": ...} on failure, else {"event_id", "event_status",
+    "previously_participating", "clan_configs"} for the caller's post-await tail (the cross-guild
+    sharing/detach loops below, which DO need real awaits and so stay in the async function)."""
     # Never creates a season itself (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase E.3: that's
     # exclusively "Add New Season"'s job) — the guild's currently-selected season must already
     # have an event, or this is a stale/pre-bootstrap request and the admin needs to use
     # "Add New Season" in Discord first.
-    season = resolve_selected_cwl_season(guild_id)
     event = db.get_cwl_event_sync(str(guild_id), season)
     if event is None:
-        return web.json_response(
-            {"error": f"no CWL event exists yet for season {season} — use \"Add New Season\" in Discord first"},
-            status=409,
-        )
+        return {
+            "error": f"no CWL event exists yet for season {season} — use \"Add New Season\" in Discord first",
+            "status": 409,
+        }
     event_id = event["id"]
 
     # Snapshot of what was participating BEFORE this save — the cross-guild sharing check below
@@ -1131,6 +1136,55 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
 
     db.set_cwl_event_clans_sync(event_id, clan_configs)
 
+    return {
+        "event_id": event_id,
+        "event_status": event["status"],
+        "previously_participating": previously_participating,
+        "clan_configs": clan_configs,
+    }
+
+
+async def handle_post_clan_config(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        guild_id = int(body["guild_id"])
+        discord_user_id = int(body["discord_user_id"])
+        clans_in = body["clans"]
+    except (KeyError, ValueError, TypeError):
+        return web.json_response({"error": "invalid request body"}, status=400)
+
+    if not await _resolve_admin(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin of this guild"}, status=403)
+
+    db = CACHE.db_manager
+    if db is None:
+        return web.json_response({"error": "database not ready"}, status=503)
+
+    from qapbot.QBdiscocmdshelper_cwl import (
+        auto_assign_prior_cwl_members,
+        detach_guild_from_shared_clan_on_deactivation,
+        ensure_cwl_clan_sharing,
+        resolve_selected_cwl_season,
+    )
+    from qapbot.ui_cwl_roster import notify_cwl_clan_shared, refresh_cwl_management_hub_message
+
+    # Never creates a season itself (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase E.3: that's
+    # exclusively "Add New Season"'s job) — the guild's currently-selected season must already
+    # have an event, or this is a stale/pre-bootstrap request and the admin needs to use
+    # "Add New Season" in Discord first.
+    season = resolve_selected_cwl_season(guild_id)
+    # asyncio.to_thread()-wrapped as one bundled hop — see _prepare_and_save_clan_config_sync's
+    # own docstring (2026-08-16, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md).
+    prepared = await asyncio.to_thread(_prepare_and_save_clan_config_sync, db, guild_id, season, clans_in)
+    if prepared.get("error"):
+        return web.json_response({"error": prepared["error"]}, status=prepared["status"])
+    event_id = prepared["event_id"]
+    event_status = prepared["event_status"]
+    previously_participating = prepared["previously_participating"]
+    clan_configs = prepared["clan_configs"]
+
     # Cross-guild shared-clan check (2026-08-15, project owner's spec) — the first of the two
     # trigger points (the other is start_cwl_enrollment). The frontend's Guests search already
     # highlighted an already-claimed clan and had the admin confirm adding it anyway (see
@@ -1156,7 +1210,7 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
         # PLAYER, not per clan, so it correctly fills in any newly-qualifying members even when a
         # couple of deliberately locked placements already survived the removal (2026-08-16, see
         # auto_assign_prior_cwl_members's own docstring).
-        if event["status"] != "draft":
+        if event_status != "draft":
             try:
                 await auto_assign_prior_cwl_members(guild_id, event_id, season, clan_tag)
             except Exception as e:

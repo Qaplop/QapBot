@@ -905,3 +905,148 @@ syncs are never affected — Entry Point commands are inherently global-only, so
 workaround: every future global sync on either the DEV or PROD app (both Activities-enabled
 now) would otherwise hit this exact wall again. 3 tests added in
 `tests/discord/test_discord_health.py`.
+
+---
+
+## Pitfall 26: A sync DB *write* called directly inside an `async def` interaction callback can freeze the whole bot, not just that one interaction
+
+Symptom (2026-08-16, PROD): clicking "Add New Season" in the CWL Management Hub while the
+periodic update cycle was mid-write produced a `database is locked` error from
+`create_cwl_event_sync`, immediately followed by unrelated `[COC-API-SLOW]` log lines for
+*other guilds'* clans all completing ~5.1-5.2s later than they should have (bunched at the exact
+same wall-clock moment), and the interaction itself died with `discord.errors.NotFound: 404
+Unknown interaction`.
+
+Root cause: `qapbot/ui_cwl_roster.py`'s `_make_cwl_management_add_season_callback` called
+`db.create_cwl_event_sync(...)` **directly** — not `asyncio.to_thread()`-wrapped — inside its
+`async def callback`. That method (`db_manager.py`) does `with self._sync_write_lock:` (a plain
+`threading.Lock` shared by every sync writer in the process) around a SQLite write with
+`PRAGMA busy_timeout=5000`. Called this way, the lock-wait and the busy-timeout wait both happen
+**on the event loop thread itself** — so while they block, `asyncio` cannot schedule ANY other
+coroutine on that thread, not just this one. Every concurrent `await` elsewhere in the bot
+(unrelated guilds' CoC API calls, other interactions, the gateway heartbeat) stalls in lockstep
+until the lock is released or `busy_timeout` expires. Separately, by the time this callback
+finally called `interaction.response.send_message()`, more than Discord's ~3s ack window had
+already elapsed, so Discord had invalidated the interaction — hence the `404 Unknown interaction`
+crash on top of the freeze.
+
+This is a distinct case from Pitfall 16's `gc.collect()`/hashlib gotcha, not a repeat of it:
+`threading.Lock.acquire()` and CPython's stdlib `sqlite3` C module both release the GIL while
+blocked waiting (they're genuine I/O-like blocking calls, not one atomic non-yielding C call), so
+`asyncio.to_thread()` **does** fix the whole-bot-freeze half of this bug — moving the call off the
+event loop thread means the lock/busy-timeout wait happens on a worker thread, leaving the event
+loop free to keep processing everything else concurrently. It does NOT, by itself, guarantee
+*this* interaction's own response beats Discord's 3s deadline if the wait is genuinely that long —
+that part still needs graceful handling (below).
+
+Fix, two parts, both required:
+1. **Every `db.*_sync()` call with a write verb (`create_`, `set_`, `update_`, `delete_`,
+   `upsert_`, `insert_`, `save_`, `remove_`, `evict_`, `mark_`, `add_`) made from inside an
+   `async def` Discord interaction callback (button/select/modal) must go through
+   `await asyncio.to_thread(db.method_name, *args)`, never called bare. Read-only `get_*_sync`/
+   `list_*_sync` calls are lower risk (SQLite WAL mode lets reads proceed concurrently with a
+   writer in the common case) but wrapping them too is harmless and matches the convention used
+   elsewhere (e.g. `QapBot.py`'s startup `check_hot_history_schema_parity_sync()` call).
+2. **Any response sent after one of these calls must tolerate the interaction having already
+   expired** — wrap `interaction.response.send_message()` in `try/except discord.errors.NotFound:
+   logging.warning(...)` (see `_respond_or_log()` in `ui_cwl_roster.py`) instead of letting it
+   raise unhandled. One caller (`_launch_cwl_activity`, the Discord Activity LAUNCH_ACTIVITY
+   callback) has the opposite constraint — it has no deferred/followup form at all, so it must
+   remain the interaction's literal first response and cannot call `defer()` first; that path
+   already degrades to a plain text fallback (and swallows the final exception) if the interaction
+   died before it got there — a template worth reusing for other "must-be-first-response" flows.
+
+Diagnostic tool for finding what the periodic cycle itself was doing at the time:
+`qapbot/scripts/log_time_gaps.py` (see Pitfall 16) against the live PROD log around the
+incident's timestamp — not run for this specific incident since the local dev copy of
+`data/logs/qapbot.log` predates the PROD restart and doesn't cover it, but it's the right tool
+for correlating a `database is locked` timestamp with what the update cycle's own sync writes
+were doing at that exact moment.
+
+**Full-sweep follow-up, same day**: an audit of every `qapbot/ui_*.py`, `QBdiscocmdshelper*.py`,
+and `qapbot/web_bridge.py` write path found the anti-pattern was not a one-off — the entire CWL
+shared-clan/roster subsystem had **zero** `asyncio.to_thread()` usage anywhere (`QBdiscocmdshelper_cwl.py`,
+`web_bridge.py`), across season create/delete/carry-over, cross-guild sharing/detach/evict,
+signup/assignment upserts, and Start Enrollment. `web_bridge.py` matters exactly as much as the
+Discord-side files here even though it has no Discord interaction of its own — its module
+docstring is explicit that its aiohttp handlers run "IN-PROCESS with the bot (same asyncio loop,
+same CACHE/db_manager)", so a bare sync write in an HTTP handler freezes the whole bot exactly
+like one in a button callback would.
+
+Fixed by two concrete sub-patterns, chosen per function based on whether it mixes real `await`s
+with its sync DB work:
+- **Pattern A — bundle, don't scatter.** A function whose body is *already* 100% synchronous
+  today (an `async def` with zero `await` inside, or a plain sync `def`) gets ONE
+  `asyncio.to_thread()` hop wrapping the whole thing (via a small private `_*_sync` helper),
+  never one hop per DB call. This isn't just an efficiency choice: today, with zero yield points,
+  nothing else can run between that function's own reads and writes — a second concurrent call
+  for the same clan/event can't interleave mid-sequence. Splitting one hop into several would
+  introduce new interleaving windows that don't exist today, which is a correctness regression,
+  not a style one. Examples: `ensure_cwl_clan_sharing`'s two branches
+  (`_attach_guild_to_existing_shared_clan_sync`/`_create_new_shared_clan_sync`),
+  `auto_assign_prior_cwl_members`, `evict_guild_from_shared_clan`,
+  `handle_post_cwl_enrollment_signup`/`_assign`/`_guest` and `handle_post_clan_config` in
+  `web_bridge.py` (`_apply_cwl_enrollment_signup_sync`/`_prepare_and_save_clan_config_sync`).
+- **Pattern B — wrap call-by-call.** A function that already has a real `await` in the middle
+  (e.g. `prune_or_detach_shared_clans_before_deletion`/`detach_guild_from_shared_clan_on_deactivation`,
+  both of which `await resolve_cwl_clan_owner()` mid-sequence) was never atomic across that
+  `await` to begin with — another coroutine could already interleave there before this fix. For
+  these, each sync DB call around the existing `await` is wrapped individually; no new
+  interleaving risk is introduced since one already existed.
+
+`assign_cwl_player_sync` (the one general "place a player in a pool" write path, already a plain
+sync `def` used as an atomic unit by design) needed no changes itself — only its 3 call sites
+(`web_bridge.py`'s drag-and-drop handler, `auto_assign_prior_cwl_members`, `start_cwl_enrollment`'s
+seed loop) needed `to_thread()`-wrapping, and two of those already got it for free once their
+containing function became Pattern A.
+
+## Pitfall 27: Adding `overflow-x: auto` to a wrapper around a `position: sticky` element can silently relocate that element's sticky containing block, hiding content behind it
+
+Symptom (2026-08-16, PROD): the CWL clan-config table's `(34)` fix (adding a `.table-scroll`
+wrapper with `overflow-x: auto` around `<table>`, to make an over-wide table scroll sideways
+instead of letting cells wrap and break row alignment) shipped clean in isolation, but broke the
+very screen it fixed — the column header row rendered, then every clan row underneath it was
+gone, at ANY window width or scroll position (not just the narrow-window case (34) targeted).
+
+Root cause: `activity/client/src/clanConfigTable.ts` already had `thead th { position: sticky;
+top: <JS-computed pixel value> }`, set to the height of a sibling `.board-topbar` element so the
+column headers stick just below it as the page scrolls. Before (34), nothing between `th` and the
+page had non-`visible` overflow, so `th`'s sticky *containing block* was the page/viewport, and
+the JS-computed offset was correct relative to that. (34)'s new `.table-scroll { overflow-x: auto
+}` wrapper changed that silently: per the CSS Overflow spec, when one axis's overflow is
+`visible` and the other isn't, the browser forces the `visible` axis's *used* value to `auto` too
+— this is real, current, unconditional Chromium/Firefox/Safari behavior, not a bug in the app's
+own CSS, and it cannot be worked around by setting `overflow-y: hidden` explicitly (non-`visible`
+still counts, regardless of which non-`visible` value it is). That silently made `.table-scroll`
+the new nearest-non-`visible`-overflow ancestor — i.e. the new sticky containing block for the
+`th`s inside it — even though its `height` was left `auto` (sized exactly to its own content), so
+it never actually has anything to scroll internally. A sticky element whose containing block never
+scrolls has nothing to react to: it just renders at a permanent, fixed offset from that
+container's top, forever — which is exactly what happened, except the "fixed offset" left over
+from before (34) was `<topbar's height>px`, pushing the header down on top of the first couple of
+rows and hiding them behind its own opaque background (`thead th`'s `background: #313338`, needed
+so scrolled-under rows don't show through it).
+
+**The generalizable trap**: adding `overflow-x` (or `-y`) to *any* element has a real chance of
+silently promoting it to a CSS "scroll container" on BOTH axes, which changes the sticky
+containing block for every `position: sticky` descendant inside it — even ones that look
+unrelated to the specific overflow you meant to fix, and even when that element never actually
+develops a scrollbar. This is invisible in the diff (nothing about `position: sticky` changed) and
+in a type-checker (no TypeScript/CSS syntax is wrong), so it only shows up as a live rendering bug.
+Before adding `overflow-x`/`overflow-y` to any element, grep its descendants for
+`position: sticky` — if any exist, either (a) verify their `top`/`left`/etc. offsets are still
+correct relative to the NEW containing block, not the old one, or (b) if genuine page-level
+sticky tracking still matters, give the container a real, JS-computed bounded height (`max-height`
+or `height`) so it becomes an actual scroll container rather than an inert one — see
+`enrollmentBoard.ts`'s `resizeBoard()`/`.board` pattern (which solved this identical
+containing-block problem first, before clan-config table existed) and
+`resizeTableScroll()`/`.table-scroll` in `clanConfigTable.ts` (this fix) for two working examples
+of the JS-computed-bounded-height approach.
+
+Confirmed both the root cause and the fix empirically, not just by reading the CSS spec — this
+class of bug is layout/paint behavior a DOM inspection or a `grep` cannot show; a throwaway
+Playwright harness rendering the real `renderClanConfigTable()` against mock data (outside the
+git-tracked tree) was used to screenshot the broken state, inspect the sticky element's
+`getBoundingClientRect()` and `.table-scroll`'s computed `overflow-y`, then verify the candidate
+fix restored both correct row visibility AND correct sticky-tracking-during-scroll before it was
+applied to the real source.

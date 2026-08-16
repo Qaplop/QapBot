@@ -13,6 +13,7 @@ shown in two places, per the plan's Phase 1 design.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -652,29 +653,32 @@ async def ensure_cwl_clan_sharing(guild_id: int, event_id: int, season: str, cla
     "other_guild_ids"} for the caller to build a confirmation prompt / notification from — this
     function itself does not send any DM or post any message, callers own that (different
     trigger points want different wording)."""
+    # Every sync DB call below is asyncio.to_thread()-wrapped (2026-08-16, Pitfall 26,
+    # COPILOT_PITFALLS_COOKBOOK.md — root-caused from a PROD incident in ui_cwl_roster.py's Add
+    # New Season button, but the same "sync write called directly on the event loop thread"
+    # anti-pattern was present throughout this whole shared-clan subsystem). Each branch's own
+    # sequence of DB calls is bundled into ONE to_thread() hop (a private _*_sync helper) rather
+    # than one hop per line — this branch currently has zero `await`s in it, so it's atomic with
+    # respect to other coroutines today (nothing else can run between its reads and writes); a
+    # per-line wrap would introduce new interleaving windows a second concurrent
+    # ensure_cwl_clan_sharing() call for the same clan_tag/season could race through. One hop for
+    # the whole branch preserves that.
     db = CACHE.db_manager
     if db is None:
         return None
     guild_id_str = str(guild_id)
 
-    existing = db.get_cwl_shared_clan_sync(clan_tag, season)
+    existing = await asyncio.to_thread(db.get_cwl_shared_clan_sync, clan_tag, season)
     if existing is not None:
         # Already an established shared clan — just attach this guild, no re-resolution (owner
         # stays frozen once resolved; see resolve_cwl_clan_owner's docstring).
-        db.add_guild_to_shared_clan_sync(existing["id"], guild_id_str, event_id)
-        _migrate_local_clan_roster_to_shared(db, event_id, existing["id"], clan_tag, guild_id_str)
-        sync_cwl_shared_clan_roster_to_local_pools(existing["id"])
-        other_guild_ids = [
-            g["guild_id"] for g in db.list_cwl_shared_clan_guilds_sync(existing["id"]) if g["guild_id"] != guild_id_str
-        ]
-        return {
-            "shared_clan_id": existing["id"],
-            "owner_guild_id": existing["owner_guild_id"],
-            "is_new": False,
-            "other_guild_ids": other_guild_ids,
-        }
+        return await asyncio.to_thread(
+            _attach_guild_to_existing_shared_clan_sync, db, existing, event_id, clan_tag, guild_id_str,
+        )
 
-    others = db.find_cwl_clan_participation_across_guilds_sync(clan_tag, season, exclude_guild_id=guild_id_str)
+    others = await asyncio.to_thread(
+        db.find_cwl_clan_participation_across_guilds_sync, clan_tag, season, exclude_guild_id=guild_id_str,
+    )
     if not others:
         return None  # not shared with anyone — nothing to do, the common case
 
@@ -687,6 +691,37 @@ async def ensure_cwl_clan_sharing(guild_id: int, event_id: int, season: str, cla
         # the calling flow (guest-clan add / Start Enrollment) over it.
         owner_guild_id, owner_event_id, resolution_method = guild_id_str, event_id, "unresolved_first_claimer"
 
+    return await asyncio.to_thread(
+        _create_new_shared_clan_sync, db, clan_tag, season, owner_guild_id, owner_event_id,
+        resolution_method, event_id, guild_id_str, others,
+    )
+
+
+def _attach_guild_to_existing_shared_clan_sync(
+    db: Any, existing: Dict[str, Any], event_id: int, clan_tag: str, guild_id_str: str,
+) -> Dict[str, Any]:
+    """Synchronous unit of work for ensure_cwl_clan_sharing()'s "already-shared" branch — run as
+    one atomic asyncio.to_thread() hop by that function; see its own comment for why."""
+    db.add_guild_to_shared_clan_sync(existing["id"], guild_id_str, event_id)
+    _migrate_local_clan_roster_to_shared(db, event_id, existing["id"], clan_tag, guild_id_str)
+    sync_cwl_shared_clan_roster_to_local_pools(existing["id"])
+    other_guild_ids = [
+        g["guild_id"] for g in db.list_cwl_shared_clan_guilds_sync(existing["id"]) if g["guild_id"] != guild_id_str
+    ]
+    return {
+        "shared_clan_id": existing["id"],
+        "owner_guild_id": existing["owner_guild_id"],
+        "is_new": False,
+        "other_guild_ids": other_guild_ids,
+    }
+
+
+def _create_new_shared_clan_sync(
+    db: Any, clan_tag: str, season: str, owner_guild_id: str, owner_event_id: int, resolution_method: str,
+    event_id: int, guild_id_str: str, others: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Synchronous unit of work for ensure_cwl_clan_sharing()'s "brand-new shared clan" branch —
+    run as one atomic asyncio.to_thread() hop by that function; see its own comment for why."""
     shared_clan_id = db.create_cwl_shared_clan_sync(clan_tag, season, owner_guild_id, owner_event_id, resolution_method)
     if shared_clan_id is None:
         return None
@@ -993,6 +1028,15 @@ async def auto_assign_prior_cwl_members(guild_id: int, event_id: int, season: st
        gives every clan present at that time, just applied retroactively for a clan added later.
        Unlike step 1, this isn't gated on placement state at all — it's pure visibility,
        independent of whether anyone's actually been assigned yet."""
+    # This whole function is already pure sync DB work despite the `async def` (no `await` in the
+    # body below) — bundled into one asyncio.to_thread() hop rather than wrapping each call
+    # individually, both to avoid the overhead of many small hops and to keep the same
+    # atomicity-with-respect-to-other-coroutines this body already had before this fix (2026-08-16,
+    # Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md).
+    await asyncio.to_thread(_auto_assign_prior_cwl_members_sync, guild_id, event_id, season, clan_tag)
+
+
+def _auto_assign_prior_cwl_members_sync(guild_id: int, event_id: int, season: str, clan_tag: str) -> None:
     db = CACHE.db_manager
     if db is None:
         return
@@ -1115,24 +1159,32 @@ async def prune_or_detach_shared_clans_before_deletion(guild_id: int, event_id: 
     was the owner) — the shared roster survives untouched. If this guild is the last one
     attached, the shared record itself (and its roster, via cascade) is pruned — nothing left
     for anyone to dangle from."""
+    # asyncio.to_thread()-wrapped per DB call (2026-08-16, Pitfall 26,
+    # COPILOT_PITFALLS_COOKBOOK.md) — this loop already has a real `await resolve_cwl_clan_owner()`
+    # inside it, so it was never atomic-across-iterations to begin with (another coroutine can
+    # already interleave between processing one shared clan and the next); wrapping the
+    # individual sync calls here doesn't introduce a new class of race, just moves the existing
+    # per-iteration blocking work off the event loop thread.
     db = CACHE.db_manager
     if db is None:
         return
     guild_id_str = str(guild_id)
 
-    for info in get_cwl_event_shared_clan_info_sync(event_id, guild_id, season):
+    shared_clan_info = await asyncio.to_thread(get_cwl_event_shared_clan_info_sync, event_id, guild_id, season)
+    for info in shared_clan_info:
         if info["other_guild_ids"]:
-            db.remove_guild_from_shared_clan_sync(info["shared_clan_id"], guild_id_str)
+            await asyncio.to_thread(db.remove_guild_from_shared_clan_sync, info["shared_clan_id"], guild_id_str)
             if info["owner_guild_id"] == guild_id_str:
                 new_owner_guild_id, resolution_method, new_owner_event_id = await resolve_cwl_clan_owner(
                     info["clan_tag"], season, [int(g) for g in info["other_guild_ids"]]
                 )
                 if new_owner_event_id is not None:
-                    db.repoint_cwl_shared_clan_owner_sync(
-                        info["shared_clan_id"], new_owner_guild_id, new_owner_event_id, resolution_method
+                    await asyncio.to_thread(
+                        db.repoint_cwl_shared_clan_owner_sync,
+                        info["shared_clan_id"], new_owner_guild_id, new_owner_event_id, resolution_method,
                     )
         else:
-            db.delete_cwl_shared_clan_sync(info["shared_clan_id"])
+            await asyncio.to_thread(db.delete_cwl_shared_clan_sync, info["shared_clan_id"])
 
 
 def _cleanup_local_pool_for_plain_clan_deactivation_sync(db: Any, guild_id: int, event_id: int, clan_tag: str) -> None:
@@ -1263,10 +1315,46 @@ async def detach_guild_from_shared_clan_on_deactivation(guild_id: int, event_id:
     member of clan_tag" cross-referenced against this guild's own cwl_assignments. Each one gets
     flipped to a guest signup (mark_cwl_signup_as_shared_clan_guest_sync), stamped with this
     shared clan's id so a later reassignment by the clan's real owning guild
-    (handle_post_cwl_enrollment_assign's purge hook) can find and remove them."""
+    (handle_post_cwl_enrollment_assign's purge hook) can find and remove them.
+
+    Everything through computing `other_guild_ids` runs as one asyncio.to_thread() hop
+    (_detach_guild_from_shared_clan_on_deactivation_sync, 2026-08-16, Pitfall 26,
+    COPILOT_PITFALLS_COOKBOOK.md) — this function has no `await` before that point today, so
+    bundling preserves that same atomicity instead of introducing new interleaving windows a
+    per-line wrap would; the tail (repoint-or-delete, after the real `await
+    resolve_cwl_clan_owner()` below) was never atomic with the rest regardless, so it's wrapped
+    call-by-call instead."""
     db = CACHE.db_manager
     if db is None:
         return
+    pre = await asyncio.to_thread(
+        _detach_guild_from_shared_clan_on_deactivation_sync, db, guild_id, event_id, season, clan_tag,
+    )
+    if pre is None:
+        return
+    shared, other_guild_ids, guild_id_str = pre
+    if other_guild_ids:
+        await asyncio.to_thread(db.remove_guild_from_shared_clan_sync, shared["id"], guild_id_str)
+        if shared["owner_guild_id"] == guild_id_str:
+            new_owner_guild_id, resolution_method, new_owner_event_id = await resolve_cwl_clan_owner(
+                clan_tag, season, [int(g) for g in other_guild_ids]
+            )
+            if new_owner_event_id is not None:
+                await asyncio.to_thread(
+                    db.repoint_cwl_shared_clan_owner_sync,
+                    shared["id"], new_owner_guild_id, new_owner_event_id, resolution_method,
+                )
+    else:
+        await asyncio.to_thread(db.delete_cwl_shared_clan_sync, shared["id"])
+
+
+def _detach_guild_from_shared_clan_on_deactivation_sync(
+    db: Any, guild_id: int, event_id: int, season: str, clan_tag: str,
+) -> Optional[Tuple[Dict[str, Any], List[str], str]]:
+    """Synchronous unit of work for detach_guild_from_shared_clan_on_deactivation() — see that
+    function's own comment for why this is one atomic asyncio.to_thread() hop. Returns None for
+    both of the function's early-return cases (never shared, or not actually attached); otherwise
+    (shared, other_guild_ids, guild_id_str) for the caller's post-await tail."""
     shared = db.get_cwl_shared_clan_sync(clan_tag, season)
     if shared is None:
         # Plain (never cross-guild-shared) guest clan — 2026-08-16 follow-up, live-testing
@@ -1390,16 +1478,7 @@ async def detach_guild_from_shared_clan_on_deactivation(guild_id: int, event_id:
             db.delete_cwl_signup_sync(event_id, tag)
 
     other_guild_ids = [g["guild_id"] for g in guilds if g["guild_id"] != guild_id_str]
-    if other_guild_ids:
-        db.remove_guild_from_shared_clan_sync(shared["id"], guild_id_str)
-        if shared["owner_guild_id"] == guild_id_str:
-            new_owner_guild_id, resolution_method, new_owner_event_id = await resolve_cwl_clan_owner(
-                clan_tag, season, [int(g) for g in other_guild_ids]
-            )
-            if new_owner_event_id is not None:
-                db.repoint_cwl_shared_clan_owner_sync(shared["id"], new_owner_guild_id, new_owner_event_id, resolution_method)
-    else:
-        db.delete_cwl_shared_clan_sync(shared["id"])
+    return shared, other_guild_ids, guild_id_str
 
 
 def purge_orphaned_shared_clan_guests_sync(shared_clan_id: int, player_tag: str) -> None:
@@ -1435,11 +1514,19 @@ async def evict_guild_from_shared_clan(
 
     Returns {"ok": bool, "error": Optional[str]} — error is one of 'not_shared', 'not_owner',
     'cannot_evict_owner' (the owner can't evict themselves — see prune_or_detach_shared_clans_
-    before_deletion / delete-season instead, which is the real "I want out" path for an owner)."""
+    before_deletion / delete-season instead, which is the real "I want out" path for an owner).
+
+    This whole function is pure sync DB work despite the `async def` (no `await` in the body) —
+    bundled into one asyncio.to_thread() hop (2026-08-16, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md)."""
     db = CACHE.db_manager
     if db is None:
         return {"ok": False, "error": "no_database"}
+    return await asyncio.to_thread(_evict_guild_from_shared_clan_sync, db, acting_guild_id, target_guild_id, clan_tag, season)
 
+
+def _evict_guild_from_shared_clan_sync(
+    db: Any, acting_guild_id: int, target_guild_id: int, clan_tag: str, season: str,
+) -> Dict[str, Any]:
     shared = db.get_cwl_shared_clan_sync(clan_tag, season)
     if shared is None:
         return {"ok": False, "error": "not_shared"}
@@ -1453,6 +1540,19 @@ async def evict_guild_from_shared_clan(
     if target_event is not None:
         db.deactivate_cwl_event_clan_sync(target_event["id"], clan_tag)
     return {"ok": True, "error": None}
+
+
+def _seed_prior_cwl_assignments_sync(
+    guild_id: int, event_id: int, season: str, prior_assignments: Dict[str, str],
+) -> None:
+    """Synchronous unit of work for start_cwl_enrollment()'s auto-assignment seed loop — see that
+    function's own comment for why this is one atomic asyncio.to_thread() hop."""
+    for player_tag, target_clan_tag in prior_assignments.items():
+        assign_cwl_player_sync(
+            guild_id, event_id, season, player_tag, target_clan_tag,
+            source="auto_assigned", assignment_source="suggested", signup_source="auto_assigned",
+            locked=False, deliberate=False,
+        )
 
 
 async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
@@ -1586,7 +1686,9 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
             summary["skipped_unlinked"] += 1
 
     if signups_to_create:
-        db.bulk_create_cwl_signups_sync(event["id"], signups_to_create)
+        # asyncio.to_thread()-wrapped (2026-08-16, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — a
+        # real bulk write, potentially every member across every participating clan.
+        await asyncio.to_thread(db.bulk_create_cwl_signups_sync, event["id"], signups_to_create)
         summary["seeded"] = len(signups_to_create)
 
     # Auto-assignment seed — the initial "who probably plays where" suggestion, from each
@@ -1628,12 +1730,11 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     # writes to cwl_shared_clan_players instead when that's the case, matching every other write
     # path in this feature.
     prior_assignments = resolve_prior_cwl_assignments(list(current_member_tags), participating_clan_tags)
-    for player_tag, target_clan_tag in prior_assignments.items():
-        assign_cwl_player_sync(
-            guild_id, event["id"], season, player_tag, target_clan_tag,
-            source="auto_assigned", assignment_source="suggested", signup_source="auto_assigned",
-            locked=False, deliberate=False,
-        )
+    # Whole loop bundled into one asyncio.to_thread() hop (2026-08-16, Pitfall 26,
+    # COPILOT_PITFALLS_COOKBOOK.md) rather than one hop per player — it's pure sync work with no
+    # `await` inside, so one hop is both cheaper and keeps this loop atomic with respect to other
+    # coroutines, matching its behavior before this fix.
+    await asyncio.to_thread(_seed_prior_cwl_assignments_sync, guild_id, event["id"], season, prior_assignments)
     summary["assigned"] = len(prior_assignments)
 
     for participant in dm_targets:
@@ -1647,7 +1748,7 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
         if sent:
             summary["contacted"] += 1
 
-    db.update_cwl_event_status_sync(event["id"], "signup_open")
+    await asyncio.to_thread(db.update_cwl_event_status_sync, event["id"], "signup_open")
     summary["ok"] = True
     return summary
 
