@@ -238,8 +238,7 @@
       "list": {
         "short": "List accounts, families, or players",
         "title": "📝 List Command",
-        "detailed": "List various data: Discord accounts with registered players, clan families, or all players in a clan/family.\n\n**Usage:**\n`/list action:<Accounts|Families|Players|Tracked Clans> [clan:<clan>] [family:<family>]`\n\n**Actions:**\n\n**Accounts** - List all Discord user accounts and their registered players\n• Shows verification status\n• Displays primary accounts\n• Includes Town Hall levels\n\n**Families** - List all clan families and their member clans\n• Shows family structure\n• Lists all clans in each family\n\n**Players** - List all players in a clan or family\n• `clan` parameter: Specify clan tag or name\n• `family` parameter: Specify family tag\n• Shows player names, tags, and TH levels\n• Displays Discord link status\n\n**Tracked Clans** - Bar chart of all tracked clans grouped by war league\n• Posted as an image to the channel\n\n**Examples:**\n`/list action:Accounts`\n`/list action:Families`\n`/list action:Players clan:#L2J0C0PY`\n`/list action:Players family:#FAMILY123`\n`/list action:Tracked Clans`",
-        "tracked_clans_no_data": "No war league data found for tracked clans."
+        "detailed": "List various data: Discord accounts with registered players, clan families, or all players in a clan/family.\n\n**Usage:**\n`/list action:<Accounts|Families|Players|Tracked Clans|Managed CWLs> [clan:<clan>] [family:<family>] [season:<season>]`\n\n**Actions:**\n\n**Accounts** - List all Discord user accounts and their registered players\n• Shows verification status\n• Displays primary accounts\n• Includes Town Hall levels\n\n**Families** - List all clan families and their member clans\n• Shows family structure\n• Lists all clans in each family\n\n**Players** - List all players in a clan or family\n• `clan` parameter: Specify clan tag or name\n• `family` parameter: Specify family tag\n• Shows player names, tags, and TH levels\n• Displays Discord link status\n\n**Tracked Clans** - Bar chart of all tracked clans grouped by war league\n• Posted as an image to the channel\n\n**Managed CWLs** (Bot Admin) - List every guild with a managed CWL for a season\n• `season` parameter: CWL season as YYYY-MM — defaults to the next upcoming season if omitted\n\n**Examples:**\n`/list action:Accounts`\n`/list action:Families`\n`/list action:Players clan:#L2J0C0PY`\n`/list action:Players family:#FAMILY123`\n`/list action:Tracked Clans`\n`/list action:Managed CWLs season:2026-09`"
       },
       "whois": {
         "short": "Look up CoC accounts for a Discord user, or war history for a player",
@@ -264,6 +263,11 @@
     },
     "subscribe": {},
     "unsubscribe": {},
+    "list": {
+      "tracked_clans_no_data": "No war league data found for tracked clans.",
+      "managed_cwls_no_data": "No guild has a managed CWL for season {season}.",
+      "invalid_season_format": "\"{season}\" isn't a valid season — use YYYY-MM (e.g. 2026-09)."
+    },
     "admin": {
       "set_language": {
         "success": "✅ Server language successfully set to {language_name}",
@@ -789,6 +793,7 @@
       "button_configure_clans": "Configure Participating Clans",
       "button_start_enrollment": "Start Enrollment",
       "button_manage_assignment": "Manage Teams",
+      "button_open_enrollment_after_start": "Open Teams Management",
       "button_delete_season": "Delete Season",
       "button_confirm_delete": "Yes, Delete Season",
       "button_add_season": "Add New Season",

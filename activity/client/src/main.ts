@@ -11,6 +11,20 @@ import type { ClanConfig, ClanConfigPayload, EnrollmentPayload, GuestSearchResul
 
 const clientId = import.meta.env.VITE_CLIENT_ID as string | undefined
 
+// Session-scoped access_token cache (2026-08-16, live-testing feedback: opening/closing the
+// Activity repeatedly in a short span hit Discord's own OAuth token-endpoint rate limit —
+// "You are being rate limited for requesting too many tokens" — because every single launch,
+// even reopening the same view seconds later, did a completely fresh authorize()+/api/token
+// round-trip. Confirmed via live wrangler tail: each launch really was exactly one legitimate
+// authorize+exchange pair, not a bug duplicating calls — the limit is purely a function of launch
+// *count* in a short window. authenticate() is documented to accept a previously-obtained
+// access_token directly (it returns a fresh `expires` either way), so a cached token can skip
+// authorize()+/api/token entirely on the next launch within the same browser session — falling
+// back to the full flow the moment the cached token is ever rejected. sessionStorage (not
+// module-level state) because Discord reloads this script fresh on every launch, but keeps the
+// same top-level browsing context alive across repeated launches within one Discord session.
+const CACHED_TOKEN_KEY = 'cwl-activity-access-token'
+
 async function setup(): Promise<void> {
   const root = document.getElementById('app')
   if (!root) return
@@ -25,27 +39,55 @@ async function setup(): Promise<void> {
   try {
     await discordSdk.ready()
 
-    const { code } = await discordSdk.commands.authorize({
-      client_id: clientId,
-      response_type: 'code',
-      state: '',
-      prompt: 'none',
-      scope: ['identify', 'guilds'],
-    })
-
-    // Runs through Discord's own proxy (/api/*) straight to our Worker — never call the
-    // Worker's absolute URL directly from inside the iframe.
-    const tokenResponse = await fetch('/api/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code }),
-    })
-    if (!tokenResponse.ok) {
-      throw new Error(`token exchange failed: ${tokenResponse.status}`)
+    let accessToken: string | null = null
+    const cachedToken = sessionStorage.getItem(CACHED_TOKEN_KEY)
+    if (cachedToken) {
+      try {
+        await discordSdk.commands.authenticate({ access_token: cachedToken })
+        accessToken = cachedToken
+      } catch (err) {
+        // Cached token expired, revoked, or otherwise rejected — fall through to a full,
+        // fresh authorize()+exchange below. Never treat this as fatal.
+        console.log('[cwl-activity] cached access_token rejected, re-authorizing:', err)
+        sessionStorage.removeItem(CACHED_TOKEN_KEY)
+      }
     }
-    const { access_token: accessToken } = (await tokenResponse.json()) as { access_token: string }
 
-    await discordSdk.commands.authenticate({ access_token: accessToken })
+    if (!accessToken) {
+      const { code } = await discordSdk.commands.authorize({
+        client_id: clientId,
+        response_type: 'code',
+        state: '',
+        prompt: 'none',
+        scope: ['identify', 'guilds'],
+      })
+
+      // Runs through Discord's own proxy (/api/*) straight to our Worker — never call the
+      // Worker's absolute URL directly from inside the iframe.
+      const tokenResponse = await fetch('/api/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      })
+      if (!tokenResponse.ok) {
+        // Surface Discord's own rejection reason (2026-08-16, live-testing feedback: a bare
+        // "token exchange failed: 502" gave no way to tell invalid_grant (code already used, or
+        // expired) apart from Discord's own OAuth rate limit — the Worker always had this in its
+        // response body, it just never reached the screen).
+        let detail = ''
+        try {
+          const body = (await tokenResponse.json()) as { detail?: string }
+          if (body.detail) detail = ` — ${body.detail}`
+        } catch {
+          // Body wasn't JSON (e.g. a raw Cloudflare error page) — fall back to the bare status.
+        }
+        throw new Error(`token exchange failed: ${tokenResponse.status}${detail}`)
+      }
+      ;({ access_token: accessToken } = (await tokenResponse.json()) as { access_token: string })
+
+      await discordSdk.commands.authenticate({ access_token: accessToken })
+      sessionStorage.setItem(CACHED_TOKEN_KEY, accessToken)
+    }
 
     const guildId = discordSdk.guildId
     if (!guildId) {
@@ -53,7 +95,28 @@ async function setup(): Promise<void> {
       return
     }
 
-    const closeActivity = (reason: string): void => {
+    const closeActivity = async (reason: string): Promise<void> => {
+      // Notify the bot BEFORE actually closing (2026-08-16, live-testing feedback: on iPad, the
+      // Hub message's launch buttons stayed visibly greyed out/unresponsive after closing the
+      // Activity — Discord's own client-side "an Activity was launched from this message" visual
+      // state, which only the SAVE flow's existing Hub-message refresh happened to incidentally
+      // clear, since that's a genuine new message edit, not a response to the now-stale original
+      // interaction. Closing WITHOUT saving (a plain view, or Cancel) never triggered any refresh
+      // at all. Best-effort with a short timeout — this must never meaningfully delay the actual
+      // close the user is waiting on, and a failure here is never worth blocking it over.
+      try {
+        await Promise.race([
+          fetch('/api/cwl/activity-closed', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+            body: JSON.stringify({ guild_id: guildId }),
+          }),
+          new Promise((resolve) => setTimeout(resolve, 1500)),
+        ])
+      } catch (err) {
+        console.error('[cwl-activity] activity-closed notification failed:', err)
+      }
+
       // Diagnostic logging (visible via Discord's own Activity dev console) in case this
       // silently no-ops for some environments — console output is routed to Discord's client
       // by the SDK itself (see Discord.d.ts's overrideConsoleLogging warning).
@@ -91,7 +154,7 @@ async function setup(): Promise<void> {
       }
       const payload = (await enrollmentResponse.json()) as EnrollmentPayload
 
-      renderEnrollmentBoard(
+      const boardHandle = renderEnrollmentBoard(
         root,
         payload,
         async (playerTag: string, clanTag: string | null) => {
@@ -105,8 +168,35 @@ async function setup(): Promise<void> {
             throw new Error(`${response.status}: ${body}`)
           }
         },
-        closeActivity,
+        async (reason: string) => {
+          clearInterval(pollTimer)
+          await closeActivity(reason)
+        },
       )
+
+      // Live-polling (2026-08-16, live-testing feedback: "would it be possible to auto-update
+      // this view whenever a user changes his confirmation setting?") — re-fetches the same
+      // enrollment payload on a timer and merges just the externally-changeable fields (see
+      // enrollmentBoard.ts's applyPolledUpdate for exactly which, and why assignment isn't one of
+      // them). 12s balances feeling reasonably live against not hammering the bridge/bot while
+      // several admins could plausibly have this board open at once. A failed poll is silently
+      // skipped (logged only) — the next tick tries again; it must never surface as a page error
+      // the way the initial load's own fetch failures do.
+      const POLL_INTERVAL_MS = 12000
+      const pollTimer = setInterval(() => {
+        void (async () => {
+          try {
+            const pollResponse = await fetch(`/api/cwl/enrollment?guild_id=${encodeURIComponent(guildId)}`, {
+              headers: { Authorization: `Bearer ${accessToken}` },
+            })
+            if (!pollResponse.ok) return
+            const freshPayload = (await pollResponse.json()) as EnrollmentPayload
+            boardHandle.applyPolledUpdate(freshPayload.players)
+          } catch (err) {
+            console.error('[cwl-activity] enrollment poll failed:', err)
+          }
+        })()
+      }, POLL_INTERVAL_MS)
       return
     }
 

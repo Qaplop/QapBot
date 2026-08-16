@@ -12,21 +12,56 @@
         color: #f2f3f5;
         font-family: system-ui, -apple-system, sans-serif;
       }
-      #app { padding: 16px; }
+      /* Extra right-side padding (2026-08-16, live-testing feedback: on iPad, Discord's own
+         Activity control bar sits over the right edge of the view, covering the Start Time
+         column) — asymmetric on purpose, shifting everything left a bit rather than adding
+         equal padding all around, which would just shrink the whole table instead of clearing
+         that specific overlay. 36px wasn't enough on a real iPad (still partly covered) — bumped
+         further; may still need another pass once verified live, since there's no way to measure
+         the overlay's real width without an iPad in hand. */
+      #app { padding: 16px 64px 16px 16px; }
 
       .header { font-size: 1.1rem; font-weight: 600; margin-bottom: 4px; }
       .tz-note { margin-bottom: 12px; font-size: 0.8rem; color: #f2f3f5; }
 
       table { border-collapse: collapse; width: 100%; }
-      /* vertical-align: top (2026-08-15, live-testing feedback: "the lines got broken" after
-         adding a shared clan) — a shared clan's name cell grows taller than its neighbors (the
-         badge wraps below the clan name), and without an explicit vertical-align every column
-         defaulted to its own alignment within that taller row — the roster-size select sank
-         toward the badge's line while start-time/checkbox stayed anchored near the top, so the
-         row's controls no longer lined up with each other or with the clan name. Top-aligning
-         every cell keeps all of a row's content anchored to the same line regardless of which
-         cell happens to be tallest. */
-      th, td { padding: 4px 12px; text-align: left; border-bottom: 1px solid #3f4147; vertical-align: top; }
+      /* height: 34px, vertical-align: middle (2026-08-16, live-testing feedback: the fixed
+         height fixed the broken lines, but 40px read as too tall, and top-aligning content
+         inside a now-UNIFORM row height just left everything pinned high with empty space below
+         instead of centered). vertical-align: top was only ever needed while row height was
+         driven by variable content (badge-bearing rows taller than plain ones — see the removed
+         comment history below) — now that `height` below is a fixed, uniform floor every row
+         shares regardless of content, that problem doesn't exist anymore, so plain centering is
+         both correct and looks right. Row height in table layout is always
+         max(this height, every cell's natural content height) — line-height alone (kept for
+         pure-text cells) can't touch a <select>/<input>'s own box-model height, which is why an
+         explicit `height` is what actually keeps every row uniform: 34px comfortably fits the
+         select/date-input combo (padding + border + font) without clipping, while sitting
+         noticeably more compact than the original 40px. */
+      th, td { padding: 4px 12px; text-align: left; vertical-align: middle; line-height: 20px; height: 34px; }
+      /* The divider line lives on each CELL as a box-shadow, not a border-bottom, and not on the
+         <tr> either (2026-08-16, live-testing feedback: "a straight line is a straight line...
+         but yours isn't", then later "lines are good now on PC but missing on iPad"). History:
+         with border-collapse: collapse, a row's line used to be stitched together from N
+         *separate* per-cell border-bottom segments merged at their shared edges — any two
+         adjacent cells painting even a fractional device-pixel apart at final rasterization (a
+         real browser behavior for heterogeneous content like a <select> next to plain text) could
+         visibly shift that shared edge. Moving the shadow to a single box-shadow on the <tr>
+         fixed that on desktop Chrome/Firefox — but WebKit (Safari, and every iOS browser is
+         WebKit under the hood, including iPad Chrome) never paints box-shadow on <tr>/<tbody> at
+         all, a known WebKit limitation specific to internal table-layout elements — so the line
+         simply never rendered on iPad. box-shadow on <td>/<th> themselves is fully supported
+         everywhere (this WebKit gap is <tr>-specific, not table cells in general), and since row
+         height is now a hard-coded 34px floor on every cell (see `height` above), each cell's own
+         inset shadow lands at the identical pixel offset regardless — nothing left for adjacent
+         cells to disagree about, without relying on the <tr>-level trick that broke iOS. Also
+         fixes a second bug the <tr>-level version had even on desktop: the header row's own line
+         was invisible because each sticky <th>'s own opaque background (needed to hide scrolled-
+         under content) painted OVER the ancestor <tr>'s box-shadow — an ancestor's box-shadow is
+         painted before a descendant's background, so it was hidden the whole time; putting the
+         shadow on the <th> itself paints it after that own cell's background, same box, no
+         ancestor/descendant ordering issue left to hide it. */
+      th, td { box-shadow: inset 0 -1px 0 0 #3f4147; }
       th { color: #f2f3f5; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.02em; padding-top: 6px; padding-bottom: 6px; }
       thead th {
         position: sticky;
@@ -63,7 +98,21 @@
       .evict-button:disabled { opacity: 0.5; cursor: default; }
 
       input[type="checkbox"] { width: 16px; height: 16px; accent-color: #5865f2; }
+      /* box-sizing: border-box + an explicit height (2026-08-16, live-testing feedback: "I want
+         this perfect" — still one row very slightly off after the fixed-row-height fix). Without
+         box-sizing: border-box, a <select>'s rendered height is padding + border + font-driven
+         content height ADDED TOGETHER — and different form control TYPES (<select> vs
+         <input type="date">) are documented to compute that font-driven content height via
+         slightly different internal UA rendering paths even under byte-identical CSS, which can
+         round a sub-pixel apart between them. An explicit `height` makes the box's total
+         rendered size a hard-coded constant instead of anything computed from font metrics at
+         all — combined with border-box (so padding/border live INSIDE that height rather than
+         adding to it), every one of these controls now renders at the exact same number of
+         pixels, full stop, with no font-metric computation left anywhere for the two control
+         types to possibly disagree on. */
       select, input[type="date"], input[type="text"] {
+        box-sizing: border-box;
+        height: 26px;
         background: #1e1f22;
         color: #f2f3f5;
         border: 1px solid #3f4147;
@@ -71,7 +120,20 @@
         padding: 3px 8px;
         font-size: 0.85rem;
       }
-      select:disabled, input:disabled { cursor: not-allowed; }
+      /* Explicit color (2026-08-16, live-testing feedback: "the roster size and time have a
+         different font color than the data" in read-only mode) — browsers apply their own
+         dimmed/grayed default text color to a disabled select/input (e.g. Chrome's GrayText),
+         which read as visibly different from the rest of the row even though the value itself
+         is real, current data, not a placeholder — a shared clan's canonical settings, just not
+         editable from this (non-owner) guild. Same color as the enabled state; -webkit-text-
+         fill-color is needed too since Chromium ignores a plain `color` override specifically
+         on :disabled form controls and falls back to its own UA style otherwise. */
+      select:disabled, input:disabled {
+        cursor: not-allowed;
+        color: #f2f3f5;
+        -webkit-text-fill-color: #f2f3f5;
+        opacity: 1;
+      }
       .start-time-cell { display: flex; gap: 8px; align-items: center; }
       .start-time-cell input[type="date"] { flex: 1; min-width: 0; }
 
@@ -79,7 +141,12 @@
          inviting a clan or individual player from outside this guild's own family. Sits below
          the table, above the Save/Cancel footer, as its own block (not the sticky header — a
          search box + growing results list doesn't belong in a region meant to stay short). */
-      .guests-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid #3f4147; }
+      /* No border-top (2026-08-16, live-testing feedback: "we don't need the line above the
+         Guests section... keep the spacing") — the table's own last row already ends in a
+         divider line (see th/td box-shadow above), so a second line immediately above this
+         section read as redundant. margin-top + padding-top both kept as-is so the actual gap
+         above "Guests" is unchanged, only the rule itself is gone. */
+      .guests-section { margin-top: 20px; padding-top: 16px; }
       .guests-title { font-size: 1rem; font-weight: 600; margin-bottom: 4px; }
       .guests-hint { font-size: 0.8rem; color: #949ba4; margin-bottom: 10px; }
       .guests-search-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
@@ -196,6 +263,16 @@
       .legend { display: flex; align-items: center; gap: 12px; }
       .legend-item { display: flex; align-items: center; gap: 4px; font-size: 0.75rem; color: #f2f3f5; }
       .legend-icon { width: 16px; height: 16px; }
+      /* Reproduces .guest-card's own inset box-shadow accent exactly (2026-08-16) — same swatch
+         size as .legend-icon so it lines up with the other legend entries. */
+      .legend-guest-swatch {
+        width: 16px;
+        height: 16px;
+        border-radius: 2px;
+        background: #1e1f22;
+        border: 1px solid #3f4147;
+        box-shadow: inset 3px 0 0 0 #f0b232;
+      }
       /* Was an unstyled plain block div — its two .sort-selector children (each display:flex,
          but block-level themselves) stacked one per line by default block flow, with nothing
          actually asking for that. flex here puts "Sort by:" and "Show:" on one line with a
@@ -231,6 +308,12 @@
            handles internal scrolling for whichever ones have more players than fit. */
       }
       .column.column-unassigned { border-color: #4a4d54; }
+      /* Orphaned-assignment column (2026-08-16) — a player stuck pointing at a clan that's no
+         longer one of this guild's participating columns (most often a detached shared clan).
+         Amber border/header, same "needs attention" color already used for count-under and the
+         shared-clan read-only notice, so it reads as a warning without introducing a new color. */
+      .column.column-orphaned { border-color: #f0b232; }
+      .column.column-orphaned .column-header { background: rgba(240, 178, 50, 0.12); }
       .column.drop-target { border-color: #5865f2; background: #32354b; }
       .column.dragging { opacity: 0.4; }
       .column-header {

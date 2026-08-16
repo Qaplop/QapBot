@@ -570,6 +570,101 @@ async def test_start_enrollment_detects_and_reports_shared_clan(db, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_start_enrollment_never_double_books_a_confirmed_shared_clan_guest(db, monkeypatch):
+    """Confirmed live-testing bug (2026-08-16, project owner's spec, verbatim): "I deleted The
+    QCrew's saison and created it new. QManiac was auto-assigned to The QCrew's player roster
+    although QManiac was already assigned to StayCalm's roster as a guest player. This race
+    condition should be checked during creation of the season and auto-assignment." Deleting and
+    recreating an event re-runs this exact auto-assign seed from scratch — a player who is
+    already a deliberately admin_override-confirmed guest on a DIFFERENT (shared) clan's roster
+    must never get silently reassigned into this event's own auto-assign target, purely because
+    that target happens to be their last real CWL attack destination. The general
+    assign_cwl_player_sync (QBdiscocmdshelper_cwl.py) now gates every auto-assign write on
+    deliberate=False, which never evicts the existing claim — it mirrors the player into a local
+    assignment pointing at their REAL shared clan instead of the auto-assign target."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    await _seed_guild_and_clan(db, "1020", clan_tag="#CLAN1")  # "The QCrew"
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#SHAREDCLAN', 'StayCalm')")
+    await db.conn.commit()
+
+    event_id = db.create_cwl_event_sync("1020", "2026-08", "creator")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#CLAN1", "participating": True},
+        {"clan_tag": "#SHAREDCLAN", "participating": True},
+    ])
+    shared_id = db.create_cwl_shared_clan_sync("#SHAREDCLAN", "2026-08", "1020", event_id, "unresolved_first_claimer")
+    db.add_guild_to_shared_clan_sync(shared_id, "1020", event_id)
+    db.set_cwl_shared_clan_player_assignment_sync(shared_id, "#QMANIAC", "QManiac", "d1", True, "admin_override", "1020")
+
+    # #QMANIAC's last real CWL attack was for #CLAN1 — exactly the signal that would normally
+    # auto-assign them there, if not for already being a deliberately-placed guest elsewhere.
+    await _seed_current_clan_member(db, "d1", "#QMANIAC", "#CLAN1")
+    await _seed_cwl_war(db, "#CLAN1", [("#QMANIAC", "QManiac")])
+    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+
+    summary = await start_cwl_enrollment(1020, "2026-08")
+
+    assert summary["ok"] is True
+    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event_id)}
+    # Never double-booked into #CLAN1 — any local mirror row, if present, points at their REAL
+    # shared clan instead (here #SHAREDCLAN is itself a currently-participating column, so the
+    # shared-table merge in _build_enrollment_payload takes priority over this local mirror
+    # regardless — see test_start_enrollment_shows_confirmed_shared_guest_as_orphaned_when_shared_clan_not_participating
+    # for the case where that merge doesn't apply and the mirror is what actually surfaces them).
+    assert assignments.get("#QMANIAC") != "#CLAN1"
+
+    shared_players = {p["player_tag"]: p for p in db.get_cwl_shared_clan_players_sync(shared_id)}
+    assert shared_players["#QMANIAC"]["assigned"] == 1  # untouched, still placed there
+    assert shared_players["#QMANIAC"]["source"] == "admin_override"
+
+
+@pytest.mark.asyncio
+async def test_start_enrollment_shows_confirmed_shared_guest_as_orphaned_when_shared_clan_not_participating(db, monkeypatch):
+    """2026-08-16 follow-up, live-testing feedback, project owner's spec, verbatim: "QManiac still
+    assigned to StayCalm. So during auto-assignment this should have been recognized and instead
+    of putting QManiac to the unassigned pool he should have been assigned to the 'Assigned to
+    other clan' pool." Unlike the sibling test above, #SHAREDCLAN here is NOT a participating
+    clan of this event at all (the guild deleted/recreated its season without StayCalm on the
+    roster) — nothing in _build_enrollment_payload's shared-table merge would ever resolve
+    #QMANIAC's real placement on its own, so assign_cwl_player_sync's local mirror is the ONLY
+    thing standing between them and silently landing in plain Unassigned."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    await _seed_guild_and_clan(db, "1021", clan_tag="#CLAN1")  # "The QCrew"
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#SHAREDCLAN', 'StayCalm')")
+    await db.conn.commit()
+
+    # #SHAREDCLAN already exists as a shared clan (from an earlier season/round) but this NEW
+    # event only has #CLAN1 participating — StayCalm isn't on this event's roster at all.
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('1020a')")
+    await db.conn.commit()
+    other_event_id = db.create_cwl_event_sync("1020a", "2026-08", "other-creator")
+    shared_id = db.create_cwl_shared_clan_sync("#SHAREDCLAN", "2026-08", "1020a", other_event_id, "unresolved_first_claimer")
+    db.set_cwl_shared_clan_player_assignment_sync(shared_id, "#QMANIAC", "QManiac", "d1", True, "admin_override", "1020a")
+
+    event_id = db.create_cwl_event_sync("1021", "2026-08", "creator")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+
+    await _seed_current_clan_member(db, "d1", "#QMANIAC", "#CLAN1")
+    await _seed_cwl_war(db, "#CLAN1", [("#QMANIAC", "QManiac")])
+    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+
+    summary = await start_cwl_enrollment(1021, "2026-08")
+
+    assert summary["ok"] is True
+    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event_id)}
+    assert assignments.get("#QMANIAC") == "#SHAREDCLAN"  # surfaces via "Assigned to other Guild", not bare Unassigned
+
+    shared_players = {p["player_tag"]: p for p in db.get_cwl_shared_clan_players_sync(shared_id)}
+    assert shared_players["#QMANIAC"]["assigned"] == 1  # untouched, still placed there
+
+
+@pytest.mark.asyncio
 async def test_start_enrollment_shared_clans_empty_when_nothing_shared(db, monkeypatch):
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment

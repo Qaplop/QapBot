@@ -238,7 +238,7 @@
       "list": {
         "short": "Konten, Familien oder Spieler auflisten",
         "title": "📝 List-Befehl",
-        "detailed": "Liste verschiedene Daten auf: Discord-Konten mit registrierten Spielern, Clan-Familien oder alle Spieler in einem Clan/Familie.\n\n**Verwendung:**\n`/list action:<Accounts|Families|Players|Tracked Clans> [clan:<clan>] [family:<family>]`\n\n**Aktionen:**\n\n**Accounts** - Liste aller Discord-Benutzerkonten und ihrer registrierten Spieler\n• Zeigt Verifizierungsstatus\n• Zeigt Hauptkonten an\n• Inklusive Rathausstufen\n\n**Families** - Liste aller Clan-Familien und ihrer Mitglieds-Clans\n• Zeigt Familienstruktur\n• Listet alle Clans in jeder Familie auf\n\n**Players** - Liste aller Spieler in einem Clan oder Familie\n• `clan`-Parameter: Clan-Tag oder -Name angeben\n• `family`-Parameter: Familien-Tag angeben\n• Zeigt Spielernamen, Tags und RH-Stufen\n• Zeigt Discord-Verknüpfungsstatus\n\n**Verfolgte Clans** - Balkendiagramm aller verfolgten Clans nach Kriegsliga gruppiert\n• Wird als Bild in den Kanal gepostet\n\n**Beispiele:**\n`/list action:Accounts`\n`/list action:Families`\n`/list action:Players clan:#L2J0C0PY`\n`/list action:Players family:#FAMILY123`\n`/list action:Tracked Clans`"
+        "detailed": "Liste verschiedene Daten auf: Discord-Konten mit registrierten Spielern, Clan-Familien oder alle Spieler in einem Clan/Familie.\n\n**Verwendung:**\n`/list action:<Accounts|Families|Players|Tracked Clans|Managed CWLs> [clan:<clan>] [family:<family>] [season:<saison>]`\n\n**Aktionen:**\n\n**Accounts** - Liste aller Discord-Benutzerkonten und ihrer registrierten Spieler\n• Zeigt Verifizierungsstatus\n• Zeigt Hauptkonten an\n• Inklusive Rathausstufen\n\n**Families** - Liste aller Clan-Familien und ihrer Mitglieds-Clans\n• Zeigt Familienstruktur\n• Listet alle Clans in jeder Familie auf\n\n**Players** - Liste aller Spieler in einem Clan oder Familie\n• `clan`-Parameter: Clan-Tag oder -Name angeben\n• `family`-Parameter: Familien-Tag angeben\n• Zeigt Spielernamen, Tags und RH-Stufen\n• Zeigt Discord-Verknüpfungsstatus\n\n**Verfolgte Clans** - Balkendiagramm aller verfolgten Clans nach Kriegsliga gruppiert\n• Wird als Bild in den Kanal gepostet\n\n**Managed CWLs** (Bot-Admin) - Liste aller Server mit einer verwalteten CWL für eine Saison\n• `season`-Parameter: CWL-Saison als JJJJ-MM — ohne Angabe wird die nächste bevorstehende Saison verwendet\n\n**Beispiele:**\n`/list action:Accounts`\n`/list action:Families`\n`/list action:Players clan:#L2J0C0PY`\n`/list action:Players family:#FAMILY123`\n`/list action:Tracked Clans`\n`/list action:Managed CWLs season:2026-09`"
       },
       "whois": {
         "short": "CoC-Konten für einen Discord-Nutzer oder Kriegsverlauf für einen Spieler",
@@ -263,6 +263,11 @@
     },
     "subscribe": {},
     "unsubscribe": {},
+    "list": {
+      "tracked_clans_no_data": "Keine Kriegsliga-Daten für getrackte Clans gefunden.",
+      "managed_cwls_no_data": "Kein Server hat eine verwaltete CWL für Saison {season}.",
+      "invalid_season_format": "„{season}“ ist keine gültige Saison — bitte JJJJ-MM verwenden (z. B. 2026-09)."
+    },
     "admin": {
       "set_language": {
         "success": "✅ Server-Sprache erfolgreich auf {language_name} gesetzt",
@@ -788,6 +793,7 @@
       "button_configure_clans": "Teilnehmende Clans konfigurieren",
       "button_start_enrollment": "Anmeldephase starten",
       "button_manage_assignment": "Teams verwalten",
+      "button_open_enrollment_after_start": "Team-Verwaltung öffnen",
       "button_delete_season": "Saison löschen",
       "button_confirm_delete": "Ja, Saison löschen",
       "button_add_season": "Neue Saison hinzufügen",

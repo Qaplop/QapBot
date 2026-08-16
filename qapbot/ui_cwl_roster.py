@@ -357,15 +357,25 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     view.add_item(delete_button)  # type: ignore[arg-type]
 
     # 5th and last slot in row 3 (Discord's per-row button cap) — the sole place that creates a
-    # season and/or offers the carry-over-from-last-month prompt (Phase E.3/E.4).
-    add_season_button = discord.ui.Button(
-        label=t('cwl.management.button_add_season', guild_id=guild_id),
-        style=discord.ButtonStyle.success,
-        custom_id="cwl_management_add_season",
-        row=3,
-    )
-    add_season_button.callback = _make_cwl_management_add_season_callback(view)  # type: ignore[assignment]
-    view.add_item(add_season_button)  # type: ignore[arg-type]
+    # season and/or offers the carry-over-from-last-month prompt (Phase E.3/E.4). Omitted
+    # entirely (not just disabled) once adding one is genuinely impossible — 2026-08-16,
+    # live-testing feedback, project owner's spec: "when adding a new season is not possible, the
+    # corresponding button should not be visible" — a deliberate exception to this screen's usual
+    # "present but greyed out" convention for the other action buttons, since this one stays
+    # unusable for the entire rest of the current CWL month once the season for it already
+    # exists, not just until some nearer, more interesting condition is met.
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+
+    target_season = resolve_current_cwl_season()
+    if db is None or db.get_cwl_event_sync(str(guild_id), target_season) is None:
+        add_season_button = discord.ui.Button(
+            label=t('cwl.management.button_add_season', guild_id=guild_id),
+            style=discord.ButtonStyle.success,
+            custom_id="cwl_management_add_season",
+            row=3,
+        )
+        add_season_button.callback = _make_cwl_management_add_season_callback(view)  # type: ignore[assignment]
+        view.add_item(add_season_button)  # type: ignore[arg-type]
 
     if event is not None:
         # Surfaced so an admin opening this screen can see at a glance whether every
@@ -477,11 +487,48 @@ def _make_cwl_management_add_season_callback(view: discord.ui.View):
                 t('cwl.management.add_season_failed', guild_id=guild_id_int), ephemeral=True,
             )
             return
+        # Auto-enable every family clan (2026-08-16 follow-up, live-testing feedback, project
+        # owner's spec: "if after the previous cwls no clan in the guild is enabled then
+        # auto-enable all clans of the guild. It doesn't make sense that no clan is enabled after
+        # the season was created"). The first fix for this only covered the carry-over ("Yes")
+        # path inside CwlCarryOverPromptView._create_season — it never touched THIS branch, which
+        # fires whenever get_previous_cwl_event_clans_sync() finds no previously-participating
+        # rows at all (a genuinely brand-new guild, or a guild whose prior season also had zero
+        # clans enabled) and skips the carry-over prompt entirely, leaving zero cwl_event_clans
+        # rows — the exact same "nothing checked" symptom, reached via a completely different
+        # code path the first fix never covered. No history to preserve a split from here (there
+        # IS no prior data at all), so every family clan is unconditionally enabled.
+        #
+        # cwl_start_at explicitly set to the same default _build_clan_config_payload() would have
+        # shown for a nonexistent row (2026-08-16 follow-up, live-testing feedback: writing a real
+        # row here — needed for participating=True to persist — meant that fallback no longer
+        # applied, since it only ever fires when NO row exists at all; the date field rendered
+        # empty instead of pre-filled once a row with cwl_start_at=NULL existed instead of no row).
+        from qapbot.QBdiscocmdshelper_cwl import resolve_guild_member_clan_tags
+
+        family_clan_tags = resolve_guild_member_clan_tags(guild_id_int)
+        if family_clan_tags:
+            default_start_at = f"{target_season}-01T08:00Z"
+            db.set_cwl_event_clans_sync(event_id, [
+                {
+                    "clan_tag": clan_tag, "roster_size": 15, "tier_order": 0,
+                    "cwl_start_at": default_start_at, "participating": True,
+                }
+                for clan_tag in family_clan_tags
+            ])
         config = CACHE.server_config.setdefault(guild_id_str, {})
         config["cwl_selected_season"] = target_season
         await CACHE.persist_server_config(guild_id_str)
-        await interaction.response.defer(thinking=False, ephemeral=True)
-        await _refresh_parent(view, interaction, "cwl_management")
+        # Auto-opens "Configure Participating Clans" as the logical next step (2026-08-16,
+        # live-testing feedback, project owner's spec: "after adding a new season we should add a
+        # logic that the Configure Participating Clans view is opened automatically as a logical
+        # consequence of adding a new season") — all the DB work above is fast/synchronous, so it
+        # can finish before responding, letting this be the interaction's own first response
+        # (LAUNCH_ACTIVITY has no deferred form — see _launch_cwl_activity's docstring). Replaces
+        # the old defer()+_refresh_parent() call: the Hub message no longer needs a separate
+        # refresh here since closing the Activity already triggers one via
+        # POST /api/cwl/activity-closed.
+        await _launch_cwl_activity(interaction, guild_id_int, "clan_config")
 
     return callback
 
@@ -561,17 +608,37 @@ class CwlCarryOverPromptView(discord.ui.View):
             # re-enrolled here via real history but never manually toggled on before just gets
             # this dict's plain defaults, same as a brand-new family clan would).
             previous_settings = {r["clan_tag"]: r for r in self.previous_rows}
+            # Same default _build_clan_config_payload() would show for a nonexistent row
+            # (2026-08-16, live-testing feedback: a clan with no prior settings — brand new to
+            # the family, or only ever enabled via the auto-enable-all fallback below — got
+            # cwl_start_at=NULL here, and once a real row exists that fallback in the payload
+            # builder no longer applies, so the date field rendered empty instead of pre-filled).
+            default_start_at = f"{self.target_season}-01T08:00Z"
             clan_configs = [
                 {
                     "clan_tag": clan_tag,
                     "target_league_rank": previous_settings.get(clan_tag, {}).get("target_league_rank"),
                     "roster_size": previous_settings.get(clan_tag, {}).get("roster_size", 15),
                     "tier_order": previous_settings.get(clan_tag, {}).get("tier_order", 0),
-                    "cwl_start_at": previous_settings.get(clan_tag, {}).get("cwl_start_at"),
+                    "cwl_start_at": previous_settings.get(clan_tag, {}).get("cwl_start_at") or default_start_at,
                     "participating": clan_tag in played_last_season,
                 }
                 for clan_tag in family_clan_tags
             ]
+            # Auto-enable-all fallback (2026-08-16, live-testing feedback, project owner's spec,
+            # verbatim: "if after the previous cwls no clan in the guild is enabled then
+            # auto-enable all clans of the guild. It doesn't make sense that no clan is enabled
+            # after the season was created") — played_last_season comes from real war history for
+            # the guild's *previous* season, so a guild with no tracked CWL history at all (brand
+            # new to the bot, or simply took a season off) ends up with every family clan
+            # correctly-but-uselessly defaulted to participating=False, handing the admin a new
+            # season where literally nothing is checked. Only fires when EVERY family clan came
+            # back False and there's at least one family clan to enable — a guild where some
+            # clans genuinely didn't play last season while others did is left exactly as
+            # computed, since that split is real, useful information, not a degenerate case.
+            if family_clan_tags and not any(c["participating"] for c in clan_configs):
+                for config in clan_configs:
+                    config["participating"] = True
             db.set_cwl_event_clans_sync(event_id, clan_configs)
         config = CACHE.server_config.setdefault(guild_id_str, {})
         config["cwl_selected_season"] = self.target_season
@@ -580,13 +647,18 @@ class CwlCarryOverPromptView(discord.ui.View):
     async def _finish(self, interaction: discord.Interaction, apply_carry_over: bool) -> None:
         if not await _check_cwl_admin_permission(interaction):
             return
-        await interaction.response.defer(thinking=False, ephemeral=True)
         await self._create_season(interaction.user.id, apply_carry_over)
-        try:
-            await interaction.delete_original_response()
-        except discord.NotFound:
-            pass
-        await _refresh_parent(self.parent_view, interaction, "cwl_management")
+        # Auto-opens "Configure Participating Clans" as the logical next step (2026-08-16,
+        # live-testing feedback, project owner's spec — see _launch_cwl_activity's docstring for
+        # the hard "must be this interaction's first response" constraint this relies on).
+        # Trade-off: this consumes the interaction's one response slot, so — unlike the previous
+        # defer()+delete_original_response() sequence — this Yes/No prompt message itself can no
+        # longer be cleanly deleted afterward; it's left in place with its now-inert buttons
+        # (Discord surfaces "This interaction failed" if clicked again) rather than skip the
+        # auto-launch to preserve that cleanup. The Hub message no longer needs a separate
+        # refresh here either — closing the Activity already triggers one via
+        # POST /api/cwl/activity-closed.
+        await _launch_cwl_activity(interaction, self.guild_id, "clan_config")
 
     async def _on_yes(self, interaction: discord.Interaction) -> None:
         await self._finish(interaction, apply_carry_over=True)
@@ -595,81 +667,76 @@ class CwlCarryOverPromptView(discord.ui.View):
         await self._finish(interaction, apply_carry_over=False)
 
 
-def _make_cwl_management_open_web_callback(view: discord.ui.View):
+async def _launch_cwl_activity(interaction: discord.Interaction, guild_id: int, screen: str) -> None:
     """Opens the CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Discord Activity in-context via the
     LAUNCH_ACTIVITY interaction-response callback (type 12) — flagged in the plan as unverified
     from a plain component interaction (only confirmed working for the auto-created Entry Point
-    /launch command). discord.py has no high-level wrapper for this callback type, so it's a
-    raw REST call through the bot's own HTTPClient, matching the plan's documented mechanism.
+    /launch command; live-testing this session confirms it does work from a component click).
+    discord.py has no high-level wrapper for this callback type, so it's a raw REST call through
+    the bot's own HTTPClient, matching the plan's documented mechanism.
+
+    **Hard constraint (2026-08-16, live-testing feedback — this governs every caller below):**
+    type 12 MUST be *interaction*'s very first response — Discord allows exactly one initial
+    response per interaction, and LAUNCH_ACTIVITY has no "deferred" or "followup" variant. A
+    caller that has already called `interaction.response.defer()`/`send_message()`/`edit_message()`
+    for this exact interaction can never call this function afterwards for it — any DB work that
+    needs to finish before the Activity opens (so its GET calls see the final state, not a stale
+    one) must run to completion *before* calling this, not after. This is why "auto-open the
+    Activity after Start Enrollment finishes" isn't implemented the same way: that operation sends
+    a real multi-second DM blast, so its confirming interaction has to reply with immediate
+    "processing…" feedback (consuming the interaction's one response slot) long before the result
+    is known — there is no Discord-API-legal way to defer a response and still launch the Activity
+    once the slow work completes. Only genuinely fast, synchronous completions (season creation)
+    can auto-launch this way; anything that needs a "please wait" state cannot.
     """
+    CACHE.pending_cwl_activity_screen[(str(guild_id), str(interaction.user.id))] = screen
+    from discord.http import Route
+
+    try:
+        await interaction.client.http.request(
+            Route(
+                "POST",
+                "/interactions/{interaction_id}/{interaction_token}/callback",
+                interaction_id=interaction.id,
+                interaction_token=interaction.token,
+            ),
+            json={"type": 12, "data": {}},  # 12 = LAUNCH_ACTIVITY
+        )
+    except Exception as e:
+        logging.warning(f"[CWL] LAUNCH_ACTIVITY callback failed, falling back to a text hint: {e}")
+        if not interaction.response.is_done():
+            from qapbot.i18n import t
+            fallback_key = 'cwl.management.open_web_fallback' if screen == "clan_config" else 'cwl.management.open_enrollment_fallback'
+            try:
+                await interaction.response.send_message(t(fallback_key, guild_id=guild_id), ephemeral=True)
+            except Exception:
+                pass
+
+
+def _make_cwl_management_open_web_callback(view: discord.ui.View):
+    """LAUNCH_ACTIVITY callback for the "Configure Participating Clans" button — see
+    _launch_cwl_activity's own docstring for the underlying mechanism."""
     async def callback(interaction: discord.Interaction) -> None:
         if not await _check_cwl_admin_permission(interaction):
             return
         guild_id = interaction.guild.id if interaction.guild else None
         if guild_id is not None:
-            CACHE.pending_cwl_activity_screen[(str(guild_id), str(interaction.user.id))] = "clan_config"
-        from discord.http import Route
-
-        try:
-            await interaction.client.http.request(
-                Route(
-                    "POST",
-                    "/interactions/{interaction_id}/{interaction_token}/callback",
-                    interaction_id=interaction.id,
-                    interaction_token=interaction.token,
-                ),
-                json={"type": 12, "data": {}},  # 12 = LAUNCH_ACTIVITY
-            )
-        except Exception as e:
-            logging.warning(f"[CWL] LAUNCH_ACTIVITY callback failed, falling back to a text hint: {e}")
-            if not interaction.response.is_done():
-                from qapbot.i18n import t
-                try:
-                    await interaction.response.send_message(
-                        t('cwl.management.open_web_fallback', guild_id=guild_id),
-                        ephemeral=True,
-                    )
-                except Exception:
-                    pass
+            await _launch_cwl_activity(interaction, guild_id, "clan_config")
 
     return callback
 
 
 def _make_cwl_management_open_enrollment_web_callback(view: discord.ui.View):
-    """Same LAUNCH_ACTIVITY mechanism as _make_cwl_management_open_web_callback above, but
-    records "enrollment" as the pending screen (CACHE.pending_cwl_activity_screen) before
-    launching, and is gated by the admin-or-leader permission tier rather than admin-only —
-    this is the "Manage Assignment" button's callback (CWL_ROSTER_PLANNING_PLAN.md "Manage
-    Enrollment" slice 5)."""
+    """Same LAUNCH_ACTIVITY mechanism as _make_cwl_management_open_web_callback above (see
+    _launch_cwl_activity's own docstring), but records "enrollment" as the pending screen and is
+    gated by the admin-or-leader permission tier rather than admin-only — this is the "Manage
+    Assignment" button's callback (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment" slice 5)."""
     async def callback(interaction: discord.Interaction) -> None:
         if not await _check_cwl_admin_or_leader_permission(interaction):
             return
         guild_id = interaction.guild.id if interaction.guild else None
         if guild_id is not None:
-            CACHE.pending_cwl_activity_screen[(str(guild_id), str(interaction.user.id))] = "enrollment"
-        from discord.http import Route
-
-        try:
-            await interaction.client.http.request(
-                Route(
-                    "POST",
-                    "/interactions/{interaction_id}/{interaction_token}/callback",
-                    interaction_id=interaction.id,
-                    interaction_token=interaction.token,
-                ),
-                json={"type": 12, "data": {}},  # 12 = LAUNCH_ACTIVITY
-            )
-        except Exception as e:
-            logging.warning(f"[CWL] LAUNCH_ACTIVITY callback failed, falling back to a text hint: {e}")
-            if not interaction.response.is_done():
-                from qapbot.i18n import t
-                try:
-                    await interaction.response.send_message(
-                        t('cwl.management.open_enrollment_fallback', guild_id=guild_id),
-                        ephemeral=True,
-                    )
-                except Exception:
-                    pass
+            await _launch_cwl_activity(interaction, guild_id, "enrollment")
 
     return callback
 
@@ -861,8 +928,20 @@ class CwlStartEnrollmentConfirmView(discord.ui.View):
                 skipped_unlinked=summary["skipped_unlinked"],
                 skipped_dm_guard=summary["skipped_dm_guard"],
             )
+        # A one-click "open Teams Management" follow-up (2026-08-16, live-testing feedback,
+        # project owner's spec: "when starting the enrollment process the 'Teams Management' view
+        # should be opened automatically after the enrollment start is finished") — true
+        # zero-click auto-launch isn't achievable here the way it is for Add New Season: this
+        # confirm click already had to respond immediately with "processing…" feedback (above),
+        # long before start_cwl_enrollment()'s multi-second DM blast finishes, and LAUNCH_ACTIVITY
+        # has no deferred form (see _launch_cwl_activity's own docstring) — there's no legal way to
+        # defer this interaction's response and still launch the Activity once the result is
+        # known. This button is the closest equivalent: it's already sitting in the completion
+        # message, one click away, rather than making the admin navigate back to find "Manage
+        # Assignment" again. Only shown on success — nothing to manage yet if it failed.
+        follow_up_view = CwlOpenEnrollmentView(self.guild_id) if summary["ok"] else None
         try:
-            await interaction.edit_original_response(content=content, view=None)
+            await interaction.edit_original_response(content=content, view=follow_up_view)
         except discord.NotFound:
             pass
         if summary["ok"]:
@@ -883,6 +962,35 @@ class CwlStartEnrollmentConfirmView(discord.ui.View):
             await interaction.delete_original_response()
         except discord.NotFound:
             pass
+
+
+class CwlOpenEnrollmentView(discord.ui.View):
+    """One-button follow-up shown on Start Enrollment's completion message (2026-08-16,
+    live-testing feedback, project owner's spec: "when starting the enrollment process the 'Teams
+    Management' view should be opened automatically after the enrollment start is finished").
+    True zero-click auto-launch isn't achievable here — see CwlStartEnrollmentConfirmView._on_
+    confirm's own comment for why — so this is the closest legal equivalent: the button is
+    already sitting in the completion message, one click away, instead of making the admin
+    navigate back to find "Manage Assignment" again."""
+
+    def __init__(self, guild_id: int, timeout: int = 300):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+
+        from qapbot.i18n import t
+
+        open_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.management.button_open_enrollment_after_start', guild_id=guild_id),
+            style=discord.ButtonStyle.primary,
+            custom_id="cwl_open_enrollment_after_start",
+        )
+        open_button.callback = self._on_open  # type: ignore[assignment]
+        self.add_item(open_button)
+
+    async def _on_open(self, interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_or_leader_permission(interaction):
+            return
+        await _launch_cwl_activity(interaction, self.guild_id, "enrollment")
 
 
 # ---------------------------------------------------------------------------

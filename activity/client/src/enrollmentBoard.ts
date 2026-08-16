@@ -92,6 +92,18 @@ function sortPlayers(players: EnrollmentPlayer[], order: SortOrder): EnrollmentP
 
 const COLUMN_DRAG_TYPE = 'application/x-cwl-column-index'
 
+// Orphaned-assignment column (2026-08-16, project owner's spec): a player can end up assigned to
+// a clan_tag that's no longer one of this guild's participating columns at all — most commonly a
+// shared clan the guild has since detached from (its column disappears, but the underlying
+// assignment — local cwl_assignments for a plain guest clan, or a mirrored one for a former
+// shared clan — was deliberately left in place rather than silently cleared, so the clan lead
+// isn't left guessing where that player went). Before this fix such a player simply vanished
+// from the board entirely (playersFor() only ever matched a REAL column's own tag, so an
+// unrecognized assigned_clan_tag matched nothing, not even Unassigned) — this sentinel gives
+// them a real, always-draggable-out home instead. Guaranteed never to collide with a real CoC
+// clan tag (those always start with '#').
+const ORPHANED_COLUMN_TAG = '__orphaned__'
+
 /**
  * Renders the CWL "Manage Assignment" board — participating clans as drag-and-drop columns plus
  * an "Unassigned" pool, each player a compact card: TH icon + level, name, skill score, and a
@@ -107,20 +119,46 @@ const COLUMN_DRAG_TYPE = 'application/x-cwl-column-index'
  * The title/legend/sort-order block is a `position: sticky` header so it stays in view while a
  * long roster scrolls (each column also scrolls internally past a height cap).
  */
+export type EnrollmentBoardHandle = {
+  /** Merges freshly-fetched player data into the live board (2026-08-16, live-testing feedback:
+   * "would it be possible to auto-update this view whenever a user changes his confirmation
+   * setting?") — see the function's own definition below for exactly which fields are safe to
+   * live-update and why `assigned_clan_tag` deliberately isn't one of them. */
+  applyPolledUpdate: (freshPlayers: EnrollmentPlayer[]) => void
+}
+
 export function renderEnrollmentBoard(
   container: HTMLElement,
   payload: EnrollmentPayload,
   onAssignAction: (playerTag: string, clanTag: string | null) => Promise<void>,
   onClose: (reason: string) => void,
-): void {
+): EnrollmentBoardHandle {
   const working: EnrollmentPlayer[] = payload.players.map((p) => ({ ...p }))
   const byTag = new Map(working.map((p) => [p.player_tag, p]))
+  // Set for the duration of any native HTML5 drag gesture (player card or column-header) — a
+  // poll-triggered renderBoard() mid-drag would tear down the very DOM node the browser is
+  // currently dragging, silently aborting the gesture (2026-08-16, live-testing feedback: polling
+  // support). applyPolledUpdate() below checks this and simply defers to the next poll tick
+  // instead of rendering mid-gesture.
+  let isDragging = false
   let sortOrder: SortOrder = 'th'
   let displayMetric: DisplayMetric = 'avg_stars'
+  const knownClanTags = new Set(payload.clans.map((c) => c.clan_tag))
+  const hasOrphanedAssignments = working.some(
+    (p) => p.assigned_clan_tag !== null && !knownClanTags.has(p.assigned_clan_tag),
+  )
   // Column order: participating clans (already tier-sorted by the bridge, highest league
-  // first — see _build_enrollment_payload), Unassigned pool last. Mutable so column headers can
-  // be dragged to reorder — a purely client-side arrangement, not persisted.
-  let columnOrder: (string | null)[] = [...payload.clans.map((c) => c.clan_tag), null]
+  // first — see _build_enrollment_payload), then the orphaned-assignment column (only when
+  // actually needed — see ORPHANED_COLUMN_TAG), Unassigned pool last. Mutable so column headers
+  // can be dragged to reorder — a purely client-side arrangement, not persisted. Computed once
+  // at setup, same as every other column — if the clan lead reassigns every orphaned player away
+  // during this session the column stays put (now empty) rather than disappearing mid-session,
+  // matching how every other column already behaves once shown.
+  let columnOrder: (string | null)[] = [
+    ...payload.clans.map((c) => c.clan_tag),
+    ...(hasOrphanedAssignments ? [ORPHANED_COLUMN_TAG] : []),
+    null,
+  ]
   // buildColumn()/renderBoard() hand-off for sizing each column's roster-band-bg overlay — see
   // buildColumn()'s comment on why this needs a second pass after DOM attachment.
   let pendingBandSizing: { bg: HTMLElement; lastCard: HTMLElement }[] = []
@@ -147,6 +185,12 @@ export function renderEnrollmentBoard(
     buildLegendItem(gcheckIconUrl, STATUS_LABEL.confirmed),
     buildLegendItem(redxIconUrl, STATUS_LABEL.declined),
     buildLegendItem(unlinkedIconUrl, UNLINKED_LABEL),
+    // Guest indicator (2026-08-16, live-testing feedback: "what is the meaning of the small
+    // yellow band" — the .guest-card left-accent already had a hover tooltip, but that's not
+    // discoverable without hovering every card; a legend entry is) — a small swatch reproducing
+    // the exact same inset box-shadow .guest-card itself uses, so it reads as "this is what that
+    // accent means" rather than an unrelated new symbol.
+    buildGuestLegendItem(),
   )
   titleRow.appendChild(legend)
 
@@ -231,10 +275,11 @@ export function renderEnrollmentBoard(
   }
 
   function playersFor(clanTag: string | null): EnrollmentPlayer[] {
-    const sorted = sortPlayers(
-      working.filter((p) => p.assigned_clan_tag === clanTag),
-      sortOrder,
-    )
+    const matches =
+      clanTag === ORPHANED_COLUMN_TAG
+        ? (p: EnrollmentPlayer) => p.assigned_clan_tag !== null && !knownClanTags.has(p.assigned_clan_tag)
+        : (p: EnrollmentPlayer) => p.assigned_clan_tag === clanTag
+    const sorted = sortPlayers(working.filter(matches), sortOrder)
     if (clanTag !== null) return sorted
     // Unassigned only — opted-out players always sort last (Array.sort is stable, so each
     // partition keeps the order sortPlayers() already gave it).
@@ -281,8 +326,12 @@ export function renderEnrollmentBoard(
       e.dataTransfer?.setData('text/plain', player.player_tag)
       if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
       card.classList.add('dragging')
+      isDragging = true
     })
-    card.addEventListener('dragend', () => card.classList.remove('dragging'))
+    card.addEventListener('dragend', () => {
+      card.classList.remove('dragging')
+      isDragging = false
+    })
 
     const row = document.createElement('div')
     row.className = 'player-row'
@@ -395,11 +444,12 @@ export function renderEnrollmentBoard(
   }
 
   function buildColumn(clanTag: string | null, index: number): HTMLElement {
+    const isOrphanedColumn = clanTag === ORPHANED_COLUMN_TAG
     const column = document.createElement('div')
-    column.className = clanTag === null ? 'column column-unassigned' : 'column'
+    column.className = clanTag === null ? 'column column-unassigned' : isOrphanedColumn ? 'column column-orphaned' : 'column'
 
     const players = playersFor(clanTag)
-    const clan = clanTag === null ? null : payload.clans.find((c) => c.clan_tag === clanTag)
+    const clan = clanTag === null || isOrphanedColumn ? null : payload.clans.find((c) => c.clan_tag === clanTag)
     const rosterSize = clan?.roster_size ?? null
 
     // Two lines: clan name (+ count) on top, league tier below — no clan tag, no "·" separator
@@ -417,7 +467,7 @@ export function renderEnrollmentBoard(
     nameLine.className = 'column-header-name'
     const nameSpan = document.createElement('span')
     nameSpan.className = 'column-header-name-text'
-    nameSpan.textContent = clanTag === null ? 'Unassigned' : (clan?.name ?? clanTag)
+    nameSpan.textContent = clanTag === null ? 'Unassigned' : isOrphanedColumn ? 'Assigned to other Guild' : (clan?.name ?? clanTag)
     nameLine.appendChild(nameSpan)
     const countSpan = document.createElement('span')
     countSpan.className = 'column-count'
@@ -444,8 +494,12 @@ export function renderEnrollmentBoard(
       e.dataTransfer?.setData(COLUMN_DRAG_TYPE, String(index))
       if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
       column.classList.add('dragging')
+      isDragging = true
     })
-    columnHeader.addEventListener('dragend', () => column.classList.remove('dragging'))
+    columnHeader.addEventListener('dragend', () => {
+      column.classList.remove('dragging')
+      isDragging = false
+    })
     column.appendChild(columnHeader)
 
     const cardList = document.createElement('div')
@@ -517,6 +571,9 @@ export function renderEnrollmentBoard(
         handleColumnReorder(Number(e.dataTransfer.getData(COLUMN_DRAG_TYPE)), index)
         return
       }
+      // Not a real assignment target — there's no clan_tag to assign anyone TO here, only
+      // players already stuck here to drag back OUT. Column reordering (above) still works.
+      if (isOrphanedColumn) return
       const playerTag = e.dataTransfer?.getData('text/plain')
       if (!playerTag) return
       const player = byTag.get(playerTag)
@@ -547,7 +604,62 @@ export function renderEnrollmentBoard(
     }
   }
 
+  // Live-polling support (2026-08-16, live-testing feedback: "would it be possible to auto-update
+  // this view whenever a user changes his confirmation setting?"). main.ts calls this on a
+  // timer with a freshly-fetched payload's players. Deliberately merges only the fields another
+  // person's action could actually change — a member's own DM response (signup_status), their
+  // live CoC state (th_level/th_icon_url/current_clan_tag), or another admin's guest-invite
+  // action (is_guest/discord_id/player_name) — never `assigned_clan_tag`. That field is this
+  // board's own optimistic drag-and-drop state, confirmed or reverted by handleDrop()'s own
+  // direct POST response; blindly overwriting it from a poll tick that raced an in-flight local
+  // drag would visually snap a card back to its pre-drag column for a moment, then snap forward
+  // again once the drag's own response lands — a strictly worse experience than just not touching
+  // it here at all. Skips entirely while a native drag gesture is in progress (isDragging) since
+  // tearing down the board mid-gesture would silently abort it; the next poll tick catches up.
+  function applyPolledUpdate(freshPlayers: EnrollmentPlayer[]): void {
+    if (isDragging) return
+    let changed = false
+    for (const fresh of freshPlayers) {
+      const existing = byTag.get(fresh.player_tag)
+      if (!existing) {
+        // A genuinely new player (e.g. just invited as a guest, or freshly resolved from a
+        // linked account) — add them so they show up without needing a manual reopen.
+        const added: EnrollmentPlayer = { ...fresh }
+        working.push(added)
+        byTag.set(added.player_tag, added)
+        changed = true
+        continue
+      }
+      if (
+        existing.signup_status !== fresh.signup_status ||
+        existing.player_name !== fresh.player_name ||
+        existing.discord_id !== fresh.discord_id ||
+        existing.th_level !== fresh.th_level ||
+        existing.th_icon_url !== fresh.th_icon_url ||
+        existing.skill_score !== fresh.skill_score ||
+        existing.avg_stars !== fresh.avg_stars ||
+        existing.cwl_permanent_optout !== fresh.cwl_permanent_optout ||
+        existing.current_clan_tag !== fresh.current_clan_tag ||
+        existing.is_guest !== fresh.is_guest
+      ) {
+        existing.signup_status = fresh.signup_status
+        existing.player_name = fresh.player_name
+        existing.discord_id = fresh.discord_id
+        existing.th_level = fresh.th_level
+        existing.th_icon_url = fresh.th_icon_url
+        existing.skill_score = fresh.skill_score
+        existing.avg_stars = fresh.avg_stars
+        existing.cwl_permanent_optout = fresh.cwl_permanent_optout
+        existing.current_clan_tag = fresh.current_clan_tag
+        existing.is_guest = fresh.is_guest
+        changed = true
+      }
+    }
+    if (changed) renderBoard()
+  }
+
   renderBoard()
+  return { applyPolledUpdate }
 }
 
 function buildLegendItem(iconUrl: string, label: string): HTMLElement {
@@ -558,6 +670,15 @@ function buildLegendItem(iconUrl: string, label: string): HTMLElement {
   icon.src = iconUrl
   icon.alt = label
   item.append(icon, label)
+  return item
+}
+
+function buildGuestLegendItem(): HTMLElement {
+  const item = document.createElement('span')
+  item.className = 'legend-item'
+  const swatch = document.createElement('span')
+  swatch.className = 'legend-guest-swatch'
+  item.append(swatch, 'Guest (from another clan/guild)')
   return item
 }
 

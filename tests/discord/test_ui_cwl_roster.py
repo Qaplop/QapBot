@@ -7,7 +7,7 @@ the sole clan-config entry point; the native toggle-and-carry-over flow was reti
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -635,7 +635,7 @@ async def test_cwl_delete_season_confirm_view_warns_about_shared_clans(db, mock_
     shared_clan_id = db.create_cwl_shared_clan_sync("#CLAN1", "2026-09", "446", event_id, "unresolved_first_claimer")
     db.add_guild_to_shared_clan_sync(shared_clan_id, "446", event_id)
     db.add_guild_to_shared_clan_sync(shared_clan_id, "447", other_event_id)
-    db.upsert_cwl_shared_clan_player_sync(shared_clan_id, "#P1", "Player", "111", "confirmed", "guest_invite", "446")
+    db.set_cwl_shared_clan_player_status_sync(shared_clan_id, "#P1", "Player", "111", "confirmed", "guest_invite", "446")
 
     shared_clan_info = get_cwl_event_shared_clan_info_sync(event_id, 446, "2026-09")
     parent = MagicMock()
@@ -777,6 +777,11 @@ async def test_cwl_management_open_enrollment_web_callback_falls_back_if_launch_
 @pytest.mark.discord
 @pytest.mark.asyncio
 async def test_add_season_creates_event_directly_when_no_previous_data(db, mock_interaction):
+    """2026-08-16 follow-up, live-testing feedback, project owner's spec: "after adding a new
+    season we should add a logic that the Configure Participating Clans view is opened
+    automatically as a logical consequence of adding a new season" — verified here via the
+    LAUNCH_ACTIVITY interaction-response callback, same mechanism/assertion pattern as
+    test_cwl_management_open_web_callback_sends_launch_activity below."""
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
     from qapbot.ui_cwl_roster import _make_cwl_management_add_season_callback
@@ -784,7 +789,10 @@ async def test_add_season_creates_event_directly_when_no_previous_data(db, mock_
     await _seed_guild_and_clans(db, "1111", {"#CLAN1": "Alpha"})
     CACHE.db_manager = db
     CACHE.server_config["1111"] = {}
+    mock_interaction.id = 42
+    mock_interaction.token = "test-token"
     mock_interaction.guild.id = 1111
+    mock_interaction.user.id = 999
 
     parent = MagicMock()
     parent.refresh_cwl_view = AsyncMock()
@@ -795,8 +803,51 @@ async def test_add_season_creates_event_directly_when_no_previous_data(db, mock_
     season = resolve_current_cwl_season()
     assert db.get_cwl_event_sync("1111", season) is not None
     assert CACHE.server_config["1111"]["cwl_selected_season"] == season
-    parent.refresh_cwl_view.assert_awaited_once()
-    assert parent.refresh_cwl_view.await_args.args[1] == "cwl_management"
+    mock_interaction.client.http.request.assert_awaited_once()
+    _, kwargs = mock_interaction.client.http.request.await_args
+    assert kwargs["json"] == {"type": 12, "data": {}}  # 12 = LAUNCH_ACTIVITY
+    assert CACHE.pending_cwl_activity_screen[("1111", "999")] == "clan_config"
+    # No carry-over data existed, so no ephemeral prompt should have been sent either.
+    mock_interaction.followup.send.assert_not_awaited()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_add_season_auto_enables_family_clans_when_no_previous_data_at_all(db, mock_interaction):
+    """2026-08-16 follow-up, live-testing feedback, project owner's spec, verbatim: "just created
+    a new season after restarting the dev bot and still all clans unchecked! you said you fixed
+    this but your fix doesn't work." The first fix only covered CwlCarryOverPromptView's "Yes"
+    carry-over path — it never touched THIS branch, which fires whenever
+    get_previous_cwl_event_clans_sync() finds no previously-participating rows at all (a
+    genuinely brand-new guild, or a guild whose prior season also had zero clans enabled) and
+    skips the carry-over prompt entirely, leaving zero cwl_event_clans rows — the exact same
+    "nothing checked" symptom via a completely different code path."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+    from qapbot.ui_cwl_roster import _make_cwl_management_add_season_callback
+
+    await _seed_guild_and_clans(db, "1112", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
+    CACHE.db_manager = db
+    CACHE.server_config["1112"] = {"member_clans": ["#CLAN1", "#CLAN2"]}
+    mock_interaction.guild.id = 1112
+
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+
+    callback = _make_cwl_management_add_season_callback(parent)
+    await callback(mock_interaction)
+
+    season = resolve_current_cwl_season()
+    event = db.get_cwl_event_sync("1112", season)
+    assert event is not None
+    clans = {c["clan_tag"]: c for c in db.get_cwl_event_clans_sync(event["id"])}
+    assert clans["#CLAN1"]["participating"] == 1
+    assert clans["#CLAN2"]["participating"] == 1
+    # 2026-08-16 follow-up: writing a real row here (needed for participating=True to persist)
+    # meant _build_clan_config_payload's "no row -> default start time" fallback no longer
+    # applied — the date field must still come pre-filled, not empty.
+    assert clans["#CLAN1"]["cwl_start_at"] == f"{season}-01T08:00Z"
+    assert clans["#CLAN2"]["cwl_start_at"] == f"{season}-01T08:00Z"
     # No carry-over data existed, so no ephemeral prompt should have been sent either.
     mock_interaction.followup.send.assert_not_awaited()
 
@@ -868,7 +919,10 @@ async def test_cwl_carry_over_prompt_yes_presets_participating_from_real_war_his
     await _seed_guild_and_clans(db, "4444", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
     CACHE.db_manager = db
     CACHE.server_config["4444"] = {"member_clans": ["#CLAN1", "#CLAN2"]}
+    mock_interaction.id = 42
+    mock_interaction.token = "test-token"
     mock_interaction.guild.id = 4444
+    mock_interaction.user.id = 999
 
     # Previous season's admin-configured settings (roster_size etc.) — #CLAN1 only.
     old_event_id = db.create_cwl_event_sync("4444", "2026-01", "discordid1")
@@ -901,8 +955,89 @@ async def test_cwl_carry_over_prompt_yes_presets_participating_from_real_war_his
     assert clans["#CLAN2"]["participating"] == 0  # didn't play last season -> False
     assert clans["#CLAN2"]["roster_size"] == 15  # never configured before -> plain default
     assert CACHE.server_config["4444"]["cwl_selected_season"] == "2026-02"
-    mock_interaction.delete_original_response.assert_awaited_once()
-    parent.refresh_cwl_view.assert_awaited_once()
+    # 2026-08-16 follow-up: "Configure Participating Clans" now auto-opens as the logical next
+    # step, via the same LAUNCH_ACTIVITY mechanism the button itself uses — this consumes the
+    # interaction's one response slot, so the prompt message is no longer separately deleted/
+    # refreshed here (see _finish's own comment for the trade-off).
+    mock_interaction.client.http.request.assert_awaited_once()
+    _, kwargs = mock_interaction.client.http.request.await_args
+    assert kwargs["json"] == {"type": 12, "data": {}}  # 12 = LAUNCH_ACTIVITY
+    assert CACHE.pending_cwl_activity_screen[("4444", "999")] == "clan_config"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_carry_over_prompt_yes_auto_enables_all_when_none_played_last_season(db, mock_interaction):
+    """2026-08-16 follow-up, live-testing feedback, project owner's spec, verbatim: "if after the
+    previous cwls no clan in the guild is enabled then auto-enable all clans of the guild. It
+    doesn't make sense that no clan is enabled after the season was created." A guild with no
+    tracked CWL history at all (brand new to the bot, or simply took a season off) would
+    otherwise get a freshly-created season where every single family clan defaults to
+    participating=False, handing the admin a table with nothing checked."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCarryOverPromptView
+
+    await _seed_guild_and_clans(db, "4445", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
+    CACHE.db_manager = db
+    CACHE.server_config["4445"] = {"member_clans": ["#CLAN1", "#CLAN2"]}
+    mock_interaction.guild.id = 4445
+
+    # No real CWL war history anywhere for either clan — a genuinely fresh/inactive guild.
+    previous_rows: List[Dict[str, Any]] = []
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+    prompt_view = CwlCarryOverPromptView(
+        parent_view=parent, guild_id=4445, target_season="2026-02", previous_rows=previous_rows,
+    )
+
+    await prompt_view._on_yes(mock_interaction)
+
+    event = db.get_cwl_event_sync("4445", "2026-02")
+    assert event is not None
+    clans = {c["clan_tag"]: c for c in db.get_cwl_event_clans_sync(event["id"])}
+    assert clans["#CLAN1"]["participating"] == 1
+    assert clans["#CLAN2"]["participating"] == 1
+    # 2026-08-16 follow-up: a clan with no previous settings must still get a sensible default
+    # start time, not NULL — once a real row exists, the payload builder's own "no row -> default"
+    # fallback no longer applies.
+    assert clans["#CLAN1"]["cwl_start_at"] == "2026-02-01T08:00Z"
+    assert clans["#CLAN2"]["cwl_start_at"] == "2026-02-01T08:00Z"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_carry_over_prompt_yes_leaves_real_split_alone(db, mock_interaction):
+    """The auto-enable-all fallback must NOT fire when the family is a genuine mix of played/
+    didn't-play — that split is real, useful information from actual war history, not a
+    degenerate all-False case that needs rescuing."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCarryOverPromptView
+
+    await _seed_guild_and_clans(db, "4446", {"#CLAN1": "Alpha", "#CLAN2": "Bravo"})
+    CACHE.db_manager = db
+    CACHE.server_config["4446"] = {"member_clans": ["#CLAN1", "#CLAN2"]}
+    mock_interaction.guild.id = 4446
+
+    db.create_cwl_event_sync("4446", "2026-01", "discordid1")  # resolves as the previous season
+    await db.conn.execute(
+        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
+        "VALUES ('w1', '#CLAN1', '#OPP', 1, '2026-01', '2026-01-05T08:00')"
+    )
+    await db.conn.commit()
+
+    previous_rows: List[Dict[str, Any]] = []
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+    prompt_view = CwlCarryOverPromptView(
+        parent_view=parent, guild_id=4446, target_season="2026-02", previous_rows=previous_rows,
+    )
+
+    await prompt_view._on_yes(mock_interaction)
+
+    event = db.get_cwl_event_sync("4446", "2026-02")
+    clans = {c["clan_tag"]: c for c in db.get_cwl_event_clans_sync(event["id"])}
+    assert clans["#CLAN1"]["participating"] == 1  # played -> True, as computed
+    assert clans["#CLAN2"]["participating"] == 0  # didn't play -> stays False, not rescued
 
 
 @pytest.mark.discord
@@ -993,6 +1128,45 @@ async def test_season_select_present_and_configure_enabled_once_a_season_exists(
     assert values == {"2026-04"}
     configure_button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_configure_clans")
     assert configure_button.disabled is False  # type: ignore[union-attr]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_add_season_button_hidden_when_current_season_already_exists(db):
+    """2026-08-16, live-testing feedback, project owner's spec: "when adding a new season is not
+    possible, the corresponding button should not be visible" — a deliberate exception to this
+    screen's usual "present but greyed out" convention (see button_add_season's own comment)."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    await _seed_guild_and_clans(db, "8889", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["8889"] = {}
+    db.create_cwl_event_sync("8889", resolve_current_cwl_season(), "discordid1")
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 8889)
+
+    assert not any(getattr(c, "custom_id", None) == "cwl_management_add_season" for c in view.children)
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_add_season_button_visible_when_current_season_does_not_exist(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    await _seed_guild_and_clans(db, "8890", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["8890"] = {}
+    # A past/unrelated season exists, but not the current one — the button must still show.
+    db.create_cwl_event_sync("8890", "2026-01", "discordid1")
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 8890)
+
+    assert any(getattr(c, "custom_id", None) == "cwl_management_add_season" for c in view.children)
 
 
 # ---------------------------------------------------------------------------
@@ -1136,9 +1310,39 @@ async def test_start_enrollment_confirm_view_confirm_starts_enrollment_and_refre
     assert all(item.disabled for item in confirm_view.children)  # type: ignore[union-attr]
     mock_interaction.edit_original_response.assert_awaited_once()
     _, kwargs = mock_interaction.edit_original_response.call_args
-    assert kwargs["view"] is None
+    # 2026-08-16 follow-up, live-testing feedback, project owner's spec: "when starting the
+    # enrollment process the 'Teams Management' view should be opened automatically after the
+    # enrollment start is finished" — true zero-click auto-launch isn't achievable (see
+    # CwlOpenEnrollmentView's own docstring), so the completion message carries a one-click
+    # "Open Teams Management" follow-up button instead of a bare `view=None`.
+    from qapbot.ui_cwl_roster import CwlOpenEnrollmentView
+
+    assert isinstance(kwargs["view"], CwlOpenEnrollmentView)
+    assert kwargs["view"].guild_id == 9006
     parent.refresh_cwl_view.assert_awaited_once()
     assert parent.refresh_cwl_view.await_args.args[1] == "cwl_management"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_open_enrollment_view_button_launches_activity(mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlOpenEnrollmentView
+
+    mock_interaction.id = 42
+    mock_interaction.token = "test-token"
+    mock_interaction.guild.id = 9006
+    mock_interaction.user.id = 999
+
+    view = CwlOpenEnrollmentView(guild_id=9006)
+    open_button = next(iter(view.children))
+
+    await open_button.callback(mock_interaction)  # type: ignore[misc]
+
+    mock_interaction.client.http.request.assert_awaited_once()
+    _, kwargs = mock_interaction.client.http.request.await_args
+    assert kwargs["json"] == {"type": 12, "data": {}}  # 12 = LAUNCH_ACTIVITY
+    assert CACHE.pending_cwl_activity_screen[("9006", "999")] == "enrollment"
 
 
 @pytest.mark.discord

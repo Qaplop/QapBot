@@ -206,11 +206,20 @@ async def _build_clan_config_payload(guild_id: int) -> Dict[str, Any]:
         row = known_rows.get(tag)
         participating = bool(row["participating"]) if row else False
 
-        # Cross-guild shared-clan status (2026-08-15) — only meaningful for a currently
-        # participating clan; a deactivated/never-configured row has nothing to share.
+        # Cross-guild shared-clan status (2026-08-15, follow-up fix 2026-08-16: this used to be
+        # gated on `participating` too — "only meaningful for a currently participating clan" —
+        # but a clan's actual cwl_shared_clans record doesn't care whether THIS guild currently
+        # has it checked or not; it's the same real-world clan either way. Gating on
+        # `participating` meant re-checking a previously-shared-but-deactivated row's checkbox
+        # client-side (which only ever flips `clan.participating` locally, never re-fetches)
+        # showed no shared/read-only info at all until the NEXT full reload after a Save —
+        # live-testing feedback: "re-enabling should check this and if valid also show the guest
+        # clan warning and disable the clan settings," without needing an intervening save
+        # first. Computed for any KNOWN row (participating or not) instead — a never-configured
+        # clan (row is None) still has nothing to share, same as before.
         shared_with: Optional[Dict[str, Any]] = None
         effective_row = row
-        if participating and db is not None:
+        if db is not None:
             shared = db.get_cwl_shared_clan_sync(tag, season)
             if shared is not None:
                 other_guild_ids = [
@@ -398,7 +407,8 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
     # — but isn't part of the guild's own family, so resolve_guild_member_clan_tags() alone would
     # never surface its roster here; the union is what actually gives it "full participating
     # clan" treatment: a board column from `clans` above, and its live members in the pool here).
-    all_member_clan_tags = list(set(resolve_guild_member_clan_tags(guild_id)) | set(participating_clan_tags))
+    family_clan_tags = set(resolve_guild_member_clan_tags(guild_id))
+    all_member_clan_tags = list(family_clan_tags | set(participating_clan_tags))
     live_th_by_tag: Dict[str, int] = {}
     optout_by_tag: Dict[str, bool] = {}
     current_clan_by_tag: Dict[str, str] = {}
@@ -435,14 +445,22 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
                 "player_tag": tag,
                 "player_name": shared_player["player_name"],
                 "discord_id": shared_player["discord_id"],
+                # The RAW status, unconditionally (2026-08-16, live-testing feedback, project
+                # owner's spec, verbatim: "Confirmation status and assignment status should be
+                # treated completely separate... The symbols in the player tile should exclusively
+                # reflect confirmation status. The assignment status is obvious to the user from
+                # the column the player tile appears in."). `status` and `assigned` are now
+                # genuinely independent columns (see cwl_shared_clan_players' own CREATE TABLE
+                # comment) — an assignment/placement write (drag-and-drop, the auto-assign seed)
+                # never touches `status` at all, so this always reflects a real player response
+                # (or the honest 'pending' default) with nothing left to correct for here.
                 "signup_status": shared_player["status"],
                 "is_guest": shared_player["source"] == "guest_invite",
             }
-            # A shared clan has no separate assignments table — one shared_clan_id already IS
-            # exactly one clan (see cwl_shared_clan_players' own CREATE TABLE comment), so
-            # status='confirmed' IS the assignment; anything else (pending/declined/withdrawn)
-            # means not currently assigned.
-            if shared_player["status"] == "confirmed":
+            # Placement is driven by `assigned`, not `status` (2026-08-16 follow-up — the two
+            # used to be conflated into one column precisely because a shared clan has no
+            # separate assignments table; they're now genuinely separate columns instead).
+            if shared_player["assigned"]:
                 assigned_clan_by_tag[tag] = clan_tag
             else:
                 assigned_clan_by_tag.pop(tag, None)
@@ -478,7 +496,22 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
         # None only when truly unknown (no current_clan_tag on record anywhere) — lets the board
         # tell that apart from "currently in a different clan than their assignment"
         # (same-clan/different-clan highlighting, 2026-08-14).
-        player["current_clan_tag"] = current_clan_by_tag.get(player_tag, current_clan_fallback_by_tag.get(player_tag))
+        current_clan_tag = current_clan_by_tag.get(player_tag, current_clan_fallback_by_tag.get(player_tag))
+        player["current_clan_tag"] = current_clan_tag
+        # is_guest, redefined around live current-clan membership (2026-08-16 follow-up,
+        # live-testing feedback, project owner's spec, verbatim: "the yellow marker is defined as
+        # being a GUEST player for this guild... a member is a member regardless of assignment
+        # status, a guest is a guest regardless of assignment status... that rule is pretty simple
+        # and generic"). Overrides whatever the three write-path-specific markers above guessed
+        # (signup source, shared-roster source, or the hardcoded False for a plain family-clan
+        # member) whenever a live current clan is actually known — a real family-clan member must
+        # never carry the badge no matter how they ended up in this pool (e.g. old auto_assigned/
+        # auto_seeded history from a clan they've since left), and a player currently in any other
+        # clan must always carry it, including sitting unassigned or moved into "Assigned to other
+        # Guild." Only truly untrackable players (no current_clan_tag anywhere — left the game
+        # entirely) keep the earlier write-path-based guess, since there's no live signal to use.
+        if current_clan_tag is not None:
+            player["is_guest"] = current_clan_tag not in family_clan_tags
 
     players = sorted(players_by_tag.values(), key=lambda p: (p["player_name"] or p["player_tag"]).lower())
 
@@ -710,7 +743,11 @@ async def handle_post_cwl_enrollment_signup(request: web.Request) -> web.Respons
     responded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
 
     if player_shared_clan is not None:
-        db.upsert_cwl_shared_clan_player_sync(
+        # Status-only (2026-08-16, live-testing feedback, project owner's spec: confirmation and
+        # assignment must never be conflated) — confirming/withdrawing records the player's own
+        # genuine response and nothing else; whether they're actually placed in this clan's
+        # column (assigned) is a completely separate decision, left untouched either way.
+        db.set_cwl_shared_clan_player_status_sync(
             player_shared_clan["id"], player_tag, shared_roster_row["player_name"], shared_roster_row["discord_id"],
             new_status, "admin_added", str(guild_id), responded_at,
         )
@@ -775,13 +812,7 @@ async def handle_post_cwl_enrollment_assign(request: web.Request) -> web.Respons
     if db is None:
         return web.json_response({"error": "database not ready"}, status=503)
 
-    from qapbot.QBdiscocmdshelper_cwl import (
-        get_event_shared_clans_by_tag_sync,
-        purge_orphaned_shared_clan_guests_sync,
-        resolve_guild_member_clan_tags,
-        resolve_selected_cwl_season,
-        sync_cwl_shared_clan_roster_to_local_pools,
-    )
+    from qapbot.QBdiscocmdshelper_cwl import assign_cwl_player_sync, resolve_selected_cwl_season
     from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
 
     season = resolve_selected_cwl_season(guild_id)
@@ -791,58 +822,16 @@ async def handle_post_cwl_enrollment_assign(request: web.Request) -> web.Respons
             {"error": f"no CWL event exists yet for season {season}"}, status=409
         )
 
-    # Cross-guild shared-clan write-path branch (2026-08-15, slice 4) — a shared clan's roster
-    # lives in cwl_shared_clan_players, not this guild's own cwl_assignments (see
-    # _build_enrollment_payload's merge, which would just silently override a local write).
-    shared_clans_by_tag = get_event_shared_clans_by_tag_sync(event["id"], season)
-
-    # Being dragged away from a shared clan (to Unassigned, a private clan, or a DIFFERENT
-    # shared clan) — remove the player from every OTHER shared clan they currently sit in first,
-    # regardless of destination. "Other" because if clan_tag itself is the destination and also
-    # shared, that case is upserted (not deleted) below.
-    for tag, shared in shared_clans_by_tag.items():
-        if tag == clan_tag:
-            continue
-        db.delete_cwl_shared_clan_player_sync(shared["id"], player_tag)
-        # Foreign-guest purge (2026-08-15, project owner's spec) — this player just left `tag`'s
-        # shared roster (whoever did it, wherever they went instead); any OTHER guild that had
-        # cross-assigned this exact player into one of its OWN clans, on the strength of them
-        # having been a real member of `tag`, loses that legitimacy the moment they leave — purge
-        # it there too, not just here.
-        purge_orphaned_shared_clan_guests_sync(shared["id"], player_tag)
-
-    if clan_tag is not None and clan_tag in shared_clans_by_tag:
-        # Destination is a shared clan — resolve player_name/discord_id the same way
-        # handle_post_cwl_enrollment_signup does for a not-yet-signed-up player: prefer an
-        # existing signup row, else fall back to current clan membership.
-        existing_signup = db.get_cwl_signup_sync(event["id"], player_tag)
-        if existing_signup is not None:
-            player_name, discord_id = existing_signup["player_name"], existing_signup["discord_id"]
-        else:
-            candidate_tags = list(set(resolve_guild_member_clan_tags(guild_id)) | {clan_tag})
-            member = next(
-                (m for m in db.get_current_clan_members_sync(candidate_tags) if m["player_tag"] == player_tag),
-                None,
-            )
-            player_name = member["player_name"] if member else player_tag
-            discord_id = member["discord_id"] if member else None
-        db.upsert_cwl_shared_clan_player_sync(
-            shared_clans_by_tag[clan_tag]["id"], player_tag, player_name, discord_id,
-            "confirmed", "admin_override", str(guild_id),
-        )
-        # De-sync guard (2026-08-15) — see sync_cwl_shared_clan_roster_to_local_pools's docstring:
-        # keeps every OTHER attached guild's own local cwl_signups pool aware of this player too.
-        sync_cwl_shared_clan_roster_to_local_pools(shared_clans_by_tag[clan_tag]["id"])
-        # Clear any stale LOCAL assignment row too — this player's assignment now lives in the
-        # shared table exclusively (see _build_enrollment_payload's merge, which reads the
-        # shared table as authoritative regardless, but a lingering local row is dead weight).
-        db.delete_cwl_assignment_sync(event["id"], player_tag)
-    elif clan_tag is None:
-        db.delete_cwl_assignment_sync(event["id"], player_tag)
-    else:
-        db.upsert_cwl_assignment_sync(
-            event["id"], player_tag, str(clan_tag), assignment_source="admin_override", locked=True
-        )
+    # A deliberate human drag-and-drop action — routed through the one general assignment method
+    # (2026-08-16, live-testing feedback, project owner's spec: "one general method that assigns
+    # players to any pool and the race condition checks should all be implemented there") so the
+    # conflict-purge (evicting the player from any OTHER shared clan they're already confirmed in)
+    # can never be skipped here or by any other write path. See assign_cwl_player_sync's own
+    # docstring for the full purge/write logic this used to duplicate inline.
+    assign_cwl_player_sync(
+        guild_id, event["id"], season, player_tag, clan_tag,
+        source="admin_override", locked=True,
+    )
 
     try:
         await refresh_cwl_management_hub_message(guild_id, "cwl_management")
@@ -1120,6 +1109,45 @@ async def handle_post_cwl_shared_clan_evict(request: web.Request) -> web.Respons
     return web.json_response({"ok": True})
 
 
+async def handle_post_cwl_activity_closed(request: web.Request) -> web.Response:
+    """Best-effort notification that the Activity iframe is about to close — fired by
+    main.ts's closeActivity() on EVERY close (Save, Cancel, or the native X/back gesture alike),
+    not just after a successful save (2026-08-16, live-testing feedback: on iPad, the Hub
+    message's launch buttons stayed visibly greyed out/unresponsive after closing the Activity —
+    Discord's own client-side "an Activity was launched from this message" visual state, which
+    QapBot's own code never sets directly (no `disabled=True` anywhere tied to Activity session
+    state — only `refresh_cwl_management_hub_message()`'s pre-existing save-triggered refreshes
+    happened to incidentally clear it, since each is a genuine new message.edit() REST call, a
+    completely different HTTP request from "respond to the original interaction" and so not
+    subject to whatever Discord's client had cached for that specific interaction). Closing
+    WITHOUT saving anything (a plain view, or Cancel) never triggered any refresh at all, leaving
+    nothing to clear that stuck state — this endpoint plugs that gap by unconditionally
+    triggering the exact same refresh on every close, regardless of whether anything changed.
+    Never returns an error status for anything past auth — a missing/misconfigured Hub message
+    is `refresh_cwl_management_hub_message()`'s own no-op, not a client-visible failure, and the
+    Activity is already in the process of closing by the time this fires."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        guild_id = int(body["guild_id"])
+        discord_user_id = int(body["discord_user_id"])
+    except (KeyError, ValueError, TypeError):
+        return web.json_response({"error": "invalid request body"}, status=400)
+
+    if not await _resolve_admin_or_leader(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
+
+    from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+
+    try:
+        await refresh_cwl_management_hub_message(guild_id, "cwl_management")
+    except Exception as e:
+        logging.warning(f"[WEB-BRIDGE] Activity-closed Hub refresh failed: {e}")
+
+    return web.json_response({"ok": True})
+
+
 def create_app() -> web.Application:
     app = web.Application(middlewares=[_access_log_middleware])
     app.router.add_get("/api/health", handle_health)
@@ -1132,6 +1160,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/cwl/guest-search", handle_get_cwl_guest_search)
     app.router.add_post("/api/cwl/enrollment/guest", handle_post_cwl_enrollment_guest)
     app.router.add_post("/api/cwl/shared-clan/evict", handle_post_cwl_shared_clan_evict)
+    app.router.add_post("/api/cwl/activity-closed", handle_post_cwl_activity_closed)
     return app
 
 

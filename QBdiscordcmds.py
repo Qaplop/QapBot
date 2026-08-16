@@ -3723,7 +3723,8 @@ async def ping(interaction: discord.Interaction):
 @app_commands.describe(
     action="Select what to list: Accounts, Families, or Players",
     clan="(Players only) Clan tag or name to list players for",
-    family="(Players only) Clan family tag to list players for"
+    family="(Players only) Clan family tag to list players for",
+    season="(Managed CWLs only) CWL season as YYYY-MM — defaults to the next upcoming season"
 )
 @app_commands.choices(action=[
     app_commands.Choice(name="Accounts - List all Discord user accounts and registered players", value="ACCOUNTS"),
@@ -3731,6 +3732,7 @@ async def ping(interaction: discord.Interaction):
     app_commands.Choice(name="Players - List all players for a given clan or family", value="PLAYERS"),
     app_commands.Choice(name="Tracked Clans - Chart of tracked clans per war league", value="TRACKED_CLANS"),
     app_commands.Choice(name="Testers - List all DM-testing recipients (bot admin)", value="TESTERS"),
+    app_commands.Choice(name="Managed CWLs - List all guilds with a managed CWL for a season (bot admin)", value="MANAGED_CWLS"),
 ])
 # DM-invokable (Phase 0b, CWL_ROSTER_PLANNING_PLAN.md) — operates on global CACHE data, no admin gate, display-only guild_id.
 @app_commands.checks.cooldown(1, 5.0, key=lambda i: (i.guild_id, i.channel_id))
@@ -3738,18 +3740,19 @@ async def list(
     interaction: discord.Interaction,
     action: str,
     clan: Optional[str] = None,
-    family: Optional[str] = None
+    family: Optional[str] = None,
+    season: Optional[str] = None
 ):
     """
     Consolidated list command with three actions: Accounts, Families, and Players.
-    
+
     Actions:
     - Accounts: List all Discord user accounts and their registered players with verification status
     - Families: List all clan families and their member clans
     - Players: List all players for a given clan or family
     """
     action_norm = action.upper()
-    _log_cmd(interaction, "list", action=action, clan=clan, family=family)
+    _log_cmd(interaction, "list", action=action, clan=clan, family=family, season=season)
     
     # Handle ACCOUNTS action
     if action_norm == "ACCOUNTS":
@@ -4011,6 +4014,65 @@ async def list(
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
 
+    # Handle MANAGED_CWLS action (bot admin only) — cross-guild data (which OTHER guilds have a
+    # CWL set up), same sensitivity class as TESTERS above, same gate (2026-08-16, project
+    # owner's spec: "gives a list of all guilds that have a managed cwl for that season").
+    if action_norm == "MANAGED_CWLS":
+        if not await _safe_defer(interaction, thinking=True, ephemeral=True):
+            return
+        guild_id = interaction.guild.id if interaction.guild else None
+        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+        if not check_bot_admin_only(interaction, SERVER_ADMIN):
+            await interaction.followup.send(t('commands.errors.bot_admin_required', guild_id=guild_id), ephemeral=True)
+            return
+
+        from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+
+        if season:
+            # YYYY-MM only — the same shape resolve_current_cwl_season()/every cwl_events row
+            # already uses; reject anything else rather than silently querying a season that can
+            # never match a real row.
+            import re
+            if not re.fullmatch(r"\d{4}-\d{2}", season):
+                await interaction.followup.send(
+                    t('commands.list.invalid_season_format', guild_id=guild_id, season=season), ephemeral=True
+                )
+                return
+            resolved_season = season
+        else:
+            # "the next upcoming one" (project owner's spec, verbatim) — despite its name,
+            # resolve_current_cwl_season() IS the next-upcoming-month resolver, not "whichever
+            # season is currently selected" (that's resolve_selected_cwl_season(), which is
+            # per-guild and not what a guild-agnostic default should use here).
+            resolved_season = resolve_current_cwl_season()
+
+        db = CACHE.db_manager
+        rows = db.list_cwl_events_for_season_across_guilds_sync(resolved_season) if db else []
+
+        if not rows:
+            await interaction.followup.send(
+                t('commands.list.managed_cwls_no_data', guild_id=guild_id, season=resolved_season), ephemeral=True
+            )
+            return
+
+        def _guild_label(gid: str) -> str:
+            resolved_guild = QBcore.bot.get_guild(int(gid))
+            return resolved_guild.name if resolved_guild else f"Unknown guild ({gid})"
+
+        lines = [
+            f"**{_guild_label(row['guild_id'])}** — {row['status'].replace('_', ' ').title()}"
+            for row in sorted(rows, key=lambda r: _guild_label(r["guild_id"]).lower())
+        ]
+
+        embed = discord.Embed(
+            title=f"Managed CWLs — {resolved_season}",
+            description="\n".join(lines),
+            color=0x2B2D31,
+        )
+        embed.set_footer(text=f"{len(rows)} guild(s) with a managed CWL for {resolved_season}.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
 @list.autocomplete('clan')  # type: ignore[attr-defined]
 async def list_clan_autocomplete(interaction: discord.Interaction, current: str):
     """Autocomplete for clan: suggests all tracked clans (excludes families)."""
@@ -4033,6 +4095,24 @@ async def list_family_autocomplete(interaction: discord.Interaction, current: st
         if len(choices) >= 25:
             break
     
+    return choices[:25]
+
+@list.autocomplete('season')  # type: ignore[attr-defined]
+async def list_season_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete for season (Managed CWLs only): the next 6 calendar months as YYYY-MM
+    convenience suggestions — a free-typed value in that shape still works even if it isn't
+    offered here (any month could in principle have a managed CWL somewhere)."""
+    from discord import app_commands
+
+    now = datetime.now(timezone.utc)
+    choices: List[app_commands.Choice[str]] = []
+    for i in range(6):
+        month_index = now.month - 1 + i
+        year = now.year + month_index // 12
+        month = month_index % 12 + 1
+        value = f"{year}-{month:02d}"
+        if not current or current in value:
+            choices.append(app_commands.Choice(name=value, value=value))
     return choices[:25]
 
 

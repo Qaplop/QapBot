@@ -64,7 +64,16 @@ api.post('/token', async (c) => {
 
   if (!response.ok) {
     const detail = await response.text()
-    return c.json({ error: 'token exchange failed', detail }, 502)
+    // Logged (2026-08-16, live-testing feedback: repeated open/close of the Activity eventually
+    // hit "token exchange failed: 502" with no way to tell why — this Worker already had
+    // Discord's own real rejection reason in `detail`, it just never went anywhere visible).
+    // `wrangler tail` / Cloudflare's dashboard Logs now show Discord's actual status + body —
+    // almost certainly either `invalid_grant` (the authorization code was already exchanged
+    // once, or expired — Discord codes are single-use and short-lived) or a 429 from Discord's
+    // own OAuth rate limit on repeated token exchanges in a short window, both very plausible
+    // for "opened and closed the Activity several times in a row."
+    console.error(`[token] Discord OAuth token exchange failed: HTTP ${response.status} — ${detail}`)
+    return c.json({ error: 'token exchange failed', status: response.status, detail }, 502)
   }
 
   const { access_token } = await response.json<{ access_token: string }>()
@@ -210,6 +219,30 @@ api.post('/cwl/enrollment/assign', async (c) => {
     body: JSON.stringify({ ...body, discord_user_id: discordUserId }),
   })
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 409 | 503)
+})
+
+// Activity-closed notification (2026-08-16, live-testing feedback: iPad's Hub message launch
+// buttons stayed visibly disabled after closing the Activity) — same verify-then-proxy shape as
+// every other route here, fired from main.ts's closeActivity() on every close, not just a save.
+api.post('/cwl/activity-closed', async (c) => {
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  let body: Record<string, unknown>
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  const upstream = await fetch(`${c.env.BRIDGE_URL}/api/cwl/activity-closed`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': c.env.BRIDGE_SECRET },
+    body: JSON.stringify({ ...body, discord_user_id: discordUserId }),
+  })
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 503)
 })
 
 // Guests (2026-08-15) — invite a guest clan/player into Configure Participating Clans' Guests

@@ -1947,9 +1947,27 @@ class WarHistoryDB:
         )
 
         # The shared roster itself — mirrors cwl_signups' shape but keyed by shared_clan_id, not
-        # event_id, so it's visible identically from every attached guild's board. One clan per
-        # shared_clan_id, so status='confirmed' IS the assignment — no separate shared
-        # assignments table needed.
+        # event_id, so it's visible identically from every attached guild's board.
+        #
+        # `status` and `assigned` are DELIBERATELY separate columns, never conflated (2026-08-16,
+        # live-testing feedback, project owner's spec, verbatim: "Confirmation status and
+        # assignment status should be treated completely separate. the one has a totally
+        # different meaning logically than the other! ... The symbols in the player tile should
+        # exclusively reflect confirmation status. The assignment status is obvious to the user
+        # from the column the player tile appears in."):
+        #   - `status` (pending/confirmed/declined/withdrawn) is PURELY the player's own genuine
+        #     response — set ONLY by set_cwl_shared_clan_player_status_sync (db_manager.py), which
+        #     never touches `assigned`. Nothing an assignment/placement decision does may ever
+        #     alter it, for the same reason auto-assigning a player into a clan on the "Manage
+        #     Enrollment" board never flips their `cwl_signups.status` to 'confirmed' either.
+        #   - `assigned` (0/1) is PURELY "is this player currently placed in THIS clan's column" —
+        #     set ONLY by set_cwl_shared_clan_player_assignment_sync, which never touches `status`.
+        #     Drag-and-drop and the auto-assign seed both write only this column.
+        # The original design ("one clan per shared_clan_id, so status='confirmed' IS the
+        # assignment — no separate assignments table needed") conflated the two into one column,
+        # which is exactly what caused every auto-assigned player in a freshly-added shared clan
+        # to show the ✓ Confirmed badge despite nobody having actually responded — a machine
+        # guess and a real human confirmation are not the same fact and must never share storage.
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS cwl_shared_clan_players (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1958,6 +1976,7 @@ class WarHistoryDB:
                 player_name       TEXT,
                 discord_id        TEXT,
                 status            TEXT    NOT NULL DEFAULT 'pending',
+                assigned          INTEGER NOT NULL DEFAULT 0,
                 source            TEXT    NOT NULL,
                 added_by_guild_id TEXT    NOT NULL,
                 responded_at      TEXT,
@@ -2119,19 +2138,35 @@ class WarHistoryDB:
             "CREATE INDEX IF NOT EXISTS idx_cwl_signups_origin_shared_clan "
             "ON cwl_signups(origin_shared_clan_id, player_tag) WHERE origin_shared_clan_id IS NOT NULL"
         )
+        # `assigned` split out of `status` (2026-08-16, live-testing feedback — see the
+        # cwl_shared_clan_players CREATE TABLE comment above for the full rationale). A one-time
+        # backfill (gated on _add_column_if_missing actually having just added the column, never
+        # re-run on an already-migrated DB) preserves every currently-placed player's column under
+        # the OLD combined meaning — without it, every player the old status='confirmed' had
+        # placed into a clan's column would silently vanish from it the moment this ships.
+        assigned_column_added = await self._add_column_if_missing(
+            "cwl_shared_clan_players", "assigned", "INTEGER NOT NULL DEFAULT 0"
+        )
+        if assigned_column_added:
+            await self._conn.execute("UPDATE cwl_shared_clan_players SET assigned = 1 WHERE status = 'confirmed'")
+            logging.info("[DB-MIGRATE] Backfilled cwl_shared_clan_players.assigned from legacy status='confirmed' rows")
 
         logging.debug("[DB-SCHEMA] Maindata schema created/verified")
 
-    async def _add_column_if_missing(self, table: str, column: str, ddl_type: str) -> None:
+    async def _add_column_if_missing(self, table: str, column: str, ddl_type: str) -> bool:
         """Idempotently ALTER TABLE ADD COLUMN for pre-existing databases (SQLite has no
         ADD COLUMN IF NOT EXISTS). Checks PRAGMA table_info first since re-running ALTER TABLE
         on a column that already exists raises. Part of the temporary migration block above —
-        remove alongside it once dev/prod are both migrated."""
+        remove alongside it once dev/prod are both migrated. Returns True only when the column
+        was actually just added (a fresh migration, not a no-op against an already-migrated DB) —
+        callers with a one-time backfill that must never re-run should gate on this."""
         cursor = await self._conn.execute(f"PRAGMA table_info({table})")
         existing_columns = {row[1] async for row in cursor}
         if column not in existing_columns:
             await self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
             logging.info(f"[DB-MIGRATE] Added column {table}.{column}")
+            return True
+        return False
 
     async def _create_bot_metadata_schema(self) -> None:
         """Create the bot_metadata key-value table (idempotent)."""
@@ -3178,6 +3213,31 @@ class WarHistoryDB:
                 return [dict(row) for row in rows]
             except sqlite3.Error as e:
                 logging.error(f"[DB-QUERY-SYNC] list_cwl_events_sync failed for guild {guild_id}: {e}")
+                return []
+
+    def list_cwl_events_for_season_across_guilds_sync(self, season: str) -> List[Dict[str, Any]]:
+        """Every guild's cwl_events row for one season, across ALL guilds — unlike every other
+        cwl_events query in this file (always scoped to one guild_id), this is deliberately
+        guild-agnostic: used by /list's "Managed CWLs" option (2026-08-16, project owner's spec)
+        to answer "which guilds have a managed CWL for season X" as a single query rather than
+        looping every known guild_id. No index on cwl_season alone (only
+        idx_cwl_events_guild_status, guild_id-first) — an acceptable full-table scan given
+        cwl_events is short-lived operational data per DATABASE_ARCHITECTURE.md, not a
+        hot/history-split table. One row per guild (guild_id, cwl_season) is UNIQUE by schema."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM cwl_events WHERE cwl_season = ? ORDER BY guild_id",
+                    (season,),
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] list_cwl_events_for_season_across_guilds_sync failed for season {season}: {e}")
                 return []
 
     def update_cwl_event_status_sync(self, event_id: int, status: str) -> bool:
@@ -4259,7 +4319,48 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] get_cwl_shared_clan_players_sync failed for shared_clan {shared_clan_id}: {e}")
                 return []
 
-    def upsert_cwl_shared_clan_player_sync(
+    def find_cwl_shared_clan_memberships_for_player_sync(self, season: str, player_tag: str) -> List[Dict[str, Any]]:
+        """Every shared clan (for this season) where player_tag is currently PLACED — i.e.
+        assigned=1, not status='confirmed' (2026-08-16 follow-up: this is purely an occupancy/
+        placement question — every caller uses it to find and evict a conflicting PLACEMENT
+        before making a new one, never to check on a genuine response — see
+        cwl_shared_clan_players' own CREATE TABLE comment for the full status/assigned split
+        rationale). Deliberately player-scoped, not scoped to any one guild's currently-
+        participating clans (unlike get_event_shared_clans_by_tag_sync, which
+        handle_post_cwl_enrollment_assign used to rely on exclusively for this). 2026-08-16
+        live-testing regression fix: dragging a player OUT of the "Assigned to other Guild"
+        pseudo-column (enrollmentBoard.ts) — whose underlying clan_tag is, by definition, no
+        longer one of the acting guild's participating clans — meant the old participating-scoped
+        lookup never found (or cleared) their real cwl_shared_clan_players row at all. Left
+        assigned there forever, it would silently "win" again the next time that clan got
+        reactivated and its roster re-synced, undoing the reassignment the admin had just made.
+        Scanning by player_tag instead finds a shared placement regardless of whether the clan
+        happens to be a live column for this guild right now, so it gets cleared no matter which
+        column the player was dragged out of."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT csc.id AS shared_clan_id, csc.clan_tag AS clan_tag
+                    FROM cwl_shared_clan_players cscp
+                    JOIN cwl_shared_clans csc ON csc.id = cscp.shared_clan_id
+                    WHERE cscp.player_tag = ? AND csc.cwl_season = ? AND cscp.assigned = 1
+                    """,
+                    (player_tag, season),
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-QUERY-SYNC] find_cwl_shared_clan_memberships_for_player_sync failed for player {player_tag}: {e}"
+                )
+                return []
+
+    def set_cwl_shared_clan_player_status_sync(
         self,
         shared_clan_id: int,
         player_tag: str,
@@ -4270,11 +4371,17 @@ class WarHistoryDB:
         added_by_guild_id: str,
         responded_at: Optional[str] = None,
     ) -> bool:
-        """Create or overwrite one shared-clan roster row — either attached guild's admin/
-        leader may call this (sharing is symmetric for editing; only eviction is owner-gated).
-        added_by_guild_id is audit-only, always overwritten to whichever guild's action most
-        recently touched the row (mirrors upsert_cwl_signup_sync's always-overwrite-on-conflict
-        semantics — the latest explicit action supersedes whatever was there before)."""
+        """Record a player's genuine RESPONSE (pending/confirmed/declined/withdrawn) — and ONLY
+        that (2026-08-16, live-testing feedback, project owner's spec, verbatim: "Confirmation
+        status and assignment status should be treated completely separate. the one has a totally
+        different meaning logically than the other!"). Deliberately never touches `assigned` —
+        the SET clause below doesn't mention it, so it's simply preserved on an existing row, and
+        a brand-new row gets the column's own DEFAULT 0 (not placed in any column just because
+        someone recorded a response). See set_cwl_shared_clan_player_assignment_sync for the
+        other half of this split, and cwl_shared_clan_players' own CREATE TABLE comment for the
+        full rationale. Either attached guild's admin/leader may call this (sharing is symmetric
+        for editing; only eviction is owner-gated). added_by_guild_id is audit-only, always
+        overwritten to whichever guild's action most recently touched the row."""
         import sqlite3
 
         if not self.db_path:
@@ -4306,7 +4413,61 @@ class WarHistoryDB:
                 return True
             except sqlite3.Error as e:
                 logging.error(
-                    f"[DB-WRITE-SYNC] upsert_cwl_shared_clan_player_sync failed for shared_clan {shared_clan_id} player {player_tag}: {e}"
+                    f"[DB-WRITE-SYNC] set_cwl_shared_clan_player_status_sync failed for shared_clan {shared_clan_id} player {player_tag}: {e}"
+                )
+                conn.rollback()
+                return False
+
+    def set_cwl_shared_clan_player_assignment_sync(
+        self,
+        shared_clan_id: int,
+        player_tag: str,
+        player_name: Optional[str],
+        discord_id: Optional[str],
+        assigned: bool,
+        source: str,
+        added_by_guild_id: str,
+    ) -> bool:
+        """Place or unplace a player in this shared clan's column — and ONLY that (2026-08-16,
+        live-testing feedback, project owner's spec — see set_cwl_shared_clan_player_status_sync's
+        docstring for the full rationale; "The symbols in the player tile should exclusively
+        reflect confirmation status. The assignment status is obvious to the user from the column
+        the player tile appears in."). Deliberately never touches `status`/`responded_at` — the
+        SET clause below doesn't mention them, so an existing row's genuine response is preserved
+        untouched, and a brand-new row gets the column's own DEFAULT 'pending' (an auto-assign or
+        drag-and-drop placement is never itself a confirmation). Drag-and-drop and the auto-assign
+        seed (assign_cwl_player_sync, QBdiscocmdshelper_cwl.py) are the only callers."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        """
+                        INSERT INTO cwl_shared_clan_players
+                            (shared_clan_id, player_tag, player_name, discord_id, assigned, source,
+                             added_by_guild_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(shared_clan_id, player_tag) DO UPDATE SET
+                            player_name = excluded.player_name,
+                            discord_id = excluded.discord_id,
+                            assigned = excluded.assigned,
+                            source = excluded.source,
+                            added_by_guild_id = excluded.added_by_guild_id,
+                            updated_at = datetime('now')
+                        """,
+                        (shared_clan_id, player_tag, player_name, discord_id, 1 if assigned else 0, source,
+                         added_by_guild_id),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] set_cwl_shared_clan_player_assignment_sync failed for shared_clan {shared_clan_id} player {player_tag}: {e}"
                 )
                 conn.rollback()
                 return False

@@ -131,6 +131,32 @@ class TestCwlEventCrud:
         db.create_cwl_event_sync("111", "2026-08", "discordid1")
         assert db.get_cwl_event_sync("222", "2026-08") is None
 
+    @pytest.mark.integration
+    async def test_list_cwl_events_for_season_across_guilds(self, db):
+        """list_cwl_events_for_season_across_guilds_sync (2026-08-16, /list "Managed CWLs"):
+        deliberately guild-agnostic, unlike every other cwl_events query in this file."""
+        await _seed_guild_and_clan(db, guild_id="111")
+        await _seed_guild_and_clan(db, guild_id="222")
+        await _seed_guild_and_clan(db, guild_id="333")
+        db.create_cwl_event_sync("111", "2026-09", "discordid1")
+        event_222 = db.create_cwl_event_sync("222", "2026-09", "discordid2")
+        db.update_cwl_event_status_sync(event_222, "signup_open")
+        db.create_cwl_event_sync("333", "2026-08", "discordid3")  # different season — excluded
+
+        rows = db.list_cwl_events_for_season_across_guilds_sync("2026-09")
+
+        by_guild = {r["guild_id"]: r for r in rows}
+        assert set(by_guild.keys()) == {"111", "222"}
+        assert by_guild["111"]["status"] == "draft"
+        assert by_guild["222"]["status"] == "signup_open"
+
+    @pytest.mark.integration
+    async def test_list_cwl_events_for_season_across_guilds_empty_for_no_matches(self, db):
+        await _seed_guild_and_clan(db, guild_id="111")
+        db.create_cwl_event_sync("111", "2026-09", "discordid1")
+
+        assert db.list_cwl_events_for_season_across_guilds_sync("2099-01") == []
+
 
 class TestCwlEventClans:
     @pytest.mark.integration

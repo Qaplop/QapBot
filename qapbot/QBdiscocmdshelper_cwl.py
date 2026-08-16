@@ -693,14 +693,24 @@ def _migrate_local_clan_roster_to_shared(db: Any, event_id: int, shared_clan_id:
     over to reading cwl_shared_clan_players instead (see _build_enrollment_payload's merge).
     Only migrates players actually ASSIGNED to clan_tag (via cwl_assignments) — a player merely
     signed up but not yet assigned to any clan isn't specific to this clan, so stays exactly
-    where it already was (the general Unassigned pool, unaffected by clan-level sharing)."""
+    where it already was (the general Unassigned pool, unaffected by clan-level sharing).
+
+    Sets BOTH placement and status explicitly, in two separate calls (2026-08-16, live-testing
+    feedback — see cwl_shared_clan_players' own CREATE TABLE comment for the full status/assigned
+    split rationale) — this is the one legitimate place that needs to set both at once, since it's
+    carrying forward two genuinely real, independent prior facts (they WERE locally assigned here,
+    AND they had this exact real response), not deriving one from the other."""
     for assignment in db.get_cwl_assignments_sync(event_id):
         if assignment["assigned_clan_tag"] != clan_tag:
             continue
         signup = db.get_cwl_signup_sync(event_id, assignment["player_tag"])
         if signup is None:
             continue
-        db.upsert_cwl_shared_clan_player_sync(
+        db.set_cwl_shared_clan_player_assignment_sync(
+            shared_clan_id, signup["player_tag"], signup["player_name"], signup["discord_id"],
+            True, signup["source"], guild_id_str,
+        )
+        db.set_cwl_shared_clan_player_status_sync(
             shared_clan_id, signup["player_tag"], signup["player_name"], signup["discord_id"],
             signup["status"], signup["source"], guild_id_str, signup.get("responded_at"),
         )
@@ -741,6 +751,185 @@ def sync_cwl_shared_clan_roster_to_local_pools(shared_clan_id: int) -> None:
                 event_id, player["player_tag"], player["player_name"], player["discord_id"], None,
                 source="guest_invite", status=player["status"],
             )
+
+
+def assign_cwl_player_sync(
+    guild_id: int,
+    event_id: int,
+    season: str,
+    player_tag: str,
+    target_clan_tag: Optional[str],
+    *,
+    source: str,
+    assignment_source: Optional[str] = None,
+    signup_source: str = "admin_added",
+    locked: bool = False,
+    deliberate: bool = True,
+) -> None:
+    """The one general "place a player into a CWL pool" write path (2026-08-16, live-testing
+    feedback, project owner's spec, verbatim: "we should have one general method that assigns
+    players to any pool and the race condition checks should all be implemented there so that we
+    don't have multiple code paths for player assignment/dragging"). Every caller that decides a
+    player belongs in a specific clan column (or back in Unassigned) should route through this
+    function instead of writing cwl_assignments/cwl_shared_clan_players directly, so the
+    conflict-purge below can never be silently skipped by a new or overlooked call site.
+
+    Confirmed live-testing bug this fixes: deleting and recreating a season's event re-ran Start
+    Enrollment's own inline bulk auto-assign, which — unlike handle_post_cwl_enrollment_assign's
+    drag-and-drop write path this function is extracted from — never checked whether a candidate
+    was already a CONFIRMED member of a totally different shared clan's roster elsewhere in this
+    guild. A player already a confirmed guest in one clan's shared roster got silently
+    double-booked into another clan's column by the very next season's auto-assign seed, purely
+    because that OTHER clan happened to be their last real CWL attack destination.
+
+    Before writing the new placement, purges the player from every OTHER shared clan they're
+    currently PLACED (assigned) in — same two-source union `handle_post_cwl_enrollment_assign`
+    used (this guild's own currently-participating shared clans, PLUS, via
+    find_cwl_shared_clan_memberships_for_player_sync, any shared clan anywhere this player is
+    assigned in — covering the "sitting in the orphaned/Assigned-to-other-Guild pseudo-column"
+    case too) — then writes the new placement:
+      - target_clan_tag is shared with another guild this season: cwl_shared_clan_players,
+        assigned=1 via set_cwl_shared_clan_player_assignment_sync — NEVER touches `status` (see
+        that table's own CREATE TABLE comment: confirmation and assignment are deliberately
+        separate columns) — clears any stale local cwl_assignments row.
+      - target_clan_tag is None: clears any local cwl_assignments row (Unassigned).
+      - otherwise (this guild's own private clan): cwl_assignments, first ensuring a local
+        cwl_signups row exists (the purge above may have just removed the player's ONLY local
+        record — e.g. they only ever existed via a shared roster row that just got purged —
+        leaving them with an assignment but no resolvable name/discord_id otherwise).
+
+    `source` labels cwl_shared_clan_players.source (why they're on that shared roster — e.g.
+    'admin_override', 'auto_assigned'). `assignment_source` labels the separate, differently-
+    scoped cwl_assignments.assignment_source column (defaults to `source` when omitted, matching
+    the pre-extraction drag-and-drop behavior of using one label for both — pass it explicitly
+    when a caller needs the two columns to disagree, e.g. the auto-assign seed uses
+    source='auto_assigned' for the shared table but assignment_source='suggested' locally, to
+    keep each column's own pre-existing vocabulary intact). `signup_source` labels a NEW local
+    cwl_signups row created as a byproduct of the private-clan branch above (default 'admin_added',
+    matching drag-and-drop's own pre-extraction behavior — pass 'auto_assigned' for an auto-seed
+    caller so a freshly-created signup reads as machine-seeded, not admin-added).
+
+    `deliberate` (default True, matching drag-and-drop's own pre-extraction behavior — a human
+    dragging a card always wins, evicting whatever it takes) — set False for an automatic/
+    best-guess placement (auto-assign seeds): if the player already holds ANY existing claim
+    (already PLACED/assigned in a different shared clan, or a locked local assignment in a
+    different clan) the target is never written, and it never evicts the existing claim either.
+    When the conflict is a
+    different SHARED clan specifically, it instead mirrors the player into a local assignment
+    pointing at that real clan (2026-08-16 follow-up, live-testing feedback, project owner's spec:
+    "instead of putting QManiac to the unassigned pool he should have been assigned to the
+    'Assigned to other clan' pool") — so the frontend's orphaned pseudo-column surfaces where they
+    actually are instead of them silently vanishing into plain Unassigned; a conflicting LOCKED
+    LOCAL assignment elsewhere is left untouched since it's already visible wherever it points.
+    This is the actual fix for the confirmed live-testing bug (2026-08-16, project owner's spec,
+    verbatim): deleting and recreating a season's event re-ran Start Enrollment's own auto-assign
+    seed, which silently moved a player who was already a deliberately admin_override-confirmed
+    guest in one shared clan's roster into a completely different clan's column, purely because
+    that other clan happened to be their last real CWL attack destination — an automatic guess
+    must never override a real, existing placement, deliberate or not."""
+    db = CACHE.db_manager
+    if db is None:
+        return
+
+    shared_clans_by_tag = get_event_shared_clans_by_tag_sync(event_id, season)
+
+    shared_clan_ids_to_clear: Dict[int, str] = {
+        shared["id"]: tag for tag, shared in shared_clans_by_tag.items() if tag != target_clan_tag
+    }
+    for membership in db.find_cwl_shared_clan_memberships_for_player_sync(season, player_tag):
+        if membership["clan_tag"] != target_clan_tag:
+            shared_clan_ids_to_clear[membership["shared_clan_id"]] = membership["clan_tag"]
+
+    if not deliberate:
+        if shared_clan_ids_to_clear:
+            # Not evicted (an automatic guess never evicts a real placement) — but leaving the
+            # player with no local record at all would show them as bare Unassigned, which is
+            # misleading: they DO have a real home, just not one with a column in THIS event.
+            # Mirror them into a local assignment pointing at their real confirmed shared clan
+            # instead, the same "orphaned assignment preservation" pattern
+            # detach_guild_from_shared_clan_on_deactivation already uses, so the frontend's
+            # "Assigned to other Guild" pseudo-column (enrollmentBoard.ts) picks them up correctly
+            # instead of them silently vanishing into Unassigned (2026-08-16 follow-up,
+            # live-testing feedback, project owner's spec, verbatim: "QManiac still assigned to
+            # StayCalm. So during auto-assignment this should have been recognized and instead of
+            # putting QManiac to the unassigned pool he should have been assigned to the
+            # 'Assigned to other clan' pool").
+            other_shared_clan_id, other_clan_tag = next(iter(shared_clan_ids_to_clear.items()))
+            other_shared_row = next(
+                (p for p in db.get_cwl_shared_clan_players_sync(other_shared_clan_id) if p["player_tag"] == player_tag),
+                None,
+            )
+            if other_shared_row is not None and db.get_cwl_signup_sync(event_id, player_tag) is None:
+                db.upsert_cwl_signup_sync(
+                    event_id, player_tag, other_shared_row["player_name"], other_shared_row["discord_id"],
+                    None, signup_source, "pending",
+                )
+            db.upsert_cwl_assignment_sync(
+                event_id, player_tag, other_clan_tag, assignment_source="orphaned_elsewhere", locked=False,
+            )
+            return
+        existing_assignment = next(
+            (a for a in db.get_cwl_assignments_sync(event_id) if a["player_tag"] == player_tag), None
+        )
+        if (
+            existing_assignment is not None
+            and existing_assignment["assigned_clan_tag"] != target_clan_tag
+            and existing_assignment["locked"]
+        ):
+            return  # already deliberately placed elsewhere locally — same rule, same reason
+
+    removed_player_name: Optional[str] = None
+    removed_discord_id: Optional[str] = None
+    for shared_clan_id in shared_clan_ids_to_clear:
+        shared_row = next(
+            (p for p in db.get_cwl_shared_clan_players_sync(shared_clan_id) if p["player_tag"] == player_tag),
+            None,
+        )
+        if shared_row is not None:
+            removed_player_name = shared_row["player_name"]
+            removed_discord_id = shared_row["discord_id"]
+        db.delete_cwl_shared_clan_player_sync(shared_clan_id, player_tag)
+        purge_orphaned_shared_clan_guests_sync(shared_clan_id, player_tag)
+
+    def _resolve_identity(candidate_tags: List[str]) -> Tuple[str, Optional[str]]:
+        existing_signup = db.get_cwl_signup_sync(event_id, player_tag)
+        if existing_signup is not None:
+            return existing_signup["player_name"], existing_signup["discord_id"]
+        if removed_player_name is not None:
+            return removed_player_name, removed_discord_id
+        member = next(
+            (m for m in db.get_current_clan_members_sync(candidate_tags) if m["player_tag"] == player_tag),
+            None,
+        )
+        if member is not None:
+            return member["player_name"], member["discord_id"]
+        return player_tag, None
+
+    if target_clan_tag is not None and target_clan_tag in shared_clans_by_tag:
+        player_name, discord_id = _resolve_identity(list(set(resolve_guild_member_clan_tags(guild_id)) | {target_clan_tag}))
+        # Assignment-only (2026-08-16, live-testing feedback, project owner's spec: "Confirmation
+        # status and assignment status should be treated completely separate"). Placing a player
+        # here — whether by drag-and-drop or the auto-assign seed — is never itself a
+        # confirmation; any genuine response they've already recorded (or haven't) is left
+        # completely untouched by this call.
+        db.set_cwl_shared_clan_player_assignment_sync(
+            shared_clans_by_tag[target_clan_tag]["id"], player_tag, player_name, discord_id,
+            True, source, str(guild_id),
+        )
+        sync_cwl_shared_clan_roster_to_local_pools(shared_clans_by_tag[target_clan_tag]["id"])
+        db.delete_cwl_assignment_sync(event_id, player_tag)
+    elif target_clan_tag is None:
+        db.delete_cwl_assignment_sync(event_id, player_tag)
+    else:
+        player_name, discord_id = _resolve_identity(list(set(resolve_guild_member_clan_tags(guild_id)) | {str(target_clan_tag)}))
+        if db.get_cwl_signup_sync(event_id, player_tag) is None:
+            db.upsert_cwl_signup_sync(
+                event_id, player_tag, player_name, discord_id, None, signup_source, "pending"
+            )
+        db.upsert_cwl_assignment_sync(
+            event_id, player_tag, str(target_clan_tag),
+            assignment_source=assignment_source or source, suggested_clan_tag=str(target_clan_tag), locked=locked,
+        )
 
 
 async def auto_assign_prior_cwl_members_if_empty(guild_id: int, event_id: int, season: str, clan_tag: str) -> None:
@@ -797,34 +986,30 @@ async def auto_assign_prior_cwl_members_if_empty(guild_id: int, event_id: int, s
 
     members_by_tag = {m["player_tag"]: m for m in current_members}
     for tag in qualifying_tags:
-        member = members_by_tag[tag]
-        if shared is not None:
-            # status='confirmed' IS the assignment for a shared clan (no separate assignments
-            # table — see cwl_shared_clan_players' own CREATE TABLE comment); 'pending' here
-            # would leave them floating in Unassigned instead of actually landing in this column.
-            db.upsert_cwl_shared_clan_player_sync(
-                shared["id"], tag, member["player_name"], member["discord_id"],
-                "confirmed", "auto_assigned", str(guild_id),
-            )
-        else:
-            if db.get_cwl_signup_sync(event_id, tag) is None:
-                db.upsert_cwl_signup_sync(
-                    event_id, tag, member["player_name"], member["discord_id"], member.get("preferred_league_rank"),
-                    "auto_assigned", "pending",
-                )
-            db.upsert_cwl_assignment_sync(event_id, tag, clan_tag, assignment_source="suggested", locked=False)
+        # Routed through the general assignment method (2026-08-16, live-testing feedback,
+        # project owner's spec — see assign_cwl_player_sync's own docstring) so this seed can
+        # never place a player here without first checking (and, if needed, evicting) any OTHER
+        # shared clan they're already PLACED in — a target that's shared lands them there via the
+        # separate `assigned` column (never touching `status`, see cwl_shared_clan_players' own
+        # CREATE TABLE comment); otherwise they land in this guild's own local cwl_assignments.
+        assign_cwl_player_sync(
+            guild_id, event_id, season, tag, clan_tag,
+            source="auto_assigned", assignment_source="suggested", signup_source="auto_assigned",
+            locked=False, deliberate=False,
+        )
 
     # Step 2: visibility seed for everyone else — see docstring. A 'pending' shared_clan_players
     # row still populates players_by_tag via _build_enrollment_payload's merge without counting
-    # as an assignment (only status='confirmed' does), so this correctly lands them in Unassigned
-    # with a pending icon, not in the clan's own column.
+    # as an assignment (assigned=0 by default — unset by this status-only write, see
+    # cwl_shared_clan_players' own CREATE TABLE comment), so this correctly lands them in
+    # Unassigned with a pending icon, not in the clan's own column.
     for tag, member in members_by_tag.items():
         if tag in qualifying_tags:
             continue  # already handled above
         if shared is not None:
             if tag in already_shared:
                 continue
-            db.upsert_cwl_shared_clan_player_sync(
+            db.set_cwl_shared_clan_player_status_sync(
                 shared["id"], tag, member["player_name"], member["discord_id"],
                 "pending", "auto_seeded", str(guild_id),
             )
@@ -967,6 +1152,95 @@ async def detach_guild_from_shared_clan_on_deactivation(guild_id: int, event_id:
             db.mark_cwl_signup_as_shared_clan_guest_sync(
                 event_id, tag, member["player_name"], member["discord_id"], shared["id"]
             )
+
+    # Orphaned-assignment preservation (2026-08-16, live-testing feedback, project owner's spec):
+    # the OTHER direction — one of THIS guild's own players (family member or otherwise) who was
+    # drag-assigned INTO the shared clan itself lives only in cwl_shared_clan_players, never in
+    # this guild's own cwl_assignments (see handle_post_cwl_enrollment_assign's shared-destination
+    # branch, which deliberately clears any local assignment row). Once this clan stops being a
+    # participating column here, that player would otherwise vanish from the board entirely — not
+    # even falling back to Unassigned — since nothing in the payload builder would ever resolve
+    # their assignment again. Mirroring every currently-confirmed shared-roster player into a
+    # local cwl_assignments row (still pointing at clan_tag, now a "column that doesn't exist"
+    # tag) reuses exactly the same mechanism a plain, never-shared guest clan already gets for
+    # free when deactivated — its stale local assignment simply survives untouched — and the
+    # frontend's new "Assigned to other Guild" column (enrollmentBoard.ts) is what actually
+    # surfaces it instead of leaving it silently invisible. Reuses
+    # mark_cwl_signup_as_shared_clan_guest_sync for the signup half too (not just the "cross-
+    # assigned into MY other clan" case above) — deliberately uniform treatment regardless of
+    # whether this particular player is really this guild's own family member or a stranger:
+    # stamping origin_shared_clan_id means purge_orphaned_shared_clan_guests_sync will correctly
+    # clean up this guild's own now-stale local copy too, the moment the clan's real owning guild
+    # ever reassigns this same player away from clan_tag on ITS OWN board — the shared roster
+    # itself is untouched by any of this (still exactly what get_cwl_shared_clan_players_sync
+    # returns), only local mirrors are ever written here.
+    #
+    # Scoped to source == 'admin_override' ONLY (2026-08-16 follow-up, live-testing feedback,
+    # project owner's spec, verbatim: "all players from that guest clan that are not already
+    # assigned to a member clan player roster should be removed from the player pool
+    # completely... only [the one deliberately drag-assigned player] should have stayed").
+    # auto_assign_prior_cwl_members_if_empty() seeds the REST of a newly-added clan's real
+    # current members as 'confirmed'/auto_assigned (prior CWL history) or 'pending'/auto_seeded
+    # (pure visibility placeholder) purely so the clan doesn't look empty WHILE it's on the
+    # roster — that's a passive side effect of the clan being added, not a deliberate cross-guild
+    # placement decision by an admin, and there's no reason for this guild to keep tracking them
+    # once the clan comes back off the roster. Only a genuine human drag-and-drop action
+    # (admin_override — see handle_post_cwl_enrollment_assign's shared-destination branch) means
+    # someone deliberately wanted this exact player there, which is what actually earns them a
+    # spot in "Assigned to other Guild" instead of just disappearing along with the clan.
+    # Stale local-mirror cleanup (2026-08-16 follow-up, live-testing feedback, project owner's
+    # spec, verbatim, repeated and emphasized twice: "The STY members still show up in both pools
+    # 'Assigned to other guild' and 'Unassigned'. Fix this now and adhere to my instructions." The
+    # admin_override filter above only ever controlled which players get a NEW local mirror row
+    # going forward — it never cleaned up rows sync_cwl_shared_clan_roster_to_local_pools() (or an
+    # earlier detach, before this filter existed) already wrote into cwl_signups/cwl_assignments
+    # *while the clan was still active*.
+    #
+    # First attempt at recognizing a "stale mirror" checked local source == 'guest_invite' —
+    # turned out too narrow and still left players behind: auto_assign_prior_cwl_members_if_empty()
+    # writes LOCAL cwl_signups directly with source='auto_assigned'/'auto_seeded' whenever it runs
+    # BEFORE this clan is detected as cross-guild shared (its `shared is None` branch) — a guest
+    # clan added first as private, only later discovered to be shared with another guild, leaves
+    # exactly these non-'guest_invite'-sourced local rows behind, which the source check then
+    # wrongly treated as "genuine, never touch."
+    #
+    # Reframed around the same live signal the is_guest badge itself now uses (see
+    # _build_enrollment_payload, web_bridge.py — "a member is a member regardless of assignment
+    # status, a guest is a guest regardless of assignment status," project owner's spec, verbatim):
+    # a player only belongs in THIS guild's pool if they're a CURRENT member of one of the guild's
+    # own family clans. Every player returned by get_cwl_shared_clan_players_sync() got there
+    # because of clan_tag specifically (signup/confirm, auto-assign/auto-seed, or admin_override)
+    # — if their live current clan isn't one of this guild's own, nothing legitimizes a local
+    # mirror surviving the clan coming off the roster, regardless of what source it was written
+    # with. The one exception a source check can't safely replace: a player's current clan IS one
+    # of this guild's own family clans (they've since moved from clan_tag into a real family clan)
+    # — their local record, if any, is now genuinely theirs and must never be deleted just because
+    # they also happen to have old auto_assigned/auto_seeded history in clan_tag's shared roster.
+    # `assigned`, not status='confirmed' (2026-08-16 follow-up, live-testing feedback, project
+    # owner's spec: confirmation and assignment are separate facts — this check has always really
+    # been "is this player currently PLACED here via a deliberate admin action," never about
+    # whether they ever responded, so it now reads the field that actually means that).
+    non_preserved_tags = []
+    shared_player_by_tag: Dict[str, Dict[str, Any]] = {}
+    for shared_player in db.get_cwl_shared_clan_players_sync(shared["id"]):
+        tag = shared_player["player_tag"]
+        if shared_player["assigned"] and shared_player["source"] == "admin_override":
+            db.mark_cwl_signup_as_shared_clan_guest_sync(
+                event_id, tag, shared_player["player_name"], shared_player["discord_id"], shared["id"]
+            )
+            db.upsert_cwl_assignment_sync(event_id, tag, clan_tag, assignment_source="orphaned_on_detach", locked=False)
+            continue
+        non_preserved_tags.append(tag)
+        shared_player_by_tag[tag] = shared_player
+
+    if non_preserved_tags:
+        family_clan_tags = set(resolve_guild_member_clan_tags(guild_id))
+        current_clan_by_tag = db.get_current_clan_tags_for_players_sync(non_preserved_tags)
+        for tag in non_preserved_tags:
+            if current_clan_by_tag.get(tag) in family_clan_tags:
+                continue  # a genuine current member of one of THIS guild's own clans — never touch
+            db.delete_cwl_assignment_sync(event_id, tag)
+            db.delete_cwl_signup_sync(event_id, tag)
 
     other_guild_ids = [g["guild_id"] for g in guilds if g["guild_id"] != guild_id_str]
     if other_guild_ids:
@@ -1184,14 +1458,25 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     # given, so prior_assignments' keys are already a subset of current_member_tags — no extra
     # membership filter needed here (unlike the pre-2026-08-14 design, which queried clan
     # rosters independently of current membership and needed one).
+    # Routed through the general assignment method, one player at a time (2026-08-16, live-testing
+    # feedback, project owner's spec — see assign_cwl_player_sync's own docstring), replacing the
+    # old direct bulk_create_cwl_assignments_sync call. Confirmed live-testing bug this fixes:
+    # deleting and recreating a season's event re-ran this exact seed, which previously never
+    # checked whether a candidate was already a CONFIRMED guest in a totally different shared
+    # clan's roster elsewhere in this guild — they got silently double-booked purely because
+    # their last real CWL attack happened to be for this event's target clan. The bulk path also
+    # never branched on the target clan being shared at all (always wrote a plain local
+    # cwl_assignments row even for a shared-clan target) — assign_cwl_player_sync now correctly
+    # writes to cwl_shared_clan_players instead when that's the case, matching every other write
+    # path in this feature.
     prior_assignments = resolve_prior_cwl_assignments(list(current_member_tags), participating_clan_tags)
-    assignments_to_create = [
-        {"player_tag": player_tag, "assigned_clan_tag": clan_tag}
-        for player_tag, clan_tag in prior_assignments.items()
-    ]
-    if assignments_to_create:
-        db.bulk_create_cwl_assignments_sync(event["id"], assignments_to_create)
-        summary["assigned"] = len(assignments_to_create)
+    for player_tag, target_clan_tag in prior_assignments.items():
+        assign_cwl_player_sync(
+            guild_id, event["id"], season, player_tag, target_clan_tag,
+            source="auto_assigned", assignment_source="suggested", signup_source="auto_assigned",
+            locked=False, deliberate=False,
+        )
+    summary["assigned"] = len(prior_assignments)
 
     for participant in dm_targets:
         participant_discord_id = str(participant["discord_id"])

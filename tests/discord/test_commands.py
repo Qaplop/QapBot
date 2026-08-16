@@ -138,4 +138,113 @@ async def test_admin_check_data_calls_checker_when_bot_admin(monkeypatch: pytest
     mock_interaction.followup.send.assert_awaited()
     args, kwargs = mock_interaction.followup.send.await_args
     assert "DATA OK" in args[0]
+
+
+# ---------------------------------------------------------------------------
+# /list action:Managed CWLs (2026-08-16, project owner's spec) — cross-guild data (which OTHER
+# guilds have a managed CWL for a season), same bot-admin gate as TESTERS.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_list_managed_cwls_rejects_non_bot_admin(monkeypatch: pytest.MonkeyPatch, mock_interaction):
+    import QBdiscordcmds
+    import qapbot.QBdiscocmdshelper as helper
+
+    monkeypatch.setattr(QBdiscordcmds, "SERVER_ADMIN", "BotAdmin")
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", _FakeCache())
+    monkeypatch.setattr(helper, "check_bot_admin_only", lambda interaction, server_admin: False)
+
+    await QBdiscordcmds.list.callback(mock_interaction, action="MANAGED_CWLS")  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited()
+    args, kwargs = mock_interaction.followup.send.await_args
+    assert "bot administrator" in args[0]
+    assert kwargs.get("ephemeral") is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_list_managed_cwls_defaults_to_next_upcoming_season(monkeypatch: pytest.MonkeyPatch, mock_interaction):
+    import QBdiscordcmds
+    import qapbot.QBdiscocmdshelper as helper
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+
+    expected_season = resolve_current_cwl_season()
+
+    class _FakeDb:
+        def list_cwl_events_for_season_across_guilds_sync(self, season):
+            assert season == expected_season
+            return [
+                {"guild_id": "111", "cwl_season": season, "status": "signup_open"},
+                {"guild_id": "222", "cwl_season": season, "status": "draft"},
+            ]
+
+    fake_cache = _FakeCache()
+    fake_cache.db_manager = _FakeDb()
+    monkeypatch.setattr(QBdiscordcmds, "SERVER_ADMIN", "BotAdmin")
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+    monkeypatch.setattr(helper, "check_bot_admin_only", lambda interaction, server_admin: True)
+
+    guild_a = MagicMock(name="Alpha Guild")
+    guild_a.name = "Alpha Guild"
+    guild_b = MagicMock(name="Beta Guild")
+    guild_b.name = "Beta Guild"
+    bot = MagicMock()
+    bot.get_guild = MagicMock(side_effect=lambda gid: {111: guild_a, 222: guild_b}.get(gid))
+    monkeypatch.setattr(QBdiscordcmds, "QBcore", MagicMock(bot=bot))
+
+    await QBdiscordcmds.list.callback(mock_interaction, action="MANAGED_CWLS")  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited()
+    _, kwargs = mock_interaction.followup.send.await_args
+    embed = kwargs["embed"]
+    assert expected_season in embed.title
+    assert "Alpha Guild" in embed.description
+    assert "Beta Guild" in embed.description
+    assert "Signup Open" in embed.description
+    assert "Draft" in embed.description
+    assert kwargs.get("ephemeral") is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_list_managed_cwls_rejects_invalid_season_format(monkeypatch: pytest.MonkeyPatch, mock_interaction):
+    import QBdiscordcmds
+    import qapbot.QBdiscocmdshelper as helper
+
+    monkeypatch.setattr(QBdiscordcmds, "SERVER_ADMIN", "BotAdmin")
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", _FakeCache())
+    monkeypatch.setattr(helper, "check_bot_admin_only", lambda interaction, server_admin: True)
+
+    await QBdiscordcmds.list.callback(mock_interaction, action="MANAGED_CWLS", season="not-a-season")  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited()
+    args, kwargs = mock_interaction.followup.send.await_args
+    assert "not-a-season" in args[0]
+    assert kwargs.get("ephemeral") is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_list_managed_cwls_no_data_message(monkeypatch: pytest.MonkeyPatch, mock_interaction):
+    import QBdiscordcmds
+    import qapbot.QBdiscocmdshelper as helper
+
+    class _FakeDb:
+        def list_cwl_events_for_season_across_guilds_sync(self, season):
+            return []
+
+    fake_cache = _FakeCache()
+    fake_cache.db_manager = _FakeDb()
+    monkeypatch.setattr(QBdiscordcmds, "SERVER_ADMIN", "BotAdmin")
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+    monkeypatch.setattr(helper, "check_bot_admin_only", lambda interaction, server_admin: True)
+
+    await QBdiscordcmds.list.callback(mock_interaction, action="MANAGED_CWLS", season="2026-09")  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited()
+    args, kwargs = mock_interaction.followup.send.await_args
+    assert "2026-09" in args[0]
+    assert kwargs.get("ephemeral") is True
     assert kwargs.get("ephemeral") is True

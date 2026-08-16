@@ -1,6 +1,433 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-16 (10)
+- Fixed: the box-shadow-on-`<tr>` row-line fix (2026-08-16 (8)) rendered correctly on desktop
+  Chrome/Firefox but not at all on iPad — WebKit (which every iOS browser runs on, including iPad
+  Chrome) never paints box-shadow on `<tr>`/`<tbody>`, a known limitation specific to internal
+  table-layout elements. Moved the divider to a box-shadow on each `<td>`/`<th>` cell instead
+  (fully supported everywhere) — row height is already a hard-coded 34px floor on every cell, so
+  each cell's own shadow lands at the same pixel offset with nothing left to disagree about. This
+  also fixed a second bug the `<tr>`-level version had even on desktop: the header row's own line
+  was invisible because each sticky `<th>`'s opaque background painted over the ancestor `<tr>`'s
+  shadow; putting the shadow on the `<th>` itself (same box as its own background) removes that
+  ordering issue entirely.
+- Changed: removed the horizontal rule above the "Guests" section on Configure Participating
+  Clans — the table's own last row already ends in a divider line, so a second one directly above
+  read as redundant. Spacing (margin-top/padding-top) is unchanged. `index.html`. Frontend
+  typecheck/build clean, deployed to DEV.
+
+2026-08-16 (20)
+- Added: the "Manage Enrollment" board now polls for live updates every 12s while open, project
+  owner's spec: "would it be possible to auto-update this view whenever a user changes his
+  confirmation setting?" Re-fetches GET /api/cwl/enrollment on a timer and merges only the fields
+  another actor could legitimately change from outside this board — a member's own DM response
+  (signup_status), their live CoC state (th_level/current_clan_tag), or another admin's
+  guest-invite action (is_guest/discord_id/player_name/th_icon_url/skill_score/avg_stars) —
+  deliberately excluding assigned_clan_tag, since that field is this board's own optimistic
+  drag-and-drop state; blindly overwriting it from a poll that raced an in-flight local drag
+  would visually snap a card back then forward again once the drag's own response lands. Also
+  skips entirely while a native HTML5 drag gesture is in progress (tearing down the board
+  mid-gesture would silently abort it) and picks it up on the next tick instead. A brand-new
+  player appearing in a poll (freshly guest-invited, or newly resolved from a linked account) is
+  added to the pool; nothing is ever removed by a poll. Polling stops when the Activity closes.
+  `activity/client/src/enrollmentBoard.ts` (new `applyPolledUpdate`, returned from
+  `renderEnrollmentBoard` as part of a new `EnrollmentBoardHandle`), `activity/client/src/main.ts`.
+  Frontend typecheck/build clean, deployed to DEV. No frontend test framework exists for this
+  package (typecheck + build + manual verification is the established convention here) — needs a
+  live DEV check: open the board, have a test account respond to its template DM, confirm the
+  icon updates within ~12s without a manual reopen, and confirm an in-progress drag survives a
+  poll tick landing mid-gesture.
+
+2026-08-16 (19)
+- Added, project owner's spec: "when adding a new season is not possible, the corresponding
+  button should not be visible. And after adding a new season we should add a logic that the
+  Configure Participating Clans view is opened automatically as a logical consequence of adding a
+  new season." Follow-up in the same message: "Equally when starting the enrollment process the
+  'Teams Management' view should be opened automatically after the enrollment start is finished."
+- "Add New Season" is now omitted entirely (not just disabled) from the CWL Management screen
+  once a season for the current CWL month already exists — a deliberate exception to this
+  screen's usual "present but greyed out" convention, since this button stays unusable for the
+  entire rest of the month, not just until some nearer condition is met.
+- Both season-creation completions (the bare-create path with no carry-over data, and the
+  carry-over Yes/No prompt) now auto-open "Configure Participating Clans" directly via the
+  LAUNCH_ACTIVITY interaction-response mechanism, instead of just refreshing the Hub message —
+  all the season-creation DB work is fast/synchronous, so it can finish before responding to the
+  interaction, letting the response itself be the Activity launch. Trade-off for the carry-over
+  path: LAUNCH_ACTIVITY has to be the interaction's one-and-only response, so the Yes/No prompt
+  message itself can no longer also be cleanly deleted in the same click — it's left in place
+  with now-inert buttons rather than sacrifice the auto-launch.
+- Start Enrollment's completion message now carries a one-click "Open Teams Management" button
+  instead of a bare confirmation with no follow-up — true zero-click auto-launch isn't achievable
+  there: start_cwl_enrollment() sends a real multi-second DM blast, so its confirming interaction
+  already has to respond immediately with "processing…" feedback long before the result is known,
+  and LAUNCH_ACTIVITY has no deferred/followup form (a hard Discord API constraint, not a choice)
+  — so a button already sitting in the completion message is the closest legal equivalent to
+  automatic.
+- Extracted the shared LAUNCH_ACTIVITY call into one `_launch_cwl_activity()` helper
+  (`qapbot/ui_cwl_roster.py`), replacing the duplicated inline version in both existing
+  "Configure Participating Clans"/"Manage Assignment" button callbacks as well as the three new
+  call sites above. New i18n key `cwl.management.button_open_enrollment_after_start` (en/de).
+  Tests: 5 new/updated for the button-visibility gate and all three auto-launch points.
+  `.\run_tests.ps1`: 1966 passed, 4 deselected. Python-only change — needs the bot process
+  restarted on DEV/PROD to take effect (manual, as always).
+
+2026-08-16 (18)
+- Fixed a follow-on regression from (17): auto-enabling a clan that never had a prior
+  `cwl_event_clans` row (both the "no previous data at all" branch and the carry-over "Yes"
+  auto-enable-all fallback) left `cwl_start_at` NULL, so the Activity's Start Time field rendered
+  completely empty instead of the expected default. Root cause: `_build_clan_config_payload`'s
+  "no row yet -> default to the 1st of the season's month at 08:00 UTC" fallback only applies
+  when NO row exists at all — both fixes now write a real row (needed for `participating=True` to
+  persist), so a row with `cwl_start_at=NULL` exists instead of no row, and that fallback no
+  longer fires. Both write paths now explicitly set `cwl_start_at` to that same default whenever
+  a clan has no prior value to carry over. `qapbot/ui_cwl_roster.py`. Tests: both (17)'s and the
+  earlier carry-over test extended with start-time assertions. `.\run_tests.ps1`: 1963 passed, 4
+  deselected. Python-only change — needs the bot process restarted on DEV/PROD to take effect
+  (manual, as always).
+
+2026-08-16 (17)
+- Fixed a second, un-covered code path behind the same symptom as (14), project owner's spec,
+  verbatim: "just created a new season after restarting the dev bot and still all clans unchecked!
+  you said you fixed this but your fix doesn't work." (14)'s fix only lived inside
+  CwlCarryOverPromptView._create_season's "Yes" carry-over branch — but "Add New Season" has a
+  THIRD path that never reaches that view at all: when get_previous_cwl_event_clans_sync() finds
+  no previously-participating rows for this guild whatsoever (a genuinely brand-new guild, or one
+  whose prior season also had zero clans enabled), the carry-over Yes/No prompt is skipped
+  entirely and the season is created with a bare create_cwl_event_sync() call — zero
+  cwl_event_clans rows, which the Activity's own payload builder then defaults to
+  participating=False for every family clan. Same "nothing checked" symptom, completely different
+  code path, never touched by (14).
+- `_make_cwl_management_add_season_callback()`'s "no previous data to offer" branch now also
+  resolves the guild's family clans and enables all of them via set_cwl_event_clans_sync — there's
+  no prior history to preserve a real split from in this branch (that's the whole reason it's
+  here), so every family clan is unconditionally enabled, same spirit as (14)'s carry-over fix.
+  `qapbot/ui_cwl_roster.py`. Tests: 1 new (`tests/discord/test_ui_cwl_roster.py`). `.\run_tests.ps1`:
+  1963 passed, 4 deselected. Python-only change — needs the bot process restarted on DEV/PROD to
+  take effect (manual, as always).
+
+2026-08-16 (16)
+- Architectural fix, not just a display patch: split `cwl_shared_clan_players.status` (a shared
+  clan's overloaded "confirmed IS the assignment" column) into two genuinely independent columns.
+  Project owner's spec, verbatim, across several follow-up messages: "The confirmation status is
+  player specific and unique per player. It must not be altered by any assignment process across
+  clans and guilds! ... Confirmation status and assignment status should be treated completely
+  separate. the one has a totally different meaning logically than the other! ... The symbols in
+  the player tile should exclusively reflect confirmation status. The assignment status is
+  obvious to the user from the column the player tile appears in." (15)'s display-layer patch
+  (hiding the badge for source='auto_assigned' specifically) only band-aided the one reported
+  symptom — the underlying DATABASE value was still being force-set to 'confirmed' by every
+  placement decision (auto-assign, and even a deliberate admin_override drag-and-drop), which is
+  the actual violation the project owner flagged.
+- New `cwl_shared_clan_players.assigned` column (0/1), migrated with a one-time backfill
+  (`assigned=1 WHERE status='confirmed'`, gated so it only ever runs once against a real
+  pre-existing DB) so no currently-placed player silently drops out of their column. Two new,
+  narrowly-scoped DB methods replace the old combined upsert: `set_cwl_shared_clan_player_status_sync`
+  (touches ONLY status/responded_at — genuine player response, never touches `assigned`) and
+  `set_cwl_shared_clan_player_assignment_sync` (touches ONLY `assigned` — placement, never touches
+  `status`). Every write path updated to call the correct one: drag-and-drop/auto-assign
+  (`assign_cwl_player_sync`) now call the assignment-only method; confirm/withdraw
+  (`handle_post_cwl_enrollment_signup`) and the visibility-seed step call the status-only method;
+  the sharing-migration step (the one legitimate place both facts are genuinely known at once)
+  calls both. `_build_enrollment_payload`'s placement check now reads `assigned` instead of
+  `status == 'confirmed'`, and the displayed `signup_status` is simply the raw, always-honest
+  `status` column — (15)'s source-based display override is no longer needed at all.
+  `find_cwl_shared_clan_memberships_for_player_sync` (the conflict-detection query used by the
+  eviction/purge logic) now queries `assigned = 1` instead of `status = 'confirmed'`, since every
+  one of its callers only ever cared about placement, never response.
+- `qapbot/db_manager.py`, `qapbot/QBdiscocmdshelper_cwl.py`, `qapbot/web_bridge.py`. Tests: DB-layer
+  coverage rewritten around the two new methods plus explicit cross-contamination tests (a status
+  write never touches assigned and vice versa), a migration test against a simulated pre-existing
+  database, and ~20 existing tests across 5 files updated for the new seeding pattern.
+  `.\run_tests.ps1`: 1962 passed, 4 deselected. Logged as a general lesson in
+  `.github/copilot-instructions.md` (confirmation and placement are different facts about a player
+  and must never share storage). Python-only change — needs the bot process restarted on DEV/PROD
+  to take effect (manual, as always).
+
+2026-08-16 (15)
+- Fixed: adding a guest clan to a guild's CWL roster showed EVERY auto-assigned player in that
+  clan's shared roster as "Confirmed" (green checkmark), project owner's spec, verbatim: "all the
+  players in StayCalm's player roster have the 'Confirmed' status set. This is a bug. Since I'm
+  only testing in dev no one of those players could possibly have confirmed their participation.
+  Make all views in all code paths within the Teams Management view show the correct player
+  statuses." Root cause: a shared clan has no separate assignments table, so
+  cwl_shared_clan_players.status='confirmed' has to do double duty as "this IS the assignment"
+  for placement purposes — but auto_assign_prior_cwl_members_if_empty's prior-CWL-history seed
+  (source='auto_assigned', a machine guess, never a real player response) writes exactly that
+  same status='confirmed' value purely so the player lands in the right column, with no way to
+  tell it apart from a genuine confirmation once read back.
+- `_build_enrollment_payload()` (`qapbot/web_bridge.py`) now derives the DISPLAYED signup_status
+  for a shared-clan player separately from the raw status column: source='auto_assigned' always
+  shows as 'pending' (the honest state — nobody actually confirmed) regardless of the underlying
+  'confirmed' value, while placement (assigned_clan_by_tag, which column they're in) is entirely
+  unaffected — still driven by the raw status, not this display value. Every other source
+  (guest_invite, admin_override, template_confirm, admin_added) is unaffected — those already
+  represent a genuine player response or a deliberate admin action, not a bare machine guess.
+  Audited every other write path into cwl_shared_clan_players for the same conflation; none of
+  the others have it (drag-and-drop and self-signup-confirm both write status from a genuine
+  action; the sharing-migration step and the detach-time preservation step both just carry
+  forward whatever status a row already legitimately had).
+- Tests: 1 new (`tests/discord/test_web_bridge.py` — an auto_assigned shared-clan player shows
+  pending in the payload while staying correctly placed in its column). `.\run_tests.ps1`: 1959
+  passed, 4 deselected. Python-only change — needs the bot process restarted on DEV/PROD to take
+  effect (manual, as always).
+
+2026-08-16 (14)
+- Added: "Add New Season"'s carry-over ("Yes") path now auto-enables every family clan whenever
+  the real-war-history computation results in ZERO participating clans, project owner's spec,
+  verbatim: "if after the previous cwls no clan in the guild is enabled then auto-enable all
+  clans of the guild. It doesn't make sense that no clan is enabled after the season was
+  created." A guild with no tracked CWL history at all (brand new to the bot, or simply took a
+  season off) previously got a freshly-created season where every single family clan defaulted to
+  participating=False, handing the admin a table with nothing checked. A genuine mixed split
+  (some clans played last season, others didn't) is left exactly as computed — real, useful
+  information, not a degenerate case that needs rescuing. `qapbot/ui_cwl_roster.py`
+  (`CwlCarryOverPromptView._create_season`). Tests: 2 new (all-False triggers auto-enable-all;
+  a real split is left alone). `.\run_tests.ps1`: 1958 passed, 4 deselected. Python-only change —
+  needs the bot process restarted on DEV/PROD to take effect (manual, as always).
+
+2026-08-16 (13)
+- Fixed a follow-up gap in (12)'s race-condition fix, project owner's spec, verbatim: "QManiac
+  still assigned to StayCalm. So during auto-assignment this should have been recognized and
+  instead of putting QManiac to the unassigned pool he should have been assigned to the 'Assigned
+  to other clan' pool." (12) correctly stopped the auto-assign seed from evicting/double-booking a
+  player already confirmed in a different shared clan — but the non-deliberate skip left them with
+  NO local record at all whenever that other shared clan wasn't itself a currently-participating
+  column, so they fell into plain Unassigned instead of the existing "Assigned to other Guild"
+  pseudo-column, misleadingly implying they had no home at all.
+- `assign_cwl_player_sync()`'s `deliberate=False` path now mirrors the player into a local
+  cwl_assignments row pointing at their REAL confirmed shared clan (same "orphaned assignment
+  preservation" pattern `detach_guild_from_shared_clan_on_deactivation` already uses) instead of
+  doing nothing — the frontend's orphaned-column detection (enrollmentBoard.ts, purely
+  assigned_clan_tag-driven) picks this up automatically, no frontend change needed.
+  `qapbot/QBdiscocmdshelper_cwl.py`. Tests: 1 new integration test for the exact
+  shared-clan-not-participating scenario, plus the (12) regression test's assertion updated for
+  the new mirroring behavior. `.\run_tests.ps1`: 1956 passed, 4 deselected. Python-only change —
+  needs the bot process restarted on DEV/PROD to take effect (manual, as always).
+
+2026-08-16 (12)
+- Fixed a genuine race condition, project owner's spec, verbatim: "I deleted The QCrew's saison
+  and created it new. QManiac was auto-assigned to The QCrew's player roster although QManiac was
+  already assigned to StayCalm's roster as a guest player. This race condition should be checked
+  during creation of the season and auto-assignment. I would say we should have one general
+  method that assigns players to any pool and the race condition checks should all be implemented
+  there so that we don't have multiple code paths for player assignment/dragging." Root cause:
+  Start Enrollment's own inline bulk auto-assign (and the separate "clan added after enrollment
+  started" auto-assign seed) wrote assignments directly, with no check for whether the candidate
+  was already a CONFIRMED guest elsewhere in the same guild — only the drag-and-drop handler had
+  that conflict check, duplicated inline rather than shared.
+- Extracted the drag-and-drop handler's purge-then-place logic into one general
+  `assign_cwl_player_sync()` (`qapbot/QBdiscocmdshelper_cwl.py`) — every write path that decides
+  where a player belongs now routes through it: `handle_post_cwl_enrollment_assign` (drag-and-
+  drop, unchanged behavior, now shared code instead of duplicated), Start Enrollment's bulk
+  auto-assign seed, and `auto_assign_prior_cwl_members_if_empty`'s confirmed-assignment step (both
+  previously wrote straight to cwl_assignments/cwl_shared_clan_players with no conflict check).
+- New `deliberate` flag (default True, matching drag-and-drop's existing "a human dragging a card
+  always wins" behavior) distinguishes a real human action from an automatic best-guess: the two
+  auto-assign call sites now pass `deliberate=False`, which makes the write a complete no-op
+  whenever the candidate already holds any existing claim (confirmed in a different shared clan,
+  or a locked local assignment elsewhere) — an automatic guess must never override a real,
+  existing placement, deliberate or not.
+- `qapbot/QBdiscocmdshelper_cwl.py`, `qapbot/web_bridge.py`. Tests: 1 new integration test
+  reproducing the exact reported scenario (a confirmed admin_override shared-clan guest survives
+  Start Enrollment's auto-assign untouched, never double-booked into another clan). `.\run_tests.ps1`:
+  1955 passed, 4 deselected. Python-only change — needs the bot process restarted on DEV/PROD to
+  take effect (manual, as always).
+
+2026-08-16 (11)
+- Fixed (properly this time): (9) below's stale-mirror cleanup still left guest-clan members
+  behind in "Unassigned" after detach — its source='guest_invite' check was too narrow, since
+  auto_assign_prior_cwl_members_if_empty() itself writes LOCAL cwl_signups directly with
+  source='auto_assigned'/'auto_seeded' whenever it runs *before* a clan is detected as cross-guild
+  shared (its `shared is None` branch) — a guest clan added first as private, only later
+  discovered to be shared with another guild, leaves exactly these non-'guest_invite' local rows
+  behind, which the source check then wrongly treated as genuine and skipped.
+- Reframed around the same live signal the guest badge now uses (see next bullet): a player only
+  belongs in this guild's local pool if they're a CURRENT member of one of the guild's own family
+  clans. `detach_guild_from_shared_clan_on_deactivation()` now checks each non-preserved
+  shared-roster player's live current clan (`get_current_clan_tags_for_players_sync`) against
+  `resolve_guild_member_clan_tags()` — deletes the local mirror unless the player has since become
+  a genuine current member of one of the guild's own clans, regardless of what source their local
+  row happens to carry. `qapbot/QBdiscocmdshelper_cwl.py`.
+- Redefined the "guest" (yellow marker) badge itself the same way, project owner's spec, verbatim:
+  "a member is a member regardless of assignment status, a guest is a guest regardless of
+  assignment status... that rule is pretty simple and generic." `_build_enrollment_payload()`
+  (`qapbot/web_bridge.py`) now overrides is_guest from live current-clan membership whenever a
+  current clan is known — a genuine family-clan member never carries the badge no matter how they
+  first entered the pool, and a player currently in any other clan always carries it, including
+  while unassigned or drag-assigned into a member clan's own roster. Falls back to the old
+  write-path-based guess only for a truly untrackable player (no current clan anywhere).
+- Tests: 3 new (`tests/unit/test_cwl_clan_ownership.py` — the "genuine local signup" survival
+  test rewritten around live current-clan membership instead of source; `tests/discord/
+  test_web_bridge.py` — is_guest follows current clan, independent of assignment/source, in both
+  directions). `.\run_tests.ps1`: 1954 passed, 4 deselected. Python-only change — needs the bot
+  process restarted on DEV/PROD to take effect (manual, as always). Note for DEV verification:
+  the detach-time cleanup still only fires on a NEW detach going forward — any already-stale rows
+  left over from earlier test rounds need one more toggle-on/toggle-off of the guest clan after
+  the restart to actually get purged.
+
+2026-08-16 (9)
+- Fixed: removing a guest clan from a guild's CWL roster left non-deliberately-placed members of
+  that clan (auto_assigned/auto_seeded, never a genuine human drag-and-drop) stuck showing up
+  forever in both "Unassigned" and "Assigned to other Guild" instead of disappearing from the
+  pool as instructed. Root cause: the prior fix (2026-08-16 (3)) only ever controlled which
+  players get a NEW local cwl_signups/cwl_assignments mirror row at detach time — it never
+  cleaned up rows sync_cwl_shared_clan_roster_to_local_pools() (or an earlier, pre-filter detach)
+  had already written into local tables while the clan was still active. Extended
+  detach_guild_from_shared_clan_on_deactivation() to actively DELETE any local mirror row
+  (recognized by source='guest_invite', the marker only ever used for this bot's own gap-filler
+  placeholders — a guild's genuine local signup is never touched) for every shared-roster player
+  who doesn't earn the deliberate admin_override preservation. `qapbot/QBdiscocmdshelper_cwl.py`.
+  Tests: 2 new (stale-mirror gets deleted; a genuine local signup sharing the same tag survives
+  untouched). `.\run_tests.ps1`: 1953 passed, 4 deselected. Python-only change — needs the bot
+  process restarted on DEV/PROD to take effect (manual, as always). Note for DEV verification:
+  this only fires on a NEW detach going forward — any already-stale rows left over from earlier
+  test rounds need one more toggle-on/toggle-off of the guest clan to actually get purged; they
+  won't retroactively clean themselves up on their own.
+
+2026-08-16 (8)
+- Fixed (finally, hopefully): the Configure Participating Clans row-line-off-by-a-pixel saga —
+  three prior rounds tried to make every cell's rendered height agree to the sub-pixel (vertical-
+  align, line-height, explicit height, box-sizing) and it kept recurring. Reframed the actual
+  mechanism instead of re-patching the symptom: with border-collapse: collapse, a row's divider
+  is stitched together from N *separate* per-cell border-bottom segments merged at their shared
+  edges — if any two adjacent cells paint even a fractional device-pixel apart at final
+  rasterization (a real browser behavior for heterogeneous content like a <select> next to plain
+  text, regardless of how identical their CSS box-model math is), that shared edge can visibly
+  shift, because multiple independent things had to agree and didn't. Replaced every cell's own
+  `border-bottom` with a single `box-shadow: inset 0 -1px 0 0` on the `<tr>` itself — one row,
+  one paint operation, one line; nothing left for two cells to disagree about, since only one box
+  is involved at all. `index.html`. Frontend typecheck/build clean, deployed to DEV.
+
+2026-08-16 (7)
+- Changed: right-side padding on the Configure Participating Clans / Manage Enrollment views
+  bumped further (36px -> 64px) — still partly covered by Discord's own iPad Activity control
+  bar; may need another pass once verified live.
+- Fixed: row lines still off by a device-pixel even after the fixed row-height fix — a
+  <select>'s and an <input type="date">'s font-driven content height can round a sub-pixel apart
+  even under identical CSS (different form control types, different internal browser rendering
+  paths). Fixed with `box-sizing: border-box` plus an explicit `height: 26px` on every select/
+  date/text input, making their rendered size a hard-coded constant instead of anything computed
+  from font metrics — nothing left for the two control types to possibly disagree on.
+- Added: `POST /api/cwl/activity-closed` — fired on every Activity close (Save, Cancel, or the
+  native gesture alike), not just after a successful save. Root cause of "buttons stay greyed
+  out/unresponsive after closing on iPad": Discord's own client-side "an Activity was launched
+  from this message" visual state, which QapBot's code never sets directly — only the save
+  flow's existing Hub-message refresh happened to incidentally clear it (a genuine new message
+  edit, not a response to the now-stale original interaction). Closing WITHOUT saving never
+  triggered any refresh at all, leaving nothing to clear the stuck state. Best-effort with a
+  1.5s client-side timeout so it can never meaningfully delay the actual close.
+  `qapbot/web_bridge.py`, `activity/server/src/index.ts`, `activity/client/src/main.ts`,
+  `index.html`. Tests: 4 new. `.\run_tests.ps1`: 1951 passed, 4 deselected. Both frontend
+  packages typecheck/build clean, deployed to DEV. The new endpoint needs the DEV bot process
+  itself restarted to pick up `web_bridge.py`'s change (manual, as always).
+
+2026-08-16 (6)
+- Fixed: one row's separator line was still very slightly off even after the fixed-height fix
+  (entry 4/5) — root cause was that a <select>'s font-driven content height and an
+  <input type="date">'s can round a sub-pixel apart even under identical CSS (different form
+  control types, different internal browser rendering paths). Fixed with `box-sizing: border-box`
+  plus an explicit `height: 26px` on every select/date/text input, making their rendered size a
+  hard-coded constant instead of anything computed from font metrics.
+- Changed: added extra right-side padding (`#app`) so Discord's own iPad Activity control bar,
+  which sits over the right edge of the view, no longer covers the Start Time column.
+  `index.html`. Frontend typecheck/build clean, deployed to DEV.
+
+2026-08-16 (5)
+- Changed: Configure Participating Clans table's fixed row height (entry 4) was straight but too
+  tall, and vertical-align: top left everything pinned to the top of each row instead of
+  centered — was only ever needed while row height varied by content, which a fixed height makes
+  moot. Reduced to 34px and switched to vertical-align: middle. `index.html`. Frontend
+  typecheck/build clean, deployed to DEV.
+
+2026-08-16 (4)
+- Fixed: Configure Participating Clans table rows were still off by a pixel or two despite the
+  earlier line-height fix — line-height only governs inline text, not a <select>/<input>'s own
+  box model, so a row's real height was still `max()` of whichever cell's actual content (a
+  select, a date picker) happened to render tallest. Fixed with an explicit `height: 40px` on
+  every table cell — a real constraint in table layout, not just a hint. Also fixed disabled
+  (read-only, shared-clan) roster-size/start-time fields rendering in the browser's dimmed
+  default disabled-text color instead of matching the rest of the row.
+- Fixed: "Assigned to other Guild" showed every current member of a detached clan, not just the
+  one player someone had actually drag-assigned there — the auto-assign-on-add visibility seed
+  (a passive side effect of adding the clan) was being mirrored right alongside genuine
+  deliberate admin placements. Scoped the mirroring to `source == 'admin_override'` only.
+- Fixed: dragging a player OUT of "Assigned to other Guild" into a real clan didn't actually
+  clear their shared-clan-roster membership (only currently-participating shared clans were
+  checked, and the origin clan isn't one by definition) — reactivating the old clan later synced
+  its roster and silently snapped the player right back to it, undoing the reassignment. New
+  player-scoped `find_cwl_shared_clan_memberships_for_player_sync()`, unioned with the existing
+  guild-scoped check (a different, still-valid scenario depends on that one). Also ensures a
+  local signup record always exists after assigning to a private clan, closing a related gap
+  where a just-purged foreign guest could end up with an assignment but no resolvable name.
+- Added: a legend entry explaining the small amber card accent (a guest player) — previously
+  only discoverable by hovering.
+  `qapbot/QBdiscocmdshelper_cwl.py`, `qapbot/web_bridge.py`, `qapbot/db_manager.py`,
+  `activity/client/src/enrollmentBoard.ts`, `index.html`. Tests: 8 new. `.\run_tests.ps1`: 1947
+  passed, 4 deselected. Frontend typecheck/build clean, deployed to DEV.
+
+2026-08-16 (3)
+- Added: `/list action:Managed CWLs` (bot admin only, same gate as Testers) — lists every guild
+  with a managed CWL for a given season, optionally asking for `season` as YYYY-MM (autocomplete
+  suggests the next 6 months); defaults to the next upcoming season
+  (`resolve_current_cwl_season()`, despite its name — see its own docstring) when omitted, per
+  spec. New guild-agnostic `list_cwl_events_for_season_across_guilds_sync()` in `db_manager.py`
+  (every other `cwl_events` query in that file is scoped to one guild_id; this one deliberately
+  isn't). `QBdiscordcmds.py`, `qapbot/db_manager.py`.
+- Fixed (found while adding the above): `commands.list.tracked_clans_no_data` — used by the
+  pre-existing `Tracked Clans` action's empty-state message — was actually stored in the
+  translation JSON under `commands.help.list.tracked_clans_no_data` (the `/help` embed
+  namespace), not the top-level `commands.list.*` path the code actually looks up. In production
+  this meant any guild that ever hit that empty-state case saw the raw literal key string
+  instead of real text. Moved it (and the two new keys above) to a proper new top-level
+  `commands.list` block in both `en.json`/`de.json`, sibling to `commands.help` — `short`/
+  `title`/`detailed` correctly stay under `commands.help.list` (genuinely /help-embed text, not
+  runtime messages, per `i18n.py`'s own documented split).
+  Tests: 8 new (`test_commands.py`, `test_db_manager_cwl_roster.py`). `.\run_tests.ps1`: 1945
+  passed, 4 deselected.
+
+2026-08-16 (2)
+- Fixed: a player drag-assigned INTO a shared/guest clan itself could vanish from the Manage
+  Enrollment board entirely once that clan got deactivated — their assignment lived only in
+  `cwl_shared_clan_players` (or, for a plain non-shared guest clan, a stale `cwl_assignments`
+  row survived deactivation fine but the frontend still had no column to place it in), and
+  `enrollmentBoard.ts` only ever matched a player to a column by exact `assigned_clan_tag`
+  equality — an unrecognized tag matched nothing, not even Unassigned. Fixed:
+  `detach_guild_from_shared_clan_on_deactivation()` now mirrors every confirmed shared-roster
+  player into a local `cwl_assignments` row before detaching (reusing the existing foreign-guest
+  purge mechanism for later cleanup once the real owning guild reassigns them); the frontend
+  gains a new dynamic "Assigned to other Guild" column, shown only when needed, cards draggable
+  out but not into it.
+- Fixed: re-checking a previously-shared clan's checkbox on Configure Participating Clans showed
+  no shared/read-only info at all until an intervening Save — `_build_clan_config_payload`'s
+  `shared_with` computation was wrongly gated on the clan's current `participating` flag, but
+  toggling a checkbox client-side never re-fetches anything. Computed for any known row now,
+  regardless of participating status.
+- Fixed: the Configure Participating Clans table's row separator lines were still off by 1-2px
+  after the earlier `vertical-align: top` fix, for a different reason — mixing font-sizes on one
+  line (clan name + the smaller inline shared-clan badge) let the browser's unset line-height
+  round a device-pixel differently per row. Fixed with an explicit, fixed `line-height: 20px` on
+  every table cell.
+  `qapbot/QBdiscocmdshelper_cwl.py`, `qapbot/web_bridge.py`, `activity/client/src/enrollmentBoard.ts`,
+  `index.html`. Tests: 6 new. `.\run_tests.ps1`: 1939 passed, 4 deselected. Frontend
+  typecheck/build clean, deployed to DEV.
+
+2026-08-16 (1)
+- Fixed: repeatedly opening/closing the CWL Activity in DEV eventually failed with "Setup
+  failed: token exchange failed: 502" and stopped working. Root-caused via a live `wrangler
+  tail` session during reproduction (after first fixing the Worker to actually log/return
+  Discord's real rejection reason, which it always had but never surfaced): Discord's own OAuth
+  token-endpoint rate limit ("You are being rate limited for requesting too many tokens"), not
+  a bug producing malformed/duplicate requests — every launch really was exactly one legitimate
+  authorize()+/api/token pair. Root cause was launch *frequency*: every single launch, even
+  reopening the same view a few seconds after closing it, did a completely fresh OAuth
+  round-trip, when `authenticate()` is documented to accept a previously-obtained access_token
+  directly. Fixed: `main.ts` now caches the access_token in `sessionStorage` after a successful
+  exchange and tries `authenticate()` with the cached token first on the next launch — skipping
+  `authorize()`/`/api/token` entirely — falling back to the full flow only if the cached token
+  is ever rejected. `activity/server/src/index.ts`, `activity/client/src/main.ts`. Frontend
+  typecheck/build clean, deployed to DEV. Full details: `qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md`.
+
 2026-08-15 (10)
 - Fixed: live DEV testing of the cross-guild shared-clan feature (entry 9) surfaced a real
   ownership-resolution bug: `resolve_cwl_clan_owner`'s only tiebreak beyond role/verified was
