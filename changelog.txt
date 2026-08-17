@@ -1,6 +1,33 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (53)
+- Fixed: (52)'s own one-time rowid-scheme migration froze the event loop on PROD and missed a
+  Discord gateway heartbeat (confirmed live: `[DB-SCHEMA] Backfilling ...` logged, then nothing
+  for ~5 minutes, then `[DISCORD-WS] Gateway disconnected — awaiting automatic reconnect`).
+  Root cause: `_backfill_player_name_search_if_needed()` ran three sequential pure-Python list
+  comprehensions over all 6,675,749 `player_name_index` rows directly inline in its `async def`
+  body — including one calling `hashlib.blake2b()` once per row (added by (52) itself) — with
+  zero `await` yield points. Classic Pitfall 26/16 class of bug (documented in
+  `qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md`, new example added under Pitfall 16), just in
+  once-at-startup migration code rather than a per-cycle hot path, so it had far less scrutiny.
+  - Fix: `qapbot/db_manager.py` — extracted the actual row-fetch + tuple-building (including the
+    per-tag rowid hash) + bulk DELETE/INSERT into a new sync method,
+    `_backfill_player_name_search_sync()`, run via `await asyncio.to_thread(...)` on the sync
+    connection — matching the exact pattern `flush_pending_war_writes` already uses elsewhere in
+    this file. The async wrapper now only does the two cheap `COUNT(*)` checks inline; the event
+    loop stays free for the whole duration of the actual rebuild.
+  - Not a data-integrity issue — same as (51)/(52), the operation was just slow, not deadlocked
+    or corrupting anything; it already recovered from one heartbeat miss via Discord.py's
+    automatic reconnect before this fix shipped.
+  - Existing (52) tests (`tests/unit/test_player_name_search_fts.py`) all still pass unchanged —
+    they exercise the public `_backfill_player_name_search_if_needed()`/search-result behavior,
+    which is identical; only the internal threading changed. 2053 tests pass.
+  - Needs a bot restart on PROD to pick up the fix. If (52)'s migration is still mid-flight when
+    you read this, it's safe to kill (the `player_name_fts_rowid_scheme` marker isn't set until
+    the rebuild finishes, so a restart just retries cleanly) — this restart will retry it
+    correctly threaded instead.
+
 2026-08-17 (52)
 - Fixed: first PROD update cycle after deploying (51)/Batch 7 stalled silently right after
   "[PHASE-3B] Completed" every cycle — confirmed via live PROD log analysis, not a deadlock (the

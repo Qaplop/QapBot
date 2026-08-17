@@ -1604,7 +1604,15 @@ class WarHistoryDB:
         switched every writer to an explicit rowid derived from player_tag
         (_fts_rowid_for_tag), so any table populated by the old code has stale rowids that the
         new incremental-writer code can no longer address. One full rebuild after this fix
-        ships repairs that; the marker then prevents repeating it on every future startup."""
+        ships repairs that; the marker then prevents repeating it on every future startup.
+
+        2026-08-17 Pitfall-26 fix: the actual rebuild (row fetch, Python-side tuple building,
+        the per-tag rowid hash, and the bulk DELETE+INSERT) runs via asyncio.to_thread() on the
+        sync connection instead of inline on the event loop. Confirmed empirically on PROD: at
+        ~6.6M rows, three sequential pure-Python list comprehensions plus 6.6M blake2b calls
+        with no await point in between froze the event loop long enough to miss a Discord
+        gateway heartbeat. Only the two cheap COUNT(*) checks above stay on the async
+        connection."""
         _rowid_scheme = await self.get_bot_metadata(PLAYER_NAME_FTS_ROWID_SCHEME_KEY)
         _needs_rowid_migration = _rowid_scheme != PLAYER_NAME_FTS_ROWID_SCHEME_VALUE
 
@@ -1625,25 +1633,35 @@ class WarHistoryDB:
             f"{', rowid scheme migration' if _needs_rowid_migration else ''})..."
         )
         _t0 = _time.monotonic()
-        async with self._conn.execute("SELECT player_tag, player_name FROM player_name_index") as cur:
-            rows = await cur.fetchall()
-        pairs = [(row["player_tag"], row["player_name"]) for row in rows]
-        await self._conn.execute("DELETE FROM player_name_search")
-        await self._conn.execute("DELETE FROM player_name_fts")
-        await self._conn.executemany(
-            "INSERT INTO player_name_search (player_tag, name, name_lower) VALUES (?, ?, ?)",
-            [(tag, name, name.lower()) for tag, name in pairs],
-        )
-        await self._conn.executemany(
-            "INSERT INTO player_name_fts (rowid, player_tag, name) VALUES (?, ?, ?)",
-            [(_fts_rowid_for_tag(tag), tag, name) for tag, name in pairs],
-        )
-        await self._conn.commit()
+        _backfilled_count = await asyncio.to_thread(self._backfill_player_name_search_sync)
         await self.set_bot_metadata(PLAYER_NAME_FTS_ROWID_SCHEME_KEY, PLAYER_NAME_FTS_ROWID_SCHEME_VALUE)
         logging.info(
-            f"[DB-SCHEMA] Backfilled {len(pairs):,} player_name_search/player_name_fts row(s) "
+            f"[DB-SCHEMA] Backfilled {_backfilled_count:,} player_name_search/player_name_fts row(s) "
             f"in {_time.monotonic() - _t0:.2f}s"
         )
+
+    def _backfill_player_name_search_sync(self) -> int:
+        """Sync core of _backfill_player_name_search_if_needed — the actual heavy lifting
+        (row fetch, Python-side tuple building including the per-tag rowid hash, bulk
+        DELETE+INSERT), run entirely on the sync connection so the caller can offload it via
+        asyncio.to_thread() and keep the event loop free for the whole duration. Returns the
+        number of rows backfilled."""
+        with self._sync_conn() as conn:
+            rows = conn.execute("SELECT player_tag, player_name FROM player_name_index").fetchall()
+            pairs = [(row["player_tag"], row["player_name"]) for row in rows]
+            with self._sync_write_lock:
+                conn.execute("DELETE FROM player_name_search")
+                conn.execute("DELETE FROM player_name_fts")
+                conn.executemany(
+                    "INSERT INTO player_name_search (player_tag, name, name_lower) VALUES (?, ?, ?)",
+                    [(tag, name, name.lower()) for tag, name in pairs],
+                )
+                conn.executemany(
+                    "INSERT INTO player_name_fts (rowid, player_tag, name) VALUES (?, ?, ?)",
+                    [(_fts_rowid_for_tag(tag), tag, name) for tag, name in pairs],
+                )
+                conn.commit()
+        return len(pairs)
 
     async def _create_history_schema(self) -> None:
         """

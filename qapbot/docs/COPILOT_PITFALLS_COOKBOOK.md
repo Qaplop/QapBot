@@ -420,6 +420,22 @@ loop in `main()` (QapBot.py) iterating `CACHE.clan_name_cache` (~380K entries in
 ~4.1-4.2s of frozen event-loop time every cycle; fixed with `await asyncio.sleep(0)` every 2000
 iterations (simpler than `to_thread()`-wrapping the whole loop).
 
+Second example, the *inverse* mistake (2026-08-17, PROD): `db_manager.py`'s
+`_backfill_player_name_search_if_needed()` ran three sequential Python-level list comprehensions
+over `player_name_index` (6.6M rows on PROD) directly inline in its `async def` body — no
+`to_thread()`, no `sleep(0)`, nothing — including one that called `hashlib.blake2b()` once per
+row. Unlike the `gc.collect()` case above, this WAS ordinary Python bytecode (dict/tuple
+construction, a hash call per iteration), so it would have been fully fixed by
+`asyncio.to_thread()`-wrapping the whole thing — the bug was simply never wrapping it at all, not
+a to_thread-doesn't-help case. Missed because this code runs once, at startup/rare schema
+migrations, a code path with much less scrutiny than the hot per-cycle loops this pitfall is
+usually hunted in — froze the event loop long enough (multiple minutes at 6.6M rows) to miss a
+Discord gateway heartbeat and force a reconnect. Fix: moved the whole row-fetch +
+transform + bulk-write to a sync method run via `asyncio.to_thread()` on the sync connection,
+matching the pattern already used by `flush_pending_war_writes` elsewhere in the same file.
+Lesson: this pitfall applies just as much to one-time startup/migration code as to per-cycle
+hot paths — "runs once" is not the same as "runs fast," and at PROD's row counts it wasn't.
+
 Diagnostic tool: `qapbot/scripts/log_time_gaps.py --log data/logs/qapbot.log --top N` finds the
 biggest gaps between consecutive timestamped log lines — the fastest way to find blocking/slow
 segments in the update cycle. On Windows, pipe through
