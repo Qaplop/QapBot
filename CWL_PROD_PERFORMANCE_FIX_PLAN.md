@@ -591,6 +591,22 @@ search).
 in-memory and DB implementations on a seeded fixture, tag-prefix search cap, and the
 `run_tests.ps1` full suite.
 
+**Status (2026-08-17, Batch 7): implemented as designed, with corrections to the plan's own
+draft SQL found empirically during implementation** — see the dated entry in
+`qapbot/docs/DATABASE_ARCHITECTURE.md` ("2026-08-17: player_name_index Scan-Cost Fix + SQLite/
+FTS5 Search Alternative") for the full writeup: the `UNPREFIXED` column option doesn't exist
+(real keyword: `UNINDEXED`), FTS5 virtual tables don't support `ON CONFLICT` upsert syntax
+(used delete-then-insert instead), trigram tokenization needs >=3 characters to match anything,
+and every query needs FTS5-literal-quoting before use (an unquoted needle containing `-`, `*`,
+`"`, or words like AND/OR/NOT is parsed as query syntax, not literal text). Rollout flag
+`CONFIG.cwl_use_fts_player_search` defaults `False` (in-memory path stays active); `/whois`'s
+own separate inline scan (not `search_player_names()` — see Step 9's own correction) is
+deliberately NOT migrated to FTS5, since it needs the full match set for its guild-membership
+reorder, out of scope for this step. 26 new tests (20 in a new `tests/unit/
+test_player_name_search_fts.py`), 2046 tests pass. Backend-only, needs a bot restart — and since
+the flag defaults off, a restart alone changes nothing user-visible; flipping the flag (DEV
+first) is a separate, deliberate follow-up step once ready to actually exercise this path.
+
 ---
 
 ## Pre-implementation verification notes (docs/backlog sweep, 2026-08-17)

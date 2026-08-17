@@ -191,6 +191,16 @@ class BotConfig:
     # to False only once the feature is ready for real players to be DMed.
     cwl_dm_restrict_to_admin: bool = True
 
+    # SQLite/FTS5-backed player-name search rollout flag (2026-08-17,
+    # CWL_PROD_PERFORMANCE_FIX_PLAN.md P2 Step 11). CACHE.player_name_index (the in-memory
+    # dict) is always loaded/dual-written regardless of this flag — it's the safety-net fallback
+    # for at least one release. False (default): CACHE.search_player_names() uses the existing
+    # in-memory Python scan. True: it delegates to WarHistoryDB.search_player_names_sync()
+    # (SQLite, FTS5 trigram-indexed) instead — flip only after DEV+PROD burn-in confirms the two
+    # paths return equivalent results; this is a config change, not a code change, precisely so
+    # the switch (and any rollback) needs no redeploy. DEV/PROD-suffixed like
+    # cwl_dm_restrict_to_admin above.
+    cwl_use_fts_player_search: bool = False
 
 
 
@@ -373,6 +383,12 @@ def load_config() -> BotConfig:
     else:
         cwl_dm_restrict_to_admin = os.getenv("CWL_DM_RESTRICT_TO_ADMIN", "true").lower() in ("true", "1", "yes")
 
+    # SQLite/FTS5 player-name search rollout toggle — defaults False (in-memory scan) on both.
+    if is_dev_mode:
+        cwl_use_fts_player_search = os.getenv("CWL_USE_FTS_PLAYER_SEARCH_DEV", "false").lower() in ("true", "1", "yes")
+    else:
+        cwl_use_fts_player_search = os.getenv("CWL_USE_FTS_PLAYER_SEARCH", "false").lower() in ("true", "1", "yes")
+
     # Create config object
     config = BotConfig(
         coc_email=coc_email,
@@ -402,6 +418,7 @@ def load_config() -> BotConfig:
         web_bridge_port=web_bridge_port,
         web_bridge_secret=web_bridge_secret,
         cwl_dm_restrict_to_admin=cwl_dm_restrict_to_admin,
+        cwl_use_fts_player_search=cwl_use_fts_player_search,
     )
     
     # Validate configuration (fail fast on startup)

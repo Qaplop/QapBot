@@ -1,6 +1,51 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (49)
+- Added: Batch 7 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md` (P2 Step 11, the final step in the plan) —
+  a SQLite/FTS5-backed alternative to the in-memory player-name search, gated behind a config
+  flag defaulting off. Feasibility (FTS5 + trigram tokenizer) was confirmed live via SSH on both
+  DEV and PROD before starting (previous session).
+  - `qapbot/db_manager.py`: new `player_name_search(player_tag PK, name, name_lower)` (plain
+    table, tag-prefix search) and `player_name_fts` (FTS5, `tokenize='trigram'`, name-substring
+    search) tables, a one-time idempotent startup backfill (row-count-guarded), two new readers
+    (`search_player_names_sync`, `search_player_tags_by_prefix_sync`), and both existing
+    `player_name_index` writers (`_upsert_player_name_index_in_conn`, `update_player_name_index_
+    sync`) extended to keep the new tables in sync — re-reading the just-upserted
+    `player_name_index` row rather than trusting the write batch directly, so a "not newer, skip"
+    outcome there can never leave the new tables holding a stale name.
+  - `qapbot/config.py`: new `cwl_use_fts_player_search` flag (default `False`, DEV/PROD-suffixed
+    env vars like the existing `cwl_dm_restrict_to_admin`) — `False` keeps `CACHE.player_name_
+    index` (the in-memory dict, still fully loaded/dual-written either way) as the active search
+    path; `True` delegates to the new SQLite-backed readers instead. Flip only after DEV+PROD
+    burn-in confirms parity — a config change, not a code change.
+  - `qapbot/cache_manager.py`'s `search_player_names()` and `qapbot/web_bridge.py`'s guest-search
+    `#` tag mode both check the flag and delegate accordingly.
+  - **Corrections to the plan's own draft SQL, found empirically during implementation**: the
+    plan's `fts5(player_tag UNPREFIXED, name)` doesn't parse — FTS5 has no `UNPREFIXED` column
+    option, the real keyword is `UNINDEXED`. FTS5 virtual tables don't support `INSERT ... ON
+    CONFLICT DO UPDATE` ("UPSERT not implemented for virtual table") — used delete-then-insert
+    per row instead. Trigram tokenization needs >=3 characters to match anything at all — the new
+    SQL-backed search returns `[]` immediately below that, same contract as the in-memory path's
+    own Step 9 minimum. Every query is FTS5-literal-quoted before use — an unquoted needle
+    containing `-`, `*`, `"`, or words like AND/OR/NOT gets parsed as FTS5 query syntax instead
+    of literal text (confirmed: an unquoted "bob-smith" raised "no such column: smith").
+  - Deliberately NOT migrated: `/whois`'s own separate inline scan (`QBdiscordcmds.py` — per
+    Step 9's own correction, it doesn't call `CACHE.search_player_names()` at all) needs the
+    full match set for its guild-membership reorder, which a `LIMIT`-based FTS5 query doesn't
+    naturally provide — out of this step's scope.
+  - `qapbot/docs/DATABASE_ARCHITECTURE.md`: dated changelog-style entry added, plus the existing
+    `player_name_index` write-up updated for the Step 9 tuple-shape change.
+  - Tests: 26 new (20 in a new `tests/unit/test_player_name_search_fts.py` covering schema
+    creation, backfill idempotency, both writers' sync behavior including the newest-wins
+    conflict case, both new readers' edge cases, and the rollout-flag delegation; 1 guest-search
+    integration test proving the tag-prefix path actually delegates end-to-end when the flag is
+    on; plus the earlier Step 9 count). 2046 tests pass (`.\run_tests.ps1`). Backend-only, needs
+    a bot restart — but since the flag defaults off, a restart alone changes no user-visible
+    behavior; flipping it on DEV to actually exercise this path is a separate follow-up.
+  - This closes out `CWL_PROD_PERFORMANCE_FIX_PLAN.md` — all 7 batches (11 steps across P0/P1/P2)
+    are now implemented.
+
 2026-08-17 (48)
 - Added: Batch 6 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md` (P2 Step 10) — GC tuning headroom on the
   weak PROD box (10 GB RAM, 2-core Celeron J3355). Pure mitigation, not a fix — P0 (Batch 1)

@@ -1497,6 +1497,43 @@ class WarHistoryDB:
             )
         """)
 
+        # ── player_name_search / player_name_fts: SQLite-backed name search (2026-08-17,
+        # CWL_PROD_PERFORMANCE_FIX_PLAN.md P2 Step 11) — replaces the in-memory
+        # CACHE.player_name_index O(n) Python-side scan (millions of entries on PROD) with
+        # SQLite-backed lookups, kept incrementally in sync by the same writers that maintain
+        # player_name_index (_upsert_player_name_index_in_conn / update_player_name_index_sync).
+        # Two tables, two different jobs:
+        #   - player_name_search: a plain table (PK on player_tag) for the guest search's `#`
+        #     tag-PREFIX mode — `player_tag LIKE ?||'%'` is index-backed on a PK's own B-tree,
+        #     no FTS needed for a prefix match. name_lower is carried for consistency/future use
+        #     but deliberately has no separate index: substring matching (what an index on
+        #     name_lower could NOT accelerate anyway — LIKE '%needle%' can't use a b-tree index)
+        #     is FTS5's job below, so a name_lower index here would just be write-cost with no
+        #     matching read ever using it.
+        #   - player_name_fts: FTS5 with the trigram tokenizer for actual name-SUBSTRING search
+        #     (search_player_names, /whois) — feasibility-gate-confirmed available on both DEV
+        #     (SQLite 3.50.4) and PROD (SQLite 3.45.2) via a live runtime probe over SSH, see this
+        #     step's own status note in the plan doc. `player_tag UNINDEXED` (NOT the plan's own
+        #     draft `UNPREFIXED`, which doesn't exist as an FTS5 column option — verified
+        #     2026-08-17, `CREATE VIRTUAL TABLE ... fts5(player_tag UNPREFIXED, ...)` raises
+        #     "unrecognized column option") excludes player_tag from the full-text index (we only
+        #     ever search by name, never by tag substring) while still storing/returning it.
+        #     Trigram tokenization requires >=3 characters to match anything at all (verified
+        #     empirically) — search_player_names()'s own minimum-length guard accounts for this.
+        logging.info("[DB-SCHEMA] Verifying player_name_search / player_name_fts tables...")
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS player_name_search (
+                player_tag  TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                name_lower  TEXT NOT NULL
+            )
+        """)
+        await self._conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS player_name_fts USING fts5(
+                player_tag UNINDEXED, name, tokenize='trigram'
+            )
+        """)
+
         # Maindata tables
         logging.info("[DB-SCHEMA] Verifying maindata tables...")
         await self._create_maindata_schema()
@@ -1516,6 +1553,50 @@ class WarHistoryDB:
         await self._conn.commit()
         _elapsed = _time.monotonic() - _t0
         logging.info(f"[DB-SCHEMA] Schema verified in {_elapsed:.2f}s")
+
+        await self._backfill_player_name_search_if_needed()
+
+    async def _backfill_player_name_search_if_needed(self) -> None:
+        """One-time idempotent backfill of player_name_search/player_name_fts from
+        player_name_index (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 11, Rule 12) —
+        safe to run on every startup: guarded by a row-count comparison against
+        player_name_index, so an already-backfilled DB (the normal case after the first
+        startup post-migration) does two indexed COUNT(*) queries and nothing else. Counts stay
+        in lockstep after the first backfill because every incremental writer
+        (_upsert_player_name_index_in_conn / update_player_name_index_sync) updates all three
+        tables together from then on — a mismatch should only ever be observed once, on the
+        first startup after this migration ships."""
+        async with self._conn.execute("SELECT COUNT(*) FROM player_name_index") as cur:
+            source_count = (await cur.fetchone())[0]
+        if source_count == 0:
+            return
+        async with self._conn.execute("SELECT COUNT(*) FROM player_name_search") as cur:
+            target_count = (await cur.fetchone())[0]
+        if source_count == target_count:
+            return
+
+        logging.info(
+            f"[DB-SCHEMA] Backfilling player_name_search/player_name_fts from player_name_index "
+            f"({source_count:,} source rows, {target_count:,} already present)..."
+        )
+        _t0 = _time.monotonic()
+        async with self._conn.execute("SELECT player_tag, player_name FROM player_name_index") as cur:
+            rows = await cur.fetchall()
+        pairs = [(row["player_tag"], row["player_name"]) for row in rows]
+        await self._conn.execute("DELETE FROM player_name_search")
+        await self._conn.execute("DELETE FROM player_name_fts")
+        await self._conn.executemany(
+            "INSERT INTO player_name_search (player_tag, name, name_lower) VALUES (?, ?, ?)",
+            [(tag, name, name.lower()) for tag, name in pairs],
+        )
+        await self._conn.executemany(
+            "INSERT INTO player_name_fts (player_tag, name) VALUES (?, ?)", pairs,
+        )
+        await self._conn.commit()
+        logging.info(
+            f"[DB-SCHEMA] Backfilled {len(pairs):,} player_name_search/player_name_fts row(s) "
+            f"in {_time.monotonic() - _t0:.2f}s"
+        )
 
     async def _create_history_schema(self) -> None:
         """
@@ -5075,6 +5156,33 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] get_cwl_attack_records_sync failed: {e}")
                 return []
 
+    def _upsert_player_name_search_rows_in_conn(self, conn: Any, tag_name_pairs: List[Tuple[str, str]]) -> None:
+        """Upserts (player_tag, name) pairs into BOTH player_name_search (a plain table — real
+        upsert support) and player_name_fts (FTS5 — confirmed 2026-08-17: virtual tables don't
+        support `ON CONFLICT ... DO UPDATE`, "UPSERT not implemented for virtual table"; a
+        confirmed-working DELETE-then-INSERT per row is the correct pattern instead — an
+        UPDATE ... WHERE player_tag = ? also works directly against an UNINDEXED column, but
+        delete+insert is simpler when a row may not exist yet, same call site either way).
+
+        Callers must pass already-conflict-resolved (player_tag, name) pairs — this helper does
+        no timestamp/recency comparison of its own; it just makes the search tables match
+        whatever the caller says is current (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md
+        Step 11)."""
+        if not tag_name_pairs:
+            return
+        conn.executemany("""
+            INSERT INTO player_name_search (player_tag, name, name_lower) VALUES (?, ?, ?)
+            ON CONFLICT(player_tag) DO UPDATE SET
+                name = excluded.name,
+                name_lower = excluded.name_lower
+        """, [(tag, name, name.lower()) for tag, name in tag_name_pairs])
+        conn.executemany(
+            "DELETE FROM player_name_fts WHERE player_tag = ?", [(tag,) for tag, _ in tag_name_pairs],
+        )
+        conn.executemany(
+            "INSERT INTO player_name_fts (player_tag, name) VALUES (?, ?)", tag_name_pairs,
+        )
+
     def _upsert_player_name_index_in_conn(
         self,
         conn: Any,
@@ -5118,6 +5226,19 @@ class WarHistoryDB:
                 last_seen   = excluded.last_seen
             WHERE excluded.last_seen > player_name_index.last_seen
         """, [(tag, name, date) for tag, (name, date) in best.items()])
+        # player_name_search/player_name_fts mirror player_name_index (2026-08-17, Step 11) —
+        # re-read the just-upserted rows' ACTUAL resulting names (not `best`'s own values
+        # directly) since the WHERE guard above may have kept an existing, more-recent name for
+        # some tag in this batch (a rare out-of-order war-save race); re-reading keeps the search
+        # tables authoritative-consistent with player_name_index without duplicating its
+        # newest-wins conflict logic here too. Chunked (Step 4) — this batch is normally one
+        # war's worth of players, but a bulk-flush caller could hand this a much larger batch.
+        resolved = self._chunked_in_query_sync(
+            conn,
+            "SELECT player_tag, player_name FROM player_name_index WHERE player_tag IN ({placeholders})",
+            list(best.keys()),
+        )
+        self._upsert_player_name_search_rows_in_conn(conn, [(r["player_tag"], r["player_name"]) for r in resolved])
 
     def load_player_name_index_sync(self) -> Dict[str, str]:
         """Load the full player_name_index table into a {player_tag: player_name} dict.
@@ -5166,9 +5287,89 @@ class WarHistoryDB:
                             last_seen   = excluded.last_seen
                         WHERE excluded.last_seen > player_name_index.last_seen
                     """, updates)
+                    # Mirrors player_name_index into player_name_search/player_name_fts
+                    # (2026-08-17, Step 11) — same re-read-to-resolve-conflicts reasoning as
+                    # _upsert_player_name_index_in_conn's own call site.
+                    tags = [u[0] for u in updates]
+                    resolved = self._chunked_in_query_sync(
+                        conn,
+                        "SELECT player_tag, player_name FROM player_name_index WHERE player_tag IN ({placeholders})",
+                        tags,
+                    )
+                    self._upsert_player_name_search_rows_in_conn(
+                        conn, [(r["player_tag"], r["player_name"]) for r in resolved]
+                    )
                     conn.commit()
             except Exception as e:
                 logging.error(f"[DB-WRITE-SYNC] update_player_name_index_sync failed: {e}")
+
+    def search_player_names_sync(self, query: str, limit: int = 25) -> List[Dict[str, str]]:
+        """SQLite/FTS5-backed name-substring search over player_name_fts (2026-08-17,
+        CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 11) — the SQL-backed counterpart to
+        CACHE.search_player_names()'s in-memory scan, used when
+        CONFIG.cwl_use_fts_player_search is True. Same alphabetical-sort/25-cap contract as the
+        in-memory version, but genuinely index-backed (no in-process bound like
+        SEARCH_PLAYER_NAMES_MAX_COLLECT is needed — FTS5's trigram index finds matching rows
+        without touching non-matching ones, so LIMIT is honored without an application-level
+        early-exit).
+
+        Trigram tokenization needs >=3 characters to form even one trigram, so a shorter query
+        can structurally never match anything (verified empirically 2026-08-17) — returns []
+        immediately rather than issuing a query guaranteed to find nothing.
+
+        The query is FTS5-literal-quoted before use (confirmed 2026-08-17: an unquoted needle
+        containing characters like `-`, `*`, `"`, or words like AND/OR/NOT gets parsed as FTS5
+        query syntax instead of literal text — e.g. an unquoted "bob-smith" raises "no such
+        column: smith" instead of matching the literal substring) — never build this query with
+        the caller's raw string.
+
+        Called synchronously — thread it from any event-loop caller (this mirrors
+        CACHE.search_player_names()'s own threading requirement, not a new constraint)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        query = query.strip()
+        if len(query) < 3:
+            return []
+        literal = '"' + query.replace('"', '""') + '"'
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute("""
+                    SELECT player_tag, name FROM player_name_fts
+                    WHERE player_name_fts MATCH ?
+                    ORDER BY name COLLATE NOCASE
+                    LIMIT ?
+                """, (literal, min(limit, 25))).fetchall()
+                return [{"player_tag": row["player_tag"], "player_name": row["name"]} for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] search_player_names_sync failed: {e}")
+                return []
+
+    def search_player_tags_by_prefix_sync(self, prefix: str, limit: int = 12) -> List[Dict[str, str]]:
+        """Tag-PREFIX search over player_name_search (2026-08-17, Step 11) — backs the CWL
+        guest search's `#` tag mode (web_bridge.py's _search_cwl_guests_sync), used when
+        CONFIG.cwl_use_fts_player_search is True. A prefix LIKE pattern (no leading `%`) is
+        index-backed on player_name_search's own PK B-tree — no FTS needed for a tag prefix,
+        only name substrings need trigram matching."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        prefix = prefix.strip()
+        if not prefix:
+            return []
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute("""
+                    SELECT player_tag, name FROM player_name_search
+                    WHERE player_tag LIKE ?
+                    LIMIT ?
+                """, (prefix.replace('%', '').replace('_', '') + '%', min(limit, 12))).fetchall()
+                return [{"player_tag": row["player_tag"], "player_name": row["name"]} for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] search_player_tags_by_prefix_sync failed: {e}")
+                return []
 
     def search_players_by_name_sync(
         self, name_substring: str, limit: int = 25

@@ -53,6 +53,23 @@ _CREATE_PLAYER_NAME_INDEX = """
     )
 """
 
+# player_name_search / player_name_fts (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 11) —
+# _upsert_player_name_index_in_conn/update_player_name_index_sync now also write these, so this
+# file's hand-built minimal schema (deliberately NOT the full WarHistoryDB.initialize(), see
+# _make_db's own docstring) needs them too, same as the real schema-creation code does.
+_CREATE_PLAYER_NAME_SEARCH = """
+    CREATE TABLE IF NOT EXISTS player_name_search (
+        player_tag  TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        name_lower  TEXT NOT NULL
+    )
+"""
+_CREATE_PLAYER_NAME_FTS = """
+    CREATE VIRTUAL TABLE IF NOT EXISTS player_name_fts USING fts5(
+        player_tag UNINDEXED, name, tokenize='trigram'
+    )
+"""
+
 
 def _make_db(tmp_path) -> WarHistoryDB:
     """Create a WarHistoryDB with war_attacks and player_name_index schema in a temp file."""
@@ -61,6 +78,8 @@ def _make_db(tmp_path) -> WarHistoryDB:
     conn.row_factory = sqlite3.Row
     conn.execute(_CREATE_WAR_ATTACKS)
     conn.execute(_CREATE_PLAYER_NAME_INDEX)
+    conn.execute(_CREATE_PLAYER_NAME_SEARCH)
+    conn.execute(_CREATE_PLAYER_NAME_FTS)
     conn.commit()
     conn.close()
 

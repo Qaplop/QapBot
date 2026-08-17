@@ -670,6 +670,7 @@ def _search_cwl_guests_sync(guild_id: int, query: str) -> List[Dict[str, Any]]:
     round-robining one-of-each into the final list) guarantees both kinds of matches are visible
     without scrolling through a wall of same-type rows first. Doesn't apply to the `@`-restricted
     path since that's single-type by construction."""
+    from qapbot.config import CONFIG
     from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
 
     db = CACHE.db_manager
@@ -771,11 +772,18 @@ def _search_cwl_guests_sync(guild_id: int, query: str) -> List[Dict[str, Any]]:
     player_hits: Dict[str, Dict[str, Any]] = {}
     if tag_only_mode:
         upper_query = query.upper()
-        for tag, (name, _name_lower) in CACHE.player_name_index.items():
-            if len(player_hits) >= GUEST_SEARCH_CAP:
-                break
-            if tag.upper().startswith(upper_query):
-                player_hits.setdefault(tag, {"player_tag": tag, "player_name": name})
+        # SQLite-backed tag-prefix lookup (2026-08-17, Step 11) when the rollout flag is on —
+        # index-backed on player_name_search's own PK, no in-memory scan at all. Falls back to
+        # the in-memory player_name_index iteration otherwise (default, until DEV+PROD burn-in).
+        if CONFIG.cwl_use_fts_player_search and db is not None:
+            for match in db.search_player_tags_by_prefix_sync(upper_query, limit=GUEST_SEARCH_CAP):
+                player_hits.setdefault(match["player_tag"], match)
+        else:
+            for tag, (name, _name_lower) in CACHE.player_name_index.items():
+                if len(player_hits) >= GUEST_SEARCH_CAP:
+                    break
+                if tag.upper().startswith(upper_query):
+                    player_hits.setdefault(tag, {"player_tag": tag, "player_name": name})
         # A tag typed exactly that the index doesn't know about at all — still offered as a raw
         # hit (name falls back to the tag itself) so the admin can add it directly; whether it's
         # actually a real CoC tag is only found out once something tries to use it. Added

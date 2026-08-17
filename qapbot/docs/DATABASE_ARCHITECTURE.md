@@ -374,17 +374,43 @@ The `get_clan_attack_history_sync()` method in `db_manager.py` aggregates `SUM(s
   PK: war_tag (globally unique). Joined to war_summary via war_tag to populate round_number.
   Populated by CacheManager._process_league_group_response() on every fresh get_league_group() call.
 
-**Search Index** (2026-05-15 - Complete):
+**Search Index** (2026-05-15 - Complete; extended 2026-08-17 - see CWL_PROD_PERFORMANCE_FIX_PLAN.md
+Steps 9 & 11):
 - `player_name_index` - Fast name-lookup index: one row per unique player_tag with their most
-  recent known name and `last_seen` ISO timestamp. ~6.2 M rows on production (⏱ time-sensitive,
-  verified 2026-07-26 — see Database Size below for the re-verify note).
-  Loaded entirely into `CACHE.player_name_index: Dict[str,str]` at startup; in-memory
-  O(n) search replaces a `LIKE '%substr%'` scan over the full `war_attacks` table (now ~113 M
-  rows combined across the hot + history DBs — see Database Size below).
+  recent known name and `last_seen` ISO timestamp. ~6.6 M rows on production (per the
+  2026-08-16 PROD incident log analysis, CWL_PROD_PERFORMANCE_FIX_PLAN.md — supersedes the
+  2026-07-26 ~6.2M figure above, which itself superseded an earlier stale ~125K estimate found
+  in two docstrings and corrected the same day).
+  Loaded entirely into `CACHE.player_name_index: Dict[str, Tuple[str, str]]` at startup — values
+  changed from a bare name string to `(name, name_lower)` tuples (2026-08-17, Step 9) so a
+  search never re-lowercases all 6.6M names per call; the common already-lowercase case reuses
+  the same string object for both tuple slots rather than allocating a second copy.
+  In-memory O(n) search (`CACHE.search_player_names()`) replaces a `LIKE '%substr%'` scan over
+  the full `war_attacks` table (now ~113 M rows combined across the hot + history DBs — see
+  Database Size below) — still the DEFAULT active search path (see `player_name_search`/
+  `player_name_fts` below for the opt-in SQLite-backed alternative).
   Populated/maintained by `_upsert_player_name_index_in_conn()` inside every war write path
   (INSERT OR IGNORE ... ON CONFLICT DO UPDATE WHERE excluded.last_seen > stored).
   Also updated by `update_player_name_index_sync()` when coc_cache detects a live API name change.
   Sentinel rows (attack_order=0) ARE included so missed-war players appear in /whois searches.
+- `player_name_search(player_tag PK, name, name_lower)` / `player_name_fts` (FTS5, trigram
+  tokenizer) — 2026-08-17, Step 11: a SQLite-backed alternative to the in-memory scan above,
+  gated behind `CONFIG.cwl_use_fts_player_search` (default `False` — the in-memory path stays
+  active until DEV+PROD burn-in confirms parity; flipping it is a config change, not a code
+  change). `player_name_search` is a plain table (PK-indexed, backs the CWL guest search's `#`
+  tag-PREFIX mode — `player_tag LIKE ?||'%'`); `player_name_fts` is FTS5 with the trigram
+  tokenizer (backs actual name-SUBSTRING search) — feasibility confirmed live via SSH on both
+  DEV (SQLite 3.50.4) and PROD (SQLite 3.45.2), both fully support FTS5 + trigram. Kept in sync
+  by the SAME two writers as `player_name_index` above (`_upsert_player_name_index_in_conn` /
+  `update_player_name_index_sync`), re-reading the just-upserted `player_name_index` row rather
+  than trusting the write batch's own value directly, so a WHERE-guarded "not newer, skip"
+  outcome there can never leave these two tables holding a stale name `player_name_index`
+  itself rejected. One-time idempotent backfill on every startup (`_backfill_player_name_search_
+  if_needed()`), guarded by a row-count comparison against `player_name_index` so it's a no-op
+  once already in sync. `/whois`'s OWN separate inline scan (`QBdiscordcmds.py` — deliberately
+  not `CACHE.search_player_names()`, see Step 9's own note) is NOT migrated to this path — it
+  needs the full match set for its guild-membership reorder, which a `LIMIT`-based FTS5 query
+  doesn't naturally provide; out of this step's scope.
 
 ### Foreign Key Relationships
 
@@ -1430,6 +1456,52 @@ re-check) rather than trusting them long-term.
   (a restart within the same 03:00 window recomputes the same date, correctly skips), but is no
   longer sensitive to what time of day an unrelated manual run happened.
 - Files: `QapBot.py` (`periodic_main()`'s `_maint_due` block). 1519 tests pass.
+
+### 2026-08-17: `player_name_index` Scan-Cost Fix + SQLite/FTS5 Search Alternative (Complete ✅)
+- **Context**: `CWL_PROD_PERFORMANCE_FIX_PLAN.md` P1 Step 9 + P2 Step 11, following the
+  2026-08-16 PROD meltdown (see the CWL Guests-search incident referenced throughout that plan
+  doc — a different code path, but the same `player_name_index` table was one of the two
+  million-plus-entry structures the incident's uncapped scans walked).
+- **Step 9**: `CACHE.player_name_index` values changed from a bare `player_name: str` to
+  `(name, name_lower)` tuples, built once at load/write time (`_player_name_tuple()`) instead of
+  every reader calling `.lower()` on every one of the ~6.6M entries per search.
+  `CACHE.search_player_names()` now also bounds collection to 200 matches before sorting/capping
+  instead of scanning to completion first. Found and fixed a matching cost in `/whois`'s OWN
+  separate inline scan (`QBdiscordcmds.py` — doesn't call `search_player_names()` at all, needs
+  the full match set for its guild-membership reorder) — extracted into
+  `_search_player_name_index_sync()`, `asyncio.to_thread()`-wrapped (was running unwrapped on
+  the event loop).
+- **Step 11**: added a SQLite-backed alternative — `player_name_search(player_tag PK, name,
+  name_lower)` (plain table, tag-prefix search) + `player_name_fts` (FTS5, `tokenize='trigram'`,
+  name-substring search), gated behind `CONFIG.cwl_use_fts_player_search` (default `False`).
+  Feasibility (FTS5 + trigram tokenizer support) confirmed live via SSH on both DEV (SQLite
+  3.50.4) and PROD (SQLite 3.45.2) before implementing — both fully support it. Kept in sync by
+  the same two writers as `player_name_index` (`_upsert_player_name_index_in_conn` /
+  `update_player_name_index_sync`), re-reading the just-upserted `player_name_index` row (not
+  trusting the write batch's own value) so a "not newer, skip" outcome there can never leave the
+  new tables holding a stale name. One-time idempotent backfill on every startup, guarded by a
+  row-count comparison. `CACHE.player_name_index` stays fully loaded/dual-written regardless of
+  the flag — explicit safety-net retention for at least one release; dropping it from RAM (the
+  actual ~1GB RSS payoff) is a later, separate decision once DEV+PROD burn-in confirms parity.
+- **Corrections made to the plan's own draft during implementation** (verified empirically,
+  2026-08-17): the plan's `fts5(player_tag UNPREFIXED, name)` doesn't parse — FTS5 has no
+  `UNPREFIXED` column option; the real keyword is `UNINDEXED`. FTS5 virtual tables don't support
+  `INSERT ... ON CONFLICT DO UPDATE` ("UPSERT not implemented for virtual table") — used
+  DELETE-then-INSERT per row instead (`UPDATE ... WHERE <unindexed column> = ?` also works
+  against FTS5 directly, confirmed, but delete+insert is simpler when a row may not exist yet).
+  Trigram tokenization needs >=3 characters to form even one trigram, so a shorter query
+  structurally cannot match anything — `search_player_names_sync()` returns `[]` immediately for
+  those. An unquoted needle is parsed as FTS5 query syntax, not literal text (a raw hyphen raises
+  "no such column", an unescaped `"` raises "unterminated string") — every query is wrapped in
+  FTS5's own literal-string quoting (`"..."`, embedded `"` doubled) before use.
+- Files: `qapbot/db_manager.py` (schema, backfill, 2 writers extended, 2 new readers:
+  `search_player_names_sync`/`search_player_tags_by_prefix_sync`), `qapbot/cache_manager.py`
+  (tuple shape, `set_player_name()`, rollout-flag delegation), `qapbot/coc_cache.py` (writer
+  switched to `set_player_name()`), `qapbot/web_bridge.py` (guest-search tag-prefix mode
+  delegation), `QBdiscordcmds.py` (`/whois` threading fix), `qapbot/config.py`
+  (`cwl_use_fts_player_search`). 26 new tests (20 in a new `tests/unit/
+  test_player_name_search_fts.py`, plus the Step 9 tests and one guest-search delegation test).
+  2046 tests pass.
 
 ### Future Phases
 **Not currently planned:**

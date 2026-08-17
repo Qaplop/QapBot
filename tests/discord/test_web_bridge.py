@@ -1990,6 +1990,47 @@ async def test_guest_search_hash_prefix_caps_player_hits_at_twelve(db, bridge_co
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_guest_search_hash_prefix_uses_sqlite_when_fts_flag_enabled(db, bridge_config, client, monkeypatch):
+    """2026-08-17 (CWL_PROD_PERFORMANCE_FIX_PLAN.md P2 Step 11): with CONFIG.cwl_use_fts_player_
+    search on, the # tag-mode path delegates to db.search_player_tags_by_prefix_sync() (SQLite,
+    PK-prefix-indexed) instead of scanning CACHE.player_name_index in Python — proven here by
+    seeding ONLY the real DB (via update_player_name_index_sync, which also populates
+    player_name_search) and leaving CACHE.player_name_index empty; a correct result is only
+    possible if the SQLite path actually ran."""
+    import dataclasses
+
+    from qapbot.cache_manager import CACHE
+    from qapbot.config import CONFIG
+
+    await _seed_guild_and_clans(db, "835", {})
+    CACHE.db_manager = db
+    CACHE.server_config["835"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {}
+    CACHE.player_name_index = {}  # deliberately empty
+    CACHE.user_accounts = {}
+    db.update_player_name_index_sync([("#QAPFTS1", "FtsPlayer", "2026-08-17T00:00")])
+
+    monkeypatch.setattr("qapbot.config.CONFIG", dataclasses.replace(bridge_config, cwl_use_fts_player_search=True))
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(835, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=835&discord_user_id=42&q=%23QAPFTS",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    player_hits = [r for r in body["results"] if r["type"] == "player"]
+    # Includes the pre-existing "raw unindexed tag" fallback (query len >= 5, not itself an
+    # exact key in the hits) alongside the real SQLite-backed match — unrelated to this test's
+    # own point, just the existing behavior at this query length.
+    assert {"type": "player", "player_tag": "#QAPFTS1", "player_name": "FtsPlayer", "discord_id": None} in player_hits
+    assert len(player_hits) == 2
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_guest_search_text_query_caps_clan_hits_and_db_check_calls(db, bridge_config, client, monkeypatch):
     """The clan scan breaks at GUEST_SEARCH_CAP (12) and the cross-guild DB check
     (find_cwl_clan_participation_across_guilds_sync) only ever runs for the capped set, not once

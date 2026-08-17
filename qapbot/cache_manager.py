@@ -483,7 +483,18 @@ class CacheManager:
         A worst-case scan (a needle that never reaches 200 matches) is still a full pass over
         player_name_index — millions of entries on PROD — with no per-entry allocation now that
         name_lower is precomputed (~1s worst case on the PROD Celeron). Callers reached from the
-        event loop MUST still asyncio.to_thread() this; both current callers already do."""
+        event loop MUST still asyncio.to_thread() this; both current callers already do.
+
+        Delegates to WarHistoryDB.search_player_names_sync() (SQLite, FTS5 trigram-indexed)
+        instead when CONFIG.cwl_use_fts_player_search is True (2026-08-17, Step 11) — the
+        rollout flag defaults False (this in-memory scan stays the active path) until DEV+PROD
+        burn-in confirms the two paths return equivalent results; still threaded the same way by
+        every caller either way, so the switch is transparent to them."""
+        from qapbot.config import CONFIG
+
+        if CONFIG.cwl_use_fts_player_search and self.db_manager is not None:
+            return self.db_manager.search_player_names_sync(query, limit)
+
         if not query:
             return []
         needle = query.lower()
