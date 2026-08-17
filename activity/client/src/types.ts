@@ -88,7 +88,20 @@ export type EnrollmentPayload = {
   event_status: string | null
   clans: EnrollmentClan[]
   players: EnrollmentPlayer[]
+  // The wait loop's starting point (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8) —
+  // every GET /api/cwl/enrollment response carries the guild's current enrollment version, so a
+  // fresh page load (or a refetch triggered by the wait loop itself) always has a correct
+  // known_version to hand the next GET /api/cwl/enrollment/wait call.
+  version: number
 }
+
+/** GET /api/cwl/enrollment/wait's response shape (2026-08-17, Step 8) — the long-poll backing
+ * the client's event-driven wait loop, replacing the old fixed 12s setInterval. `changed: true`
+ * means the caller should refetch the full EnrollmentPayload (this response carries no payload
+ * of its own); `changed: false` only ever happens after the bridge's hold timeout with no write
+ * in between, and `version` always echoes the bridge's authoritative current value either way —
+ * the wait loop uses it as the next call's known_version regardless of which branch happened. */
+export type WaitResponse = { changed: boolean; version: number }
 
 /** One flat result from GET /api/cwl/guest-search — the Guests invite search on Configure
  * Participating Clans (2026-08-15). A "clan" hit gets added straight into the same `clans` array

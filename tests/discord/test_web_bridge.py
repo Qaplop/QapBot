@@ -2187,6 +2187,244 @@ async def test_clan_names_empty_tags_returns_empty(bridge_config, client, monkey
 
 
 # ---------------------------------------------------------------------------
+# 2026-08-17 (CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8) — GET /api/cwl/enrollment/wait, the
+# event-driven long-poll replacing the client's old fixed 12s setInterval. guild_ids in the
+# 860x range are dedicated to this section (never reused elsewhere in this file) since
+# _enrollment_version/_enrollment_changed are module-level state that persists across tests.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_includes_version_field(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "8600", {})
+    CACHE.db_manager = db
+    CACHE.server_config["8600"] = {"member_clans": [], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(8600, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "8600", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["version"] == 0
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_wait_rejects_missing_secret(bridge_config, client):
+    resp = await client.get("/api/cwl/enrollment/wait?guild_id=8601&discord_user_id=42&known_version=0")
+    assert resp.status == 403
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_wait_stale_known_version_returns_immediately(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "8601", {})
+    CACHE.db_manager = db
+    CACHE.server_config["8601"] = {"member_clans": [], "member_families": []}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(8601, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment/wait?guild_id=8601&discord_user_id=42&known_version=999",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body == {"changed": True, "version": 0}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_wait_times_out_with_no_write(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    import qapbot.web_bridge as web_bridge_module
+
+    await _seed_guild_and_clans(db, "8602", {})
+    CACHE.db_manager = db
+    CACHE.server_config["8602"] = {"member_clans": [], "member_families": []}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(8602, 42, is_admin=True))
+    monkeypatch.setattr(web_bridge_module, "_ENROLLMENT_WAIT_TIMEOUT_SECONDS", 0.1)
+
+    resp = await client.get(
+        "/api/cwl/enrollment/wait?guild_id=8602&discord_user_id=42&known_version=0",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body == {"changed": False, "version": 0}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_wait_resolves_on_concurrent_write(db, bridge_config, client, monkeypatch):
+    """A parked wait must be released promptly by a real write through the normal POST endpoint —
+    not just by calling bump_enrollment_version() directly — proving the actual handler wiring,
+    not just the primitive."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+
+    await _seed_guild_and_clans(db, "8603", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.server_config["8603"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    season = resolve_current_cwl_season()
+    event_id = db.create_cwl_event_sync("8603", season, "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    await _seed_current_clan_member(db, "10", "#P1", "#CLAN1")
+    await db.conn.commit()
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(8603, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    wait_task = asyncio.create_task(client.get(
+        "/api/cwl/enrollment/wait?guild_id=8603&discord_user_id=42&known_version=0",
+        headers={"X-Bridge-Secret": "test-secret"},
+    ))
+    await asyncio.sleep(0.05)  # let the wait task actually park on the guild's Condition
+    assert not wait_task.done()
+
+    assign_resp = await client.post(
+        "/api/cwl/enrollment/assign",
+        json={"guild_id": 8603, "discord_user_id": 42, "player_tag": "#P1", "clan_tag": "#CLAN1"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert assign_resp.status == 200
+
+    wait_resp = await asyncio.wait_for(wait_task, timeout=5)
+    assert wait_resp.status == 200
+    body = await wait_resp.json()
+    assert body == {"changed": True, "version": 1}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_wait_waiter_cap_overflow_returns_changed_immediately(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    import qapbot.web_bridge as web_bridge_module
+
+    await _seed_guild_and_clans(db, "8604", {})
+    CACHE.db_manager = db
+    CACHE.server_config["8604"] = {"member_clans": [], "member_families": []}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(8604, 42, is_admin=True))
+    monkeypatch.setattr(web_bridge_module, "_ENROLLMENT_WAIT_MAX_WAITERS_PER_GUILD", 1)
+    monkeypatch.setattr(web_bridge_module, "_ENROLLMENT_WAIT_TIMEOUT_SECONDS", 0.2)
+
+    first_task = asyncio.create_task(client.get(
+        "/api/cwl/enrollment/wait?guild_id=8604&discord_user_id=42&known_version=0",
+        headers={"X-Bridge-Secret": "test-secret"},
+    ))
+    await asyncio.sleep(0.05)  # let it register as the one parked waiter allowed by the cap
+    assert not first_task.done()
+
+    overflow_resp = await client.get(
+        "/api/cwl/enrollment/wait?guild_id=8604&discord_user_id=42&known_version=0",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert overflow_resp.status == 200
+    overflow_body = await overflow_resp.json()
+    assert overflow_body == {"changed": True, "version": 0}
+
+    # The first waiter is still just an ordinary timeout — degrade-gracefully behavior, not a
+    # crash — confirming the cap didn't corrupt its own outcome.
+    first_resp = await asyncio.wait_for(first_task, timeout=5)
+    assert first_resp.status == 200
+    first_body = await first_resp.json()
+    assert first_body == {"changed": False, "version": 0}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_wait_cross_guild_shared_clan_write_releases_other_guild(db, bridge_config, client, monkeypatch):
+    """A shared-clan write made through guild A (the owner) must release guild B's (the
+    follower's) parked waiter too — the global-bump fallback (bump_enrollment_version's own
+    docstring) for the case sync_cwl_shared_clan_roster_to_local_pools() doesn't report exactly
+    which other guild(s) it touched."""
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    CACHE.server_config["8605"] = {"member_clans": [], "member_families": []}
+    CACHE.server_config["8606"] = {"member_clans": [], "member_families": []}
+    shared_clan_id, owner_event_id, follower_event_id = await _seed_shared_clan_pair(db, "8605", "8606")
+    db.set_cwl_shared_clan_player_status_sync(
+        shared_clan_id, "#P1", "Alpha1", "999", "pending", "guest_invite", "8605",
+    )
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(8605, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    # Guild 8606 (the follower) is the one waiting.
+    wait_task = asyncio.create_task(client.get(
+        "/api/cwl/enrollment/wait?guild_id=8606&discord_user_id=42&known_version=0",
+        headers={"X-Bridge-Secret": "test-secret"},
+    ))
+    await asyncio.sleep(0.05)
+    assert not wait_task.done()
+
+    # Guild 8605 (the owner) confirms the shared player — the write that must release 8606's wait.
+    signup_resp = await client.post(
+        "/api/cwl/enrollment/signup",
+        json={"guild_id": 8605, "discord_user_id": 42, "player_tag": "#P1", "action": "confirm"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert signup_resp.status == 200
+
+    wait_resp = await asyncio.wait_for(wait_task, timeout=5)
+    assert wait_resp.status == 200
+    body = await wait_resp.json()
+    assert body["changed"] is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_activity_closed_does_not_bump_enrollment_version(bridge_config, client, monkeypatch):
+    """handle_post_cwl_activity_closed fires refresh_cwl_management_hub_message() unconditionally
+    on every close, even when nothing changed — deliberately excluded from bump_enrollment_version
+    (see that handler's own docstring) so a plain Cancel/back-gesture close doesn't wake every
+    parked waiter for no reason."""
+    import qapbot.web_bridge as web_bridge_module
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(8609, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    before = web_bridge_module._enrollment_version.get("8609", 0)
+
+    resp = await client.post(
+        "/api/cwl/activity-closed",
+        json={"guild_id": 8609, "discord_user_id": 42},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+
+    after = web_bridge_module._enrollment_version.get("8609", 0)
+    assert after == before
+
+
+# ---------------------------------------------------------------------------
 # Player-stats lookup (2026-08-16) — GET /api/cwl/player-stats. The other half of the Manage
 # Enrollment board's hover pop-up progressive fetch: missed CWL attacks + attack/defense star
 # ratio, computed exactly as /leaderboard mode=missedattacks|attackdefratio cwl_only=true
@@ -2282,6 +2520,142 @@ async def test_player_stats_returns_recent_cwl_stats(db, bridge_config, client, 
     assert body["attack_defense_ratio"] == 3.0
     assert len(body["seasons"]) == 3
     assert body["seasons"][-1] == now.strftime("%Y-%m")
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-17 (CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 7): _player_stats_cache TTL cache — the
+# incident log showed get_recent_cwl_player_stats running ~100+ times in one session, almost
+# always for the same handful of players a lead was scanning back and forth across. Each test
+# calls clear_player_stats_cache() first and uses a player_tag not used by any other test in this
+# file, since the cache is module-level (persists across tests) and keyed by player_tag alone.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_stats_caches_repeat_lookups_for_same_tag(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    import qapbot.web_bridge as web_bridge_module
+    import QBhelperfunctions
+
+    web_bridge_module.clear_player_stats_cache()
+    await _seed_guild_and_clans(db, "850", {})
+    CACHE.db_manager = db
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(850, 42, is_admin=True))
+
+    call_log: list = []
+    real_fn = QBhelperfunctions.get_recent_cwl_player_stats
+
+    def spy(player_tag, *args, **kwargs):
+        call_log.append(player_tag)
+        return real_fn(player_tag, *args, **kwargs)
+
+    monkeypatch.setattr(QBhelperfunctions, "get_recent_cwl_player_stats", spy)
+
+    resp1 = await client.get(
+        "/api/cwl/player-stats?guild_id=850&discord_user_id=42&player_tag=%23CACHETEST1",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    resp2 = await client.get(
+        "/api/cwl/player-stats?guild_id=850&discord_user_id=42&player_tag=%23CACHETEST1",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp1.status == 200 and resp2.status == 200
+    assert (await resp1.json()) == (await resp2.json())
+    assert call_log == ["#CACHETEST1"]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_stats_cache_expires_after_ttl(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    import qapbot.web_bridge as web_bridge_module
+    import QBhelperfunctions
+
+    web_bridge_module.clear_player_stats_cache()
+    await _seed_guild_and_clans(db, "851", {})
+    CACHE.db_manager = db
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(851, 42, is_admin=True))
+
+    call_log: list = []
+    real_fn = QBhelperfunctions.get_recent_cwl_player_stats
+
+    def spy(player_tag, *args, **kwargs):
+        call_log.append(player_tag)
+        return real_fn(player_tag, *args, **kwargs)
+
+    monkeypatch.setattr(QBhelperfunctions, "get_recent_cwl_player_stats", spy)
+
+    fake_now = [1_000.0]
+    monkeypatch.setattr(web_bridge_module.time, "monotonic", lambda: fake_now[0])
+
+    resp1 = await client.get(
+        "/api/cwl/player-stats?guild_id=851&discord_user_id=42&player_tag=%23CACHETEST2",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp1.status == 200
+    assert call_log == ["#CACHETEST2"]
+
+    # Still within the TTL -> served from cache, no second underlying call.
+    fake_now[0] += 60
+    resp2 = await client.get(
+        "/api/cwl/player-stats?guild_id=851&discord_user_id=42&player_tag=%23CACHETEST2",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp2.status == 200
+    assert call_log == ["#CACHETEST2"]
+
+    # Past the TTL -> real call again.
+    fake_now[0] += web_bridge_module._PLAYER_STATS_CACHE_TTL_SECONDS + 1
+    resp3 = await client.get(
+        "/api/cwl/player-stats?guild_id=851&discord_user_id=42&player_tag=%23CACHETEST2",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp3.status == 200
+    assert call_log == ["#CACHETEST2", "#CACHETEST2"]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_stats_cache_cleared_by_clear_player_stats_cache(db, bridge_config, client, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    import qapbot.web_bridge as web_bridge_module
+    import QBhelperfunctions
+
+    web_bridge_module.clear_player_stats_cache()
+    await _seed_guild_and_clans(db, "852", {})
+    CACHE.db_manager = db
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(852, 42, is_admin=True))
+
+    call_log: list = []
+    real_fn = QBhelperfunctions.get_recent_cwl_player_stats
+
+    def spy(player_tag, *args, **kwargs):
+        call_log.append(player_tag)
+        return real_fn(player_tag, *args, **kwargs)
+
+    monkeypatch.setattr(QBhelperfunctions, "get_recent_cwl_player_stats", spy)
+
+    resp1 = await client.get(
+        "/api/cwl/player-stats?guild_id=852&discord_user_id=42&player_tag=%23CACHETEST3",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp1.status == 200
+    assert call_log == ["#CACHETEST3"]
+
+    web_bridge_module.clear_player_stats_cache()
+
+    resp2 = await client.get(
+        "/api/cwl/player-stats?guild_id=852&discord_user_id=42&player_tag=%23CACHETEST3",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp2.status == 200
+    assert call_log == ["#CACHETEST3", "#CACHETEST3"]
 
 
 @pytest.mark.discord

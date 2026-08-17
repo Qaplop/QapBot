@@ -179,6 +179,31 @@ api.get('/cwl/enrollment', async (c) => {
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
 })
 
+// Event-driven long-poll (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8) replacing the
+// client's old fixed 12s setInterval poll of /cwl/enrollment above. Same verify-identity-then-
+// proxy shape as every other route here — the upstream fetch simply takes up to ~25s (the
+// bridge's own hold duration) instead of returning immediately; Worker wall-clock time spent
+// waiting on origin I/O like this is not billed CPU time, so this is free-plan safe.
+api.get('/cwl/enrollment/wait', async (c) => {
+  const guildId = c.req.query('guild_id')
+  const knownVersion = c.req.query('known_version')
+  if (!guildId || knownVersion === undefined) {
+    return c.json({ error: 'missing guild_id or known_version' }, 400)
+  }
+
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  const upstream = await fetch(
+    `${c.env.BRIDGE_URL}/api/cwl/enrollment/wait?guild_id=${encodeURIComponent(guildId)}` +
+      `&discord_user_id=${encodeURIComponent(discordUserId)}&known_version=${encodeURIComponent(knownVersion)}`,
+    { headers: { 'X-Bridge-Secret': c.env.BRIDGE_SECRET } },
+  )
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
+})
+
 // Hover pop-up progressive fetch (2026-08-16) — resolves clan_tag -> name for tags the board's
 // initial payload didn't already carry a name for. Same verify-identity-then-proxy shape as
 // /cwl/enrollment above (which this is a companion to); `tags` is a plain comma-joined list, not

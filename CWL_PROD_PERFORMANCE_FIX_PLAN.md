@@ -297,6 +297,12 @@ acceptable, stats change at most once per war round.
 `get_recent_cwl_player_stats` called once (spy); TTL expiry (monkeypatch the clock) → called
 again; cache cleared on `clear_player_stats_cache()`.
 
+**Status (2026-08-17, Batch 4): implemented as designed.** Confirmed `get_recent_cwl_player_stats`
+has exactly one caller anywhere (this handler) — no `/whois`/other caller exists today, so no
+always-fresh-vs-cached split was needed. `clear_player_stats_cache()` wired into `QapBot.py`'s
+`[CYCLE-CLEANUP]` hook. 3 new tests (repeat-lookup caching, TTL expiry via a monkeypatched clock,
+explicit clear) — all pass.
+
 ### Step 8: Replace the 12s enrollment poll with event-driven long-polling
 
 **Files**: `qapbot/web_bridge.py`, `activity/server/src/index.ts` (one new proxy route),
@@ -393,6 +399,40 @@ correctness after a bot restart or tunnel blip) — it is not polling-specific m
 - Waiter-cap overflow → immediate `{"changed": true}`.
 - Cross-guild bump: a shared-clan write in guild A releases guild B's parked waiter.
 Frontend: typecheck/build only (no test harness exists for the client).
+
+**Status (2026-08-17, Batch 4): implemented, backend verification pending live Discord testing.**
+- Version counter: per-guild (`Dict[str, int]`, string keys matching this module's own
+  convention), not a single global counter — `bump_enrollment_version(guild_id)` for the acting
+  guild, `bump_enrollment_version(None)` (bumps every currently-tracked guild) as the
+  plan-sanctioned simpler fallback for write paths where resolving the exact cross-guild partner
+  set isn't already cheap (assign's conflict-purge, detach-on-deactivate, Delete Season's
+  prune-or-detach); precise per-guild targeting used wherever the partner guild(s) were already
+  at hand for free (shared-clan evict's `target_guild_id`, `ensure_cwl_clan_sharing`'s own
+  `other_guild_ids` return value in both its trigger points — `handle_post_clan_config` and Start
+  Enrollment). 10 total call sites wired: 5 in `web_bridge.py` (signup, assign, guest, clan-config
+  save, shared-clan evict) + 5 in `ui_cwl_roster.py` (season select, Add New Season ×2, Delete
+  Season, Start Enrollment). `handle_post_cwl_activity_closed` deliberately excluded — see its own
+  docstring — it refreshes unconditionally on every close regardless of whether anything changed,
+  so bumping there would wake every parked waiter for a plain Cancel/back-gesture close.
+- Client backoff/degrade (main.ts): implemented as ONE loop rather than two separate code paths —
+  exponential backoff (5s→10s→20s→40s→60s cap) on any wait failure, and once 3+ failures have
+  accumulated, each backoff cycle ALSO does a plain GET refetch (so the board doesn't go stale for
+  the whole backoff duration) before retrying `/wait` again next cycle — achieves the same
+  "degrade to ~60s polling until a wait succeeds again" outcome the spec describes without a
+  separate degraded-mode branch. Visibility pause checks `document.visibilityState` between loop
+  iterations (doesn't abort an in-flight wait mid-request); resume does one immediate refetch.
+- 8 new bridge tests (stale version, timeout, resolves-via-real-POST, waiter-cap overflow,
+  cross-guild release via a real shared-clan signup, version field present, activity-closed
+  non-bump regression) — all pass. `npm run typecheck && npm run build` clean for both
+  `activity/client` and `activity/server`.
+- **NOT yet done**: the hold-duration verification this step's own design notes call for doing
+  FIRST (empirically confirming the ~25s hold survives Discord proxy → Worker → cloudflared →
+  aiohttp intact) — this requires a live Discord Activity session, which isn't something that can
+  be exercised outside one. Deployed to DEV for that live test; until confirmed, treat the 25s
+  constant as unverified. The client's own 3-failures-and-degrade safety net means a hop that
+  silently truncates the hold would show up as: `/wait` responses returning near-instantly
+  instead of holding, but should NOT break the board (it'd just settle into noisier polling until
+  the constant is lowered here per this step's own instructions).
 
 ### Step 9: Fix `search_player_names` scan cost
 

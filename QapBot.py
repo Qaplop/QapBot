@@ -2303,6 +2303,11 @@ async def periodic_main() -> None:
             def _post_cycle_cleanup() -> int:
                 _t0 = time.perf_counter()
                 expired = CACHE.coc_clan_cache.clear_expired()
+                # CWL Guests board hover-stats cache (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md
+                # P1 Step 7) — cleared once per cycle so a just-finished war round's stats show up
+                # within one cycle instead of waiting out the full 15-minute TTL.
+                from qapbot.web_bridge import clear_player_stats_cache
+                clear_player_stats_cache()
                 _t1 = time.perf_counter()
                 import gc as _gc
                 _gc.collect(1)

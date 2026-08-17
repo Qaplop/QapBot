@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional, Set
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import discord
 from aiohttp import web
@@ -145,6 +146,70 @@ async def _resolve_admin_or_leader(guild_id: int, discord_user_id: int) -> bool:
     if coleader_role_id and int(coleader_role_id) in member_role_ids:
         return True
     return False
+
+
+# Enrollment-board version counter + notification primitive (2026-08-17,
+# CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8) — backs GET /api/cwl/enrollment/wait's long-poll,
+# replacing the client's old fixed 12s setInterval poll with an event-triggered one. Keyed by
+# guild_id (as str, matching the rest of this module's convention). A guild's entry is created
+# lazily on first touch (either a write or a wait) — untouched guilds cost nothing. Also doubles
+# as the reconnect/resync mechanism after a bot restart or tunnel blip: a restart resets every
+# counter to 0 in-memory, which a stale client's nonzero `known_version` will never match, so it
+# gets exactly one extra "changed" response and one refetch — no special-case restart handling
+# needed, an in-memory reset just looks like an ordinary change.
+_enrollment_version: Dict[str, int] = {}
+_enrollment_changed: Dict[str, asyncio.Condition] = {}
+_enrollment_waiter_counts: Dict[str, int] = {}
+_ENROLLMENT_WAIT_TIMEOUT_SECONDS = 25.0
+# Cloudflare's ~100s idle timeout and the Discord Activity proxy both stay comfortably clear of
+# this 25s hold; see CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 8 for the empirical DEV verification
+# this constant depends on (lower it here, with a comment recording the measured limit, if any
+# hop in the Discord proxy -> Worker -> cloudflared -> aiohttp chain turns out to cut it short).
+_ENROLLMENT_WAIT_MAX_WAITERS_PER_GUILD = 10
+
+
+def _enrollment_condition_for(guild_id_str: str) -> asyncio.Condition:
+    cond = _enrollment_changed.get(guild_id_str)
+    if cond is None:
+        cond = asyncio.Condition()
+        _enrollment_changed[guild_id_str] = cond
+        _enrollment_version.setdefault(guild_id_str, 0)
+    return cond
+
+
+def get_enrollment_version(guild_id: int) -> int:
+    """Read-only — used by _build_enrollment_payload_sync (a worker-thread sync core) to stamp
+    its own response with the version the wait loop should start from. A plain dict read is
+    GIL-safe from a worker thread; nothing here does a Python-level callback mid-read."""
+    return _enrollment_version.get(str(guild_id), 0)
+
+
+async def bump_enrollment_version(guild_id: Optional[int] = None) -> None:
+    """Call this immediately after any write that changes what the enrollment payload renders —
+    every existing refresh_cwl_management_hub_message()/_refresh_parent(..., "cwl_management")
+    call site in this module and in qapbot/ui_cwl_roster.py is exactly the right hook point (they
+    already mark "board-visible state changed"), so this is called right alongside each of them.
+
+    guild_id=None bumps EVERY currently-tracked guild (only guilds someone has actually opened
+    the board for, or that have been bumped before — never a wasted bump for a guild nobody is
+    watching) — the deliberately simple fallback for the cross-guild shared-clan case (a write in
+    guild A can change guild B's board) at call sites where resolving the exact partner guild set
+    would need extra plumbing/queries; a spurious wake-up only when a write happened anywhere is
+    still an enormous reduction versus the old fixed-interval poll (CWL_PROD_PERFORMANCE_FIX_PLAN.md
+    Step 8 design notes). Call sites that already know the specific partner guild(s) cheaply
+    (e.g. the shared-clan evict endpoint's explicit target_guild_id) bump those directly instead —
+    see each call site's own comment.
+
+    Always awaited from the event loop, never from inside a to_thread sync core — every call site
+    bumps AFTER its own to_thread hop returns, so asyncio.Condition (loop-only) is never touched
+    off-loop."""
+    guild_id_strs = [str(guild_id)] if guild_id is not None else list(_enrollment_version.keys())
+    for guild_id_str in guild_id_strs:
+        _enrollment_version[guild_id_str] = _enrollment_version.get(guild_id_str, 0) + 1
+        cond = _enrollment_changed.get(guild_id_str)
+        if cond is not None:
+            async with cond:
+                cond.notify_all()
 
 
 def _build_clan_config_payload_sync(guild_id: int) -> Dict[str, Any]:
@@ -324,6 +389,7 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
             "event_status": event["status"] if event else None,
             "clans": [],
             "players": [],
+            "version": get_enrollment_version(guild_id),
         }
 
     all_clans = db.get_cwl_event_clans_sync(event["id"])
@@ -531,6 +597,7 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
         "event_status": event["status"],
         "clans": clans,
         "players": players,
+        "version": get_enrollment_version(guild_id),
     }
 
 
@@ -781,6 +848,60 @@ async def handle_get_cwl_enrollment(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
+async def handle_get_cwl_enrollment_wait(request: web.Request) -> web.Response:
+    """Long-poll endpoint (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8) replacing the
+    client's old fixed 12s setInterval poll of GET /api/cwl/enrollment. Same admin-or-leader gate
+    as the enrollment GET. `known_version` is whatever the client last saw (from that GET's own
+    "version" field, or a prior wait's response); if the guild's current version already differs,
+    responds immediately. Otherwise parks on the guild's asyncio.Condition for up to
+    _ENROLLMENT_WAIT_TIMEOUT_SECONDS, released the instant any write bumps the version
+    (bump_enrollment_version(), called next to every existing hub-refresh call site). Carries NO
+    payload of its own on purpose — the client refetches the full enrollment payload via the
+    existing GET whenever this responds `changed: true`, so this handler stays allocation-free
+    and there's exactly one place (`_build_enrollment_payload_sync`) that builds the actual board
+    data. Every hop between here and the Discord Activity (Worker, cloudflared, the Discord
+    proxy itself) only ever sees an ordinary HTTP request that happens to take up to
+    _ENROLLMENT_WAIT_TIMEOUT_SECONDS — no streaming, no protocol upgrade."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        guild_id = int(request.query["guild_id"])
+        discord_user_id = int(request.query["discord_user_id"])
+        known_version = int(request.query["known_version"])
+    except (KeyError, ValueError):
+        return web.json_response(
+            {"error": "missing/invalid guild_id, discord_user_id or known_version"}, status=400
+        )
+
+    if not await _resolve_admin_or_leader(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
+
+    guild_id_str = str(guild_id)
+    current = _enrollment_version.get(guild_id_str, 0)
+    if current != known_version:
+        return web.json_response({"changed": True, "version": current})
+
+    # Waiter cap (2026-08-17, Step 8) — beyond this many parked coroutines for one guild, degrade
+    # gracefully (report "changed" so the client refetches and re-issues the wait with a fresh
+    # known_version) rather than accumulate coroutines without bound.
+    if _enrollment_waiter_counts.get(guild_id_str, 0) >= _ENROLLMENT_WAIT_MAX_WAITERS_PER_GUILD:
+        return web.json_response({"changed": True, "version": current})
+
+    _enrollment_waiter_counts[guild_id_str] = _enrollment_waiter_counts.get(guild_id_str, 0) + 1
+    try:
+        cond = _enrollment_condition_for(guild_id_str)
+        async with cond:
+            try:
+                await asyncio.wait_for(cond.wait(), timeout=_ENROLLMENT_WAIT_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        _enrollment_waiter_counts[guild_id_str] = _enrollment_waiter_counts.get(guild_id_str, 1) - 1
+
+    current = _enrollment_version.get(guild_id_str, 0)
+    return web.json_response({"changed": current != known_version, "version": current})
+
+
 async def handle_get_cwl_clan_names(request: web.Request) -> web.Response:
     """Resolves clan_tag -> name for tags the Manage Enrollment board's hover pop-up doesn't
     already know locally (2026-08-16, project owner's spec: "show the pop-up as soon as possible
@@ -807,6 +928,28 @@ async def handle_get_cwl_clan_names(request: web.Request) -> web.Response:
     return web.json_response({"names": {tag: name for tag, name in names.items() if name is not None}})
 
 
+# Player-stats cache (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 7) — the hover
+# pop-up's 3-month main+history SQL aggregation ran ~100+ times in the incident session, almost
+# always for the same handful of players a lead was scanning back and forth across. Bridge-side
+# only: get_recent_cwl_player_stats has exactly one caller anywhere in the codebase (this
+# handler — confirmed 2026-08-17, no QBhelperfunctions.py/QBdiscocmdshelper_cwl.py caller and no
+# /whois usage exists today), so there's no "always-fresh" caller to keep separate from.
+# player_tag -> (monotonic timestamp, payload). TTL, not correctness — stats change at most once
+# per war round, so a stale-by-minutes read is harmless.
+_player_stats_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_PLAYER_STATS_CACHE_TTL_SECONDS = 15 * 60
+_PLAYER_STATS_CACHE_MAX_ENTRIES = 2000
+
+
+def clear_player_stats_cache() -> None:
+    """Wholesale invalidation, called once per update cycle (QapBot.py's [CYCLE-CLEANUP] hook) so
+    a just-finished war round's stats show up within one cycle instead of waiting out the full
+    TTL. Safe to call from a worker thread (dict.clear() is a single GIL-atomic C call, same
+    thread-safety assumption CACHE.coc_clan_cache.clear_expired() already relies on in that same
+    cleanup hook) — nothing here does a Python-level callback mid-clear."""
+    _player_stats_cache.clear()
+
+
 async def handle_get_cwl_player_stats(request: web.Request) -> web.Response:
     """Backs the second half of the Manage Enrollment board's hover pop-up progressive fetch
     (2026-08-16, project owner's spec, verbatim: "get the number of missed cwl attacks from the
@@ -819,7 +962,10 @@ async def handle_get_cwl_player_stats(request: web.Request) -> web.Response:
     rather than a separate query, so the two can never disagree again. Same admin-or-leader gate
     as the enrollment screen itself. A player with no CWL history at all still gets a 200 with
     null fields (not a 404/error) — the client just leaves those pop-up lines out, same as it
-    already does for an unresolved clan name."""
+    already does for an unresolved clan name.
+
+    TTL-cached per player_tag (2026-08-17, Step 7, see _player_stats_cache above) — a repeat
+    hover within 15 minutes never touches the DB at all."""
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
     try:
@@ -832,6 +978,11 @@ async def handle_get_cwl_player_stats(request: web.Request) -> web.Response:
     if not await _resolve_admin_or_leader(guild_id, discord_user_id):
         return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
 
+    now = time.monotonic()
+    cached = _player_stats_cache.get(player_tag)
+    if cached is not None and now - cached[0] < _PLAYER_STATS_CACHE_TTL_SECONDS:
+        return web.json_response(cached[1])
+
     from QBhelperfunctions import get_recent_cwl_player_stats
 
     # asyncio.to_thread()-wrapped (2026-08-17, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md — the
@@ -839,6 +990,15 @@ async def handle_get_cwl_player_stats(request: web.Request) -> web.Response:
     # aggregation the PROD incident log showed running synchronously on the loop once per tile
     # hover (~100+ calls in the session).
     stats = await asyncio.to_thread(get_recent_cwl_player_stats, player_tag)
+
+    if len(_player_stats_cache) >= _PLAYER_STATS_CACHE_MAX_ENTRIES:
+        # dict.popitem() is LIFO (evicts the most-recently-INSERTED key), not true "oldest" LRU
+        # eviction — the plan's own "no external LRU dependency" tradeoff. In practice this cap
+        # is far larger than any real player pool a board would ever hover through in a session,
+        # so it's a safety valve against unbounded growth, not a hot eviction path.
+        _player_stats_cache.popitem()
+    _player_stats_cache[player_tag] = (now, stats)
+
     return web.json_response(stats)
 
 
@@ -910,7 +1070,10 @@ def _apply_cwl_enrollment_signup_sync(
         if action == "withdraw":
             db.delete_cwl_assignment_sync(event_id, player_tag)
 
-    return {"ok": True}
+    # "shared" tells the caller whether sync_cwl_shared_clan_roster_to_local_pools() above may
+    # have touched another guild's local pool too (2026-08-17, Step 8) — if so, the caller bumps
+    # the enrollment version globally rather than just for this guild.
+    return {"ok": True, "shared": player_shared_clan is not None}
 
 
 async def handle_post_cwl_enrollment_signup(request: web.Request) -> web.Response:
@@ -965,6 +1128,10 @@ async def handle_post_cwl_enrollment_signup(request: web.Request) -> web.Respons
         await refresh_cwl_management_hub_message(guild_id, "cwl_management")
     except Exception as e:
         logging.warning(f"[WEB-BRIDGE] Saved signup but could not refresh the Hub message: {e}")
+    # Step 8: a shared-clan response (result["shared"]) also updated another guild's local pool
+    # via sync_cwl_shared_clan_roster_to_local_pools() — bump globally rather than resolve the
+    # exact partner guild here (see bump_enrollment_version's own docstring for the tradeoff).
+    await bump_enrollment_version(None if result.get("shared") else guild_id)
 
     return web.json_response({"ok": True})
 
@@ -1018,6 +1185,12 @@ async def handle_post_cwl_enrollment_assign(request: web.Request) -> web.Respons
         await refresh_cwl_management_hub_message(guild_id, "cwl_management")
     except Exception as e:
         logging.warning(f"[WEB-BRIDGE] Saved assignment but could not refresh the Hub message: {e}")
+    # Step 8: assign_cwl_player_sync can write to another guild's cwl_shared_clan_players (target
+    # is a shared clan) or purge the player from one they're placed in elsewhere — it doesn't
+    # currently report which, so bump globally rather than resolve the exact partner guild for
+    # every single drag-and-drop move (see bump_enrollment_version's own docstring for the
+    # tradeoff; this is the plan's explicitly-sanctioned simpler fallback).
+    await bump_enrollment_version(None)
 
     return web.json_response({"ok": True})
 
@@ -1138,6 +1311,9 @@ async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response
         await refresh_cwl_management_hub_message(guild_id, "cwl_management")
     except Exception as e:
         logging.warning(f"[WEB-BRIDGE] Saved guest but could not refresh the Hub message: {e}")
+    # A guest PLAYER add is always local to this guild's own cwl_signups — no shared-clan branch
+    # (see this handler's own docstring: guest CLANS go through a different endpoint entirely).
+    await bump_enrollment_version(guild_id)
 
     return web.json_response({"ok": True, "dm_sent": dm_sent})
 
@@ -1282,9 +1458,15 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
         c["clan_tag"] for c in clan_configs
         if c["participating"] and c["clan_tag"] not in previously_participating
     ]
+    # Step 8: guild_ids whose board also needs a version bump because THIS save touched a shared
+    # clan they're attached to — precise where the write path already resolves it cheaply
+    # (ensure_cwl_clan_sharing's own return value), global fallback where it doesn't (detach,
+    # below) — see bump_enrollment_version's own docstring for the tradeoff.
+    also_bump_guild_ids: set = set()
     for clan_tag in newly_participating_tags:
         sharing_result = await ensure_cwl_clan_sharing(guild_id, event_id, season, clan_tag)
         if sharing_result is not None:
+            also_bump_guild_ids.update(int(gid) for gid in sharing_result.get("other_guild_ids", []))
             try:
                 await notify_cwl_clan_shared(guild_id, clan_tag, season, sharing_result, acting_discord_id=discord_user_id)
             except Exception as e:
@@ -1323,6 +1505,14 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
         await refresh_cwl_management_hub_message(guild_id, "cwl_management")
     except Exception as e:
         logging.warning(f"[WEB-BRIDGE] Saved clan-config but could not refresh the Hub message: {e}")
+
+    await bump_enrollment_version(guild_id)
+    for other_guild_id in also_bump_guild_ids:
+        await bump_enrollment_version(other_guild_id)
+    if newly_deactivated_tags:
+        # detach_guild_from_shared_clan_on_deactivation() doesn't report which guild(s) it
+        # repointed ownership to — global fallback for this (rare) branch only.
+        await bump_enrollment_version(None)
 
     return web.json_response({"ok": True, "event_id": event_id})
 
@@ -1363,6 +1553,9 @@ async def handle_post_cwl_shared_clan_evict(request: web.Request) -> web.Respons
         await refresh_cwl_management_hub_message(guild_id, "cwl_management")
     except Exception as e:
         logging.warning(f"[WEB-BRIDGE] Evicted guild {target_guild_id} from shared clan {clan_tag} but could not refresh the Hub message: {e}")
+    # Step 8: both guild_ids are already known precisely here — no need for the global fallback.
+    await bump_enrollment_version(guild_id)
+    await bump_enrollment_version(target_guild_id)
 
     return web.json_response({"ok": True})
 
@@ -1383,7 +1576,13 @@ async def handle_post_cwl_activity_closed(request: web.Request) -> web.Response:
     triggering the exact same refresh on every close, regardless of whether anything changed.
     Never returns an error status for anything past auth — a missing/misconfigured Hub message
     is `refresh_cwl_management_hub_message()`'s own no-op, not a client-visible failure, and the
-    Activity is already in the process of closing by the time this fires."""
+    Activity is already in the process of closing by the time this fires.
+
+    Deliberately does NOT call bump_enrollment_version() (2026-08-17, Step 8) — unlike every
+    other refresh_cwl_management_hub_message() call site in this module, this one fires
+    unconditionally on every close regardless of whether anything actually changed, so bumping
+    here would wake every parked wait() for this guild on a plain Cancel/back-gesture close with
+    zero real change, defeating the "steady-state = zero rebuilds" point of the wait endpoint."""
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
     try:
@@ -1413,6 +1612,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/cwl/clan-config", handle_post_clan_config)
     app.router.add_get("/api/cwl/screen", handle_get_cwl_screen)
     app.router.add_get("/api/cwl/enrollment", handle_get_cwl_enrollment)
+    app.router.add_get("/api/cwl/enrollment/wait", handle_get_cwl_enrollment_wait)
     app.router.add_get("/api/cwl/clan-names", handle_get_cwl_clan_names)
     app.router.add_get("/api/cwl/player-stats", handle_get_cwl_player_stats)
     app.router.add_post("/api/cwl/enrollment/signup", handle_post_cwl_enrollment_signup)

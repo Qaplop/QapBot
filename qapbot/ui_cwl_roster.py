@@ -437,6 +437,12 @@ def _make_cwl_management_season_select_callback(view: discord.ui.View):
         config["cwl_selected_season"] = values[0]
         await CACHE.persist_server_config(guild_id_str)
         await _refresh_parent(view, interaction, "cwl_management")
+        # Step 8 (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md): switching the selected season
+        # changes what the web Activity's enrollment payload IS (it's season-scoped), not just a
+        # signup/assignment row within it — an open board must still be told, or it'd keep
+        # showing the old season's roster indefinitely.
+        from qapbot.web_bridge import bump_enrollment_version
+        await bump_enrollment_version(interaction.guild.id)
 
     return callback
 
@@ -561,6 +567,10 @@ def _make_cwl_management_add_season_callback(view: discord.ui.View):
         # activity-closed) — a harmless no-op duplicate, not worth special-casing away just to
         # avoid it, given the alternative is the ephemeral screen never refreshing at all.
         await _refresh_parent(view, interaction, "cwl_management")
+        # Step 8 (2026-08-17): a brand-new event + its initial cwl_event_clans rows — an open
+        # board (for this guild specifically; a fresh season has no shared clans yet) must refetch.
+        from qapbot.web_bridge import bump_enrollment_version
+        await bump_enrollment_version(interaction.guild.id)
         # Auto-opens "Configure Participating Clans" as the logical next step (2026-08-16,
         # live-testing feedback, project owner's spec: "after adding a new season we should add a
         # logic that the Configure Participating Clans view is opened automatically as a logical
@@ -705,6 +715,11 @@ class CwlCarryOverPromptView(discord.ui.View):
         # reason: _refresh_parent() never touches `interaction.response`, so it doesn't consume
         # the interaction's one response slot that _launch_cwl_activity below still needs.
         await _refresh_parent(self.parent_view, interaction, "cwl_management")
+        # Step 8 (2026-08-17): same reasoning as the direct-create path above — a brand-new event
+        # (this time possibly carrying over roster_size/cwl_start_at/participating from last
+        # season) needs an open board for this guild to refetch.
+        from qapbot.web_bridge import bump_enrollment_version
+        await bump_enrollment_version(interaction.guild.id)
         # Auto-opens "Configure Participating Clans" as the logical next step (2026-08-16,
         # live-testing feedback, project owner's spec — see _launch_cwl_activity's docstring for
         # the hard "must be this interaction's first response" constraint this relies on).
@@ -896,6 +911,12 @@ class CwlDeleteSeasonConfirmView(discord.ui.View):
         except discord.NotFound:
             pass
         await _refresh_parent(self.parent_view, interaction, "cwl_management")
+        # Step 8 (2026-08-17): the whole event (and, via prune_or_detach_shared_clans_before_
+        # deletion above, possibly another guild's shared-clan attachment/ownership) is gone —
+        # that function doesn't report which other guild(s) it touched, so bump globally rather
+        # than resolve it here; deletion is rare enough that this is cheap.
+        from qapbot.web_bridge import bump_enrollment_version
+        await bump_enrollment_version(None)
 
     async def _on_cancel(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=False, ephemeral=True)
@@ -1028,6 +1049,15 @@ class CwlStartEnrollmentConfirmView(discord.ui.View):
                     acting_discord_id=interaction.user.id,
                 )
             await _refresh_parent(self.parent_view, interaction, "cwl_management")
+            # Step 8 (2026-08-17): the bulk signup/assignment seed always changes this guild's own
+            # board; each summary["shared_clans"] entry (ensure_cwl_clan_sharing's own return
+            # shape) already names the exact partner guild(s) precisely, same as
+            # handle_post_clan_config's identical loop in web_bridge.py.
+            from qapbot.web_bridge import bump_enrollment_version
+            await bump_enrollment_version(self.guild_id)
+            for shared in summary["shared_clans"]:
+                for other_guild_id in shared.get("other_guild_ids", []):
+                    await bump_enrollment_version(int(other_guild_id))
 
     async def _on_cancel(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=False, ephemeral=True)

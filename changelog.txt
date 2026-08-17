@@ -1,6 +1,46 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (42)
+- Added: Batch 4 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md` (P1 Steps 7 & 8) — caches the hover
+  pop-up's player-stats lookup and replaces the Manage Enrollment board's fixed 12s poll with an
+  event-driven long-poll.
+  - **Step 7 (player-stats cache)**: `qapbot/web_bridge.py` — new `_player_stats_cache`
+    (player_tag -> (monotonic timestamp, payload)), 15-minute TTL, 2,000-entry cap, consulted in
+    `handle_get_cwl_player_stats` before the `to_thread` hop. `clear_player_stats_cache()` wired
+    into `QapBot.py`'s `[CYCLE-CLEANUP]` hook so a just-finished war round's stats show up within
+    one cycle instead of waiting out the TTL. Confirmed `get_recent_cwl_player_stats` has exactly
+    one caller anywhere in the codebase (this handler), so bridge-side-only caching needed no
+    always-fresh-vs-cached split.
+  - **Step 8 (event-driven long-polling)**: new `GET /api/cwl/enrollment/wait` (bridge) — a
+    per-guild `asyncio.Condition`-backed long-poll, held up to 25s, released the instant any
+    write bumps that guild's enrollment version (`bump_enrollment_version()`, wired into 10 write
+    paths: 5 in `web_bridge.py`, 5 in `ui_cwl_roster.py` — see the plan doc's Step 8 status note
+    for the exact precise-vs-global-fallback tradeoff at each cross-guild-shared-clan site).
+    `activity/server/src/index.ts`: matching `/cwl/enrollment/wait` proxy route. `main.ts`: the
+    old `setInterval(..., 12000)` poll is replaced by an async wait loop with exponential backoff
+    on failure (5s->60s cap), a 3-consecutive-failures safety net that layers a plain refetch on
+    top of the backoff cycle so the board can't go stale indefinitely during a bot restart/tunnel
+    blip, and a `document.visibilityState` pause/resume so a backgrounded tab does no wait/poll
+    traffic at all. `types.ts`: `EnrollmentPayload.version`, new `WaitResponse` type.
+  - Tests: `tests/discord/test_web_bridge.py` — 3 for the player-stats cache (repeat-lookup
+    caching, TTL expiry via a monkeypatched clock, explicit `clear_player_stats_cache()`) + 8 for
+    the wait endpoint (stale version, timeout, resolves via a real concurrent POST, waiter-cap
+    overflow, cross-guild release via a real shared-clan signup, the enrollment GET's new
+    `version` field, and an `activity-closed` non-bump regression guard — that handler refreshes
+    unconditionally on every close regardless of whether anything changed, so it's deliberately
+    excluded from the bump). 2021 tests pass (`.\run_tests.ps1`). `npm run typecheck && npm run
+    build` clean for both `activity/client` and `activity/server`.
+  - Deployed to DEV: client https://907e68b5.cwl-clan-config-dev.pages.dev, Worker
+    https://cwl-clan-config-server-dev.qapbotdev.workers.dev. Backend (Python) changes need a bot
+    restart on DEV/PROD to take effect.
+  - **Not yet verified**: the ~25s long-poll hold surviving the full Discord proxy -> Worker ->
+    cloudflared -> aiohttp chain intact — the plan's own design notes call for confirming this
+    live through the real Discord Activity before trusting the constant; not something testable
+    outside one. If some hop truncates it, the client's backoff/degrade safety net keeps the
+    board working (just noisier polling) rather than breaking — see the plan doc's Step 8 status
+    note.
+
 2026-08-17 (41)
 - Fixed: Batch 3 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md` (P0 Step 5) — frontend guard rails for the
   CWL Guests search, matching the server-side minimum-length/single-flight guards from Batches 1–2

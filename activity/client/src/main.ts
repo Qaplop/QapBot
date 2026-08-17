@@ -7,7 +7,14 @@
 import { DiscordSDK, RPCCloseCodes } from '@discord/embedded-app-sdk'
 import { renderClanConfigTable } from './clanConfigTable'
 import { renderEnrollmentBoard } from './enrollmentBoard'
-import type { ClanConfig, ClanConfigPayload, EnrollmentPayload, GuestSearchResponse, ScreenPayload } from './types'
+import type {
+  ClanConfig,
+  ClanConfigPayload,
+  EnrollmentPayload,
+  GuestSearchResponse,
+  ScreenPayload,
+  WaitResponse,
+} from './types'
 
 const clientId = import.meta.env.VITE_CLIENT_ID as string | undefined
 
@@ -169,7 +176,8 @@ async function setup(): Promise<void> {
           }
         },
         async (reason: string) => {
-          clearInterval(pollTimer)
+          waitLoopStopped = true
+          waitController?.abort()
           await closeActivity(reason)
         },
         // Hover pop-up progressive fetch (2026-08-16, project owner's spec: show the pop-up
@@ -204,29 +212,95 @@ async function setup(): Promise<void> {
         },
       )
 
-      // Live-polling (2026-08-16, live-testing feedback: "would it be possible to auto-update
-      // this view whenever a user changes his confirmation setting?") — re-fetches the same
-      // enrollment payload on a timer and merges just the externally-changeable fields (see
-      // enrollmentBoard.ts's applyPolledUpdate for exactly which, and why assignment isn't one of
-      // them). 12s balances feeling reasonably live against not hammering the bridge/bot while
-      // several admins could plausibly have this board open at once. A failed poll is silently
-      // skipped (logged only) — the next tick tries again; it must never surface as a page error
-      // the way the initial load's own fetch failures do.
-      const POLL_INTERVAL_MS = 12000
-      const pollTimer = setInterval(() => {
-        void (async () => {
-          try {
-            const pollResponse = await fetch(`/api/cwl/enrollment?guild_id=${encodeURIComponent(guildId)}`, {
-              headers: { Authorization: `Bearer ${accessToken}` },
-            })
-            if (!pollResponse.ok) return
-            const freshPayload = (await pollResponse.json()) as EnrollmentPayload
-            boardHandle.applyPolledUpdate(freshPayload.players)
-          } catch (err) {
-            console.error('[cwl-activity] enrollment poll failed:', err)
+      // Event-driven live-update (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8 —
+      // replaces the old fixed 12s setInterval poll that answered live-testing feedback: "would
+      // it be possible to auto-update this view whenever a user changes his confirmation
+      // setting?"). Long-polls GET /api/cwl/enrollment/wait, which the bridge holds open for up
+      // to ~25s and releases the instant any write bumps the guild's enrollment version — every
+      // hop in between only ever sees an ordinary HTTP request, no streaming/protocol upgrade.
+      // On `changed: true`, refetches the full payload and merges just the externally-changeable
+      // fields (see enrollmentBoard.ts's applyPolledUpdate for exactly which, and why assignment
+      // deliberately isn't one of them) via the SAME applyPolledUpdate the old poll used — the
+      // mid-drag deferral there is reused as-is, unaware anything about the trigger changed.
+      let knownVersion = payload.version
+      let waitLoopStopped = false
+      let waitController: AbortController | null = null
+
+      const refetchEnrollmentAndApply = async (): Promise<void> => {
+        const pollResponse = await fetch(`/api/cwl/enrollment?guild_id=${encodeURIComponent(guildId)}`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        })
+        if (!pollResponse.ok) throw new Error(`enrollment refetch failed: ${pollResponse.status}`)
+        const freshPayload = (await pollResponse.json()) as EnrollmentPayload
+        knownVersion = freshPayload.version
+        boardHandle.applyPolledUpdate(freshPayload.players)
+      }
+
+      // Tab hidden -> paused (no wait/refetch traffic at all while nobody can see the board);
+      // resumed -> one immediate refetch (may have missed a change while paused, since a hidden
+      // tab still has no wait in flight to be notified by) before the wait loop picks back up.
+      const waitForVisible = (): Promise<void> =>
+        new Promise((resolve) => {
+          const onVisibilityChange = () => {
+            if (document.visibilityState === 'visible') {
+              document.removeEventListener('visibilitychange', onVisibilityChange)
+              resolve()
+            }
           }
-        })()
-      }, POLL_INTERVAL_MS)
+          document.addEventListener('visibilitychange', onVisibilityChange)
+        })
+
+      void (async () => {
+        let consecutiveFailures = 0
+        while (!waitLoopStopped) {
+          if (document.visibilityState === 'hidden') {
+            await waitForVisible()
+            if (waitLoopStopped) break
+            try {
+              await refetchEnrollmentAndApply()
+            } catch (err) {
+              console.error('[cwl-activity] enrollment refetch on resume failed:', err)
+            }
+            continue
+          }
+
+          try {
+            waitController = new AbortController()
+            const waitResponse = await fetch(
+              `/api/cwl/enrollment/wait?guild_id=${encodeURIComponent(guildId)}&known_version=${encodeURIComponent(String(knownVersion))}`,
+              { headers: { Authorization: `Bearer ${accessToken}` }, signal: waitController.signal },
+            )
+            if (!waitResponse.ok) throw new Error(`wait failed: ${waitResponse.status}`)
+            const waitBody = (await waitResponse.json()) as WaitResponse
+            consecutiveFailures = 0
+            knownVersion = waitBody.version
+            if (waitBody.changed) {
+              await refetchEnrollmentAndApply()
+            }
+            // changed: false only happens after the bridge's own hold timeout with no write in
+            // between — immediately re-issue the wait (next loop iteration) with the same
+            // (still-current) knownVersion.
+          } catch (err) {
+            if ((err as Error).name === 'AbortError') return // waitLoopStopped — cleanup requested
+            consecutiveFailures += 1
+            console.error('[cwl-activity] enrollment wait failed:', err)
+            // Safety net (bot restart, tunnel blip, any non-200): once backed off 3+ times in a
+            // row, also refetch on every backoff cycle so the board doesn't go stale for the
+            // whole backoff duration — a plain ~60s-cadence poll layered on top of the retry
+            // loop below, not a separate code path, and it stops the moment a wait succeeds
+            // again (consecutiveFailures resets to 0 above).
+            if (consecutiveFailures >= 3) {
+              try {
+                await refetchEnrollmentAndApply()
+              } catch (refetchErr) {
+                console.error('[cwl-activity] degraded-mode enrollment refetch failed:', refetchErr)
+              }
+            }
+            const backoffMs = Math.min(5000 * 2 ** (consecutiveFailures - 1), 60000)
+            await new Promise((resolve) => setTimeout(resolve, backoffMs))
+          }
+        }
+      })()
       return
     }
 
