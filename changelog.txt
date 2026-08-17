@@ -1,6 +1,42 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (52)
+- Fixed: first PROD update cycle after deploying (51)/Batch 7 stalled silently right after
+  "[PHASE-3B] Completed" every cycle — confirmed via live PROD log analysis, not a deadlock (the
+  process kept consuming CPU). Root cause: `player_name_fts` is an FTS5 virtual table with
+  `player_tag UNINDEXED` — UNINDEXED only excludes a column from full-text `MATCH`, it does NOT
+  give SQLite any index for a plain equality lookup on that column. The incremental writer
+  (`_upsert_player_name_search_rows_in_conn`, called from every war-write flush via
+  `_upsert_player_name_index_in_conn`) did `DELETE FROM player_name_fts WHERE player_tag = ?` once
+  per changed player — with no index to use, each call degraded to a full table scan. Invisible in
+  tests (tiny tables); catastrophic in PROD the moment the one-time startup backfill populated the
+  table to its real ~6.6M rows — a single flush batch touching a few hundred players turned into
+  hundreds of full-table scans back to back. Flipping `cwl_use_fts_player_search` back off would
+  NOT have fixed this: that flag only gates the *read* path: the write-through into
+  player_name_search/player_name_fts runs unconditionally regardless of it.
+  - Fix: `qapbot/db_manager.py` — new module-level `_fts_rowid_for_tag(player_tag)` derives a
+    deterministic FTS5 `rowid` from a blake2b hash of the tag (8 bytes, collision-negligible even
+    at 6.6M+ tags). `rowid` is the one column FTS5 genuinely indexes, so DELETE/INSERT against
+    `player_name_fts` now target `WHERE rowid = ?` (O(1)) instead of `WHERE player_tag = ?`
+    (O(table size)) — computed independently by every caller, no DB round-trip needed.
+    `_upsert_player_name_search_rows_in_conn` and `_backfill_player_name_search_if_needed` both
+    updated to use it.
+  - Migration: PROD's already-backfilled `player_name_fts` has old, SQLite-auto-assigned rowids
+    that don't match the new hash-derived scheme. Added a `bot_metadata` marker
+    (`player_name_fts_rowid_scheme` = `tag_hash_v1`) checked at startup — if unset,
+    `_backfill_player_name_search_if_needed()` force-rebuilds `player_name_search`/`player_name_fts`
+    from `player_name_index` even when row counts already match (the old guard's only check),
+    then sets the marker so the rebuild doesn't repeat on future startups.
+  - 6 new tests (`tests/unit/test_player_name_search_fts.py`): `_fts_rowid_for_tag` determinism/
+    range, no stale duplicate FTS row after a re-upsert (rowid-delete actually finds the old row),
+    the migration marker forcing one rebuild of old-scheme data, and the marker not repeating once
+    set. 2053 tests pass.
+  - Needs a bot restart on PROD to pick up the fix (and to let the one-time rowid-scheme
+    migration run and finally clear the stalled state) — DEV has no accumulated
+    `player_name_fts` data at PROD scale so was never at risk of this, but gets the fix too on its
+    next restart.
+
 2026-08-17 (51)
 - Fixed: `/whois player <name>` inserting a bogus placeholder row into the `clans` table for the
   *reported player's own tag* — **this is a reoccurrence of 2026-07-18 (11)**, not a new bug.

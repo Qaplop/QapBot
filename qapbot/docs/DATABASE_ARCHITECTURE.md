@@ -411,6 +411,19 @@ Steps 9 & 11):
   not `CACHE.search_player_names()`, see Step 9's own note) is NOT migrated to this path — it
   needs the full match set for its guild-membership reorder, which a `LIMIT`-based FTS5 query
   doesn't naturally provide; out of this step's scope.
+  - **2026-08-17 follow-up fix — `player_name_fts` rowid**: `player_tag` is declared `UNINDEXED`
+    in the FTS5 schema, which only excludes it from full-text `MATCH` — it does NOT give SQLite
+    any index for a plain equality lookup, so `DELETE FROM player_name_fts WHERE player_tag = ?`
+    (the incremental writer's original pattern) falls back to a full table scan. That was
+    invisible in tests but stalled every PROD update cycle right after the startup backfill
+    populated the table to its real ~6.6M rows — one flush batch's worth of changed players
+    turned into hundreds of full scans back to back. Fixed by giving `player_name_fts` an
+    explicit `rowid` derived from `player_tag` via `_fts_rowid_for_tag()` (a blake2b hash,
+    collision-negligible at this row count) — `rowid` is the one column FTS5 genuinely indexes,
+    so writes/deletes now target `WHERE rowid = ?` (O(1)), computed independently by every
+    caller with no DB round-trip. A `bot_metadata` marker (`player_name_fts_rowid_scheme` =
+    `tag_hash_v1`) forces one full rebuild of any table populated by the old auto-assigned-rowid
+    code, since the row-count guard alone can't detect a stale rowid scheme.
 
 ### Foreign Key Relationships
 

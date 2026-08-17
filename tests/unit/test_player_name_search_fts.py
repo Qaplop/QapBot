@@ -207,6 +207,108 @@ class TestSearchPlayerTagsByPrefixSync:
         assert db.search_player_tags_by_prefix_sync("") == []
 
 
+class TestFtsRowidForTag:
+    """_fts_rowid_for_tag (2026-08-17 fix) — deterministic FTS5 rowid derived from player_tag,
+    replacing SQLite's auto-assigned rowid so DELETE/INSERT against player_name_fts can target
+    the one column FTS5 actually indexes instead of the UNINDEXED player_tag column (see the
+    function's own docstring for the full PROD-incident root cause)."""
+
+    def test_deterministic(self):
+        from qapbot.db_manager import _fts_rowid_for_tag
+        assert _fts_rowid_for_tag("#ABC123") == _fts_rowid_for_tag("#ABC123")
+
+    def test_distinct_tags_differ(self):
+        from qapbot.db_manager import _fts_rowid_for_tag
+        assert _fts_rowid_for_tag("#ABC123") != _fts_rowid_for_tag("#XYZ999")
+
+    def test_within_signed_64_bit_rowid_range(self):
+        from qapbot.db_manager import _fts_rowid_for_tag
+        for tag in ("#A", "#ABCDEFGHIJ", "#0000000000", "#ZZZZZZZZZZ"):
+            rowid = _fts_rowid_for_tag(tag)
+            assert -(2 ** 63) <= rowid < 2 ** 63
+
+
+class TestPlayerNameFtsRowidMigration:
+    @pytest.mark.integration
+    async def test_no_stale_duplicate_fts_row_after_upsert(self, db):
+        """Regression guard: DELETE FROM player_name_fts WHERE rowid = ? must actually find and
+        remove the existing row for a re-upserted tag. search_player_names_sync's own results
+        wouldn't reveal a stale duplicate (FTS5 doesn't dedupe by player_tag), so this checks the
+        raw row count directly instead."""
+        db.update_player_name_index_sync([("#DUP1", "FirstName", "2026-08-17T00:00")])
+        db.update_player_name_index_sync([("#DUP1", "SecondName", "2026-08-17T01:00")])
+        with db._sync_conn() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM player_name_fts WHERE player_tag = ?", ("#DUP1",)
+            ).fetchone()["cnt"]
+        assert count == 1
+
+    @pytest.mark.integration
+    async def test_migration_marker_forces_rebuild_of_stale_rowids(self, db):
+        """Simulates PROD's pre-fix state: player_name_fts populated with SQLite's own
+        auto-assigned rowid (not the new tag-derived one) and no migration marker recorded. The
+        next backfill call must detect the mismatch and rebuild even though row counts already
+        match — the old row-count-only guard would otherwise treat this as "already backfilled"
+        and skip it forever."""
+        from qapbot.db_manager import (
+            PLAYER_NAME_FTS_ROWID_SCHEME_KEY,
+            PLAYER_NAME_FTS_ROWID_SCHEME_VALUE,
+            _fts_rowid_for_tag,
+        )
+
+        # initialize()'s own backfill call already set the marker (for the then-empty DB) during
+        # fixture setup — clear it to simulate "never migrated" before seeding old-scheme rows.
+        await db.conn.execute(
+            "DELETE FROM bot_metadata WHERE key = ?", (PLAYER_NAME_FTS_ROWID_SCHEME_KEY,)
+        )
+        await db.conn.execute(
+            "INSERT INTO player_name_index (player_tag, player_name, last_seen) VALUES (?, ?, ?)",
+            ("#OLD1", "OldSchemeName", "2026-01-01T00:00"),
+        )
+        await db.conn.execute(
+            "INSERT INTO player_name_search (player_tag, name, name_lower) VALUES (?, ?, ?)",
+            ("#OLD1", "OldSchemeName", "oldschemename"),
+        )
+        # Auto-assigned rowid (pre-fix behavior) — deliberately NOT the hash-derived one.
+        await db.conn.execute(
+            "INSERT INTO player_name_fts (player_tag, name) VALUES (?, ?)",
+            ("#OLD1", "OldSchemeName"),
+        )
+        await db.conn.commit()
+        assert await db.get_bot_metadata(PLAYER_NAME_FTS_ROWID_SCHEME_KEY) is None
+
+        await db._backfill_player_name_search_if_needed()
+
+        assert await db.get_bot_metadata(PLAYER_NAME_FTS_ROWID_SCHEME_KEY) == PLAYER_NAME_FTS_ROWID_SCHEME_VALUE
+        with db._sync_conn() as conn:
+            row = conn.execute(
+                "SELECT rowid FROM player_name_fts WHERE player_tag = ?", ("#OLD1",)
+            ).fetchone()
+        assert row["rowid"] == _fts_rowid_for_tag("#OLD1")
+
+        # And future incremental writes can now find/replace it correctly by rowid.
+        db.update_player_name_index_sync([("#OLD1", "NewName", "2026-08-17T00:00")])
+        with db._sync_conn() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM player_name_fts WHERE player_tag = ?", ("#OLD1",)
+            ).fetchone()["cnt"]
+        assert count == 1
+        assert db.search_player_names_sync("NewName") == [{"player_tag": "#OLD1", "player_name": "NewName"}]
+
+    @pytest.mark.integration
+    async def test_migration_marker_prevents_repeat_rebuild(self, db):
+        """Once the marker is set, re-running the backfill must not rebuild again (covered
+        indirectly by test_backfill_is_idempotent's row-count assertions; this asserts the
+        marker itself is stable across repeat calls)."""
+        from qapbot.db_manager import PLAYER_NAME_FTS_ROWID_SCHEME_KEY, PLAYER_NAME_FTS_ROWID_SCHEME_VALUE
+
+        db.update_player_name_index_sync([("#A1", "Alice", "2026-08-17T00:00")])
+        await db._backfill_player_name_search_if_needed()
+        assert await db.get_bot_metadata(PLAYER_NAME_FTS_ROWID_SCHEME_KEY) == PLAYER_NAME_FTS_ROWID_SCHEME_VALUE
+        await db._backfill_player_name_search_if_needed()
+        assert await db.get_bot_metadata(PLAYER_NAME_FTS_ROWID_SCHEME_KEY) == PLAYER_NAME_FTS_ROWID_SCHEME_VALUE
+
+
 class TestCacheManagerRolloutFlag:
     """CACHE.search_player_names() delegates to db_manager.search_player_names_sync() only when
     CONFIG.cwl_use_fts_player_search is True (2026-08-17, Step 11 rollout flag — defaults False,
