@@ -4,8 +4,10 @@ super-admin bypass), and the GET/POST clan-config endpoints' actual behavior.
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import os
+import threading
 from typing import Dict
 from unittest.mock import AsyncMock, MagicMock
 
@@ -756,6 +758,29 @@ async def test_screen_get_rejects_missing_params(bridge_config, client):
         headers={"X-Bridge-Secret": "test-secret"},
     )
     assert resp.status == 400
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-17 (CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 6): the enrollment and clan-config payload
+# builders are now plain sync functions run via asyncio.to_thread from their GET handlers, same
+# as every write handler already does (Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md — now covers
+# READ paths too). Regression guard: nobody accidentally makes the sync core `async def` again,
+# which would silently put its DB work back on the event loop.
+# ---------------------------------------------------------------------------
+
+def test_build_enrollment_payload_sync_is_not_a_coroutine_function():
+    from qapbot.web_bridge import _build_enrollment_payload_sync
+    assert not asyncio.iscoroutinefunction(_build_enrollment_payload_sync)
+
+
+def test_build_clan_config_payload_sync_is_not_a_coroutine_function():
+    from qapbot.web_bridge import _build_clan_config_payload_sync
+    assert not asyncio.iscoroutinefunction(_build_clan_config_payload_sync)
+
+
+def test_search_cwl_guests_sync_is_not_a_coroutine_function():
+    from qapbot.web_bridge import _search_cwl_guests_sync
+    assert not asyncio.iscoroutinefunction(_search_cwl_guests_sync)
 
 
 # ---------------------------------------------------------------------------
@@ -1989,6 +2014,113 @@ async def test_guest_search_text_query_caps_clan_hits_and_db_check_calls(db, bri
     clan_hits = [r for r in body["results"] if r["type"] == "clan"]
     assert len(clan_hits) == 12
     assert claim_spy.call_count <= 12
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-17 PROD meltdown fix (CWL_PROD_PERFORMANCE_FIX_PLAN.md P0 Step 3): guest search now
+# runs off the event loop via asyncio.to_thread, plus a single-flight/newest-wins guard per
+# (guild_id, discord_user_id) so a burst of debounced keystrokes can't pile up concurrent DB
+# scans for the same admin.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_still_returns_normal_results_when_threaded(db, bridge_config, client, monkeypatch):
+    """Behavioral no-op check: routing the real _search_cwl_guests_sync through
+    asyncio.to_thread must not change what a normal (non-concurrent) query returns."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "840", {"#CLAN1": "Marines"})
+    CACHE.db_manager = db
+    CACHE.server_config["840"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Marines"}}
+    CACHE.player_name_index = {}
+    CACHE.user_accounts = {}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(840, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=840&discord_user_id=42&q=marines",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == [
+        {"type": "clan", "clan_tag": "#CLAN1", "clan_name": "Marines", "clan_tier": None, "already_shared_with": None}
+    ]
+    assert "stale" not in body
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_coalesces_a_queued_keystroke_superseded_by_a_newer_one(
+    bridge_config, client, monkeypatch,
+):
+    """Fires three overlapping searches for the SAME admin to prove the single-flight guard
+    actually coalesces pile-up rather than just serializing every keystroke:
+      1. "first" acquires the per-key semaphore and blocks (a real worker thread, released on
+         cue) — simulates a search already in flight when the next keystroke lands.
+      2. "second" arrives while "first" is still running; it bumps the generation counter, then
+         queues behind the semaphore.
+      3. "third" arrives before "second" gets a turn; it bumps the generation counter past
+         "second"'s, then also queues.
+    When "first" finally releases the semaphore, "second" is next in line (FIFO) — it discovers
+    its generation is stale (superseded by "third") and returns {"stale": True} WITHOUT ever
+    calling the underlying search function. "third" then runs for real. So the underlying search
+    function must be called exactly twice ("first", "third") — never for "second" — which is
+    the actual pile-up-prevention property Step 3 exists for."""
+    import qapbot.web_bridge as web_bridge_module
+
+    started = threading.Event()
+    release = threading.Event()
+    calls: list = []
+
+    def fake_search(guild_id, query):
+        calls.append(query)
+        if query == "first":
+            started.set()
+            release.wait(timeout=5)
+        return []
+
+    monkeypatch.setattr(web_bridge_module, "_search_cwl_guests_sync", fake_search)
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(841, 42, is_admin=True))
+
+    async def _get(query: str):
+        return await client.get(
+            f"/api/cwl/guest-search?guild_id=841&discord_user_id=42&q={query}",
+            headers={"X-Bridge-Secret": "test-secret"},
+        )
+
+    task_first = asyncio.create_task(_get("first"))
+    for _ in range(500):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set(), "the 'first' search never started"
+
+    task_second = asyncio.create_task(_get("second"))
+    await asyncio.sleep(0.05)  # let "second" bump its generation and queue on the semaphore
+
+    task_third = asyncio.create_task(_get("third"))
+    await asyncio.sleep(0.05)  # let "third" bump its generation and queue on the semaphore
+
+    release.set()  # let "first" finish and release the semaphore
+
+    resp_first, resp_second, resp_third = await asyncio.gather(task_first, task_second, task_third)
+
+    body_first = await resp_first.json()
+    body_second = await resp_second.json()
+    body_third = await resp_third.json()
+
+    assert resp_second.status == 200
+    assert body_second == {"results": [], "stale": True}
+    assert body_first["results"] == [] and "stale" not in body_first
+    assert body_third["results"] == [] and "stale" not in body_third
+
+    assert calls == ["first", "third"]
 
 
 # ---------------------------------------------------------------------------

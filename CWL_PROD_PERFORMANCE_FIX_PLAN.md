@@ -1,7 +1,7 @@
 # CWL Management PROD Performance Fix Plan
 
 Implementation plan for the 11 improvements (P0–P2) identified from the 2026-08-16 PROD test
-session log analysis (`qapbot_PROD.log`). Each step is self-contained and ordered so the plan can
+session log analysis (`.\data\log\qapbot_PROD.log`). Each step is self-contained and ordered so the plan can
 be executed top-to-bottom; P0 items fix the two observed production meltdowns, P1 items fix
 responsiveness, P2 items buy headroom on the weak PROD box (10 GB RAM, 2-core Celeron J3355).
 
@@ -243,6 +243,33 @@ through the aiohttp test client, so threading is transparent). Add one regressio
 
 **Docs**: extend Pitfall 26 in `qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md` with one sentence: the
 rule covers READ paths too, not just writes (this incident is the proof).
+
+### Step 6a: Debounce the hover pop-up itself (2026-08-17, added post-Batch-2, live-testing
+feedback)
+
+**File**: `activity/client/src/enrollmentBoard.ts`.
+
+**Problem**: Step 6 moves the hover pop-up's two fetches (clan-name resolve, player-stats) off
+the event loop, and Step 7 below caches repeat player-stats lookups — but neither reduces *how
+many* fetches a single mouse sweep triggers in the first place. `buildCard()`'s `mouseenter`
+listener called `showTooltip()` (and therefore both fetches, for any not-yet-attempted tag)
+immediately, with no delay — so dragging the cursor across a filled column fired one clan-name +
+one player-stats fetch per DISTINCT card merely brushed past on the way to somewhere else, not
+just the one the admin actually paused on. Purely a frontend request-volume problem; nothing on
+the backend can fix it.
+
+**Target behavior** (implemented): a `HOVER_TOOLTIP_DELAY_MS = 1500` debounce. `mouseenter` no
+longer calls `showTooltip()` directly — it calls a new `scheduleTooltip()`, which arms a
+`setTimeout(..., HOVER_TOOLTIP_DELAY_MS)` that calls the real `showTooltip()` (pop-up display +
+both fetches) only once it fires. `hideTooltip()` — already the `mouseleave`/`dragstart` handler —
+clears that pending timer before removing any visible tooltip, so a fast sweep cancels the timer
+before it ever fires: no pop-up, no fetch, for any card the cursor didn't actually pause on for
+1.5s. A genuine pause still shows the pop-up and fires the fetches exactly as before.
+
+**Tests**: no client test harness exists (see Step 5's own note) — `npm run typecheck && npm run
+build` only. Verified clean.
+
+**Docs**: none needed beyond this entry — no backend contract change, no new endpoint.
 
 ### Step 7: Cache `get_recent_cwl_player_stats` per player_tag (TTL)
 
@@ -508,7 +535,7 @@ re-derive them:
 | Batch | Steps | Rationale |
 |-------|-------|-----------|
 | 1 | 1, 2, 4 | Pure backend, kills the meltdown mechanics; deployable alone |
-| 2 | 3, 6 | Threading sweep for all bridge reads (one review context) |
+| 2 | 3, 6, 6a | Threading sweep for all bridge reads, plus the hover-tooltip debounce found during Batch 2 review (frontend-only, no backend dependency — folded in rather than deferred to Batch 3 since it's this small) |
 | 3 | 5 | Frontend guard rails; deploy Pages DEV→PROD |
 | 4 | 7, 8 | Caching layer + event-driven long-poll (touch the same handlers) |
 | 5 | 9 | cache_manager index shape change (isolated, riskier — own batch) |

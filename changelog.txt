@@ -1,6 +1,62 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (40)
+- Fixed: Manage Enrollment board's hover pop-up fired a clan-name + player-stats fetch for every
+  player card the mouse merely swept past on the way to somewhere else, not just the one the admin
+  actually paused on — reported live-testing (project owner: "the pop-ups really pop up like hell
+  when the mouse moves over a filled column with players"). Neither Batch 2's event-loop threading
+  nor the still-unimplemented Step 7 TTL cache would have fixed this — both reduce the *cost* of a
+  fetch, not how many a single sweep triggers. `activity/client/src/enrollmentBoard.ts`:
+  `buildCard()`'s `mouseenter` listener now calls a new `scheduleTooltip()` (arms a 1.5s
+  `HOVER_TOOLTIP_DELAY_MS` timer) instead of calling `showTooltip()` directly; `hideTooltip()`
+  (already the `mouseleave`/`dragstart` handler) cancels that pending timer before it fires. A
+  fast sweep now triggers no pop-up and no fetch for any card the cursor didn't actually rest on;
+  a genuine pause still shows the pop-up and fires both fetches exactly as before. Frontend-only,
+  no backend/contract change. Folded into `CWL_PROD_PERFORMANCE_FIX_PLAN.md` as Step 6a (P1),
+  added to Batch 2's already-delivered scope. No test harness exists for the client (per Step 5's
+  own note) — `npm run typecheck && npm run build` both clean. Deployed to DEV:
+  https://c2a8f2ad.cwl-clan-config-dev.pages.dev — needs a PROD deploy separately to take effect
+  there (see `activity/README.md`).
+
+2026-08-17 (39)
+- Fixed: PROD meltdown, continued — Batch 2 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md` (P0 Step 3, P1
+  Step 6). Batch 1 (38) closed off the two mechanisms that turned the Guests search into a crash
+  (unbounded scans, unchunked SQL); this batch removes the actual event-loop-blocking behavior —
+  the reason a slow search froze the whole bot (gateway disconnects) rather than just being slow
+  for the one admin using it.
+  - `qapbot/web_bridge.py`: `_search_cwl_guests()` -> `_search_cwl_guests_sync()` (plain `def`,
+    no `await` in its body — confirmed by inspection), now run via one bundled
+    `asyncio.to_thread()` hop from `handle_get_cwl_guest_search`. Added a single-flight,
+    newest-wins guard per `(guild_id, discord_user_id)`: a per-key generation counter plus
+    `asyncio.Semaphore(1)` ensures at most one guest-search thread runs per admin at a time, and a
+    keystroke that's still queued behind an in-flight search — but has since been superseded by
+    an even-newer keystroke — returns `{"results": [], "stale": true}` immediately instead of
+    running a now-pointless search (the frontend's `searchRequestId` guard already discards stale
+    renders, so this is purely about not piling up redundant DB work).
+  - Same Pattern-A treatment (Pitfall 26) for the two other bridge READ paths that still ran full
+    DB-query sequences on the loop: `_build_enrollment_payload()` -> `_build_enrollment_payload_sync()`
+    (from `handle_get_cwl_enrollment`) and `_build_clan_config_payload()` ->
+    `_build_clan_config_payload_sync()` (from `handle_get_clan_config`), plus
+    `handle_get_cwl_player_stats`'s `get_recent_cwl_player_stats()` call (the 3-month main+history
+    aggregation the incident log showed running ~100+ times per session, once per tile hover).
+    Audited every other GET handler (`handle_health`, `handle_get_cwl_screen`,
+    `handle_get_cwl_clan_names`) — no other un-threaded DB/O(n)-scan work found; those three stay
+    un-threaded on purpose (pure O(1) CACHE dict lookups, matching Pitfall 26's "don't wrap
+    everything" guidance).
+  - `qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md`: extended Pitfall 26 with a "2026-08-17 follow-up"
+    paragraph — the rule covers READ paths too, not just writes.
+  - Tests: `tests/discord/test_web_bridge.py` — a behavioral no-op check for a normal query, a
+    3-request concurrency test proving the middle of three overlapping searches for the same
+    admin gets coalesced away (never reaches the underlying search function) while the first and
+    the newest both complete normally, and three regression tests asserting the three new sync
+    cores are not coroutine functions (guards against someone re-async-ifying them and silently
+    putting the DB work back on the loop). 2010 tests pass (`.\run_tests.ps1`).
+  - Batches 3–7 (frontend abort/min-length guards, player-stats caching, event-driven long-
+    polling for the enrollment board, the `player_name_index` scan-cost fix, GC tuning, and the
+    eventual FTS5 migration) are not yet implemented. Backend-only — needs a bot restart on
+    DEV/PROD to take effect.
+
 2026-08-17 (38)
 - Fixed: PROD meltdown — two near-identical incidents on 2026-08-16 (19:43–19:45 and 19:54–19:59)
   where the CWL "Guests" search box (`GET /api/cwl/guest-search`, keystroke-debounced 300ms, no

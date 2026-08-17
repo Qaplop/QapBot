@@ -90,6 +90,14 @@ type PlayerStats = {
 
 type TooltipLine = { text: string; kind: 'name' | 'header' | 'line' }
 
+// Debounce before a hover triggers the pop-up (and its fetches) at all (2026-08-17, live-testing
+// feedback: sweeping the mouse across a filled column fired a clan-name + player-stats fetch for
+// every card merely brushed past on the way to somewhere else, not just the one the admin
+// actually paused on — CWL_PROD_PERFORMANCE_FIX_PLAN.md). mouseleave cancels the pending timer
+// before it fires (see hideTooltip), so only a genuine pause — not a passing sweep — ever shows
+// the pop-up or triggers a fetch.
+const HOVER_TOOLTIP_DELAY_MS = 1500
+
 // Hover info pop-up (2026-08-16, project owner's spec — "a small pop-up shows the clan the
 // player belongs to along with some other info on the user that we have in the DB", then
 // follow-up: "show up the pop-up as soon as possible... and then fetch more data... as it comes
@@ -332,12 +340,32 @@ export function renderEnrollmentBoard(
   // "is this still the card the user is hovering" before mutating anything — the user may have
   // already moved to a different card, or away entirely, by the time the fetch resolves.
   let activeTooltip: { el: HTMLElement; playerTag: string } | null = null
+  // The pending HOVER_TOOLTIP_DELAY_MS timer between a mouseenter and the tooltip actually
+  // appearing — cleared (via hideTooltip, below) by mouseleave, dragstart, or a new mouseenter,
+  // so a fast sweep across several cards never lets an earlier card's timer fire after the mouse
+  // has already moved on.
+  let hoverTimer: ReturnType<typeof setTimeout> | null = null
 
   function hideTooltip(): void {
+    if (hoverTimer !== null) {
+      clearTimeout(hoverTimer)
+      hoverTimer = null
+    }
     if (activeTooltip) {
       activeTooltip.el.remove()
       activeTooltip = null
     }
+  }
+
+  // mouseenter handler — schedules showTooltip() after HOVER_TOOLTIP_DELAY_MS instead of calling
+  // it directly, so the pop-up (and its clan-name/player-stats fetches) only ever fires for a
+  // card the admin actually pauses on.
+  function scheduleTooltip(player: EnrollmentPlayer, anchor: HTMLElement): void {
+    hideTooltip()
+    hoverTimer = setTimeout(() => {
+      hoverTimer = null
+      showTooltip(player, anchor)
+    }, HOVER_TOOLTIP_DELAY_MS)
   }
 
   // Re-renders the pop-up in place IF the user is still hovering the same player it was opened
@@ -570,7 +598,7 @@ export function renderEnrollmentBoard(
     if (player.is_guest) {
       card.classList.add('guest-card')
     }
-    card.addEventListener('mouseenter', () => showTooltip(player, card))
+    card.addEventListener('mouseenter', () => scheduleTooltip(player, card))
     card.addEventListener('mouseleave', hideTooltip)
     card.draggable = true
     card.addEventListener('dragstart', (e) => {

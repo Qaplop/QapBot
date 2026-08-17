@@ -1000,6 +1000,22 @@ sync `def` used as an atomic unit by design) needed no changes itself — only i
 seed loop) needed `to_thread()`-wrapping, and two of those already got it for free once their
 containing function became Pattern A.
 
+**2026-08-17 follow-up, PROD meltdown**: this rule covers **READ** paths too, not just writes —
+proven the hard way. `web_bridge.py`'s `_search_cwl_guests()` (an uncapped scan over
+`CACHE.clan_name_cache`/`CACHE.player_name_index`, millions of entries), `_build_enrollment_payload()`,
+`_build_clan_config_payload()`, and `handle_get_cwl_player_stats`'s `get_recent_cwl_player_stats()`
+call (a 3-month main+history SQL aggregation, run once per tile hover) were all still bare `async
+def`/direct calls running full DB-query sequences and O(n) cache scans on the event loop — the
+"lower risk, WAL lets reads proceed concurrently" note above is about a read racing a WRITER's
+lock, not about a slow read blocking the loop itself, which is the actual failure mode: escalating
+multi-second gen-2 GC pauses and 3x Discord gateway heartbeat misses (`CWL_PROD_PERFORMANCE_FIX_PLAN.md`).
+Fixed with the same Pattern A treatment (`_search_cwl_guests_sync`/`_build_enrollment_payload_sync`/
+`_build_clan_config_payload_sync`, one bundled `to_thread()` hop per handler) plus, for the guest
+search specifically, a single-flight/newest-wins guard per `(guild_id, discord_user_id)` so a burst
+of debounced keystrokes can't pile up concurrent scans for the same admin. Do **not** wrap pure
+`CACHE` dict lookups that are O(1) (e.g. `handle_get_cwl_screen`, `handle_get_cwl_clan_names`) —
+the hop is for DB-query sequences and O(n) scans, not every read.
+
 ## Pitfall 27: Adding `overflow-x: auto` to a wrapper around a `position: sticky` element can silently relocate that element's sticky containing block, hiding content behind it
 
 Symptom (2026-08-16, PROD): the CWL clan-config table's `(34)` fix (adding a `.table-scroll`

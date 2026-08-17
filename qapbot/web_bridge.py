@@ -147,13 +147,18 @@ async def _resolve_admin_or_leader(guild_id: int, discord_user_id: int) -> bool:
     return False
 
 
-async def _build_clan_config_payload(guild_id: int) -> Dict[str, Any]:
+def _build_clan_config_payload_sync(guild_id: int) -> Dict[str, Any]:
     """Build the GET response for whichever season is currently selected on the guild's CWL
     Management screen (the season select there, CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase E.3) —
     this Activity has no season picker of its own; it always just shows/edits that one season.
 
     A clan with no row yet for that season defaults to roster_size=15, cwl_start_at=the 1st of
     the season's month at 08:00 UTC (the game's static schedule), participating=False.
+
+    Plain synchronous function (2026-08-17, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md — the rule
+    covers READ paths too, not just writes) — every DB/CACHE call in its body is already
+    synchronous with no `await` between any of it, so the whole thing is one atomic
+    asyncio.to_thread() hop from its only caller, handle_get_clan_config.
     """
     from qapbot.QBdiscocmdshelper import get_guild_clans_including_member_config
     from qapbot.QBdiscocmdshelper_cwl import cwl_league_rank, resolve_selected_cwl_season
@@ -266,7 +271,7 @@ async def _build_clan_config_payload(guild_id: int) -> Dict[str, Any]:
     }
 
 
-async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
+def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
     """Build the GET response for the "Manage Enrollment" board — the guild's selected season's
     participating clans as columns, and a merged player list combining cwl_signups (whatever's
     already been recorded) with get_current_clan_members_sync() (so a current member who never
@@ -283,7 +288,7 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
 
     2026-08-15 (guest clans/players, project owner's spec): a clan invited as a "guest" via the
     Configure Participating Clans screen's Guests search is just a normal participating-clan row
-    with no special marker — see _search_cwl_guests()/handle_post_clan_config() — so its roster
+    with no special marker — see _search_cwl_guests_sync()/handle_post_clan_config() — so its roster
     is pulled into the pool below via participating_clan_tags, unioned with the family pool. A
     guest *player* (an individual invited directly, possibly from a clan that isn't participating
     at all) is a plain cwl_signups row with source='guest_invite', surfaced via each player's
@@ -294,7 +299,12 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
     OWNER guild's own cwl_event_clans row, not this guild's possibly-vestigial one, and its
     player pool from cwl_shared_clan_players instead of this guild's own cwl_signups/
     cwl_assignments — so both guilds' boards render the identical live roster. See the merge
-    blocks below (marked 2026-08-15) for exactly where each override happens."""
+    blocks below (marked 2026-08-15) for exactly where each override happens.
+
+    Plain synchronous function (2026-08-17, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md — the rule
+    covers READ paths too, not just writes): every DB/CACHE call and skill-score/avg-stars pass
+    below is already synchronous with no `await` between any of it, so the whole thing is one
+    atomic asyncio.to_thread() hop from its only caller, handle_get_cwl_enrollment."""
     from qapbot.QBdiscocmdshelper_cwl import (
         compute_avg_stars_per_attack,
         compute_league_adjusted_skill_scores,
@@ -537,7 +547,7 @@ GUEST_SEARCH_MIN_NEEDLE_TEXT = 3
 GUEST_SEARCH_CAP = 12
 
 
-async def _search_cwl_guests(guild_id: int, query: str) -> List[Dict[str, Any]]:
+def _search_cwl_guests_sync(guild_id: int, query: str) -> List[Dict[str, Any]]:
     """Unified fuzzy search for the "Guests" invite flow on Configure Participating Clans
     (2026-08-15, project owner's spec: "a discord user, a coc player name or a coc player_tag
     with intelligent sub-string match and auto-complete as far as possible") — one flat result
@@ -767,7 +777,8 @@ async def handle_get_cwl_enrollment(request: web.Request) -> web.Response:
     if not await _resolve_admin_or_leader(guild_id, discord_user_id):
         return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
 
-    return web.json_response(await _build_enrollment_payload(guild_id))
+    payload = await asyncio.to_thread(_build_enrollment_payload_sync, guild_id)
+    return web.json_response(payload)
 
 
 async def handle_get_cwl_clan_names(request: web.Request) -> web.Response:
@@ -823,7 +834,12 @@ async def handle_get_cwl_player_stats(request: web.Request) -> web.Response:
 
     from QBhelperfunctions import get_recent_cwl_player_stats
 
-    return web.json_response(get_recent_cwl_player_stats(player_tag))
+    # asyncio.to_thread()-wrapped (2026-08-17, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md — the
+    # rule covers READ paths too, not just writes) — this is the 3-month main+history SQL
+    # aggregation the PROD incident log showed running synchronously on the loop once per tile
+    # hover (~100+ calls in the session).
+    stats = await asyncio.to_thread(get_recent_cwl_player_stats, player_tag)
+    return web.json_response(stats)
 
 
 def _apply_cwl_enrollment_signup_sync(
@@ -1006,10 +1022,37 @@ async def handle_post_cwl_enrollment_assign(request: web.Request) -> web.Respons
     return web.json_response({"ok": True})
 
 
+# 2026-08-17 PROD meltdown fix, Step 3 (CWL_PROD_PERFORMANCE_FIX_PLAN.md): single-flight,
+# newest-wins guard for the guest search per (guild_id, discord_user_id). Each request bumps its
+# own generation number for that key BEFORE attempting the per-key Semaphore(1) — this is what
+# lets a keystroke that's still queued behind an in-flight search discover, the instant it
+# acquires the semaphore, that an even-newer keystroke has already superseded it, and bail out
+# immediately (no thread dispatch at all) instead of running a now-pointless search. A request
+# that's already RUNNING when it gets superseded is NOT interrupted — it finishes and returns its
+# real (if by-then-stale) results; the frontend's own searchRequestId guard is what discards
+# those on render, so the backend doesn't need to duplicate that logic. Net effect: at most one
+# guest-search thread ever runs per admin at a time, and a burst of keystrokes collapses to
+# "whatever was already running" + "the latest one", never a pile-up of every keystroke in
+# between.
+_guest_search_generation: Dict[tuple, int] = {}
+_guest_search_semaphores: Dict[tuple, asyncio.Semaphore] = {}
+
+
+def _guest_search_semaphore_for(key: tuple) -> asyncio.Semaphore:
+    sem = _guest_search_semaphores.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(1)
+        _guest_search_semaphores[key] = sem
+    return sem
+
+
 async def handle_get_cwl_guest_search(request: web.Request) -> web.Response:
     """Backs the "Guests" search box on Configure Participating Clans — see
-    _search_cwl_guests()'s docstring for the actual matching logic. Admin-only, same as every
-    other route here; a plain empty-results response (not an error) for a query with no hits."""
+    _search_cwl_guests_sync()'s docstring for the actual matching logic. Admin-only, same as
+    every other route here; a plain empty-results response (not an error) for a query with no
+    hits. Runs off the event loop via asyncio.to_thread (2026-08-17, Pitfall 26,
+    COPILOT_PITFALLS_COOKBOOK.md — this incident is exactly why READ paths need the same
+    treatment as writes, not just this one) with the single-flight guard described above."""
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
     try:
@@ -1022,7 +1065,19 @@ async def handle_get_cwl_guest_search(request: web.Request) -> web.Response:
     if not await _resolve_admin(guild_id, discord_user_id):
         return web.json_response({"error": "not an admin of this guild"}, status=403)
 
-    return web.json_response({"results": await _search_cwl_guests(guild_id, query)})
+    key = (guild_id, discord_user_id)
+    my_generation = _guest_search_generation.get(key, 0) + 1
+    _guest_search_generation[key] = my_generation
+
+    async with _guest_search_semaphore_for(key):
+        if _guest_search_generation.get(key) != my_generation:
+            # Superseded by a newer keystroke while queued behind another search for this same
+            # admin — skip the now-pointless work entirely rather than run it just to have the
+            # frontend throw the result away.
+            return web.json_response({"results": [], "stale": True})
+        results = await asyncio.to_thread(_search_cwl_guests_sync, guild_id, query)
+
+    return web.json_response({"results": results})
 
 
 async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response:
@@ -1031,7 +1086,7 @@ async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response
     handle_post_cwl_enrollment_signup enforces, since the whole point of a guest is that they
     aren't. Guest CLANS never go through this endpoint at all — they're added straight into
     cwl_event_clans via the existing POST /cwl/clan-config save, same as any other clan (see
-    _search_cwl_guests's docstring for why that needs no new persistence of its own)."""
+    _search_cwl_guests_sync's docstring for why that needs no new persistence of its own)."""
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
     try:
@@ -1099,7 +1154,8 @@ async def handle_get_clan_config(request: web.Request) -> web.Response:
     if not await _resolve_admin(guild_id, discord_user_id):
         return web.json_response({"error": "not an admin of this guild"}, status=403)
 
-    return web.json_response(await _build_clan_config_payload(guild_id))
+    payload = await asyncio.to_thread(_build_clan_config_payload_sync, guild_id)
+    return web.json_response(payload)
 
 
 def _prepare_and_save_clan_config_sync(db: Any, guild_id: int, season: str, clans_in: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1219,7 +1275,7 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
     # Cross-guild shared-clan check (2026-08-15, project owner's spec) — the first of the two
     # trigger points (the other is start_cwl_enrollment). The frontend's Guests search already
     # highlighted an already-claimed clan and had the admin confirm adding it anyway (see
-    # _search_cwl_guests's docstring) — this is the mechanical step that actually establishes
+    # _search_cwl_guests_sync's docstring) — this is the mechanical step that actually establishes
     # the shared record now that the save is going through. ensure_cwl_clan_sharing() is a
     # cheap no-op for the overwhelming majority of clans that aren't shared with anyone.
     newly_participating_tags = [

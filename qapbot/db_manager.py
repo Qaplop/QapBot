@@ -3730,7 +3730,7 @@ class WarHistoryDB:
         """player_tag -> {discord_id, player_name, verified} for whichever of player_tags are
         linked to a Discord account (user_players), regardless of current clan — a player_tag
         with no linked account simply isn't a key in the returned dict. Used by the CWL guest
-        search (web_bridge.py's _search_cwl_guests) to show whether a found player can actually
+        search (web_bridge.py's _search_cwl_guests_sync) to show whether a found player can actually
         be DMed, without needing clan context the way get_current_clan_members_sync does."""
         import sqlite3
 
@@ -4190,7 +4190,7 @@ class WarHistoryDB:
         """Every OTHER guild currently participating with clan_tag for this season — scans
         across ALL guilds' cwl_events for the season, not just the caller's own. This is the
         "is this clan already claimed elsewhere" check both trigger points
-        (_search_cwl_guests/handle_post_clan_config, start_cwl_enrollment) use before deciding
+        (_search_cwl_guests_sync/handle_post_clan_config, start_cwl_enrollment) use before deciding
         whether to invoke ensure_cwl_clan_sharing(). Returns one dict per matching guild:
         guild_id, event_id, participating (always 1 — non-participating rows never count as a
         "claim")."""
