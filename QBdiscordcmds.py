@@ -1044,14 +1044,17 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
     is_dm = interaction.guild is None
 
     # Command list for autocomplete and validation — in a DM, filtered down to only the
-    # commands that are actually invokable there (see _get_help_command_dm_status()).
-    AVAILABLE_COMMANDS = [
+    # commands that are actually invokable there (see _get_help_command_dm_status()). Lowercase
+    # (not the usual module-constant SCREAMING_CASE) since this is a plain local variable,
+    # reassigned below for the DM case — an all-caps name here reads as a real constant and
+    # trips static-analysis "constant redefinition" warnings for a completely legal reassignment.
+    available_commands = [
         "subscribe", "unsubscribe", "subscriptions", "leaderboard", "highlightme", "analyse cwl_league_group",
         "analyse cwl_opponent", "clan management", "admin", "list", "whois", "ping", "status", "help"
     ]
     if is_dm:
         dm_status = _get_help_command_dm_status()
-        AVAILABLE_COMMANDS = [c for c in AVAILABLE_COMMANDS if not dm_status.get(c, True)]
+        available_commands = [c for c in available_commands if not dm_status.get(c, True)]
 
     user_id = str(interaction.user.id)
     guild_id = interaction.guild_id
@@ -1063,7 +1066,7 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
     # If specific command is requested, show detailed help
     if command:
         command_lower = command.lower()
-        if command_lower not in AVAILABLE_COMMANDS:
+        if command_lower not in available_commands:
             error_embed = discord.Embed(
                 title=t('commands.help.command_not_found_title', user_id=user_id, guild_id=guild_id),
                 description=t('commands.help.command_not_found_desc', user_id=user_id, guild_id=guild_id, command=command),
@@ -1089,7 +1092,6 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
     help_command_id = None
     try:
         # Get commands from the app's command tree
-        from qapbot.config import CONFIG
         app_id = interaction.client.application_id
         if not app_id:
             logging.warning("Application ID not available")
@@ -2255,8 +2257,7 @@ async def admin(
                 try:
                     # Import war notification formatting functions
                     from qapbot.war_notifications import _format_aggregated_reminder_message  # type: ignore[misc]
-                    from qapbot.cache_manager import CACHE
-                    
+
                     # Ensure user metadata is current (cache handles API calls internally)
                     user_data = await CACHE.ensure_user_metadata(str(selected_member.id))
                     selected_user_name = user_data.get("display_name", selected_member.display_name)
@@ -2378,7 +2379,6 @@ async def admin(
             )
             return
 
-        from qapbot.cache_manager import CACHE
         # SERVER_ADMIN is excluded here on purpose (2026-08-15, /list TESTERS follow-up): the bot
         # admin's own account is already an always-on DM recipient via the separate `is_admin`
         # check in every cwl_dm_restrict_to_admin-style guard — it was never added to
@@ -2436,7 +2436,6 @@ async def admin(
                     logging.warning(f"Failed to delete MANAGE_TESTERS selection message: {e}")
 
                 try:
-                    from qapbot.cache_manager import CACHE
                     # SERVER_ADMIN is filtered out of both sides — selecting/deselecting the bot
                     # admin's own account here is a silent no-op, since their DM eligibility never
                     # actually depended on CACHE.testers (see the comment above where
@@ -4081,7 +4080,6 @@ async def list_clan_autocomplete(interaction: discord.Interaction, current: str)
 @list.autocomplete('family')  # type: ignore[attr-defined]
 async def list_family_autocomplete(interaction: discord.Interaction, current: str):
     """Autocomplete for family: suggests all clan families."""
-    from qapbot.cache_manager import CACHE
     from discord import app_commands
     
     current_lower = (current or "").lower()

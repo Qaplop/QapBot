@@ -1,6 +1,40 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (50)
+- Fixed: `QBdiscordcmds.py`'s `admin()` action-router function (~1400 lines, one `if
+  action_norm == "X": ... return` branch per admin action) had three redundant `from
+  qapbot.cache_manager import CACHE` re-imports scattered inside individual action branches —
+  `CACHE` is already imported once at module level. Python scopes a name for a function's ENTIRE
+  body at compile time: a `from X import Y` anywhere inside a function (any branch, any nesting)
+  makes `Y` local for the WHOLE function, so any OTHER branch referencing `CACHE` earlier in
+  source order than one of those three re-imports crashed with `UnboundLocalError` the instant
+  it ran — confirmed at least the `BACKFILL_CWL_GROUPS` admin action was broken this way on
+  every single invocation. Surfaced via the VS Code Problems panel (35 Pylance
+  `reportUnboundVariable`/attribute-access errors) — not a false positive; Pylance was correctly
+  predicting a real crash. Fixed by deleting the three redundant re-imports (plus a same-pattern
+  `CONFIG` one in `/help`, and one more harmless-but-redundant `CACHE` re-import in an unrelated
+  small function, removed for consistency). Also renamed `/help`'s local `AVAILABLE_COMMANDS`
+  variable to lowercase `available_commands` (Pylance's `reportConstantRedefinition` — a
+  naming-convention lint, not a real bug: it's a plain local, legitimately reassigned once for
+  the DM-filtered case, just misleadingly ALL-CAPS).
+  - Documented as a new Pitfall 28 in `qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md` — this codebase
+    deliberately favors local imports inside functions throughout (this session included), so
+    this exact landmine is a real, recurring risk, not a one-off; includes a repro and an audit
+    technique for finding other instances.
+  - Also found and fixed a genuine test-isolation gap while investigating a DIFFERENT, unrelated
+    report from this same live-testing session (enabling `CWL_USE_FTS_PLAYER_SEARCH_DEV=true` in
+    `.env` to test Batch 7 on DEV): `tests/conftest.py` loads the same `.env` file the live bot
+    does, so the local dev flag silently changed test-suite behavior too — broke every test that
+    seeds `CACHE.player_name_index` in-memory without also seeding the real DB. Fixed the same
+    way `PROD_DATA_DIR` already is in that file (existing precedent, same file): force the flag
+    to a known `false` value in `conftest.py` before `qapbot.config`'s own `load_dotenv` runs, so
+    test-suite behavior never depends on a developer's local `.env` state for this flag.
+  - 2046 tests pass (`.\run_tests.ps1`) — unchanged count, this was a pure bugfix + test-harness
+    hardening, no behavior/feature change. Needs a bot restart on DEV/PROD to take effect (the
+    `admin()` fix is real functional behavior; the `AVAILABLE_COMMANDS` rename and the cookbook
+    doc are no-ops at runtime either way).
+
 2026-08-17 (49)
 - Added: Batch 7 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md` (P2 Step 11, the final step in the plan) —
   a SQLite/FTS5-backed alternative to the in-memory player-name search, gated behind a config

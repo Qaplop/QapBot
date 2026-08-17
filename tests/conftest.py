@@ -38,6 +38,16 @@ if load_dotenv is not None:
 # does not re-inject the .env value (override=False skips already-set vars).
 os.environ["PROD_DATA_DIR"] = ""
 
+# The test suite's baseline behavior must never depend on a developer's local .env feature-flag
+# state (2026-08-17 — found live: enabling CWL_USE_FTS_PLAYER_SEARCH_DEV=true in .env to test on
+# DEV silently broke every test that seeds CACHE.player_name_index in-memory without also
+# seeding the real DB, since CACHE.search_player_names() started delegating to the SQLite path
+# by default for the whole suite). Same fix pattern as PROD_DATA_DIR above — force a known
+# deterministic value before qapbot.config's own load_dotenv(override=False) runs. Tests that
+# specifically want the SQLite/FTS path already monkeypatch CONFIG for that one test explicitly.
+os.environ["CWL_USE_FTS_PLAYER_SEARCH_DEV"] = "false"
+os.environ["CWL_USE_FTS_PLAYER_SEARCH"] = "false"
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     """Add CLI options for live smoke behavior.

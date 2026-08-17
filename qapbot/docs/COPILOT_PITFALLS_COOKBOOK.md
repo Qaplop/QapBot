@@ -1091,3 +1091,61 @@ git-tracked tree) was used to screenshot the broken state, inspect the sticky el
 `getBoundingClientRect()` and `.table-scroll`'s computed `overflow-y`, then verify the candidate
 fix restored both correct row visibility AND correct sticky-tracking-during-scroll before it was
 applied to the real source.
+
+## Pitfall 28: A local `from module import NAME` inside one branch of a function poisons `NAME` for the WHOLE function, even in sibling branches that never run it
+
+Symptom (2026-08-17, found live-testing): opening the DEV VS Code "Problems" panel for
+`QBdiscordcmds.py` showed 35 Pylance errors — `"CACHE" is unbound` plus a cascade of `Cannot
+access attribute "X" for class "Unbound"` at unrelated-looking lines scattered from ~1476 to
+~2580. Every one of those lines is inside `admin()`, a single ~1400-line function implementing a
+dropdown-driven admin-action router (`if action_norm == "X": ... return`, repeated for a couple
+dozen actions).
+
+Root cause: `CACHE` is imported once at module level (`from qapbot.cache_manager import CACHE`,
+near the top of the file) — that should make it available everywhere. But three of `admin()`'s
+individual action branches ALSO had their own `from qapbot.cache_manager import CACHE` line,
+added independently (likely out of habit/caution, not because any of them actually needed a
+fresh import — `CACHE` was already the same module-level object). Python's compiler determines a
+name's scope for an ENTIRE function body statically, before any code runs: `from X import Y`
+inside a function is compiled exactly like `Y = ...` — if it appears ANYWHERE in the function
+(any branch, any nesting depth), `Y` is treated as a LOCAL variable for the WHOLE function, not
+just the branch it's textually in. Since only one `if action_norm == "X": ... return` branch
+ever executes per call, invoking `admin()` with an action whose branch references `CACHE` BEFORE
+(in line-number terms) one of the three re-import branches — mutually exclusive branches, so
+that re-import line never actually runs for this call — raises `UnboundLocalError: cannot access
+local variable 'CACHE' where it is not associated with a value` the instant `CACHE` is touched.
+Confirmed with a 10-line repro (`def outer(branch): if branch=="A": print(X) \n if branch=="B":
+from os import getcwd as X`) — calling `outer("A")` alone crashes, even though branch B (the one
+with the local import) never runs.
+
+This is NOT a Pylance false positive — Pylance's `reportUnboundVariable`/`Cannot access
+attribute ... for class "Unbound"` here is correctly predicting a REAL runtime crash for
+whichever admin action's branch happens to reference `CACHE` earlier in the function than the
+first branch (in source order) that re-imports it. At least one live admin action
+(`BACKFILL_CWL_GROUPS`) was broken this way — every invocation would have raised
+`UnboundLocalError` the moment its `on_submit` handler touched `CACHE`.
+
+Fix: delete the redundant local re-imports (`CACHE`, and a same-function `CONFIG` one found by
+the same audit) — both names are already module-level globals, so the local imports were pure
+liability with zero benefit. After deletion, every reference in the function correctly resolves
+to the module-level global for the function's entire body, since nothing shadows it anymore.
+
+**Rule going forward — this codebase deliberately favors LOCAL imports inside functions (see
+this cookbook's own convention throughout, and Pitfall 26's `to_thread` sync-core pattern), so
+this exact landmine is a real, recurring risk, not a one-off**: before adding `from module import
+NAME` inside ANY function (or nested branch/class/closure within one), check whether `NAME` is
+already imported at module level in that file. If it is, the local import is unnecessary —
+delete it, don't add it. If a name genuinely needs a fresh/deferred import inside a specific
+branch (e.g. to dodge a circular import), give it a distinct local alias
+(`from x import Y as _Y_deferred`) instead of reusing a name that's also a module-level global,
+so a sibling branch can never have its scope silently poisoned. A quick audit technique: `grep
+-n "^from \|^import " <file> | head -50` to list module-level imports, then grep the same names
+indented deeper in the file — any hit is a candidate for this exact bug (verify by checking
+whether the name is used anywhere else in the SAME enclosing function before that local import's
+own line, in source order, across ALL sibling branches, not just the one containing the import).
+
+Separately, `AVAILABLE_COMMANDS` (a local, ALL-CAPS variable in the `/help` command, legitimately
+reassigned once for the DM-filtered case) tripped Pylance's `reportConstantRedefinition` — a
+naming-convention lint, not a real bug (Python has no true constants; reassigning a local is
+always legal). Renamed to lowercase `available_commands` since it's genuinely not a constant —
+cheaper than fighting the lint, and more honest about what the variable actually is.
