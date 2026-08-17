@@ -1,6 +1,19 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (46)
+- Deployed: `activity/server` and `activity/client` (Batches 1-4 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md`,
+  DEV-verified live-testing through drag-and-drop, DM signup confirm, and the guest-search
+  guardrails) to PROD Cloudflare — Worker
+  https://cwl-clan-config-server-prod.qapbotdev.workers.dev, client
+  https://c8efc2cc.cwl-clan-config-prod.pages.dev. Safe to deploy ahead of the PROD bot restart:
+  if the backend hasn't picked up the new `/api/cwl/enrollment/wait` route yet, the client's own
+  wait-loop failure handling falls back to a plain 60s poll of the existing (already-supported)
+  `/api/cwl/enrollment` GET, so the board keeps working either way. **Still needed**: `git pull` +
+  bot restart on the PROD NAS to actually apply the backend half of Batches 1-4 (bounded-scan
+  guest search, event-loop threading, player-stats cache, the enrollment-version bump wiring, and
+  the two follow-up fixes — commits 21b0074 through 3e4d812).
+
 2026-08-17 (45)
 - Fixed: the `[WEB-BRIDGE] enrollment/wait ... parking`/`released` diagnostic log lines added in
   (43) to debug the live-testing report fire once per wait cycle per open board (~every 25s, or
