@@ -1,6 +1,18 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (45)
+- Fixed: the `[WEB-BRIDGE] enrollment/wait ... parking`/`released` diagnostic log lines added in
+  (43) to debug the live-testing report fire once per wait cycle per open board (~every 25s, or
+  immediately on a real change) — reported as spamming the DEV log now that both boards stayed
+  open and idle. Downgraded those two plus the "already stale" line to `logging.debug` (default
+  level is `INFO`, so they're silent by default but still available by setting `LOG_LEVEL=DEBUG`
+  if this mechanism ever needs re-diagnosing). Left `bump_enrollment_version`'s own line at DEBUG
+  too (fires once per write, not spammy, but no longer needed now the mechanism's confirmed
+  working) and kept the waiter-cap-overflow line at INFO — hitting that (10+ concurrent viewers of
+  one guild's board) is rare and worth surfacing, unlike the routine per-cycle lines. Needs a bot
+  restart on DEV/PROD to take effect.
+
 2026-08-17 (44)
 - Fixed: (43) fixed the DM-confirm half of the live-testing report, but drag-and-drop still didn't
   propagate to another open board in either direction. The new `[WEB-BRIDGE]` log lines from (43)

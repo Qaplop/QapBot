@@ -209,7 +209,7 @@ async def bump_enrollment_version(guild_id: Optional[int] = None) -> None:
         _enrollment_version[guild_id_str] = new_version
         cond = _enrollment_changed.get(guild_id_str)
         waiters = _enrollment_waiter_counts.get(guild_id_str, 0)
-        logging.info(
+        logging.debug(
             f"[WEB-BRIDGE] bump_enrollment_version guild={guild_id_str} -> version={new_version} "
             f"(parked_waiters={waiters}, tracked={cond is not None})"
         )
@@ -885,7 +885,7 @@ async def handle_get_cwl_enrollment_wait(request: web.Request) -> web.Response:
     guild_id_str = str(guild_id)
     current = _enrollment_version.get(guild_id_str, 0)
     if current != known_version:
-        logging.info(
+        logging.debug(
             f"[WEB-BRIDGE] enrollment/wait guild={guild_id_str} known_version={known_version} "
             f"already stale (current={current}) -> immediate changed=true"
         )
@@ -893,13 +893,15 @@ async def handle_get_cwl_enrollment_wait(request: web.Request) -> web.Response:
 
     # Waiter cap (2026-08-17, Step 8) — beyond this many parked coroutines for one guild, degrade
     # gracefully (report "changed" so the client refetches and re-issues the wait with a fresh
-    # known_version) rather than accumulate coroutines without bound.
+    # known_version) rather than accumulate coroutines without bound. Kept at INFO (unlike the
+    # routine parking/released lines below) — genuinely hitting this cap (10+ concurrent viewers
+    # of one guild's board) is rare and worth surfacing, not routine per-cycle noise.
     if _enrollment_waiter_counts.get(guild_id_str, 0) >= _ENROLLMENT_WAIT_MAX_WAITERS_PER_GUILD:
         logging.info(f"[WEB-BRIDGE] enrollment/wait guild={guild_id_str} waiter cap hit -> immediate changed=true")
         return web.json_response({"changed": True, "version": current})
 
     _enrollment_waiter_counts[guild_id_str] = _enrollment_waiter_counts.get(guild_id_str, 0) + 1
-    logging.info(
+    logging.debug(
         f"[WEB-BRIDGE] enrollment/wait guild={guild_id_str} parking at version={current} "
         f"(waiters now {_enrollment_waiter_counts[guild_id_str]}, timeout={_ENROLLMENT_WAIT_TIMEOUT_SECONDS}s)"
     )
@@ -915,7 +917,7 @@ async def handle_get_cwl_enrollment_wait(request: web.Request) -> web.Response:
 
     current = _enrollment_version.get(guild_id_str, 0)
     changed = current != known_version
-    logging.info(f"[WEB-BRIDGE] enrollment/wait guild={guild_id_str} released -> changed={changed} version={current}")
+    logging.debug(f"[WEB-BRIDGE] enrollment/wait guild={guild_id_str} released -> changed={changed} version={current}")
     return web.json_response({"changed": changed, "version": current})
 
 
