@@ -259,8 +259,9 @@ const ORPHANED_COLUMN_TAG = '__orphaned__'
 export type EnrollmentBoardHandle = {
   /** Merges freshly-fetched player data into the live board (2026-08-16, live-testing feedback:
    * "would it be possible to auto-update this view whenever a user changes his confirmation
-   * setting?") — see the function's own definition below for exactly which fields are safe to
-   * live-update and why `assigned_clan_tag` deliberately isn't one of them. */
+   * setting?") — see the function's own definition below for exactly which fields merge (as of
+   * 2026-08-17, that's all of them, including `assigned_clan_tag`) and the one still-excluded
+   * case (a player with a local drag-and-drop POST currently in flight). */
   applyPolledUpdate: (freshPlayers: EnrollmentPlayer[]) => void
 }
 
@@ -301,6 +302,10 @@ export function renderEnrollmentBoard(
   // apart from "confirmed no data in the window" and only show "No data available" once it's
   // actually true, never as a premature flash before the async fetch lands.
   const settledPlayerStatsTags = new Set<string>()
+  // player_tags with a drag-and-drop assignment POST currently in flight (2026-08-17,
+  // CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8 fix — see applyPolledUpdate's own comment for
+  // why this exists and isDragging alone doesn't cover the same window).
+  const pendingAssignmentTags = new Set<string>()
   // Set for the duration of any native HTML5 drag gesture (player card or column-header) — a
   // poll-triggered renderBoard() mid-drag would tear down the very DOM node the browser is
   // currently dragging, silently aborting the gesture (2026-08-16, live-testing feedback: polling
@@ -571,13 +576,24 @@ export function renderEnrollmentBoard(
     status.textContent = ''
     status.className = 'save-status'
     renderBoard()
-    onAssignAction(player.player_tag, targetClanTag).catch((err: unknown) => {
-      console.error(err)
-      player.assigned_clan_tag = previousAssignment
-      renderBoard()
-      status.textContent = `Action failed: ${(err as Error).message}`
-      status.className = 'save-status error'
-    })
+    // Marks this specific player as having a local assignment POST in flight — applyPolledUpdate
+    // skips merging assigned_clan_tag for exactly this player_tag until the POST settles, so a
+    // wait-triggered refetch that lands mid-flight can't visually snap this card back to its
+    // pre-drop column before the POST's own response confirms it (see applyPolledUpdate's own
+    // comment). Every OTHER player's assigned_clan_tag still merges normally, unlike before.
+    pendingAssignmentTags.add(player.player_tag)
+    onAssignAction(player.player_tag, targetClanTag)
+      .then(() => {
+        pendingAssignmentTags.delete(player.player_tag)
+      })
+      .catch((err: unknown) => {
+        pendingAssignmentTags.delete(player.player_tag)
+        console.error(err)
+        player.assigned_clan_tag = previousAssignment
+        renderBoard()
+        status.textContent = `Action failed: ${(err as Error).message}`
+        status.className = 'save-status error'
+      })
   }
 
   function handleColumnReorder(fromIndex: number, toIndex: number): void {
@@ -889,18 +905,21 @@ export function renderEnrollmentBoard(
     }
   }
 
-  // Live-polling support (2026-08-16, live-testing feedback: "would it be possible to auto-update
-  // this view whenever a user changes his confirmation setting?"). main.ts calls this on a
-  // timer with a freshly-fetched payload's players. Deliberately merges only the fields another
-  // person's action could actually change — a member's own DM response (signup_status), their
-  // live CoC state (th_level/th_icon_url/current_clan_tag), or another admin's guest-invite
-  // action (is_guest/discord_id/player_name) — never `assigned_clan_tag`. That field is this
-  // board's own optimistic drag-and-drop state, confirmed or reverted by handleDrop()'s own
-  // direct POST response; blindly overwriting it from a poll tick that raced an in-flight local
-  // drag would visually snap a card back to its pre-drag column for a moment, then snap forward
-  // again once the drag's own response lands — a strictly worse experience than just not touching
-  // it here at all. Skips entirely while a native drag gesture is in progress (isDragging) since
-  // tearing down the board mid-gesture would silently abort it; the next poll tick catches up.
+  // Live-update support (2026-08-16, live-testing feedback: "would it be possible to auto-update
+  // this view whenever a user changes his confirmation setting?"; originally a 12s poll, replaced
+  // 2026-08-17 by the event-driven wait loop in main.ts — see CWL_PROD_PERFORMANCE_FIX_PLAN.md P1
+  // Step 8). Called with a freshly-fetched payload's players whenever the wait loop learns
+  // something changed. Merges every field another admin's/player's action could actually change,
+  // INCLUDING `assigned_clan_tag` (2026-08-17 fix — a prior version excluded it entirely, which
+  // meant a drag-and-drop move made in one window/session never appeared in another at all; only
+  // reported live-testing after Step 8 shipped, since nothing before it made cross-window
+  // assignment sync a real expectation). The one still-excluded case is THIS player_tag having a
+  // local assignment POST in flight (pendingAssignmentTags, set by handleDrop) — a refetch racing
+  // that specific in-flight request would otherwise visually snap the just-dropped card back to
+  // its pre-drop column for a moment, then snap forward again once the drag's own POST response
+  // lands; every OTHER player's assigned_clan_tag still merges normally. Skips entirely while a
+  // native drag gesture is in progress (isDragging) since tearing down the board mid-gesture
+  // would silently abort it; the next wait/refetch cycle catches up.
   function applyPolledUpdate(freshPlayers: EnrollmentPlayer[]): void {
     if (isDragging) return
     let changed = false
@@ -915,6 +934,7 @@ export function renderEnrollmentBoard(
         changed = true
         continue
       }
+      const mergeAssignment = !pendingAssignmentTags.has(fresh.player_tag)
       if (
         existing.signup_status !== fresh.signup_status ||
         existing.player_name !== fresh.player_name ||
@@ -925,7 +945,8 @@ export function renderEnrollmentBoard(
         existing.avg_stars !== fresh.avg_stars ||
         existing.cwl_permanent_optout !== fresh.cwl_permanent_optout ||
         existing.current_clan_tag !== fresh.current_clan_tag ||
-        existing.is_guest !== fresh.is_guest
+        existing.is_guest !== fresh.is_guest ||
+        (mergeAssignment && existing.assigned_clan_tag !== fresh.assigned_clan_tag)
       ) {
         existing.signup_status = fresh.signup_status
         existing.player_name = fresh.player_name
@@ -937,6 +958,7 @@ export function renderEnrollmentBoard(
         existing.cwl_permanent_optout = fresh.cwl_permanent_optout
         existing.current_clan_tag = fresh.current_clan_tag
         existing.is_guest = fresh.is_guest
+        if (mergeAssignment) existing.assigned_clan_tag = fresh.assigned_clan_tag
         changed = true
       }
     }

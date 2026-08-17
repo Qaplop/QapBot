@@ -1,6 +1,31 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (44)
+- Fixed: (43) fixed the DM-confirm half of the live-testing report, but drag-and-drop still didn't
+  propagate to another open board in either direction. The new `[WEB-BRIDGE]` log lines from (43)
+  showed the backend working perfectly — every assign correctly bumped the version and released
+  both windows' parked waiters with `changed=true`, and both clients immediately re-issued the
+  wait, proving the refetch was actually happening. The bug was client-side, in what the refetch
+  DID with the fresh data: `activity/client/src/enrollmentBoard.ts`'s `applyPolledUpdate()` — the
+  merge function that live-updates the board — deliberately excluded `assigned_clan_tag` from
+  every merge, unconditionally, for every player. That exclusion predates Step 8 entirely
+  (2026-08-16): it was written to protect ONE specific player's local, in-flight optimistic drag
+  state from being snapped back by a same-window poll tick racing the drag's own POST response —
+  but its actual effect was to make assignment changes invisible to polling for ALL players,
+  including ones dragged in a completely different window with no race at all. Nothing before
+  Step 8 made that gap visible, since the old 12s poll was never really exercised for cross-window
+  drag sync specifically.
+  - Fixed by narrowing the exclusion to exactly the case it was meant for: a new
+    `pendingAssignmentTags` set (keyed by player_tag) is populated by `handleDrop()` for the
+    duration of its own local assignment POST and cleared once that POST settles (success or
+    failure); `applyPolledUpdate()` now merges `assigned_clan_tag` for every player EXCEPT one
+    currently in that set. A drag made in any other window/session now propagates like every
+    other field always did.
+  - No test harness exists for the client (unchanged) — `npm run typecheck && npm run build`
+    clean. Deployed to DEV: https://2f838ffe.cwl-clan-config-dev.pages.dev. Frontend-only, no
+    backend/bot restart needed for this specific fix.
+
 2026-08-17 (43)
 - Fixed: DEV live-testing of (42)'s event-driven enrollment long-polling reported "neither a
   player drag nor a signup confirmation gets updated" on another open board. Re-audited every
