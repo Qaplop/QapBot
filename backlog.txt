@@ -1,5 +1,9 @@
 Project Backlog, Improvement Ideas and General Remarks
 
+Fable-5 Recommendation:
+Have Sonnet do batch 1 (Steps 1, 2, 4), the P0 meltdown fixes) as one deploy and verify on DEV with a worst-case
+#2-style search (search by Tag) before starting the P1 work.
+
 Immediate next steps:
 - Refactor the discord user / coc player linking for admins with a nice web-ui.
 - Add a feature to DM users of the guild server to remind them to link their coc player accounts. the dm could contain a button that easily allows them to do the linking. The mail could be signed by a configurable server admin so that it is more convincing.
