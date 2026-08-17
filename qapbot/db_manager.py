@@ -3581,6 +3581,22 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] get_previous_cwl_season_sync failed for guild {guild_id}: {e}")
                 return None
 
+    def _chunked_in_query_sync(self, conn, sql_template: str, values: List[str], chunk_size: int = 900) -> "List[Any]":
+        """Execute sql_template (containing one literal '{placeholders}' slot for the IN (...)
+        clause) once per chunk_size-sized slice of values against conn, returning every chunk's
+        rows concatenated. Keeps any single query's host-parameter count under SQLite's ~999
+        limit (2026-08-17 PROD incident: an unbounded CWL guest-search player list produced
+        "too many SQL variables", one contributor to the two production meltdowns —
+        CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 4). Callers relying on ORDER BY semantics across
+        the merged result (e.g. verified-wins dedup) must re-sort the returned rows themselves —
+        a per-chunk ORDER BY does not hold across chunk boundaries."""
+        rows: List[Any] = []
+        for i in range(0, len(values), chunk_size):
+            chunk = values[i:i + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(conn.execute(sql_template.format(placeholders=placeholders), chunk).fetchall())
+        return rows
+
     def get_current_clan_members_sync(self, clan_tags: List[str]) -> List[Dict[str, Any]]:
         """Return every linked account currently tracked as a member of one of clan_tags — the
         seed for Start Enrollment's signup pool (CWL_ROSTER_PLANNING_PLAN.md Phase 2, corrected
@@ -3611,9 +3627,9 @@ class WarHistoryDB:
 
         with self._sync_conn() as conn:
             try:
-                placeholders = ",".join("?" for _ in clan_tags)
-                rows = conn.execute(
-                    f"""
+                rows = self._chunked_in_query_sync(
+                    conn,
+                    """
                     SELECT player_tag, player_name, current_clan_tag, discord_id, verified,
                            cwl_permanent_optout, cwl_default_preferred_league_rank, th_level
                     FROM user_players
@@ -3621,13 +3637,16 @@ class WarHistoryDB:
                     ORDER BY verified DESC
                     """,
                     clan_tags,
-                ).fetchall()
+                )
             except sqlite3.Error as e:
                 logging.error(f"[DB-QUERY-SYNC] get_current_clan_members_sync failed: {e}")
                 return []
 
         # ORDER BY verified DESC means the first row seen per player_tag is the verified one, if
-        # any exists — an unverified/disputed second linker never overwrites it.
+        # any exists — an unverified/disputed second linker never overwrites it. Re-sorted here
+        # (rather than trusting per-chunk ORDER BY) because chunking can split one player_tag's
+        # candidate rows across chunks, and concatenation doesn't preserve global order.
+        rows = sorted(rows, key=lambda r: not r["verified"])
         members_by_tag: Dict[str, sqlite3.Row] = {}
         for row in rows:
             members_by_tag.setdefault(row["player_tag"], row)
@@ -3722,21 +3741,23 @@ class WarHistoryDB:
 
         with self._sync_conn() as conn:
             try:
-                placeholders = ",".join("?" for _ in player_tags)
-                rows = conn.execute(
-                    f"""
+                rows = self._chunked_in_query_sync(
+                    conn,
+                    """
                     SELECT player_tag, player_name, discord_id, verified
                     FROM user_players
                     WHERE player_tag IN ({placeholders})
                     ORDER BY verified DESC
                     """,
                     player_tags,
-                ).fetchall()
+                )
             except sqlite3.Error as e:
                 logging.error(f"[DB-QUERY-SYNC] get_player_links_sync failed: {e}")
                 return {}
 
-        # Same verified-wins-per-player_tag dedup as get_current_clan_members_sync.
+        # Same verified-wins-per-player_tag dedup as get_current_clan_members_sync — re-sorted
+        # globally first since chunking (Step 4) can split one player_tag's rows across chunks.
+        rows = sorted(rows, key=lambda r: not r["verified"])
         links: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             if row["player_tag"] in links:
@@ -3768,20 +3789,23 @@ class WarHistoryDB:
 
         with self._sync_conn() as conn:
             try:
-                placeholders = ",".join("?" for _ in player_tags)
-                rows = conn.execute(
-                    f"""
+                rows = self._chunked_in_query_sync(
+                    conn,
+                    """
                     SELECT player_tag, current_clan_tag, verified
                     FROM user_players
                     WHERE player_tag IN ({placeholders}) AND current_clan_tag IS NOT NULL
                     ORDER BY verified DESC
                     """,
                     player_tags,
-                ).fetchall()
+                )
             except sqlite3.Error as e:
                 logging.error(f"[DB-QUERY-SYNC] get_current_clan_tags_for_players_sync failed: {e}")
                 return {}
 
+        # Re-sorted globally first (Step 4) — chunking can split one player_tag's rows across
+        # chunks, so a per-chunk ORDER BY alone would not guarantee verified-wins here.
+        rows = sorted(rows, key=lambda r: not r["verified"])
         clan_tags: Dict[str, str] = {}
         for row in rows:
             clan_tags.setdefault(row["player_tag"], row["current_clan_tag"])

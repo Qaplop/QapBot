@@ -1,6 +1,46 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (38)
+- Fixed: PROD meltdown — two near-identical incidents on 2026-08-16 (19:43–19:45 and 19:54–19:59)
+  where the CWL "Guests" search box (`GET /api/cwl/guest-search`, keystroke-debounced 300ms, no
+  minimum query length) triggered escalating gen-2 GC pauses (up to 11.79s, freeing 13.7M
+  objects), 3x Discord gateway disconnects (event loop blocked past the heartbeat deadline), and
+  3x `[ERROR] get_player_links_sync failed: too many SQL variables`. Full root-cause analysis and
+  the remaining fix steps are tracked in `CWL_PROD_PERFORMANCE_FIX_PLAN.md` (Batch 1 of 7 — P0
+  Steps 1, 2, 4). This batch:
+  - `qapbot/web_bridge.py`'s `_search_cwl_guests()`: added a server-side minimum query length
+    (`GUEST_SEARCH_MIN_NEEDLE_TAG = 2` for `@`/`#`-prefixed needles, `GUEST_SEARCH_MIN_NEEDLE_TEXT
+    = 3` for plain text) so a short prefix like `#2` (which matched millions of
+    `CACHE.player_name_index` entries in the incident) is rejected before any scan runs. The clan
+    scan (over `CACHE.clan_name_cache`, ~430K entries) and the `#`-mode player scan (over
+    `CACHE.player_name_index`, ~6.6M entries) now `break` as soon as `GUEST_SEARCH_CAP` (12) hits
+    are collected, instead of scanning to completion and truncating with `[:12]` at the end.
+  - Moved the per-clan cross-guild DB check (`find_cwl_clan_participation_across_guilds_sync`)
+    out of the scan loop into a second pass over the already-capped (<=12) clan hits — it used to
+    run once per *matching* clan found during the uncapped scan.
+  - `qapbot/db_manager.py`: added `WarHistoryDB._chunked_in_query_sync()` and routed
+    `get_player_links_sync`, `get_current_clan_tags_for_players_sync`, and
+    `get_current_clan_members_sync` through it — any `IN (...)` query is now split into <=900-
+    value chunks (SQLite's practical host-parameter limit is ~999), with rows merged and
+    re-sorted by `verified DESC` before the existing first-wins dedup, so a large/degenerate input
+    can no longer produce `too many SQL variables` no matter what future caller feeds it.
+  - Tests: `tests/discord/test_web_bridge.py` (below-minimum queries for all three prefixes, each
+    asserting `get_player_links_sync` is never reached; `#`-mode and text-mode cap-at-12
+    assertions; the cross-guild DB-check call-count bound) and
+    `tests/unit/test_db_manager_cwl_roster.py` (`TestChunkedInQuery`: a 2,000-tag round trip, and
+    a forced chunk-boundary split proving verified-wins dedup holds across chunks). One existing
+    guest-search test's fixture query was lengthened from 2 to 3 characters to stay above the new
+    plain-text minimum (behavior unchanged, `#CLAN2`/QCrew still the only match). 2005 tests pass
+    (`.\run_tests.ps1`).
+  - Batches 2–7 (event-loop threading for `_search_cwl_guests` + all remaining bridge reads,
+    frontend abort/min-length guards, player-stats caching, event-driven long-polling for the
+    enrollment board, the `player_name_index` scan-cost fix, GC tuning, and the eventual FTS5
+    migration) are not yet implemented — see `CWL_PROD_PERFORMANCE_FIX_PLAN.md` for the remaining
+    steps. Backend-only — needs a bot restart on DEV/PROD to take effect; this batch alone does
+    not yet remove the event-loop-blocking behavior (Batch 2 does), only the two mechanisms that
+    turned an already-slow search into a crash (unbounded scans and the SQL-variable error).
+
 2026-08-16 (37)
 - Fixed: after "Add New Season", the `/clan management` command's own "CWL Season Management"
   screen kept showing "No CWL event has been configured yet for season X" — reported live on DEV

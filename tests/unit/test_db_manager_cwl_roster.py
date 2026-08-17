@@ -1093,3 +1093,81 @@ class TestGetCurrentClanTagsForPlayers:
         clan_tags = db.get_current_clan_tags_for_players_sync(["#P1"])
 
         assert clan_tags == {"#P1": "#B"}
+
+
+class TestChunkedInQuery:
+    """_chunked_in_query_sync (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P0 Step 4) — splits
+    any IN (...) query's values into <=900-sized chunks so a large input (e.g. the CWL guest
+    search's player_hits, previously unbounded — see web_bridge.py's GUEST_SEARCH_CAP) can never
+    again produce SQLite's "too many SQL variables" error, one of the two confirmed causes of the
+    2026-08-16 PROD meltdowns. get_player_links_sync, get_current_clan_tags_for_players_sync, and
+    get_current_clan_members_sync all route their IN (...) query through it."""
+
+    @pytest.mark.integration
+    async def test_get_player_links_sync_handles_2000_tags_no_error(self, db):
+        """2,000 tags (well past the ~900 chunk boundary) — mix of linked/unlinked — must not
+        raise and must return exactly the linked subset, correctly merged across chunks."""
+        tags = [f"#P{i:05d}" for i in range(2000)]
+        linked_indices = list(range(0, 2000, 3))
+        await db.conn.executemany(
+            "INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)",
+            [(f"#C{i:05d}", "Clan") for i in linked_indices],
+        )
+        await db.conn.executemany(
+            "INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)",
+            [(f"d{i}", f"d{i}") for i in linked_indices],
+        )
+        await db.conn.executemany(
+            """
+            INSERT INTO user_players
+                (discord_id, player_tag, player_name, verified, current_clan_tag)
+            VALUES (?, ?, ?, 1, ?)
+            """,
+            [(f"d{i}", tags[i], f"Player{i}", f"#C{i:05d}") for i in linked_indices],
+        )
+        await db.conn.commit()
+
+        links = db.get_player_links_sync(tags)
+
+        assert len(links) == len(linked_indices)
+        assert links[tags[0]] == {"player_name": "Player0", "discord_id": "d0", "verified": True}
+        assert tags[1] not in links
+
+    @pytest.mark.integration
+    async def test_get_current_clan_members_sync_verified_wins_across_chunk_boundary(self, db):
+        """Forces a real chunk split: 901 distinct clan_tags means the query chunks on clan_tag
+        (900 + 1), while the dedup key is player_tag — so a disputed player_tag whose two linked
+        rows carry DIFFERENT current_clan_tag values can genuinely have one row land in chunk 1
+        and the other in chunk 2. The merged result must still resolve to the verified row
+        regardless of which chunk it came from (do NOT dedup per chunk)."""
+        chunk_a_tag = "#CHUNKA"
+        chunk_b_tag = "#CHUNKB"
+        filler_tags = [f"#F{i:04d}" for i in range(899)]
+        clan_tags = [chunk_a_tag] + filler_tags + [chunk_b_tag]  # 901 total: chunk_b lands in chunk 2
+        assert len(clan_tags) == 901
+
+        await db.conn.executemany(
+            "INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)",
+            [(t, "Clan") for t in clan_tags],
+        )
+        await db.conn.commit()
+        # Disputed player_tag: an unverified link claims it's in the FIRST-chunk clan, a verified
+        # link claims it's in the SECOND-chunk clan.
+        await _seed_user_player(db, "d1", "#P1", current_clan_tag=chunk_a_tag, verified=False)
+        await _seed_user_player(db, "d2", "#P1", current_clan_tag=chunk_b_tag, verified=True)
+
+        members = db.get_current_clan_members_sync(clan_tags)
+
+        members_by_tag = {m["player_tag"]: m for m in members}
+        assert list(members_by_tag.keys()) == ["#P1"]
+        assert members_by_tag["#P1"]["discord_id"] == "d2"
+        assert members_by_tag["#P1"]["verified"] is True
+        assert members_by_tag["#P1"]["clan_tag"] == chunk_b_tag
+
+    @pytest.mark.integration
+    async def test_empty_values_short_circuits_before_chunking(self, db):
+        """All three callers already early-return [] / {} for empty input before ever reaching
+        _chunked_in_query_sync — regression guard for that short-circuit."""
+        assert db.get_player_links_sync([]) == {}
+        assert db.get_current_clan_tags_for_players_sync([]) == {}
+        assert db.get_current_clan_members_sync([]) == []

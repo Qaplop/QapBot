@@ -1535,13 +1535,13 @@ async def test_guest_search_returns_clan_hits_excluding_already_participating(db
     monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(801, 42, is_admin=True))
 
     resp = await client.get(
-        "/api/cwl/guest-search?guild_id=801&discord_user_id=42&q=cr",
+        "/api/cwl/guest-search?guild_id=801&discord_user_id=42&q=cre",
         headers={"X-Bridge-Secret": "test-secret"},
     )
     assert resp.status == 200
     body = await resp.json()
-    # #CLAN1 (Marines) already participates -> excluded even though "cr" isn't in its name;
-    # #CLAN2 (QCrew) matches "cr" and isn't participating -> included; #CLAN3 doesn't match "cr".
+    # #CLAN1 (Marines) already participates -> excluded even though "cre" isn't in its name;
+    # #CLAN2 (QCrew) matches "cre" and isn't participating -> included; #CLAN3 doesn't match "cre".
     assert body["results"] == [
         {"type": "clan", "clan_tag": "#CLAN2", "clan_name": "QCrew", "clan_tier": None, "already_shared_with": None}
     ]
@@ -1829,6 +1829,166 @@ async def test_guest_search_empty_query_returns_empty(bridge_config, client, mon
     assert resp.status == 200
     body = await resp.json()
     assert body["results"] == []
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-17 PROD meltdown fix (CWL_PROD_PERFORMANCE_FIX_PLAN.md P0 Step 1/2): server-side
+# minimum query length (reject before any scan) and per-scan caps (break during collection,
+# not after) for _search_cwl_guests. See that function's module-level GUEST_SEARCH_MIN_NEEDLE_*/
+# GUEST_SEARCH_CAP constants.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_below_minimum_text_length_returns_empty(db, bridge_config, client, monkeypatch):
+    """A plain-text query under GUEST_SEARCH_MIN_NEEDLE_TEXT (3) must reject before any scan,
+    even though the CACHE contents would otherwise match — and must never reach
+    get_player_links_sync (the call whose unbounded input caused "too many SQL variables")."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "830", {"#CLAN1": "QCrew"})
+    CACHE.db_manager = db
+    CACHE.server_config["830"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "QCrew"}}
+    CACHE.player_name_index = {}
+    CACHE.user_accounts = {}
+
+    link_spy = MagicMock(wraps=db.get_player_links_sync)
+    monkeypatch.setattr(db, "get_player_links_sync", link_spy)
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(830, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=830&discord_user_id=42&q=cr",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == []
+    link_spy.assert_not_called()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_below_minimum_at_prefix_needle_returns_empty(db, bridge_config, client, monkeypatch):
+    """@needle under GUEST_SEARCH_MIN_NEEDLE_TAG (2) must reject before scanning user_accounts."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "831", {})
+    CACHE.db_manager = db
+    CACHE.server_config["831"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {}
+    CACHE.player_name_index = {}
+    CACHE.user_accounts = {
+        "777": {"display_name": "Qaplop", "players": [{"player_tag": "#Q1", "player_name": "Qaplop"}]},
+    }
+
+    link_spy = MagicMock(wraps=db.get_player_links_sync)
+    monkeypatch.setattr(db, "get_player_links_sync", link_spy)
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(831, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=831&discord_user_id=42&q=%40q",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == []
+    link_spy.assert_not_called()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_below_minimum_hash_prefix_needle_returns_empty(db, bridge_config, client, monkeypatch):
+    """#2 -> needle "2" (length 1) must reject; this is the exact PROD incident pattern (a short
+    '#'-prefixed query matching millions of player_name_index entries)."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "832", {})
+    CACHE.db_manager = db
+    CACHE.server_config["832"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {}
+    CACHE.player_name_index = {"#2ABCDEFGH": "SomePlayer"}
+    CACHE.user_accounts = {}
+
+    link_spy = MagicMock(wraps=db.get_player_links_sync)
+    monkeypatch.setattr(db, "get_player_links_sync", link_spy)
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(832, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=832&discord_user_id=42&q=%232",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == []
+    link_spy.assert_not_called()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_hash_prefix_caps_player_hits_at_twelve(db, bridge_config, client, monkeypatch):
+    """The # tag-mode scan over player_name_index must stop collecting once GUEST_SEARCH_CAP
+    (12) hits exist, not after scanning the whole index."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "833", {})
+    CACHE.db_manager = db
+    CACHE.server_config["833"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {}
+    CACHE.player_name_index = {f"#QAP{i:03d}": f"Player {i:03d}" for i in range(20)}
+    CACHE.user_accounts = {}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(833, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=833&discord_user_id=42&q=%23qap",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    player_hits = [r for r in body["results"] if r["type"] == "player"]
+    assert len(player_hits) == 12
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_text_query_caps_clan_hits_and_db_check_calls(db, bridge_config, client, monkeypatch):
+    """The clan scan breaks at GUEST_SEARCH_CAP (12) and the cross-guild DB check
+    (find_cwl_clan_participation_across_guilds_sync) only ever runs for the capped set, not once
+    per matching clan found during the scan — this is Step 2's "≤12 DB queries per search, ever"
+    guarantee."""
+    from qapbot.cache_manager import CACHE
+
+    clan_tags = {f"#CLAN{i:02d}": f"Test Clan {i:02d}" for i in range(20)}
+    await _seed_guild_and_clans(db, "834", clan_tags)
+    CACHE.db_manager = db
+    CACHE.server_config["834"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {tag: {"name": name} for tag, name in clan_tags.items()}
+    CACHE.player_name_index = {}
+    CACHE.user_accounts = {}
+
+    claim_spy = MagicMock(wraps=db.find_cwl_clan_participation_across_guilds_sync)
+    monkeypatch.setattr(db, "find_cwl_clan_participation_across_guilds_sync", claim_spy)
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(834, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=834&discord_user_id=42&q=test",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    clan_hits = [r for r in body["results"] if r["type"] == "clan"]
+    assert len(clan_hits) == 12
+    assert claim_spy.call_count <= 12
 
 
 # ---------------------------------------------------------------------------

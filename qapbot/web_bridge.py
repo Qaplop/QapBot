@@ -524,6 +524,19 @@ async def _build_enrollment_payload(guild_id: int) -> Dict[str, Any]:
     }
 
 
+# CWL Guests search (2026-08-17 PROD meltdown fix): the search used to be an uncapped scan
+# over CACHE.clan_name_cache (~430K entries) and, in `#` mode, CACHE.player_name_index
+# (~6.6M entries) — a short prefix like "#2" accumulated millions of hits before the [:12] cap
+# was ever applied, feeding get_player_links_sync() an IN() clause with millions of
+# placeholders ("too many SQL variables") and triggering multi-second gen-2 GC pauses that
+# blocked the Discord gateway heartbeat. GUEST_SEARCH_MIN_NEEDLE_TAG/_TEXT reject queries too
+# short to be useful before any scan starts; GUEST_SEARCH_CAP bounds collection DURING the
+# scan (break as soon as enough hits exist) instead of after it completes.
+GUEST_SEARCH_MIN_NEEDLE_TAG = 2
+GUEST_SEARCH_MIN_NEEDLE_TEXT = 3
+GUEST_SEARCH_CAP = 12
+
+
 async def _search_cwl_guests(guild_id: int, query: str) -> List[Dict[str, Any]]:
     """Unified fuzzy search for the "Guests" invite flow on Configure Participating Clans
     (2026-08-15, project owner's spec: "a discord user, a coc player name or a coc player_tag
@@ -624,14 +637,24 @@ async def _search_cwl_guests(guild_id: int, query: str) -> List[Dict[str, Any]]:
 
     if query.startswith("@"):
         needle = query[1:].strip().lower()
-        if not needle:
+        if len(needle) < GUEST_SEARCH_MIN_NEEDLE_TAG:
             return []
         return _finalize_player_hits(_discord_display_name_player_hits(needle))[:25]
 
     tag_only_mode = query.startswith("#")
+    if tag_only_mode:
+        if len(query[1:].strip()) < GUEST_SEARCH_MIN_NEEDLE_TAG:
+            return []
+    elif len(query) < GUEST_SEARCH_MIN_NEEDLE_TEXT:
+        return []
 
+    # Scan loop collects ONLY pure cache lookups (no DB queries) and breaks as soon as the cap
+    # is reached — iteration order is cache-iteration order, unchanged by the early break, since
+    # no sorting ever happened here (the [:12] used to be applied after the full scan instead).
     clan_hits: List[Dict[str, Any]] = []
     for clan_tag, _info in CACHE.clan_name_cache.items():
+        if len(clan_hits) >= GUEST_SEARCH_CAP:
+            break
         if clan_tag in already_participating:
             continue
         name = CACHE.get_clan_name(clan_tag, clan_tag) or clan_tag
@@ -640,14 +663,6 @@ async def _search_cwl_guests(guild_id: int, query: str) -> List[Dict[str, Any]]:
                 continue
         elif query.lower() not in name.lower() and query.lower() not in clan_tag.lower():
             continue
-        # Cross-guild claim check (2026-08-15) — reported, never used to hide the hit.
-        already_shared_with = None
-        other_claims = db.find_cwl_clan_participation_across_guilds_sync(
-            clan_tag, season, exclude_guild_id=guild_id_str
-        )
-        if other_claims:
-            other_guild = QBcore.bot.get_guild(int(other_claims[0]["guild_id"]))
-            already_shared_with = other_guild.name if other_guild else other_claims[0]["guild_id"]
         # Same live-tier source _build_clan_config_payload uses for every other row (never
         # admin-set) — without this, a newly-added guest clan showed "—" for tier until the
         # next full page reload picked it up from the payload builder instead (live-testing
@@ -655,32 +670,48 @@ async def _search_cwl_guests(guild_id: int, query: str) -> List[Dict[str, Any]]:
         clan_hits.append({
             "type": "clan", "clan_tag": clan_tag, "clan_name": name,
             "clan_tier": CACHE.get_clan_war_league(clan_tag),
-            "already_shared_with": already_shared_with,
         })
+
+    # Cross-guild claim check (2026-08-15) — reported, never used to hide the hit — runs AFTER
+    # the cap so it never fires more than GUEST_SEARCH_CAP times per search (was: once per
+    # matching clan found during the uncapped scan, the other PROD meltdown contributor).
+    for hit in clan_hits:
+        already_shared_with = None
+        other_claims = db.find_cwl_clan_participation_across_guilds_sync(
+            hit["clan_tag"], season, exclude_guild_id=guild_id_str
+        )
+        if other_claims:
+            other_guild = QBcore.bot.get_guild(int(other_claims[0]["guild_id"]))
+            already_shared_with = other_guild.name if other_guild else other_claims[0]["guild_id"]
+        hit["already_shared_with"] = already_shared_with
 
     player_hits: Dict[str, Dict[str, Any]] = {}
     if tag_only_mode:
         upper_query = query.upper()
         for tag, name in CACHE.player_name_index.items():
+            if len(player_hits) >= GUEST_SEARCH_CAP:
+                break
             if tag.upper().startswith(upper_query):
                 player_hits.setdefault(tag, {"player_tag": tag, "player_name": name})
         # A tag typed exactly that the index doesn't know about at all — still offered as a raw
         # hit (name falls back to the tag itself) so the admin can add it directly; whether it's
-        # actually a real CoC tag is only found out once something tries to use it.
+        # actually a real CoC tag is only found out once something tries to use it. Added
+        # regardless of the cap above (a single entry — the final [:12] slice below re-caps it).
         if len(upper_query) >= 5 and upper_query not in player_hits:
             player_hits[upper_query] = {"player_tag": upper_query, "player_name": upper_query}
     else:
         for match in CACHE.search_player_names(query, limit=25):
             player_hits[match["player_tag"]] = {"player_tag": match["player_tag"], "player_name": match["player_name"]}
-        player_hits.update({
-            tag: hit for tag, hit in _discord_display_name_player_hits(query.lower()).items()
-            if tag not in player_hits
-        })
+        for tag, hit in _discord_display_name_player_hits(query.lower()).items():
+            if len(player_hits) >= GUEST_SEARCH_CAP:
+                break
+            if tag not in player_hits:
+                player_hits[tag] = hit
 
     player_result_list = _finalize_player_hits(player_hits)
 
-    capped_clans = clan_hits[:12]
-    capped_players = player_result_list[:12]
+    capped_clans = clan_hits[:GUEST_SEARCH_CAP]
+    capped_players = player_result_list[:GUEST_SEARCH_CAP]
     results: List[Dict[str, Any]] = []
     for i in range(max(len(capped_clans), len(capped_players))):
         if i < len(capped_clans):
