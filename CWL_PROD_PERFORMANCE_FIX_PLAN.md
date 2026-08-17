@@ -526,6 +526,21 @@ allocation source):
 across a few cycles before/after (log-diff is the acceptance criterion; note findings in the
 changelog entry).
 
+**Status (2026-08-17, Batch 6): sub-step 1 implemented; sub-step 2 was already done.** Another
+correction to the plan's own audit (same pattern as Step 9's `/whois` finding): verified
+2026-08-17 by reading `QapBot.py` directly (not just searching `COPILOT_PITFALLS_COOKBOOK.md`,
+which is presumably what the "does NOT exist yet" claim was based on) — the nightly re-freeze
+**already exists**, added 2026-08-08 ("Issue 3", `run_nightly_maintenance_routine()`'s Step 5:
+`gc.unfreeze()` + full `gc.collect()` + `gc.freeze()`, logged as `[NIGHTLY-MAINTENANCE] GC
+refresh: ...` rather than a `[GC-FREEZE]`-prefixed line) — just never written up in the cookbook.
+Left the existing mechanism and its log tag as-is (working, tested-in-prod-by-time code); added
+`gc.set_threshold(700, 10, 20)` at startup (the one genuinely-missing piece) right before the
+existing startup freeze. Documented both as two new "Follow-up" paragraphs under Pitfall 21
+(cookbook) instead of editing Pitfall 21's original incident writeup. No unit tests (per this
+step's own note) — DEV `[GC-AUTO]` frequency/duration validation still pending, same as the
+Step 8 hold-duration verification: needs live observation across real cycles, noted here rather
+than blocking the implementation on it.
+
 ### Step 11: Move player-name substring search into SQLite (longer-term)
 
 **Files**: `qapbot/db_manager.py` (new table + query helpers), `qapbot/cache_manager.py`

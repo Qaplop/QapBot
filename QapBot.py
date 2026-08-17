@@ -3146,6 +3146,19 @@ async def _run_startup_initialization() -> None:
             }
             logging.info(f"📊 Cache stats: {stats}")
 
+            # Raise the gen-2 collection threshold (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md
+            # P2 Step 10 — mitigation, not the fix; P0 already removed the actual allocation
+            # source behind the 2026-08-16 PROD meltdown's escalating gen-2 [GC-AUTO] pauses,
+            # 1.5-5.5s each). Default thresholds are (700, 10, 10): a gen-2 sweep runs once gen-1
+            # has been collected 10 times since the last gen-2 sweep. Raising just the gen-2
+            # multiplier to 20 (gen-0/gen-1 left at their defaults — those stay cheap regardless
+            # of heap size) halves how often automatic gen-2 sweeps run, without changing gen-0/
+            # gen-1's own frequent, cheap collections at all. Set once, here, before the
+            # gc.freeze() below — threshold and freeze state are independent (thresholds gate
+            # WHEN a sweep runs; freezing controls WHAT a sweep walks), so order between the two
+            # doesn't matter, but co-locating them keeps every startup GC decision in one place.
+            gc.set_threshold(700, 10, 20)
+
             # Freeze the just-loaded CACHE state into gc's permanent generation.
             # CPython's automatic collector is never disabled in this codebase
             # (see the [GC-AUTO] logger registered near the top of this file) and

@@ -611,6 +611,31 @@ Diagnostic tool: same as Pitfall 16 — `qapbot/scripts/log_time_gaps.py --top 3
 `[COC-API-SLOW]`/`[NOTIFY-TIMING]`/`[CATEGORIZE-TIMING]` gaps that recur at *varying* positions
 across cycles (vs. a fixed line, which would point to a specific blocking call instead).
 
+**Follow-up 1 (2026-08-08, "Issue 3" — same day, undocumented until now)**: the startup freeze
+alone wasn't enough — PROD's automatic `[GC-AUTO]` pauses kept recurring over the following days.
+Every update cycle promotes newly-created long-lived `CACHE` growth (new clans, new war metadata —
+substantial during a CWL season, e.g. 7000+ active wars) into gen-2, which the one-time startup
+freeze never covers, so the swept-but-unfrozen working set grows daily. Fix: `run_nightly_
+maintenance_routine()` (`QapBot.py`) now ends with `gc.unfreeze()` + a real full `gc.collect()`
+(catches genuine reference cycles the per-cycle `gc.collect(1)` always skips — those would become
+permanent floating garbage once re-frozen otherwise) + `gc.freeze()` again, folding each day's
+legitimate growth back into the permanent generation before tomorrow's automatic sweeps have to
+walk it. Runs during the maintenance window (`db_maintenance_mode=True`, Discord commands already
+blocked) since a real full collect costs the same multi-second price the per-cycle scoping exists
+to avoid during live cycles — logged as `[NIGHTLY-MAINTENANCE] GC refresh: ...`. Never re-freezes
+mid-cycle or per-cycle — only nightly, after a full collect, per the caveat above (a cycle formed
+between a frozen baseline object and new post-freeze churn would never collect otherwise, so
+re-freezing has to follow a real sweep, not run on its own schedule).
+
+**Follow-up 2 (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P2 Step 10)**: raised the gen-2
+threshold multiplier from the default 10 to 20 — `gc.set_threshold(700, 10, 20)`, set once at
+startup right before the freeze above (gen-0/gen-1 left at their defaults; only gen-2's own
+allocation-threshold-triggered frequency changes). Halves how often an automatic gen-2 sweep fires
+at all, on top of (not instead of) the freeze shrinking what each sweep has to walk when it does
+fire — pure mitigation, doesn't address any allocation source (the 2026-08-16 PROD meltdown's
+actual source — an unbounded CWL guest-search scan — was removed at the source by P0 of that same
+plan).
+
 ---
 
 ## Pitfall 22: `QapBot.py`'s top-level code runs TWICE in one process — `QBdiscordcmds.py` imports back from it

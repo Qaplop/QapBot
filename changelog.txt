@@ -1,6 +1,28 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (48)
+- Added: Batch 6 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md` (P2 Step 10) — GC tuning headroom on the
+  weak PROD box (10 GB RAM, 2-core Celeron J3355). Pure mitigation, not a fix — P0 (Batch 1)
+  already removed the actual allocation source behind the 2026-08-16 meltdown's escalating gen-2
+  `[GC-AUTO]` pauses.
+  - `QapBot.py`: added `gc.set_threshold(700, 10, 20)` at startup, right before the existing
+    startup `gc.freeze()` — raises only the gen-2 multiplier (10 -> 20), halving how often an
+    automatic gen-2 sweep fires at all; gen-0/gen-1 stay at their defaults and keep collecting as
+    frequently/cheaply as before.
+  - **Correction to the plan's own audit** (same pattern as Batch 5's `/whois` finding): the
+    plan's "nightly re-freeze does NOT exist yet" claim was wrong — verified 2026-08-17 by reading
+    `QapBot.py` directly (the claim was presumably based on searching the pitfalls cookbook, which
+    never documented it) — `run_nightly_maintenance_routine()` has re-frozen the heap every night
+    since 2026-08-08 ("Issue 3": `gc.unfreeze()` + full `gc.collect()` + `gc.freeze()`, logged as
+    `[NIGHTLY-MAINTENANCE] GC refresh: ...`). Left that already-working mechanism untouched.
+  - `qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md`: added two "Follow-up" paragraphs under Pitfall 21
+    documenting both the pre-existing nightly re-freeze (finally written up) and today's new
+    threshold change.
+  - No unit-testable behavior (per the plan's own note) — 2025 tests unaffected/still pass.
+    DEV `[GC-AUTO]` frequency/duration validation across real cycles still needs live observation,
+    same open item as Step 8's hold-duration check. Backend-only, needs a bot restart.
+
 2026-08-17 (47)
 - Added: Batch 5 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md` (P1 Step 9) — fixes `search_player_names`'s
   per-call scan cost (re-lowercasing every one of PROD's ~6.6M `player_name_index` entries on
