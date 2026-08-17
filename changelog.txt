@@ -38,9 +38,13 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
     pass (net -1 vs (53), consolidating the rowid-behavior coverage).
   - PROD is currently mid-incident: its last startup attempt hit the 30-minute timeout and
     logged "bot cannot start" — check whether the process is still alive (the to_thread caveat
-    above means it might be) before deploying this fix; safe to kill either way, since the
-    migration transaction never reached its single `commit()` call, so SQLite rolls it back
-    cleanly on next connection open — no partial data risk.
+    above means it might be) before deploying this fix; safe to kill either way. Correction to
+    an earlier claim (2026-08-17 review): whether the timed-out v1 thread reached its `commit()`
+    is UNKNOWABLE from outside — per the to_thread caveat it kept running after the timeout and
+    may have finished. Safety holds regardless, for a different reason: uncommitted → SQLite
+    rolls back on next connection open; committed → the data is internally-consistent v1-scheme
+    data, and the v2 marker mismatch forces a full rebuild on next startup anyway. Both branches
+    end in the same clean place; no partial-data risk in either.
 
 2026-08-17 (53)
 - Fixed: (52)'s own one-time rowid-scheme migration froze the event loop on PROD and missed a
