@@ -90,6 +90,21 @@ class TestLeaderboardWriteThrough:
                or (call_kwargs[0] if call_kwargs[0] else [None])[1] is None
 
     @pytest.mark.asyncio
+    async def test_whois_player_mode_does_not_ensure_clan(self, cache):
+        """2026-08-17 regression (found live-testing): _player_report_logic (QBdiscordcmds.py)
+        deliberately stores a PLAYER tag in the "clan_tag" field for mode="whois_player" entries
+        (needed for its own "delete the previous whois_player entry for this player" cleanup
+        filter) — this must NEVER trigger _ensure_clan_exists(), or every single /whois
+        player-report lookup creates a bogus placeholder `clans` row for the player just looked
+        up. clan_tag itself must still be saved as-is (the cleanup filter depends on it)."""
+        data = {"clan_tag": "#PLAYERTAG1", "channel_id": "CH4", "mode": "whois_player",
+                "message_ids": "4", "content_hash": ""}
+        await cache.set_leaderboard_message("KEY4", data)
+        cache.db_manager._ensure_clan_exists.assert_not_awaited()
+        call_kwargs = cache.db_manager.save_leaderboard_message.call_args
+        assert call_kwargs.kwargs.get("clan_tag") == "#PLAYERTAG1"
+
+    @pytest.mark.asyncio
     async def test_delete_removes_cache_and_db(self, cache):
         cache.leaderboard_messages["KEY_DEL"] = {"some": "data"}
         await cache.delete_leaderboard_message("KEY_DEL")

@@ -1,6 +1,50 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (51)
+- Fixed: `/whois player <name>` inserting a bogus placeholder row into the `clans` table for the
+  *reported player's own tag* — **this is a reoccurrence of 2026-07-18 (11)**, not a new bug.
+  The user correctly pushed back on an initial "unrelated coincidence" diagnosis by pointing out
+  the exact same tag appeared twice, on two separate DEV-only `/whois` lookups with no other
+  process running to explain it — checking the changelog confirmed this exact symptom, verbatim,
+  had already been root-caused and fixed once before.
+  - What actually happened: 2026-07-18 (11) found and fixed this by removing an unconditional
+    `_ensure_clan_exists(clan_tag)` call from `db_manager.py`'s `_save_leaderboard_message_impl()`
+    — `leaderboard_messages.clan_tag` deliberately has no FK constraint, since it's reused to
+    store clan tags, family tags, AND (for `mode == "whois_player"`) a *player* tag
+    (`_player_report_logic` in `QBdiscordcmds.py`, reusing this generic field for its own
+    "delete the previous whois-report message for this player" cleanup filter). That fix left a
+    loud "Do NOT re-add this call" comment in place, and it correctly held — verified today that
+    function still has no such call.
+  - The actual bug: `CacheManager.set_leaderboard_message()` (`cache_manager.py`) — the real
+    public entry point every caller uses, which calls `db_manager.save_leaderboard_message()`
+    (and therefore the protected `_save_leaderboard_message_impl()`) only at the very end — had
+    its OWN, separate, functionally-identical `_ensure_clan_exists()` call that the 2026-07-18
+    investigation never found, since it lived in a different file/function than the one that
+    investigation looked at. It ran on every single `/whois` player-report lookup for at least a
+    month, completely unnoticed (git history was squashed at a "Clean snapshot" commit at some
+    point, so it's not possible to pin down exactly when this second call site was introduced
+    relative to the original fix).
+  - Fix: same shape as before — `set_leaderboard_message()` now skips the `_ensure_clan_exists()`
+    call specifically when `mode == 'whois_player'` (still saves `clan_tag` as-is either way,
+    since the cleanup filter depends on it). Added a loud cross-referencing comment at BOTH call
+    sites (this one, and `_save_leaderboard_message_impl()`'s existing one) explicitly naming the
+    other, so a future reader auditing either location knows to check both.
+  - Cleaned up the 2 bogus placeholder rows this reoccurrence had already created on DEV
+    (`#89VP9ULGV`, `#9G88Q8YR` — verified zero real references anywhere first: `user_players.
+    current_clan_tag`, `clan_family_members`, `subscriptions`, `guild_member_clans`,
+    `guild_clan_roles` all 0). The original one-off `cleanup_orphaned_clans.py` script no longer
+    exists (deleted after its PROD run, per convention) — did this one manually since it was
+    only 2 rows on DEV; **PROD should be checked separately** for any bogus rows accumulated
+    during the same unknown reoccurrence window (`SELECT * FROM clans WHERE name='Unknown' AND
+    last_checked_via_api IS NULL` — the same detection query the deleted script used).
+  - 1 new regression test (`tests/unit/test_cache_writethrough_phase5.py`,
+    `test_whois_player_mode_does_not_ensure_clan`) asserting `_ensure_clan_exists` is never
+    awaited for `mode='whois_player'` while `clan_tag` is still correctly saved. 2047 tests pass.
+    Found during the same live-testing session as (50)'s `admin()`/Pylance fixes, but a
+    genuinely separate bug with a separate root cause — see (50) for that one.
+  - Needs a bot restart on DEV/PROD to take effect.
+
 2026-08-17 (50)
 - Fixed: `QBdiscordcmds.py`'s `admin()` action-router function (~1400 lines, one `if
   action_norm == "X": ... return` branch per admin action) had three redundant `from

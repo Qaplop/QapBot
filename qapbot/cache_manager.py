@@ -885,14 +885,41 @@ class CacheManager:
             clan_tag = message_data.get('clan_tag')
             if clan_tag and clan_tag.startswith('channel_'):
                 clan_tag = None
-            
+
             # Guard: db_manager may be None during early startup (before on_ready finishes)
             if self.db_manager is None:
                 logging.warning(f"[DB-WRITE-THROUGH] db_manager not yet initialized, skipping DB write for {message_key}")
                 return
-            
-            # Ensure clan exists in database if clan_tag is set
-            if clan_tag:
+
+            # Ensure clan exists in database if clan_tag is set — EXCEPT for whois_player entries.
+            #
+            # THIS IS A REOCCURRENCE, not a first-time bug — same root mistake, different layer:
+            # 2026-07-18 (11) already fixed this exact symptom ("/whois player <name> was
+            # inserting a bogus placeholder row into the clans table for the reported player's
+            # own tag") by removing an identical unconditional `_ensure_clan_exists(clan_tag)`
+            # call from db_manager.py's `_save_leaderboard_message_impl()` — that function still
+            # carries a loud "Do NOT re-add this call" comment today, and correctly has no such
+            # call. But THIS function (the actual public entry point every caller uses —
+            # `_save_leaderboard_message_impl` is only reached via `self.db_manager.
+            # save_leaderboard_message()` below, called FROM here) had its own, separate
+            # `_ensure_clan_exists()` call that the 2026-07-18 fix never touched, since it lived
+            # in a different file/function than what that investigation looked at. It ran on
+            # every single /whois player-report lookup for over a month, unnoticed, until
+            # 2026-08-17 live-testing reproduced the identical symptom the 2026-07-18 entry
+            # describes, verbatim.
+            #
+            # QBdiscordcmds.py's _player_report_logic deliberately reuses this generic
+            # "clan_tag" field to store the PLAYER's own tag for whois_player messages — needed
+            # so its own "delete the previous whois_player entry for this player" cleanup filter
+            # (`v.get("clan_tag") == tag`) keeps working — per that call site's own comment,
+            # "player_tag stored here; field is non-FK constrained". `clan_tag` is still saved
+            # as-is below either way (still needed for that cleanup filter) — only the
+            # clans-table FK-safety call is skipped for this mode.
+            #
+            # DO NOT re-add an unconditional `_ensure_clan_exists()` call here OR in
+            # `_save_leaderboard_message_impl()` (db_manager.py) — this field is NOT guaranteed
+            # to hold a real clan tag, by design, in both places that touch it.
+            if clan_tag and message_data.get('mode') != 'whois_player':
                 await self.db_manager._ensure_clan_exists(clan_tag)  # type: ignore[union-attr]
             
             # Immediately persist to database

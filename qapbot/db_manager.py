@@ -8026,6 +8026,16 @@ class WarHistoryDB:
             # can't tell a player tag from a clan tag. Do NOT re-add this call;
             # nothing reads leaderboard_messages.clan_tag as a guaranteed real
             # clan, so there is nothing to "ensure".
+            #
+            # 2026-08-17 follow-up: this exact symptom reappeared for over a month after the
+            # above fix — not because this call was re-added HERE, but because
+            # CacheManager.set_leaderboard_message() (cache_manager.py), the actual public entry
+            # point every caller uses to reach this method, had its OWN separate, never-fixed
+            # `_ensure_clan_exists()` call that the original fix's investigation never found
+            # (different file, different function). See that function's own comment for the
+            # full history. The lesson: when a bug is "call X unconditionally does something
+            # wrong for input Y", grep for EVERY call site of X across the whole codebase before
+            # declaring it fixed, not just the one call site the investigation happened to reach.
             await self._conn.execute("""
                 INSERT OR REPLACE INTO leaderboard_messages 
                 (message_key, clan_tag, channel_id, mode, message_ids, content_hash, updated_at)
