@@ -1,6 +1,37 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (47)
+- Added: Batch 5 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md` (P1 Step 9) — fixes `search_player_names`'s
+  per-call scan cost (re-lowercasing every one of PROD's ~6.6M `player_name_index` entries on
+  every `/whois`/guest-search call, uncapped collection before sort/cap).
+  - `qapbot/cache_manager.py`: `player_name_index` values are now `(name, name_lower)` tuples
+    built once at load/write time (`_player_name_tuple()`), not a second full-size dict (would
+    cost ~600 MB on PROD's index) — the common already-lowercase case stores the same string
+    object twice, adding no new string. New `CACHE.set_player_name(tag, name)` is the one writer
+    helper (`coc_cache.py`'s incremental writer now uses it). `search_player_names()` collects at
+    most `SEARCH_PLAYER_NAMES_MAX_COLLECT` (200) matches before sorting/capping — documented
+    semantics change: with >200 matches the returned ≤25 are no longer guaranteed the
+    globally-alphabetically-first 25, just alphabetically-sorted among whichever 200 were
+    encountered first (irrelevant in practice — the user just refines the query).
+  - **Correction to the plan's own audit**: `/whois`'s name-search path doesn't call
+    `search_player_names()` at all — `QBdiscordcmds.py`'s `whois_slash` has its own separate,
+    previously-uncapped inline scan (needed because the 25-cap would cut off guild members
+    sorting later alphabetically, before its own guild-membership reorder). That inline scan was
+    *also* re-lowercasing every name per call, so it got the same fix: extracted into
+    `_search_player_name_index_sync()` (uses the precomputed `name_lower`), wrapped in
+    `asyncio.to_thread()` — it was previously running this multi-million-entry scan directly on
+    the event loop, unwrapped (Pitfall 26).
+  - `qapbot/web_bridge.py`'s `_search_cwl_guests_sync` `#`-tag-mode reader updated for the tuple
+    shape (unpacks `name`, doesn't need `name_lower` since it matches on tag prefix).
+  - Corrected a stale "~125K entries" estimate in two docstrings that predated PROD's growth to
+    its actual ~6.6M-row scale (evidenced in the incident log).
+  - Tests: 6 new (`tests/unit/test_db_search_players_by_name.py` — early-exit-200 proof via
+    reverse-insertion ordering, writer→reader round trip, loader tuple construction) plus every
+    existing `player_name_index`-touching fixture across `tests/discord/test_web_bridge.py`
+    updated to the tuple shape. 2025 tests pass (`.\run_tests.ps1`). Backend-only — needs a bot
+    restart on DEV/PROD to take effect.
+
 2026-08-17 (46)
 - Deployed: `activity/server` and `activity/client` (Batches 1-4 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md`,
   DEV-verified live-testing through drag-and-drop, DM signup confirm, and the guest-search

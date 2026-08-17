@@ -38,6 +38,12 @@ async def _seed_guild_and_clans(db: WarHistoryDB, guild_id: str, clan_tags: Dict
     await db.conn.commit()
 
 
+def _pname_index(names: Dict[str, str]) -> Dict[str, tuple]:
+    """Builds CACHE.player_name_index's (name, name_lower) value shape (2026-08-17,
+    CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 9) from a plain {tag: name} dict, for fixtures."""
+    return {tag: (name, name.lower()) for tag, name in names.items()}
+
+
 @pytest.fixture
 def bridge_config(monkeypatch):
     config = dataclasses.replace(CONFIG, web_bridge_secret="test-secret", web_bridge_port=1)
@@ -1666,7 +1672,7 @@ async def test_guest_search_returns_player_hit_by_name(db, bridge_config, client
     CACHE.db_manager = db
     CACHE.server_config["802"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {}
-    CACHE.player_name_index = {"#GUEST1": "GuestPlayer"}
+    CACHE.player_name_index = _pname_index({"#GUEST1": "GuestPlayer"})
     CACHE.user_accounts = {}
     await _seed_current_clan_member(db, "555", "#GUEST1", "#OUTSIDE_CLAN")
 
@@ -1755,7 +1761,7 @@ async def test_guest_search_at_prefix_restricts_to_discord_display_name_only(db,
     CACHE.db_manager = db
     CACHE.server_config["820"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {"#CLANQAP": {"name": "Qap Clan"}}
-    CACHE.player_name_index = {"#LONER": "Qaplike"}  # matches "qap" by name, but not linked
+    CACHE.player_name_index = _pname_index({"#LONER": "Qaplike"})  # matches "qap" by name, but not linked
     CACHE.user_accounts = {
         "777": {"display_name": "Qaplop", "players": [{"player_tag": "#Q1", "player_name": "Qaplop"}]},
     }
@@ -1819,7 +1825,7 @@ async def test_guest_search_interleaves_and_caps_clan_and_player_hits(db, bridge
     CACHE.db_manager = db
     CACHE.server_config["822"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {f"#CLAN{i:02d}": {"name": f"Test Clan {i:02d}"} for i in range(15)}
-    CACHE.player_name_index = {f"#PLAYER{i:02d}": f"Test Player {i:02d}" for i in range(15)}
+    CACHE.player_name_index = _pname_index({f"#PLAYER{i:02d}": f"Test Player {i:02d}" for i in range(15)})
     CACHE.user_accounts = {}
 
     import QBcore
@@ -1936,7 +1942,7 @@ async def test_guest_search_below_minimum_hash_prefix_needle_returns_empty(db, b
     CACHE.db_manager = db
     CACHE.server_config["832"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {}
-    CACHE.player_name_index = {"#2ABCDEFGH": "SomePlayer"}
+    CACHE.player_name_index = _pname_index({"#2ABCDEFGH": "SomePlayer"})
     CACHE.user_accounts = {}
 
     link_spy = MagicMock(wraps=db.get_player_links_sync)
@@ -1966,7 +1972,7 @@ async def test_guest_search_hash_prefix_caps_player_hits_at_twelve(db, bridge_co
     CACHE.db_manager = db
     CACHE.server_config["833"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {}
-    CACHE.player_name_index = {f"#QAP{i:03d}": f"Player {i:03d}" for i in range(20)}
+    CACHE.player_name_index = _pname_index({f"#QAP{i:03d}": f"Player {i:03d}" for i in range(20)})
     CACHE.user_accounts = {}
 
     import QBcore

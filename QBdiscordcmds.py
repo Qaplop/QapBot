@@ -4846,6 +4846,21 @@ async def _whois_player_select_callback(interaction: discord.Interaction, select
     _log_cmd_done(interaction, "whois")
 
 
+def _search_player_name_index_sync(needle_lower: str) -> List[Dict[str, str]]:
+    """Full, uncapped substring scan over CACHE.player_name_index for /whois's name-search path
+    (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 9). Deliberately NOT capped at 25 like
+    CACHE.search_player_names() — see whois_slash's own comment: capping here would cut off
+    guild members that sort later alphabetically, before the guild-membership reorder below even
+    runs. Worst case is a full pass over player_name_index (millions of entries on PROD, no
+    per-entry allocation now that name_lower is precomputed) — always call via
+    asyncio.to_thread() from the event loop, never directly in a coroutine."""
+    return [
+        {"player_tag": tag, "player_name": name}
+        for tag, (name, name_lower) in CACHE.player_name_index.items()
+        if needle_lower in name_lower
+    ]
+
+
 @app_commands.command(name="whois", description=dev_mode+"Show CoC accounts for a Discord user, or war history for a player.")
 @app_commands.describe(
     user="The Discord user to look up",
@@ -4878,12 +4893,14 @@ async def whois_slash(
             # sort by guild membership, then slice to 25 for the dropdown.
             # search_player_names caps at 25 alphabetically, which would cut off
             # guild members that sort later in the alphabet — so we search inline.
+            # asyncio.to_thread()-wrapped (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1
+            # Step 9) — a full, uncapped scan over player_name_index (millions of entries on
+            # PROD) running directly on the event loop would freeze the whole bot exactly like
+            # any other un-wrapped sync scan (Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md).
             needle = player_stripped.lower()
-            all_matches: List[Dict[str, str]] = [
-                {"player_tag": tag, "player_name": name}
-                for tag, name in CACHE.player_name_index.items()
-                if needle in name.lower()
-            ]
+            all_matches: List[Dict[str, str]] = await asyncio.to_thread(
+                _search_player_name_index_sync, needle
+            )
             # Prioritise players from clans that belong to this guild
             if all_matches and interaction.guild_id:
                 from qapbot.QBdiscocmdshelper import get_guild_clans_including_member_config

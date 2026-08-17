@@ -771,7 +771,7 @@ def _search_cwl_guests_sync(guild_id: int, query: str) -> List[Dict[str, Any]]:
     player_hits: Dict[str, Dict[str, Any]] = {}
     if tag_only_mode:
         upper_query = query.upper()
-        for tag, name in CACHE.player_name_index.items():
+        for tag, (name, _name_lower) in CACHE.player_name_index.items():
             if len(player_hits) >= GUEST_SEARCH_CAP:
                 break
             if tag.upper().startswith(upper_query):

@@ -477,6 +477,24 @@ Frontend: typecheck/build only (no test harness exists for the client).
 **Tests** (`tests/unit/`): tuple-shape index round-trip (writer→reader); early-exit bound
 respected; results still sorted and capped; guest-search integration tests still green.
 
+**Status (2026-08-17, Batch 5): implemented, with one correction to the plan's own audit.** The
+"/whois (`QBhelperfunctions.py`)" reference above is wrong — verified 2026-08-17: `/whois`'s
+name-substring path is implemented in `QBdiscordcmds.py`'s `whois_slash`, and it does **not**
+call `search_player_names()` at all — it has its own separate, inline, previously-uncapped scan
+over `player_name_index` (needed because `search_player_names()`'s 25-cap would cut off guild
+members that sort later alphabetically, before the guild-membership reorder that follows). That
+inline scan was *also* re-lowercasing every name on every call — the exact cost Step 9 exists to
+fix — so it needed the same treatment as `search_player_names()`, just at its real location:
+extracted into `_search_player_name_index_sync()` (still uncapped, now reads the precomputed
+`name_lower` from the tuple instead of calling `.lower()`), wrapped in `asyncio.to_thread()` at
+the `whois_slash` call site. All other target-behavior items implemented as specified:
+`CACHE.set_player_name()` writer helper, `SEARCH_PLAYER_NAMES_MAX_COLLECT = 200` early-exit,
+`_load_player_name_index_sync()` building tuples inside the `to_thread` hop. Also corrected a
+stale "~125K entries" estimate in two docstrings (`cache_manager.py`, `db_manager.py`) that
+predated the growth to PROD's actual ~6.6M-row scale evidenced in the incident log. 6 new tests
+(early-exit-200 proof via reverse-insertion ordering, writer→reader round trip, loader tuple
+construction) — 2025 tests pass.
+
 ---
 
 ## P2 — Headroom on the PROD box

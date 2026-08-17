@@ -5122,8 +5122,11 @@ class WarHistoryDB:
     def load_player_name_index_sync(self) -> Dict[str, str]:
         """Load the full player_name_index table into a {player_tag: player_name} dict.
 
-        Called once at startup by cache_manager.load_all().  With ~125 K rows
-        this completes in < 100 ms — the table is tiny compared to war_attacks.
+        Called once at startup by cache_manager.load_all(). PROD's table has grown to millions
+        of rows (~6.6M per the 2026-08-16 incident log — CWL_PROD_PERFORMANCE_FIX_PLAN.md — a
+        stale "~125K rows" estimate here predates that growth); still small/fast relative to
+        war_attacks, and this query itself isn't the bottleneck — see cache_manager.py's
+        search_player_names()/CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 9 for what was.
         """
         import sqlite3
 

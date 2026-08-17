@@ -675,7 +675,7 @@ class CoCClanCache:
             now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             updates = [(tag, name, now_iso) for tag, name in name_changes]
             for tag, name in name_changes:
-                cache_manager.player_name_index[tag] = name
+                cache_manager.set_player_name(tag, name)
             await asyncio.to_thread(
                 cache_manager.db_manager.update_player_name_index_sync, updates
             )

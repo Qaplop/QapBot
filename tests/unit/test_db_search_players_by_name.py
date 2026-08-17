@@ -421,10 +421,11 @@ class TestSearchPlayerNames:
     """Tests for the synchronous in-memory search over CACHE.player_name_index."""
 
     def _make_cache(self, index: dict[str, str]):
-        """Build a minimal stand-in for CACHE with a populated player_name_index."""
+        """Build a minimal stand-in for CACHE with a populated player_name_index — tuple-shaped
+        (name, name_lower) values (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 9)."""
         from qapbot.cache_manager import CacheManager
         cache = CacheManager.__new__(CacheManager)
-        cache.player_name_index = index
+        cache.player_name_index = {tag: (name, name.lower()) for tag, name in index.items()}
         return cache
 
     def test_substring_match(self):
@@ -468,4 +469,61 @@ class TestSearchPlayerNames:
     def test_empty_index_returns_empty(self):
         cache = self._make_cache({})
         assert cache.search_player_names("anything") == []
+
+    def test_early_exit_caps_collection_before_global_sort(self):
+        """2026-08-17 (CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 9): the scan collects at most
+        SEARCH_PLAYER_NAMES_MAX_COLLECT (200) matches, in index-iteration order, THEN sorts just
+        those — not a global sort over every match. Reverse-insertion order (Player299 inserted
+        first, ..., Player000 last) makes the two behaviors observably different: an early-exit
+        scan only ever sees Player299..Player100 (the first 200 by insertion order), so the
+        alphabetically-first 25 of THOSE is Player100..Player124 — never anything below
+        Player100, which the old uncapped-then-globally-sorted behavior would have returned."""
+        from qapbot.cache_manager import CacheManager, SEARCH_PLAYER_NAMES_MAX_COLLECT
+        assert SEARCH_PLAYER_NAMES_MAX_COLLECT == 200
+
+        index = {f"#{i:03d}": f"Player{i:03d}" for i in range(299, -1, -1)}
+        cache = self._make_cache(index)
+
+        result = cache.search_player_names("Player", limit=25)
+        names = [r["player_name"] for r in result]
+
+        assert len(names) == 25
+        assert names == sorted(names)
+        assert all(int(n[6:]) >= 100 for n in names)
+
+    def test_set_player_name_writer_round_trips_through_search(self):
+        """2026-08-17 (Step 9): CACHE.set_player_name() is the one writer helper — builds the
+        (name, name_lower) tuple so search_player_names() (the reader) finds it correctly."""
+        from qapbot.cache_manager import CacheManager
+        cache = CacheManager.__new__(CacheManager)
+        cache.player_name_index = {}
+
+        cache.set_player_name("#NEW1", "BrandNewPlayer")
+
+        assert cache.player_name_index["#NEW1"] == ("BrandNewPlayer", "brandnewplayer")
+        result = cache.search_player_names("newplayer")
+        assert result == [{"player_tag": "#NEW1", "player_name": "BrandNewPlayer"}]
+
+    def test_load_player_name_index_sync_builds_tuples_from_raw_db_rows(self):
+        """2026-08-17 (Step 9): _load_player_name_index_sync() is load_player_name_index()'s
+        to_thread core — db_manager.load_player_name_index_sync() itself is unchanged (still
+        returns the plain {tag: name} shape); the tuple construction happens here."""
+        from unittest.mock import MagicMock
+        from qapbot.cache_manager import CacheManager
+
+        cache = CacheManager.__new__(CacheManager)
+        cache.db_manager = MagicMock()
+        cache.db_manager.load_player_name_index_sync.return_value = {
+            "#A1": "Alice", "#B1": "already lower",
+        }
+
+        result = cache._load_player_name_index_sync()
+
+        assert result == {
+            "#A1": ("Alice", "alice"),
+            "#B1": ("already lower", "already lower"),
+        }
+        # The already-lowercase name stores the SAME string object twice rather than a fresh
+        # lowered copy (per _player_name_tuple's own docstring) — cheap to verify with `is`.
+        assert result["#B1"][0] is result["#B1"][1]
 
