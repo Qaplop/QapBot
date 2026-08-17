@@ -418,12 +418,20 @@ Steps 9 & 11):
     invisible in tests but stalled every PROD update cycle right after the startup backfill
     populated the table to its real ~6.6M rows — one flush batch's worth of changed players
     turned into hundreds of full scans back to back. Fixed by giving `player_name_fts` an
-    explicit `rowid` derived from `player_tag` via `_fts_rowid_for_tag()` (a blake2b hash,
-    collision-negligible at this row count) — `rowid` is the one column FTS5 genuinely indexes,
-    so writes/deletes now target `WHERE rowid = ?` (O(1)), computed independently by every
-    caller with no DB round-trip. A `bot_metadata` marker (`player_name_fts_rowid_scheme` =
-    `tag_hash_v1`) forces one full rebuild of any table populated by the old auto-assigned-rowid
-    code, since the row-count guard alone can't detect a stale rowid scheme.
+    explicit `rowid` — the one column FTS5 genuinely indexes — mirrored from
+    `player_name_search`'s own SQLite-assigned rowid (looked up, never computed): one bulk
+    `SELECT ... rowid FROM player_name_search` for the backfill, one small chunked lookup for the
+    incremental writer. Stable across repeated upserts since `ON CONFLICT DO UPDATE` never
+    changes a row's rowid. A `bot_metadata` marker (`player_name_fts_rowid_scheme` =
+    `player_name_search_rowid_v2`) forces one full rebuild of any table populated under an older
+    scheme, since the row-count guard alone can't detect a stale rowid scheme.
+    - **v1 → v2**: the first version of this fix (`tag_hash_v1`) derived the rowid from a
+      per-tag `hashlib.blake2b()` call instead, specifically to avoid the DB round-trip above.
+      That was the wrong trade-off: measured at 355.25s for ~6.6M rows on DEV (fast hardware),
+      and PROD's much weaker CPU never finished it at all — it hit `QapBot.py`'s 30-minute DB-init
+      safety timeout and failed to start. v2's lookup approach measured 82.42s for the same
+      dataset on the same DEV hardware (4.3x faster), since it replaces 6.6M individual Python
+      hash calls with a single bulk SQL query.
 
 ### Foreign Key Relationships
 

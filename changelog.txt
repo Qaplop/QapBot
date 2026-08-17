@@ -1,6 +1,47 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (54)
+- Fixed: (53)'s player_name_fts rowid-scheme migration was still too slow — on PROD it never
+  finished at all. Live PROD log confirmed: migration started 22:03:27, no
+  `[DB-SCHEMA] Backfilled ... row(s)` success line ever appeared, and QapBot.py's own 30-minute
+  safety timeout (`asyncio.wait_for(db_manager.initialize(...), timeout=1800.0)`) fired at
+  22:33:27 — exactly 1800s later — raising "Database initialization timed out - bot cannot
+  start". DEV had measured (53)'s hash-based approach at 355.25s for the same ~6.6M rows; PROD's
+  much weaker hardware pushed the identical work well past 30 minutes.
+  - Root cause of the slowness: (53) derived player_name_fts's rowid by calling
+    `hashlib.blake2b()` once per row in pure Python (6.6M calls) specifically to avoid a DB
+    round-trip. That avoidance was the wrong trade — the round-trip is cheap (one bulk SQL
+    query); 6.6M individual Python-level hash calls (each with its own encode()/digest()/
+    int.from_bytes()) is not.
+  - Fix: `qapbot/db_manager.py` — removed `_fts_rowid_for_tag()` and the `hashlib` import
+    entirely. player_name_fts's rowid is now looked up from player_name_search's own
+    SQLite-assigned rowid instead of computed — one bulk `SELECT player_tag, rowid FROM
+    player_name_search` for the backfill, one small chunked lookup (reusing
+    `_chunked_in_query_sync`) for the incremental writer. Stable across repeated upserts since
+    `ON CONFLICT DO UPDATE` never changes a row's rowid. Bumped
+    `PLAYER_NAME_FTS_ROWID_SCHEME_VALUE` to `player_name_search_rowid_v2` so any host already on
+    `tag_hash_v1` (or with data from the incomplete PROD run) gets one more automatic rebuild —
+    this time on the fast path.
+  - Measured on DEV (identical ~6.6M-row dataset, a fresh copy of PROD's DB): **82.42s**, a 4.3x
+    speedup over (53)'s 355.25s. Comfortable headroom under the 30-minute timeout even accounting
+    for PROD's much weaker CPU.
+  - Also found empirically while chasing this: because the backfill runs via
+    `asyncio.to_thread()`, `asyncio.wait_for()`'s timeout cancels the *awaiting* coroutine but
+    cannot stop the underlying worker thread — Python has no mechanism to forcibly kill a running
+    thread. So a timed-out migration's actual DB work may keep running in the background
+    independent of what the rest of the process does after the timeout error. Worth keeping in
+    mind for any future long-running to_thread() work guarded by a wait_for() timeout.
+  - Tests: replaced the 3 `_fts_rowid_for_tag`-specific tests with 2 tests asserting
+    player_name_fts's rowid actually mirrors player_name_search's (including stability across a
+    repeated upsert); updated the migration-marker test's rowid assertion accordingly. 2052 tests
+    pass (net -1 vs (53), consolidating the rowid-behavior coverage).
+  - PROD is currently mid-incident: its last startup attempt hit the 30-minute timeout and
+    logged "bot cannot start" — check whether the process is still alive (the to_thread caveat
+    above means it might be) before deploying this fix; safe to kill either way, since the
+    migration transaction never reached its single `commit()` call, so SQLite rolls it back
+    cleanly on next connection open — no partial data risk.
+
 2026-08-17 (53)
 - Fixed: (52)'s own one-time rowid-scheme migration froze the event loop on PROD and missed a
   Discord gateway heartbeat (confirmed live: `[DB-SCHEMA] Backfilling ...` logged, then nothing

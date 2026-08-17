@@ -207,25 +207,45 @@ class TestSearchPlayerTagsByPrefixSync:
         assert db.search_player_tags_by_prefix_sync("") == []
 
 
-class TestFtsRowidForTag:
-    """_fts_rowid_for_tag (2026-08-17 fix) — deterministic FTS5 rowid derived from player_tag,
-    replacing SQLite's auto-assigned rowid so DELETE/INSERT against player_name_fts can target
-    the one column FTS5 actually indexes instead of the UNINDEXED player_tag column (see the
-    function's own docstring for the full PROD-incident root cause)."""
+class TestPlayerNameFtsRowidMirrorsSearchTable:
+    """player_name_fts's rowid is looked up from player_name_search's own SQLite-assigned rowid
+    (2026-08-17 fix, v2 — see PLAYER_NAME_FTS_ROWID_SCHEME_VALUE's own comment) rather than
+    computed (v1 hashed every tag in Python; measured 355s for ~6.6M rows on real PROD-scale
+    data). This class checks the rowid mirroring itself, not just its indirect effects."""
 
-    def test_deterministic(self):
-        from qapbot.db_manager import _fts_rowid_for_tag
-        assert _fts_rowid_for_tag("#ABC123") == _fts_rowid_for_tag("#ABC123")
+    @pytest.mark.integration
+    async def test_fts_rowid_matches_search_table_rowid(self, db):
+        db.update_player_name_index_sync([("#R1", "RowidPlayer", "2026-08-17T00:00")])
+        with db._sync_conn() as conn:
+            search_row = conn.execute(
+                "SELECT rowid FROM player_name_search WHERE player_tag = ?", ("#R1",)
+            ).fetchone()
+            fts_row = conn.execute(
+                "SELECT rowid FROM player_name_fts WHERE player_tag = ?", ("#R1",)
+            ).fetchone()
+        assert search_row["rowid"] == fts_row["rowid"]
 
-    def test_distinct_tags_differ(self):
-        from qapbot.db_manager import _fts_rowid_for_tag
-        assert _fts_rowid_for_tag("#ABC123") != _fts_rowid_for_tag("#XYZ999")
+    @pytest.mark.integration
+    async def test_fts_rowid_stable_across_repeated_upserts(self, db):
+        """ON CONFLICT DO UPDATE must never change player_name_search's rowid — if it did,
+        player_name_fts's mirrored rowid would drift out of sync on every name change."""
+        db.update_player_name_index_sync([("#R2", "FirstName", "2026-08-17T00:00")])
+        with db._sync_conn() as conn:
+            rowid_before = conn.execute(
+                "SELECT rowid FROM player_name_search WHERE player_tag = ?", ("#R2",)
+            ).fetchone()["rowid"]
 
-    def test_within_signed_64_bit_rowid_range(self):
-        from qapbot.db_manager import _fts_rowid_for_tag
-        for tag in ("#A", "#ABCDEFGHIJ", "#0000000000", "#ZZZZZZZZZZ"):
-            rowid = _fts_rowid_for_tag(tag)
-            assert -(2 ** 63) <= rowid < 2 ** 63
+        db.update_player_name_index_sync([("#R2", "SecondName", "2026-08-17T01:00")])
+        with db._sync_conn() as conn:
+            rowid_after = conn.execute(
+                "SELECT rowid FROM player_name_search WHERE player_tag = ?", ("#R2",)
+            ).fetchone()["rowid"]
+            fts_row = conn.execute(
+                "SELECT rowid FROM player_name_fts WHERE player_tag = ?", ("#R2",)
+            ).fetchone()
+
+        assert rowid_before == rowid_after
+        assert fts_row["rowid"] == rowid_after
 
 
 class TestPlayerNameFtsRowidMigration:
@@ -250,11 +270,7 @@ class TestPlayerNameFtsRowidMigration:
         next backfill call must detect the mismatch and rebuild even though row counts already
         match — the old row-count-only guard would otherwise treat this as "already backfilled"
         and skip it forever."""
-        from qapbot.db_manager import (
-            PLAYER_NAME_FTS_ROWID_SCHEME_KEY,
-            PLAYER_NAME_FTS_ROWID_SCHEME_VALUE,
-            _fts_rowid_for_tag,
-        )
+        from qapbot.db_manager import PLAYER_NAME_FTS_ROWID_SCHEME_KEY, PLAYER_NAME_FTS_ROWID_SCHEME_VALUE
 
         # initialize()'s own backfill call already set the marker (for the then-empty DB) during
         # fixture setup — clear it to simulate "never migrated" before seeding old-scheme rows.
@@ -269,7 +285,8 @@ class TestPlayerNameFtsRowidMigration:
             "INSERT INTO player_name_search (player_tag, name, name_lower) VALUES (?, ?, ?)",
             ("#OLD1", "OldSchemeName", "oldschemename"),
         )
-        # Auto-assigned rowid (pre-fix behavior) — deliberately NOT the hash-derived one.
+        # Auto-assigned rowid (pre-fix behavior) — deliberately NOT mirrored from
+        # player_name_search's own rowid, simulating a table populated before either fix shipped.
         await db.conn.execute(
             "INSERT INTO player_name_fts (player_tag, name) VALUES (?, ?)",
             ("#OLD1", "OldSchemeName"),
@@ -281,10 +298,13 @@ class TestPlayerNameFtsRowidMigration:
 
         assert await db.get_bot_metadata(PLAYER_NAME_FTS_ROWID_SCHEME_KEY) == PLAYER_NAME_FTS_ROWID_SCHEME_VALUE
         with db._sync_conn() as conn:
-            row = conn.execute(
+            search_rowid = conn.execute(
+                "SELECT rowid FROM player_name_search WHERE player_tag = ?", ("#OLD1",)
+            ).fetchone()["rowid"]
+            fts_row = conn.execute(
                 "SELECT rowid FROM player_name_fts WHERE player_tag = ?", ("#OLD1",)
             ).fetchone()
-        assert row["rowid"] == _fts_rowid_for_tag("#OLD1")
+        assert fts_row["rowid"] == search_rowid
 
         # And future incremental writes can now find/replace it correctly by rowid.
         db.update_player_name_index_sync([("#OLD1", "NewName", "2026-08-17T00:00")])

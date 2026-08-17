@@ -28,7 +28,6 @@ Note: All methods are async for consistency with Discord.py event loop,
 """
 
 import asyncio
-import hashlib
 import logging
 import os
 import queue
@@ -112,30 +111,29 @@ CLAN_TAG_REFERENCING_TABLES: Tuple[Tuple[str, str, str, str], ...] = (
 # player_name_fts's rowid scheme version marker (bot_metadata key) — bump the value string
 # whenever the rowid-derivation scheme below changes, forcing _backfill_player_name_search_if_needed
 # to rebuild the table once on the next startup instead of trusting stale rowids.
+#
+# player_name_fts.player_tag is UNINDEXED — FTS5 gives no index of any kind to a non-MATCH
+# column, so a plain equality lookup/delete on it (``WHERE player_tag = ?``) has no viable query
+# plan and falls back to a full table scan. That was invisible in tests (tiny tables) but became
+# catastrophic in PROD the moment player_name_fts held its real ~6.6M rows: every incremental
+# war-write flush hit this once per changed player, turning a routine update cycle into hundreds
+# of full-table scans back to back and effectively hanging PHASE-3's batched flush (2026-08-17
+# PROD incident — the cycle stalled silently right after "[PHASE-3B] Completed").
+#
+# Fix: give player_name_fts an explicit rowid — the one column FTS5 genuinely indexes — mirrored
+# from player_name_search's own SQLite-assigned rowid (looked up via `SELECT ... rowid FROM
+# player_name_search`, never computed). `ON CONFLICT(player_tag) DO UPDATE` is a real UPDATE, not
+# a delete+reinsert, so a given player_tag's player_name_search rowid is stable across repeated
+# upserts — safe to reuse as player_name_fts's rowid indefinitely.
+#
+# An earlier version of this fix (v1, "tag_hash_v1") derived the rowid from a per-tag blake2b
+# hash instead, specifically to avoid this lookup. That measured 355s of pure Python CPU time for
+# the one-time ~6.6M-row backfill (6.6M hashlib calls, each with its own encode()/digest()/
+# int.from_bytes() overhead) — asyncio.to_thread() kept it from freezing the event loop, but it
+# was still far slower than necessary. The lookup approach replaces those 6.6M hash calls with a
+# single bulk `SELECT player_tag, rowid FROM player_name_search` (done entirely in SQLite/C).
 PLAYER_NAME_FTS_ROWID_SCHEME_KEY = "player_name_fts_rowid_scheme"
-PLAYER_NAME_FTS_ROWID_SCHEME_VALUE = "tag_hash_v1"
-
-
-def _fts_rowid_for_tag(player_tag: str) -> int:
-    """Deterministic FTS5 rowid derived from player_tag (2026-08-17 fix).
-
-    player_name_fts.player_tag is UNINDEXED — FTS5 gives no index of any kind to a non-MATCH
-    column, so a plain equality lookup/delete on it (``WHERE player_tag = ?``) has no viable
-    query plan and falls back to a full table scan. That was invisible in tests (tiny tables)
-    but became catastrophic in PROD the moment player_name_fts held its real ~6.6M rows: every
-    incremental war-write flush calls this once per changed player, turning a routine update
-    cycle into hundreds of full-table scans back to back and effectively hanging PHASE-3's
-    batched flush (confirmed via the 2026-08-17 PROD incident log — the cycle stalled silently
-    right after "[PHASE-3B] Completed", the code path that immediately leads into this table's
-    incremental writer).
-
-    ``rowid`` is the one column FTS5 genuinely indexes. Assigning it explicitly as a hash of
-    player_tag means every caller can compute the same rowid independently — no DB round trip
-    needed to look one up — and ``WHERE rowid = ?`` is then O(1) instead of O(table size).
-    8 bytes of a cryptographic-strength hash keeps collision probability negligible even at
-    PROD's row count (birthday-bound ~3e9, far above 6.6M tags)."""
-    digest = hashlib.blake2b(player_tag.encode(), digest_size=8).digest()
-    return int.from_bytes(digest, "big", signed=False) - (1 << 63)  # fold into signed 64-bit rowid range
+PLAYER_NAME_FTS_ROWID_SCHEME_VALUE = "player_name_search_rowid_v2"
 
 
 def _create_history_schema_sync(conn: Any, build_expensive_indexes: bool = True) -> None:
@@ -1599,20 +1597,16 @@ class WarHistoryDB:
 
         Also force-rebuilds regardless of the row-count match when
         PLAYER_NAME_FTS_ROWID_SCHEME_KEY isn't set to PLAYER_NAME_FTS_ROWID_SCHEME_VALUE yet
-        (2026-08-17 follow-up fix) — the original backfill let SQLite auto-assign
-        player_name_fts's rowid, independently of player_name_search's own rowid; the fix
-        switched every writer to an explicit rowid derived from player_tag
-        (_fts_rowid_for_tag), so any table populated by the old code has stale rowids that the
-        new incremental-writer code can no longer address. One full rebuild after this fix
-        ships repairs that; the marker then prevents repeating it on every future startup.
+        (2026-08-17 follow-up fixes, see that constant's own comment for the full history) — any
+        table populated under an older rowid scheme has stale rowids the current incremental
+        writer can no longer address. One full rebuild after a scheme change repairs that; the
+        marker then prevents repeating it on every future startup.
 
         2026-08-17 Pitfall-26 fix: the actual rebuild (row fetch, Python-side tuple building,
-        the per-tag rowid hash, and the bulk DELETE+INSERT) runs via asyncio.to_thread() on the
-        sync connection instead of inline on the event loop. Confirmed empirically on PROD: at
-        ~6.6M rows, three sequential pure-Python list comprehensions plus 6.6M blake2b calls
-        with no await point in between froze the event loop long enough to miss a Discord
-        gateway heartbeat. Only the two cheap COUNT(*) checks above stay on the async
-        connection."""
+        rowid lookup, and the bulk DELETE+INSERT) runs via asyncio.to_thread() on the sync
+        connection instead of inline on the event loop. Confirmed empirically on PROD: doing
+        this inline froze the event loop long enough to miss a Discord gateway heartbeat. Only
+        the two cheap COUNT(*) checks above stay on the async connection."""
         _rowid_scheme = await self.get_bot_metadata(PLAYER_NAME_FTS_ROWID_SCHEME_KEY)
         _needs_rowid_migration = _rowid_scheme != PLAYER_NAME_FTS_ROWID_SCHEME_VALUE
 
@@ -1641,11 +1635,16 @@ class WarHistoryDB:
         )
 
     def _backfill_player_name_search_sync(self) -> int:
-        """Sync core of _backfill_player_name_search_if_needed — the actual heavy lifting
-        (row fetch, Python-side tuple building including the per-tag rowid hash, bulk
-        DELETE+INSERT), run entirely on the sync connection so the caller can offload it via
-        asyncio.to_thread() and keep the event loop free for the whole duration. Returns the
-        number of rows backfilled."""
+        """Sync core of _backfill_player_name_search_if_needed — the actual heavy lifting (row
+        fetch, Python-side tuple building, bulk DELETE+INSERT), run entirely on the sync
+        connection so the caller can offload it via asyncio.to_thread() and keep the event loop
+        free for the whole duration. Returns the number of rows backfilled.
+
+        player_name_fts's rowid is read back from player_name_search's own SQLite-assigned rowid
+        (one bulk SELECT, done entirely in SQLite/C) rather than computed per-row in Python — see
+        PLAYER_NAME_FTS_ROWID_SCHEME_VALUE's own comment for why (v1 hashed every tag in Python
+        and measured 355s for ~6.6M rows; this bulk-lookup version replaces that with a single
+        query)."""
         with self._sync_conn() as conn:
             rows = conn.execute("SELECT player_tag, player_name FROM player_name_index").fetchall()
             pairs = [(row["player_tag"], row["player_name"]) for row in rows]
@@ -1656,9 +1655,13 @@ class WarHistoryDB:
                     "INSERT INTO player_name_search (player_tag, name, name_lower) VALUES (?, ?, ?)",
                     [(tag, name, name.lower()) for tag, name in pairs],
                 )
+                tag_to_rowid = {
+                    row["player_tag"]: row["rowid"]
+                    for row in conn.execute("SELECT player_tag, rowid FROM player_name_search")
+                }
                 conn.executemany(
                     "INSERT INTO player_name_fts (rowid, player_tag, name) VALUES (?, ?, ?)",
-                    [(_fts_rowid_for_tag(tag), tag, name) for tag, name in pairs],
+                    [(tag_to_rowid[tag], tag, name) for tag, name in pairs],
                 )
                 conn.commit()
         return len(pairs)
@@ -5229,11 +5232,12 @@ class WarHistoryDB:
         UPDATE ... WHERE player_tag = ? also works directly against an UNINDEXED column, but
         delete+insert is simpler when a row may not exist yet, same call site either way).
 
-        player_name_fts's DELETE/INSERT target `rowid`, not `player_tag` (2026-08-17 fix,
-        see _fts_rowid_for_tag's own docstring) — `WHERE player_tag = ?` on an UNINDEXED FTS5
-        column has no index to use and is a full table scan; at PROD's ~6.6M-row scale that
-        turned every incremental flush into a full-table-scan storm that stalled the update
-        cycle. rowid is computed as a pure function of the tag, so no read-back is needed.
+        player_name_fts's DELETE/INSERT target `rowid`, not `player_tag` (2026-08-17 fix, see
+        PLAYER_NAME_FTS_ROWID_SCHEME_VALUE's own comment for the full history) — `WHERE
+        player_tag = ?` on an UNINDEXED FTS5 column has no index to use and is a full table scan;
+        at PROD's ~6.6M-row scale that turned every incremental flush into a full-table-scan
+        storm that stalled the update cycle. rowid is looked up from player_name_search's own
+        SQLite-assigned rowid (stable across upserts — ON CONFLICT DO UPDATE never changes it).
 
         Callers must pass already-conflict-resolved (player_tag, name) pairs — this helper does
         no timestamp/recency comparison of its own; it just makes the search tables match
@@ -5247,13 +5251,19 @@ class WarHistoryDB:
                 name = excluded.name,
                 name_lower = excluded.name_lower
         """, [(tag, name, name.lower()) for tag, name in tag_name_pairs])
+        resolved = self._chunked_in_query_sync(
+            conn,
+            "SELECT player_tag, rowid FROM player_name_search WHERE player_tag IN ({placeholders})",
+            [tag for tag, _ in tag_name_pairs],
+        )
+        tag_to_rowid = {r["player_tag"]: r["rowid"] for r in resolved}
         conn.executemany(
             "DELETE FROM player_name_fts WHERE rowid = ?",
-            [(_fts_rowid_for_tag(tag),) for tag, _ in tag_name_pairs],
+            [(tag_to_rowid[tag],) for tag, _ in tag_name_pairs if tag in tag_to_rowid],
         )
         conn.executemany(
             "INSERT INTO player_name_fts (rowid, player_tag, name) VALUES (?, ?, ?)",
-            [(_fts_rowid_for_tag(tag), tag, name) for tag, name in tag_name_pairs],
+            [(tag_to_rowid[tag], tag, name) for tag, name in tag_name_pairs if tag in tag_to_rowid],
         )
 
     def _upsert_player_name_index_in_conn(

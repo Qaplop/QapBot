@@ -436,6 +436,15 @@ matching the pattern already used by `flush_pending_war_writes` elsewhere in the
 Lesson: this pitfall applies just as much to one-time startup/migration code as to per-cycle
 hot paths — "runs once" is not the same as "runs fast," and at PROD's row counts it wasn't.
 
+Follow-up (still 2026-08-17): the `to_thread()` fix stopped the event-loop freeze, but the
+`hashlib.blake2b()` call itself was still the wrong design — 6.6M individual Python-level hash
+calls measured 355.25s even off the event loop, and PROD's much weaker CPU never finished it at
+all inside a 30-minute startup safety timeout (see Pitfall 29). Replaced the per-row hash with a
+single bulk `SELECT ... rowid FROM player_name_search` — 82.42s for the same dataset, 4.3x
+faster. Lesson on top of the lesson: `asyncio.to_thread()` fixes the *event-loop-blocking*
+problem, but moving slow work off the loop doesn't make it fast — if a per-row operation inside
+a `to_thread()`-wrapped loop can instead be one bulk SQL query, prefer the query.
+
 Diagnostic tool: `qapbot/scripts/log_time_gaps.py --log data/logs/qapbot.log --top N` finds the
 biggest gaps between consecutive timestamped log lines — the fastest way to find blocking/slow
 segments in the update cycle. On Windows, pipe through
@@ -1165,3 +1174,48 @@ reassigned once for the DM-filtered case) tripped Pylance's `reportConstantRedef
 naming-convention lint, not a real bug (Python has no true constants; reassigning a local is
 always legal). Renamed to lowercase `available_commands` since it's genuinely not a constant —
 cheaper than fighting the lint, and more honest about what the variable actually is.
+
+---
+
+## Pitfall 29: `asyncio.wait_for(timeout=...)` around an `asyncio.to_thread()` call cancels the *wait*, not the underlying thread
+
+Symptom (2026-08-17, PROD): `QapBot.py`'s startup DB initialization is wrapped in
+`asyncio.wait_for(db_manager.initialize(...), timeout=1800.0)` as a safety net against a
+genuinely stuck migration. A one-time backfill inside that call (`_backfill_player_name_search_
+if_needed()`, itself correctly `asyncio.to_thread()`-wrapped per Pitfall 16) took longer than 30
+minutes on PROD's weak hardware. The timeout fired as designed, logged `"Database initialization
+timed out - bot cannot start"`, and the caller treated startup as failed.
+
+Root cause / the part that's easy to miss: `asyncio.to_thread()` (and `run_in_executor()` under
+it) hands the synchronous function to a `ThreadPoolExecutor` worker thread and returns a
+`Future`. When `wait_for()`'s timeout expires, it cancels the *awaiting* task — which, at the
+`await` point suspended on that `Future`, raises `CancelledError` back into the coroutine. It
+does **not**, and cannot, stop the worker thread itself: CPython has no supported mechanism to
+forcibly terminate a running thread. So the actual synchronous work (in this case, mid-way
+through a `DELETE`+`INSERT` bulk write against SQLite) keeps executing in the background, on its
+own schedule, entirely independent of whatever the rest of the process does with the
+`TimeoutError`/`RuntimeError` that resulted from the cancellation.
+
+Why this mattered in practice here: since the backfill's only `conn.commit()` sits at the very
+end of its transaction, an in-progress (never-committed) run rolling back cleanly on the next
+SQLite connection open was the actual safety net — not the `wait_for()` timeout, despite that
+being what fired. In other cases (e.g. a background write that reaches its own commit *after*
+the surrounding code has already decided the operation "failed" and moved on) this pattern can
+let a nominally-cancelled operation still take effect later, unobserved, out of sequence with
+whatever ran after the timeout — a much subtler bug than a straightforward failure would be.
+
+Fix / mitigation, situational (no single universal fix — depends what the wrapped work is):
+- If the wrapped work is a single atomic SQL transaction with one commit at the end (as here),
+  a `wait_for()` timeout is *safe* even though it doesn't stop the thread — SQLite's own
+  transaction atomicity means "cancelled before commit" and "still running in the background"
+  both resolve to the same safe outcome (rolled back / eventually committed with fully-valid
+  data) rather than a torn write.
+- If the wrapped work has multiple independent side effects (several separate commits, or
+  non-DB side effects like a Discord API call) a `wait_for()` timeout is NOT a safe way to bound
+  it — the timeout only stops YOUR code from waiting, not the effects from happening. Reach for
+  actual cooperative cancellation (checking a cancellation flag between steps) or accept that a
+  timeout here can only be a monitoring signal, not a hard stop.
+- Making the wrapped work itself faster (see Pitfall 16's follow-up in this same file, same day
+  — replacing 6.6M per-row `hashlib` calls with one bulk SQL query cut this specific backfill
+  from 355s to 82s) is often more valuable than trying to make the timeout "safer," since it
+  avoids ever needing the timeout to fire for a legitimate run in the first place.
