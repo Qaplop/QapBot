@@ -560,6 +560,18 @@ search).
    confirm the PROD binary before migrating; if unsupported, fall back to the `name_lower` table
    + bounded `LIKE` scan in SQL, which still beats Python-side iteration on memory but not
    necessarily CPU).
+
+   **Gate result (2026-08-17, confirmed on the real PROD box via SSH, using the exact venv
+   Python the bot runs under — not just the system `sqlite3` CLI, which can be a different
+   build entirely)**: `sqlite3.sqlite_version` = **3.45.2** (well above the 3.34.0 floor).
+   `CREATE VIRTUAL TABLE ... USING fts5(x)` and `... USING fts5(x, tokenize='trigram')` both
+   **SUPPORTED**. `PRAGMA compile_options` confirms `ENABLE_FTS5` (plus `ENABLE_FTS3`/`FTS4`,
+   `ENABLE_RTREE`, `ENABLE_GEOPOLY`) and explains the `mmap_size capped` log line —
+   `MAX_MMAP_SIZE=0x7fff0000` (~2 GB), a genuinely custom-capped build, but the FTS5/trigram
+   feature set itself is complete. **Gate passed — the FTS5+trigram path is confirmed
+   available; the `name_lower`+`LIKE` fallback in this step is not needed.** DEV checked the
+   same way (project venv, not system `sqlite3`): SQLite 3.50.4, FTS5 + trigram both supported
+   too — the migration can be developed and tested locally before ever touching PROD.
 2. Migration is idempotent (Rule 12): `CREATE ... IF NOT EXISTS` + a one-time backfill guarded by
    a row-count comparison against `player_name_index`'s source table, placed in the existing
    migration block in `db_manager.py`.
