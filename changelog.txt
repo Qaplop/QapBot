@@ -1,6 +1,27 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (43)
+- Fixed: DEV live-testing of (42)'s event-driven enrollment long-polling reported "neither a
+  player drag nor a signup confirmation gets updated" on another open board. Re-audited every
+  write path that touches cwl_signups/cwl_assignments/cwl_event_clans against (42)'s
+  bump_enrollment_version() call sites and found one genuine gap: `CwlSignupResponseButton`
+  (`qapbot/ui_cwl_roster.py`) — the confirm/opt-out button on the DM sent to each player — writes
+  to `cwl_signups` but has no `refresh_cwl_management_hub_message()`/`_refresh_parent()` call to
+  piggyback the version bump onto at all (it only edits the DM message itself, never a guild
+  message), so it was invisible to the original audit's search strategy. This fully explains the
+  "signup confirmation" half of the report. Fixed by calling `bump_enrollment_version(guild_id)`
+  directly after the write. The drag-and-drop half re-audits clean (`handle_post_cwl_enrollment_
+  assign` already bumps correctly, confirmed by (42)'s own concurrency test using the real POST
+  endpoint) — added a regression test for the DM-button gap specifically
+  (`test_confirm_click_bumps_enrollment_version`), 2022 tests pass.
+  - Also added `[WEB-BRIDGE]` log lines around every bump and every wait-endpoint outcome
+    (parking, immediate-stale, waiter-cap-overflow, released) so the actual server-side behavior
+    of a specific drag/confirm can be confirmed directly from the DEV log going forward, without
+    needing browser dev tools.
+  - Needs a bot restart on DEV to take effect — please retest both scenarios (drag, and a DM
+    confirm/opt-out) again once restarted.
+
 2026-08-17 (42)
 - Added: Batch 4 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md` (P1 Steps 7 & 8) — caches the hover
   pop-up's player-stats lookup and replaces the Manage Enrollment board's fixed 12s poll with an

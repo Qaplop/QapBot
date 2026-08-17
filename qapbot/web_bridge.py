@@ -205,8 +205,14 @@ async def bump_enrollment_version(guild_id: Optional[int] = None) -> None:
     off-loop."""
     guild_id_strs = [str(guild_id)] if guild_id is not None else list(_enrollment_version.keys())
     for guild_id_str in guild_id_strs:
-        _enrollment_version[guild_id_str] = _enrollment_version.get(guild_id_str, 0) + 1
+        new_version = _enrollment_version.get(guild_id_str, 0) + 1
+        _enrollment_version[guild_id_str] = new_version
         cond = _enrollment_changed.get(guild_id_str)
+        waiters = _enrollment_waiter_counts.get(guild_id_str, 0)
+        logging.info(
+            f"[WEB-BRIDGE] bump_enrollment_version guild={guild_id_str} -> version={new_version} "
+            f"(parked_waiters={waiters}, tracked={cond is not None})"
+        )
         if cond is not None:
             async with cond:
                 cond.notify_all()
@@ -879,15 +885,24 @@ async def handle_get_cwl_enrollment_wait(request: web.Request) -> web.Response:
     guild_id_str = str(guild_id)
     current = _enrollment_version.get(guild_id_str, 0)
     if current != known_version:
+        logging.info(
+            f"[WEB-BRIDGE] enrollment/wait guild={guild_id_str} known_version={known_version} "
+            f"already stale (current={current}) -> immediate changed=true"
+        )
         return web.json_response({"changed": True, "version": current})
 
     # Waiter cap (2026-08-17, Step 8) — beyond this many parked coroutines for one guild, degrade
     # gracefully (report "changed" so the client refetches and re-issues the wait with a fresh
     # known_version) rather than accumulate coroutines without bound.
     if _enrollment_waiter_counts.get(guild_id_str, 0) >= _ENROLLMENT_WAIT_MAX_WAITERS_PER_GUILD:
+        logging.info(f"[WEB-BRIDGE] enrollment/wait guild={guild_id_str} waiter cap hit -> immediate changed=true")
         return web.json_response({"changed": True, "version": current})
 
     _enrollment_waiter_counts[guild_id_str] = _enrollment_waiter_counts.get(guild_id_str, 0) + 1
+    logging.info(
+        f"[WEB-BRIDGE] enrollment/wait guild={guild_id_str} parking at version={current} "
+        f"(waiters now {_enrollment_waiter_counts[guild_id_str]}, timeout={_ENROLLMENT_WAIT_TIMEOUT_SECONDS}s)"
+    )
     try:
         cond = _enrollment_condition_for(guild_id_str)
         async with cond:
@@ -899,7 +914,9 @@ async def handle_get_cwl_enrollment_wait(request: web.Request) -> web.Response:
         _enrollment_waiter_counts[guild_id_str] = _enrollment_waiter_counts.get(guild_id_str, 1) - 1
 
     current = _enrollment_version.get(guild_id_str, 0)
-    return web.json_response({"changed": current != known_version, "version": current})
+    changed = current != known_version
+    logging.info(f"[WEB-BRIDGE] enrollment/wait guild={guild_id_str} released -> changed={changed} version={current}")
+    return web.json_response({"changed": changed, "version": current})
 
 
 async def handle_get_cwl_clan_names(request: web.Request) -> web.Response:

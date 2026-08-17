@@ -1445,6 +1445,40 @@ class TestCwlSignupResponseButton:
 
     @pytest.mark.discord
     @pytest.mark.asyncio
+    async def test_confirm_click_bumps_enrollment_version(self, db, mock_interaction, monkeypatch):
+        """2026-08-17 regression guard (CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8, found via
+        live-testing): confirming/opting out via this DM button is a real cwl_signups write, but
+        this callback has no refresh_cwl_management_hub_message()/_refresh_parent() call to
+        piggyback the version bump onto (it only edits the DM itself) — it was the one write path
+        the original Step 8 audit missed entirely, so an open Manage Enrollment board never
+        learned about a player's DM response at all."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlSignupResponseButton
+        import qapbot.web_bridge as web_bridge_module
+
+        await _seed_guild_and_clans(db, "9104", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9104", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "123456789", None, "template_confirm", "pending")
+
+        mock_interaction.user.id = 123456789
+        mock_interaction.response.edit_message = AsyncMock()
+
+        bump_spy = AsyncMock(wraps=web_bridge_module.bump_enrollment_version)
+        monkeypatch.setattr(web_bridge_module, "bump_enrollment_version", bump_spy)
+
+        before = web_bridge_module._enrollment_version.get("9104", 0)
+
+        button = CwlSignupResponseButton("confirm", event_id, "#P1")
+        await button.callback(mock_interaction)
+
+        bump_spy.assert_awaited_once_with(9104)
+        assert web_bridge_module._enrollment_version.get("9104", 0) == before + 1
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
     async def test_optout_click_marks_declined(self, db, mock_interaction):
         from qapbot.cache_manager import CACHE
         from qapbot.ui_cwl_roster import CwlSignupResponseButton

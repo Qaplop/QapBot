@@ -1193,6 +1193,14 @@ class CwlSignupResponseButton(
             self.event_id, self.player_tag, signup.get("player_name"), signup.get("discord_id"),
             signup.get("preferred_league_rank"), source, new_status, responded_at=responded_at,
         )
+        # Step 8 (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md — found via live-testing: a player
+        # confirming/opting out via this DM button never updated an open Manage Enrollment board
+        # at all, since this callback has no refresh_cwl_management_hub_message()/_refresh_parent()
+        # call to piggyback the bump onto — it only edits the DM itself, never any guild message).
+        # guild_id is already resolved above from the event row.
+        if guild_id is not None:
+            from qapbot.web_bridge import bump_enrollment_version
+            await bump_enrollment_version(guild_id)
 
         response_key = 'cwl.template.confirmed_msg' if self.action == "confirm" else 'cwl.template.declined_msg'
         player_name = signup.get("player_name") or self.player_tag
