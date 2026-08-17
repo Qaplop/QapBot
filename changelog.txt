@@ -1,6 +1,29 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-17 (41)
+- Fixed: Batch 3 of `CWL_PROD_PERFORMANCE_FIX_PLAN.md` (P0 Step 5) — frontend guard rails for the
+  CWL Guests search, matching the server-side minimum-length/single-flight guards from Batches 1–2
+  (38, 39) with client-side ones so a too-short or superseded keystroke never even reaches the
+  network.
+  - `activity/client/src/clanConfigTable.ts`: the search input handler now computes the same
+    minimum-needle-length check the bridge does (`GUEST_SEARCH_MIN_NEEDLE_TAG`/`_TEXT`, mirroring
+    `qapbot/web_bridge.py`'s constants) and skips the debounced fetch entirely below it, clearing
+    stale results and showing "Type at least N characters…" in `guestsStatus` instead. The
+    debounced fetch's `.catch` now silently drops `AbortError` instead of surfacing "Search
+    failed" for a request the client itself cancelled.
+  - `activity/client/src/main.ts`: the guest-search callback now creates an `AbortController` per
+    call and aborts the previous in-flight request before firing the next, passing `signal` to
+    `fetch` — belt-and-suspenders alongside the bridge's own single-flight guard (39) and the
+    existing `searchRequestId` stale-render guard, which both still apply unchanged. Also reads
+    the bridge's `stale: true` response shape (39) and returns `[]` for it explicitly.
+  - `activity/client/src/types.ts`: new `GuestSearchResponse = { results: GuestSearchResult[];
+    stale?: boolean }` type, used in place of an inline anonymous type.
+  - No test harness exists for the client (per Step 5's own note in the plan doc) —
+    `npm run typecheck && npm run build` both clean. 2010 backend tests still pass (no backend
+    files touched this batch). Deployed to DEV: https://dda00530.cwl-clan-config-dev.pages.dev —
+    needs a separate PROD deploy to take effect there.
+
 2026-08-17 (40)
 - Fixed: Manage Enrollment board's hover pop-up fired a clan-name + player-stats fetch for every
   player card the mouse merely swept past on the way to somewhere else, not just the one the admin

@@ -208,6 +208,12 @@ Step 3.2's shape change is implemented).
 **Verify**: `npm run typecheck && npm run build` in `activity/client`; deploy to DEV Pages first,
 click-test, then PROD (commands in `activity/README.md`).
 
+**Status (2026-08-17, Batch 3): implemented.** `types.ts` got a named `GuestSearchResponse =
+{ results: GuestSearchResult[]; stale?: boolean }` type (used in `main.ts`'s fetch callback rather
+than inlined) instead of just adding `stale?` to an anonymous inline type — same effect, easier to
+reuse. `main.ts`'s guest-search callback returns `[]` for a `stale: true` response before it ever
+reaches the caller. Both `typecheck` and `build` clean; not yet deployed.
+
 ---
 
 ## P1 — Responsiveness of the enrollment board

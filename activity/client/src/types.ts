@@ -106,3 +106,10 @@ export type EnrollmentPayload = {
 export type GuestSearchResult =
   | { type: 'clan'; clan_tag: string; clan_name: string; clan_tier: string | null; already_shared_with: string | null }
   | { type: 'player'; player_tag: string; player_name: string; discord_id: string | null }
+
+/** GET /api/cwl/guest-search's response shape (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P0
+ * Step 3). `stale` is only ever `true` — never present as `false` — set when a keystroke's search
+ * was superseded by a newer one while still queued behind the bridge's per-admin single-flight
+ * guard; `results` is always `[]` in that case (the request-id guard client-side already prevents
+ * an out-of-order response from rendering, so a `stale: true` response is simply discarded). */
+export type GuestSearchResponse = { results: GuestSearchResult[]; stale?: boolean }

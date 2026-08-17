@@ -7,7 +7,7 @@
 import { DiscordSDK, RPCCloseCodes } from '@discord/embedded-app-sdk'
 import { renderClanConfigTable } from './clanConfigTable'
 import { renderEnrollmentBoard } from './enrollmentBoard'
-import type { ClanConfig, ClanConfigPayload, EnrollmentPayload, GuestSearchResult, ScreenPayload } from './types'
+import type { ClanConfig, ClanConfigPayload, EnrollmentPayload, GuestSearchResponse, ScreenPayload } from './types'
 
 const clientId = import.meta.env.VITE_CLIENT_ID as string | undefined
 
@@ -242,6 +242,13 @@ async function setup(): Promise<void> {
     }
     const payload = (await configResponse.json()) as ClanConfigPayload
 
+    // Aborts the previous guest-search fetch the instant a newer one fires (2026-08-17,
+    // CWL_PROD_PERFORMANCE_FIX_PLAN.md P0 Step 5) — belt-and-suspenders alongside the bridge's
+    // own single-flight guard (Step 3) and the searchRequestId stale-render guard just below:
+    // this stops an obsolete request from even finishing the network round-trip, instead of only
+    // discarding it after it lands.
+    let guestSearchController: AbortController | null = null
+
     renderClanConfigTable(
       root,
       payload,
@@ -258,16 +265,24 @@ async function setup(): Promise<void> {
       },
       closeActivity,
       async (query: string) => {
+        guestSearchController?.abort()
+        const controller = new AbortController()
+        guestSearchController = controller
         const searchResponse = await fetch(
           `/api/cwl/guest-search?guild_id=${encodeURIComponent(guildId)}&q=${encodeURIComponent(query)}`,
-          { headers: { Authorization: `Bearer ${accessToken}` } },
+          { headers: { Authorization: `Bearer ${accessToken}` }, signal: controller.signal },
         )
         if (!searchResponse.ok) {
           const body = await searchResponse.text()
           throw new Error(`${searchResponse.status}: ${body}`)
         }
-        const { results } = (await searchResponse.json()) as { results: GuestSearchResult[] }
-        return results
+        const body = (await searchResponse.json()) as GuestSearchResponse
+        // A search superseded while queued behind the bridge's single-flight guard (Step 3) —
+        // results is always [] here; the caller's own searchRequestId guard would already
+        // discard this, but returning [] directly keeps that behavior explicit and avoids ever
+        // rendering an empty-but-real-looking result set as if it were a genuine "no matches".
+        if (body.stale) return []
+        return body.results
       },
       async (result, sendDmNow: boolean) => {
         const guestResponse = await fetch('/api/cwl/enrollment/guest', {

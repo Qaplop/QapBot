@@ -2,6 +2,25 @@ import type { ClanConfig, ClanConfigPayload, GuestSearchResult } from './types'
 
 const ROSTER_SIZES = [5, 15, 30] as const
 
+// Mirrors qapbot/web_bridge.py's GUEST_SEARCH_MIN_NEEDLE_TAG/_TEXT exactly (2026-08-17,
+// CWL_PROD_PERFORMANCE_FIX_PLAN.md P0 Step 5) — checking client-side too means a too-short query
+// never even fires the debounced fetch, instead of round-tripping to the bridge just to get an
+// empty-results response back. The server-side check is still the real guard (never trust the
+// client) — this is purely to save a wasted request per keystroke below the minimum.
+const GUEST_SEARCH_MIN_NEEDLE_TAG = 2
+const GUEST_SEARCH_MIN_NEEDLE_TEXT = 3
+
+/** Effective minimum for `query` as typed (including any `@`/`#` prefix) — mirrors the server's
+ * needle-length check (see _search_cwl_guests_sync's docstring for the two-namespace-prefix
+ * rules this needle length is checked against). */
+function guestSearchMinNeedleLength(query: string): number {
+  return query.startsWith('@') || query.startsWith('#') ? GUEST_SEARCH_MIN_NEEDLE_TAG : GUEST_SEARCH_MIN_NEEDLE_TEXT
+}
+
+function guestSearchNeedleLength(query: string): number {
+  return query.startsWith('@') || query.startsWith('#') ? query.slice(1).trim().length : query.length
+}
+
 // datetime-local's `step` attribute only affects *validation*, never which minutes the native
 // picker actually shows (confirmed: the spec ties step to validity checking, not UI presentation
 // — Chromium's scrollable minute list always offers all 60 regardless of step). The only
@@ -423,8 +442,20 @@ export function renderClanConfigTable(
     const query = guestsSearchInput.value.trim()
     if (!query) {
       guestsResults.innerHTML = ''
+      guestsStatus.textContent = ''
+      guestsStatus.className = 'guests-status'
       return
     }
+    if (guestSearchNeedleLength(query) < guestSearchMinNeedleLength(query)) {
+      // Below the server's own minimum (Step 5) — don't even fire the debounced fetch; clear any
+      // stale results from a longer prior query and hint at how many more characters are needed.
+      guestsResults.innerHTML = ''
+      guestsStatus.textContent = `Type at least ${guestSearchMinNeedleLength(query)} characters…`
+      guestsStatus.className = 'guests-status'
+      return
+    }
+    guestsStatus.textContent = ''
+    guestsStatus.className = 'guests-status'
     searchDebounceHandle = setTimeout(() => {
       const thisRequestId = ++searchRequestId
       onGuestSearch(query)
@@ -435,6 +466,11 @@ export function renderClanConfigTable(
           if (thisRequestId === searchRequestId) renderGuestResults(results)
         })
         .catch((err) => {
+          // AbortError (Step 5, main.ts's guestSearchController) means a newer keystroke's fetch
+          // superseded this one — not a real failure, so it's silently dropped rather than
+          // surfaced as "Search failed" (which would otherwise flash on every keystroke of a
+          // still-being-typed query).
+          if ((err as Error).name === 'AbortError') return
           console.error(err)
           if (thisRequestId === searchRequestId) {
             guestsStatus.textContent = `Search failed: ${(err as Error).message}`
