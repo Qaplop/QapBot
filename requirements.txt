@@ -6,6 +6,6 @@ psutil==7.2.2
 pytest==9.1.1
 pytest-asyncio==1.4.0
 pytest-cov==7.1.0
-python-dotenv==1.2.2
+python-dotenv==1.2.3
 tzdata==2026.3
 wcwidth==0.8.2
