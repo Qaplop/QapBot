@@ -23,7 +23,7 @@ QapBot is a modular Python Discord bot for Clash of Clans, featuring:
 | Tier | Permission Level | Can Do | Confirmation Flow | Key Function / View |
 |---|---|---|---|---|
 | **1. Regular User** | Default for all Discord users | Link UNLINKED player accounts via registration message flow | None — direct link. Blocked with an error if the player is already linked (verified or unverified) to anyone else | registration message flow |
-| **2. Guild Administrator** | Discord users with server administrator permissions | Manage clan subscriptions, access clan management interface, link players to Discord users in their guild, **re-link UNVERIFIED accounts** (cannot re-link VERIFIED accounts) | Warning shows player info + current owner's display name/Discord ID → Confirm/Cancel buttons. On Confirm: player removed from previous user + DM sent to previous owner. On Cancel: no changes made | Guild-admin linking UI |
+| **2. Guild Administrator** | Discord users with server administrator permissions | Manage clan subscriptions, access clan management interface, link players to Discord users in their guild, **re-link UNVERIFIED accounts** (cannot re-link VERIFIED accounts), **unlink any linked player from clan management — including VERIFIED accounts** | Linking: warning shows player info + current owner's display name/Discord ID → Confirm/Cancel buttons. On Confirm: player removed from previous user + DM sent to previous owner. On Cancel: no changes made. Unlinking: Confirm/Cancel dialog defaulting to Cancel; if the account is API-verified the confirmation text switches to a separate, louder warning spelling out that verified status is lost. On Confirm: player unlinked (moved to UNASSIGNED pool, no DM sent — same as self-service unlink). On Cancel: no changes made | Guild-admin linking UI, `ClanManagementUnlinkPlayerView` / `ClanManagementUnlinkPlayerConfirmView` |
 | **3. Bot Server Admin** | Configured via `CONFIG.server_admin` in qapbot/config.py (specific Discord username) | All Tier 1/2 permissions, bot-wide admin commands, **re-link VERIFIED accounts** (admin override) | 2-step: "Admin Override Required" warning with verified-owner details → explicit "Admin Override Confirm" button. On Confirm: verified player removed from previous user, DM sent, action logged (audit trail). On Cancel: no changes made | `get_verified_player_owner()`, `ClanManagementAdminOverrideView` / `AdminOverrideConfirmView` |
 
 #### Rule 4: API Token Override (Cryptographic Proof)
@@ -40,7 +40,7 @@ Unlinked → Linked (Unverified): Regular user, guild admin, bot admin
 Unlinked → Linked (Verified): Any user with API token
 Linked (Unverified) → Linked (Unverified, User B): Guild admin (with confirmation)
 Linked (Verified) → Linked (Any, User B): Bot admin only (with 2-step confirmation) OR Any user with API token
-Linked (Any) → Unlinked: User removes from their own account
+Linked (Any) → Unlinked: User removes from their own account, or guild admin removes via clan management (Confirm/Cancel, louder warning if VERIFIED)
 ```
 
 ### Key Functions for Account Protection
@@ -53,6 +53,9 @@ Linked (Any) → Unlinked: User removes from their own account
 - **ClanManagementAdminOverrideView**: Confirmation dialog for verified re-links
 - **AdminOverrideConfirmView**: Generic confirmation for admin operations
 - **ApiTokenOwnershipModal**: Modal for API token entry when ownership conflict detected
+- **unlink_player()**: Core unlink (moves player to UNASSIGNED pool, write-through persists both accounts) — shared by self-service unlink and admin unlink
+- **ClanManagementUnlinkPlayerView**: Admin's linked-player picker (paginated), opened from the clan management "Unlink Player" button
+- **ClanManagementUnlinkPlayerConfirmView**: Confirm/Cancel dialog for admin unlink; renders a separate, louder warning message when the selected account is API-verified
 
 ### Security Implementation Checklist
 

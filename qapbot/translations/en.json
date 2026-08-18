@@ -385,6 +385,7 @@
       "button_next": "Next ▶",
       "button_refresh": "🔄 Refresh",
       "button_link_accounts": "🔗 Link Accounts",
+      "button_unlink_player": "🔓 Unlink Player",
       "notification_label": "Change settings for:",
       "button_clan_notifications": "⚙️ Whole Clan",
       "button_user_notifications": "👤 Single User",
@@ -629,7 +630,8 @@
       "button_confirm_override": "Confirm Override",
       "button_cancel": "Cancel",
       "button_confirm_import": "Confirm Import",
-      "button_continue_switched": "Continue (View Switched)"
+      "button_continue_switched": "Continue (View Switched)",
+      "button_confirm_unlink_player": "Confirm Unlink"
     },
     "language_selector": {
       "placeholder": "Select a language...",
@@ -653,6 +655,8 @@
       "mode_switch_failed": "❌ Failed to switch mode: {error}",
       "clan_load_failed": "❌ Failed to load clan: {error}",
       "all_players_linked": "✅ All players in this clan are already linked!",
+      "no_linked_players": "❌ There are no linked players in this clan to unlink.",
+      "unlink_player_not_found": "❌ Could not find this player's link — it may have already changed. Please refresh and try again.",
       "no_users_in_clan": "❌ No Discord users have players registered in this clan.",
       "invalid_player_tag": "❌ Invalid player tag format. Please use format: #PLAYERTAG",
       "player_not_found_coc_api": "❌ Player {player_tag} not found in CoC API.",
@@ -713,10 +717,15 @@
       "family_saved": "✅ **Family Saved**\n\n Clan family **{family_name}** has been updated with {count} clan(s).",
       "admin_override_cancelled": "❌ **Cancelled** - No changes made.",
       "import_cancelled": "❌ **Import cancelled** - No changes made.",
+      "unlink_player_success": "✅ Unlinked **{player_name} ({player_tag})** from <@{discord_user_id}>.",
       "role_system_auto_disabled": "⚠️ **Role System Auto-Disabled**\n\nThe role system has been automatically disabled because {reason} was cleared.\n\n**To re-enable the role system:**\n1. Configure all required settings:\n   • Newbie role\n   • Member role\n   • At least one clan or family\n2. Click the **Enable Role System** button"
     },
     "prompts": {
       "link_account_header": "**Link Player Account**\n\nSelect a player to link, choose notification settings, and select the Discord user.",
+      "unlink_player_header": "**Unlink Player from Discord Account**\n\nSelect a linked player below to unlink them from their Discord account.",
+      "unlink_player_placeholder": "Select a linked player to unlink...",
+      "unlink_player_confirm": "⚠️ Unlink **{player_name} ({player_tag})** from <@{discord_user_id}>?\n\nThis account is **not** API-verified.\n\nThis defaults to **Cancel** - you must explicitly confirm.",
+      "unlink_player_confirm_verified": "🛑 **WARNING: THIS ACCOUNT IS API-VERIFIED** 🛑\n\nYou are about to unlink **{player_name} ({player_tag})** from <@{discord_user_id}>.\n\nThis player has completed **API verification** (proven in-game account ownership). Unlinking will:\n• Remove the Discord ↔ in-game account connection\n• Clear the account's verified status immediately\n• Require the player to verify again with an API token if ever re-linked\n\n**Are you absolutely sure you want to unlink this VERIFIED account?**\nThis defaults to **Cancel** - you must explicitly confirm.",
       "clan_notifications_header": "**Clan-Wide Notification Settings**\n\n⚠️ With this function you will set the notification settings for all users in this clan overriding existing settings! Use with caution! ⚠️\n\nSelect values for all options, then click 'Apply to All Users'.",
       "user_notifications_header": "**User Notification Settings**\n\nSelect a Discord user to configure their notification settings for this clan.",
       "configure_roles_header": "**Configure Roles**\n\nSelect roles for automatic assignment upon player verification.\n\n**Current Newbie Role:** {newbie_display}\n*Assigned to all newly verified players*\n\n**Current Member Role:** {member_display}\n*Assigned when verified in member clans*\n\nUse the dropdowns below to select new roles.",

@@ -341,6 +341,9 @@ class ClanManagementView(discord.ui.View):
             # Add Link Accounts button
             logging.debug(f"Adding link accounts button")
             self._add_link_accounts_button()
+            # Add Unlink Player button
+            logging.debug(f"Adding unlink player button")
+            self._add_unlink_player_button()
         elif mode == "notifications":
             # Add notification management buttons
             logging.debug(f"Adding notification management buttons")
@@ -594,7 +597,21 @@ class ClanManagementView(discord.ui.View):
         )
         link_button.callback = self._on_link_accounts  # type: ignore[assignment]
         self.add_item(link_button)  # type: ignore[arg-type]
-    
+
+    def _add_unlink_player_button(self):
+        """Add Unlink Player button to open ephemeral unlinking interface."""
+        from qapbot.i18n import t
+        guild_id = self.sent_message.guild.id if self.sent_message and self.sent_message.guild else None
+
+        unlink_button = discord.ui.Button(
+            label=t('ui_components.clan_management.button_unlink_player', guild_id=guild_id),
+            style=discord.ButtonStyle.danger,
+            custom_id="clan_mgmt_unlink_player",
+            row=4
+        )
+        unlink_button.callback = self._on_unlink_player  # type: ignore[assignment]
+        self.add_item(unlink_button)  # type: ignore[arg-type]
+
     def _add_notification_management_buttons(self):
         """Add notification management buttons for clan-wide and user-specific settings."""
         from qapbot.i18n import t
@@ -1266,6 +1283,56 @@ class ClanManagementView(discord.ui.View):
         
         # Store the ephemeral message reference in the view
         link_view.link_view_message = link_view_msg
+
+    async def _on_unlink_player(self, interaction: discord.Interaction) -> None:
+        """Handle Unlink Player button - open ephemeral unlinking interface. Admin-only."""
+        # Check admin permission first
+        if not await self._check_admin_permission(interaction):
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        # Fetch a fresh linked-players list for this clan (self.linked_players isn't
+        # tracked on the view — only unlinked_players is — so re-derive it here, same
+        # as every other refresh path in this view does via format_clan_management_message)
+        from qapbot.QBdiscocmdshelper import format_clan_management_message
+        _, _, linked_players, _ = await format_clan_management_message(
+            self.clan_tag,
+            interaction.guild
+        )
+
+        if not linked_players:
+            from qapbot.i18n import t
+            user_id = str(interaction.user.id)
+            guild_id = interaction.guild.id if interaction.guild else None
+            msg = t('ui_components.errors.no_linked_players', user_id=user_id, guild_id=guild_id)
+            await interaction.followup.send(msg, ephemeral=True)
+            return
+
+        # Create unlinking interface view
+        unlink_view = ClanManagementUnlinkPlayerView(  # type: ignore[name-defined]
+            clan_tag=self.clan_tag,
+            linked_players=linked_players,
+            sent_message=self.sent_message,
+            guild_clans=self.guild_clans,
+            mode=self.mode,
+            timeout=300
+        )
+
+        from qapbot.i18n import t
+        user_id = str(interaction.user.id)
+        guild_id = interaction.guild.id if interaction.guild else None
+        header_msg = t('ui_components.prompts.unlink_player_header', user_id=user_id, guild_id=guild_id)
+
+        unlink_view_msg = await interaction.followup.send(
+            header_msg,
+            view=unlink_view,  # type: ignore[arg-type]
+            ephemeral=True,
+            wait=True  # Wait for message to be created so we can store it
+        )
+
+        # Store the ephemeral message reference in the view
+        unlink_view.unlink_view_message = unlink_view_msg
 
     async def _on_clan_notification_settings(self, interaction: discord.Interaction) -> None:
         """Handle Clan Settings button - open clan-wide notification settings interface. Admin-only."""
@@ -6086,6 +6153,308 @@ class ClanManagementLinkAccountView(discord.ui.View):
             )
         except Exception as refresh_error:
             logging.warning(f"Could not auto-refresh clan management message after linking: {refresh_error}")
+
+
+class ClanManagementUnlinkPlayerView(discord.ui.View):
+    """
+    Admin interface for unlinking a currently-linked player from their Discord
+    account, opened from the clan management "Unlink Player" button.
+
+    Shows a single dropdown of the clan's linked players (paginated past 25).
+    Selecting one shows a confirmation dialog (ClanManagementUnlinkPlayerConfirmView)
+    before anything is changed.
+    """
+    def __init__(
+        self,
+        clan_tag: str,
+        linked_players: List[Dict[str, Any]],
+        sent_message: discord.Message,
+        guild_clans: List[str],
+        mode: str = "registrations",
+        timeout: int = 300
+    ):
+        """
+        Initialize the unlink-player selection view.
+
+        Args:
+            clan_tag: Clan tag for context
+            linked_players: List of linked player dicts (tag, name, discord_user_id,
+                discord_name, verified, th_level) as returned by format_clan_management_message
+            sent_message: The clan management message to refresh after unlinking
+            guild_clans: List of all guild clan tags
+            mode: Current clan management mode
+            timeout: View timeout in seconds
+        """
+        super().__init__(timeout=timeout)
+        self.clan_tag = clan_tag
+        self.linked_players = linked_players
+        self.sent_message = sent_message
+        self.guild = sent_message.guild  # Extract guild from message for i18n
+        self.guild_clans = guild_clans
+        self.mode = mode
+        self.unlink_view_message: Optional[discord.Message] = None  # Track the ephemeral view message
+
+        # Pagination state for player selector (max 50 players in a clan)
+        self.player_offset = 0
+        self.players_per_page = 24  # Show 24 + "Load more..." = 25 total
+
+        self._add_player_select()  # row 0
+
+    def _add_player_select(self):
+        """Add linked-player selection dropdown with pagination support."""
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+
+        players_sorted = sorted(self.linked_players, key=lambda p: (p.get("name") or "").lower())
+
+        total_players = len(players_sorted)
+        start_idx = self.player_offset
+        end_idx = start_idx + self.players_per_page
+        has_more = end_idx < total_players
+        current_page = players_sorted[start_idx:end_idx]
+
+        player_options = []
+        for player in current_page:
+            tag = player.get("tag", "")
+            name = player.get("name", "Unknown")
+            discord_name = player.get("discord_name", "Unknown")
+            verified = player.get("verified", False)
+            verify_emoji = "✅" if verified else "❌"
+
+            label = f"{name} ({tag})"
+            if len(label) > 100:
+                label = label[:97] + "..."
+
+            description = f"→ {discord_name}  {verify_emoji}"
+            if len(description) > 100:
+                description = description[:97] + "..."
+
+            player_options.append(discord.SelectOption(
+                label=label,
+                value=tag,
+                description=description,
+                default=False
+            ))
+
+        # Add "Back to first page" option if not on first page
+        if self.player_offset > 0:
+            label = t('ui_components.notification_settings.button_back_to_first', guild_id=guild_id)
+            player_options.insert(0, discord.SelectOption(
+                label=label,
+                value="__back_to_first__"
+            ))
+
+        # Add "Load more..." option if there are more players
+        if has_more:
+            remaining = total_players - end_idx
+            player_options.append(discord.SelectOption(
+                label=f"📄 Load more... ({remaining} remaining)",
+                value="__load_more__"
+            ))
+
+        if not player_options:
+            return
+
+        placeholder = t('ui_components.prompts.unlink_player_placeholder', guild_id=guild_id)
+
+        player_select = discord.ui.Select(
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            options=player_options,  # type: ignore[arg-type]
+            custom_id="unlink_player_select",
+            row=0
+        )
+        player_select.callback = self._on_player_select  # type: ignore[assignment]
+        self.add_item(player_select)  # type: ignore[arg-type]
+
+    async def _on_player_select(self, interaction: discord.Interaction) -> None:
+        """Handle player selection or pagination, then show the confirmation dialog."""
+        selected_value = interaction.data['values'][0]  # type: ignore[index]
+
+        if selected_value == "__back_to_first__":
+            self.player_offset = 0
+            self.clear_items()
+            self._add_player_select()
+            await interaction.response.edit_message(view=self)
+            return
+
+        if selected_value == "__load_more__":
+            self.player_offset += self.players_per_page
+            self.clear_items()
+            self._add_player_select()
+            await interaction.response.edit_message(view=self)
+            return
+
+        player_tag = selected_value
+        player_data = next((p for p in self.linked_players if p.get("tag") == player_tag), None)
+        if not player_data:
+            return
+
+        confirm_view = ClanManagementUnlinkPlayerConfirmView(  # type: ignore[name-defined]
+            player_data=player_data,
+            clan_tag=self.clan_tag,
+            sent_message=self.sent_message,
+            guild_clans=self.guild_clans,
+            mode=self.mode,
+            parent_view=self
+        )
+
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+        player_name = player_data.get("name", "Unknown")
+        discord_user_id = player_data.get("discord_user_id", "")
+        verified = player_data.get("verified", False)
+
+        # ACCOUNT PROTECTION (Cardinal Rule 2): make an API-verified account's status
+        # VERY clear before an admin can remove it — separate, louder message text.
+        if verified:
+            confirm_text = t(
+                'ui_components.prompts.unlink_player_confirm_verified',
+                guild_id=guild_id,
+                player_name=player_name,
+                player_tag=player_tag,
+                discord_user_id=discord_user_id
+            )
+        else:
+            confirm_text = t(
+                'ui_components.prompts.unlink_player_confirm',
+                guild_id=guild_id,
+                player_name=player_name,
+                player_tag=player_tag,
+                discord_user_id=discord_user_id
+            )
+
+        await interaction.response.edit_message(content=confirm_text, view=confirm_view)
+
+
+class ClanManagementUnlinkPlayerConfirmView(discord.ui.View):
+    """
+    Confirmation dialog for an admin unlinking a linked player from clan management.
+
+    Defaults to Cancel; requires an explicit Confirm click (Cardinal Rule 2: never
+    remove a verified account without explicit bot-admin confirmation) — the
+    ClanManagementUnlinkPlayerView caller already put a loud warning in the message
+    content when the player is API-verified.
+    """
+    def __init__(
+        self,
+        player_data: Dict[str, Any],
+        clan_tag: str,
+        sent_message: discord.Message,
+        guild_clans: List[str],
+        mode: str,
+        parent_view: 'ClanManagementUnlinkPlayerView'
+    ):
+        super().__init__(timeout=60)
+        self.player_data = player_data
+        self.clan_tag = clan_tag
+        self.sent_message = sent_message
+        self.guild = sent_message.guild
+        self.guild_clans = guild_clans
+        self.mode = mode
+        self.parent_view = parent_view
+
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+
+        cancel_button = discord.ui.Button(
+            label=f"❌ {t('ui_components.confirmation_dialogs.button_cancel_default', guild_id=guild_id)}",
+            style=discord.ButtonStyle.secondary,
+            custom_id="cancel_unlink_player"
+        )
+        cancel_button.callback = self._on_cancel  # type: ignore[assignment]
+        self.add_item(cancel_button)  # type: ignore[arg-type]
+
+        confirm_button = discord.ui.Button(
+            label=f"⚠️ {t('ui_components.confirmation_dialogs.button_confirm_unlink_player', guild_id=guild_id)}",
+            style=discord.ButtonStyle.danger,
+            custom_id="confirm_unlink_player"
+        )
+        confirm_button.callback = self._on_confirm  # type: ignore[assignment]
+        self.add_item(confirm_button)  # type: ignore[arg-type]
+
+    async def _on_cancel(self, interaction: discord.Interaction) -> None:
+        """Handle Cancel button - restore the parent player-selection view unchanged."""
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+        header_msg = t('ui_components.prompts.unlink_player_header', guild_id=guild_id)
+        await interaction.response.edit_message(content=header_msg, view=self.parent_view)
+
+    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+        """Handle Confirm button - unlink the player, sync roles, and refresh the clan management message."""
+        from qapbot.QBdiscocmdshelper import unlink_player
+        from qapbot.i18n import t
+
+        player_tag = self.player_data.get("tag", "")
+        player_name = self.player_data.get("name", "Unknown")
+        discord_user_id = str(self.player_data.get("discord_user_id", ""))
+        was_verified = self.player_data.get("verified", False)
+        guild_id = self.guild.id if self.guild else None
+
+        success = await unlink_player(discord_user_id, player_tag)
+
+        if not success:
+            error_msg = t('ui_components.errors.unlink_player_not_found', guild_id=guild_id)
+            await interaction.response.edit_message(content=error_msg, view=None)
+            return
+
+        # Role sync mirrors the self-service unlink flow (UnlinkConfirmView._on_confirm
+        # in ui_registration.py) - re-check clan/member/CoC roles immediately after unlinking.
+        if self.guild:
+            try:
+                from qapbot.guild_role_manager import sync_roles_for_user
+                await sync_roles_for_user(self.guild, str(self.guild.id), int(discord_user_id))
+            except Exception as role_sync_error:
+                logging.warning(f"[ROLE-SYNC] Post-admin-unlink role sync failed for {discord_user_id}: {role_sync_error}")
+
+        logging.info(
+            f"CLAN_MANAGEMENT: {interaction.user} unlinked player {player_name} ({player_tag}) "
+            f"from discord_user={discord_user_id} (was_verified={was_verified})"
+        )
+
+        success_msg = t(
+            'ui_components.messages.unlink_player_success',
+            guild_id=guild_id,
+            player_name=player_name,
+            player_tag=player_tag,
+            discord_user_id=discord_user_id
+        )
+        await interaction.response.edit_message(content=success_msg, view=None)
+
+        # Refresh the original clan management message, mirroring the post-link refresh
+        # in ClanManagementLinkAccountView._on_submit
+        try:
+            from qapbot.QBdiscocmdshelper import format_clan_management_message
+
+            if not self.sent_message or not self.sent_message.guild:
+                logging.warning("Cannot refresh clan management message: message or guild is None")
+                return
+
+            main_embed, unlinked_embed, _, unlinked_players = await format_clan_management_message(
+                self.clan_tag,
+                self.sent_message.guild
+            )
+
+            new_view = ClanManagementView(
+                clan_tag=self.clan_tag,
+                guild_clans=self.guild_clans,
+                unlinked_players=unlinked_players,
+                sent_message=self.sent_message,
+                mode=self.mode,
+                timeout=1800
+            )
+
+            embeds = [main_embed]
+            if unlinked_embed:
+                embeds.append(unlinked_embed)
+
+            await self.sent_message.edit(
+                embeds=embeds,  # type: ignore[arg-type]
+                view=new_view
+            )
+        except Exception as refresh_error:
+            logging.warning(f"Could not auto-refresh clan management message after unlinking: {refresh_error}")
 
 
 class ClanManagementAdminOverrideView(discord.ui.View):

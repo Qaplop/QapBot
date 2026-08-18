@@ -1,6 +1,20 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-18 (60)
+- Added: "Unlink Player" button in `/clan management` (registrations mode), letting clan
+  leads/guild admins unlink a linked player from its Discord account without going through
+  the player's own self-service flow. Opens an ephemeral player-select dropdown (paginated
+  past 25 linked players); selecting one shows a Confirm/Cancel dialog defaulting to Cancel.
+  If the account is API-verified, the confirmation text switches to a loud, separate warning
+  (Cardinal Rule 2: never remove a verified account without explicit admin confirmation) that
+  spells out what verified status means and that it will be lost. Reuses the existing
+  `unlink_player()` helper (`QBdiscocmdshelper.py`) and the same post-unlink role-sync +
+  original-message refresh pattern already used by the account-linking flow.
+  Files: qapbot/ui_clan_management.py (new `ClanManagementUnlinkPlayerView` +
+  `ClanManagementUnlinkPlayerConfirmView`, new button on `ClanManagementView`),
+  qapbot/translations/en.json, qapbot/translations/de.json. 2053 tests pass.
+
 2026-08-18 (59)
 - Fixed: `coc_cache.py`'s `update_player_info_in_user_accounts()` — the per-clan-fetch step that
   keeps `user_players` TH/name/clan/role current — did two full O(len(user_accounts)) synchronous

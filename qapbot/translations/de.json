@@ -385,6 +385,7 @@
       "button_next": "Weiter ▶",
       "button_refresh": "🔄 Aktualisieren",
       "button_link_accounts": "🔗 Konten verknüpfen",
+      "button_unlink_player": "🔓 Spieler entkoppeln",
       "notification_label": "Einstellungen ändern für:",
       "button_clan_notifications": "⚙️ Ganzer Clan",
       "button_user_notifications": "👤 Einzelner Benutzer",
@@ -629,7 +630,8 @@
       "button_confirm_override": "Überschreiben bestätigen",
       "button_cancel": "Abbrechen",
       "button_confirm_import": "Import bestätigen",
-      "button_continue_switched": "Weiter (Ansicht gewechselt)"
+      "button_continue_switched": "Weiter (Ansicht gewechselt)",
+      "button_confirm_unlink_player": "Entkoppeln bestätigen"
     },
     "language_selector": {
       "placeholder": "Sprache auswählen...",
@@ -653,6 +655,8 @@
       "mode_switch_failed": "❌ Fehler beim Wechseln des Modus: {error}",
       "clan_load_failed": "❌ Fehler beim Laden des Clans: {error}",
       "all_players_linked": "✅ Alle Spieler in diesem Clan sind bereits verknüpft!",
+      "no_linked_players": "❌ Es gibt keine verknüpften Spieler in diesem Clan zum Entkoppeln.",
+      "unlink_player_not_found": "❌ Die Verknüpfung dieses Spielers konnte nicht gefunden werden - sie hat sich möglicherweise bereits geändert. Bitte aktualisiere und versuche es erneut.",
       "no_users_in_clan": "❌ Keine Discord-Benutzer haben Spieler in diesem Clan registriert.",
       "invalid_player_tag": "❌ Ungültiges Spieler-Tag-Format. Bitte verwende das Format: #SPIELERTAG",
       "player_not_found_coc_api": "❌ Spieler {player_tag} wurde in der CoC API nicht gefunden.",
@@ -713,10 +717,15 @@
       "family_saved": "✅ **Familie gespeichert**\n\nClan-Familie **{family_name}** wurde mit {count} Clan(s) aktualisiert.",
       "admin_override_cancelled": "❌ **Abgebrochen** - Keine Änderungen vorgenommen.",
       "import_cancelled": "❌ **Import abgebrochen** - Keine Änderungen vorgenommen.",
+      "unlink_player_success": "✅ **{player_name} ({player_tag})** wurde von <@{discord_user_id}> entkoppelt.",
       "role_system_auto_disabled": "⚠️ **Rollensystem automatisch deaktiviert**\n\nDas Rollensystem wurde automatisch deaktiviert, da {reason} gelöscht wurde.\n\n**Um das Rollensystem erneut zu aktivieren:**\n1. Konfiguriere alle erforderlichen Einstellungen:\n   • Neuling-Rolle\n   • Mitglieds-Rolle\n   • Mindestens einen Clan oder eine Familie\n2. Klicke auf die Schaltfläche **Rollensystem aktivieren**"
     },
     "prompts": {
       "link_account_header": "**Spielerkonto verknüpfen**\n\nWähle einen Spieler zum Verknüpfen, wähle Benachrichtigungseinstellungen und wähle den Discord-Benutzer aus.",
+      "unlink_player_header": "**Spieler vom Discord-Konto entkoppeln**\n\nWähle unten einen verknüpften Spieler aus, um ihn von seinem Discord-Konto zu entkoppeln.",
+      "unlink_player_placeholder": "Wähle einen verknüpften Spieler zum Entkoppeln...",
+      "unlink_player_confirm": "⚠️ **{player_name} ({player_tag})** von <@{discord_user_id}> entkoppeln?\n\nDieses Konto ist **nicht** API-verifiziert.\n\nStandardmäßig ist **Abbrechen** ausgewählt - du musst explizit bestätigen.",
+      "unlink_player_confirm_verified": "🛑 **WARNUNG: DIESES KONTO IST API-VERIFIZIERT** 🛑\n\nDu bist dabei, **{player_name} ({player_tag})** von <@{discord_user_id}> zu entkoppeln.\n\nDieser Spieler hat die **API-Verifizierung** abgeschlossen (nachgewiesener Besitz des Spielkontos). Das Entkoppeln wird:\n• Die Verbindung zwischen Discord und dem Spielkonto entfernen\n• Den verifizierten Status sofort löschen\n• Erfordern, dass sich der Spieler bei einer erneuten Verknüpfung wieder mit einem API-Token verifiziert\n\n**Bist du absolut sicher, dass du dieses VERIFIZIERTE Konto entkoppeln möchtest?**\nStandardmäßig ist **Abbrechen** ausgewählt - du musst explizit bestätigen.",
       "clan_notifications_header": "**Clan-weite Benachrichtigungseinstellungen**\n\n⚠️ Mit dieser Funktion setzt du die Benachrichtigungseinstellungen für alle Benutzer in diesem Clan und überschreibst bestehende Einstellungen! Verwende dies mit Vorsicht! ⚠️\n\nWähle Werte für alle Optionen und klicke dann auf 'Auf alle Benutzer anwenden'.",
       "user_notifications_header": "**Benutzer-Benachrichtigungseinstellungen**\n\nWähle einen Discord-Benutzer aus, um seine Benachrichtigungseinstellungen für diesen Clan zu konfigurieren.",
       "configure_roles_header": "**Rollen konfigurieren**\n\nWähle Rollen für automatische Zuweisung bei Spielerverifizierung.\n\n**Aktuelle Neuling-Rolle:** {newbie_display}\n*Wird allen neu verifizierten Spielern zugewiesen*\n\n**Aktuelle Mitglieds-Rolle:** {member_display}\n*Wird zugewiesen, wenn in Mitglieds-Clans verifiziert*\n\nVerwende die Dropdown-Menüs unten, um neue Rollen auszuwählen.",
