@@ -304,6 +304,7 @@ class TestUpdatePlayerInfo:
         c = CoCClanCache()
         cm = MagicMock()
         cm.persist_user = AsyncMock()
+        cm.db_manager = None  # exercise the full-scan fallback (DB-indexed path covered separately)
         cm.user_accounts = {
             "100": {"players": [{"player_tag": "#P1", "player_name": "#P1", "th_level": 14, "current_clan_tag": "#CLAN1"}]}
         }
@@ -320,6 +321,7 @@ class TestUpdatePlayerInfo:
         c = CoCClanCache()
         cm = MagicMock()
         cm.persist_user = AsyncMock()
+        cm.db_manager = None  # exercise the full-scan fallback (DB-indexed path covered separately)
         cm.user_accounts = {
             "100": {"players": [{"player_tag": "#P1", "player_name": "#P1", "th_level": 15, "current_clan_tag": "#OLD"}]}
         }
@@ -336,6 +338,7 @@ class TestUpdatePlayerInfo:
         c = CoCClanCache()
         cm = MagicMock()
         cm.persist_user = AsyncMock()
+        cm.db_manager = None  # exercise the full-scan fallback (DB-indexed path covered separately)
         cm.user_accounts = {
             "100": {"players": [
                 {"player_tag": "#P1", "player_name": "#P1", "th_level": 15, "current_clan_tag": "#CLAN1", "coc_role": "member"}
@@ -353,6 +356,7 @@ class TestUpdatePlayerInfo:
         c = CoCClanCache()
         cm = MagicMock()
         cm.persist_user = AsyncMock()
+        cm.db_manager = None  # exercise the full-scan fallback (DB-indexed path covered separately)
         cm.user_accounts = {
             "100": {"players": [
                 {"player_tag": "#P1", "player_name": "#P1", "th_level": 15, "current_clan_tag": "#CLAN1", "coc_role": "member"}
@@ -371,6 +375,7 @@ class TestUpdatePlayerInfo:
         c = CoCClanCache()
         cm = MagicMock()
         cm.persist_user = AsyncMock()
+        cm.db_manager = None  # exercise the full-scan fallback (DB-indexed path covered separately)
         cm.user_accounts = {
             "100": {"players": [
                 {"player_tag": "#P1", "player_name": "#P1", "th_level": 15, "current_clan_tag": "#CLAN1"}
@@ -392,6 +397,7 @@ class TestUpdatePlayerInfo:
         c = CoCClanCache()
         cm = MagicMock()
         cm.persist_user = AsyncMock()
+        cm.db_manager = None  # exercise the full-scan fallback (DB-indexed path covered separately)
         cm.user_accounts = {
             "UNASSIGNED": {"players": [
                 {"player_tag": "#P1", "player_name": "#P1", "th_level": 10, "current_clan_tag": "#CLAN1"}
@@ -410,6 +416,7 @@ class TestUpdatePlayerInfo:
         c = CoCClanCache()
         cm = MagicMock()
         cm.persist_user = AsyncMock()
+        cm.db_manager = None  # exercise the full-scan fallback (DB-indexed path covered separately)
         cm.user_accounts = {
             "UNASSIGNED": {"players": [
                 {"player_tag": "#P1", "player_name": "#P1", "th_level": 10, "current_clan_tag": "#CLAN1"}
@@ -431,6 +438,7 @@ class TestUpdatePlayerInfo:
         c = CoCClanCache()
         cm = MagicMock()
         cm.persist_user = AsyncMock()
+        cm.db_manager = None  # exercise the full-scan fallback (DB-indexed path covered separately)
         cm.user_accounts = {}
         clan_mock = MagicMock()
         clan_mock.tag = "#CLAN1"
@@ -452,6 +460,7 @@ class TestUpdatePlayerInfo:
         c = CoCClanCache()
         cm = MagicMock()
         cm.persist_user = AsyncMock()
+        cm.db_manager = None  # exercise the full-scan fallback (DB-indexed path covered separately)
         cm.user_accounts = {
             "UNASSIGNED": {"players": [
                 {"player_tag": "#OLD", "player_name": "#OLD", "th_level": 5, "current_clan_tag": None}
@@ -471,6 +480,7 @@ class TestUpdatePlayerInfo:
         c = CoCClanCache()
         cm = MagicMock()
         cm.persist_user = AsyncMock()
+        cm.db_manager = None  # exercise the full-scan fallback (DB-indexed path covered separately)
         cm.user_accounts = {
             "100": {"players": [
                 {"player_tag": "#P1", "player_name": "#P1", "th_level": 15, "current_clan_tag": "#CLAN1", "coc_role": "member"}
@@ -503,6 +513,132 @@ class TestUpdatePlayerInfo:
         clan_mock.members = [self._make_member("#P1", th=15, role_name="member")]
 
         await c.update_player_info_in_user_accounts(clan_mock, cm)
+        cm.persist_user.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# update_player_info_in_user_accounts — DB-indexed path (2026-08-18)
+#
+# Replaces the two O(len(user_accounts)) full scans with
+# get_player_owners_for_tags_sync()/get_player_owners_for_clan_sync() lookups. These tests
+# mock those two db_manager methods directly (they're plain sync callables invoked via
+# asyncio.to_thread, so a MagicMock return value works without any thread-safety concerns)
+# rather than a real SQLite db, since the DB layer itself is covered by
+# tests/unit/test_db_manager*.py.
+# ---------------------------------------------------------------------------
+
+class TestUpdatePlayerInfoDbIndexed:
+    def _make_member(self, tag: str, th: int = 15, role_name: str = "member"):
+        m = MagicMock()
+        m.tag = tag
+        m.name = tag
+        m.town_hall = th
+        role_mock = MagicMock()
+        role_mock.name = role_name
+        m.role = role_mock
+        return m
+
+    @pytest.mark.asyncio
+    async def test_updates_th_level_via_owner_lookup(self):
+        c = CoCClanCache()
+        cm = MagicMock()
+        cm.persist_user = AsyncMock()
+        cm.db_manager.get_player_owners_for_tags_sync = MagicMock(return_value={"#P1": "100"})
+        cm.db_manager.get_player_owners_for_clan_sync = MagicMock(return_value={})
+        cm.user_accounts = {
+            "100": {"players": [{"player_tag": "#P1", "player_name": "#P1", "th_level": 14, "current_clan_tag": "#CLAN1"}]}
+        }
+        clan_mock = MagicMock()
+        clan_mock.tag = "#CLAN1"
+        clan_mock.members = [self._make_member("#P1", th=16)]
+
+        await c.update_player_info_in_user_accounts(clan_mock, cm)
+
+        assert cm.user_accounts["100"]["players"][0]["th_level"] == 16
+        cm.persist_user.assert_awaited_once_with("100")
+        cm.db_manager.get_player_owners_for_tags_sync.assert_called_once_with(["#P1"])
+        cm.db_manager.get_player_owners_for_clan_sync.assert_called_once_with("#CLAN1")
+
+    @pytest.mark.asyncio
+    async def test_never_tracked_member_gets_shadow_unassigned_entry(self):
+        """A tag the owner-lookup query has no row for (never linked, never seen) still gets
+        a fresh UNASSIGNED entry — same as the full-scan fallback."""
+        c = CoCClanCache()
+        cm = MagicMock()
+        cm.persist_user = AsyncMock()
+        cm.db_manager.get_player_owners_for_tags_sync = MagicMock(return_value={})
+        cm.db_manager.get_player_owners_for_clan_sync = MagicMock(return_value={})
+        cm.user_accounts = {}
+        clan_mock = MagicMock()
+        clan_mock.tag = "#CLAN1"
+        clan_mock.members = [self._make_member("#NEW1", th=13)]
+
+        await c.update_player_info_in_user_accounts(clan_mock, cm)
+
+        unassigned_players = cm.user_accounts["UNASSIGNED"]["players"]
+        assert len(unassigned_players) == 1
+        assert unassigned_players[0]["player_tag"] == "#NEW1"
+        cm.persist_user.assert_awaited_once_with("UNASSIGNED")
+
+    @pytest.mark.asyncio
+    async def test_detects_departure_via_clan_owner_lookup(self):
+        """get_player_owners_for_clan_sync surfaces a tag the clan's live member list no longer
+        has -> current_clan_tag gets cleared, same as the full-scan fallback's departure pass."""
+        c = CoCClanCache()
+        cm = MagicMock()
+        cm.persist_user = AsyncMock()
+        cm.db_manager.get_player_owners_for_tags_sync = MagicMock(return_value={})
+        cm.db_manager.get_player_owners_for_clan_sync = MagicMock(return_value={"#P1": "100"})
+        cm.user_accounts = {
+            "100": {"players": [{"player_tag": "#P1", "player_name": "#P1", "th_level": 15, "current_clan_tag": "#CLAN1"}]}
+        }
+        clan_mock = MagicMock()
+        clan_mock.tag = "#CLAN1"
+        clan_mock.members = []  # P1 no longer in the live roster
+
+        await c.update_player_info_in_user_accounts(clan_mock, cm)
+
+        assert cm.user_accounts["100"]["players"][0]["current_clan_tag"] is None
+        cm.persist_user.assert_awaited_once_with("100")
+
+    @pytest.mark.asyncio
+    async def test_departure_skipped_if_clan_tag_already_changed_since_snapshot(self):
+        """Defensive guard: if the in-memory current_clan_tag no longer matches this clan by the
+        time we process the DB snapshot (e.g. a concurrent cycle already moved it), don't clobber
+        the newer value."""
+        c = CoCClanCache()
+        cm = MagicMock()
+        cm.persist_user = AsyncMock()
+        cm.db_manager.get_player_owners_for_tags_sync = MagicMock(return_value={})
+        cm.db_manager.get_player_owners_for_clan_sync = MagicMock(return_value={"#P1": "100"})
+        cm.user_accounts = {
+            "100": {"players": [{"player_tag": "#P1", "player_name": "#P1", "th_level": 15, "current_clan_tag": "#SOMEWHERE-ELSE"}]}
+        }
+        clan_mock = MagicMock()
+        clan_mock.tag = "#CLAN1"
+        clan_mock.members = []
+
+        await c.update_player_info_in_user_accounts(clan_mock, cm)
+
+        assert cm.user_accounts["100"]["players"][0]["current_clan_tag"] == "#SOMEWHERE-ELSE"
+        cm.persist_user.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_owner_row_with_no_matching_in_memory_entry_is_skipped(self):
+        """DB says a discord_id owns this tag, but CACHE.user_accounts has no such entry
+        (cache/DB drift) — must skip cleanly rather than raising."""
+        c = CoCClanCache()
+        cm = MagicMock()
+        cm.persist_user = AsyncMock()
+        cm.db_manager.get_player_owners_for_tags_sync = MagicMock(return_value={"#P1": "999"})
+        cm.db_manager.get_player_owners_for_clan_sync = MagicMock(return_value={})
+        cm.user_accounts = {}  # "999" not present
+        clan_mock = MagicMock()
+        clan_mock.tag = "#CLAN1"
+        clan_mock.members = [self._make_member("#P1", th=16)]
+
+        await c.update_player_info_in_user_accounts(clan_mock, cm)
+
         cm.persist_user.assert_not_awaited()
 
 

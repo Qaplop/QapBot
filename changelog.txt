@@ -1,6 +1,42 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-18 (59)
+- Fixed: `coc_cache.py`'s `update_player_info_in_user_accounts()` — the per-clan-fetch step that
+  keeps `user_players` TH/name/clan/role current — did two full O(len(user_accounts)) synchronous
+  scans (every Discord user × every linked player, including the ever-growing UNASSIGNED pool),
+  with no `await` inside either loop. Diagnosed from a live PROD log: an 11s gap between two
+  consecutive `[COC-API-CALL] Fetching clan data for ...` lines inside the same "20 concurrent"
+  Phase-1 fetch batch — the scan doesn't just make its own clan's fetch slow, it blocks the whole
+  asyncio event loop for its duration, stalling every other concurrently in-flight clan fetch too
+  (network-bound tasks that could otherwise have proceeded). Only triggered for clans with
+  `has_active_subscriptions=True` (guild member clans), so every "inactive 22h" member-clan poll
+  paid this cost.
+  - Added two indexed lookups to `db_manager.py`: `get_player_owners_for_tags_sync(player_tags)`
+    (`WHERE player_tag IN (...)`, `idx_user_players_player_tag`) and
+    `get_player_owners_for_clan_sync(clan_tag)` (`WHERE current_clan_tag = ?`,
+    `idx_user_players_clan_tag`) — both return player_tag -> discord_id verbatim (including the
+    'UNASSIGNED' sentinel, unlike `get_player_links_sync`/`get_current_clan_members_sync` which
+    null it out for their DM-ability callers). Same "stop scanning in-memory, query the indexed
+    SQL table instead" move as `PLAYER_NAME_INDEX_RETIREMENT_PLAN.md`'s FTS5 migration for
+    `/whois` — the underlying `user_players` table already had both indexes, no schema change
+    needed.
+  - `coc_cache.py`: `update_player_info_in_user_accounts()` now queries both (via
+    `asyncio.gather` + `asyncio.to_thread`) instead of scanning `CACHE.user_accounts` — cost is
+    now bounded by this clan's roster size, not by total registered accounts. Field-update logic
+    (TH/clan-tag/name/coc_role) extracted into a new `_apply_member_field_updates()` helper shared
+    by this path and a full-scan fallback (kept for when `db_manager` is unavailable — should not
+    happen in a running bot, but a real reachable branch, not dead code). Departure detection
+    re-checks `current_clan_tag` against the live in-memory value before clearing it, in case a
+    concurrent cycle already changed it since the DB snapshot was taken.
+  - Tests: 5 new (`tests/unit/test_coc_cache_coverage.py::TestUpdatePlayerInfoDbIndexed`) covering
+    the DB-indexed path directly (TH update via owner lookup, new-tag UNASSIGNED creation,
+    departure detection, the concurrent-change guard, and cache/DB drift where a DB row has no
+    matching in-memory entry). Existing `TestUpdatePlayerInfo` class (11 tests) now sets
+    `db_manager = None` to keep exercising the full-scan fallback explicitly rather than
+    incidentally. 2057 tests pass.
+  - Needs a bot restart on DEV/PROD to take effect.
+
 2026-08-18 (58)
 - Fixed: misleading `[ROLE-SYNC]` startup log line — found analyzing today's PROD startup log
   (post player-name-index-retirement deploy, otherwise fully clean: zero warnings/errors, RSS

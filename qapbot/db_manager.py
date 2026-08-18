@@ -3960,6 +3960,86 @@ class WarHistoryDB:
             clan_tags.setdefault(row["player_tag"], row["current_clan_tag"])
         return clan_tags
 
+    def get_player_owners_for_tags_sync(self, player_tags: List[str]) -> Dict[str, str]:
+        """player_tag -> discord_id (verbatim, including the 'UNASSIGNED' sentinel) for whichever
+        of player_tags have a user_players row. This is the indexed (idx_user_players_player_tag)
+        replacement for scanning the whole of CACHE.user_accounts to find which of a clan's live
+        members are already tracked — coc_cache.py's update_player_info_in_user_accounts() used
+        to do two full O(len(user_accounts)) passes per clan fetch, which blocks the event loop
+        for the duration (no `await` inside either loop), stalling every other concurrently
+        in-flight clan fetch too (see COPILOT_PITFALLS_COOKBOOK.md for the class of incident this
+        causes). Unlike get_player_links_sync (which nulls out 'UNASSIGNED' for its DM-ability
+        callers), this preserves the raw discord_id since the caller needs it to find the right
+        CACHE.user_accounts[...] entry to mutate, UNASSIGNED bucket included. If the same
+        player_tag is linked by more than one Discord account (disputed ownership), the verified
+        one wins — same convention as get_current_clan_members_sync."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not player_tags:
+            return {}
+
+        with self._sync_conn() as conn:
+            try:
+                rows = self._chunked_in_query_sync(
+                    conn,
+                    """
+                    SELECT player_tag, discord_id, verified
+                    FROM user_players
+                    WHERE player_tag IN ({placeholders})
+                    ORDER BY verified DESC
+                    """,
+                    player_tags,
+                )
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_player_owners_for_tags_sync failed: {e}")
+                return {}
+
+        # Re-sorted globally first (Step 4-style chunking) — a per-chunk ORDER BY alone would
+        # not guarantee verified-wins once one player_tag's candidate rows split across chunks.
+        rows = sorted(rows, key=lambda r: not r["verified"])
+        owners: Dict[str, str] = {}
+        for row in rows:
+            owners.setdefault(row["player_tag"], row["discord_id"])
+        return owners
+
+    def get_player_owners_for_clan_sync(self, clan_tag: str) -> Dict[str, str]:
+        """player_tag -> discord_id (verbatim, including 'UNASSIGNED') for every user_players row
+        currently attributed to clan_tag. Companion to get_player_owners_for_tags_sync — this one
+        answers "who does the bot currently think is in this clan" (indexed via
+        idx_user_players_clan_tag), used to detect departures: a tracked player whose
+        current_clan_tag still matches but who has fallen off the live API member list. Kept as a
+        separate query (WHERE current_clan_tag = ? vs WHERE player_tag IN (...)) rather than
+        derived from get_player_owners_for_tags_sync's result, since a departed player is by
+        definition NOT in the live member-tag list that query is scoped to."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not clan_tag:
+            return {}
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT player_tag, discord_id, verified
+                    FROM user_players
+                    WHERE current_clan_tag = ?
+                    ORDER BY verified DESC
+                    """,
+                    (clan_tag,),
+                ).fetchall()
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_player_owners_for_clan_sync failed: {e}")
+                return {}
+
+        owners: Dict[str, str] = {}
+        for row in rows:
+            owners.setdefault(row["player_tag"], row["discord_id"])
+        return owners
+
     def bulk_create_cwl_signups_sync(self, event_id: int, signups: List[Dict[str, Any]]) -> bool:
         """Bulk-insert cwl_signups rows for Start Enrollment's template-copy step. Idempotent via
         ON CONFLICT(event_id, player_tag) DO NOTHING — safe to re-run without clobbering a row a

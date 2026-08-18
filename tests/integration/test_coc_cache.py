@@ -118,6 +118,7 @@ async def test_update_player_info_maps_coc_role_name_correctly():
         "4": {"players": [_player("#P4")]},
     }
     cache_manager.persist_user = AsyncMock()
+    cache_manager.db_manager = None  # exercise the full-scan fallback
 
     cache = CoCClanCache()
     await cache.update_player_info_in_user_accounts(clan_obj, cache_manager)

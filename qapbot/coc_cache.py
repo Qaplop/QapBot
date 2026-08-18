@@ -514,6 +514,61 @@ class CoCClanCache:
             await self.cache_manager.persist_clan(clan_tag)  # type: ignore[arg-type]
             logging.info(f"[WARLOG-STATUS] {clan_tag} war log changed to private (detected via clan endpoint)")
     
+    def _apply_member_field_updates(
+        self, player: Dict[str, Any], member: Any, clan_obj: 'coc.Clan'
+    ) -> tuple[bool, Optional[str]]:
+        """Apply the TH/clan-tag/name/role updates for one already-tracked player against a
+        fresh clan-member API record. Shared by both branches of
+        update_player_info_in_user_accounts() (DB-indexed lookup and the full-scan fallback) so
+        the field semantics can't drift between them. Returns (changed, new_name) — new_name is
+        set only when the name actually changed, for the caller's player_name_index propagation.
+        """
+        changed = False
+        player_tag = player.get("player_tag")  # type: ignore[union-attr]
+
+        # Update TH level
+        old_th: Optional[int] = player.get("th_level")  # type: ignore[assignment]
+        new_th: int = member.town_hall  # type: ignore[attr-defined]
+        if old_th != new_th:
+            player["th_level"] = new_th
+            changed = True
+            logging.debug(f"[USER-ACCOUNTS-UPDATE] {player_tag}: TH {old_th} -> {new_th}")
+
+        # Update current clan tag (name looked up from clan_name_cache)
+        old_clan_tag: Optional[str] = player.get("current_clan_tag")  # type: ignore[assignment]
+        new_clan_tag: str = clan_obj.tag  # type: ignore[assignment, attr-defined]
+        if old_clan_tag != new_clan_tag:
+            player["current_clan_tag"] = new_clan_tag
+            changed = True
+            logging.debug(f"[USER-ACCOUNTS-UPDATE] {player_tag}: Clan updated to {new_clan_tag}")
+
+        # Update player name (CoC API is authoritative for current name)
+        new_name_out: Optional[str] = None
+        old_name: Optional[str] = player.get("player_name")  # type: ignore[assignment]
+        new_name: str = member.name  # type: ignore[attr-defined]
+        if old_name != new_name:
+            player["player_name"] = new_name
+            changed = True
+            new_name_out = new_name
+            logging.info(f"[PLAYER-NAME-UPDATE] {player_tag}: '{old_name}' -> '{new_name}'")
+
+        # Update CoC in-game role (member/elder/coLeader/leader)
+        old_coc_role: Optional[str] = player.get("coc_role")  # type: ignore[assignment]
+        raw_member_role = getattr(member, "role", None)  # type: ignore[attr-defined]
+        # Use role.name instead of str() or .value:
+        # str(Role.leader) == "Leader" (title-case) — won't match our keys
+        # Role.elder.value == "admin" — won't match "elder"
+        # Role.name gives "member", "elder", "co_leader", "leader"
+        # Map co_leader → coLeader to match COC_ROLE_PRIORITY
+        _raw_name: Optional[str] = getattr(raw_member_role, "name", None) if raw_member_role else None
+        new_coc_role: Optional[str] = ("coLeader" if _raw_name == "co_leader" else _raw_name) if _raw_name else None
+        if old_coc_role != new_coc_role:
+            player["coc_role"] = new_coc_role
+            changed = True
+            logging.debug(f"[USER-ACCOUNTS-UPDATE] {player_tag}: CoC role {old_coc_role} -> {new_coc_role}")
+
+        return changed, new_name_out
+
     async def update_player_info_in_user_accounts(self, clan_obj: 'coc.Clan', cache_manager: 'CacheManager') -> None:
         """
         Update TH level and clan info for every player this clan-info API response mentions —
@@ -530,117 +585,116 @@ class CoCClanCache:
         This keeps user_players current with player TH levels and clan membership without
         requiring individual API calls per player.
 
+        2026-08-18: was two full O(len(user_accounts)) synchronous scans (no `await` inside
+        either loop, so it blocked the whole event loop — every other concurrently in-flight
+        clan fetch stalled with it, not just this one). Now uses
+        db_manager.get_player_owners_for_tags_sync()/get_player_owners_for_clan_sync() —
+        idx_user_players_player_tag / idx_user_players_clan_tag indexed lookups bounded by this
+        clan's roster size, not by total registered accounts — the same "stop scanning
+        in-memory, query the indexed SQL table instead" move as the recent
+        PLAYER_NAME_INDEX_RETIREMENT_PLAN.md work. Falls back to the full scan when db_manager
+        isn't available (should not happen in a running bot; kept for safety/tests).
+
         Args:
             clan_obj: CoC Clan object with member data
             cache_manager: CacheManager instance with user_accounts data
         """
         # Build lookup: player_tag -> member data
         clan_members = {member.tag: member for member in clan_obj.members}  # type: ignore[misc, attr-defined]
+        clan_tag_str: str = str(clan_obj.tag)  # type: ignore[attr-defined]
 
         # Track changes
         changes_made = False
         affected_user_ids: List[str] = []
         name_changes: List[tuple[str, str]] = []  # (player_tag, new_name) for index update
-        tracked_tags: Set[str] = set()
 
-        # Update all registered players who are in this clan (including the UNASSIGNED pool —
-        # see the docstring above for why that's no longer skipped)
-        for user_id, user_data in cache_manager.user_accounts.items():
-            # Skip invalid entries (shouldn't happen after validation)
-            if not isinstance(user_data, dict):  # type: ignore[misc]
-                continue
+        # (user_id, player_dict, member) for already-tracked players in this clan's live roster,
+        # and (user_id, player_dict) for tracked players who have departed it.
+        member_updates: List[tuple[str, Dict[str, Any], Any]] = []
+        departure_candidates: List[tuple[str, Dict[str, Any]]] = []
+        new_tags: List[str]
 
-            players = user_data.get("players", [])
-            for player in players:
-                if not isinstance(player, dict):
+        if cache_manager.db_manager is not None:
+            member_tags = list(clan_members.keys())
+            owners_for_members, owners_for_clan = await asyncio.gather(
+                asyncio.to_thread(cache_manager.db_manager.get_player_owners_for_tags_sync, member_tags),
+                asyncio.to_thread(cache_manager.db_manager.get_player_owners_for_clan_sync, clan_tag_str),
+            )
+
+            for tag, discord_id in owners_for_members.items():
+                user_data = cache_manager.user_accounts.get(discord_id)
+                if not isinstance(user_data, dict):  # type: ignore[misc]
+                    continue  # DB row present but in-memory cache lacks it — cache/DB drift, skip
+                player = next(
+                    (p for p in user_data.get("players", []) if isinstance(p, dict) and p.get("player_tag") == tag),
+                    None,
+                )
+                if player is None:
                     continue
+                member_updates.append((discord_id, player, clan_members[tag]))
 
-                player_tag = player.get("player_tag")  # type: ignore[union-attr]
-                if player_tag:
-                    tracked_tags.add(player_tag)
-                if player_tag in clan_members:
-                    member = clan_members[player_tag]
-                    
-                    # Update TH level
-                    old_th: Optional[int] = player.get("th_level")  # type: ignore[assignment]
-                    new_th: int = member.town_hall  # type: ignore[attr-defined]
-                    if old_th != new_th:
-                        player["th_level"] = new_th
-                        changes_made = True
-                        if user_id not in affected_user_ids:
-                            affected_user_ids.append(user_id)
-                        logging.debug(f"[USER-ACCOUNTS-UPDATE] {player_tag}: TH {old_th} -> {new_th}")
-                    
-                    # Update current clan tag (name looked up from clan_name_cache)
-                    old_clan_tag: Optional[str] = player.get("current_clan_tag")  # type: ignore[assignment]
-                    new_clan_tag: str = clan_obj.tag  # type: ignore[assignment, attr-defined]
-                    
-                    if old_clan_tag != new_clan_tag:
-                        player["current_clan_tag"] = new_clan_tag
-                        changes_made = True
-                        if user_id not in affected_user_ids:
-                            affected_user_ids.append(user_id)
-                        logging.debug(f"[USER-ACCOUNTS-UPDATE] {player_tag}: Clan updated to {new_clan_tag}")
-
-                    # Update player name (CoC API is authoritative for current name)
-                    old_name: Optional[str] = player.get("player_name")  # type: ignore[assignment]
-                    new_name: str = member.name  # type: ignore[attr-defined]
-                    if old_name != new_name:
-                        player["player_name"] = new_name
-                        changes_made = True
-                        if user_id not in affected_user_ids:
-                            affected_user_ids.append(user_id)
-                        if not player_tag:
-                            continue
-                        name_changes.append((str(player_tag), new_name))
-                        logging.info(
-                            f"[PLAYER-NAME-UPDATE] {player_tag}: '{old_name}' -> '{new_name}'"
-                        )
-
-                    # Update CoC in-game role (member/elder/coLeader/leader)
-                    old_coc_role: Optional[str] = player.get("coc_role")  # type: ignore[assignment]
-                    raw_member_role = getattr(member, "role", None)  # type: ignore[attr-defined]
-                    # Use role.name instead of str() or .value:
-                    # str(Role.leader) == "Leader" (title-case) — won't match our keys
-                    # Role.elder.value == "admin" — won't match "elder"
-                    # Role.name gives "member", "elder", "co_leader", "leader"
-                    # Map co_leader → coLeader to match COC_ROLE_PRIORITY
-                    _raw_name: Optional[str] = getattr(raw_member_role, "name", None) if raw_member_role else None
-                    new_coc_role: Optional[str] = ("coLeader" if _raw_name == "co_leader" else _raw_name) if _raw_name else None
-                    if old_coc_role != new_coc_role:
-                        player["coc_role"] = new_coc_role
-                        changes_made = True
-                        if user_id not in affected_user_ids:
-                            affected_user_ids.append(user_id)
-                        logging.debug(f"[USER-ACCOUNTS-UPDATE] {player_tag}: CoC role {old_coc_role} -> {new_coc_role}")
-        
-        # Detect departures: players whose current_clan_tag == this clan but are no longer in
-        # the current member list. Clear current_clan_tag so role sync stops assigning the old
-        # clan role and a fresh get_player() can set the correct new clan on next cycle.
-        clan_tag_str: str = str(clan_obj.tag)  # type: ignore[attr-defined]
-        for user_id, user_data in cache_manager.user_accounts.items():
-            if not isinstance(user_data, dict):  # type: ignore[misc]
-                continue
-            for player in user_data.get("players", []):
-                if not isinstance(player, dict):
+            for tag, discord_id in owners_for_clan.items():
+                if tag in clan_members:
+                    continue  # still a current member — not a departure
+                user_data = cache_manager.user_accounts.get(discord_id)
+                if not isinstance(user_data, dict):  # type: ignore[misc]
                     continue
-                p_tag = player.get("player_tag")  # type: ignore[union-attr]
-                if (player.get("current_clan_tag") == clan_tag_str  # type: ignore[union-attr]
-                        and p_tag not in clan_members):
-                    player["current_clan_tag"] = None
-                    logging.info(
-                        f"[USER-ACCOUNTS-UPDATE] {p_tag}: departed from {clan_tag_str} "
-                        f"(not in current member list) — clearing current_clan_tag"
-                    )
-                    changes_made = True
-                    if user_id not in affected_user_ids:
-                        affected_user_ids.append(user_id)
+                player = next(
+                    (p for p in user_data.get("players", []) if isinstance(p, dict) and p.get("player_tag") == tag),
+                    None,
+                )
+                if player is None or player.get("current_clan_tag") != clan_tag_str:
+                    continue  # already changed since the DB snapshot — leave it alone
+                departure_candidates.append((discord_id, player))
+
+            new_tags = [tag for tag in clan_members if tag not in owners_for_members]
+        else:
+            # Fallback: no DB to query (should not happen in a running bot). Correct but
+            # O(len(user_accounts)) — full scan over every registered player, including UNASSIGNED.
+            tracked_tags: Set[str] = set()
+            for user_id, user_data in cache_manager.user_accounts.items():
+                if not isinstance(user_data, dict):  # type: ignore[misc]
+                    continue
+                for player in user_data.get("players", []):
+                    if not isinstance(player, dict):
+                        continue
+                    tag = player.get("player_tag")  # type: ignore[union-attr]
+                    if tag:
+                        tracked_tags.add(tag)
+                    if tag in clan_members:
+                        member_updates.append((user_id, player, clan_members[tag]))
+                    elif player.get("current_clan_tag") == clan_tag_str:  # type: ignore[union-attr]
+                        departure_candidates.append((user_id, player))
+            new_tags = [tag for tag in clan_members if tag not in tracked_tags]
+
+        # Apply field updates for already-tracked members in this clan's live roster.
+        for user_id, player, member in member_updates:
+            changed, new_name = self._apply_member_field_updates(player, member, clan_obj)
+            if changed:
+                changes_made = True
+                if user_id not in affected_user_ids:
+                    affected_user_ids.append(user_id)
+            if new_name is not None:
+                name_changes.append((str(player.get("player_tag")), new_name))  # type: ignore[union-attr]
+
+        # Clear current_clan_tag for tracked players no longer in the live member list, so role
+        # sync stops assigning the old clan role and a fresh get_player() can set the correct
+        # new clan on next cycle.
+        for user_id, player in departure_candidates:
+            p_tag = player.get("player_tag")  # type: ignore[union-attr]
+            player["current_clan_tag"] = None
+            logging.info(
+                f"[USER-ACCOUNTS-UPDATE] {p_tag}: departed from {clan_tag_str} "
+                f"(not in current member list) — clearing current_clan_tag"
+            )
+            changes_made = True
+            if user_id not in affected_user_ids:
+                affected_user_ids.append(user_id)
 
         # Any clan member this bot has never tracked in any account (registered or UNASSIGNED)
         # gets a brand-new UNASSIGNED-pool entry — the only way a never-linked player ends up
         # with a user_players row at all, so features like get_current_clan_members_sync() (the
         # "Manage Enrollment" board's player pool) can find them from day one.
-        new_tags = [tag for tag in clan_members if tag not in tracked_tags]
         if new_tags:
             unassigned_entry = cache_manager.user_accounts.setdefault(
                 "UNASSIGNED", {"display_name": "UNASSIGNED", "players": []}
