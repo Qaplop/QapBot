@@ -131,3 +131,136 @@ class TestVerifyApiToken:
             ok, msg = await cm.verify_api_token("#P1", "bad_token")
             assert ok is False
             assert isinstance(msg, str) and len(msg) > 0
+
+
+# ---------------------------------------------------------------------------
+# send_user_dm / send_user_dm_detailed (2026-08-18, item 3 of the CWL enrollment redesign: a
+# transient discord.DiscordServerError used to be re-raised here instead of returning False like
+# every other failure path, which let one recipient's Discord hiccup abort an entire batch DM
+# loop — e.g. start_cwl_enrollment()'s per-recipient loop had no try/except of its own).
+# ---------------------------------------------------------------------------
+
+class TestSendUserDmDetailed:
+    @pytest.mark.asyncio
+    async def test_success(self):
+        cm = _make_cm()
+        user = MagicMock()
+        user.name = "tester"
+        user.send = AsyncMock()
+        cm.get_user_for_dm = AsyncMock(return_value=user)
+
+        sent, outcome = await cm.send_user_dm_detailed("123", "hello")
+
+        assert (sent, outcome) == (True, "sent")
+        user.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_user_could_not_be_fetched_is_failed_not_blocked(self):
+        # get_user_for_dm() already swallows the specific reason (including a transient 5xx
+        # during the fetch itself) and just returns None — "failed" not "blocked" since we don't
+        # actually know the recipient has DMs closed, only that the fetch didn't work.
+        cm = _make_cm()
+        cm.get_user_for_dm = AsyncMock(return_value=None)
+
+        sent, outcome = await cm.send_user_dm_detailed("123", "hello")
+
+        assert (sent, outcome) == (False, "failed")
+
+    @pytest.mark.asyncio
+    async def test_forbidden_is_blocked_with_no_retry(self):
+        import discord
+
+        cm = _make_cm()
+        user = MagicMock()
+        user.send = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "no perms"))
+        cm.get_user_for_dm = AsyncMock(return_value=user)
+
+        sent, outcome = await cm.send_user_dm_detailed("123", "hello")
+
+        assert (sent, outcome) == (False, "blocked")
+        assert user.send.await_count == 1  # not worth retrying a block
+
+    @pytest.mark.asyncio
+    async def test_not_found_is_blocked_with_no_retry(self):
+        import discord
+
+        cm = _make_cm()
+        user = MagicMock()
+        user.send = AsyncMock(side_effect=discord.NotFound(MagicMock(), "unknown user"))
+        cm.get_user_for_dm = AsyncMock(return_value=user)
+
+        sent, outcome = await cm.send_user_dm_detailed("123", "hello")
+
+        assert (sent, outcome) == (False, "blocked")
+        assert user.send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_is_failed_with_no_retry(self):
+        cm = _make_cm()
+        user = MagicMock()
+        user.send = AsyncMock(side_effect=RuntimeError("boom"))
+        cm.get_user_for_dm = AsyncMock(return_value=user)
+
+        sent, outcome = await cm.send_user_dm_detailed("123", "hello")
+
+        assert (sent, outcome) == (False, "failed")
+        assert user.send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_server_error_retries_then_succeeds(self):
+        import discord
+
+        cm = _make_cm()
+        user = MagicMock()
+        user.name = "tester"
+        error = discord.DiscordServerError(MagicMock(status=503), "outage")
+        user.send = AsyncMock(side_effect=[error, error, None])  # fails twice, then works
+        cm.get_user_for_dm = AsyncMock(return_value=user)
+
+        with patch("qapbot.cache_manager.asyncio.sleep", new_callable=AsyncMock):
+            sent, outcome = await cm.send_user_dm_detailed("123", "hello")
+
+        assert (sent, outcome) == (True, "sent")
+        assert user.send.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_transient_server_error_never_raises_even_after_exhausting_retries(self):
+        # The actual bug this fixes: this must return, never raise — a caller looping over many
+        # recipients (start_cwl_enrollment) must be able to keep going to the next one.
+        import discord
+        from qapbot.cache_manager import DM_SEND_MAX_RETRIES
+
+        cm = _make_cm()
+        user = MagicMock()
+        error = discord.DiscordServerError(MagicMock(status=503), "outage")
+        user.send = AsyncMock(side_effect=error)
+        cm.get_user_for_dm = AsyncMock(return_value=user)
+
+        with patch("qapbot.cache_manager.asyncio.sleep", new_callable=AsyncMock):
+            sent, outcome = await cm.send_user_dm_detailed("123", "hello")
+
+        assert (sent, outcome) == (False, "failed")
+        assert user.send.await_count == DM_SEND_MAX_RETRIES
+
+
+class TestSendUserDm:
+    """send_user_dm() is now a thin bool-only wrapper around send_user_dm_detailed() — the many
+    existing callers across the bot that only care about success/failure keep working unchanged."""
+
+    @pytest.mark.asyncio
+    async def test_wraps_detailed_result_as_bool_true(self):
+        cm = _make_cm()
+        cm.send_user_dm_detailed = AsyncMock(return_value=(True, "sent"))
+
+        result = await cm.send_user_dm("123", "hello")
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_wraps_detailed_result_as_bool_false(self):
+        cm = _make_cm()
+        cm.send_user_dm_detailed = AsyncMock(return_value=(False, "blocked"))
+
+        result = await cm.send_user_dm("123", "hello")
+
+        assert result is False

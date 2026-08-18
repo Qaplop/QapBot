@@ -1,6 +1,249 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-18 (75)
+- Fixed: the "Shared CWL Clan" notification always claimed "Your guild is the recognized owner
+  (real in-game Leader/Co-Leader)" even when `resolve_cwl_clan_owner()` couldn't find a
+  resolvable Leader/Co-Leader in ANY affected guild and correctly fell back to
+  `owner_resolution_method='unresolved_first_claimer'` (live-tested in DEV, project owner's
+  report — NOT a race condition, the resolver was already detecting this correctly; the
+  notification text just never branched on the actual resolution method).
+  - `qapbot/QBdiscocmdshelper_cwl.py`: `ensure_cwl_clan_sharing()`'s two return paths
+    (`_create_new_shared_clan_sync`, `_attach_guild_to_existing_shared_clan_sync`) now include
+    `owner_resolution_method` in their returned dict (it was computed/stored in the DB all along,
+    just never passed through to the caller).
+  - `qapbot/ui_cwl_roster.py`: `notify_cwl_clan_shared()` now shows an honest "ownership is
+    unresolved for now, no eviction rights granted" message for the unresolved case, instead of
+    a false ownership claim; the genuinely-resolved case is unchanged.
+  - New tests in `tests/discord/test_ui_cwl_roster.py`. Full suite: 2100 passed, 4 deselected.
+    Python backend change — needs the DEV bot process restarted to take effect.
+
+2026-08-18 (74)
+- Fixed: the guest-clan checkbox and its "Remove" button were landing on visibly different
+  lines/heights (plain inline siblings inside a narrow `<td>`), not vertically centered against
+  each other as intended (live-tested in DEV, project owner's report). Added an inner flex
+  wrapper (`.checkbox-cell-inner`) around both — the `<td>` itself stays `display: table-cell`
+  (required for correct table row/column layout), so the flex centering lives on this wrapper
+  div instead.
+  - `activity/client/src/clanConfigTable.ts`, `activity/client/index.html`.
+  - `tsc --noEmit` clean. Deployed to DEV only: https://b6bcdda8.cwl-clan-config-dev.pages.dev
+
+2026-08-18 (73)
+- Fixed: two more live-tested-in-DEV bugs in the CWL enrollment player-pool redesign
+  (`CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md`).
+  1. "Remove guest clan didn't remove the players from the player pool" — `remove_cwl_guest_clan()`
+     only ran the destructive local-pool cleanup for a clan that was never cross-guild shared; a
+     SHARED guest clan only got the cross-guild detach bookkeeping, which never touches this
+     guild's own local `cwl_signups`/`cwl_assignments` rows for the clan's real current members.
+     Fixed by running `_cleanup_local_pool_for_plain_clan_deactivation_sync` unconditionally
+     (after the shared-detach step when applicable) — verified by reverting the fix, confirming
+     the new regression test fails, then restoring it.
+  2. "the AKATSUKI guest clan being in the list but unchecked... the members of that clan should
+     be in the player pool but they aren't" — a clan added to the roster while its checkbox
+     stayed unchecked never triggered `auto_assign_prior_cwl_members()` at all (the only
+     post-Start-Enrollment pool-seeding hook), since that only ran for clans newly turning
+     `participating=True`. Pool membership must not depend on the checkbox (rule b/d). Fixed by
+     also triggering it for any clan genuinely NEW to the roster this save regardless of
+     participating state; `_auto_assign_prior_cwl_members_sync` itself now skips actually
+     assigning anyone into a non-participating clan's column (still not a valid target) while
+     still running its plain pool-visibility seed unconditionally. Also verified via a
+     revert-confirm-restore cycle.
+  - `qapbot/QBdiscocmdshelper_cwl.py`, `qapbot/web_bridge.py`. New regression tests in
+    `tests/unit/test_cwl_clan_ownership.py` and `tests/discord/test_web_bridge.py`. Full suite:
+    2098 passed, 4 deselected. **Both fixes are Python backend changes — need the DEV bot process
+    restarted to take effect**, unlike the Cloudflare deploys below.
+
+2026-08-18 (71)
+- Fixed: pasting into the "Guests" search box (Configure Participating Clans) sometimes swallowed
+  the native `input` event inside the Discord Activity's sandboxed iframe — the pasted text still
+  visibly landed in the field (that part isn't JS-driven), but the debounced search never fired,
+  and every later keystroke inherited the same dead state until the admin closed and reopened the
+  view (live-tested in DEV, project owner's report).
+  - `activity/client/src/clanConfigTable.ts`: extracted the search trigger into
+    `handleSearchInput()`, wired to both `input` (unchanged) and a new `paste` listener (deferred
+    one tick via `setTimeout(…, 0)` so `.value` has actually been updated by the time it reads it)
+    — a second, independent way to notice the same change if the native `input` event gets lost.
+  - `tsc --noEmit` clean. Deployed to DEV only: https://ee647060.cwl-clan-config-dev.pages.dev
+
+2026-08-18 (70)
+- Fixed: the three new CWL endpoints added in Phases 4-5 of
+  `CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md` (`POST /cwl/enrollment/guest-clan/remove`,
+  `GET /cwl/enrollment/guest-players`, `POST /cwl/enrollment/guest-players/remove`) 404'd
+  unconditionally in the DEV Activity — "Remove Guest Players…" reported `Failed to load: 404:
+  {"error":"not found",...}` regardless of whether any guest players actually existed. Root
+  cause: `qapbot/web_bridge.py` got the new routes, but `activity/server/src/index.ts` — a
+  separate Cloudflare Worker that authenticates the Activity's Discord user and proxies each
+  request on to the Python bridge — never got matching proxy routes registered, so its own Hono
+  router 404'd every one of these three calls before they ever reached the bridge.
+  - `activity/server/src/index.ts`: added the three missing proxy routes, same
+    verify-identity-then-forward pattern as every existing CWL route in this file.
+  - `tsc --noEmit` clean (this Worker has no test suite). Deployed to DEV only
+    (`cwl-clan-config-server-dev`, distinct Worker from `-prod`) via `npm run deploy:dev`:
+    https://cwl-clan-config-server-dev.qapbotdev.workers.dev
+
+2026-08-18 (69)
+- Deployed: `activity/client` (the CWL Activity frontend — clan-config table, guest-clan
+  Remove button, "Remove Guest Players" panel from Phase 4 of
+  `CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md`) to DEV only via `npm run deploy:dev`.
+  DEV deploy URL: https://b258628a.cwl-clan-config-dev.pages.dev
+
+2026-08-18 (68)
+- Added: cross-guild CWL enrollment status — rule h of
+  `CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md` Phase 5, completing the enrollment redesign
+  (project owner's spec, verbatim: "we generally need only one enrollment DM per player
+  regardless of how many guilds and/or clans invite him... The player has a global 'Got dm
+  message already' attribute... Then the player accepts or declines or is pending and that
+  status is shown automatically in guild a's and guild B's clan rosters. no need to manage
+  anything manually"). A player already DMed/responded via one guild's CWL event is never
+  DMed again by a second guild pooling them for the same season, and their real response
+  propagates automatically to every guild's board.
+  - `qapbot/QBdiscocmdshelper_cwl.py`: `start_cwl_enrollment()`'s seeding loop now seeds each
+    candidate's REAL global status (from the Phase-2 `cwl_player_season_status` table) instead
+    of hardcoding 'pending'; `_send_cwl_enrollment_dm_batch()` skips anyone already globally
+    DMed (`skipped_already_dm_globally`) and records a successful send via
+    `mark_cwl_player_dm_sent_sync`. New `propagate_cwl_player_response()` (generalizes the
+    existing `sync_cwl_shared_clan_roster_to_local_pools` one-shared-clan pattern to the whole
+    season): writes the global response record, then fans it out to every OTHER guild's
+    `cwl_signups` row and every shared clan's roster for that same player+season. New
+    `has_cwl_pool_members_missing_dm()` — a cheap, plain-synchronous gating check (mirrors
+    `start_cwl_enrollment`'s own pool computation, NOT the heavier enrollment-payload builder,
+    since it runs on the synchronous CWL Management screen render path).
+  - `qapbot/ui_cwl_roster.py`: `CwlSignupResponseButton.callback` (the DM confirm/opt-out
+    button) and `web_bridge.py`'s `_apply_cwl_enrollment_signup_sync` (the admin's manual
+    board confirm) both now call the propagation and bump every additional affected guild's
+    enrollment version. New "Notify New Pool Members" button + confirm dialog
+    (`add_cwl_management_components`, row 2) — shown only when enrollment is open and someone's
+    still missing a DM; reuses the Start Enrollment summary's blocked/failed reporting.
+  - `qapbot/web_bridge.py`: new `notify_new_cwl_pool_members()` — re-resolves the live pool and
+    runs it through the shared DM batch helper, so the global dedup naturally limits it to
+    not-yet-contacted members.
+  - Tests: new cross-guild propagation tests in `tests/discord/test_ui_cwl_roster.py` (DM
+    button) and `tests/discord/test_web_bridge.py` (admin manual confirm, `notify_new_cwl_pool_
+    members`, button-gating). New dedup regression test in
+    `tests/integration/test_cwl_start_enrollment.py`. Full suite: 2095 passed, 4 deselected.
+    **All 5 phases of the CWL enrollment player-pool redesign are now complete.**
+
+2026-08-18 (67)
+- Added: "Remove Guest Players" — rule g of `CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md` Phase
+  4 (project owner's spec), completing the guest pool management rework started in (66). A new
+  collapsed-by-default panel on "Configure Participating Clans" lists every currently-pooled
+  guest player (individually invited, or an orphaned leftover from a rule-f guest-clan removal)
+  with a multi-select checkbox list, so an admin can remove them from the player pool (and any
+  clan-roster assignment) without needing the clan-level Remove button.
+  - `qapbot/web_bridge.py`: new `GET /api/cwl/enrollment/guest-players` (reuses
+    `_build_enrollment_payload_sync`'s existing `is_guest` computation rather than re-deriving
+    it — Cardinal Rule 4) and `POST /api/cwl/enrollment/guest-players/remove` (per tag:
+    `delete_cwl_assignment_sync` + `delete_cwl_signup_sync`, deliberately leaves
+    `cwl_player_season_status` — Phase 2's schema — untouched, so a removed-then-re-added guest
+    player is still recognized as already-contacted once rule h wires that up in Phase 5).
+  - `activity/client/src/`: new "Remove Guest Players…" toggle + panel in `clanConfigTable.ts`
+    (fetches fresh on open, multi-select + Remove Selected/Cancel, same inline-confirmation
+    conventions as the rest of this screen); `main.ts`/`types.ts` wired to match.
+  - Tests: new `test_guest_players_list_includes_invited_and_orphaned_but_not_family` and
+    `test_guest_players_remove_purges_pool_but_not_global_status` in
+    `tests/discord/test_web_bridge.py` (the latter also confirms the Phase-2 global dm_sent
+    record survives removal, per rule h's future requirement). Frontend `tsc --noEmit` clean.
+    Full suite: 2087 passed, 4 deselected. **Phase 4 of the CWL enrollment redesign is now
+    complete** (rules c/d/e/f/g all done); Phase 5 (rule h) remains.
+
+2026-08-18 (66)
+- Changed: CWL guest-clan pool management, rules e/f of
+  `CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md` Phase 4 (project owner's spec). Unchecking a
+  guest clan in "Configure Participating Clans" and saving used to automatically purge its
+  members' `cwl_signups`/`cwl_assignments` rows from the player pool — now purely cosmetic (just
+  drops it off the active roster); the same destructive purge moved to a new explicit "Remove"
+  button, placed right of each guest clan's checkbox, which also deletes the clan's
+  `cwl_event_clans` row entirely. The "Send enrollment DM immediately (players only)" checkbox on
+  guest player invites is removed — guest players are pool-only adds now, DMed only when Start
+  Enrollment runs (or later via the rule-h "notify new members" flow, Phase 5).
+  - `qapbot/QBdiscocmdshelper_cwl.py`: `detach_guild_from_shared_clan_on_deactivation`'s
+    non-shared branch no longer calls `_cleanup_local_pool_for_plain_clan_deactivation_sync`
+    automatically; new `remove_cwl_guest_clan()` orchestrates the full removal (reuses that same
+    cleanup function, or the shared-clan detach path, then deletes the `cwl_event_clans` row).
+  - `qapbot/web_bridge.py`: new `POST /api/cwl/enrollment/guest-clan/remove` (rejects a family
+    clan tag outright); `handle_post_cwl_enrollment_guest` no longer sends an immediate DM;
+    `_build_clan_config_payload_sync` now returns a per-clan `is_guest` flag (from
+    `resolve_guild_member_clan_tags`, the real CWL-family definition — not the broader
+    `get_guild_clans_including_member_config`).
+  - `qapbot/db_manager.py`: new `delete_cwl_event_clan_sync`.
+  - `activity/client/src/`: `clanConfigTable.ts` drops the DM checkbox, adds the guest-clan
+    Remove button (inline Yes/Cancel confirm, matching the existing guest-add pattern) gated on
+    `ClanConfig.is_guest`; `main.ts`/`types.ts` updated to match.
+  - Tests: 7 `test_plain_guest_clan_detach_*` tests in `tests/unit/test_cwl_clan_ownership.py`
+    retargeted to the new `remove_cwl_guest_clan()` entry point (same cleanup logic, just
+    triggered differently now); new tests in `tests/discord/test_web_bridge.py` covering the
+    non-destructive uncheck, the new Remove endpoint's success/family-rejection/404 paths, and
+    the guest-invite endpoint no longer sending a DM. Frontend `tsc --noEmit` clean. Full suite:
+    2085 passed, 4 deselected.
+
+2026-08-18 (65)
+- Fixed: the actual root cause of the live bug that started this whole redesign — CWL
+  enrollment's player pool (`start_cwl_enrollment()`) only ever seeded/DMed clans currently
+  toggled `participating` for the event, so a guild member with linked accounts spread across
+  several of the guild's own clans only got the enrollment DM for whichever accounts happened
+  to be in a clan someone had remembered to toggle on. Rule b of
+  `CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md` Phase 3, project owner's spec: "when a guild
+  starts a new season ALL memebrs of all clans should be put to the player pool regardless of
+  participation status of each clan."
+  - `QBdiscocmdshelper_cwl.py`: `start_cwl_enrollment()`'s candidate-pool line now unions the
+    guild's whole family (`resolve_guild_member_clan_tags`, regardless of participating) with
+    every clan ever configured for the event (participating or not — covers a guest clan
+    unchecked before Start Enrollment ran too). `participating_clan_tags` itself is untouched —
+    still governs the auto-assignment *target* restriction and the cross-guild sharing check.
+  - Tests: new `test_non_participating_family_clan_members_are_still_pooled_and_dmed` in
+    `tests/integration/test_cwl_start_enrollment.py`, reproducing the exact reported scenario
+    (a family clan not toggled participating still gets its members pooled/DMed; a genuinely
+    unrelated clan still doesn't). Full suite: 2081 passed, 4 deselected.
+
+2026-08-18 (64)
+- Added: `cwl_player_season_status` table — a normalized, cross-guild record of one real-world
+  player's CWL enrollment status per season, independent of which guild(s)/clan(s) currently
+  pool them. Phase 2 of `CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md` (rule h's "normalized
+  data model" for never DMing the same player twice for a season, and for a player's
+  confirm/decline response to auto-propagate across every guild pooling them). Schema-only —
+  not wired into any caller yet (that's Phase 5).
+  - `db_manager.py`: new table (`dm_sent`/`dm_sent_at`/`dm_sent_via_*` vs `status`/
+    `responded_at`/`responded_via_*` — two independent facts, written by two separate methods,
+    mirroring `cwl_shared_clan_players`' existing status/assigned split) plus
+    `get_cwl_player_season_status_sync`, `get_cwl_player_season_dm_status_bulk_sync`,
+    `get_cwl_player_season_status_bulk_sync`, `mark_cwl_player_dm_sent_sync`,
+    `set_cwl_player_response_status_sync`, `find_cwl_signup_events_for_player_and_season_sync`,
+    `find_cwl_shared_clan_ids_for_player_and_season_sync`, `update_cwl_signup_status_sync`
+    (narrow, never creates a row), and `delete_cwl_event_clan_sync` (rule f's future guest-clan
+    Remove button).
+  - Tests: new `TestCwlPlayerSeasonStatus` class in `tests/unit/test_db_manager_cwl_roster.py`
+    (round-trip CRUD, dm_sent/status independence, season-scoped fan-out target lookups,
+    narrow-update never-creates guard, delete-one-row-only guard). Full suite: 2080 passed, 4
+    deselected.
+
+2026-08-18 (63)
+- Fixed: CWL enrollment's DM-sending loop (`start_cwl_enrollment()`) could be silently aborted
+  mid-batch by a single transient Discord 5xx error — `CacheManager.send_user_dm()` used to
+  re-raise `discord.DiscordServerError` instead of returning `False` like every other failure
+  path, and the CWL loop had no try/except of its own, so every recipient after the failing one
+  never got DMed and the event stayed stuck in `status='draft'` (the transition to
+  `signup_open` runs after the loop). Phase 1 of `CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md`
+  (multi-phase rework of the CWL player-pool/enrollment-DM flow, prompted by a live bug where a
+  multi-account test user only got DMed for some of his linked accounts).
+  - `cache_manager.py`: `send_user_dm()` is now a thin bool wrapper around a new
+    `send_user_dm_detailed()`, which retries a `DiscordServerError` up to `DM_SEND_MAX_RETRIES`
+    (3) with a short backoff and never re-raises, returning `(bool, "sent"|"blocked"|"failed")` —
+    `"blocked"` (DMs closed/bot blocked/user gone) is never retried, `"failed"` is a transient
+    error that didn't recover.
+  - `QBdiscocmdshelper_cwl.py`: the DM loop extracted into `_send_cwl_enrollment_dm_batch()`,
+    collecting `blocked`/`failed` recipient-name lists into `start_cwl_enrollment()`'s summary.
+    `send_cwl_signup_template_dm()` now returns `(bool, outcome)` (its other caller,
+    `web_bridge.py`'s `handle_post_cwl_enrollment_guest`, updated to unpack).
+  - `ui_cwl_roster.py` + `en.json`/`de.json`: the Start Enrollment admin summary now reports
+    blocked/failed recipients by name instead of the failure disappearing silently.
+  - Tests: new `TestSendUserDmDetailed`/`TestSendUserDm` classes in
+    `tests/unit/test_cache_manager_async.py` (retry-then-succeed, exhausted-retries never
+    raises, Forbidden/NotFound never retried); new
+    `test_one_recipients_dm_failure_does_not_abort_the_rest_of_the_batch` in
+    `tests/integration/test_cwl_start_enrollment.py`; ~20 existing CWL enrollment tests and 2
+    `test_web_bridge.py` guest-invite tests updated for the `send_user_dm`/
+    `send_cwl_signup_template_dm` signature changes. Full suite: 2074 passed, 4 deselected.
+
 2026-08-18 (62)
 - Added: `/whois` player-report embed's clan info line now also shows the clan's CWL league
   tier (e.g. "Master League I"), read from `CACHE.clan_name_cache[...]["war_league"]" — the

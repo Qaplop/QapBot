@@ -166,11 +166,11 @@ async def test_seeds_signups_and_dms_linked_confirmed_accounts(db, monkeypatch):
 
     sent_dms = []
 
-    async def fake_send_user_dm(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
         sent_dms.append((user_id, message, view))
-        return True
+        return True, "sent"
 
-    monkeypatch.setattr(CACHE, "send_user_dm", fake_send_user_dm)
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
 
     summary = await start_cwl_enrollment(1005, "2026-08")
 
@@ -193,6 +193,159 @@ async def test_seeds_signups_and_dms_linked_confirmed_accounts(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_one_recipients_dm_failure_does_not_abort_the_rest_of_the_batch(db, monkeypatch):
+    """2026-08-18, item 3 of the enrollment redesign: a Discord error for one recipient used to
+    re-raise out of CACHE.send_user_dm() and abort start_cwl_enrollment()'s whole DM loop —
+    every recipient after the failing one never got DMed, and the event never reached
+    signup_open (that transition runs after the loop). The fix now lives one layer down in
+    cache_manager.py (retried, never re-raised) — this asserts the outcome an admin actually
+    cares about: every OTHER recipient still gets DMed, the event still opens, and the failure
+    is reported back instead of silently vanishing."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    await _seed_guild_and_clan(db, "1030")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(db, "d1", "#P1")  # this one's DM "fails" (retries exhausted)
+    await _seed_current_clan_member(db, "d2", "#P2")  # must still be reached afterward
+    await _make_event(db, "1030", "2026-08")
+
+    contacted = []
+
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
+        if user_id == "d1":
+            return False, "failed"
+        contacted.append(user_id)
+        return True, "sent"
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
+
+    summary = await start_cwl_enrollment(1030, "2026-08")
+
+    assert summary["ok"] is True
+    assert summary["seeded"] == 2
+    assert summary["contacted"] == 1
+    assert contacted == ["d2"]  # d2 was still reached despite d1's failure
+    assert summary["failed"] == ["Player"]  # d1's player_name, reported back for follow-up
+    assert summary["blocked"] == []
+    assert db.get_cwl_event_sync("1030", "2026-08")["status"] == "signup_open"
+
+
+@pytest.mark.asyncio
+async def test_non_participating_family_clan_members_are_still_pooled_and_dmed(db, monkeypatch):
+    """The original live bug report this whole redesign started from: a test user ("Lucas")
+    with linked accounts across several clans in one guild's family only got enrollment DMs for
+    SOME of them — the accounts whose clan happened to be toggled `participating` for this CWL
+    event. Rule b (2026-08-18, project owner's spec, verbatim): "when a guild starts a new
+    season ALL memebrs of all clans should be put to the player pool regardless of participation
+    status of each clan." #CLAN2 here is a real family clan (same as #CLAN1) but NOT toggled
+    participating for this event — its member must still be seeded and DMed. #OTHER_CLAN is a
+    genuinely unrelated clan (neither family nor configured on this event at all) and must still
+    be excluded — this isn't "pool literally everyone in the database," just the whole family."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    guild_id = "1031"
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#CLAN1', 'Clan One')")
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#CLAN2', 'Clan Two')")
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHER_CLAN', 'Unrelated Clan')")
+    await db.conn.commit()
+    # Both #CLAN1 and #CLAN2 are this guild's own family — #OTHER_CLAN is not.
+    CACHE.server_config[guild_id] = {"member_clans": ["#CLAN1", "#CLAN2"], "member_families": []}
+    monkeypatch.setattr(CACHE, "db_manager", db)
+
+    await _seed_current_clan_member(db, "d1", "#P1", clan_tag="#CLAN1")
+    await _seed_current_clan_member(db, "d2", "#P2", clan_tag="#CLAN2")  # family, but not participating
+    await _seed_current_clan_member(db, "d3", "#P3", clan_tag="#OTHER_CLAN")  # not family at all
+
+    event_id = db.create_cwl_event_sync(guild_id, "2026-08", "creator")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#CLAN1", "participating": True},
+        {"clan_tag": "#CLAN2", "participating": False},
+    ])
+
+    contacted = []
+
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
+        contacted.append(user_id)
+        return True, "sent"
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
+
+    summary = await start_cwl_enrollment(int(guild_id), "2026-08")
+
+    assert summary["ok"] is True
+    assert summary["seeded"] == 2  # #P1 and #P2 — not #P3
+    assert summary["contacted"] == 2
+    assert sorted(contacted) == ["d1", "d2"]
+    assert db.get_cwl_signup_sync(event_id, "#P1") is not None
+    assert db.get_cwl_signup_sync(event_id, "#P2") is not None  # the fix: non-participating family clan, still pooled
+    assert db.get_cwl_signup_sync(event_id, "#P3") is None  # genuinely unrelated clan, still excluded
+
+
+@pytest.mark.asyncio
+async def test_globally_already_dmed_player_is_seeded_with_real_status_but_not_redmed(db, monkeypatch):
+    """Rule h (2026-08-18, project owner's spec, verbatim): "we generally need only one
+    enrollment DM per player regardless of how many guilds and/or clans invite him... Then the
+    player accepts or declines or is pending and that status is shown automatically in guild A's
+    and guild B's clan rosters." Simulates the cross-guild scenario without needing a second real
+    guild: #P1 already has a global cwl_player_season_status row (as if some OTHER guild's Start
+    Enrollment already DMed and they confirmed) before THIS guild's Start Enrollment runs."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    await _seed_guild_and_clan(db, "1032")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(db, "d1", "#P1")  # already globally DMed+confirmed elsewhere
+    await _seed_current_clan_member(db, "d2", "#P2")  # never contacted by anyone yet
+    await _make_event(db, "1032", "2026-08")
+
+    db.mark_cwl_player_dm_sent_sync("#P1", "2026-08", "Player", "d1", 999, 999, "2026-08-17T09:00Z")
+    db.set_cwl_player_response_status_sync("#P1", "2026-08", "Player", "d1", "confirmed", "2026-08-17T09:05Z", 999, 999)
+
+    contacted = []
+
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
+        contacted.append(user_id)
+        return True, "sent"
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
+
+    summary = await start_cwl_enrollment(1032, "2026-08")
+
+    assert summary["ok"] is True
+    assert summary["seeded"] == 2
+    assert summary["contacted"] == 1
+    assert summary["skipped_already_dm_globally"] == 1
+    assert contacted == ["d2"]  # #P1 (d1) was NOT re-DMed
+
+    event_id = db.get_cwl_event_sync("1032", "2026-08")["id"]
+    p1_signup = db.get_cwl_signup_sync(event_id, "#P1")
+    assert p1_signup["status"] == "confirmed"  # seeded with the REAL global status, not 'pending'
+    p2_signup = db.get_cwl_signup_sync(event_id, "#P2")
+    assert p2_signup["status"] == "pending"  # never contacted anywhere -> genuinely pending
+
+
+@pytest.mark.asyncio
 async def test_departed_member_is_not_seeded(db, monkeypatch):
     """A player currently in a different clan (or no clan at all) must not be pulled into this
     clan's enrollment, even if they were previously in it — matches live membership only."""
@@ -206,7 +359,7 @@ async def test_departed_member_is_not_seeded(db, monkeypatch):
     await _seed_current_clan_member(db, "d1", "#P1", clan_tag="#OTHER_CLAN")
     await _make_event(db, "1009", "2026-08", clan_tag="#CLAN1")
 
-    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
 
     summary = await start_cwl_enrollment(1009, "2026-08")
     assert summary["seeded"] == 0
@@ -222,7 +375,7 @@ async def test_skips_permanently_opted_out_accounts(db, monkeypatch):
     await _seed_current_clan_member(db, "d1", "#P1", cwl_permanent_optout=True)
     await _make_event(db, "1006", "2026-08")
 
-    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
 
     summary = await start_cwl_enrollment(1006, "2026-08")
 
@@ -256,11 +409,11 @@ async def test_dm_guard_only_dms_the_configured_server_admin_in_dev(db, monkeypa
 
     sent_to = []
 
-    async def fake_send_user_dm(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
         sent_to.append(user_id)
-        return True
+        return True, "sent"
 
-    monkeypatch.setattr(CACHE, "send_user_dm", fake_send_user_dm)
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
 
     summary = await start_cwl_enrollment(1007, "2026-08")
 
@@ -292,11 +445,11 @@ async def test_dm_guard_only_dms_the_configured_server_admin_in_prod(db, monkeyp
 
     sent_to = []
 
-    async def fake_send_user_dm(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
         sent_to.append(user_id)
-        return True
+        return True, "sent"
 
-    monkeypatch.setattr(CACHE, "send_user_dm", fake_send_user_dm)
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
 
     summary = await start_cwl_enrollment(1009, "2026-08")
 
@@ -330,11 +483,11 @@ async def test_dm_guard_also_dms_enrolled_testers_in_prod(db, monkeypatch):
 
     sent_to = []
 
-    async def fake_send_user_dm(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
         sent_to.append(user_id)
-        return True
+        return True, "sent"
 
-    monkeypatch.setattr(CACHE, "send_user_dm", fake_send_user_dm)
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
 
     summary = await start_cwl_enrollment(1010, "2026-08")
 
@@ -366,11 +519,11 @@ async def test_dm_guard_ignores_testers_in_dev(db, monkeypatch):
 
     sent_to = []
 
-    async def fake_send_user_dm(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
         sent_to.append(user_id)
-        return True
+        return True, "sent"
 
-    monkeypatch.setattr(CACHE, "send_user_dm", fake_send_user_dm)
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
 
     summary = await start_cwl_enrollment(1011, "2026-08")
 
@@ -398,11 +551,11 @@ async def test_prod_mode_is_unaffected_when_dm_guard_disabled(db, monkeypatch):
 
     sent_to = []
 
-    async def fake_send_user_dm(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
         sent_to.append(user_id)
-        return True
+        return True, "sent"
 
-    monkeypatch.setattr(CACHE, "send_user_dm", fake_send_user_dm)
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
 
     summary = await start_cwl_enrollment(1008, "2026-08")
 
@@ -422,7 +575,7 @@ async def test_seeds_auto_assignments_from_last_months_cwl_activity(db, monkeypa
     await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha")])
     await _make_event(db, "1010", "2026-08")
 
-    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
 
     summary = await start_cwl_enrollment(1010, "2026-08")
 
@@ -462,7 +615,7 @@ async def test_seeds_auto_assignments_for_a_guest_clans_own_current_members(db, 
         {"clan_tag": "#CLAN1", "participating": True},
         {"clan_tag": "#GUESTCLAN", "participating": True},
     ])
-    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
 
     summary = await start_cwl_enrollment(guild_id, "2026-08")
 
@@ -486,7 +639,7 @@ async def test_departed_member_is_not_auto_assigned(db, monkeypatch):
     await _seed_cwl_war(db, "#CLAN1", [("#P1", "Alpha")])
     await _make_event(db, "1011", "2026-08")
 
-    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
 
     summary = await start_cwl_enrollment(1011, "2026-08")
 
@@ -505,7 +658,7 @@ async def test_no_cwl_history_leaves_player_unassigned(db, monkeypatch):
     await _seed_current_clan_member(db, "d1", "#P1")  # never played CWL
     await _make_event(db, "1012", "2026-08")
 
-    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
 
     summary = await start_cwl_enrollment(1012, "2026-08")
 
@@ -531,7 +684,7 @@ async def test_account_wide_expansion_off_by_default(db, monkeypatch):
     await _seed_current_clan_member(db, "d1", "#P2", clan_tag="#QCREW")
     await _make_event(db, "1013", "2026-08")
 
-    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
 
     summary = await start_cwl_enrollment(1013, "2026-08")
 
@@ -561,7 +714,7 @@ async def test_account_wide_expansion_pulls_in_other_clan_players_when_enabled(d
     await _seed_current_clan_member(db, "d2", "#P3", clan_tag="#OTHER")
     await _make_event(db, "1014", "2026-08")
 
-    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
 
     summary = await start_cwl_enrollment(1014, "2026-08")
 
@@ -591,7 +744,7 @@ async def test_start_enrollment_detects_and_reports_shared_clan(db, monkeypatch)
     db.set_cwl_event_clans_sync(other_event_id, [{"clan_tag": "#CLAN1", "participating": True}])
 
     await _make_event(db, "1015", "2026-08")
-    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
 
     summary = await start_cwl_enrollment(1015, "2026-08")
 
@@ -641,7 +794,7 @@ async def test_start_enrollment_never_double_books_a_confirmed_shared_clan_guest
     # auto-assign them there, if not for already being a deliberately-placed guest elsewhere.
     await _seed_current_clan_member(db, "d1", "#QMANIAC", "#CLAN1")
     await _seed_cwl_war(db, "#CLAN1", [("#QMANIAC", "QManiac")])
-    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
 
     summary = await start_cwl_enrollment(1020, "2026-08")
 
@@ -690,7 +843,7 @@ async def test_start_enrollment_shows_confirmed_shared_guest_as_orphaned_when_sh
 
     await _seed_current_clan_member(db, "d1", "#QMANIAC", "#CLAN1")
     await _seed_cwl_war(db, "#CLAN1", [("#QMANIAC", "QManiac")])
-    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
 
     summary = await start_cwl_enrollment(1021, "2026-08")
 
@@ -710,7 +863,7 @@ async def test_start_enrollment_shared_clans_empty_when_nothing_shared(db, monke
     await _seed_guild_and_clan(db, "1016", clan_tag="#CLAN1")
     monkeypatch.setattr(CACHE, "db_manager", db)
     await _make_event(db, "1016", "2026-08")
-    monkeypatch.setattr(CACHE, "send_user_dm", AsyncMock(return_value=True))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
 
     summary = await start_cwl_enrollment(1016, "2026-08")
 

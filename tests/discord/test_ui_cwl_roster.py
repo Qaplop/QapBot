@@ -50,6 +50,96 @@ async def _seed_guild_and_clans(db: WarHistoryDB, guild_id: str, clan_tags: Dict
 
 
 # ---------------------------------------------------------------------------
+# notify_cwl_clan_shared — ownership-message honesty (2026-08-18)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_notify_cwl_clan_shared_reports_unresolved_ownership_honestly(monkeypatch):
+    """Bug fixed 2026-08-18 (live-tested in DEV, project owner's report, verbatim: "the message
+    is wrong. akatsuki doesn't have a leader in our guild!! but it doesn't have the leader in the
+    other guild as well. is this a race condition?"). NOT a race condition — resolve_cwl_clan_
+    owner() (QBdiscocmdshelper_cwl.py) already correctly detects "no resolvable Leader/Co-Leader
+    anywhere" and returns owner_resolution_method='unresolved_first_claimer'; this notification
+    just always claimed "real in-game Leader/Co-Leader" ownership regardless of that."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import notify_cwl_clan_shared
+
+    CACHE.clan_name_cache = {"#AKATSUKI": {"name": "!!AKATSUKI!!"}}
+
+    posted = []
+
+    async def fake_post(guild_id, message, discord_id):
+        posted.append((guild_id, message))
+
+    monkeypatch.setattr("qapbot.ui_cwl_roster._post_cwl_shared_clan_notice", fake_post)
+
+    import QBcore
+    fake_guild = MagicMock()
+    fake_guild.name = "CoC | Stay"
+    monkeypatch.setattr(QBcore, "bot", MagicMock(get_guild=MagicMock(return_value=fake_guild)))
+
+    await notify_cwl_clan_shared(
+        acting_guild_id=100,
+        clan_tag="#AKATSUKI",
+        season="2026-09",
+        sharing_result={
+            "shared_clan_id": 1,
+            "owner_guild_id": "100",
+            "owner_resolution_method": "unresolved_first_claimer",
+            "is_new": True,
+            "other_guild_ids": ["200"],
+        },
+        acting_discord_id=42,
+    )
+
+    acting_message = posted[0][1]
+    assert "recognized owner" not in acting_message  # the fix — no false ownership claim
+    assert "unresolved" in acting_message.lower()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_notify_cwl_clan_shared_still_names_a_real_resolved_owner(monkeypatch):
+    """Sibling case — a genuinely resolved owner (leader/co-leader found) must still get the
+    original, accurate ownership claim, unaffected by the unresolved-case fix."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import notify_cwl_clan_shared
+
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha"}}
+
+    posted = []
+
+    async def fake_post(guild_id, message, discord_id):
+        posted.append((guild_id, message))
+
+    monkeypatch.setattr("qapbot.ui_cwl_roster._post_cwl_shared_clan_notice", fake_post)
+
+    import QBcore
+    fake_guild = MagicMock()
+    fake_guild.name = "Other Guild"
+    monkeypatch.setattr(QBcore, "bot", MagicMock(get_guild=MagicMock(return_value=fake_guild)))
+
+    await notify_cwl_clan_shared(
+        acting_guild_id=100,
+        clan_tag="#CLAN1",
+        season="2026-09",
+        sharing_result={
+            "shared_clan_id": 1,
+            "owner_guild_id": "100",
+            "owner_resolution_method": "leader_verified",
+            "is_new": True,
+            "other_guild_ids": ["200"],
+        },
+        acting_discord_id=42,
+    )
+
+    acting_message = posted[0][1]
+    assert "real in-game Leader/Co-Leader" in acting_message
+    assert "recognized owner" in acting_message
+
+
+# ---------------------------------------------------------------------------
 # format_clan_management_message() dispatch — entry point (a)
 # ---------------------------------------------------------------------------
 
@@ -1179,6 +1269,92 @@ async def test_add_season_button_visible_when_current_season_does_not_exist(db):
     assert any(getattr(c, "custom_id", None) == "cwl_management_add_season" for c in view.children)
 
 
+def _notify_new_members_button(view: discord.ui.View):
+    return next(
+        (c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_notify_new_members"), None
+    )
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_notify_new_members_button_absent_while_draft(db):
+    """Rule h (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md) — the button only makes
+    sense once enrollment has actually started (a draft event has no DMs sent yet at all)."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    await _seed_guild_and_clans(db, "8891", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["8891"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    event_id = db.create_cwl_event_sync("8891", "2026-08", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('10', '10')")
+    await db.conn.execute(
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
+        "VALUES ('10', '#P1', 'Player', 1, '#CLAN1')"
+    )
+    await db.conn.commit()
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 8891)
+
+    assert _notify_new_members_button(view) is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_notify_new_members_button_absent_when_everyone_already_dmed(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    await _seed_guild_and_clans(db, "8892", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["8892"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    event_id = db.create_cwl_event_sync("8892", "2026-08", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    db.update_cwl_event_status_sync(event_id, "signup_open")
+    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('10', '10')")
+    await db.conn.execute(
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
+        "VALUES ('10', '#P1', 'Player', 1, '#CLAN1')"
+    )
+    await db.conn.commit()
+    db.mark_cwl_player_dm_sent_sync("#P1", "2026-08", "Player", "10", event_id, 8892, "2026-08-18T09:00Z")
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 8892)
+
+    assert _notify_new_members_button(view) is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_notify_new_members_button_present_when_someone_missing_dm(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    await _seed_guild_and_clans(db, "8893", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["8893"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    event_id = db.create_cwl_event_sync("8893", "2026-08", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    db.update_cwl_event_status_sync(event_id, "signup_open")
+    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('10', '10')")
+    await db.conn.execute(
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
+        "VALUES ('10', '#P1', 'Player', 1, '#CLAN1')"
+    )
+    await db.conn.commit()
+    # Never marked dm_sent — a genuinely new/never-contacted pool member.
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 8893)
+
+    button = _notify_new_members_button(view)
+    assert button is not None
+    assert button.row == 2  # type: ignore[union-attr]
+
+
 # ---------------------------------------------------------------------------
 # Start Enrollment (Phase 2) — button gating, confirm dialog, DynamicItem DM buttons
 # ---------------------------------------------------------------------------
@@ -1476,6 +1652,53 @@ class TestCwlSignupResponseButton:
 
         bump_spy.assert_awaited_once_with(9104)
         assert web_bridge_module._enrollment_version.get("9104", 0) == before + 1
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
+    async def test_confirm_click_propagates_to_another_guilds_local_signup(self, db, mock_interaction, monkeypatch):
+        """Rule h (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md, project owner's
+        spec, verbatim): "The player has a global 'Got dm message already' attribute that is
+        valid for guild a and b regardless of which guild sent the dm first. Then the player
+        accepts or declines or is pending and that status is shown automatically in guild a's
+        and guild B's clan rosters. no need to manage anything manually." This DM's custom_id
+        only ever names ONE event (guild 9106, the one that actually sent it) — a second guild
+        (9107) already pooling the same real-world player for the same season must see the
+        response too, with zero action from that guild's own admin."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlSignupResponseButton
+        import qapbot.web_bridge as web_bridge_module
+
+        await _seed_guild_and_clans(db, "9106", {"#CLAN1": "Alpha"})
+        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('9107')")
+        await db.conn.commit()
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9106", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "123456789", None, "template_confirm", "pending")
+
+        # A second guild's event, same season, same real-world player already pooled there too
+        # (e.g. via its own guest-invite) — must be updated automatically, no separate DM.
+        other_event_id = db.create_cwl_event_sync("9107", "2026-08", "otherdiscordid")
+        db.upsert_cwl_signup_sync(other_event_id, "#P1", "Alpha", "123456789", None, "guest_invite", "pending")
+
+        mock_interaction.user.id = 123456789
+        mock_interaction.response.edit_message = AsyncMock()
+
+        bump_spy = AsyncMock(wraps=web_bridge_module.bump_enrollment_version)
+        monkeypatch.setattr(web_bridge_module, "bump_enrollment_version", bump_spy)
+
+        button = CwlSignupResponseButton("confirm", event_id, "#P1")
+        await button.callback(mock_interaction)
+
+        assert db.get_cwl_signup_sync(event_id, "#P1")["status"] == "confirmed"
+        assert db.get_cwl_signup_sync(other_event_id, "#P1")["status"] == "confirmed"  # propagated
+        bumped_guilds = {call.args[0] for call in bump_spy.await_args_list}
+        assert bumped_guilds == {9106, 9107}
+
+        global_status = db.get_cwl_player_season_status_sync("#P1", "2026-08")
+        assert global_status is not None
+        assert global_status["status"] == "confirmed"
 
     @pytest.mark.discord
     @pytest.mark.asyncio

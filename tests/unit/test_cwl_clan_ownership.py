@@ -1136,6 +1136,39 @@ async def test_orphaned_assignment_gets_purged_when_owning_guild_reassigns_elsew
     assert "#STUCK" not in assignments
 
 
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_remove_guest_clan_purges_local_pool_even_when_clan_is_shared(db, monkeypatch):
+    """Bug fixed 2026-08-18 (live-tested in DEV, project owner's report, verbatim: "Remove guest
+    clan didn't remove the players from the player pool!"). remove_cwl_guest_clan() used to only
+    run the destructive local-pool cleanup (_cleanup_local_pool_for_plain_clan_deactivation_sync)
+    for a clan that was NEVER cross-guild shared — a shared one only got
+    detach_guild_from_shared_clan_on_deactivation's cross-guild bookkeeping, which never touches
+    THIS guild's own local cwl_signups/cwl_assignments rows for the clan's real current members
+    (only whatever happens to already be registered in cwl_shared_clan_players). Fixed by running
+    the local cleanup unconditionally, after the shared-detach step."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": [], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "100", "200")
+
+    # A real current member of the shared clan, with a genuine LOCAL signup/assignment on the
+    # owner guild's own board — never registered in cwl_shared_clan_players at all (the exact gap
+    # the shared-detach branch alone can't see, since it only iterates that table).
+    await _seed_current_clan_member(db, "10", "#P1", "#CLAN1")
+    db.upsert_cwl_signup_sync(owner_event_id, "#P1", "P1", "10", None, "template_confirm", "pending")
+    db.upsert_cwl_assignment_sync(owner_event_id, "#P1", "#CLAN1", assignment_source="suggested", locked=False)
+
+    await remove_cwl_guest_clan(100, owner_event_id, "2026-09", "#CLAN1")
+
+    assert db.get_cwl_signup_sync(owner_event_id, "#P1") is None  # the fix
+    assert db.get_cwl_assignments_sync(owner_event_id) == []
+    assert db.get_cwl_event_clans_sync(owner_event_id) == []  # the clan row itself is gone too
+
+
 # ---------------------------------------------------------------------------
 # detach_guild_from_shared_clan_on_deactivation — the `shared is None` branch: a PLAIN guest clan
 # (never cross-guild shared with anyone else). 2026-08-16 follow-up, live-testing feedback,
@@ -1151,7 +1184,7 @@ async def test_orphaned_assignment_gets_purged_when_owning_guild_reassigns_elsew
 @pytest.mark.asyncio
 async def test_plain_guest_clan_detach_removes_auto_assigned_and_auto_seeded_players(db, monkeypatch):
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
 
     monkeypatch.setattr(CACHE, "db_manager", db)
     monkeypatch.setattr(CACHE, "server_config", {"300": {"member_clans": [], "member_families": []}})
@@ -1168,7 +1201,7 @@ async def test_plain_guest_clan_detach_removes_auto_assigned_and_auto_seeded_pla
     # #AUTO_SEEDED: step-2's pure visibility placeholder — pending, no assignment at all.
     db.upsert_cwl_signup_sync(event_id, "#AUTO_SEEDED", "Seeded", "20", None, "auto_seeded", "pending")
 
-    await detach_guild_from_shared_clan_on_deactivation(300, event_id, "2026-09", "#GUESTCLAN")
+    await remove_cwl_guest_clan(300, event_id, "2026-09", "#GUESTCLAN")
 
     assert db.get_cwl_signup_sync(event_id, "#AUTO_ASSIGNED") is None
     assert db.get_cwl_signup_sync(event_id, "#AUTO_SEEDED") is None
@@ -1178,13 +1211,13 @@ async def test_plain_guest_clan_detach_removes_auto_assigned_and_auto_seeded_pla
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_plain_guest_clan_detach_preserves_deliberate_admin_override_assignment(db, monkeypatch):
+async def test_plain_guest_clan_remove_preserves_deliberate_admin_override_assignment(db, monkeypatch):
     """A genuine human drag-and-drop placement must survive — same "Assigned to other Guild"
     treatment the shared-clan branch gives its own admin_override players, except here the local
     cwl_assignments row already IS the real assignment (no shared table to mirror from), so
     preserving it is simply not deleting it."""
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
 
     monkeypatch.setattr(CACHE, "db_manager", db)
     monkeypatch.setattr(CACHE, "server_config", {"301": {"member_clans": [], "member_families": []}})
@@ -1196,7 +1229,7 @@ async def test_plain_guest_clan_detach_preserves_deliberate_admin_override_assig
     db.upsert_cwl_signup_sync(event_id, "#DRAGGED", "Dragged", "10", None, "admin_added", "pending")
     db.upsert_cwl_assignment_sync(event_id, "#DRAGGED", "#GUESTCLAN", assignment_source="admin_override", locked=True)
 
-    await detach_guild_from_shared_clan_on_deactivation(301, event_id, "2026-09", "#GUESTCLAN")
+    await remove_cwl_guest_clan(301, event_id, "2026-09", "#GUESTCLAN")
 
     signup = db.get_cwl_signup_sync(event_id, "#DRAGGED")
     assert signup is not None
@@ -1211,7 +1244,7 @@ async def test_plain_guest_clan_detach_never_deletes_a_genuine_family_members_si
     their local signup deleted, even if they also happen to carry old auto_assigned/auto_seeded
     history from the guest clan (e.g. from before they moved into the family clan)."""
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
 
     monkeypatch.setattr(CACHE, "db_manager", db)
     monkeypatch.setattr(CACHE, "server_config", {"302": {"member_clans": ["#FAMILY_CLAN"], "member_families": []}})
@@ -1229,7 +1262,7 @@ async def test_plain_guest_clan_detach_never_deletes_a_genuine_family_members_si
     db.upsert_cwl_signup_sync(event_id, "#REAL_SIGNUP", "Real", "10", None, "template_confirm", "confirmed")
     db.upsert_cwl_assignment_sync(event_id, "#REAL_SIGNUP", "#GUESTCLAN", assignment_source="suggested", locked=False)
 
-    await detach_guild_from_shared_clan_on_deactivation(302, event_id, "2026-09", "#GUESTCLAN")
+    await remove_cwl_guest_clan(302, event_id, "2026-09", "#GUESTCLAN")
 
     signup = db.get_cwl_signup_sync(event_id, "#REAL_SIGNUP")
     assert signup is not None
@@ -1255,7 +1288,7 @@ async def test_plain_guest_clan_detach_never_deletes_a_genuine_family_members_si
 @pytest.mark.asyncio
 async def test_plain_guest_clan_detach_removes_discord_linked_alt_in_unrelated_clan(db, monkeypatch):
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
 
     monkeypatch.setattr(CACHE, "db_manager", db)
     monkeypatch.setattr(CACHE, "server_config", {"303": {"member_clans": [], "member_families": []}})
@@ -1272,7 +1305,7 @@ async def test_plain_guest_clan_detach_removes_discord_linked_alt_in_unrelated_c
     db.upsert_cwl_signup_sync(event_id, "#P1", "P1", "50", None, "template_confirm", "pending")
     db.upsert_cwl_signup_sync(event_id, "#P2", "P2", "50", None, "template_confirm", "pending")
 
-    await detach_guild_from_shared_clan_on_deactivation(303, event_id, "2026-09", "#GUESTCLAN")
+    await remove_cwl_guest_clan(303, event_id, "2026-09", "#GUESTCLAN")
 
     assert db.get_cwl_signup_sync(event_id, "#P1") is None
     assert db.get_cwl_signup_sync(event_id, "#P2") is None  # the alt gets swept too
@@ -1282,7 +1315,7 @@ async def test_plain_guest_clan_detach_removes_discord_linked_alt_in_unrelated_c
 @pytest.mark.asyncio
 async def test_plain_guest_clan_detach_keeps_discord_linked_alt_in_family_clan_unconditionally(db, monkeypatch):
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
 
     monkeypatch.setattr(CACHE, "db_manager", db)
     # No cwl_enrollment_include_all_linked_accounts set at all — family protection must not
@@ -1301,7 +1334,7 @@ async def test_plain_guest_clan_detach_keeps_discord_linked_alt_in_family_clan_u
     db.upsert_cwl_signup_sync(event_id, "#P1", "P1", "60", None, "template_confirm", "pending")
     db.upsert_cwl_signup_sync(event_id, "#P2", "P2", "60", None, "template_confirm", "pending")
 
-    await detach_guild_from_shared_clan_on_deactivation(304, event_id, "2026-09", "#GUESTCLAN")
+    await remove_cwl_guest_clan(304, event_id, "2026-09", "#GUESTCLAN")
 
     # BOTH survive — the whole linked account is protected once any of its players is a genuine
     # family-clan member, unconditionally.
@@ -1313,7 +1346,7 @@ async def test_plain_guest_clan_detach_keeps_discord_linked_alt_in_family_clan_u
 @pytest.mark.asyncio
 async def test_plain_guest_clan_detach_keeps_discord_linked_alt_in_other_guest_clan_when_toggle_on(db, monkeypatch):
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
 
     monkeypatch.setattr(CACHE, "db_manager", db)
     monkeypatch.setattr(CACHE, "server_config", {
@@ -1335,7 +1368,7 @@ async def test_plain_guest_clan_detach_keeps_discord_linked_alt_in_other_guest_c
     db.upsert_cwl_signup_sync(event_id, "#P1", "P1", "70", None, "template_confirm", "pending")
     db.upsert_cwl_signup_sync(event_id, "#P2", "P2", "70", None, "template_confirm", "pending")
 
-    await detach_guild_from_shared_clan_on_deactivation(305, event_id, "2026-09", "#GUESTCLAN")
+    await remove_cwl_guest_clan(305, event_id, "2026-09", "#GUESTCLAN")
 
     # BOTH survive: #P2 is a direct #OTHERGUEST member (unconditional); #P1 is only linked, but
     # the expansion toggle is currently on, so it's protected too.
@@ -1347,7 +1380,7 @@ async def test_plain_guest_clan_detach_keeps_discord_linked_alt_in_other_guest_c
 @pytest.mark.asyncio
 async def test_plain_guest_clan_detach_removes_discord_linked_alt_in_other_guest_clan_when_toggle_off(db, monkeypatch):
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
 
     monkeypatch.setattr(CACHE, "db_manager", db)
     # cwl_enrollment_include_all_linked_accounts left off (default False).
@@ -1366,7 +1399,7 @@ async def test_plain_guest_clan_detach_removes_discord_linked_alt_in_other_guest
     db.upsert_cwl_signup_sync(event_id, "#P1", "P1", "80", None, "template_confirm", "pending")
     db.upsert_cwl_signup_sync(event_id, "#P2", "P2", "80", None, "template_confirm", "pending")
 
-    await detach_guild_from_shared_clan_on_deactivation(306, event_id, "2026-09", "#GUESTCLAN")
+    await remove_cwl_guest_clan(306, event_id, "2026-09", "#GUESTCLAN")
 
     # #P2 still survives (direct #OTHERGUEST membership is unconditional), but #P1 — only ever
     # linked, never a direct #OTHERGUEST member — is removed since the expansion toggle is off.

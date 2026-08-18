@@ -821,11 +821,21 @@
       "button_confirm_start_enrollment": "Yes, Start Enrollment",
       "start_enrollment_confirm_body": "⚠️ Start enrollment for season **{season}**? This copies last season's roster as a template and sends every resolved member a confirm/opt-out DM. This cannot be undone.",
       "start_enrollment_processing": "⏳ Starting enrollment — sending DMs, this can take a few seconds…",
-      "start_enrollment_summary": "✅ Enrollment started.\nSeeded: {seeded}\nPre-assigned from last month's CWL: {assigned}\nContacted: {contacted}\nSkipped (opted out): {skipped_optout}\nSkipped (no linked account): {skipped_unlinked}\nSkipped (DM guard): {skipped_dm_guard}",
+      "start_enrollment_summary": "✅ Enrollment started.\nSeeded: {seeded}\nPre-assigned from last month's CWL: {assigned}\nContacted: {contacted}\nSkipped (opted out): {skipped_optout}\nSkipped (no linked account): {skipped_unlinked}\nSkipped (DM guard): {skipped_dm_guard}{dm_issues}",
+      "start_enrollment_dm_blocked_line": "\n⚠️ Blocked (DMs disabled or bot blocked, not retried): {names}",
+      "start_enrollment_dm_failed_line": "\n⚠️ Failed after {retries} retries, may be transient — retry manually later: {names}",
       "start_enrollment_error_no_database": "⚠️ Database not ready — try again shortly.",
       "start_enrollment_error_no_event": "⚠️ No CWL event found for this season anymore — it may have been deleted.",
       "start_enrollment_error_not_draft": "⚠️ Enrollment has already been started for this season.",
-      "start_enrollment_error_no_clans": "⚠️ Add at least one participating clan before starting enrollment."
+      "start_enrollment_error_no_clans": "⚠️ Add at least one participating clan before starting enrollment.",
+      "button_notify_new_members": "Notify New Pool Members",
+      "button_confirm_notify_new_members": "Yes, Send DMs",
+      "notify_new_members_confirm_body": "📋 Send the enrollment confirm/opt-out DM to every pool member who hasn't received it yet for season **{season}**?",
+      "notify_new_members_processing": "⏳ Sending DMs to newly-added pool members, this can take a few seconds…",
+      "notify_new_members_summary": "✅ Done.\nContacted: {contacted}\nSkipped (DM guard): {skipped_dm_guard}\nAlready contacted (another guild): {skipped_already_dm_globally}{dm_issues}",
+      "notify_new_members_error_no_database": "⚠️ Database not ready — try again shortly.",
+      "notify_new_members_error_no_event": "⚠️ No CWL event found for this season anymore — it may have been deleted.",
+      "notify_new_members_error_not_open": "⚠️ Enrollment hasn't been started yet for this season."
     },
     "setup": {
       "button_cancel": "Cancel"

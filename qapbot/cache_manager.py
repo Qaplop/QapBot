@@ -45,7 +45,7 @@ import hashlib
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone as _dt_timezone
-from typing import Dict, Any, Tuple, List, Optional, Set, cast, TYPE_CHECKING
+from typing import Dict, Any, Tuple, List, Literal, Optional, Set, cast, TYPE_CHECKING
 import discord
 import coc  # type: ignore[import-untyped]
 import re
@@ -66,6 +66,11 @@ from qapbot.coc_cache import CoCClanCache
 # War-ended evictions still fire independently; this cap is a safety net.
 MAX_TEMP_WAR_OBJECTS = 100_000
 _MAX_TEMP_WAR_OBJECTS = MAX_TEMP_WAR_OBJECTS
+
+# A transient Discord 5xx during send_user_dm() is retried this many times (2026-08-18, project
+# owner's spec: "a discord error should not lead to the stop of the enrollment process... 3 times
+# retry if a dm send fails") before giving up and reporting the recipient as failed.
+DM_SEND_MAX_RETRIES = 3
 
 def _de_n(v: int) -> str:
     """Format integer with European thousand separator (period)."""
@@ -1296,7 +1301,8 @@ class CacheManager:
         Send DM to user, handling fetch and metadata update internally.
 
         Centralizes DM sending with automatic user fetching and metadata updates.
-        Handles common exceptions (Forbidden, NotFound) gracefully.
+        Handles common exceptions (Forbidden, NotFound) gracefully. Thin wrapper around
+        send_user_dm_detailed() for the many callers that only care whether it worked.
 
         Args:
             user_id: Discord user ID (string or int)
@@ -1312,36 +1318,91 @@ class CacheManager:
             if not success:
                 logging.warning(f"Could not DM user {user_id}")
         """
+        sent, _outcome = await self.send_user_dm_detailed(user_id, message, view=view, embed=embed)
+        return sent
+
+    async def send_user_dm_detailed(
+        self,
+        user_id: str,
+        message: str,
+        view: Optional['discord.ui.View'] = None,
+        embed: Optional['discord.Embed'] = None,
+    ) -> Tuple[bool, Literal["sent", "blocked", "failed"]]:
+        """
+        Send DM to user, handling fetch and metadata update internally, and retrying a
+        transient Discord server error up to DM_SEND_MAX_RETRIES times before giving up.
+
+        Single choke point for every DM this bot sends (2026-08-15, project owner's spec:
+        "log when a DM is sent... so I can track when and to whom") — every real call site
+        funnels through this method (directly or via send_user_dm()), so one log line here
+        covers all of them.
+
+        A discord.DiscordServerError (Discord 5xx — transient outage/overload) used to be
+        re-raised here, which meant one recipient's transient failure aborted every OTHER
+        recipient in whatever batch loop was calling this (2026-08-18, live-testing bug found
+        while investigating lost CWL enrollment DMs — the CWL DM loop had no try/except around
+        each send). It's now retried up to DM_SEND_MAX_RETRIES times with a short backoff and
+        never re-raised, matching every other failure path (Forbidden/NotFound/generic
+        Exception) — a Discord error must never stop the overall send process (project owner's
+        spec).
+
+        Returns:
+            (True, "sent") once the DM actually goes out.
+            (False, "blocked") when the recipient can't be reached at all — DMs disabled, the
+                bot is blocked, the user no longer exists, or the user couldn't be fetched. Not
+                worth retrying; distinct from "failed" so a caller reporting back to an admin
+                can say "this person blocked the bot" rather than "a retry is worth trying again
+                later."
+            (False, "failed") for a transient error that didn't recover after
+                DM_SEND_MAX_RETRIES attempts, or any other unexpected exception.
+
+        Example:
+            sent, outcome = await CACHE.send_user_dm_detailed(str(user_id), "CWL enrollment!")
+            if not sent and outcome == "blocked":
+                # tell the admin this recipient has DMs closed, retrying won't help
+                ...
+        """
         import discord
 
-        try:
-            user = await self.get_user_for_dm(user_id)
-            if not user:
-                return False
+        user = await self.get_user_for_dm(user_id)
+        if not user:
+            # get_user_for_dm() already logged the specific reason (including any transient
+            # 5xx while fetching) and returns None either way — "failed" not "blocked" since we
+            # don't actually know the recipient has DMs closed, just that the fetch didn't work.
+            return False, "failed"
 
-            await user.send(message, view=view, embed=embed)
-            # Single choke point for every DM this bot sends (2026-08-15, project owner's spec:
-            # "log when a DM is sent... so I can track when and to whom") — every real call site
-            # funnels through this one function, so one log line here covers all of them rather
-            # than needing a log line at each of the ~7 call sites individually. Preview is
-            # truncated, not the full message, to keep this readable and avoid logging anything
-            # sensitive (e.g. a confirm link) in full.
-            preview = message[:60] + ('…' if len(message) > 60 else '') if message else ''
-            logging.info(f"[DM-SENT] to user_id={user_id} ({user.name}): {preview!r}")
-            return True
+        last_error: Optional[Exception] = None
+        for attempt in range(1, DM_SEND_MAX_RETRIES + 1):
+            try:
+                await user.send(message, view=view, embed=embed)
+                # Preview is truncated, not the full message, to keep this readable and avoid
+                # logging anything sensitive (e.g. a confirm link) in full.
+                preview = message[:60] + ('…' if len(message) > 60 else '') if message else ''
+                logging.info(f"[DM-SENT] to user_id={user_id} ({user.name}): {preview!r}")
+                return True, "sent"
 
-        except discord.Forbidden:
-            logging.info(f"Cannot send DM to user {user_id}: DMs disabled or bot blocked")
-            return False
-        except discord.NotFound:
-            logging.info(f"Cannot send DM to user {user_id}: User not found")
-            return False
-        except discord.DiscordServerError as e:
-            logging.warning(f"Transient Discord server error sending DM to {user_id}: HTTP {e.status}")
-            raise
-        except Exception as e:
-            logging.error(f"Failed to send DM to user {user_id}: {e}", exc_info=True)
-            return False
+            except discord.Forbidden:
+                logging.info(f"Cannot send DM to user {user_id}: DMs disabled or bot blocked")
+                return False, "blocked"
+            except discord.NotFound:
+                logging.info(f"Cannot send DM to user {user_id}: User not found")
+                return False, "blocked"
+            except discord.DiscordServerError as e:
+                last_error = e
+                logging.warning(
+                    f"[DM-RETRY] Transient Discord server error sending DM to {user_id} "
+                    f"(attempt {attempt}/{DM_SEND_MAX_RETRIES}): HTTP {e.status}"
+                )
+                if attempt < DM_SEND_MAX_RETRIES:
+                    await asyncio.sleep(1.5 * attempt)
+            except Exception as e:
+                logging.error(f"Failed to send DM to user {user_id}: {e}", exc_info=True)
+                return False, "failed"
+
+        logging.error(
+            f"[DM-FAILED] Exhausted {DM_SEND_MAX_RETRIES} retries sending DM to {user_id}: {last_error}"
+        )
+        return False, "failed"
 
     async def get_player(self, player_tag: str) -> Optional['coc.Player']:
         """

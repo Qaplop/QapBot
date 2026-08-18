@@ -11,6 +11,7 @@ import type {
   ClanConfig,
   ClanConfigPayload,
   EnrollmentPayload,
+  GuestPlayerPoolEntry,
   GuestSearchResponse,
   ScreenPayload,
   WaitResponse,
@@ -358,7 +359,7 @@ async function setup(): Promise<void> {
         if (body.stale) return []
         return body.results
       },
-      async (result, sendDmNow: boolean) => {
+      async (result) => {
         const guestResponse = await fetch('/api/cwl/enrollment/guest', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
@@ -367,14 +368,12 @@ async function setup(): Promise<void> {
             player_tag: result.player_tag,
             player_name: result.player_name,
             discord_id: result.discord_id,
-            send_dm_on_save: sendDmNow,
           }),
         })
         if (!guestResponse.ok) {
           const body = await guestResponse.text()
           throw new Error(`${guestResponse.status}: ${body}`)
         }
-        return (await guestResponse.json()) as { dm_sent: boolean }
       },
       async (clanTag: string, targetGuildId: string) => {
         const evictResponse = await fetch('/api/cwl/shared-clan/evict', {
@@ -385,6 +384,40 @@ async function setup(): Promise<void> {
         if (!evictResponse.ok) {
           const body = await evictResponse.text()
           throw new Error(`${evictResponse.status}: ${body}`)
+        }
+      },
+      async (clanTag: string) => {
+        const removeResponse = await fetch('/api/cwl/enrollment/guest-clan/remove', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+          body: JSON.stringify({ guild_id: guildId, clan_tag: clanTag }),
+        })
+        if (!removeResponse.ok) {
+          const body = await removeResponse.text()
+          throw new Error(`${removeResponse.status}: ${body}`)
+        }
+      },
+      async () => {
+        const listResponse = await fetch(
+          `/api/cwl/enrollment/guest-players?guild_id=${encodeURIComponent(guildId)}`,
+          { headers: { Authorization: `Bearer ${accessToken}` } },
+        )
+        if (!listResponse.ok) {
+          const body = await listResponse.text()
+          throw new Error(`${listResponse.status}: ${body}`)
+        }
+        const body = (await listResponse.json()) as { players: GuestPlayerPoolEntry[] }
+        return body.players
+      },
+      async (playerTags: string[]) => {
+        const removeResponse = await fetch('/api/cwl/enrollment/guest-players/remove', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+          body: JSON.stringify({ guild_id: guildId, player_tags: playerTags }),
+        })
+        if (!removeResponse.ok) {
+          const body = await removeResponse.text()
+          throw new Error(`${removeResponse.status}: ${body}`)
         }
       },
     )

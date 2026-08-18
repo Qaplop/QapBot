@@ -2235,6 +2235,49 @@ class WarHistoryDB:
             "CREATE INDEX IF NOT EXISTS idx_cwl_shared_clan_players_shared_clan ON cwl_shared_clan_players(shared_clan_id)"
         )
 
+        # Global, cross-guild CWL player status (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_
+        # PLAN.md, rule h, project owner's spec: "a normalized data model") — one row per
+        # real-world player per CWL season, independent of which guild(s)/clan(s) currently pool
+        # them. `cwl_signups.status` and `cwl_shared_clan_players.status` remain per-event/
+        # per-shared-clan READ-optimized mirrors (unchanged read paths); this table is the single
+        # source of truth for two independent facts, following the exact same "never conflate"
+        # discipline as cwl_shared_clan_players' own status/assigned split above:
+        #   - `dm_sent` — has ANY guild already sent this player the enrollment DM this season?
+        #     Must survive a guest player being removed from one guild's pool then re-added later
+        #     (rule g/h), so it is NOT derived from cwl_signups row existence — written ONLY by
+        #     mark_cwl_player_dm_sent_sync, which never touches `status`.
+        #   - `status`/`responded_at` — the player's own genuine confirm/decline response, fanned
+        #     out to every guild's local mirror the moment it changes (propagate_cwl_player_
+        #     response(), QBdiscocmdshelper_cwl.py) — written ONLY by
+        #     set_cwl_player_response_status_sync, which never touches `dm_sent`.
+        # `dm_sent_via_*`/`responded_via_*` are audit-only, deliberately NOT foreign keys (same
+        # rationale as cwl_signups.origin_shared_clan_id) — the event/guild that first sent the DM
+        # or recorded the response may later be deleted (Delete Season) without this global record
+        # needing to be touched or cascaded.
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS cwl_player_season_status (
+                id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_tag             TEXT    NOT NULL,
+                cwl_season             TEXT    NOT NULL,
+                player_name            TEXT,
+                discord_id             TEXT,
+                dm_sent                INTEGER NOT NULL DEFAULT 0,
+                dm_sent_at             TEXT,
+                dm_sent_via_event_id   INTEGER,
+                dm_sent_via_guild_id   TEXT,
+                status                 TEXT    NOT NULL DEFAULT 'pending',
+                responded_at           TEXT,
+                responded_via_event_id INTEGER,
+                responded_via_guild_id TEXT,
+                created_at             TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_at             TEXT    NOT NULL DEFAULT (datetime('now')),
+                UNIQUE (player_tag, cwl_season)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_player_season_status_season ON cwl_player_season_status(cwl_season)"
+        )
+
         # Guild welcome-message family selections (clan-link mode, multi-select, per-family toggle)
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS guild_welcome_families (
@@ -3629,6 +3672,37 @@ class WarHistoryDB:
                 conn.rollback()
                 return False
 
+    def delete_cwl_event_clan_sync(self, event_id: int, clan_tag: str) -> bool:
+        """Remove one cwl_event_clans row entirely — as opposed to
+        deactivate_cwl_event_clan_sync's "keep the row, just stop counting it," this is a genuine
+        removal (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md, rule f's guest-clan
+        "Remove" button: unchecking a guest clan is now purely cosmetic — see
+        _cleanup_local_pool_for_plain_clan_deactivation_sync's own docstring, QBdiscocmdshelper_
+        cwl.py — and this is the only way to fully retire one from the season). Guest clans have
+        no roster_size/tier_order/cwl_start_at worth preserving across a remove/re-add cycle
+        (unlike a family clan, which is never removed this way — callers must reject that case
+        before calling this), so a full DELETE is correct here where it wouldn't be for a family
+        clan's plain deactivation toggle."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "DELETE FROM cwl_event_clans WHERE event_id = ? AND clan_tag = ?",
+                        (event_id, clan_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] delete_cwl_event_clan_sync failed for event {event_id} clan {clan_tag}: {e}")
+                conn.rollback()
+                return False
+
     def get_cwl_event_clans_sync(self, event_id: int) -> List[Dict[str, Any]]:
         """Return an event's participating clans, ordered by tier (0 = highest tier first)."""
         import sqlite3
@@ -4283,6 +4357,269 @@ class WarHistoryDB:
                     f"{origin_shared_clan_id} player {player_tag}: {e}"
                 )
                 return []
+
+    # -----------------------------------------------------------------------
+    # cwl_player_season_status — the global, cross-guild DM/response record
+    # (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md, rule h). See the CREATE TABLE
+    # comment (schema-creation method, above) for the dm_sent/status split — the two write
+    # methods below (mark_cwl_player_dm_sent_sync, set_cwl_player_response_status_sync) each
+    # touch only their own half and must never be merged into one.
+    # -----------------------------------------------------------------------
+
+    def get_cwl_player_season_status_sync(self, player_tag: str, cwl_season: str) -> Optional[Dict[str, Any]]:
+        """Return one player's global season record, or None if they've never been DMed or
+        responded for this season by any guild yet."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT * FROM cwl_player_season_status WHERE player_tag = ? AND cwl_season = ?",
+                    (player_tag, cwl_season),
+                ).fetchone()
+                return dict(row) if row is not None else None
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-QUERY-SYNC] get_cwl_player_season_status_sync failed for {player_tag}/{cwl_season}: {e}"
+                )
+                return None
+
+    def get_cwl_player_season_dm_status_bulk_sync(self, player_tags: List[str], cwl_season: str) -> Dict[str, bool]:
+        """Bulk dm_sent lookup for a whole candidate pool at once — the dedup check
+        _send_cwl_enrollment_dm_batch() (QBdiscocmdshelper_cwl.py) runs before DMing anyone, so a
+        player already contacted by ANY guild this season is never DMed a second time. A tag with
+        no row (never contacted) is simply absent from the returned dict — callers use
+        `.get(tag, False)`. Chunked manually (not via _chunked_in_query_sync, which has no slot
+        for the extra cwl_season parameter) to stay under SQLite's ~999 host-parameter limit for a
+        large pool (CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 4's same concern)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not player_tags:
+            return {}
+
+        result: Dict[str, bool] = {}
+        chunk_size = 900
+        with self._sync_conn() as conn:
+            try:
+                for i in range(0, len(player_tags), chunk_size):
+                    chunk = player_tags[i:i + chunk_size]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = conn.execute(
+                        f"SELECT player_tag, dm_sent FROM cwl_player_season_status "
+                        f"WHERE cwl_season = ? AND player_tag IN ({placeholders})",
+                        [cwl_season, *chunk],
+                    ).fetchall()
+                    for row in rows:
+                        result[row["player_tag"]] = bool(row["dm_sent"])
+                return result
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_player_season_dm_status_bulk_sync failed: {e}")
+                return result
+
+    def get_cwl_player_season_status_bulk_sync(self, player_tags: List[str], cwl_season: str) -> Dict[str, Dict[str, Any]]:
+        """Bulk full-row lookup, keyed by player_tag — used when seeding cwl_signups to carry
+        over a player's REAL current global status (e.g. already 'confirmed' via another guild's
+        DM) instead of hardcoding 'pending' (rule h). A tag with no row is absent from the
+        returned dict. Same manual chunking as get_cwl_player_season_dm_status_bulk_sync."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not player_tags:
+            return {}
+
+        result: Dict[str, Dict[str, Any]] = {}
+        chunk_size = 900
+        with self._sync_conn() as conn:
+            try:
+                for i in range(0, len(player_tags), chunk_size):
+                    chunk = player_tags[i:i + chunk_size]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = conn.execute(
+                        f"SELECT * FROM cwl_player_season_status "
+                        f"WHERE cwl_season = ? AND player_tag IN ({placeholders})",
+                        [cwl_season, *chunk],
+                    ).fetchall()
+                    for row in rows:
+                        result[row["player_tag"]] = dict(row)
+                return result
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_player_season_status_bulk_sync failed: {e}")
+                return result
+
+    def mark_cwl_player_dm_sent_sync(
+        self, player_tag: str, cwl_season: str, player_name: Optional[str], discord_id: Optional[str],
+        event_id: int, guild_id: int, sent_at: str,
+    ) -> bool:
+        """Record that the enrollment DM went out to this player for this season — touches ONLY
+        the dm_sent* columns, never `status` (see the table's own CREATE TABLE comment). Upserts
+        so the first guild to ever DM this player for a season creates the row."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        """
+                        INSERT INTO cwl_player_season_status
+                            (player_tag, cwl_season, player_name, discord_id, dm_sent, dm_sent_at,
+                             dm_sent_via_event_id, dm_sent_via_guild_id)
+                        VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                        ON CONFLICT(player_tag, cwl_season) DO UPDATE SET
+                            player_name = excluded.player_name,
+                            discord_id = excluded.discord_id,
+                            dm_sent = 1,
+                            dm_sent_at = excluded.dm_sent_at,
+                            dm_sent_via_event_id = excluded.dm_sent_via_event_id,
+                            dm_sent_via_guild_id = excluded.dm_sent_via_guild_id,
+                            updated_at = datetime('now')
+                        """,
+                        (player_tag, cwl_season, player_name, discord_id, sent_at, event_id, str(guild_id)),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] mark_cwl_player_dm_sent_sync failed for {player_tag}/{cwl_season}: {e}")
+                conn.rollback()
+                return False
+
+    def set_cwl_player_response_status_sync(
+        self, player_tag: str, cwl_season: str, player_name: Optional[str], discord_id: Optional[str],
+        status: str, responded_at: Optional[str], event_id: int, guild_id: int,
+    ) -> bool:
+        """Record this player's own genuine confirm/decline response, globally for the season —
+        touches ONLY status/responded_at/responded_via_*, never dm_sent (see the table's own
+        CREATE TABLE comment). Upserts so a response can arrive before any dm_sent row exists
+        (e.g. an admin manually confirming a player on the board who was never actually DMed).
+        Callers must still fan this out to every OTHER guild's local mirror themselves — see
+        propagate_cwl_player_response() (QBdiscocmdshelper_cwl.py), which calls this first."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        """
+                        INSERT INTO cwl_player_season_status
+                            (player_tag, cwl_season, player_name, discord_id, status, responded_at,
+                             responded_via_event_id, responded_via_guild_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(player_tag, cwl_season) DO UPDATE SET
+                            player_name = excluded.player_name,
+                            discord_id = excluded.discord_id,
+                            status = excluded.status,
+                            responded_at = excluded.responded_at,
+                            responded_via_event_id = excluded.responded_via_event_id,
+                            responded_via_guild_id = excluded.responded_via_guild_id,
+                            updated_at = datetime('now')
+                        """,
+                        (player_tag, cwl_season, player_name, discord_id, status, responded_at, event_id, str(guild_id)),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] set_cwl_player_response_status_sync failed for {player_tag}/{cwl_season}: {e}")
+                conn.rollback()
+                return False
+
+    def find_cwl_signup_events_for_player_and_season_sync(self, player_tag: str, cwl_season: str) -> List[int]:
+        """Every event_id (any guild) whose cwl_signups pool already contains this player for this
+        season — the fan-out target list for propagate_cwl_player_response()'s cross-guild status
+        sync (rule h)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT cwl_signups.event_id AS event_id
+                    FROM cwl_signups
+                    JOIN cwl_events ON cwl_events.id = cwl_signups.event_id
+                    WHERE cwl_signups.player_tag = ? AND cwl_events.cwl_season = ?
+                    """,
+                    (player_tag, cwl_season),
+                ).fetchall()
+                return [row["event_id"] for row in rows]
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-QUERY-SYNC] find_cwl_signup_events_for_player_and_season_sync failed for "
+                    f"{player_tag}/{cwl_season}: {e}"
+                )
+                return []
+
+    def find_cwl_shared_clan_ids_for_player_and_season_sync(self, player_tag: str, cwl_season: str) -> List[int]:
+        """Every shared_clan_id (any guild) whose cwl_shared_clan_players roster already contains
+        this player for this season — the other half of propagate_cwl_player_response()'s
+        fan-out target list, alongside find_cwl_signup_events_for_player_and_season_sync."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT cwl_shared_clan_players.shared_clan_id AS shared_clan_id
+                    FROM cwl_shared_clan_players
+                    JOIN cwl_shared_clans ON cwl_shared_clans.id = cwl_shared_clan_players.shared_clan_id
+                    WHERE cwl_shared_clan_players.player_tag = ? AND cwl_shared_clans.cwl_season = ?
+                    """,
+                    (player_tag, cwl_season),
+                ).fetchall()
+                return [row["shared_clan_id"] for row in rows]
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-QUERY-SYNC] find_cwl_shared_clan_ids_for_player_and_season_sync failed for "
+                    f"{player_tag}/{cwl_season}: {e}"
+                )
+                return []
+
+    def update_cwl_signup_status_sync(
+        self, event_id: int, player_tag: str, status: str, responded_at: Optional[str],
+    ) -> bool:
+        """Narrow UPDATE of an EXISTING cwl_signups row's status/responded_at — deliberately does
+        NOT create a row if one doesn't exist (unlike upsert_cwl_signup_sync), since this is only
+        ever used by propagate_cwl_player_response()'s fan-out to fill a gap in a guild that has
+        ALREADY pooled this player, never to seed a new guild into the pool (that's Start
+        Enrollment's/the guest-invite endpoints' job)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "UPDATE cwl_signups SET status = ?, responded_at = ? WHERE event_id = ? AND player_tag = ?",
+                        (status, responded_at, event_id, player_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] update_cwl_signup_status_sync failed for event {event_id} player {player_tag}: {e}"
+                )
+                conn.rollback()
+                return False
 
     def upsert_cwl_assignment_sync(
         self,

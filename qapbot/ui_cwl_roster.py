@@ -378,6 +378,26 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
         add_season_button.callback = _make_cwl_management_add_season_callback(view)  # type: ignore[assignment]
         view.add_item(add_season_button)  # type: ignore[arg-type]
 
+    # "Notify New Pool Members" (rule h, 2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md)
+    # — shown only once enrollment has actually started AND there's at least one pool member who
+    # hasn't been sent the enrollment DM yet, by ANY guild, this season (see
+    # has_cwl_pool_members_missing_dm's own docstring). Omitted entirely rather than just
+    # disabled — matching "Add New Season"'s own "don't show what's currently pointless"
+    # convention above — since this button has nothing to do the overwhelming majority of the
+    # time. Row 2 is free (row 1: season select, row 3: the 4 buttons above).
+    if event is not None and event["status"] not in ("draft", "cancelled"):
+        from qapbot.QBdiscocmdshelper_cwl import has_cwl_pool_members_missing_dm
+
+        if has_cwl_pool_members_missing_dm(guild_id, season):
+            notify_new_members_button = discord.ui.Button(
+                label=t('cwl.management.button_notify_new_members', guild_id=guild_id),
+                style=discord.ButtonStyle.secondary,
+                custom_id="cwl_management_notify_new_members",
+                row=2,
+            )
+            notify_new_members_button.callback = _make_cwl_management_notify_new_members_callback(view)  # type: ignore[assignment]
+            view.add_item(notify_new_members_button)  # type: ignore[arg-type]
+
     if event is not None:
         # Surfaced so an admin opening this screen can see at a glance whether every
         # participating clan already has a start time set (Finalize, Phase 4, will require it).
@@ -1012,6 +1032,23 @@ class CwlStartEnrollmentConfirmView(discord.ui.View):
         if not summary["ok"]:
             content = t(f"cwl.management.start_enrollment_error_{summary['error']}", guild_id=self.guild_id)
         else:
+            # Blocked (DMs closed/bot blocked) vs failed-after-retries (transient, cache_manager.py's
+            # DM_SEND_MAX_RETRIES) get separate lines — an admin follows up differently for each
+            # (2026-08-18, item 3 of the enrollment redesign: surface DM problems instead of
+            # letting a batch abort silently).
+            dm_issues = ""
+            if summary["blocked"]:
+                dm_issues += t(
+                    'cwl.management.start_enrollment_dm_blocked_line',
+                    guild_id=self.guild_id, names=", ".join(summary["blocked"]),
+                )
+            if summary["failed"]:
+                from qapbot.cache_manager import DM_SEND_MAX_RETRIES
+
+                dm_issues += t(
+                    'cwl.management.start_enrollment_dm_failed_line',
+                    guild_id=self.guild_id, retries=DM_SEND_MAX_RETRIES, names=", ".join(summary["failed"]),
+                )
             content = t(
                 'cwl.management.start_enrollment_summary',
                 guild_id=self.guild_id,
@@ -1021,6 +1058,7 @@ class CwlStartEnrollmentConfirmView(discord.ui.View):
                 skipped_optout=summary["skipped_optout"],
                 skipped_unlinked=summary["skipped_unlinked"],
                 skipped_dm_guard=summary["skipped_dm_guard"],
+                dm_issues=dm_issues,
             )
         # A one-click "open Teams Management" follow-up (2026-08-16, live-testing feedback,
         # project owner's spec: "when starting the enrollment process the 'Teams Management' view
@@ -1058,6 +1096,125 @@ class CwlStartEnrollmentConfirmView(discord.ui.View):
             for shared in summary["shared_clans"]:
                 for other_guild_id in shared.get("other_guild_ids", []):
                     await bump_enrollment_version(int(other_guild_id))
+
+    async def _on_cancel(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        try:
+            await interaction.delete_original_response()
+        except discord.NotFound:
+            pass
+
+
+def _make_cwl_management_notify_new_members_callback(view: discord.ui.View):
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        if not interaction.guild:
+            return
+        from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+
+        db = CACHE.db_manager
+        season = resolve_selected_cwl_season(interaction.guild.id)
+        event = db.get_cwl_event_sync(str(interaction.guild.id), season) if db is not None else None
+        if event is None:
+            return
+        confirm_view = CwlNotifyNewMembersConfirmView(
+            parent_view=view,
+            guild_id=interaction.guild.id,
+            season=event["cwl_season"],
+        )
+        await interaction.followup.send(
+            confirm_view._build_content(),  # type: ignore[attr-defined]
+            view=confirm_view,
+            ephemeral=True,
+        )
+
+    return callback
+
+
+class CwlNotifyNewMembersConfirmView(discord.ui.View):
+    """Confirm/cancel dialog for rule h's "Notify New Pool Members" (2026-08-18,
+    CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md) — sends real DMs, so not a single-click action,
+    mirroring CwlStartEnrollmentConfirmView's own shape exactly."""
+
+    def __init__(self, parent_view: discord.ui.View, guild_id: int, season: str, timeout: int = 60):
+        super().__init__(timeout=timeout)
+        self.parent_view = parent_view
+        self.guild_id = guild_id
+        self.season = season
+
+        from qapbot.i18n import t
+
+        confirm_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.management.button_confirm_notify_new_members', guild_id=guild_id),
+            style=discord.ButtonStyle.success,
+            custom_id="cwl_notify_new_members_confirm",
+        )
+        confirm_button.callback = self._on_confirm  # type: ignore[assignment]
+        self.add_item(confirm_button)
+
+        cancel_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.setup.button_cancel', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_notify_new_members_cancel",
+        )
+        cancel_button.callback = self._on_cancel  # type: ignore[assignment]
+        self.add_item(cancel_button)
+
+    def _build_content(self) -> str:
+        from qapbot.i18n import t
+
+        return t('cwl.management.notify_new_members_confirm_body', guild_id=self.guild_id, season=self.season)
+
+    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        from qapbot.i18n import t
+
+        for item in self.children:
+            item.disabled = True  # type: ignore[union-attr]
+        await interaction.response.edit_message(
+            content=t('cwl.management.notify_new_members_processing', guild_id=self.guild_id), view=self
+        )
+        from qapbot.web_bridge import notify_new_cwl_pool_members
+
+        result = await notify_new_cwl_pool_members(self.guild_id, self.season)
+        if not result["ok"]:
+            content = t(f"cwl.management.notify_new_members_error_{result['error']}", guild_id=self.guild_id)
+        else:
+            # Same blocked/failed reporting shape as Start Enrollment's own summary (item 3 of
+            # the enrollment redesign) — reuses those same i18n lines, generic enough to apply
+            # to any DM batch, not just the original Start Enrollment one.
+            dm_issues = ""
+            if result["blocked"]:
+                dm_issues += t(
+                    'cwl.management.start_enrollment_dm_blocked_line',
+                    guild_id=self.guild_id, names=", ".join(result["blocked"]),
+                )
+            if result["failed"]:
+                from qapbot.cache_manager import DM_SEND_MAX_RETRIES
+
+                dm_issues += t(
+                    'cwl.management.start_enrollment_dm_failed_line',
+                    guild_id=self.guild_id, retries=DM_SEND_MAX_RETRIES, names=", ".join(result["failed"]),
+                )
+            content = t(
+                'cwl.management.notify_new_members_summary',
+                guild_id=self.guild_id,
+                contacted=result["contacted"],
+                skipped_dm_guard=result["skipped_dm_guard"],
+                skipped_already_dm_globally=result["skipped_already_dm_globally"],
+                dm_issues=dm_issues,
+            )
+        try:
+            await interaction.edit_original_response(content=content, view=None)
+        except discord.NotFound:
+            pass
+        if result["ok"]:
+            await _refresh_parent(self.parent_view, interaction, "cwl_management")
+            from qapbot.web_bridge import bump_enrollment_version
+            await bump_enrollment_version(self.guild_id)
 
     async def _on_cancel(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=False, ephemeral=True)
@@ -1193,14 +1350,31 @@ class CwlSignupResponseButton(
             self.event_id, self.player_tag, signup.get("player_name"), signup.get("discord_id"),
             signup.get("preferred_league_rank"), source, new_status, responded_at=responded_at,
         )
+        # rule h (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md, project owner's spec:
+        # "that status is shown automatically in guild a's and guild B's clan rosters... no need
+        # to manage anything manually") — this DM's custom_id only ever names ONE event_id (the
+        # guild that happened to send it), but the SAME real-world player may be pooled by other
+        # guilds too for this same season; propagate_cwl_player_response() writes the global
+        # source of truth and fans this exact response out to every one of those guilds' own
+        # local boards.
+        from qapbot.QBdiscocmdshelper_cwl import propagate_cwl_player_response
+
+        affected_guild_ids = await propagate_cwl_player_response(
+            self.player_tag, event["cwl_season"], new_status, responded_at,
+            signup.get("player_name"), signup.get("discord_id"), self.event_id, guild_id or 0,
+        )
         # Step 8 (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md — found via live-testing: a player
         # confirming/opting out via this DM button never updated an open Manage Enrollment board
         # at all, since this callback has no refresh_cwl_management_hub_message()/_refresh_parent()
         # call to piggyback the bump onto — it only edits the DM itself, never any guild message).
-        # guild_id is already resolved above from the event row.
+        # guild_id is already resolved above from the event row; affected_guild_ids (rule h) adds
+        # every OTHER guild whose board this same response just updated.
+        from qapbot.web_bridge import bump_enrollment_version
+
         if guild_id is not None:
-            from qapbot.web_bridge import bump_enrollment_version
             await bump_enrollment_version(guild_id)
+        for other_guild_id in affected_guild_ids:
+            await bump_enrollment_version(other_guild_id)
 
         response_key = 'cwl.template.confirmed_msg' if self.action == "confirm" else 'cwl.template.declined_msg'
         player_name = signup.get("player_name") or self.player_tag
@@ -1378,12 +1552,21 @@ async def notify_cwl_clan_shared(
     currently acting on behalf of).
 
     sharing_result is exactly what ensure_cwl_clan_sharing() returned: shared_clan_id,
-    owner_guild_id, is_new, other_guild_ids."""
+    owner_guild_id, owner_resolution_method, is_new, other_guild_ids."""
     import QBcore
 
     owner_guild_id = sharing_result["owner_guild_id"]
     other_guild_ids: List[str] = sharing_result["other_guild_ids"]
     is_new = sharing_result["is_new"]
+    # 2026-08-18, live-tested bug (project owner's report, verbatim: "the message is wrong.
+    # akatsuki doesn't have a leader in our guild!! but it doesn't have the leader in the other
+    # guild as well.") — this used to unconditionally claim "real in-game Leader/Co-Leader"
+    # ownership even when resolve_cwl_clan_owner() (QBdiscocmdshelper_cwl.py) couldn't find one
+    # in ANY affected guild and fell back to "unresolved_first_claimer" (first guild to claim it,
+    # no eviction rights granted to anyone). Not a race condition — the resolver was already
+    # correctly detecting this case, the notification text just never branched on it.
+    owner_resolution_method = sharing_result.get("owner_resolution_method")
+    is_unresolved = owner_resolution_method == "unresolved_first_claimer"
     clan_name = CACHE.get_clan_name(clan_tag, clan_tag) or clan_tag
     acting_guild_id_str = str(acting_guild_id)
     is_acting_owner = owner_guild_id == acting_guild_id_str
@@ -1395,13 +1578,20 @@ async def notify_cwl_clan_shared(
     other_names = ", ".join(_guild_name(g) for g in other_guild_ids) or "another guild"
 
     if is_new:
-        ownership_line = (
-            "Your guild is the recognized owner (real in-game Leader/Co-Leader) — only your "
-            "guild's admins can remove another guild from this clan's roster."
-            if is_acting_owner else
-            f"**{_guild_name(owner_guild_id)}** is the recognized owner (real in-game "
-            "Leader/Co-Leader) and can remove your guild from this clan's roster if needed."
-        )
+        if is_unresolved:
+            ownership_line = (
+                "⚠️ No resolvable real in-game Leader/Co-Leader was found for this clan in any "
+                "affected guild, so ownership is unresolved for now — nobody currently has "
+                "eviction rights until a linked, verified Leader/Co-Leader account is found."
+            )
+        else:
+            ownership_line = (
+                "Your guild is the recognized owner (real in-game Leader/Co-Leader) — only your "
+                "guild's admins can remove another guild from this clan's roster."
+                if is_acting_owner else
+                f"**{_guild_name(owner_guild_id)}** is the recognized owner (real in-game "
+                "Leader/Co-Leader) and can remove your guild from this clan's roster if needed."
+            )
         acting_message = (
             f"🔗 **Shared CWL Clan**\n{clan_name} ({clan_tag}) is now shared for season {season} "
             f"with **{other_names}**. {ownership_line}"

@@ -1219,3 +1219,33 @@ Fix / mitigation, situational (no single universal fix — depends what the wrap
   — replacing 6.6M per-row `hashlib` calls with one bulk SQL query cut this specific backfill
   from 355s to 82s) is often more valuable than trying to make the timeout "safer," since it
   avoids ever needing the timeout to fire for a legitimate run in the first place.
+
+---
+
+## Pitfall 30: A new `/api/cwl/...` bridge endpoint needs a route in TWO places, not one
+
+Symptom (2026-08-18, live-tested in DEV): three new CWL enrollment endpoints
+(`POST /api/cwl/enrollment/guest-clan/remove`, `GET /api/cwl/enrollment/guest-players`,
+`POST /api/cwl/enrollment/guest-players/remove`) were added to `qapbot/web_bridge.py` — routes
+registered, handlers written, unit-tested against the bridge directly, all green. In the actual
+DEV Activity, every one of them 404'd unconditionally: `{"error":"not found","path":"/cwl/
+enrollment/guest-players","method":"GET"}` — regardless of whether the underlying data existed,
+which read at first like an empty-state case rather than a routing bug.
+
+Root cause: the CWL clan-config Discord Activity has TWO server-side layers, not one —
+`activity/server/src/index.ts` (a separate Cloudflare Worker, Hono-based) sits in front of
+`qapbot/web_bridge.py` (the actual Python bridge) and does two jobs neither side can do alone:
+verifies the Activity's Discord user via `verifiedDiscordUserId()` (the bridge itself only
+checks a shared secret, never the caller's real identity) and injects the server-verified
+`discord_user_id` into the forwarded request (so a client can never spoof someone else's ID).
+Every single bridge endpoint therefore needs an explicit matching route in `index.ts`'s Hono
+`api` router — there is no wildcard/passthrough. `web_bridge.py` getting a new route says
+nothing about whether `index.ts` has one; the bridge's own tests (which hit it directly, bypassing
+the Worker entirely) can't catch a missing proxy route either — this is exactly why it went
+unnoticed until a live click in the actual Activity iframe.
+
+Fix: add the new endpoint to BOTH files, mirroring the exact verify-identity-then-proxy shape
+every existing route in `index.ts` already uses (see any `api.get(...)`/`api.post(...)` block
+there — query-string forwarding for GET, `{ ...body, discord_user_id: discordUserId }` for
+POST). `npm run typecheck` in `activity/server` catches a malformed route but NOT a missing one
+— only an actual live request (or manually diffing the two files' endpoint lists) surfaces that.

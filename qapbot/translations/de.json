@@ -821,11 +821,21 @@
       "button_confirm_start_enrollment": "Ja, Anmeldephase starten",
       "start_enrollment_confirm_body": "⚠️ Anmeldephase für Saison **{season}** starten? Dabei wird der Kader der letzten Saison als Vorlage übernommen und jedem zuordenbaren Mitglied eine Bestätigen/Absagen-DM gesendet. Dies kann nicht rückgängig gemacht werden.",
       "start_enrollment_processing": "⏳ Anmeldephase wird gestartet — DMs werden versendet, dies kann einige Sekunden dauern…",
-      "start_enrollment_summary": "✅ Anmeldephase gestartet.\nAngelegt: {seeded}\nVorbelegt aus dem letzten CWL-Monat: {assigned}\nKontaktiert: {contacted}\nÜbersprungen (abgemeldet): {skipped_optout}\nÜbersprungen (kein verknüpfter Account): {skipped_unlinked}\nÜbersprungen (DM-Schutz): {skipped_dm_guard}",
+      "start_enrollment_summary": "✅ Anmeldephase gestartet.\nAngelegt: {seeded}\nVorbelegt aus dem letzten CWL-Monat: {assigned}\nKontaktiert: {contacted}\nÜbersprungen (abgemeldet): {skipped_optout}\nÜbersprungen (kein verknüpfter Account): {skipped_unlinked}\nÜbersprungen (DM-Schutz): {skipped_dm_guard}{dm_issues}",
+      "start_enrollment_dm_blocked_line": "\n⚠️ Blockiert (DMs deaktiviert oder Bot blockiert, kein erneuter Versuch): {names}",
+      "start_enrollment_dm_failed_line": "\n⚠️ Nach {retries} Versuchen fehlgeschlagen, evtl. vorübergehend — später erneut versuchen: {names}",
       "start_enrollment_error_no_database": "⚠️ Datenbank nicht bereit — bitte gleich erneut versuchen.",
       "start_enrollment_error_no_event": "⚠️ Für diese Saison wurde kein CWL-Event mehr gefunden — es wurde möglicherweise gelöscht.",
       "start_enrollment_error_not_draft": "⚠️ Die Anmeldephase für diese Saison wurde bereits gestartet.",
-      "start_enrollment_error_no_clans": "⚠️ Füge mindestens einen teilnehmenden Clan hinzu, bevor die Anmeldephase gestartet wird."
+      "start_enrollment_error_no_clans": "⚠️ Füge mindestens einen teilnehmenden Clan hinzu, bevor die Anmeldephase gestartet wird.",
+      "button_notify_new_members": "Neue Pool-Mitglieder benachrichtigen",
+      "button_confirm_notify_new_members": "Ja, DMs senden",
+      "notify_new_members_confirm_body": "📋 Soll jedem Pool-Mitglied, das noch keine erhalten hat, die Bestätigen/Absagen-DM für Saison **{season}** gesendet werden?",
+      "notify_new_members_processing": "⏳ DMs an neu hinzugekommene Pool-Mitglieder werden gesendet, dies kann einige Sekunden dauern…",
+      "notify_new_members_summary": "✅ Fertig.\nKontaktiert: {contacted}\nÜbersprungen (DM-Schutz): {skipped_dm_guard}\nBereits kontaktiert (anderer Guild): {skipped_already_dm_globally}{dm_issues}",
+      "notify_new_members_error_no_database": "⚠️ Datenbank nicht bereit — bitte gleich erneut versuchen.",
+      "notify_new_members_error_no_event": "⚠️ Für diese Saison wurde kein CWL-Event mehr gefunden — es wurde möglicherweise gelöscht.",
+      "notify_new_members_error_not_open": "⚠️ Die Anmeldephase für diese Saison wurde noch nicht gestartet."
     },
     "setup": {
       "button_cancel": "Abbrechen"

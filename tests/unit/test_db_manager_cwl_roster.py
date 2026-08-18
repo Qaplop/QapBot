@@ -1171,3 +1171,117 @@ class TestChunkedInQuery:
         assert db.get_player_links_sync([]) == {}
         assert db.get_current_clan_tags_for_players_sync([]) == {}
         assert db.get_current_clan_members_sync([]) == []
+
+
+class TestCwlPlayerSeasonStatus:
+    """cwl_player_season_status (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md Phase 2,
+    rule h) — the global, cross-guild per-(player_tag, cwl_season) DM/response record. Schema-only
+    phase: these methods aren't wired into any caller yet, so these tests exercise the CRUD
+    surface directly rather than through start_cwl_enrollment()."""
+
+    async def test_dm_sent_round_trip_and_bulk_lookup(self, db):
+        assert db.get_cwl_player_season_status_sync("#P1", "2026-08") is None
+        assert db.get_cwl_player_season_dm_status_bulk_sync(["#P1", "#P2"], "2026-08") == {}
+
+        ok = db.mark_cwl_player_dm_sent_sync("#P1", "2026-08", "Player One", "d1", 1, 100, "2026-08-18T09:00Z")
+        assert ok is True
+
+        row = db.get_cwl_player_season_status_sync("#P1", "2026-08")
+        assert row is not None
+        assert row["dm_sent"] == 1
+        assert row["dm_sent_at"] == "2026-08-18T09:00Z"
+        assert row["dm_sent_via_event_id"] == 1
+        assert row["dm_sent_via_guild_id"] == "100"
+        assert row["status"] == "pending"  # untouched default — dm_sent and status are independent
+        assert row["responded_at"] is None
+
+        # #P2 was never marked — bulk lookup omits it entirely, caller uses .get(tag, False).
+        bulk = db.get_cwl_player_season_dm_status_bulk_sync(["#P1", "#P2"], "2026-08")
+        assert bulk == {"#P1": True}
+        assert bulk.get("#P2", False) is False
+
+        # A different season for the same player is a completely separate record.
+        assert db.get_cwl_player_season_status_sync("#P1", "2026-09") is None
+
+    async def test_re_marking_dm_sent_updates_in_place_without_touching_status(self, db):
+        db.mark_cwl_player_dm_sent_sync("#P1", "2026-08", "Player One", "d1", 1, 100, "2026-08-18T09:00Z")
+        db.set_cwl_player_response_status_sync("#P1", "2026-08", "Player One", "d1", "confirmed", "2026-08-18T09:05Z", 1, 100)
+
+        # A second guild also "sends" (re-marks) the same player+season — dm_sent_via_* updates
+        # to the new source, but the earlier confirmed response must survive untouched.
+        db.mark_cwl_player_dm_sent_sync("#P1", "2026-08", "Player One", "d1", 2, 200, "2026-08-18T10:00Z")
+
+        row = db.get_cwl_player_season_status_sync("#P1", "2026-08")
+        assert row["dm_sent_via_event_id"] == 2
+        assert row["dm_sent_via_guild_id"] == "200"
+        assert row["status"] == "confirmed"  # untouched by the DM re-mark
+        assert row["responded_at"] == "2026-08-18T09:05Z"
+
+    async def test_response_status_round_trip_and_bulk_lookup(self, db):
+        ok = db.set_cwl_player_response_status_sync(
+            "#P1", "2026-08", "Player One", "d1", "confirmed", "2026-08-18T09:05Z", 1, 100,
+        )
+        assert ok is True
+
+        row = db.get_cwl_player_season_status_sync("#P1", "2026-08")
+        assert row["status"] == "confirmed"
+        assert row["responded_via_event_id"] == 1
+        assert row["responded_via_guild_id"] == "100"
+        assert row["dm_sent"] == 0  # untouched — a response can arrive without a tracked DM send
+
+        bulk = db.get_cwl_player_season_status_bulk_sync(["#P1", "#P2"], "2026-08")
+        assert set(bulk.keys()) == {"#P1"}
+        assert bulk["#P1"]["status"] == "confirmed"
+
+    async def test_fan_out_target_lookups_are_season_scoped(self, db):
+        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('501')")
+        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('502')")
+        await db.conn.commit()
+
+        event_a = db.create_cwl_event_sync("501", "2026-08", "creator")
+        event_b = db.create_cwl_event_sync("502", "2026-08", "creator")
+        event_other_season = db.create_cwl_event_sync("501", "2026-09", "creator")
+
+        db.upsert_cwl_signup_sync(event_a, "#P1", "Player One", "d1", None, "template_confirm", "pending")
+        db.upsert_cwl_signup_sync(event_b, "#P1", "Player One", "d1", None, "guest_invite", "pending")
+        db.upsert_cwl_signup_sync(event_other_season, "#P1", "Player One", "d1", None, "template_confirm", "pending")
+        db.upsert_cwl_signup_sync(event_a, "#P2", "Player Two", "d2", None, "template_confirm", "pending")
+
+        events = sorted(db.find_cwl_signup_events_for_player_and_season_sync("#P1", "2026-08"))
+        assert events == sorted([event_a, event_b])  # both guilds' 2026-08 events, not the 2026-09 one
+
+        shared_id = db.create_cwl_shared_clan_sync("#SHAREDCLAN", "2026-08", "501", event_a, "unresolved_first_claimer")
+        db.set_cwl_shared_clan_player_status_sync(shared_id, "#P1", "Player One", "d1", "pending", "admin_added", "501", None)
+
+        shared_ids = db.find_cwl_shared_clan_ids_for_player_and_season_sync("#P1", "2026-08")
+        assert shared_ids == [shared_id]
+        assert db.find_cwl_shared_clan_ids_for_player_and_season_sync("#P2", "2026-08") == []
+
+    async def test_update_cwl_signup_status_only_fills_a_gap_never_creates(self, db):
+        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('503')")
+        await db.conn.commit()
+        event_id = db.create_cwl_event_sync("503", "2026-08", "creator")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Player One", "d1", None, "template_confirm", "pending")
+
+        ok = db.update_cwl_signup_status_sync(event_id, "#P1", "confirmed", "2026-08-18T09:05Z")
+        assert ok is True
+        assert db.get_cwl_signup_sync(event_id, "#P1")["status"] == "confirmed"
+
+        # #P2 was never seeded in this event — must NOT create a row.
+        db.update_cwl_signup_status_sync(event_id, "#P2", "confirmed", "2026-08-18T09:05Z")
+        assert db.get_cwl_signup_sync(event_id, "#P2") is None
+
+    async def test_delete_cwl_event_clan_sync_removes_only_the_targeted_row(self, db):
+        await _seed_guild_and_clan(db, "504", clan_tag="#CLAN1")
+        await _seed_clan(db, "#GUESTCLAN", "Guest Clan")
+        event_id = db.create_cwl_event_sync("504", "2026-08", "creator")
+        db.set_cwl_event_clans_sync(event_id, [
+            {"clan_tag": "#CLAN1", "participating": True},
+            {"clan_tag": "#GUESTCLAN", "participating": True},
+        ])
+
+        ok = db.delete_cwl_event_clan_sync(event_id, "#GUESTCLAN")
+        assert ok is True
+
+        remaining = {c["clan_tag"] for c in db.get_cwl_event_clans_sync(event_id)}
+        assert remaining == {"#CLAN1"}  # #GUESTCLAN's row is gone entirely, #CLAN1 untouched

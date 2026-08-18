@@ -1,4 +1,4 @@
-import type { ClanConfig, ClanConfigPayload, GuestSearchResult } from './types'
+import type { ClanConfig, ClanConfigPayload, GuestPlayerPoolEntry, GuestSearchResult } from './types'
 
 const ROSTER_SIZES = [5, 15, 30] as const
 
@@ -107,15 +107,24 @@ export function renderClanConfigTable(
   onSave: (clans: ClanConfig[]) => Promise<void>,
   onClose: (reason: string) => void,
   onGuestSearch: (query: string) => Promise<GuestSearchResult[]>,
-  onGuestPlayerAdd: (
-    result: Extract<GuestSearchResult, { type: 'player' }>,
-    sendDmNow: boolean,
-  ) => Promise<{ dm_sent: boolean }>,
+  onGuestPlayerAdd: (result: Extract<GuestSearchResult, { type: 'player' }>) => Promise<void>,
   // Owner-only eviction (2026-08-15) — removes targetGuildId's participation in a shared clan.
   // Independent of Save/onSave, same immediate-action shape as onGuestPlayerAdd: it doesn't
   // touch `working` at all, so nothing here needs a page reload to reflect it beyond re-running
   // this same render with a fresh payload (see main.ts's call site).
   onEvict: (clanTag: string, targetGuildId: string) => Promise<void>,
+  // Rule f (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md) — full removal of a guest
+  // clan from the season (deletes its cwl_event_clans row AND purges its members from the
+  // player pool), as opposed to just unchecking it (now purely cosmetic). Same immediate-action
+  // shape as onEvict/onGuestPlayerAdd: independent of Save, applies the moment "Remove" +
+  // confirm is clicked.
+  onGuestClanRemove: (clanTag: string) => Promise<void>,
+  // Rule g (2026-08-18) — "Remove Guest Players." Fetched fresh each time the panel opens
+  // (immediate action, independent of Save, same shape as every other guest-management callback
+  // here) rather than reusing `working`'s own player data, since guest PLAYERS aren't part of
+  // `working` at all (that array is clans only).
+  onGuestPlayersList: () => Promise<GuestPlayerPoolEntry[]>,
+  onGuestPlayersRemove: (playerTags: string[]) => Promise<void>,
 ): void {
   const working: ClanConfig[] = payload.clans.map((c) => ({ ...c }))
 
@@ -177,9 +186,27 @@ export function renderClanConfigTable(
   const seasonStartUtc = `${payload.season}-01T08:00Z`
   const seasonEndUtc = `${new Date(new Date(seasonStartUtc).getTime() + 48 * 60 * 60 * 1000).toISOString().slice(0, 16)}Z`
 
+  // Rule f's Remove-button handler (2026-08-18) — network call (onGuestClanRemove, supplied by
+  // the caller/main.ts) plus the outer-scope cleanup a successful removal needs: splice `working`
+  // (so a later Save can't resurrect the removed clan), drop it from `existingClanTags`, and
+  // refresh the select-all/read-only-notice state, exactly like the guest-clan Add flow's own
+  // state updates below. Defined as a hoisted function declaration so it can safely reference
+  // `existingClanTags`/`updateSelectAllState`/`updateReadOnlyNoticeVisibility` even though those
+  // are declared further down in this function body — none of that matters until this actually
+  // runs, long after the whole render has finished (a user click, not initial render).
+  async function removeGuestClanRow(clan: ClanConfig, row: HTMLTableRowElement): Promise<void> {
+    await onGuestClanRemove(clan.clan_tag)
+    const index = working.indexOf(clan)
+    if (index !== -1) working.splice(index, 1)
+    existingClanTags.delete(clan.clan_tag)
+    row.remove()
+    updateSelectAllState()
+    updateReadOnlyNoticeVisibility()
+  }
+
   const tbody = document.createElement('tbody')
   for (const clan of working) {
-    tbody.appendChild(buildRow(clan, seasonStartUtc, seasonEndUtc, onEvict))
+    tbody.appendChild(buildRow(clan, seasonStartUtc, seasonEndUtc, onEvict, removeGuestClanRow))
   }
   table.appendChild(tbody)
 
@@ -284,13 +311,6 @@ export function renderClanConfigTable(
   guestsSearchInput.className = 'guests-search-input'
   guestsSearchInput.placeholder = 'Search name/tag, clan, @discord user, or #tag…'
   guestsSearchRow.appendChild(guestsSearchInput)
-  const guestsDmLabel = document.createElement('label')
-  guestsDmLabel.className = 'guests-dm-label'
-  const guestsDmCheckbox = document.createElement('input')
-  guestsDmCheckbox.type = 'checkbox'
-  guestsDmLabel.appendChild(guestsDmCheckbox)
-  guestsDmLabel.append('Send enrollment DM immediately (players only)')
-  guestsSearchRow.appendChild(guestsDmLabel)
   guestsSection.appendChild(guestsSearchRow)
 
   const guestsResults = document.createElement('div')
@@ -359,7 +379,7 @@ export function renderClanConfigTable(
           }
           working.push(newClan)
           existingClanTags.add(clanResult.clan_tag)
-          const newRow = buildRow(newClan, seasonStartUtc, seasonEndUtc, onEvict)
+          const newRow = buildRow(newClan, seasonStartUtc, seasonEndUtc, onEvict, removeGuestClanRow)
           tbody.appendChild(newRow)
           newRow.querySelector<HTMLInputElement>('input[type="checkbox"]')?.addEventListener('change', updateSelectAllState)
           updateSelectAllState()
@@ -412,15 +432,12 @@ export function renderClanConfigTable(
         row.appendChild(label)
         row.appendChild(addButton)
         addButton.addEventListener('click', async () => {
-          const sendDmNow = guestsDmCheckbox.checked && !!result.discord_id
           addButton.disabled = true
           guestsStatus.textContent = 'Adding…'
           guestsStatus.className = 'guests-status'
           try {
-            const { dm_sent } = await onGuestPlayerAdd(result, sendDmNow)
-            guestsStatus.textContent = dm_sent
-              ? `Added ${result.player_name} and sent the enrollment DM.`
-              : `Added ${result.player_name} to the enrollment pool.`
+            await onGuestPlayerAdd(result)
+            guestsStatus.textContent = `Added ${result.player_name} to the enrollment pool.`
             guestsStatus.className = 'guests-status success'
             guestsSearchInput.value = ''
             guestsResults.innerHTML = ''
@@ -437,7 +454,7 @@ export function renderClanConfigTable(
     }
   }
 
-  guestsSearchInput.addEventListener('input', () => {
+  function handleSearchInput(): void {
     if (searchDebounceHandle !== undefined) clearTimeout(searchDebounceHandle)
     const query = guestsSearchInput.value.trim()
     if (!query) {
@@ -478,7 +495,129 @@ export function renderClanConfigTable(
           }
         })
     }, 300)
+  }
+
+  guestsSearchInput.addEventListener('input', handleSearchInput)
+
+  // Paste-specific fallback (2026-08-18, live-testing feedback: "when i pasted from the
+  // clipboard to the search field it stopped working. i had to close and reopen the view to get
+  // it back to work.") — inside a Discord Activity's sandboxed iframe, a clipboard paste can
+  // apparently swallow the native 'input' event the browser normally fires right after (the
+  // pasted text still visibly lands in the field — that part isn't JS-driven at all — but
+  // nothing here ever heard about it, so the debounced search silently never fires and every
+  // later keystroke inherits the same dead state). A dedicated 'paste' listener is a second,
+  // independent way to notice the exact same change: at the moment 'paste' fires the browser
+  // hasn't actually inserted the clipboard text into `.value` yet (that's the event's own
+  // default action, which runs right after), so this defers one tick via setTimeout(…, 0) before
+  // reading `.value` and re-running the identical search trigger — cheap and fully idempotent if
+  // the native 'input' event *did* also fire normally (handleSearchInput's own debounce/
+  // requestId guards already collapse any resulting duplicate call to a no-op).
+  guestsSearchInput.addEventListener('paste', () => {
+    setTimeout(handleSearchInput, 0)
   })
+
+  // Rule g (2026-08-18) — "Remove Guest Players": a collapsed-by-default multi-select list of
+  // every currently-pooled guest player, fetched fresh each time the panel opens so it always
+  // reflects the latest pool state (including any orphaned-by-rule-f leftovers) rather than a
+  // possibly-stale snapshot from page load.
+  const guestPlayersSection = document.createElement('div')
+  guestPlayersSection.className = 'guest-players-section'
+
+  const guestPlayersToggle = document.createElement('button')
+  guestPlayersToggle.className = 'guest-add-button'
+  guestPlayersToggle.textContent = 'Remove Guest Players…'
+  guestPlayersSection.appendChild(guestPlayersToggle)
+
+  const guestPlayersPanel = document.createElement('div')
+  guestPlayersPanel.className = 'guest-players-panel'
+  guestPlayersPanel.style.display = 'none'
+  guestPlayersSection.appendChild(guestPlayersPanel)
+
+  guestPlayersToggle.addEventListener('click', async () => {
+    // Toggle closed if already open.
+    if (guestPlayersPanel.style.display !== 'none') {
+      guestPlayersPanel.style.display = 'none'
+      guestPlayersPanel.innerHTML = ''
+      return
+    }
+    guestPlayersPanel.style.display = ''
+    guestPlayersPanel.textContent = 'Loading…'
+    let players: GuestPlayerPoolEntry[]
+    try {
+      players = await onGuestPlayersList()
+    } catch (err) {
+      console.error(err)
+      guestPlayersPanel.textContent = `Failed to load: ${(err as Error).message}`
+      return
+    }
+    guestPlayersPanel.innerHTML = ''
+    if (players.length === 0) {
+      const empty = document.createElement('div')
+      empty.className = 'guests-status'
+      empty.textContent = 'No guest players in the pool right now.'
+      guestPlayersPanel.appendChild(empty)
+      return
+    }
+
+    const list = document.createElement('div')
+    list.className = 'guest-players-list'
+    const checkboxes: HTMLInputElement[] = []
+    for (const player of players) {
+      const row = document.createElement('label')
+      row.className = 'guest-players-row'
+      const cb = document.createElement('input')
+      cb.type = 'checkbox'
+      cb.value = player.player_tag
+      checkboxes.push(cb)
+      row.appendChild(cb)
+      row.append(` ${player.player_name ?? player.player_tag} (${player.player_tag})`)
+      list.appendChild(row)
+    }
+    guestPlayersPanel.appendChild(list)
+
+    const actionRow = document.createElement('div')
+    actionRow.className = 'guest-players-actions'
+    const removeSelectedButton = document.createElement('button')
+    removeSelectedButton.className = 'guest-clan-remove-button'
+    removeSelectedButton.textContent = 'Remove Selected'
+    const cancelSelectionButton = document.createElement('button')
+    cancelSelectionButton.className = 'guest-add-button'
+    cancelSelectionButton.textContent = 'Cancel'
+    const selectionStatus = document.createElement('span')
+    selectionStatus.className = 'guests-status'
+    actionRow.append(removeSelectedButton, cancelSelectionButton, selectionStatus)
+    guestPlayersPanel.appendChild(actionRow)
+
+    cancelSelectionButton.addEventListener('click', () => {
+      guestPlayersPanel.style.display = 'none'
+      guestPlayersPanel.innerHTML = ''
+    })
+    removeSelectedButton.addEventListener('click', async () => {
+      const selected = checkboxes.filter((cb) => cb.checked).map((cb) => cb.value)
+      if (selected.length === 0) {
+        selectionStatus.textContent = 'Select at least one player.'
+        selectionStatus.className = 'guests-status error'
+        return
+      }
+      removeSelectedButton.disabled = true
+      cancelSelectionButton.disabled = true
+      selectionStatus.textContent = 'Removing…'
+      selectionStatus.className = 'guests-status'
+      try {
+        await onGuestPlayersRemove(selected)
+        guestPlayersPanel.style.display = 'none'
+        guestPlayersPanel.innerHTML = ''
+      } catch (err) {
+        console.error(err)
+        selectionStatus.textContent = `Failed: ${(err as Error).message}`
+        selectionStatus.className = 'guests-status error'
+        removeSelectedButton.disabled = false
+        cancelSelectionButton.disabled = false
+      }
+    })
+  })
+
+  guestsSection.appendChild(guestPlayersSection)
 
   container.appendChild(guestsSection)
 
@@ -526,6 +665,11 @@ function buildRow(
   seasonStartUtc: string,
   seasonEndUtc: string,
   onEvict: (clanTag: string, targetGuildId: string) => Promise<void>,
+  // Rule f (2026-08-18) — full clan removal, offered only for a real (saved) guest clan row, see
+  // ClanConfig.is_guest's own comment. The caller (renderClanConfigTable's removeGuestClanRow)
+  // owns both the network call and the outer working[]/existingClanTags cleanup; this function
+  // only owns the button/confirm UI and error display.
+  onGuestClanRemove: (clan: ClanConfig, row: HTMLTableRowElement) => Promise<void>,
 ): HTMLTableRowElement {
   const row = document.createElement('tr')
   const seasonStartMs = new Date(seasonStartUtc).getTime()
@@ -683,7 +827,66 @@ function buildRow(
   timeSelect.addEventListener('change', updateStartValue)
   syncDisabledState()
 
-  checkboxCell.appendChild(checkbox)
+  // Inner flex row (2026-08-18, live-testing feedback: the checkbox and "Remove" button were
+  // landing on visibly different lines/heights as plain inline siblings inside the `<td>`) — a
+  // `<td>` must stay `display: table-cell` to keep participating correctly in the table's own
+  // row/column layout, so the flex centering lives on this inner wrapper instead of the cell
+  // itself; see `.checkbox-cell-inner` in index.html.
+  const checkboxCellInner = document.createElement('div')
+  checkboxCellInner.className = 'checkbox-cell-inner'
+  checkboxCell.appendChild(checkboxCellInner)
+  checkboxCellInner.appendChild(checkbox)
+
+  // Rule f's "Remove" button — placed right of the checkbox (project owner's spec), vertically
+  // centered against it (checkbox-cell-inner's own `align-items: center`), only for a real guest
+  // clan (never a family clan — is_guest is false/undefined for those, and for a
+  // freshly-added-but-unsaved guest clan, see ClanConfig.is_guest's own comment for why that's
+  // deliberate too).
+  if (clan.is_guest) {
+    const removeButton = document.createElement('button')
+    removeButton.className = 'guest-clan-remove-button'
+    removeButton.textContent = 'Remove'
+    removeButton.title = `Remove ${clan.name} from this season entirely — deletes it from the roster and removes its players from the enrollment pool`
+
+    removeButton.addEventListener('click', () => {
+      // Destructive action — no window.confirm() (this runs in a sandboxed Activity iframe, and
+      // every other confirmation in this file is an inline UI element, never a browser dialog,
+      // matching the guest-clan-add "already shared, add anyway?" pattern above).
+      removeButton.remove()
+      const confirmLabel = document.createElement('span')
+      confirmLabel.className = 'guest-result-note'
+      confirmLabel.textContent = 'Remove clan and its players from the pool?'
+      const yesButton = document.createElement('button')
+      yesButton.className = 'guest-clan-remove-button'
+      yesButton.textContent = 'Yes'
+      const cancelButton = document.createElement('button')
+      cancelButton.className = 'guest-clan-remove-button'
+      cancelButton.textContent = 'Cancel'
+      yesButton.addEventListener('click', async () => {
+        yesButton.disabled = true
+        cancelButton.disabled = true
+        try {
+          await onGuestClanRemove(clan, row)
+          // Success: the caller already removed `row` from the DOM — nothing left to update here.
+        } catch (err) {
+          console.error(err)
+          confirmLabel.textContent = `Failed to remove: ${(err as Error).message}`
+          yesButton.disabled = false
+          cancelButton.disabled = false
+        }
+      })
+      cancelButton.addEventListener('click', () => {
+        confirmLabel.remove()
+        yesButton.remove()
+        cancelButton.remove()
+        checkboxCellInner.appendChild(removeButton)
+      })
+      checkboxCellInner.append(confirmLabel, yesButton, cancelButton)
+    })
+
+    checkboxCellInner.appendChild(removeButton)
+  }
+
   row.append(checkboxCell, nameCell, tierCell, rosterCell, startCell)
   return row
 }

@@ -232,7 +232,7 @@ def _build_clan_config_payload_sync(guild_id: int) -> Dict[str, Any]:
     asyncio.to_thread() hop from its only caller, handle_get_clan_config.
     """
     from qapbot.QBdiscocmdshelper import get_guild_clans_including_member_config
-    from qapbot.QBdiscocmdshelper_cwl import cwl_league_rank, resolve_selected_cwl_season
+    from qapbot.QBdiscocmdshelper_cwl import cwl_league_rank, resolve_guild_member_clan_tags, resolve_selected_cwl_season
 
     db = CACHE.db_manager
 
@@ -258,6 +258,14 @@ def _build_clan_config_payload_sync(guild_id: int) -> Dict[str, Any]:
     # actually configured, not just the family" rule _build_enrollment_payload already applies to
     # its own player pool.
     all_tags = set(get_guild_clans_including_member_config(guild_id)) | set(known_rows.keys())
+
+    # is_guest (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md rule f): drives the
+    # frontend's "Remove" button, which must NEVER be offered for a real family clan — deliberately
+    # resolve_guild_member_clan_tags(), the same CWL-family definition used everywhere else in this
+    # feature (start_cwl_enrollment, the cleanup protection logic), not the broader
+    # get_guild_clans_including_member_config() above (that one also includes a clan this guild
+    # merely subscribes to for war tracking, which is not the same thing as "part of the family").
+    family_clan_tags = set(resolve_guild_member_clan_tags(guild_id))
 
     default_start_at = f"{season}-01T08:00Z"
 
@@ -333,6 +341,7 @@ def _build_clan_config_payload_sync(guild_id: int) -> Dict[str, Any]:
             "roster_size": effective_row["roster_size"] if effective_row else 15,
             "cwl_start_at": effective_row["cwl_start_at"] if effective_row else default_start_at,
             "shared_with": shared_with,
+            "is_guest": tag not in family_clan_tags,
         })
 
     return {
@@ -605,6 +614,36 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
         "players": players,
         "version": get_enrollment_version(guild_id),
     }
+
+
+async def notify_new_cwl_pool_members(guild_id: int, season: str) -> Dict[str, Any]:
+    """Rule h's "Notify New Pool Members" action (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_
+    REDESIGN_PLAN.md) — for an event past `draft`, re-resolves the actual current pool (reuses
+    _build_enrollment_payload_sync, same reasoning as handle_get_cwl_guest_players above — this
+    is a real button-click callback, not the synchronous UI-render path, so the heavier payload
+    build is safe here) and runs it through the shared DM batch helper. The batch helper's own
+    global dm_sent dedup (QBdiscocmdshelper_cwl.py) means this is naturally "only the
+    not-yet-contacted ones" — no separate filtering needed here. The button-gating check
+    (has_cwl_pool_members_missing_dm, QBdiscocmdshelper_cwl.py) is a separate, cheaper function —
+    it runs on the synchronous CWL Management screen render path, which can't await this one."""
+    from qapbot.QBdiscocmdshelper_cwl import _send_cwl_enrollment_dm_batch
+
+    db = CACHE.db_manager
+    if db is None:
+        return {"ok": False, "error": "no_database"}
+    event = await asyncio.to_thread(db.get_cwl_event_sync, str(guild_id), season)
+    if event is None:
+        return {"ok": False, "error": "no_event"}
+    if event["status"] in ("draft", "cancelled"):
+        return {"ok": False, "error": "not_open"}
+
+    payload = await asyncio.to_thread(_build_enrollment_payload_sync, guild_id)
+    dm_targets = [
+        {"player_tag": p["player_tag"], "player_name": p["player_name"], "discord_id": p["discord_id"]}
+        for p in payload["players"] if p["discord_id"]
+    ]
+    dm_result = await _send_cwl_enrollment_dm_batch(event["id"], guild_id, season, dm_targets)
+    return {"ok": True, **dm_result}
 
 
 # CWL Guests search (2026-08-17 PROD meltdown fix): the search used to be an uncapped scan
@@ -1032,7 +1071,11 @@ def _apply_cwl_enrollment_signup_sync(
     or {"error": ..., "status": ...} for the one case this needs to report back as an HTTP error."""
     from datetime import datetime, timezone
 
-    from qapbot.QBdiscocmdshelper_cwl import get_event_shared_clans_by_tag_sync, sync_cwl_shared_clan_roster_to_local_pools
+    from qapbot.QBdiscocmdshelper_cwl import (
+        _propagate_cwl_player_response_sync,
+        get_event_shared_clans_by_tag_sync,
+        sync_cwl_shared_clan_roster_to_local_pools,
+    )
 
     # Cross-guild shared-clan write-path branch (2026-08-15, slice 4) — checked FIRST: a player
     # already sitting in a shared clan's roster may exist ONLY there (e.g. this guild's own
@@ -1065,6 +1108,8 @@ def _apply_cwl_enrollment_signup_sync(
         # De-sync guard (2026-08-15) — see sync_cwl_shared_clan_roster_to_local_pools's docstring:
         # keeps every OTHER attached guild's own local cwl_signups pool aware of this player too.
         sync_cwl_shared_clan_roster_to_local_pools(player_shared_clan["id"])
+        player_name = shared_roster_row["player_name"]
+        discord_id = shared_roster_row["discord_id"]
     else:
         existing = db.get_cwl_signup_sync(event_id, player_tag)
         if existing is not None:
@@ -1092,10 +1137,22 @@ def _apply_cwl_enrollment_signup_sync(
         if action == "withdraw":
             db.delete_cwl_assignment_sync(event_id, player_tag)
 
+    # rule h (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md) — an admin's manual
+    # 1-click confirm/withdraw from the Manage Enrollment board is just as much "the player's own
+    # genuine response" as a DM-button click for propagation purposes; fans this exact status out
+    # to every OTHER guild already pooling this same real-world player for this season. Calls the
+    # sync half directly (not the async propagate_cwl_player_response wrapper) since this whole
+    # function is itself the sync half of one atomic asyncio.to_thread() hop — see this function's
+    # own docstring.
+    affected_guild_ids = _propagate_cwl_player_response_sync(
+        db, player_tag, season, new_status, responded_at, player_name, discord_id, event_id, guild_id,
+    )
+
     # "shared" tells the caller whether sync_cwl_shared_clan_roster_to_local_pools() above may
-    # have touched another guild's local pool too (2026-08-17, Step 8) — if so, the caller bumps
-    # the enrollment version globally rather than just for this guild.
-    return {"ok": True, "shared": player_shared_clan is not None}
+    # have touched another guild's local pool too (2026-08-17, Step 8); "affected_guild_ids"
+    # (rule h) names every additional guild propagate_cwl_player_response's own fan-out touched —
+    # the caller bumps all of them, plus its own guild_id, plus the global fallback if "shared".
+    return {"ok": True, "shared": player_shared_clan is not None, "affected_guild_ids": affected_guild_ids}
 
 
 async def handle_post_cwl_enrollment_signup(request: web.Request) -> web.Response:
@@ -1154,6 +1211,12 @@ async def handle_post_cwl_enrollment_signup(request: web.Request) -> web.Respons
     # via sync_cwl_shared_clan_roster_to_local_pools() — bump globally rather than resolve the
     # exact partner guild here (see bump_enrollment_version's own docstring for the tradeoff).
     await bump_enrollment_version(None if result.get("shared") else guild_id)
+    # rule h (2026-08-18) — propagate_cwl_player_response's own fan-out (a separate mechanism
+    # from the shared-clan sync above) named every OTHER guild it touched precisely; only needed
+    # when the bump above wasn't already global.
+    if not result.get("shared"):
+        for other_guild_id in result.get("affected_guild_ids", []):
+            await bump_enrollment_version(other_guild_id)
 
     return web.json_response({"ok": True})
 
@@ -1281,7 +1344,13 @@ async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response
     handle_post_cwl_enrollment_signup enforces, since the whole point of a guest is that they
     aren't. Guest CLANS never go through this endpoint at all — they're added straight into
     cwl_event_clans via the existing POST /cwl/clan-config save, same as any other clan (see
-    _search_cwl_guests_sync's docstring for why that needs no new persistence of its own)."""
+    _search_cwl_guests_sync's docstring for why that needs no new persistence of its own).
+
+    Purely a pool-add now (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md, rules c/e) —
+    no longer sends an immediate DM. Rule c: a guest player invited before enrollment starts is
+    added to the pool and gets DMed only when Start Enrollment runs (or, once already open, via
+    the rule-h "notify new pool members" flow) — the "Send enrollment DM immediately" checkbox
+    that used to bypass that timing is gone, replaced entirely by that later flow."""
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
     try:
@@ -1291,7 +1360,6 @@ async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response
         player_tag = str(body["player_tag"]).upper()
         player_name = str(body.get("player_name") or player_tag)
         guest_discord_id = body.get("discord_id")
-        send_dm_on_save = bool(body.get("send_dm_on_save", False))
     except (KeyError, ValueError, TypeError):
         return web.json_response({"error": "invalid request body"}, status=400)
 
@@ -1302,7 +1370,7 @@ async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response
     if db is None:
         return web.json_response({"error": "database not ready"}, status=503)
 
-    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season, send_cwl_signup_template_dm
+    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
     from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
 
     season = resolve_selected_cwl_season(guild_id)
@@ -1319,16 +1387,6 @@ async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response
         source="guest_invite", status="pending",
     )
 
-    dm_sent = False
-    if send_dm_on_save and guest_discord_id:
-        # Deliberately bypasses CONFIG.cwl_dm_restrict_to_admin — that guard exists to stop an
-        # accidental BULK blast while the feature is under live-testing; this is one admin
-        # deliberately choosing to DM one specific person right now, same category of action as
-        # /admin's TEST_NOTIFY, not the kind of blast the guard was built to catch.
-        dm_sent = await send_cwl_signup_template_dm(event["id"], guild_id, season, {
-            "player_tag": player_tag, "player_name": player_name, "discord_id": guest_discord_id,
-        })
-
     try:
         await refresh_cwl_management_hub_message(guild_id, "cwl_management")
     except Exception as e:
@@ -1337,7 +1395,7 @@ async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response
     # (see this handler's own docstring: guest CLANS go through a different endpoint entirely).
     await bump_enrollment_version(guild_id)
 
-    return web.json_response({"ok": True, "dm_sent": dm_sent})
+    return web.json_response({"ok": True})
 
 
 async def handle_get_clan_config(request: web.Request) -> web.Response:
@@ -1377,11 +1435,16 @@ def _prepare_and_save_clan_config_sync(db: Any, guild_id: int, season: str, clan
         }
     event_id = event["id"]
 
-    # Snapshot of what was participating BEFORE this save — the cross-guild sharing check below
-    # (2026-08-15) only needs to run for clans newly turning on, not every clan on every save.
-    previously_participating = {
-        c["clan_tag"] for c in db.get_cwl_event_clans_sync(event_id) if c.get("participating", 1)
-    }
+    # Snapshot of what was on the roster BEFORE this save.
+    existing_rows = db.get_cwl_event_clans_sync(event_id)
+    # Participating-only subset — the cross-guild sharing check below (2026-08-15) only needs to
+    # run for clans newly turning on, not every clan on every save.
+    previously_participating = {c["clan_tag"] for c in existing_rows if c.get("participating", 1)}
+    # ALL previously-known tags, participating or not (2026-08-18, rule b/d,
+    # CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md) — lets the caller tell "genuinely new to the
+    # roster this save" apart from "already here, just re-toggled," since pool-seeding now needs
+    # to trigger on the former regardless of participating state.
+    previously_known_tags = {c["clan_tag"] for c in existing_rows}
 
     # Same shape create_cwl_event_sync()/set_cwl_event_clans_sync() already expect.
     # Every clan the frontend sent is persisted, participating or not — set_cwl_event_clans_sync()
@@ -1425,6 +1488,7 @@ def _prepare_and_save_clan_config_sync(db: Any, guild_id: int, season: str, clan
         "event_id": event_id,
         "event_status": event["status"],
         "previously_participating": previously_participating,
+        "previously_known_tags": previously_known_tags,
         "clan_configs": clan_configs,
     }
 
@@ -1468,6 +1532,7 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
     event_id = prepared["event_id"]
     event_status = prepared["event_status"]
     previously_participating = prepared["previously_participating"]
+    previously_known_tags = prepared["previously_known_tags"]
     clan_configs = prepared["clan_configs"]
 
     # Cross-guild shared-clan check (2026-08-15, project owner's spec) — the first of the two
@@ -1506,6 +1571,26 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
                 await auto_assign_prior_cwl_members(guild_id, event_id, season, clan_tag)
             except Exception as e:
                 logging.warning(f"[WEB-BRIDGE] Clan {clan_tag} added but prior-CWL auto-assign failed: {e}")
+
+    # Pool-seed a newly-added clan that stayed UNCHECKED (2026-08-18, rule b/d,
+    # CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md, live-tested bug: a guest clan invited and
+    # immediately left unchecked never got its members into the pool at all — "in the pool"
+    # must not depend on the participating checkbox, only the auto-assignment TARGET does).
+    # Deliberately separate from the loop above: no cross-guild sharing/ownership resolution for
+    # a clan that isn't even participating, and auto_assign_prior_cwl_members itself already
+    # skips actually placing anyone into a non-participating clan's column (pure pool-visibility
+    # seed only — see its own docstring) — so this only needs to run once enrollment is open,
+    # same gate as the loop above.
+    newly_added_non_participating_tags = [
+        c["clan_tag"] for c in clan_configs
+        if not c["participating"] and c["clan_tag"] not in previously_known_tags
+    ]
+    if event_status != "draft":
+        for clan_tag in newly_added_non_participating_tags:
+            try:
+                await auto_assign_prior_cwl_members(guild_id, event_id, season, clan_tag)
+            except Exception as e:
+                logging.warning(f"[WEB-BRIDGE] Clan {clan_tag} added (unchecked) but pool-visibility seed failed: {e}")
 
     # Cross-guild shared-clan detach-on-deactivate (2026-08-15, live-testing feedback) — the
     # inverse of the block above: a clan turning OFF this save that's currently shared must
@@ -1582,6 +1667,152 @@ async def handle_post_cwl_shared_clan_evict(request: web.Request) -> web.Respons
     return web.json_response({"ok": True})
 
 
+async def handle_post_cwl_guest_clan_remove(request: web.Request) -> web.Response:
+    """Full removal of a guest clan from the season (rule f's "Remove" button, 2026-08-18,
+    CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md) — as opposed to unchecking a guest clan's
+    checkbox and saving (now purely cosmetic, see detach_guild_from_shared_clan_on_deactivation's
+    own docstring), this deletes the clan's cwl_event_clans row entirely AND removes its members
+    from the player pool (the destructive cleanup that used to run automatically on every
+    uncheck+Save). Rejects a family-clan tag outright — family membership is never removable this
+    way, fail closed here rather than relying solely on remove_cwl_guest_clan's own internal
+    protection logic."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        guild_id = int(body["guild_id"])
+        discord_user_id = int(body["discord_user_id"])
+        clan_tag = str(body["clan_tag"])
+    except (KeyError, ValueError, TypeError):
+        return web.json_response({"error": "invalid request body"}, status=400)
+
+    if not await _resolve_admin(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin of this guild"}, status=403)
+
+    db = CACHE.db_manager
+    if db is None:
+        return web.json_response({"error": "database not ready"}, status=503)
+
+    from qapbot.QBdiscocmdshelper_cwl import (
+        remove_cwl_guest_clan,
+        resolve_guild_member_clan_tags,
+        resolve_selected_cwl_season,
+    )
+    from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+
+    if clan_tag in resolve_guild_member_clan_tags(guild_id):
+        return web.json_response({"error": "cannot remove a family clan this way"}, status=400)
+
+    season = resolve_selected_cwl_season(guild_id)
+    event = await asyncio.to_thread(db.get_cwl_event_sync, str(guild_id), season)
+    if event is None:
+        return web.json_response({"error": f"no CWL event exists yet for season {season}"}, status=409)
+    event_id = event["id"]
+
+    existing_clans = await asyncio.to_thread(db.get_cwl_event_clans_sync, event_id)
+    if not any(c["clan_tag"] == clan_tag for c in existing_clans):
+        return web.json_response({"error": "clan is not on this event's roster"}, status=404)
+
+    await remove_cwl_guest_clan(guild_id, event_id, season, clan_tag)
+
+    try:
+        await refresh_cwl_management_hub_message(guild_id, "cwl_management")
+    except Exception as e:
+        logging.warning(f"[WEB-BRIDGE] Removed guest clan {clan_tag} but could not refresh the Hub message: {e}")
+    await bump_enrollment_version(guild_id)
+
+    return web.json_response({"ok": True})
+
+
+async def handle_get_cwl_guest_players(request: web.Request) -> web.Response:
+    """Rule g (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md) — lists every pooled
+    player currently carrying the guest badge, for the "Remove Guest Players" multi-select on
+    Configure Participating Clans: individually-invited guest players (source='guest_invite')
+    AND orphaned ex-guest-clan players (their clan's cwl_event_clans row was unchecked or
+    deleted, but rule f means their own cwl_signups/cwl_assignments rows survived that).
+
+    Deliberately reuses _build_enrollment_payload_sync's own is_guest computation (Cardinal Rule
+    4 — search before creating) rather than re-deriving it: that function already redefines
+    is_guest around live current-clan membership regardless of write-path source ("a member is a
+    member regardless of assignment status, a guest is a guest regardless," project owner's spec)
+    — exactly the definition rule g's removal list needs, and the only place in this codebase
+    that already computes it correctly for every player in the pool."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        guild_id = int(request.query["guild_id"])
+        discord_user_id = int(request.query["discord_user_id"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "missing/invalid guild_id or discord_user_id"}, status=400)
+
+    if not await _resolve_admin(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin of this guild"}, status=403)
+
+    payload = await asyncio.to_thread(_build_enrollment_payload_sync, guild_id)
+    guest_players = [
+        {
+            "player_tag": p["player_tag"],
+            "player_name": p["player_name"],
+            "current_clan_tag": p["current_clan_tag"],
+            "assigned_clan_tag": p["assigned_clan_tag"],
+        }
+        for p in payload["players"] if p["is_guest"]
+    ]
+    return web.json_response({"players": guest_players})
+
+
+async def handle_post_cwl_guest_players_remove(request: web.Request) -> web.Response:
+    """Rule g's actual removal — per tag, the same two calls
+    _cleanup_local_pool_for_plain_clan_deactivation_sync already uses (delete_cwl_assignment_sync
+    + delete_cwl_signup_sync), no new deletion primitive needed. Deliberately does NOT touch
+    cwl_player_season_status (Phase 5) — rule h requires a removed-then-re-added guest player's
+    global dm_sent/response record to survive this exact operation.
+
+    Scoped to LOCAL cwl_signups/cwl_assignments only — a guest player who also happens to sit in
+    a cross-guild shared clan's roster (cwl_shared_clan_players) is a much rarer case this action
+    doesn't reach; that roster has its own dedicated removal path (shared-clan eviction/detach)."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        guild_id = int(body["guild_id"])
+        discord_user_id = int(body["discord_user_id"])
+        player_tags = [str(t) for t in body["player_tags"]]
+    except (KeyError, ValueError, TypeError):
+        return web.json_response({"error": "invalid request body"}, status=400)
+
+    if not await _resolve_admin(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin of this guild"}, status=403)
+
+    db = CACHE.db_manager
+    if db is None:
+        return web.json_response({"error": "database not ready"}, status=503)
+
+    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+    from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+
+    season = resolve_selected_cwl_season(guild_id)
+    event = await asyncio.to_thread(db.get_cwl_event_sync, str(guild_id), season)
+    if event is None:
+        return web.json_response({"error": f"no CWL event exists yet for season {season}"}, status=409)
+    event_id = event["id"]
+
+    def _remove_players_sync() -> None:
+        for tag in player_tags:
+            db.delete_cwl_assignment_sync(event_id, tag)
+            db.delete_cwl_signup_sync(event_id, tag)
+
+    await asyncio.to_thread(_remove_players_sync)
+
+    try:
+        await refresh_cwl_management_hub_message(guild_id, "cwl_management")
+    except Exception as e:
+        logging.warning(f"[WEB-BRIDGE] Removed {len(player_tags)} guest player(s) but could not refresh the Hub message: {e}")
+    await bump_enrollment_version(guild_id)
+
+    return web.json_response({"ok": True})
+
+
 async def handle_post_cwl_activity_closed(request: web.Request) -> web.Response:
     """Best-effort notification that the Activity iframe is about to close — fired by
     main.ts's closeActivity() on EVERY close (Save, Cancel, or the native X/back gesture alike),
@@ -1641,6 +1872,9 @@ def create_app() -> web.Application:
     app.router.add_post("/api/cwl/enrollment/assign", handle_post_cwl_enrollment_assign)
     app.router.add_get("/api/cwl/guest-search", handle_get_cwl_guest_search)
     app.router.add_post("/api/cwl/enrollment/guest", handle_post_cwl_enrollment_guest)
+    app.router.add_post("/api/cwl/enrollment/guest-clan/remove", handle_post_cwl_guest_clan_remove)
+    app.router.add_get("/api/cwl/enrollment/guest-players", handle_get_cwl_guest_players)
+    app.router.add_post("/api/cwl/enrollment/guest-players/remove", handle_post_cwl_guest_players_remove)
     app.router.add_post("/api/cwl/shared-clan/evict", handle_post_cwl_shared_clan_evict)
     app.router.add_post("/api/cwl/activity-closed", handle_post_cwl_activity_closed)
     return app

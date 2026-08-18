@@ -16,6 +16,14 @@ export type ClanConfig = {
    * only the owner guild may remove another guild from a shared clan
    * (CWL_ROSTER_PLANNING_PLAN.md). */
   shared_with: { is_owner: boolean; other_guild_ids: string[]; other_guild_names: string[] } | null
+  /** True when this clan is NOT part of the guild's own CWL family (2026-08-18,
+   * CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md rule f) — drives the "Remove" button, which must
+   * never be offered for a real family clan. GET-only, computed server-side from
+   * resolve_guild_member_clan_tags(); a freshly-added guest clan (still unsaved, from the Guests
+   * search "Add" click) is constructed client-side and deliberately does NOT set this field
+   * (stays `undefined`/falsy) — Remove is only offered for a clan that's actually on the saved
+   * roster, since removing an unsaved row is just "don't click Save." */
+  is_guest?: boolean
 }
 
 /** Season selection lives entirely on the Discord-side CWL Management screen (its own season
@@ -119,6 +127,16 @@ export type WaitResponse = { changed: boolean; version: number }
 export type GuestSearchResult =
   | { type: 'clan'; clan_tag: string; clan_name: string; clan_tier: string | null; already_shared_with: string | null }
   | { type: 'player'; player_tag: string; player_name: string; discord_id: string | null }
+
+/** One row from GET /api/cwl/enrollment/guest-players (2026-08-18, rule g) — every currently
+ * pooled guest player (individually invited, or an orphaned leftover from a rule-f guest-clan
+ * removal), for the "Remove Guest Players" multi-select. */
+export type GuestPlayerPoolEntry = {
+  player_tag: string
+  player_name: string | null
+  current_clan_tag: string | null
+  assigned_clan_tag: string | null
+}
 
 /** GET /api/cwl/guest-search's response shape (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P0
  * Step 3). `stale` is only ever `true` — never present as `false` — set when a keystroke's search
