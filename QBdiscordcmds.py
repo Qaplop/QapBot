@@ -4844,19 +4844,74 @@ async def _whois_player_select_callback(interaction: discord.Interaction, select
     _log_cmd_done(interaction, "whois")
 
 
-def _search_player_name_index_sync(needle_lower: str) -> List[Dict[str, str]]:
-    """Full, uncapped substring scan over CACHE.player_name_index for /whois's name-search path
-    (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 9). Deliberately NOT capped at 25 like
-    CACHE.search_player_names() — see whois_slash's own comment: capping here would cut off
-    guild members that sort later alphabetically, before the guild-membership reorder below even
-    runs. Worst case is a full pass over player_name_index (millions of entries on PROD, no
-    per-entry allocation now that name_lower is precomputed) — always call via
-    asyncio.to_thread() from the event loop, never directly in a coroutine."""
-    return [
-        {"player_tag": tag, "player_name": name}
-        for tag, (name, name_lower) in CACHE.player_name_index.items()
-        if needle_lower in name_lower
-    ]
+def _build_guild_player_name_matches(guild_id: Optional[int], needle_lower: str) -> List[Dict[str, str]]:
+    """Guild-first half of /whois's two-step name search (2026-08-18,
+    PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Steps 1-3) — an always-complete, uncapped substring
+    match over the guild's OWN player pool, built fresh from the same 3 in-memory sources the
+    old post-search reorder step used (CACHE.user_accounts, CACHE.temp_war_stats,
+    CACHE.coc_clan_cache for the guild's own clans). A guild's own roster tops out in the
+    hundreds, so this runs directly on the event loop — no asyncio.to_thread() needed here,
+    unlike the capped global SQL fallback in whois_slash's own caller.
+
+    Guarantees completeness for guild members specifically: unlike the global FTS5 fallback
+    (search_player_names_full_sync), a guild member can never be excluded here just because a
+    huge global match count pushed them past a cap — the whole point of this redesign. Returns
+    [] with no guild context (DM invocation) or when the guild has no configured clans; callers
+    then rely entirely on the global fallback, matching pre-redesign DM behavior."""
+    if not guild_id:
+        return []
+    from qapbot.QBdiscocmdshelper import get_guild_clans_including_member_config
+    guild_clan_tags: set[str] = set(get_guild_clans_including_member_config(guild_id))
+    if not guild_clan_tags:
+        return []
+
+    tag_to_clan: Dict[str, str] = {}
+    tag_to_name: Dict[str, str] = {}
+    # Source 1: registered Discord users (current_clan_tag + player_name fields)
+    for user_data in CACHE.user_accounts.values():
+        for p in user_data.get("players", []):
+            if isinstance(p, dict):
+                ptag = p.get("player_tag", "")
+                if not ptag:
+                    continue
+                ctag = p.get("current_clan_tag") or ""
+                if ctag:
+                    tag_to_clan[ptag] = ctag
+                pname = p.get("player_name")
+                if pname:
+                    tag_to_name.setdefault(ptag, pname)
+    # Source 2: all players currently in active wars (covers unregistered members) — only keys
+    # carry a tag->clan association here, no name; resolved below (source 3, then
+    # player_name_index) for any tag that ends up with no name from source 1/3.
+    for clan_tag, player_stats in CACHE.temp_war_stats.items():
+        for player_tag in player_stats:
+            tag_to_clan[player_tag] = clan_tag
+    # Source 3: cached clan members for guild clans (covers between-wars) — freshest source,
+    # overwrites any stale name source 1 might hold.
+    for clan_tag in guild_clan_tags:
+        _clan_obj = CACHE.coc_clan_cache.cache.get(clan_tag, {}).get("data")
+        if _clan_obj is not None:
+            for _member in getattr(_clan_obj, 'members', []):
+                _ptag = getattr(_member, 'tag', '')
+                if _ptag:
+                    tag_to_clan[_ptag] = clan_tag
+                    _mname = getattr(_member, 'name', '')
+                    if _mname:
+                        tag_to_name[_ptag] = _mname
+
+    matches: List[Dict[str, str]] = []
+    for ptag, ctag in tag_to_clan.items():
+        if ctag not in guild_clan_tags:
+            continue
+        name = tag_to_name.get(ptag)
+        if not name:
+            _idx_entry = CACHE.player_name_index.get(ptag)
+            name = _idx_entry[0] if _idx_entry else None
+        if not name or needle_lower not in name.lower():
+            continue
+        matches.append({"player_tag": ptag, "player_name": name})
+    matches.sort(key=lambda m: m["player_name"].lower())
+    return matches
 
 
 @app_commands.command(name="whois", description=dev_mode+"Show CoC accounts for a Discord user, or war history for a player.")
@@ -4887,59 +4942,44 @@ async def whois_slash(
             await _player_report_logic(interaction, player_stripped)
             _log_cmd_done(interaction, "whois")
         else:
-            # Name substring search — get ALL matches first (no 25-cap yet), then
-            # sort by guild membership, then slice to 25 for the dropdown.
-            # search_player_names caps at 25 alphabetically, which would cut off
-            # guild members that sort later in the alphabet — so we search inline.
-            # asyncio.to_thread()-wrapped (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1
-            # Step 9) — a full, uncapped scan over player_name_index (millions of entries on
-            # PROD) running directly on the event loop would freeze the whole bot exactly like
-            # any other un-wrapped sync scan (Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md).
+            # Two-step search (2026-08-18, PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Steps 1-3):
+            # guild members first, via an always-complete in-memory pass over the guild's own
+            # player pool (never subject to any cap — see _build_guild_player_name_matches),
+            # then a capped global FTS5 fallback for everyone else. The guild pass IS the
+            # priority ordering now, structurally (it's collected and sorted first), replacing
+            # the old single uncapped scan over CACHE.player_name_index followed by a separate
+            # sort-by-tag_to_clan reorder step.
             needle = player_stripped.lower()
-            all_matches: List[Dict[str, str]] = await asyncio.to_thread(
-                _search_player_name_index_sync, needle
-            )
-            # Prioritise players from clans that belong to this guild
-            if all_matches and interaction.guild_id:
-                from qapbot.QBdiscocmdshelper import get_guild_clans_including_member_config
-                guild_clan_tags: set[str] = set(get_guild_clans_including_member_config(interaction.guild_id))
-                if guild_clan_tags:
-                    # Build player_tag → clan_tag from multiple sources:
-                    # Source 1: registered Discord users (current_clan_tag field)
-                    tag_to_clan: Dict[str, str] = {}
-                    for user_data in CACHE.user_accounts.values():
-                        for p in user_data.get("players", []):
-                            if isinstance(p, dict):
-                                ptag = p.get("player_tag", "")
-                                ctag = p.get("current_clan_tag") or ""
-                                if ptag and ctag:
-                                    tag_to_clan[ptag] = ctag
-                    # Source 2: all players currently in active wars (covers unregistered members)
-                    for clan_tag, player_stats in CACHE.temp_war_stats.items():
-                        for player_tag in player_stats:
-                            tag_to_clan[player_tag] = clan_tag
-                    # Source 3: cached clan members for guild clans (covers between-wars)
-                    for clan_tag in guild_clan_tags:
-                        _clan_obj = CACHE.coc_clan_cache.cache.get(clan_tag, {}).get("data")
-                        if _clan_obj is not None:
-                            for _member in getattr(_clan_obj, 'members', []):
-                                _ptag = getattr(_member, 'tag', '')
-                                if _ptag:
-                                    tag_to_clan[_ptag] = clan_tag
-                    all_matches.sort(key=lambda m: (
-                        0 if tag_to_clan.get(m["player_tag"], "") in guild_clan_tags else 1,
-                        m["player_name"].lower(),
-                    ))
-                else:
-                    all_matches.sort(key=lambda m: m["player_name"].lower())
-            else:
-                all_matches.sort(key=lambda m: m["player_name"].lower())
+            guild_matches = _build_guild_player_name_matches(interaction.guild_id, needle)
+            guild_tags_matched = {m["player_tag"] for m in guild_matches}
+
+            # Global fallback only above the FTS5 trigram floor (3 chars) — below that, the
+            # guild pass above (no floor of its own) may already have answered; skip silently
+            # rather than issuing a query guaranteed to find nothing (Pitfall 26 doesn't apply
+            # to skipping a call, only to making one unwrapped).
+            global_matches: List[Dict[str, str]] = []
+            if len(needle) >= 3 and CACHE.db_manager is not None:
+                global_raw: List[Dict[str, str]] = await asyncio.to_thread(
+                    CACHE.db_manager.search_player_names_full_sync, needle
+                )
+                global_matches = [m for m in global_raw if m["player_tag"] not in guild_tags_matched]
+
+            all_matches = guild_matches + global_matches
             matches = all_matches[:25]
             if not matches:
-                await interaction.followup.send(
-                    t('commands.whois.player_not_found', guild_id=interaction.guild_id).format(name=player_stripped),
-                    ephemeral=True,
-                )
+                # "Too short" only when the guild pass (which has no length floor of its own)
+                # also found nothing — a guild admin searching "Al" for their own 3-member
+                # roster should get a working result, not an error.
+                if len(needle) < 3:
+                    await interaction.followup.send(
+                        t('commands.whois.player_search_too_short', guild_id=interaction.guild_id).format(name=player_stripped),
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.followup.send(
+                        t('commands.whois.player_not_found', guild_id=interaction.guild_id).format(name=player_stripped),
+                        ephemeral=True,
+                    )
             elif len(matches) == 1:
                 await _player_report_logic(interaction, matches[0]["player_tag"])
                 _log_cmd_done(interaction, "whois")

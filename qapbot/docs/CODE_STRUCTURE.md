@@ -293,7 +293,8 @@ all rebuild/button-handler paths so the reference is never lost.
 - Provides centralized access to db_manager for all database operations
 - No JSON persistence (only temp war files in data/temp/ remain as JSON)
 - `player_name_index: Dict[str, str]` — in-memory {player_tag: player_name} map loaded at startup via `load_player_name_index()`
-- `search_player_names(query, limit=25)`: synchronous O(n) substring search over in-memory index, sorted alphabetically then capped at `limit`. NOT used by /whois — `/whois` searches `CACHE.player_name_index` inline instead so it can prioritise guild members before slicing to 25 (this method's own cap would cut off guild members that sort later alphabetically). Currently only covered by unit tests.
+- `search_player_names(query, limit=25)`: synchronous O(n) substring search over in-memory index (or delegates to `db_manager.search_player_names_sync()` when `CONFIG.cwl_use_fts_player_search` is on), sorted alphabetically then capped at `limit`. Backs the CWL guest search's name-substring mode. NOT used by /whois.
+- **`/whois`'s own two-step search** (2026-08-18, `PLAYER_NAME_INDEX_RETIREMENT_PLAN.md` Steps 1-3, `QBdiscordcmds.py`): `_build_guild_player_name_matches()` does an always-complete, uncapped in-memory pass over the guild's own player pool first (built from `user_accounts`/`temp_war_stats`/`coc_clan_cache`), then `db_manager.search_player_names_full_sync()` (`hard_cap=5000`) fills in everyone else, deduplicated by tag. Guild matches are concatenated first, so they can never be pushed out by the 25-result UX slice regardless of global match volume — replaces the old inline `CACHE.player_name_index` scan plus a separate post-search reorder step.
 
 🟨 qapbot/db_manager.py (Database Layer - ~6200 lines)
 - WarHistoryDB class for ALL SQLite database operations (22 tables)

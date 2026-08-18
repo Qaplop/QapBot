@@ -432,6 +432,25 @@ Steps 9 & 11):
       safety timeout and failed to start. v2's lookup approach measured 82.42s for the same
       dataset on the same DEV hardware (4.3x faster), since it replaces 6.6M individual Python
       hash calls with a single bulk SQL query.
+  - **2026-08-18 — `/whois` migrated too, via a two-step search, not a bigger cap**
+    (`PLAYER_NAME_INDEX_RETIREMENT_PLAN.md` Steps 1-3): the note above ("out of this step's
+    scope") is now out of date. A naive migration — just pointing `/whois` at a higher-`LIMIT`
+    FTS5 reader — would have reintroduced the exact same completeness problem one order of
+    magnitude later (a guild member sorting past a 5000-match global cap, instead of past 25).
+    Fixed instead with a two-step design: `QBdiscordcmds._build_guild_player_name_matches()`
+    does an always-complete, uncapped Python substring match over the guild's OWN player pool
+    (built fresh from the same 3 in-memory CACHE sources the old post-search reorder step used —
+    `user_accounts`, `temp_war_stats`, `coc_clan_cache` — small enough, a few hundred entries at
+    most, to run directly on the event loop with no threading needed), and only THEN does
+    `db_manager.search_player_names_full_sync()` (new, `hard_cap=5000`, shares its FTS5 MATCH
+    core with `search_player_names_sync` via `_search_player_names_fts_sync`) fill in the
+    "everyone else" fallback, deduplicated by tag. Guild matches are structurally first in the
+    concatenation, so they can never be pushed out by the `[:25]` UX slice regardless of how
+    many unrelated global matches exist — the ordering guarantee is positional, not a sort key.
+    Replaces the old separate `tag_to_clan`-based reorder step entirely (redundant once the
+    guild pass already produces that same split by construction). New i18n key
+    `commands.whois.player_search_too_short` — the 3-character FTS5 trigram floor only gates
+    the global fallback, not the guild pass, which has none.
 
 ### Foreign Key Relationships
 

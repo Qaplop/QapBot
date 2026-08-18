@@ -5386,15 +5386,12 @@ class WarHistoryDB:
             except Exception as e:
                 logging.error(f"[DB-WRITE-SYNC] update_player_name_index_sync failed: {e}")
 
-    def search_player_names_sync(self, query: str, limit: int = 25) -> List[Dict[str, str]]:
-        """SQLite/FTS5-backed name-substring search over player_name_fts (2026-08-17,
-        CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 11) — the SQL-backed counterpart to
-        CACHE.search_player_names()'s in-memory scan, used when
-        CONFIG.cwl_use_fts_player_search is True. Same alphabetical-sort/25-cap contract as the
-        in-memory version, but genuinely index-backed (no in-process bound like
-        SEARCH_PLAYER_NAMES_MAX_COLLECT is needed — FTS5's trigram index finds matching rows
-        without touching non-matching ones, so LIMIT is honored without an application-level
-        early-exit).
+    def _search_player_names_fts_sync(self, query: str, limit: int) -> List[Dict[str, str]]:
+        """Shared FTS5 MATCH core for search_player_names_sync (25-cap, guest search/UX) and
+        search_player_names_full_sync (5000-cap, /whois's global fallback) — factored out
+        (2026-08-18, PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Step 1) so the trigram-floor guard and
+        FTS5-literal-quoting logic exist in exactly one place. See either public wrapper's own
+        docstring for behavior/contract; this method has no independent semantics of its own.
 
         Trigram tokenization needs >=3 characters to form even one trigram, so a shorter query
         can structurally never match anything (verified empirically 2026-08-17) — returns []
@@ -5423,11 +5420,40 @@ class WarHistoryDB:
                     WHERE player_name_fts MATCH ?
                     ORDER BY name COLLATE NOCASE
                     LIMIT ?
-                """, (literal, min(limit, 25))).fetchall()
+                """, (literal, limit)).fetchall()
                 return [{"player_tag": row["player_tag"], "player_name": row["name"]} for row in rows]
             except sqlite3.Error as e:
-                logging.error(f"[DB-QUERY-SYNC] search_player_names_sync failed: {e}")
+                logging.error(f"[DB-QUERY-SYNC] _search_player_names_fts_sync failed: {e}")
                 return []
+
+    def search_player_names_sync(self, query: str, limit: int = 25) -> List[Dict[str, str]]:
+        """SQLite/FTS5-backed name-substring search over player_name_fts (2026-08-17,
+        CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 11) — the SQL-backed counterpart to
+        CACHE.search_player_names()'s in-memory scan, used when
+        CONFIG.cwl_use_fts_player_search is True. Same alphabetical-sort/25-cap contract as the
+        in-memory version, but genuinely index-backed (no in-process bound like
+        SEARCH_PLAYER_NAMES_MAX_COLLECT is needed — FTS5's trigram index finds matching rows
+        without touching non-matching ones, so LIMIT is honored without an application-level
+        early-exit).
+
+        NOT completeness-guaranteed beyond `limit` — a query matching more players than `limit`
+        silently drops the alphabetically-late remainder. Fine for this reader's callers (guest
+        search's UX cap); see search_player_names_full_sync for the caller that needs a much
+        higher ceiling instead."""
+        return self._search_player_names_fts_sync(query, min(limit, 25))
+
+    def search_player_names_full_sync(self, query: str, hard_cap: int = 5000) -> List[Dict[str, str]]:
+        """Same FTS5 MATCH query as search_player_names_sync, but with a generous safety-valve
+        cap instead of a 25-row UX cap — the global "everyone else" half of /whois's two-step
+        search (PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Step 1; currently the only caller). NOT
+        completeness-guaranteed: a query matching more than hard_cap players silently drops the
+        alphabetically-late remainder, so callers must NEVER rely on this for matches that have
+        to be found — /whois guarantees guild-member completeness via its own separate in-memory
+        pass over CACHE (built before this is ever called), precisely so this cap only ever
+        truncates non-member fallback results, where completeness is not part of the contract.
+        hard_cap exists only to bound worst-case cost against a pathological substring matching a
+        huge fraction of the table."""
+        return self._search_player_names_fts_sync(query, hard_cap)
 
     def search_player_tags_by_prefix_sync(self, prefix: str, limit: int = 12) -> List[Dict[str, str]]:
         """Tag-PREFIX search over player_name_search (2026-08-17, Step 11) — backs the CWL

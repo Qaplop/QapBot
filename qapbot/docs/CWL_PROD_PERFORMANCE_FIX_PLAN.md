@@ -425,14 +425,19 @@ Frontend: typecheck/build only (no test harness exists for the client).
   cross-guild release via a real shared-clan signup, version field present, activity-closed
   non-bump regression) — all pass. `npm run typecheck && npm run build` clean for both
   `activity/client` and `activity/server`.
-- **NOT yet done**: the hold-duration verification this step's own design notes call for doing
-  FIRST (empirically confirming the ~25s hold survives Discord proxy → Worker → cloudflared →
-  aiohttp intact) — this requires a live Discord Activity session, which isn't something that can
-  be exercised outside one. Deployed to DEV for that live test; until confirmed, treat the 25s
-  constant as unverified. The client's own 3-failures-and-degrade safety net means a hop that
-  silently truncates the hold would show up as: `/wait` responses returning near-instantly
-  instead of holding, but should NOT break the board (it'd just settle into noisier polling until
-  the constant is lowered here per this step's own instructions).
+- **Hold-duration verification: DONE (2026-08-18), confirmed live through the real Discord
+  Activity.** Both halves checked:
+  - **Steady state**: server log (`[WEB-BRIDGE] ... enrollment/wait ...`) showed 15+ consecutive
+    cycles at ~25.3s apart (e.g. 08:23:04→08:29:49, every gap 25.26–25.36s), cross-checked against
+    the browser's own Network tab on the same session (`wait?guild_id=...` rows independently
+    showing 25.26s–25.33s) — confirms the hold survives Discord proxy → Worker → cloudflared →
+    aiohttp fully intact, not truncated by any hop.
+  - **Change detection**: a real status change released a parked wait early at 16.68s (visible in
+    both server log and Network tab as the standout non-25s row), immediately followed by a plain
+    `/api/cwl/enrollment` refetch; several rapid successive test changes right after each produced
+    their own near-instant release+refetch pairs (1.01s/3.31s/1.26s waits, 315ms/256ms/401ms
+    refetches) — exactly the designed behavior, board UI updated correctly in step with each.
+  - The 25s constant is confirmed correct as-is; no adjustment needed.
 
 ### Step 9: Fix `search_player_names` scan cost
 
@@ -537,9 +542,21 @@ Left the existing mechanism and its log tag as-is (working, tested-in-prod-by-ti
 `gc.set_threshold(700, 10, 20)` at startup (the one genuinely-missing piece) right before the
 existing startup freeze. Documented both as two new "Follow-up" paragraphs under Pitfall 21
 (cookbook) instead of editing Pitfall 21's original incident writeup. No unit tests (per this
-step's own note) — DEV `[GC-AUTO]` frequency/duration validation still pending, same as the
-Step 8 hold-duration verification: needs live observation across real cycles, noted here rather
-than blocking the implementation on it.
+step's own note).
+
+**Live validation: DONE (2026-08-18), PROD log analysis.** Analyzed a full day's PROD log
+(00:02:06–07:42:21, 92 update cycles — the file's later portion switches to DEV content for
+unrelated Step 8 testing and was excluded). 191 gen-2 `[GC-AUTO]` pauses (≈2.1/cycle), range
+0.56s–6.31s, mean 2.60s, **zero** exceeding 8s, and flat across the window (first-half mean
+2.64s vs second-half 2.56s — no escalation over time). Zero errors/tracebacks/gateway
+disconnects in the whole window. Compares favorably against the 2026-08-16 incident baseline
+(escalating 2.4s→4.8s pauses climaxing at 11.79s, plus 3 gateway disconnects and 3 `too many SQL
+variables` errors) on every axis: no escalation pattern, no pause anywhere near the 10-12s range
+that caused the original disconnects, no knock-on errors. Caveat: no genuine
+old-threshold/otherwise-identical-conditions log exists to isolate this step's own contribution
+from P0's independent allocation-source fix — but the combined outcome (frequent-but-small,
+bounded, non-escalating gen-2 pauses with no downstream errors) is exactly what Step 10 set out
+to achieve, whichever fix deserves the credit.
 
 ### Step 11: Move player-name substring search into SQLite (longer-term)
 

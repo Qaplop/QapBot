@@ -163,6 +163,7 @@
       "player_report_no_data": "Keine Kriegsverlaufsdaten für Spieler-Tag `{tag}` gefunden. Der Spieler hat möglicherweise an keinen getrackten Kriegen teilgenommen.",
       "player_report_no_args": "Bitte gib einen Discord-Nutzer **oder** einen Spieler-Tag / -Namen an (z. B. `#ABC123` oder ein Name).",
       "player_not_found": "Kein Spieler mit dem Namen `{name}` gefunden. Versuche einen anderen Namen oder gib einen `#TAG` direkt ein.",
+      "player_search_too_short": "`{name}` ist zu kurz für eine Suche — gib mindestens 3 Zeichen ein, oder gib einen `#TAG` direkt ein.",
       "player_select_prompt": "Mehrere Spieler mit dem Namen `{name}` gefunden. Bitte wähle einen aus:",
       "player_select_placeholder": "Spieler auswählen...",
       "player_select_too_many": "*(Es werden nur die ersten 25 Ergebnisse angezeigt — gib einen genaueren Namen ein, um die Auswahl einzugrenzen.)*",

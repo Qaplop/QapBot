@@ -163,6 +163,7 @@
       "player_report_no_data": "No war history data found for player tag `{tag}`. The player may not have participated in any tracked wars.",
       "player_report_no_args": "Please specify a Discord user **or** a player tag / name (e.g. `#ABC123` or a name).",
       "player_not_found": "No players found matching `{name}`. Try a different name or use a `#TAG` directly.",
+      "player_search_too_short": "`{name}` is too short to search — type at least 3 characters, or use a `#TAG` directly.",
       "player_select_prompt": "Multiple players found matching `{name}`. Please select one:",
       "player_select_placeholder": "Select a player...",
       "player_select_too_many": "*(Showing first 25 results \u2014 type a more specific name to narrow down.)*",

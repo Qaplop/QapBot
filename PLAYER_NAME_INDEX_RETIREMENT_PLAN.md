@@ -9,14 +9,22 @@ one release on both DEV and PROD. This plan grew out of a live-testing follow-up
 (`QBdiscordcmds.py:_search_player_name_index_sync`) was deliberately left on the old in-memory
 path because it needs the *full, uncapped* match set for its guild-membership reorder, and the
 existing SQL reader (`search_player_names_sync`) hard-caps at `LIMIT 25`. That is the only real
-blocker, and it is solvable: FTS5's trigram index only touches matching rows, so a generously
-(not tightly) capped SQL query is cheap even when the in-memory "give me everything" scan
-wouldn't have been.
+blocker, and it is solvable — see Step 1's **Resolution** for the adopted design (2026-08-17
+revision, proposed by the user): a two-step guild-first search, where guild members are matched
+against a small always-complete in-memory dict built from CACHE and only the "everyone else"
+fallback runs through a generously capped FTS5 query (cheap, since FTS5's trigram index only
+touches matching rows).
 
-**Do not start until `cwl_use_fts_player_search` has had a confirmed burn-in period on PROD** (the
-guest-search path only) — check with the user before Step 5 (retiring the in-memory dict) if that
-burn-in hasn't been explicitly confirmed yet. Steps 1–4 are safe to implement and test at any time
-since they only *add* a new code path; nothing is removed until Step 5.
+**PROD burn-in gate: CLEARED (2026-08-18).** `cwl_use_fts_player_search`'s guest-search path was
+confirmed working live on PROD — `GET /api/cwl/guest-search guild=CoC ... -> 200` in a real PROD
+guild session — after several days enabled. Step 5 (retiring the in-memory dict) is unblocked;
+the plan can be executed end to end.
+
+Rollback-safety note (unchanged from the original gate text): Steps 1–2 are purely additive;
+Step 3 rewires `/whois`'s search internals (including deleting the now-redundant reorder block,
+per its revised scope) but leaves `CACHE.player_name_index`, its loader, and all its writers
+untouched — so through Step 4, rollback is a plain git revert of `/whois`-local code with no
+shared infrastructure lost. Step 5 is the first step that removes anything other code depends on.
 
 ---
 
@@ -106,11 +114,17 @@ silently excluded before the reorder ever runs.
 ```python
 def search_player_names_full_sync(self, query: str, hard_cap: int = 5000) -> List[Dict[str, str]]:
     """Same FTS5 MATCH query as search_player_names_sync, but with a generous safety-valve cap
-    instead of a 25-row UX cap — for callers (currently only /whois) that need the full match
-    set for their own downstream reordering/filtering before slicing to a UX-facing count.
-    hard_cap exists only to bound worst-case cost against a pathological substring matching a
-    huge fraction of the table; real guild rosters never come close to it."""
+    instead of a 25-row UX cap — the global "everyone else" half of /whois's two-step search
+    (currently the only caller). NOT completeness-guaranteed: a query matching more than
+    hard_cap players silently drops the alphabetically-late remainder, so callers must NEVER
+    rely on this for matches that have to be found — /whois guarantees guild-member completeness
+    via its own separate in-memory pass over CACHE, precisely so this cap only ever truncates
+    non-member fallback results, where completeness is not part of the contract."""
 ```
+
+(Docstring wording matters here — an earlier draft defended the cap with "real guild rosters
+never come close to it," which defends the wrong quantity; see the review finding below. The
+cap's safety argument is the caller's guild-first design, not any claim about match counts.)
 
 Reuse the exact same literal-quoting (`'"' + query.replace('"', '""') + '"'`), the same `<3 chars
 → []` trigram-floor guard, and the same `sqlite3.Error` catch-and-log-empty pattern as
@@ -124,19 +138,46 @@ don't duplicate the FTS5-quoting logic verbatim in two places (see
 `ORDER BY name COLLATE NOCASE LIMIT :hard_cap`, a query matching MORE than `hard_cap` players
 drops the alphabetically-late matches *before* `/whois`'s guild reorder ever sees them — which is
 structurally the same failure mode quoted above as the reason `/whois` can't use the 25-cap
-reader, just at 5000 instead of 25. The docstring's "real guild rosters never come close to it"
-defends the wrong quantity: the risk scales with total MATCH count for the substring, not roster
+reader, just at 5000 instead of 25. The original draft docstring's "real guild rosters never come
+close to it" (since rewritten in the snippet above, which now states the actual contract)
+defended the wrong quantity: the risk scales with total MATCH count for the substring, not roster
 size (e.g. a 3-char needle like "war" over 6.6M names can clear 5000 matches easily; a guild
 member named "Zwarrior" then sorts past the cap and can never be surfaced by the reorder). The
 old in-memory scan had no such cutoff, so this is a genuine (if narrow) behavior regression, not
-a wash. Two acceptable resolutions — pick one explicitly and record it in the changelog entry:
-  1. **Accept + document**: `/whois` already appends a "too many matches, refine your query"
-     hint when >25 matches; extend that reasoning — a >5000-match query is far too vague to be
-     useful anyway, and the fix is typing one more character. Cheapest, probably right.
-  2. **Mitigate**: after the capped query, run a second small FTS query for the same needle
-     restricted to the guild's member tags (`AND player_tag IN (...)` via the chunked-IN helper,
-     guild tags come from the same sources the reorder already collects) and union the results
-     in. Only worth it if the user considers the edge case real for their guilds' name patterns.
+a wash.
+
+**Resolution (2026-08-17 revision, supersedes the original two-option list below) — two-step
+search, not a bigger cap.** The user's own proposal, verified against the actual data shapes
+(`coc.ClanMember` has `.tag`/`.name` directly; `user_accounts` player dicts have `player_name`)
+and adopted as the plan's recommended design:
+
+1. Before touching the DB at all, build `guild_player_names: Dict[str, str]` (tag → name) from
+   the *same three in-memory sources* `whois_slash`'s existing reorder step already iterates
+   (`CACHE.user_accounts`, `CACHE.temp_war_stats`, `CACHE.coc_clan_cache` for the guild's own
+   clans — see `QBdiscordcmds.py:4902-4936` for the exact three-source pattern to reuse, not
+   reinvent). No DB call, no cap needed — a guild's own player pool tops out in the hundreds,
+   nowhere near a scale where truncation risk exists.
+2. Substring-match the needle against `guild_player_names` in pure Python
+   (`needle_lower in name.lower()`) — trivially cheap at this size, and by construction uses the
+   exact same "guild member" definition the reorder step already relies on, so there's no
+   second, subtly-different notion of membership to keep in sync.
+3. Only then run the capped global FTS5 query (`search_player_names_full_sync`, `hard_cap=5000`)
+   for the "everyone else" fallback — dedupe against step 2's tags, fill the dropdown up to 25.
+
+This fully closes the gap for guild members (the actual concern — they're never subject to the
+global cap at all) while leaving the cap in place for non-member matches, where completeness was
+never actually required. It also collapses two currently-separate concerns (search matching,
+membership-based reordering) into one data structure built once, simplifying the code versus
+today's "search everything uncapped, then re-sort by membership" shape.
+
+The original two-option list (kept for context, superseded above):
+  1. ~~Accept + document~~: `/whois` already appends a "too many matches, refine your query" hint
+     past 25 matches; would have relied on the same reasoning at 5000. Superseded — the two-step
+     design gets correctness AND avoids ever telling a guild admin to "refine your query" just to
+     find their own member.
+  2. ~~Mitigate via a second FTS query restricted to guild tags~~: same shape as the adopted
+     resolution but needlessly round-trips through FTS5/SQL for data that's already resident in
+     CACHE — no reason to touch the DB for a search over a few hundred in-memory names.
 
 **Tests** (extend `tests/unit/test_player_name_search_fts.py`):
 - Query matching > 25 rows returns more than 25 (proves it's not silently reusing the 25-cap
@@ -152,45 +193,88 @@ a wash. Two acceptable resolutions — pick one explicitly and record it in the 
 
 ---
 
-## Step 2: Add the ≥3-character floor to `/whois` explicitly, with a clear user-facing message
+## Step 2: Add the ≥3-character floor to `/whois`'s global fallback, with a clear user-facing message when nothing else answered
 
 **File**: `QBdiscordcmds.py`, `whois_slash()` (~line 4883-4901).
 
 **Why this step exists on its own**: this is the one real, non-cosmetic behavior change in the
 whole migration. Today's in-memory scan (`needle_lower in name_lower`) has no length floor — a
 1- or 2-character query works. FTS5's trigram tokenizer structurally cannot match anything below
-3 characters. Silently returning "no results" for a 1-2 char query would look like a bug, not a
-documented limitation — surface it explicitly instead.
+3 characters.
 
-**Target behavior**: before calling the new SQL reader, check
-`len(player_stripped) < 3` (after the existing `#`-prefix branch, which is unaffected — explicit
-tag lookups never go through name search at all) and send a clear, translated message instead of
-searching, e.g. reusing the `t()` i18n pattern already used elsewhere in this function:
-`commands.whois.player_search_too_short` (new key, both `en` and `de` locale files — check
-`qapbot/locales/` or wherever `t()`'s translation files live for the existing key-naming
-convention next to `player_not_found`/`player_select_prompt`).
+**Revised scope (2026-08-17, after adopting Step 1's two-step guild-first design)**: the floor
+only applies to the global FTS5 fallback — Step 1's guild-member dictionary pass is a plain
+Python substring check with no trigram tokenizer involved, so it has no length floor and needs
+none added. A 1-2 character query should still search guild members normally; only the "everyone
+else" global fallback needs to be skipped for queries under 3 characters (silently — it would
+have found nothing anyway, no need to tell the user their query is short when the guild-member
+pass may have already answered it). Only surface the "too short" message if the guild-member
+pass *also* found nothing for a sub-3-character query (or there's no guild context at all, e.g.
+DM usage) — otherwise a guild admin searching "Al" for their own 3-member "Alice/Albert/Alex"
+roster would get an unnecessary error instead of a working result.
+
+**Target behavior**: after Step 1's guild-member pass runs (regardless of query length), check
+`len(player_stripped) < 3` only immediately before the global FTS5 fallback call — skip that call
+(not the whole search) if true. Send the "too short" message only when both passes end up empty:
+zero guild matches AND the query was too short to attempt the global fallback. Reuse the `t()`
+i18n pattern already used elsewhere in this function: `commands.whois.player_search_too_short`
+(new key, both `en` and `de` locale files — check `qapbot/locales/` or wherever `t()`'s
+translation files live for the existing key-naming convention next to
+`player_not_found`/`player_select_prompt`).
 
 **Tests** (extend wherever `whois_slash`'s name-search branch is already tested, likely
-`tests/discord/` — grep for `player_not_found` or `whois_slash` to find the right file):
-- 1-character and 2-character `player=` values → the new too-short message, and assert the new
-  SQL reader (and the old in-memory one) was NOT called.
-- 3-character value → proceeds to search as normal.
+`tests/discord/` — grep for `player_not_found` or `whois_slash` to find the right file; these
+bullets match the REVISED two-step behavior above, not the original all-or-nothing floor):
+- 1-2 character query **with** at least one guild-member match → results are returned (no
+  too-short message), and the global SQL reader was NOT called.
+- 1-2 character query with **zero** guild-member matches → the too-short message, and the global
+  SQL reader was NOT called.
+- 1-2 character query with no guild context at all (DM invocation, `interaction.guild_id is
+  None`) → the too-short message.
+- 3-character value → both passes run (guild dict AND global SQL reader called), results merged
+  per Step 3's ordering.
 
 ---
 
-## Step 3: Swap `/whois`'s match-collection call site to the SQL reader
+## Step 3: Swap `/whois`'s match-collection call site to the two-step search
 
-**File**: `QBdiscordcmds.py` — `_search_player_name_index_sync()` (~line 4847-4859) and its call
-site in `whois_slash()` (~line 4894-4901).
+**File**: `QBdiscordcmds.py` — `_search_player_name_index_sync()` (~line 4847-4859), its call site
+in `whois_slash()` (~line 4894-4901), **and** the guild-membership reorder block immediately below
+it (~line 4902-4936).
 
-**Target behavior**: replace the body of `_search_player_name_index_sync` (or rename it — it's no
-longer scanning `player_name_index`) to call
-`CACHE.db_manager.search_player_names_full_sync(needle, hard_cap=...)` instead of iterating
-`CACHE.player_name_index`. Keep the `asyncio.to_thread()` wrapping at the call site exactly as it
-is today (sync SQLite calls still must not run on the event loop, even though they're now
-index-backed and fast — Pitfall 26 applies regardless of expected latency, not just to slow
-calls). The guild-membership reorder code immediately below (~line 4902-4936) needs **no
-changes** — it's already keyed purely on `player_tag` from whatever match list it's handed.
+**Revised scope (2026-08-17, after adopting Step 1's two-step design)**: this step is bigger than
+originally scoped — the two-step search doesn't just replace the match-collection call, it makes
+the separate reorder block **redundant**, not merely compatible with it. Trace why: today's flow
+is (a) collect ALL matches unordered, (b) build `tag_to_clan` from the 3 in-memory sources, (c)
+sort the combined list by `(0 if guild member else 1, name)`. Step 1's design builds that same
+`tag_to_clan`-equivalent dictionary FIRST and searches it separately — so the guild/non-guild
+split that step (c) computes via a sort key is already structurally true by construction: guild
+matches live in one (already alphabetically-sortable) collection, non-guild matches in another.
+Concatenating them achieves the same ordering as the old sort, without the sort.
+
+**Target behavior**:
+1. Delete the separate `tag_to_clan` construction + sort-by-tuple block (~line 4902-4936).
+2. Replace `_search_player_name_index_sync()` with the two-step logic. **Signature change
+   required** (2026-08-17 review): today's helper takes only `needle_lower` — the two-step
+   version also needs the guild context (pass the prebuilt `guild_player_names` dict in, or the
+   guild_id plus the sources to build it — prebuilt-dict-in is cleaner given point 3 below).
+   Handle no-guild-context invocations (DMs: `interaction.guild_id is None`) by passing an empty
+   dict — the guild pass then contributes nothing and only the global fallback applies, which
+   matches today's DM behavior (the reorder block already no-ops without a guild).
+3. **Build `guild_player_names` ON the event loop, before the `to_thread()` hop** — not inside
+   it. The three CACHE sources (`user_accounts`, `temp_war_stats`, `coc_clan_cache`) are read on
+   the event loop by today's reorder block; keeping the build loop-side preserves those threading
+   semantics exactly, whereas moving the iteration into a worker thread would add a new
+   cross-thread read of mutable CACHE dicts (risking "dictionary changed size during iteration"
+   against a concurrent update cycle) for zero benefit — the build is a few hundred entries of
+   plain dict work, far below the scale where Pitfall 16/26 loop-blocking concerns apply. Keep
+   the `asyncio.to_thread()` wrapping for the SQL half exactly as today (Pitfall 26 applies to
+   the SQLite call regardless of expected latency); the Python substring match over the small
+   guild dict can live on either side — simplest is alongside the dict build, loop-side.
+4. Result ordering falls out for free: guild matches (already the complete, priority set) first,
+   then non-guild matches, each internally name-sorted — write this as an explicit two-part
+   concatenation, not a re-derived sort key, so the ordering guarantee is structural rather than
+   coincidental.
 
 Do **not** delete `CACHE.player_name_index` itself in this step — leave the dict, its loader, and
 `set_player_name()` in place and still being written to. This step only changes what `/whois`
@@ -205,11 +289,23 @@ merging, don't ship it).
 `player_name_fts`) instead, mirroring the pattern already used in
 `tests/discord/test_web_bridge.py`'s `test_..._sqlite_backed_...` tests (e.g. around line
 1996-2011, which proves the SQL path was used by leaving `CACHE.player_name_index` deliberately
-empty and seeding only the DB).
+empty and seeding only the DB). Add explicitly, since this is the whole point of the redesign:
+- A guild member whose name would sort past `hard_cap` in a purely global search is still found
+  — seed `hard_cap` (or more) non-guild matches into the DB alongside one guild-clan member whose
+  name sorts alphabetically last, assert the guild member is still present in the final result
+  and appears before the non-guild matches.
+- Result ordering is guild-matches-then-non-guild, each name-sorted internally, with no
+  duplicate tags between the two halves when a guild member's tag also happens to be indexed.
 
 ---
 
 ## Step 4: DEV/PROD burn-in of the `/whois` migration itself
+
+**Steps 1-3: DONE (2026-08-18, commit pending), Batch A of the delivery grouping below.**
+Implemented as designed — `search_player_names_full_sync` (Step 1), `_build_guild_player_name_
+matches` + the two-step rewrite of `whois_slash`'s search branch (Steps 2-3). 19 new tests
+(5 DB-layer, 14 for the two-step logic including a 6000-entry uncapped-scale proof), 2071 total
+pass. Not yet deployed/restarted — this checkpoint still needs a live DEV test before Step 5.
 
 Not a code step — a checkpoint. Deploy Steps 1-3, restart DEV, and live-test `/whois player
 <substring>` with:
@@ -217,8 +313,16 @@ Not a code step — a checkpoint. Deploy Steps 1-3, restart DEV, and live-test `
 - A substring matching exactly one player (auto-resolves, per existing `len(matches) == 1`
   branch).
 - A substring matching several players in your own test guild (dropdown appears, guild members
-  sort first — this is the behavior Step 11 explicitly protected; verify it still holds).
-- A 1-2 character substring (verify Step 2's new message, not a silent empty result).
+  listed first — this is the behavior Step 11 explicitly protected; verify it still holds under
+  the new structural ordering).
+- A 1-2 character substring that DOES match a guild member (verify results come back, no
+  too-short message — Step 2's revised behavior) AND one that matches no guild member (verify
+  the too-short message, not a silent empty result).
+- Per the addendum's point 3 (folded in here so this checklist is self-contained): watch a full
+  update cycle complete `[PHASE-3B] Completed` → `[PHASE-3] File processing completed` promptly,
+  with no silent multi-minute gaps in the log — the 2026-08-17 incident class hides exactly
+  there, and DEV's smaller tables can mask it, so repeat this specific check on PROD after the
+  eventual deploy too.
 
 Only proceed to Step 5 once this is confirmed on DEV — and, per the note at the top of this plan,
 once the user has separately confirmed PROD burn-in on the guest-search path from the original
@@ -328,7 +432,9 @@ into the same commit/entry, to keep the history readable.
 
 ## Suggested delivery grouping
 
-- **Batch A** (Steps 1-3): additive only, safe to ship independently. One changelog entry.
+- **Batch A** (Steps 1-3): safe to ship independently — Steps 1-2 are additive; Step 3 rewires
+  `/whois`-local code (including deleting the redundant reorder block) but removes no shared
+  infrastructure, so rollback stays a plain revert. One changelog entry.
 - **Checkpoint** (Step 4): DEV live-test, no code change, no changelog entry needed beyond a note
   once Batch B ships.
 - **Batch B** (Steps 5-6): the actual retirement + flag decision — ask the user to confirm the

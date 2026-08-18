@@ -181,6 +181,46 @@ class TestSearchPlayerNamesSync:
         assert db.search_player_names_sync("Zzzzz") == []
 
 
+class TestSearchPlayerNamesFullSync:
+    """search_player_names_full_sync (2026-08-18, PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Step 1) —
+    same FTS5 core as search_player_names_sync (shared via _search_player_names_fts_sync), just a
+    much higher default cap (5000, not 25) for /whois's global "everyone else" fallback. NOT
+    completeness-guaranteed above hard_cap — /whois's own guild-member pass is what guarantees
+    completeness for matches that actually have to be found; this reader never promises that on
+    its own."""
+
+    @pytest.mark.integration
+    async def test_matches_more_than_25_rows(self, db):
+        """Proves this reader doesn't silently reuse the 25-cap path."""
+        updates = [(f"#P{i:03d}", f"Player{i:03d}", "2026-08-17T00:00") for i in range(40)]
+        db.update_player_name_index_sync(updates)
+        assert len(db.search_player_names_full_sync("Player")) == 40
+
+    @pytest.mark.integration
+    async def test_no_match_returns_empty(self, db):
+        db.update_player_name_index_sync([("#A1", "Alice", "2026-08-17T00:00")])
+        assert db.search_player_names_full_sync("Zzzzz") == []
+
+    @pytest.mark.integration
+    async def test_below_three_chars_returns_empty(self, db):
+        db.update_player_name_index_sync([("#A1", "Alice", "2026-08-17T00:00")])
+        assert db.search_player_names_full_sync("Al") == []
+        assert db.search_player_names_full_sync("") == []
+
+    @pytest.mark.integration
+    async def test_hard_cap_is_honored(self, db):
+        updates = [(f"#H{i:03d}", f"HardCap{i:03d}", "2026-08-17T00:00") for i in range(20)]
+        db.update_player_name_index_sync(updates)
+        assert len(db.search_player_names_full_sync("HardCap", hard_cap=10)) == 10
+
+    @pytest.mark.integration
+    async def test_special_characters_are_literal_not_query_syntax(self, db):
+        db.update_player_name_index_sync([("#A1", "bob-smith", "2026-08-17T00:00")])
+        assert db.search_player_names_full_sync("bob-smith") == [
+            {"player_tag": "#A1", "player_name": "bob-smith"}
+        ]
+
+
 class TestSearchPlayerTagsByPrefixSync:
     @pytest.mark.integration
     async def test_prefix_match(self, db):
