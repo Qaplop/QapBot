@@ -91,7 +91,7 @@ for _h in handlers:
 # a full sweep (see Pitfall 16 / copilot-instructions.md) precisely because a
 # full generation-2 collection walks the entire long-lived CACHE object graph
 # (hundreds of thousands to millions of objects in PROD: clan_name_cache,
-# player_name_index, etc.) and, being a single atomic C call, freezes the
+# coc_clan_cache, etc.) and, being a single atomic C call, freezes the
 # WHOLE process — every thread, including the event loop — for its duration.
 # That fix only covers the *explicit* end-of-cycle call. CPython's automatic
 # generational collector is never disabled in this codebase and still runs
@@ -3166,7 +3166,7 @@ async def _run_startup_initialization() -> None:
             # including mid-cycle, during Phase-1's concurrent API-response churn.
             # A gen-2 sweep walks every tracked object; without freezing, that
             # includes the hundreds of thousands to millions of long-lived CACHE
-            # objects (clan_name_cache, player_name_index, etc.) just loaded above,
+            # objects (clan_name_cache, coc_clan_cache, etc.) just loaded above,
             # which is what turns an automatic collection into a multi-second
             # process-wide freeze. gc.freeze() moves everything currently tracked
             # into the permanent generation, which automatic collections skip

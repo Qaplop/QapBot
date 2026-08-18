@@ -38,10 +38,12 @@ async def _seed_guild_and_clans(db: WarHistoryDB, guild_id: str, clan_tags: Dict
     await db.conn.commit()
 
 
-def _pname_index(names: Dict[str, str]) -> Dict[str, tuple]:
-    """Builds CACHE.player_name_index's (name, name_lower) value shape (2026-08-17,
-    CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 9) from a plain {tag: name} dict, for fixtures."""
-    return {tag: (name, name.lower()) for tag, name in names.items()}
+def _seed_player_names(db: WarHistoryDB, names: Dict[str, str]) -> None:
+    """Seeds the real player_name_index/player_name_search/player_name_fts DB tables from a
+    plain {tag: name} dict (2026-08-18, PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Steps 5-6 —
+    replaces the old in-memory CACHE.player_name_index fixture helper now that the guest
+    search's `#` tag-mode and name-substring paths are unconditionally SQL-backed)."""
+    db.update_player_name_index_sync([(tag, name, "2026-08-17T00:00") for tag, name in names.items()])
 
 
 @pytest.fixture
@@ -1556,7 +1558,6 @@ async def test_guest_search_returns_clan_hits_excluding_already_participating(db
         "#CLAN2": {"name": "QCrew"},
         "#CLAN3": {"name": "Not A Match"},
     }
-    CACHE.player_name_index = {}
     CACHE.user_accounts = {}
 
     event_id = db.create_cwl_event_sync("801", "2026-09", "discordid1")
@@ -1591,7 +1592,6 @@ async def test_guest_search_highlights_clan_already_on_another_guilds_roster(db,
     CACHE.db_manager = db
     CACHE.server_config["811"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {"#CLAN1": {"name": "Marines"}}
-    CACHE.player_name_index = {}
     CACHE.user_accounts = {}
 
     season = resolve_current_cwl_season()
@@ -1643,7 +1643,6 @@ async def test_guest_search_clan_hit_includes_live_tier(db, bridge_config, clien
     CACHE.db_manager = db
     CACHE.server_config["810"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {"#CLAN1": {"name": "Marines", "war_league": "Master League I"}}
-    CACHE.player_name_index = {}
     CACHE.user_accounts = {}
 
     import QBcore
@@ -1672,7 +1671,7 @@ async def test_guest_search_returns_player_hit_by_name(db, bridge_config, client
     CACHE.db_manager = db
     CACHE.server_config["802"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {}
-    CACHE.player_name_index = _pname_index({"#GUEST1": "GuestPlayer"})
+    _seed_player_names(db, {"#GUEST1": "GuestPlayer"})
     CACHE.user_accounts = {}
     await _seed_current_clan_member(db, "555", "#GUEST1", "#OUTSIDE_CLAN")
 
@@ -1701,7 +1700,6 @@ async def test_guest_search_returns_player_hit_via_discord_account_name(db, brid
     CACHE.db_manager = db
     CACHE.server_config["803"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {}
-    CACHE.player_name_index = {}
     CACHE.user_accounts = {
         "777": {"display_name": "Qaplop", "players": [{"player_tag": "#Q1", "player_name": "Qaplop"}]},
     }
@@ -1731,7 +1729,6 @@ async def test_guest_search_raw_unindexed_tag_still_returned(db, bridge_config, 
     CACHE.db_manager = db
     CACHE.server_config["804"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {}
-    CACHE.player_name_index = {}
     CACHE.user_accounts = {}
 
     import QBcore
@@ -1761,7 +1758,7 @@ async def test_guest_search_at_prefix_restricts_to_discord_display_name_only(db,
     CACHE.db_manager = db
     CACHE.server_config["820"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {"#CLANQAP": {"name": "Qap Clan"}}
-    CACHE.player_name_index = _pname_index({"#LONER": "Qaplike"})  # matches "qap" by name, but not linked
+    _seed_player_names(db, {"#LONER": "Qaplike"})  # matches "qap" by name, but not linked
     CACHE.user_accounts = {
         "777": {"display_name": "Qaplop", "players": [{"player_tag": "#Q1", "player_name": "Qaplop"}]},
     }
@@ -1796,7 +1793,6 @@ async def test_guest_search_hash_prefix_restricts_to_tag_matching_only(db, bridg
         "#QAPXYZ": {"name": "Something Else"},  # tag starts with #QAP -> matches
         "#OTHERTAG": {"name": "Qap Warriors"},  # name contains Qap, tag doesn't -> excluded
     }
-    CACHE.player_name_index = {}
     CACHE.user_accounts = {}
 
     import QBcore
@@ -1825,7 +1821,7 @@ async def test_guest_search_interleaves_and_caps_clan_and_player_hits(db, bridge
     CACHE.db_manager = db
     CACHE.server_config["822"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {f"#CLAN{i:02d}": {"name": f"Test Clan {i:02d}"} for i in range(15)}
-    CACHE.player_name_index = _pname_index({f"#PLAYER{i:02d}": f"Test Player {i:02d}" for i in range(15)})
+    _seed_player_names(db, {f"#PLAYER{i:02d}": f"Test Player {i:02d}" for i in range(15)})
     CACHE.user_accounts = {}
 
     import QBcore
@@ -1881,7 +1877,6 @@ async def test_guest_search_below_minimum_text_length_returns_empty(db, bridge_c
     CACHE.db_manager = db
     CACHE.server_config["830"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {"#CLAN1": {"name": "QCrew"}}
-    CACHE.player_name_index = {}
     CACHE.user_accounts = {}
 
     link_spy = MagicMock(wraps=db.get_player_links_sync)
@@ -1910,7 +1905,6 @@ async def test_guest_search_below_minimum_at_prefix_needle_returns_empty(db, bri
     CACHE.db_manager = db
     CACHE.server_config["831"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {}
-    CACHE.player_name_index = {}
     CACHE.user_accounts = {
         "777": {"display_name": "Qaplop", "players": [{"player_tag": "#Q1", "player_name": "Qaplop"}]},
     }
@@ -1942,7 +1936,7 @@ async def test_guest_search_below_minimum_hash_prefix_needle_returns_empty(db, b
     CACHE.db_manager = db
     CACHE.server_config["832"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {}
-    CACHE.player_name_index = _pname_index({"#2ABCDEFGH": "SomePlayer"})
+    _seed_player_names(db, {"#2ABCDEFGH": "SomePlayer"})
     CACHE.user_accounts = {}
 
     link_spy = MagicMock(wraps=db.get_player_links_sync)
@@ -1972,7 +1966,7 @@ async def test_guest_search_hash_prefix_caps_player_hits_at_twelve(db, bridge_co
     CACHE.db_manager = db
     CACHE.server_config["833"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {}
-    CACHE.player_name_index = _pname_index({f"#QAP{i:03d}": f"Player {i:03d}" for i in range(20)})
+    _seed_player_names(db, {f"#QAP{i:03d}": f"Player {i:03d}" for i in range(20)})
     CACHE.user_accounts = {}
 
     import QBcore
@@ -1990,27 +1984,21 @@ async def test_guest_search_hash_prefix_caps_player_hits_at_twelve(db, bridge_co
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_guest_search_hash_prefix_uses_sqlite_when_fts_flag_enabled(db, bridge_config, client, monkeypatch):
-    """2026-08-17 (CWL_PROD_PERFORMANCE_FIX_PLAN.md P2 Step 11): with CONFIG.cwl_use_fts_player_
-    search on, the # tag-mode path delegates to db.search_player_tags_by_prefix_sync() (SQLite,
-    PK-prefix-indexed) instead of scanning CACHE.player_name_index in Python — proven here by
-    seeding ONLY the real DB (via update_player_name_index_sync, which also populates
-    player_name_search) and leaving CACHE.player_name_index empty; a correct result is only
-    possible if the SQLite path actually ran."""
-    import dataclasses
-
+async def test_guest_search_hash_prefix_uses_sqlite(db, bridge_config, client, monkeypatch):
+    """2026-08-17 (CWL_PROD_PERFORMANCE_FIX_PLAN.md P2 Step 11), unconditional since 2026-08-18
+    (PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Steps 5-6, the in-memory fallback and its rollout flag
+    both retired): the # tag-mode path delegates to db.search_player_tags_by_prefix_sync()
+    (SQLite, PK-prefix-indexed) — proven here by seeding ONLY the real DB (via
+    update_player_name_index_sync, which also populates player_name_search); a correct result
+    is only possible if the SQLite path actually ran."""
     from qapbot.cache_manager import CACHE
-    from qapbot.config import CONFIG
 
     await _seed_guild_and_clans(db, "835", {})
     CACHE.db_manager = db
     CACHE.server_config["835"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {}
-    CACHE.player_name_index = {}  # deliberately empty
     CACHE.user_accounts = {}
     db.update_player_name_index_sync([("#QAPFTS1", "FtsPlayer", "2026-08-17T00:00")])
-
-    monkeypatch.setattr("qapbot.config.CONFIG", dataclasses.replace(bridge_config, cwl_use_fts_player_search=True))
 
     import QBcore
     monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(835, 42, is_admin=True))
@@ -2043,7 +2031,6 @@ async def test_guest_search_text_query_caps_clan_hits_and_db_check_calls(db, bri
     CACHE.db_manager = db
     CACHE.server_config["834"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {tag: {"name": name} for tag, name in clan_tags.items()}
-    CACHE.player_name_index = {}
     CACHE.user_accounts = {}
 
     claim_spy = MagicMock(wraps=db.find_cwl_clan_participation_across_guilds_sync)
@@ -2081,7 +2068,6 @@ async def test_guest_search_still_returns_normal_results_when_threaded(db, bridg
     CACHE.db_manager = db
     CACHE.server_config["840"] = {"member_clans": [], "member_families": []}
     CACHE.clan_name_cache = {"#CLAN1": {"name": "Marines"}}
-    CACHE.player_name_index = {}
     CACHE.user_accounts = {}
 
     import QBcore

@@ -4855,9 +4855,13 @@ def _build_guild_player_name_matches(guild_id: Optional[int], needle_lower: str)
 
     Guarantees completeness for guild members specifically: unlike the global FTS5 fallback
     (search_player_names_full_sync), a guild member can never be excluded here just because a
-    huge global match count pushed them past a cap — the whole point of this redesign. Returns
-    [] with no guild context (DM invocation) or when the guild has no configured clans; callers
-    then rely entirely on the global fallback, matching pre-redesign DM behavior."""
+    huge global match count pushed them past a cap — the whole point of this redesign. One
+    narrow gap: a tag known only via temp_war_stats (not registered, not a current clan member —
+    e.g. left mid-war) has no name available from any of these 3 sources and is silently
+    skipped, rather than adding a DB round-trip for a name lookup to what's meant to stay a
+    fast, in-memory-only pass. Returns [] with no guild context (DM invocation) or when the
+    guild has no configured clans; callers then rely entirely on the global fallback, matching
+    pre-redesign DM behavior."""
     if not guild_id:
         return []
     from qapbot.QBdiscocmdshelper import get_guild_clans_including_member_config
@@ -4881,8 +4885,12 @@ def _build_guild_player_name_matches(guild_id: Optional[int], needle_lower: str)
                 if pname:
                     tag_to_name.setdefault(ptag, pname)
     # Source 2: all players currently in active wars (covers unregistered members) — only keys
-    # carry a tag->clan association here, no name; resolved below (source 3, then
-    # player_name_index) for any tag that ends up with no name from source 1/3.
+    # carry a tag->clan association here, no name. A tag found ONLY here (not source 1/3) has
+    # no name to match against and is silently skipped below — narrow edge case (e.g. a player
+    # who left their clan mid-war, so no longer in coc_clan_cache), accepted rather than adding
+    # a DB round-trip (and the asyncio.to_thread() wrapping it would require) to what's meant to
+    # stay a small, always-in-memory, event-loop-safe pass (2026-08-18, Step 5 — this fallback
+    # used to resolve via CACHE.player_name_index, retired in the same change).
     for clan_tag, player_stats in CACHE.temp_war_stats.items():
         for player_tag in player_stats:
             tag_to_clan[player_tag] = clan_tag
@@ -4904,9 +4912,6 @@ def _build_guild_player_name_matches(guild_id: Optional[int], needle_lower: str)
         if ctag not in guild_clan_tags:
             continue
         name = tag_to_name.get(ptag)
-        if not name:
-            _idx_entry = CACHE.player_name_index.get(ptag)
-            name = _idx_entry[0] if _idx_entry else None
         if not name or needle_lower not in name.lower():
             continue
         matches.append({"player_tag": ptag, "player_name": name})

@@ -67,27 +67,9 @@ from qapbot.coc_cache import CoCClanCache
 MAX_TEMP_WAR_OBJECTS = 100_000
 _MAX_TEMP_WAR_OBJECTS = MAX_TEMP_WAR_OBJECTS
 
-# search_player_names()'s early-exit bound (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1
-# Step 9) — collect at most this many substring matches during the scan, THEN sort just those
-# alphabetically and cap at the caller's own `limit` (<=25). A worst-case scan is still the full
-# player_name_index (millions of entries on PROD) since a rare needle may never hit 200 matches,
-# but a common needle short-circuits collection instead of accumulating every match before
-# sorting/capping. See search_player_names()'s own docstring for the resulting semantics change.
-SEARCH_PLAYER_NAMES_MAX_COLLECT = 200
-
-
 def _de_n(v: int) -> str:
     """Format integer with European thousand separator (period)."""
     return f"{v:,}".replace(",", ".")
-
-
-def _player_name_tuple(name: str) -> Tuple[str, str]:
-    """Builds player_name_index's (name, name_lower) value shape (2026-08-17, Step 9). For the
-    very common already-lowercase name, stores the SAME string object twice rather than a fresh
-    lowered copy — most entries add no new string at all, only one extra tuple + dict-value
-    reference, which is why this beats maintaining a second full-size dict (+~600 MB on PROD's
-    6.6M-entry index)."""
-    return (name, name if name == name.lower() else name.lower())
 
 
 class CacheManager:
@@ -245,14 +227,6 @@ class CacheManager:
         # Maps clan_tag -> (raw_iso_string, parsed_datetime). Avoids 12K fromisoformat()
         # calls per cycle by only re-parsing when the stored ISO string changes.
         self.clan_dt_cache: Dict[str, Tuple[str, datetime]] = {}
-        # Fast lookup for /whois player name searches.  Populated at startup from
-        # player_name_index table; updated incrementally by each war write cycle.
-        # Maps player_tag -> (player_name, player_name.lower()) (2026-08-17,
-        # CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 9 — values used to be the bare name; the
-        # precomputed lowercase form avoids re-lowering every one of PROD's millions of names on
-        # every single search_player_names()/`/whois` call). Write via set_player_name(), never
-        # assign this dict directly, so the tuple shape can't drift.
-        self.player_name_index: Dict[str, Tuple[str, str]] = {}
 
         # Per-cycle counters.  Reset at the start of each update cycle by
         # QapBot.main() and read at the end for the [CYCLE-SUMMARY] log line.
@@ -433,81 +407,23 @@ class CacheManager:
             logging.error("FATAL: Cannot load clan data - terminating")
             raise SystemExit(1)
 
-    async def load_player_name_index(self) -> None:
-        """Load the player_name_index table into CACHE.player_name_index at startup.
-
-        Runs in a single asyncio.to_thread() hop that does BOTH the DB read and the
-        (name, name_lower) tuple construction (2026-08-17, Step 9) — the one-time lowercase
-        pass over every row costs a worker thread, never the event loop.
-        """
-        if not self.db_manager:
-            raise RuntimeError("Database manager not initialized")
-        try:
-            self.player_name_index = await asyncio.to_thread(self._load_player_name_index_sync)
-            logging.info(
-                f"[DB-READ] Loaded {len(self.player_name_index):,} entries into player_name_index"
-            )
-        except Exception as e:
-            logging.warning(f"[DB-READ] Failed to load player_name_index: {e} — /whois name search unavailable")
-            self.player_name_index = {}
-
-    def _load_player_name_index_sync(self) -> Dict[str, Tuple[str, str]]:
-        """Sync core for load_player_name_index() — db_manager.load_player_name_index_sync()
-        itself still returns the plain {player_tag: player_name} shape (unchanged DB layer);
-        the tuple construction happens here, inside the to_thread hop."""
-        raw = self.db_manager.load_player_name_index_sync()  # type: ignore[union-attr]
-        return {tag: _player_name_tuple(name) for tag, name in raw.items()}
-
-    def set_player_name(self, tag: str, name: str) -> None:
-        """The one writer helper for player_name_index (2026-08-17, Step 9) — builds the
-        (name, name_lower) tuple so callers never construct the shape by hand. Only writer
-        today: coc_cache.py's update_player_info_in_user_accounts()."""
-        self.player_name_index[tag] = _player_name_tuple(name)
-
     def search_player_names(
         self, query: str, limit: int = 25
     ) -> List[Dict[str, str]]:
-        """In-memory substring search over player_name_index — backs both /whois's tag-search
-        fallback path (QBdiscordcmds.py, guild-membership reordering needs the FULL match set so
-        it scans player_name_index inline instead of calling this) and the CWL guest search's
-        name-substring path (web_bridge.py's _search_cwl_guests_sync).
+        """SQLite/FTS5-backed name-substring search (2026-08-17 Step 11, unconditional since
+        2026-08-18 PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Steps 5-6, once DEV+PROD burn-in
+        confirmed parity with the retired in-memory scan) — backs the CWL guest search's
+        name-substring path (web_bridge.py's _search_cwl_guests_sync). `/whois` does NOT call
+        this — it needs the full match set for its own guild-membership two-step search, which
+        this method's `limit` cap doesn't provide (see QBdiscordcmds.py's
+        _build_guild_player_name_matches / search_player_names_full_sync instead).
 
-        Bounded scan (2026-08-17, Step 9): collects at most SEARCH_PLAYER_NAMES_MAX_COLLECT (200)
-        matches, in player_name_index's own iteration order, THEN sorts just those alphabetically
-        and caps at `limit` (<=25) — semantics change from before: with more than 200 matches,
-        the returned <=25 are no longer guaranteed to be the globally-alphabetically-first 25,
-        just an alphabetically-sorted subset of whichever 200 were encountered first. Best-effort
-        under heavy match counts; irrelevant in practice for a /whois-style lookup, since the user
-        just refines the query.
-
-        A worst-case scan (a needle that never reaches 200 matches) is still a full pass over
-        player_name_index — millions of entries on PROD — with no per-entry allocation now that
-        name_lower is precomputed (~1s worst case on the PROD Celeron). Callers reached from the
-        event loop MUST still asyncio.to_thread() this; both current callers already do.
-
-        Delegates to WarHistoryDB.search_player_names_sync() (SQLite, FTS5 trigram-indexed)
-        instead when CONFIG.cwl_use_fts_player_search is True (2026-08-17, Step 11) — the
-        rollout flag defaults False (this in-memory scan stays the active path) until DEV+PROD
-        burn-in confirms the two paths return equivalent results; still threaded the same way by
-        every caller either way, so the switch is transparent to them."""
-        from qapbot.config import CONFIG
-
-        if CONFIG.cwl_use_fts_player_search and self.db_manager is not None:
-            return self.db_manager.search_player_names_sync(query, limit)
-
-        if not query:
+        Delegates straight to WarHistoryDB.search_player_names_sync() — callers reached from the
+        event loop MUST still asyncio.to_thread() this, same as before; it's a real SQLite call,
+        not a free in-memory lookup."""
+        if self.db_manager is None:
             return []
-        needle = query.lower()
-        cap = min(limit, 25)
-        # (name_lower, tag, name) so the final sort below never has to call .lower() again.
-        matches: List[Tuple[str, str, str]] = []
-        for tag, (name, name_lower) in self.player_name_index.items():
-            if needle in name_lower:
-                matches.append((name_lower, tag, name))
-                if len(matches) >= SEARCH_PLAYER_NAMES_MAX_COLLECT:
-                    break
-        matches.sort(key=lambda m: m[0])
-        return [{"player_tag": tag, "player_name": name} for _, tag, name in matches[:cap]]
+        return self.db_manager.search_player_names_sync(query, limit)
 
     async def load_subscriptions(self) -> None:
         try:
@@ -2414,9 +2330,6 @@ class CacheManager:
         await asyncio.to_thread(self.load_all_temp_war_stats)
         # Initialize empty clan_history dict (loaded on-demand from database)
         self.clan_history = {}
-        self._current_load_operation = "load_player_name_index"
-        logging.info("Starting cache load_all() - loading player name index...")
-        await self.load_player_name_index()
         self._current_load_operation = "update_all_clan_subscription_statuses"
         logging.info("Cache load_all() completed successfully")
         

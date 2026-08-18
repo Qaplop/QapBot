@@ -670,12 +670,10 @@ class CoCClanCache:
                 await cache_manager.persist_user(uid)
             logging.debug(f"[USER-ACCOUNTS-SAVE] Saved player info updates from {clan_obj.tag}")  # type: ignore[attr-defined]
 
-        # Propagate name changes to player_name_index (in-memory + DB)
+        # Propagate name changes to player_name_index (DB)
         if name_changes and cache_manager.db_manager:
             now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             updates = [(tag, name, now_iso) for tag, name in name_changes]
-            for tag, name in name_changes:
-                cache_manager.set_player_name(tag, name)
             await asyncio.to_thread(
                 cache_manager.db_manager.update_player_name_index_sync, updates
             )

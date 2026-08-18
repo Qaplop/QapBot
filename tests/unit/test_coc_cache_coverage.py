@@ -492,7 +492,6 @@ class TestUpdatePlayerInfo:
         c = CoCClanCache()
         cm = MagicMock()
         cm.persist_user = AsyncMock()
-        cm.player_name_index = {}
         cm.db_manager = None
         cm.user_accounts = {
             "100": {"players": [

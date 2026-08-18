@@ -61,14 +61,26 @@ class TestBuildGuildPlayerNameMatches:
             {"player_tag": "#P2", "player_name": "BobBuilder"}
         ]
 
-    def test_source_2_resolves_name_via_player_name_index(self, monkeypatch):
-        """temp_war_stats only carries tag->clan (its keys), no name — a tag found only there
-        must fall back to CACHE.player_name_index for a display name."""
+    def test_source_2_only_tag_with_no_name_is_silently_skipped(self, monkeypatch):
+        """temp_war_stats only carries tag->clan (its keys), no name. A tag found ONLY there
+        (not source 1/3) has no name to match against — must be silently skipped, not crash
+        (2026-08-18, PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Step 5 — this used to fall back to
+        CACHE.player_name_index, which no longer exists)."""
         self._set_guild_clans(monkeypatch, ["#CLAN1"])
         monkeypatch.setattr(QBdiscordcmds.CACHE, "user_accounts", {})
         monkeypatch.setattr(QBdiscordcmds.CACHE, "temp_war_stats", {"#CLAN1": {"#P3": {}}})
         monkeypatch.setattr(QBdiscordcmds.CACHE.coc_clan_cache, "cache", {})
-        monkeypatch.setattr(QBdiscordcmds.CACHE, "player_name_index", {"#P3": ("CarolCrafter", "carolcrafter")})
+        assert QBdiscordcmds._build_guild_player_name_matches(123, "carol") == []
+
+    def test_source_2_tag_also_found_in_source_1_still_matches(self, monkeypatch):
+        """A tag present in BOTH temp_war_stats (clan association only) and user_accounts (name)
+        must still match normally — the two sources combine via the shared tag_to_clan dict."""
+        self._set_guild_clans(monkeypatch, ["#CLAN1"])
+        monkeypatch.setattr(QBdiscordcmds.CACHE, "user_accounts", {
+            "u1": {"players": [{"player_tag": "#P3", "player_name": "CarolCrafter"}]},
+        })
+        monkeypatch.setattr(QBdiscordcmds.CACHE, "temp_war_stats", {"#CLAN1": {"#P3": {}}})
+        monkeypatch.setattr(QBdiscordcmds.CACHE.coc_clan_cache, "cache", {})
         assert QBdiscordcmds._build_guild_player_name_matches(123, "carol") == [
             {"player_tag": "#P3", "player_name": "CarolCrafter"}
         ]

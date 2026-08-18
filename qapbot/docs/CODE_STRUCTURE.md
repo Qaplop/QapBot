@@ -281,8 +281,9 @@ all rebuild/button-handler paths so the reference is never lost.
 - `update_player_info_in_user_accounts`: sets player["coc_role"] from coc.Role.name with
   "co_leader" remapped to "coLeader" (str() gives title-case; .value gives "admin" for elder).
   Also detects in-game player name changes (player["player_name"] vs member.name); propagates
-  updates to CACHE.player_name_index in-memory and calls `update_player_name_index_sync()` in a
-  thread. Logs `[PLAYER-NAME-UPDATE]` per tag + `[PLAYER-NAME-INDEX]` summary per clan cycle.
+  updates via `update_player_name_index_sync()` in a thread (DB write-through only — no
+  in-memory mirror since 2026-08-18, PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Steps 5-6). Logs
+  `[PLAYER-NAME-UPDATE]` per tag + `[PLAYER-NAME-INDEX]` summary per clan cycle.
 - _schedule_role_sync_for_clan / _do_role_sync: fires background role sync after every real API
   fetch; guards with CONFIG.is_dev_mode check (skip non-dev guilds, matching periodic loop)
 
@@ -292,8 +293,7 @@ all rebuild/button-handler paths so the reference is never lost.
 - Error handling with try/except + log + re-raise on all write-through methods
 - Provides centralized access to db_manager for all database operations
 - No JSON persistence (only temp war files in data/temp/ remain as JSON)
-- `player_name_index: Dict[str, str]` — in-memory {player_tag: player_name} map loaded at startup via `load_player_name_index()`
-- `search_player_names(query, limit=25)`: synchronous O(n) substring search over in-memory index (or delegates to `db_manager.search_player_names_sync()` when `CONFIG.cwl_use_fts_player_search` is on), sorted alphabetically then capped at `limit`. Backs the CWL guest search's name-substring mode. NOT used by /whois.
+- `search_player_names(query, limit=25)`: unconditionally delegates to `db_manager.search_player_names_sync()` (SQLite/FTS5) since 2026-08-18 (PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Steps 5-6 retired the in-memory dict and rollout flag this used to sit behind). Sorted alphabetically, capped at `limit`. Backs the CWL guest search's name-substring mode. NOT used by /whois.
 - **`/whois`'s own two-step search** (2026-08-18, `PLAYER_NAME_INDEX_RETIREMENT_PLAN.md` Steps 1-3, `QBdiscordcmds.py`): `_build_guild_player_name_matches()` does an always-complete, uncapped in-memory pass over the guild's own player pool first (built from `user_accounts`/`temp_war_stats`/`coc_clan_cache`), then `db_manager.search_player_names_full_sync()` (`hard_cap=5000`) fills in everyone else, deduplicated by tag. Guild matches are concatenated first, so they can never be pushed out by the 25-result UX slice regardless of global match volume — replaces the old inline `CACHE.player_name_index` scan plus a separate post-search reorder step.
 
 🟨 qapbot/db_manager.py (Database Layer - ~6200 lines)

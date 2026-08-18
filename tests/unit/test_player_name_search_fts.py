@@ -369,36 +369,29 @@ class TestPlayerNameFtsRowidMigration:
         assert await db.get_bot_metadata(PLAYER_NAME_FTS_ROWID_SCHEME_KEY) == PLAYER_NAME_FTS_ROWID_SCHEME_VALUE
 
 
-class TestCacheManagerRolloutFlag:
-    """CACHE.search_player_names() delegates to db_manager.search_player_names_sync() only when
-    CONFIG.cwl_use_fts_player_search is True (2026-08-17, Step 11 rollout flag — defaults False,
-    the in-memory scan stays the active path until DEV+PROD burn-in confirms parity)."""
+class TestCacheManagerSearchPlayerNames:
+    """CACHE.search_player_names() delegates to db_manager.search_player_names_sync()
+    unconditionally (2026-08-18, PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Steps 5-6 — the
+    CONFIG.cwl_use_fts_player_search rollout flag and the in-memory fallback it gated were both
+    retired once DEV+PROD burn-in confirmed parity)."""
 
     @pytest.mark.integration
-    async def test_delegates_to_sqlite_when_flag_true(self, db, monkeypatch):
-        import dataclasses
+    async def test_delegates_to_sqlite(self, db):
         from qapbot.cache_manager import CacheManager
-        from qapbot.config import CONFIG
 
         db.update_player_name_index_sync([("#A1", "Alice", "2026-08-17T00:00")])
 
         cache = CacheManager.__new__(CacheManager)
         cache.db_manager = db
-        cache.player_name_index = {}  # deliberately empty — proves the SQLite path was used
-
-        monkeypatch.setattr("qapbot.config.CONFIG", dataclasses.replace(CONFIG, cwl_use_fts_player_search=True))
 
         assert cache.search_player_names("Alice") == [{"player_tag": "#A1", "player_name": "Alice"}]
 
-    def test_uses_in_memory_path_when_flag_false(self, monkeypatch):
-        import dataclasses
+    def test_returns_empty_when_db_manager_not_ready(self):
+        """Defensive guard for the early-startup window before db_manager is set — must not
+        raise AttributeError."""
         from qapbot.cache_manager import CacheManager
-        from qapbot.config import CONFIG
 
         cache = CacheManager.__new__(CacheManager)
-        cache.db_manager = None  # would AttributeError if the SQLite path were mistakenly used
-        cache.player_name_index = {"#A1": ("Alice", "alice")}
+        cache.db_manager = None
 
-        monkeypatch.setattr("qapbot.config.CONFIG", dataclasses.replace(CONFIG, cwl_use_fts_player_search=False))
-
-        assert cache.search_player_names("Alice") == [{"player_tag": "#A1", "player_name": "Alice"}]
+        assert cache.search_player_names("Alice") == []

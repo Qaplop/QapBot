@@ -332,6 +332,17 @@ Step 11 rollout. Ask before deploying Steps 5+ to PROD if that confirmation hasn
 
 ## Step 5: Retire `CACHE.player_name_index` (the in-memory dict) and its writer
 
+**DONE (2026-08-18, commit pending).** Executed together with Step 6 (interlocked — the flag
+decision shapes exactly how `search_player_names()`'s and `web_bridge.py`'s flag-gated branches
+resolve). All removals below completed as specified, plus one item found during execution not
+originally scoped: `QBdiscordcmds._build_guild_player_name_matches()` (added in Batch A, after
+this step was drafted) had its own fallback into `CACHE.player_name_index` for source-2-only
+tags — fixed to silently skip instead (see Step 6's status note and the 2026-08-18 entry in
+`qapbot/docs/DATABASE_ARCHITECTURE.md` for the full writeup). 2061 tests pass (net -10 vs Batch
+A's 2071 — removed the obsolete `TestSearchPlayerNames` class (10 tests, tested the now-deleted
+in-memory scan) and `TestCacheManagerRolloutFlag` (2 tests, tested the now-deleted flag), added a
+few narrower replacements).
+
 Only after Step 4's checkpoint passes. Both consumers (`CACHE.search_player_names()` guest-search
 path, gated by `CONFIG.cwl_use_fts_player_search`, and `/whois`, unconditionally after Step 3) no
 longer need the in-memory dict as their *primary* path — see Step 6 for the guest-search flag
@@ -410,6 +421,21 @@ confirmation both look solid — the flag's whole purpose was a safety net for e
 this plan just finished proving out; keeping it alive past that point just adds a permanently-dead
 code path (`.github/copilot-instructions.md`'s general anti-cruft guidance applies). But this is
 the user's call, not an implementation detail — ask before executing this step either way.
+
+**DONE (2026-08-18, commit pending).** User chose option 1 (retire the flag entirely), asked
+explicitly rather than assumed. `cwl_use_fts_player_search` deleted from `config.py` (both the
+field and its `.env`-reading logic) and from local `.env` — **PROD's `.env` still needs the same
+two-line removal manually, not done here** (no direct access to touch it). `search_player_names()`
+collapsed to an unconditional one-line delegation (see Step 5's status note); `web_bridge.py`'s
+tag-prefix mode lost its `else:` branch entirely, not just its condition.
+
+**Found during execution, not originally scoped**: this step's own line 407 said the flag's
+`False` branches would have "nothing left to fall back to" once Step 5 landed — true, but the
+actual fix needed was simpler than option 2's "small emergency fallback" sketch: since option 1
+was chosen, there's no `False` branch left to need one. The only genuine follow-up fix was
+`_build_guild_player_name_matches()`'s unrelated `player_name_index` fallback (see Step 5's
+status note) — caught by a Pylance error the moment the dict was removed, not by test failure,
+since no existing test exercised that specific fallback path.
 
 ---
 

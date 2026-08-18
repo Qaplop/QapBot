@@ -1,6 +1,55 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-18 (56)
+- Removed: Batch B (Steps 5-6) of `PLAYER_NAME_INDEX_RETIREMENT_PLAN.md` — retires
+  `CACHE.player_name_index` (the multi-million-entry in-memory dict) and
+  `CONFIG.cwl_use_fts_player_search` (the rollout flag that gated the SQLite/FTS5 alternative)
+  entirely, now that Step 4's DEV checkpoint and live PROD guest-search burn-in both confirmed
+  the SQL path fully replaces the in-memory one. User explicitly chose to retire the flag rather
+  than keep it as a kill-switch, asked directly rather than assumed (the plan's own Step 6 called
+  this a decision, not an implementation detail).
+  - `qapbot/cache_manager.py`: removed the `player_name_index` attribute, its startup loader
+    (`load_player_name_index`/`_load_player_name_index_sync`), its writer (`set_player_name`),
+    the now-unused `_player_name_tuple()` helper and `SEARCH_PLAYER_NAMES_MAX_COLLECT` constant.
+    `search_player_names()` collapsed from a 40-line flag-branching method to a 3-line
+    unconditional delegation to `db_manager.search_player_names_sync()`.
+  - `qapbot/config.py`: `cwl_use_fts_player_search` field and its `.env`-reading logic deleted.
+    Local `.env`'s `CWL_USE_FTS_PLAYER_SEARCH*` entries removed — **PROD's `.env` needs the same
+    two-line manual removal, not done here** (no direct PROD access).
+  - `qapbot/coc_cache.py`: dropped the `cache_manager.set_player_name()` call from
+    `update_player_info_in_user_accounts()`'s name-change propagation — the
+    `update_player_name_index_sync()` DB write-through right after it is untouched (that's the
+    real source of truth `player_name_search`/`player_name_fts` mirror from; the in-memory call
+    was always redundant with it going forward).
+  - `qapbot/web_bridge.py`: guest search's `#` tag-mode lost its flag check AND its in-memory
+    `else:` fallback branch entirely — always uses `db.search_player_tags_by_prefix_sync()` now.
+  - **Found during execution, not in the original plan**: `QBdiscordcmds._build_guild_player_
+    name_matches()` (added in Batch A, after Step 5 was originally drafted) had its own fallback
+    into `CACHE.player_name_index` for tags known only via `temp_war_stats` (no name from
+    `user_accounts`/`coc_clan_cache`) — would have raised `AttributeError` on every such lookup.
+    Caught by a Pylance error the instant the dict was removed, not by any existing test (nothing
+    exercised that specific fallback path). Fixed: such a tag is now silently skipped rather than
+    resolved — a narrow, accepted gap (e.g. a player who left their clan mid-war) rather than
+    adding a DB round-trip (and the `asyncio.to_thread()` it would require) to what's meant to
+    stay a fast, in-memory-only, event-loop-safe pass.
+  - Tests: removed `tests/unit/test_db_search_players_by_name.py`'s `TestSearchPlayerNames` class
+    (10 tests, tested the deleted in-memory scan) and `test_player_name_search_fts.py`'s
+    `TestCacheManagerRolloutFlag` (2 tests, tested the deleted flag) — replaced with 2 narrower
+    tests (`TestCacheManagerSearchPlayerNames`) covering the unconditional delegation and the
+    `db_manager is None` defensive guard. `tests/discord/test_web_bridge.py`'s ~10
+    `CACHE.player_name_index = ...` fixture seeds converted to real-DB seeding via a new
+    `_seed_player_names()` helper (the old `_pname_index()` in-memory-shape helper deleted).
+    `tests/conftest.py`'s flag-forcing override (test-isolation workaround from the flag's own
+    rollout) removed as now-dead config. 2061 tests pass (net -10 vs Batch A's 2071).
+  - Docs: `qapbot/docs/DATABASE_ARCHITECTURE.md` (rewrote the `player_name_index`/
+    `player_name_search`/`player_name_fts` description section for the new unconditional state;
+    added a dated 2026-08-18 retirement writeup) and `qapbot/docs/CODE_STRUCTURE.md` (corrected
+    two stale descriptions of the now-removed in-memory dict and its writer).
+  - Needs a bot restart on DEV/PROD to take effect. `PLAYER_NAME_INDEX_RETIREMENT_PLAN.md` is now
+    fully implemented except optional, independent Step 7 (delete the already-dead
+    `search_players_by_name_sync` — zero production callers, unrelated to this batch).
+
 2026-08-18 (55)
 - Added: Batch A (Steps 1-3) of `PLAYER_NAME_INDEX_RETIREMENT_PLAN.md` — migrates `/whois`'s
   name-substring search off the in-memory `CACHE.player_name_index` scan onto a two-step

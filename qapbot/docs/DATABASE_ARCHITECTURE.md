@@ -381,36 +381,32 @@ Steps 9 & 11):
   2026-08-16 PROD incident log analysis, CWL_PROD_PERFORMANCE_FIX_PLAN.md — supersedes the
   2026-07-26 ~6.2M figure above, which itself superseded an earlier stale ~125K estimate found
   in two docstrings and corrected the same day).
-  Loaded entirely into `CACHE.player_name_index: Dict[str, Tuple[str, str]]` at startup — values
-  changed from a bare name string to `(name, name_lower)` tuples (2026-08-17, Step 9) so a
-  search never re-lowercases all 6.6M names per call; the common already-lowercase case reuses
-  the same string object for both tuple slots rather than allocating a second copy.
-  In-memory O(n) search (`CACHE.search_player_names()`) replaces a `LIKE '%substr%'` scan over
-  the full `war_attacks` table (now ~113 M rows combined across the hot + history DBs — see
-  Database Size below) — still the DEFAULT active search path (see `player_name_search`/
-  `player_name_fts` below for the opt-in SQLite-backed alternative).
   Populated/maintained by `_upsert_player_name_index_in_conn()` inside every war write path
   (INSERT OR IGNORE ... ON CONFLICT DO UPDATE WHERE excluded.last_seen > stored).
   Also updated by `update_player_name_index_sync()` when coc_cache detects a live API name change.
   Sentinel rows (attack_order=0) ARE included so missed-war players appear in /whois searches.
+  **No longer loaded into memory** (2026-08-18, PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Steps 5-6 —
+  `CACHE.player_name_index`, the in-memory `Dict[str, Tuple[str, str]]` mirror and its O(n)
+  Python-side search, is retired; this table now exists purely as the write-through source that
+  keeps `player_name_search`/`player_name_fts` below in sync). See the 2026-08-18 dated entry
+  further down for the full retirement writeup.
 - `player_name_search(player_tag PK, name, name_lower)` / `player_name_fts` (FTS5, trigram
-  tokenizer) — 2026-08-17, Step 11: a SQLite-backed alternative to the in-memory scan above,
-  gated behind `CONFIG.cwl_use_fts_player_search` (default `False` — the in-memory path stays
-  active until DEV+PROD burn-in confirms parity; flipping it is a config change, not a code
-  change). `player_name_search` is a plain table (PK-indexed, backs the CWL guest search's `#`
-  tag-PREFIX mode — `player_tag LIKE ?||'%'`); `player_name_fts` is FTS5 with the trigram
-  tokenizer (backs actual name-SUBSTRING search) — feasibility confirmed live via SSH on both
-  DEV (SQLite 3.50.4) and PROD (SQLite 3.45.2), both fully support FTS5 + trigram. Kept in sync
-  by the SAME two writers as `player_name_index` above (`_upsert_player_name_index_in_conn` /
-  `update_player_name_index_sync`), re-reading the just-upserted `player_name_index` row rather
-  than trusting the write batch's own value directly, so a WHERE-guarded "not newer, skip"
-  outcome there can never leave these two tables holding a stale name `player_name_index`
-  itself rejected. One-time idempotent backfill on every startup (`_backfill_player_name_search_
-  if_needed()`), guarded by a row-count comparison against `player_name_index` so it's a no-op
-  once already in sync. `/whois`'s OWN separate inline scan (`QBdiscordcmds.py` — deliberately
-  not `CACHE.search_player_names()`, see Step 9's own note) is NOT migrated to this path — it
-  needs the full match set for its guild-membership reorder, which a `LIMIT`-based FTS5 query
-  doesn't naturally provide; out of this step's scope.
+  tokenizer) — 2026-08-17, Step 11, **unconditional since 2026-08-18** (the
+  `CONFIG.cwl_use_fts_player_search` rollout flag and the in-memory fallback it gated were both
+  retired once DEV+PROD burn-in confirmed parity — see below). `player_name_search` is a plain
+  table (PK-indexed, backs the CWL guest search's `#` tag-PREFIX mode — `player_tag LIKE
+  ?||'%'`); `player_name_fts` is FTS5 with the trigram tokenizer (backs actual name-SUBSTRING
+  search) — feasibility confirmed live via SSH on both DEV (SQLite 3.50.4) and PROD (SQLite
+  3.45.2), both fully support FTS5 + trigram. Kept in sync by the SAME two writers as
+  `player_name_index` above (`_upsert_player_name_index_in_conn` / `update_player_name_index_
+  sync`), re-reading the just-upserted `player_name_index` row rather than trusting the write
+  batch's own value directly, so a WHERE-guarded "not newer, skip" outcome there can never leave
+  these two tables holding a stale name `player_name_index` itself rejected. One-time idempotent
+  backfill on every startup (`_backfill_player_name_search_if_needed()`), guarded by a row-count
+  comparison against `player_name_index` so it's a no-op once already in sync. `/whois`'s own
+  search (`QBdiscordcmds.py`) uses a different, two-step design — see the 2026-08-18 dated entry
+  further down — rather than calling `search_player_names_sync` directly, since it needs
+  guild-member completeness a plain `LIMIT`-based query can't guarantee on its own.
   - **2026-08-17 follow-up fix — `player_name_fts` rowid**: `player_tag` is declared `UNINDEXED`
     in the FTS5 schema, which only excludes it from full-text `MATCH` — it does NOT give SQLite
     any index for a plain equality lookup, so `DELETE FROM player_name_fts WHERE player_tag = ?`
@@ -451,6 +447,28 @@ Steps 9 & 11):
     guild pass already produces that same split by construction). New i18n key
     `commands.whois.player_search_too_short` — the 3-character FTS5 trigram floor only gates
     the global fallback, not the guild pass, which has none.
+  - **2026-08-18 — `CACHE.player_name_index` (the in-memory dict) and
+    `CONFIG.cwl_use_fts_player_search` (the rollout flag) both retired**
+    (`PLAYER_NAME_INDEX_RETIREMENT_PLAN.md` Steps 5-6), once the Step 4 DEV/PROD checkpoint and
+    live PROD guest-search burn-in both confirmed the SQL path fully replaces the in-memory
+    scan. `CACHE.search_player_names()` now unconditionally delegates to
+    `db_manager.search_player_names_sync()`, with no fallback branch — the flag's `False` branch
+    and its in-memory implementation are both gone, not just disabled. Removed:
+    `CACHE.player_name_index` itself, `load_player_name_index()`/`_load_player_name_index_sync()`
+    (the startup loader), `set_player_name()` (the writer — `coc_cache.py`'s
+    `update_player_info_in_user_accounts()` keeps its `update_player_name_index_sync()` DB
+    write-through, just drops the now-pointless in-memory mirror call alongside it),
+    `_player_name_tuple()` and `SEARCH_PLAYER_NAMES_MAX_COLLECT` (both now-unused helpers),
+    `web_bridge.py`'s in-memory fallback branch in the guest search's `#` tag mode, and
+    `cwl_use_fts_player_search` from `config.py`/`.env` entirely. One residual behavior change:
+    `QBdiscordcmds._build_guild_player_name_matches()`'s source-2-only fallback (a tag known only
+    via `temp_war_stats`, with no name from `user_accounts`/`coc_clan_cache`) used to resolve a
+    display name via `CACHE.player_name_index`; with that gone, such a tag is now silently
+    skipped rather than adding a DB round-trip (and the `asyncio.to_thread()` wrapping it would
+    require) to what's meant to stay a fast, in-memory-only, event-loop-safe pass — accepted as a
+    narrow edge case (e.g. a player who left their clan mid-war). `player_name_index` the TABLE
+    is untouched and still the write-through source of truth for `player_name_search`/
+    `player_name_fts` above — only the in-memory `CACHE` mirror and its own O(n) scan are gone.
 
 ### Foreign Key Relationships
 

@@ -110,7 +110,6 @@ async def test_update_player_info_updates_and_persists_only_affected_users():
             "222": {"players": [{"player_tag": "#P3", "player_name": "PlayerThree", "th_level": 12, "current_clan_tag": None}]},
         },
         persist_user=persist_user,
-        player_name_index={},
         db_manager=None,
     )
 

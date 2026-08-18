@@ -5428,13 +5428,12 @@ class WarHistoryDB:
 
     def search_player_names_sync(self, query: str, limit: int = 25) -> List[Dict[str, str]]:
         """SQLite/FTS5-backed name-substring search over player_name_fts (2026-08-17,
-        CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 11) — the SQL-backed counterpart to
-        CACHE.search_player_names()'s in-memory scan, used when
-        CONFIG.cwl_use_fts_player_search is True. Same alphabetical-sort/25-cap contract as the
-        in-memory version, but genuinely index-backed (no in-process bound like
-        SEARCH_PLAYER_NAMES_MAX_COLLECT is needed — FTS5's trigram index finds matching rows
-        without touching non-matching ones, so LIMIT is honored without an application-level
-        early-exit).
+        CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 11) — unconditionally backs
+        CACHE.search_player_names() since 2026-08-18 (PLAYER_NAME_INDEX_RETIREMENT_PLAN.md
+        Steps 5-6 retired the in-memory scan it used to sit behind a rollout flag for). Capped
+        at `limit` (<=25), index-backed (no in-process bound needed — FTS5's trigram index finds
+        matching rows without touching non-matching ones, so LIMIT is honored without an
+        application-level early-exit).
 
         NOT completeness-guaranteed beyond `limit` — a query matching more players than `limit`
         silently drops the alphabetically-late remainder. Fine for this reader's callers (guest
@@ -5456,11 +5455,11 @@ class WarHistoryDB:
         return self._search_player_names_fts_sync(query, hard_cap)
 
     def search_player_tags_by_prefix_sync(self, prefix: str, limit: int = 12) -> List[Dict[str, str]]:
-        """Tag-PREFIX search over player_name_search (2026-08-17, Step 11) — backs the CWL
-        guest search's `#` tag mode (web_bridge.py's _search_cwl_guests_sync), used when
-        CONFIG.cwl_use_fts_player_search is True. A prefix LIKE pattern (no leading `%`) is
-        index-backed on player_name_search's own PK B-tree — no FTS needed for a tag prefix,
-        only name substrings need trigram matching."""
+        """Tag-PREFIX search over player_name_search (2026-08-17, Step 11) — unconditionally
+        backs the CWL guest search's `#` tag mode (web_bridge.py's _search_cwl_guests_sync)
+        since 2026-08-18 (PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Steps 5-6). A prefix LIKE pattern
+        (no leading `%`) is index-backed on player_name_search's own PK B-tree — no FTS needed
+        for a tag prefix, only name substrings need trigram matching."""
         import sqlite3
 
         if not self.db_path:
