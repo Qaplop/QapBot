@@ -1,6 +1,13 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-18 (62)
+- Added: `/whois` player-report embed's clan info line now also shows the clan's CWL league
+  tier (e.g. "Master League I"), read from `CACHE.clan_name_cache[...]["war_league"]" — the
+  same field `_ensure_clan_war_league()` and the `/list tracked_clans` chart already rely on.
+  Omitted entirely when the cache has no `war_league` for that clan (e.g. clan never seen in a
+  tracked CWL war) rather than showing a placeholder. `QBdiscordcmds.py`.
+
 2026-08-18 (61)
 - Fixed: `get_global_db_statistics_sync()`'s ~20s cold scan (the `/status` global-stats query) —
   diagnosed live on PROD's `qapbot_PROD.log` after deploying (59): the fire-and-forget startup

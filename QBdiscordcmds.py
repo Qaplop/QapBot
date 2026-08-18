@@ -4317,7 +4317,9 @@ async def _player_report_logic(
     player_name = war_rows[0]["player_name"]
     th_level    = war_rows[0]["th_level"]  # most-recent TH
     last_war_clan_tag  = war_rows[0]["clan_tag"]
-    last_war_clan_name = CACHE.clan_name_cache.get(last_war_clan_tag, {}).get("name") or last_war_clan_tag
+    _last_war_clan_data = CACHE.clan_name_cache.get(last_war_clan_tag, {})
+    last_war_clan_name = _last_war_clan_data.get("name") or last_war_clan_tag
+    last_war_clan_league = _last_war_clan_data.get("war_league")
 
     # ── Separate CW and CWL ────────────────────────────────────────────────────
     cw_rows  = [r for r in war_rows if not r["is_cwl"]]
@@ -4461,6 +4463,7 @@ async def _player_report_logic(
         description=(
             f"## Player: {th_emoji} {th_level}  [{player_name}]({profile_url})  ({tag})\n"
             f"**Clan:** **[{last_war_clan_name}]({clan_url})**  ({last_war_clan_tag})"
+            + (f"  · {last_war_clan_league}" if last_war_clan_league else "")
         ),
         color=color,
     )
