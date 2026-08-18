@@ -841,7 +841,10 @@ async def sync_all_roles_for_guild(
         if _guild_clans and set(_get_clan_tags_for_user(user_id_str)) & _guild_clans:
             expected_member_ids.add(_uid)
 
-    logging.info(f"[ROLE-SYNC] Starting guild-wide role sync for guild {guild.name} ({guild_id}): {len(user_ids)} users")
+    logging.info(
+        f"[ROLE-SYNC] Starting guild-wide role sync for guild {guild.name} ({guild_id}): "
+        f"{len(expected_member_ids)} guild-relevant of {len(user_ids)} bot-wide registered users"
+    )
 
     # Build a set of registered user IDs for fast O(1) lookup.
     registered_ids: set[int] = set(user_ids)

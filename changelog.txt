@@ -1,6 +1,22 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-18 (58)
+- Fixed: misleading `[ROLE-SYNC]` startup log line — found analyzing today's PROD startup log
+  (post player-name-index-retirement deploy, otherwise fully clean: zero warnings/errors, RSS
+  956.6 MB vs the 2.56-3.08 GB historical baseline, first live player_name_fts batched flush
+  completed in 4.24s confirming yesterday's rowid-lookup fix holds under real load). `guild_role_
+  manager.py`'s "Starting guild-wide role sync for guild X: N users" logged `len(user_ids)` —
+  which is `CACHE.user_accounts`' bot-wide registration pool (the same 131 across every guild in
+  the log, since this bot serves multiple guilds from one shared pool and that variable is never
+  guild-filtered), not a per-guild count, despite reading like one. Not a functional bug — the
+  actual sync logic below correctly intersects `guild.members` with the registered-ID set; only
+  the log line misrepresented its own scope. Now logs `len(expected_member_ids)` (the
+  already-computed guild-relevant subset) alongside the bot-wide total for context: "N
+  guild-relevant of M bot-wide registered users". 118 guild_role_manager tests pass unchanged
+  (none asserted on the old string), 2048 total. Needs a bot restart on DEV/PROD to take effect
+  (log-only change, no behavior difference).
+
 2026-08-18 (57)
 - Removed: Step 7 (final step) of `PLAYER_NAME_INDEX_RETIREMENT_PLAN.md` — deleted
   `db_manager.search_players_by_name_sync()`, a `war_attacks` full-table `LIKE` fallback that
