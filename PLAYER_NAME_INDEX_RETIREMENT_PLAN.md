@@ -454,6 +454,16 @@ class within it, if that file also covers things kept from Step 1). Do this as i
 changelog entry — it's unrelated to the player_name_index migration above and shouldn't be bundled
 into the same commit/entry, to keep the history readable.
 
+**DONE (2026-08-18, commit pending).** The function deleted along with `_explicit_column_list_
+sync`'s call site inside it (that helper itself stays — 15+ other live callers, confirmed by
+grep before assuming it was safe to remove too). The test file covered other still-live things
+(`TestUpsertPlayerNameIndexInConn`/`TestLoadPlayerNameIndexSync`/`TestUpdatePlayerNameIndexSync`,
+per this step's own parenthetical above) — renamed to `tests/unit/test_db_player_name_index.py`
+rather than left with a name describing only its now-deleted class, and its now-unused
+`war_attacks` schema fixture (`_CREATE_WAR_ATTACKS`, `_insert_attack()`) trimmed alongside the
+13 tests for the deleted function. 2048 tests pass (net -13 vs Batch B's 2061). This closes out
+`PLAYER_NAME_INDEX_RETIREMENT_PLAN.md` in full — all 7 steps done.
+
 ---
 
 ## Suggested delivery grouping

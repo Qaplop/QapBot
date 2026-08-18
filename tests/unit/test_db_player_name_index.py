@@ -1,6 +1,13 @@
-"""Tests for db_manager.search_players_by_name_sync.
+"""Tests for the player_name_index DB-layer maintenance helpers: the incremental writer
+(_upsert_player_name_index_in_conn), the startup bulk loader (load_player_name_index_sync), and
+the API-detected-name-change batch upsert (update_player_name_index_sync).
 
-Uses a real in-memory SQLite database with the war_attacks schema.
+Renamed from test_db_search_players_by_name.py (2026-08-18,
+PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Step 7) after search_players_by_name_sync — the sole reason
+for that file's original name and its war_attacks-table test fixtures — was deleted as dead code
+(superseded by the in-memory index long before this session, then by SQLite/FTS5; zero
+production callers). This file's actual remaining content was always about player_name_index
+maintenance, not name search, so the name now matches what it tests.
 """
 # pyright: reportPrivateUsage=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportAttributeAccessIssue=false, reportReturnType=false, reportOptionalMemberAccess=false
 from __future__ import annotations
@@ -16,34 +23,6 @@ from qapbot.db_manager import WarHistoryDB
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-_CREATE_WAR_ATTACKS = """
-    CREATE TABLE IF NOT EXISTS war_attacks (
-        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-        war_id                 TEXT    NOT NULL,
-        clan_tag               TEXT    NOT NULL,
-        date                   TEXT    NOT NULL,
-        player_name            TEXT    NOT NULL,
-        player_tag             TEXT    NOT NULL,
-        th_level               INTEGER NOT NULL,
-        map_position           INTEGER NOT NULL DEFAULT 0,
-        attack_order           INTEGER NOT NULL DEFAULT 0,
-        stars                  INTEGER NOT NULL,
-        destruction            REAL    NOT NULL DEFAULT 0.0,
-        defender_tag           TEXT    NOT NULL DEFAULT '',
-        defender_th            INTEGER NOT NULL DEFAULT 0,
-        defender_map_position  INTEGER NOT NULL DEFAULT 0,
-        duration               INTEGER NOT NULL DEFAULT 0,
-        is_fresh               INTEGER NOT NULL DEFAULT -1,
-        times_defended         INTEGER NOT NULL DEFAULT 0,
-        best_def_destruction   REAL    NOT NULL DEFAULT 0.0,
-        max_attacks            INTEGER NOT NULL DEFAULT 2,
-        missed_attacks         INTEGER NOT NULL DEFAULT 0,
-        defensive_stars        INTEGER NOT NULL DEFAULT 0,
-        created_at             TEXT    DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(war_id, player_tag, attack_order)
-    )
-"""
 
 _CREATE_PLAYER_NAME_INDEX = """
     CREATE TABLE IF NOT EXISTS player_name_index (
@@ -72,11 +51,11 @@ _CREATE_PLAYER_NAME_FTS = """
 
 
 def _make_db(tmp_path) -> WarHistoryDB:
-    """Create a WarHistoryDB with war_attacks and player_name_index schema in a temp file."""
+    """Create a WarHistoryDB with just the player_name_index/player_name_search/player_name_fts
+    schema in a temp file (deliberately NOT the full WarHistoryDB.initialize())."""
     db_path = str(tmp_path / "test.db")
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    conn.execute(_CREATE_WAR_ATTACKS)
     conn.execute(_CREATE_PLAYER_NAME_INDEX)
     conn.execute(_CREATE_PLAYER_NAME_SEARCH)
     conn.execute(_CREATE_PLAYER_NAME_FTS)
@@ -88,174 +67,6 @@ def _make_db(tmp_path) -> WarHistoryDB:
     dm._pool = None  # force fallback to direct sqlite3.connect in _sync_conn
     dm._sync_write_lock = threading.Lock()
     return dm
-
-
-def _insert_attack(
-    db_path: str,
-    *,
-    war_id: str = "W1",
-    clan_tag: str = "#CLAN",
-    date: str = "2025-01-15T10:00",
-    player_name: str = "PlayerOne",
-    player_tag: str = "#P1",
-    attack_order: int = 1,
-    stars: int = 3,
-) -> None:
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        """INSERT OR IGNORE INTO war_attacks
-           (war_id, clan_tag, date, player_name, player_tag, th_level,
-            attack_order, stars)
-           VALUES (?,?,?,?,?,?,?,?)""",
-        (war_id, clan_tag, date, player_name, player_tag, 15, attack_order, stars),
-    )
-    conn.commit()
-    conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-class TestSearchPlayersByNameSync:
-
-    def test_exact_name_match(self, tmp_path):
-        dm = _make_db(tmp_path)
-        _insert_attack(dm.db_path, player_name="JohnDoe", player_tag="#JD1")
-
-        result = dm.search_players_by_name_sync("JohnDoe")
-
-        assert len(result) == 1
-        assert result[0]["player_tag"] == "#JD1"
-        assert result[0]["player_name"] == "JohnDoe"
-
-    def test_substring_match(self, tmp_path):
-        dm = _make_db(tmp_path)
-        _insert_attack(dm.db_path, player_name="JohnDoe", player_tag="#JD1")
-        _insert_attack(dm.db_path, player_name="JohnSmith", player_tag="#JS1", war_id="W2")
-
-        result = dm.search_players_by_name_sync("John")
-
-        tags = {r["player_tag"] for r in result}
-        assert "#JD1" in tags
-        assert "#JS1" in tags
-
-    def test_case_insensitive(self, tmp_path):
-        dm = _make_db(tmp_path)
-        _insert_attack(dm.db_path, player_name="JohnDoe", player_tag="#JD1")
-
-        assert len(dm.search_players_by_name_sync("johndoe")) == 1
-        assert len(dm.search_players_by_name_sync("JOHNDOE")) == 1
-        assert len(dm.search_players_by_name_sync("John")) == 1
-
-    def test_no_match_returns_empty(self, tmp_path):
-        dm = _make_db(tmp_path)
-        _insert_attack(dm.db_path, player_name="JohnDoe", player_tag="#JD1")
-
-        result = dm.search_players_by_name_sync("XyzNoMatch")
-
-        assert result == []
-
-    def test_empty_table_returns_empty(self, tmp_path):
-        dm = _make_db(tmp_path)
-
-        result = dm.search_players_by_name_sync("John")
-
-        assert result == []
-
-    def test_sentinel_rows_included(self, tmp_path):
-        """Rows with attack_order=0 (missed-all-attacks sentinels) ARE now indexed."""
-        dm = _make_db(tmp_path)
-        _insert_attack(dm.db_path, player_name="GhostPlayer", player_tag="#GP1", attack_order=0)
-
-        result = dm.search_players_by_name_sync("Ghost")
-
-        assert len(result) == 1
-        assert result[0]["player_tag"] == "#GP1"
-
-    def test_deduplicates_by_player_tag(self, tmp_path):
-        """Same player appearing in multiple wars returns only one entry."""
-        dm = _make_db(tmp_path)
-        _insert_attack(dm.db_path, player_name="Alice", player_tag="#A1", war_id="W1", date="2025-01-01T10:00")
-        _insert_attack(dm.db_path, player_name="Alice", player_tag="#A1", war_id="W2", date="2025-02-01T10:00")
-
-        result = dm.search_players_by_name_sync("Alice")
-
-        assert len(result) == 1
-        assert result[0]["player_tag"] == "#A1"
-
-    def test_returns_most_recent_name(self, tmp_path):
-        """When a player's name changed, the most recent name is returned."""
-        dm = _make_db(tmp_path)
-        _insert_attack(dm.db_path, player_name="OldName", player_tag="#P1", war_id="W1", date="2025-01-01T10:00")
-        _insert_attack(dm.db_path, player_name="NewName", player_tag="#P1", war_id="W2", date="2025-06-01T10:00")
-
-        # Both "OldName" and "NewName" contain "Name" — should match
-        result = dm.search_players_by_name_sync("Name")
-
-        assert len(result) == 1
-        assert result[0]["player_name"] == "NewName"
-
-    def test_ordered_by_most_recently_seen(self, tmp_path):
-        """Results ordered by most recent war date descending."""
-        dm = _make_db(tmp_path)
-        _insert_attack(dm.db_path, player_name="Beta", player_tag="#B1", war_id="W1", date="2025-01-01T10:00")
-        _insert_attack(dm.db_path, player_name="Alpha", player_tag="#A1", war_id="W2", date="2025-06-01T10:00")
-
-        result = dm.search_players_by_name_sync("a")  # matches both
-
-        assert result[0]["player_tag"] == "#A1"  # more recent
-        assert result[1]["player_tag"] == "#B1"
-
-    def test_limit_respected(self, tmp_path):
-        """Limit parameter caps the result count (and cannot exceed 25)."""
-        dm = _make_db(tmp_path)
-        for i in range(10):
-            _insert_attack(
-                dm.db_path,
-                player_name=f"Player{i:02d}",
-                player_tag=f"#P{i:02d}",
-                war_id=f"W{i}",
-                date=f"2025-0{(i % 9) + 1}-01T10:00",
-            )
-
-        result = dm.search_players_by_name_sync("Player", limit=3)
-
-        assert len(result) <= 3
-
-    def test_limit_capped_at_25(self, tmp_path):
-        """Limit is silently capped at 25 (Discord select menu maximum)."""
-        dm = _make_db(tmp_path)
-        for i in range(30):
-            _insert_attack(
-                dm.db_path,
-                player_name=f"Player{i:02d}",
-                player_tag=f"#P{i:02d}",
-                war_id=f"W{i}",
-                date=f"2025-01-{(i % 28) + 1:02d}T10:00",
-            )
-
-        result = dm.search_players_by_name_sync("Player", limit=50)
-
-        assert len(result) <= 25
-
-    def test_result_keys(self, tmp_path):
-        """Each result dict has exactly 'player_tag' and 'player_name' keys."""
-        dm = _make_db(tmp_path)
-        _insert_attack(dm.db_path, player_name="KeyTest", player_tag="#KT1")
-
-        result = dm.search_players_by_name_sync("KeyTest")
-
-        assert set(result[0].keys()) == {"player_tag", "player_name"}
-
-    def test_db_not_initialized_raises(self):
-        """Raises RuntimeError when db_path is not set."""
-        dm = WarHistoryDB.__new__(WarHistoryDB)
-        dm.db_path = None
-        dm._pool = None
-
-        with pytest.raises(RuntimeError, match="Database not initialized"):
-            dm.search_players_by_name_sync("anything")
 
 
 # ---------------------------------------------------------------------------

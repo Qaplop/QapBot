@@ -5479,53 +5479,6 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] search_player_tags_by_prefix_sync failed: {e}")
                 return []
 
-    def search_players_by_name_sync(
-        self, name_substring: str, limit: int = 25
-    ) -> List[Dict[str, str]]:
-        """
-        Search war_attacks for distinct players whose name contains name_substring
-        (case-insensitive). Returns up to ``limit`` dicts with 'player_tag' and
-        'player_name' (most recent name seen for each tag), ordered by most
-        recently seen. Hard cap at 25 — Discord select-menu limit.
-
-        NOTE: This is the slow fallback (full table scan) used only when
-        CACHE.player_name_index is not yet populated.  Prefer
-        CACHE.search_player_names() for instant in-memory results.
-        """
-        import sqlite3
-
-        if not self.db_path:
-            raise RuntimeError("Database not initialized. Call initialize() first.")
-
-        pattern = f"%{name_substring}%"
-        with self._sync_conn() as conn:
-            try:
-                wa_cols = self._explicit_column_list_sync(conn, "war_attacks")
-                rows = conn.execute(f"""
-                    WITH wa AS (
-                        SELECT {wa_cols} FROM main.war_attacks
-                        UNION ALL SELECT {wa_cols} FROM history.war_attacks
-                    )
-                    SELECT player_tag, player_name
-                    FROM (
-                        SELECT player_tag, player_name,
-                               ROW_NUMBER() OVER (PARTITION BY player_tag ORDER BY date DESC) AS rn,
-                               MAX(date) OVER (PARTITION BY player_tag) AS last_seen
-                        FROM wa
-                        WHERE player_name LIKE ? COLLATE NOCASE
-                    )
-                    WHERE rn = 1
-                    ORDER BY last_seen DESC
-                    LIMIT ?
-                """, (pattern, min(limit, 25))).fetchall()
-                return [
-                    {"player_tag": row["player_tag"], "player_name": row["player_name"]}
-                    for row in rows
-                ]
-            except sqlite3.Error as e:
-                logging.error(f"[DB-QUERY-SYNC] search_players_by_name_sync failed: {e}")
-                return []
-
     def get_player_war_history_sync(
         self, player_tag: str, limit: int = 200
     ) -> List[Dict[str, Any]]:

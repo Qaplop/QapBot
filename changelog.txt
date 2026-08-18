@@ -1,6 +1,31 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-18 (57)
+- Removed: Step 7 (final step) of `PLAYER_NAME_INDEX_RETIREMENT_PLAN.md` — deleted
+  `db_manager.search_players_by_name_sync()`, a `war_attacks` full-table `LIKE` fallback that
+  was already dead code (zero production callers) before this session's FTS5/two-step search
+  work even started; `qapbot/docs/CODE_STRUCTURE.md` already flagged it as "superseded" prior to
+  today. Unrelated to Batches A/B above — its own small entry per the plan's own instruction, to
+  keep history readable.
+  - `qapbot/db_manager.py`: function deleted. `_explicit_column_list_sync()` (called inside it)
+    stays — confirmed 15+ other live call sites before assuming it was safe to remove too.
+  - `tests/unit/test_db_search_players_by_name.py` renamed to `tests/unit/test_db_player_name_
+    index.py`: the file's other 3 classes (`TestUpsertPlayerNameIndexInConn`/
+    `TestLoadPlayerNameIndexSync`/`TestUpdatePlayerNameIndexSync`) test still-live
+    `player_name_index` DB-layer maintenance helpers, unrelated to the deleted function — the old
+    name only ever described the one class now gone. Deleted the 13 tests for the removed
+    function along with its now-unused `war_attacks` schema fixture (`_CREATE_WAR_ATTACKS`,
+    `_insert_attack()`).
+  - `qapbot/docs/CODE_STRUCTURE.md` updated to note the deletion. Left one historical checklist
+    entry in `CLAN_AND_WAR_CYCLE_ARCHITECTURE.md` untouched (a dated, already-completed
+    migration-verification record — accurate at the time it was written, not current-state
+    documentation).
+  - 2048 tests pass (net -13 vs (56)'s 2061). Needs a bot restart on DEV/PROD to take effect
+    (though nothing user-visible changes — dead code removal only).
+  - **This closes out `PLAYER_NAME_INDEX_RETIREMENT_PLAN.md` in full — all 7 steps (Batches A,
+    B, C) done, live-verified on both DEV and PROD.**
+
 2026-08-18 (56)
 - Removed: Batch B (Steps 5-6) of `PLAYER_NAME_INDEX_RETIREMENT_PLAN.md` — retires
   `CACHE.player_name_index` (the multi-million-entry in-memory dict) and

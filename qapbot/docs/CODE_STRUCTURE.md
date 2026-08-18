@@ -326,7 +326,7 @@ all rebuild/button-handler paths so the reference is never lost.
   · `_upsert_player_name_index_in_conn(conn, attack_params)`: writes to player_name_index within any open conn/transaction; called by all war write paths
   · `load_player_name_index_sync()`: bulk-loads entire table → {player_tag: player_name} dict at startup
   · `update_player_name_index_sync(updates)`: batch-upsert for API-detected player name changes (from coc_cache)
-  · `search_players_by_name_sync(name_substring, limit=25)`: slow-fallback DB LIKE query (superseded by in-memory index at runtime)
+  · `search_players_by_name_sync` deleted 2026-08-18 (PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Step 7) — a `war_attacks` full-table LIKE fallback, already dead (zero production callers) before this session's FTS5/two-step search work even started
 - Chart data methods (2026-05-17+):
   · `get_player_monthly_star_dist_sync(player_tag)`: per-month, per-type (CW/CWL) star distribution for Skill/Reliability /whois charts
   · `get_global_db_statistics_sync(force_refresh=False)`: includes `players_tracked_count` (COUNT(*) FROM player_name_index).
