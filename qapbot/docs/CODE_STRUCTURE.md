@@ -337,6 +337,20 @@ all rebuild/button-handler paths so the reference is never lost.
     `/status` is only called a few times a week; cache is warmed at bot startup and refreshed (`force_refresh=True`) at the
     end of `run_nightly_maintenance_routine()` in QapBot.py (after REINDEX/VACUUM/ANALYZE), so `/status` should never pay
     the cold-scan cost during normal operation. See `QapBot._warm_global_db_stats_cache()`.
+    2026-08-18: the 5 sub-queries run concurrently (one `_sync_conn()` connection each via a small
+    local `ThreadPoolExecutor`) instead of sequentially on one connection — cuts wall time from
+    ~20s to roughly the single slowest query, since this was found live on PROD to be starving
+    the sync connection pool that the periodic clan-fetch cycle's Phase-1 also needs at startup.
+    Every exact computation also persists its result to `bot_metadata` (key
+    `DatabaseManager._GLOBAL_STATS_METADATA_KEY`) as JSON with a wall-clock `computed_at_utc`.
+    `preload_global_db_statistics_from_snapshot()` (async — uses the aiosqlite connection, not
+    the sync pool) restores that snapshot into the in-memory cache at startup, converting the
+    persisted wall-clock age back into an equivalent `_global_stats_cache_ts` so the normal
+    `_GLOBAL_STATS_TTL` check still expires it at the right time. `_warm_global_db_stats_cache()`'s
+    plain startup call (`force_refresh=False`) now tries this restore first — a single tiny row
+    read — and only falls through to the real (now-parallelized) scan if no snapshot exists yet
+    (fresh DB). The `force_refresh=True` call at the end of nightly maintenance always does the
+    real scan and refreshes the persisted snapshot for the next restart.
 - Never called directly from business logic - only via CACHE.db_manager
 - **Production Status**: Database-only mode (no feature flags), all data stored in SQLite
 📖 See: DATABASE_ARCHITECTURE.md for schema and architecture details

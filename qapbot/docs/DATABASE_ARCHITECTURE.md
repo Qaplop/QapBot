@@ -815,9 +815,21 @@ re-check) rather than trusting them long-term.
   and history `war_summary`/`war_attacks` (5M+ and 94M+ rows) — SQLite cannot know these counts
   without scanning, even across a `UNION ALL` of two attached schemas. Direct cause of `/status`
   being slow (~3s fast local SSD, 20+s prod NAS). Since it's a reporting stat with no
-  business-logic dependency, fixed with a simple 5-minute TTL cache on the `WarHistoryDB` instance
-  (`_global_stats_cache` / `_GLOBAL_STATS_TTL`) rather than incremental counters (which would
-  require touching every insert/delete site — much higher risk for a cosmetic stat).
+  business-logic dependency, fixed with a TTL cache on the `WarHistoryDB` instance
+  (`_global_stats_cache` / `_GLOBAL_STATS_TTL`, raised to 25h on 2026-08-03) rather than
+  incremental counters (which would require touching every insert/delete site — much higher risk
+  for a cosmetic stat). 2026-08-18: the 20+s cost itself was found live on PROD to matter even
+  with the cache, because the fire-and-forget startup warm-up call shared `WarHistoryDB`'s
+  8-connection sync pool with the periodic clan-fetch cycle's Phase-1 (also starting at bot
+  startup), starving it for the scan's whole duration. Two independent fixes, both in
+  `get_global_db_statistics_sync()`: (1) the 5 sub-queries now run concurrently instead of
+  sequentially on one connection, cutting wall time to roughly the slowest single query; (2) every
+  exact computation persists its result to `bot_metadata` (JSON, with a wall-clock
+  `computed_at_utc`), and the plain startup warm-up (`QapBot._warm_global_db_stats_cache()`,
+  `force_refresh=False`) now restores that snapshot via `preload_global_db_statistics_from_
+  snapshot()` — a single tiny row read — instead of ever re-running the scan cold on a restart.
+  Only a brand-new DB with no snapshot yet, or an explicit `force_refresh=True` (nightly
+  maintenance / manual `/status` refresh), still pays the real (now-parallelized) scan cost.
 
 ---
 

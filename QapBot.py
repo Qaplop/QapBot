@@ -1960,12 +1960,29 @@ async def _warm_global_db_stats_cache(force_refresh: bool = False) -> None:
     state and stays warm across the 25h window between /status calls.
     Swallows all exceptions — a reporting-stat warm-up must never break
     startup or nightly maintenance.
+
+    2026-08-18: the plain startup call (force_refresh=False) no longer re-runs the multi-GB
+    scan cold on every restart. It first tries to restore the last EXACT snapshot persisted to
+    bot_metadata by a previous force_refresh=True run (nightly maintenance, or a manual /status
+    force-refresh) — a single tiny row read, effectively instant. This was confirmed live on
+    PROD to matter: the cold scan shared db_manager's sync connection pool with the very first
+    periodic clan-fetch cycle's Phase-1 (also starting at startup), starving it for its ~20s
+    duration. Only a brand-new DB with no snapshot yet falls through to the real scan — which is
+    now itself parallelized (5 independent queries run concurrently instead of sequentially) so
+    even that cold-start path is faster than before. force_refresh=True always does the real
+    scan and refreshes the persisted snapshot for the next restart.
     """
     db_mgr = getattr(CACHE, "db_manager", None)
     if db_mgr is None:
         return
     try:
         _t0 = time.monotonic()
+        if not force_refresh and await db_mgr.preload_global_db_statistics_from_snapshot():
+            logging.info(
+                f"[DB-STATS-WARM] Restored global DB statistics from persisted snapshot in "
+                f"{time.monotonic() - _t0:.3f}s"
+            )
+            return
         await asyncio.to_thread(db_mgr.get_global_db_statistics_sync, force_refresh=force_refresh)
         logging.info(f"[DB-STATS-WARM] Global DB statistics cache warmed in {time.monotonic() - _t0:.1f}s")
     except Exception as _exc:

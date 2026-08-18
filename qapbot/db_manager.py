@@ -500,6 +500,12 @@ class WarHistoryDB:
     # hit a warm cache during normal operation. See get_global_db_statistics_sync.
     _GLOBAL_STATS_TTL = 25 * 3600.0  # seconds
 
+    # bot_metadata key the exact global-DB-statistics snapshot is persisted under, so a fresh
+    # restart can restore it instantly instead of re-running the multi-GB scan cold — see
+    # get_global_db_statistics_sync()'s persistence step and
+    # preload_global_db_statistics_from_snapshot().
+    _GLOBAL_STATS_METADATA_KEY = "global_db_statistics_snapshot"
+
     def __init__(self):
         """Initialize database manager (connection created in initialize())."""
         self.db_path: Optional[str] = None
@@ -6283,9 +6289,9 @@ class WarHistoryDB:
         Args:
             force_refresh: Bypass the cache and recompute now, refreshing it.
                 Used by the end-of-nightly-maintenance refresh (see
-                QapBot.py's run_nightly_maintenance_routine) so /status always
-                serves an at-most-25h-stale value during normal operation
-                instead of ever paying the scan cost inline.
+                QapBot.py's run_nightly_maintenance_routine) and by /status's
+                manual force-refresh option, so /status otherwise serves an
+                at-most-25h-stale value instead of ever paying the scan cost inline.
 
         Returns:
             Dict with keys:
@@ -6306,9 +6312,23 @@ class WarHistoryDB:
         startup and refreshed at the end of nightly maintenance (after
         REINDEX/VACUUM/ANALYZE, so it reads post-maintenance state), so this
         slow path should never actually run during normal /status calls.
+
+        2026-08-18: the 5 queries above used to run sequentially on one connection
+        (~20s on PROD's server-machine storage — confirmed live, this was also
+        stalling the periodic clan-fetch cycle's DB-pool-sharing tasks at startup).
+        They're independent reads against independent tables, so they now run
+        concurrently — one connection each, borrowed from the same pool
+        _sync_conn() already uses elsewhere — cutting wall time to roughly the
+        single slowest query instead of the sum of all five. Also persists the
+        exact result to bot_metadata afterward so a future restart can restore it
+        instantly via preload_global_db_statistics_from_snapshot() instead of
+        re-running this scan cold every time the process restarts.
         """
         import sqlite3
         import time
+        import json
+        import concurrent.futures
+        from datetime import datetime, timezone
 
         if not self.db_path:
             raise RuntimeError("Database not initialized. Call initialize() first.")
@@ -6321,49 +6341,124 @@ class WarHistoryDB:
         ):
             return dict(self._global_stats_cache)
 
-        try:
+        def _q_clans_count() -> int:
             with self._sync_conn() as conn:
-                clans_count = conn.execute("SELECT COUNT(*) AS cnt FROM clans").fetchone()["cnt"]
-                wars_count = conn.execute(
+                return conn.execute("SELECT COUNT(*) AS cnt FROM clans").fetchone()["cnt"]
+
+        def _q_wars_count() -> int:
+            with self._sync_conn() as conn:
+                return conn.execute(
                     "SELECT COUNT(DISTINCT war_id) AS cnt FROM ("
                     "SELECT war_id FROM main.war_summary UNION ALL SELECT war_id FROM history.war_summary"
                     ")"
                 ).fetchone()["cnt"]
-                # Subtract the small partial-index set (attack_order=0 rows)
-                # from the total row count instead of doing a filtered scan.
-                # Summed across main + history (each computed independently so
-                # each half can still use its own idx_wa_zero_attacks partial index).
-                attacks_count = conn.execute("""
+
+        def _q_attacks_count() -> int:
+            # Subtract the small partial-index set (attack_order=0 rows) from the total row
+            # count instead of doing a filtered scan. Summed across main + history (each
+            # computed independently so each half can still use its own
+            # idx_wa_zero_attacks partial index).
+            with self._sync_conn() as conn:
+                return conn.execute("""
                     SELECT (
                         (SELECT COUNT(*) FROM main.war_attacks) - (SELECT COUNT(*) FROM main.war_attacks WHERE attack_order = 0)
                     ) + (
                         (SELECT COUNT(*) FROM history.war_attacks) - (SELECT COUNT(*) FROM history.war_attacks WHERE attack_order = 0)
                     ) AS cnt
                 """).fetchone()["cnt"]
-                # Count linked CoC accounts (small table — avoids a 22 M-row
-                # UNION deduplication scan across war_attacks that made /status
-                # take many seconds on HDD).
-                players_count = conn.execute(
-                    "SELECT COUNT(*) AS cnt FROM user_players"
-                ).fetchone()["cnt"]
-                # Count all unique players ever seen in wars (player_name_index).
-                players_tracked_count = conn.execute(
-                    "SELECT COUNT(*) AS cnt FROM player_name_index"
-                ).fetchone()["cnt"]
 
+        def _q_players_count() -> int:
+            # Linked CoC accounts (small table — avoids a 22 M-row UNION dedup
+            # scan across war_attacks that made /status take many seconds on HDD).
+            with self._sync_conn() as conn:
+                return conn.execute("SELECT COUNT(*) AS cnt FROM user_players").fetchone()["cnt"]
+
+        def _q_players_tracked_count() -> int:
+            # All unique players ever seen in wars.
+            with self._sync_conn() as conn:
+                return conn.execute("SELECT COUNT(*) AS cnt FROM player_name_index").fetchone()["cnt"]
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5, thread_name_prefix="dbstats") as pool:
+                fut_clans = pool.submit(_q_clans_count)
+                fut_wars = pool.submit(_q_wars_count)
+                fut_attacks = pool.submit(_q_attacks_count)
+                fut_players = pool.submit(_q_players_count)
+                fut_tracked = pool.submit(_q_players_tracked_count)
                 stats = {
-                    'clans_count': clans_count,
-                    'wars_count': wars_count,
-                    'attacks_count': attacks_count,
-                    'players_count': players_count,
-                    'players_tracked_count': players_tracked_count,
+                    'clans_count': fut_clans.result(),
+                    'wars_count': fut_wars.result(),
+                    'attacks_count': fut_attacks.result(),
+                    'players_count': fut_players.result(),
+                    'players_tracked_count': fut_tracked.result(),
                 }
-                self._global_stats_cache = stats
-                self._global_stats_cache_ts = time.monotonic()
-                return dict(stats)
+
+            self._global_stats_cache = stats
+            self._global_stats_cache_ts = time.monotonic()
+
+            # Persist the exact snapshot (best-effort — a failed persist just means the next
+            # restart falls back to a cold recompute, not a correctness problem now).
+            try:
+                with self._sync_conn() as conn:
+                    with self._sync_write_lock:
+                        conn.execute(
+                            "INSERT INTO bot_metadata (key, value) VALUES (?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (
+                                self._GLOBAL_STATS_METADATA_KEY,
+                                json.dumps({**stats, 'computed_at_utc': datetime.now(timezone.utc).isoformat()}),
+                            ),
+                        )
+                        if self._should_commit():
+                            conn.commit()
+            except sqlite3.Error as _persist_exc:
+                logging.warning(f"[DB-STATS-SYNC] Failed to persist global-stats snapshot: {_persist_exc}")
+
+            return dict(stats)
         except sqlite3.Error as e:
             logging.error(f"[DB-STATS-SYNC] Failed to get global db statistics: {e}")
             return {'clans_count': 0, 'wars_count': 0, 'attacks_count': 0, 'players_count': 0, 'players_tracked_count': 0}
+
+    async def preload_global_db_statistics_from_snapshot(self) -> bool:
+        """Restore the in-memory global-DB-statistics cache from the last exact snapshot
+        persisted to bot_metadata by get_global_db_statistics_sync(), so a fresh restart can
+        serve /status instantly instead of re-running the multi-GB full-table scan cold.
+
+        The persisted 'computed_at_utc' wall-clock timestamp (not a monotonic one — those reset
+        every process restart and would be meaningless here) is converted back into an
+        equivalent self._global_stats_cache_ts, so the existing _GLOBAL_STATS_TTL check in
+        get_global_db_statistics_sync() still applies correctly across the restart: a snapshot
+        that's already past its 25h TTL by the time this loads still gets restored (better than
+        showing nothing), but the very next force_refresh=False call will see it as expired and
+        trigger a real recompute, same as if the process had never restarted at all.
+
+        Returns True if a usable snapshot was found and loaded, False if this is a brand-new DB
+        with no snapshot yet or the persisted value is unparseable (caller should fall back to
+        get_global_db_statistics_sync() for a legitimate first value).
+        """
+        import json
+        import time
+        from datetime import datetime, timezone
+
+        raw = await self.get_bot_metadata(self._GLOBAL_STATS_METADATA_KEY)
+        if not raw:
+            return False
+        try:
+            payload = json.loads(raw)
+            self._global_stats_cache = {
+                'clans_count': payload['clans_count'],
+                'wars_count': payload['wars_count'],
+                'attacks_count': payload['attacks_count'],
+                'players_count': payload['players_count'],
+                'players_tracked_count': payload['players_tracked_count'],
+            }
+            computed_at = datetime.fromisoformat(payload['computed_at_utc'])
+            age_seconds = max((datetime.now(timezone.utc) - computed_at).total_seconds(), 0.0)
+            self._global_stats_cache_ts = time.monotonic() - age_seconds
+            return True
+        except (ValueError, KeyError, TypeError) as e:
+            logging.warning(f"[DB-STATS-SYNC] Failed to parse persisted global-stats snapshot: {e}")
+            return False
 
     # ==================== Maindata DB Access Methods ====================
     

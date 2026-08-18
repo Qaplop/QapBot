@@ -1,6 +1,53 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-18 (61)
+- Fixed: `get_global_db_statistics_sync()`'s ~20s cold scan (the `/status` global-stats query) —
+  diagnosed live on PROD's `qapbot_PROD.log` after deploying (59): the fire-and-forget startup
+  warm-up (`QapBot._warm_global_db_stats_cache()`, spawned via `QBcore.spawn_tracked` right as
+  the first update cycle begins) shared `db_manager`'s 8-connection sync pool with that cycle's
+  Phase-1 clan fetches, and the leftover multi-second stalls in the first cycle after a restart
+  (14.5s, 11.2s×2, 6.1s, 6.1s, 6.0s, 5.7s, 5.5s — all clustered right on top of the
+  `[DB-STATS-WARM] ... warmed in 20.4s` line) traced back to this, not to (59)'s change. Two
+  independent fixes, both in `db_manager.py`'s `get_global_db_statistics_sync()`:
+  - **Parallelized the 5 sub-queries**: they're independent reads against independent tables, so
+    they now run concurrently (one `_sync_conn()` connection each, via a local
+    `concurrent.futures.ThreadPoolExecutor(max_workers=5)`) instead of sequentially on one
+    connection — cuts wall time to roughly the single slowest query instead of the sum of all
+    five, with zero behavior/accuracy change.
+  - **Persisted the exact result to `bot_metadata`** (new key
+    `DatabaseManager._GLOBAL_STATS_METADATA_KEY`, JSON with a wall-clock `computed_at_utc`) every
+    time an exact computation completes. New async method
+    `preload_global_db_statistics_from_snapshot()` restores that snapshot into the in-memory
+    `_global_stats_cache` at startup — converting the persisted wall-clock age back into an
+    equivalent `_global_stats_cache_ts` so the existing `_GLOBAL_STATS_TTL` (25h) check still
+    expires it at the correct time across a restart, same as if the process had never stopped.
+  - `QapBot.py`'s `_warm_global_db_stats_cache()`: the plain startup call (`force_refresh=False`)
+    now tries the snapshot restore first (a single tiny row read, effectively instant) and only
+    falls through to the real scan if no snapshot exists yet (a brand-new DB's very first-ever
+    startup). The nightly-maintenance call (`force_refresh=True`, after REINDEX/VACUUM/ANALYZE)
+    is unchanged in behavior — always does the real (now-parallelized) scan and refreshes the
+    persisted snapshot for the next restart. `/status`'s manual force-refresh option goes through
+    the same `force_refresh=True` path and benefits identically.
+  - Explicitly did NOT use SQLite's `sqlite_stat1` approximate-count tables (populated by the
+    nightly `ANALYZE`, itself already capped to a 1000-row sample via `PRAGMA analysis_limit`) —
+    an earlier option floated for this fix. Would have made the warm-up cost effectively zero,
+    but only by trading exact `/status` numbers for approximate ones, with real format-parsing
+    risk (distinct-count estimation from `sqlite_stat1`'s stat string is index-shape-dependent
+    and untested against the live schema). The persisted-exact-snapshot approach gets the same
+    "instant at startup" outcome with no accuracy tradeoff and no new fragile parsing logic, so
+    it was chosen instead.
+  - Tests: 11 new (`tests/unit/test_db_global_statistics.py`) against a real `WarHistoryDB.
+    initialize()`-backed temp-file DB (both the sync pool and the async `bot_metadata` path need
+    to be real for this) — exact count computation across main+history schemas, cache-hit vs
+    force_refresh behavior, snapshot persistence shape, snapshot restore (including an
+    already-stale-by-10h snapshot correctly restoring as 10h-aged rather than fresh), and
+    unparseable/incomplete snapshot handling. 2068 tests pass.
+  - Docs: `qapbot/docs/CODE_STRUCTURE.md` and `qapbot/docs/DATABASE_ARCHITECTURE.md` updated
+    (the latter also had a stale "5-minute TTL" mention left over from before the 2026-08-03
+    TTL raise to 25h — corrected while touching the same paragraph).
+  - Needs a bot restart on DEV/PROD to take effect.
+
 2026-08-18 (60)
 - Added: "Unlink Player" button in `/clan management` (registrations mode), letting clan
   leads/guild admins unlink a linked player from its Discord account without going through
