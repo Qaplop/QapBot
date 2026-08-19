@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CWL Pool Verification</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #F2F4F6;
+    --surface: #FFFFFF;
+    --surface-2: #E8EBEE;
+    --border: #DCE1E6;
+    --text: #1B2129;
+    --text-muted: #5B6672;
+    --accent: #B8811F;
+    --accent-strong: #96690F;
+    --accent-wash: #F6ECD8;
+    --pass: #2F8C6C;
+    --pass-wash: #E3F1EB;
+    --warn: #C05B26;
+    --warn-wash: #FBEBE0;
+    --danger: #B23A36;
+    --font-display: 'IBM Plex Sans', -apple-system, 'Segoe UI', sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, 'Cascadia Code', monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12161B;
+      --surface: #1B2129;
+      --surface-2: #232B34;
+      --border: #2E3944;
+      --text: #E8ECEF;
+      --text-muted: #8B96A3;
+      --accent: #D9A441;
+      --accent-strong: #F0BC5E;
+      --accent-wash: #35301E;
+      --pass: #4FAE8C;
+      --pass-wash: #1C2E28;
+      --warn: #E0763F;
+      --warn-wash: #332318;
+      --danger: #E06661;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12161B;
+    --surface: #1B2129;
+    --surface-2: #232B34;
+    --border: #2E3944;
+    --text: #E8ECEF;
+    --text-muted: #8B96A3;
+    --accent: #D9A441;
+    --accent-strong: #F0BC5E;
+    --accent-wash: #35301E;
+    --pass: #4FAE8C;
+    --pass-wash: #1C2E28;
+    --warn: #E0763F;
+    --warn-wash: #332318;
+    --danger: #E06661;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-display);
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent-wash); }
+
+  a { color: var(--accent-strong); }
+
+  .shell { max-width: 760px; margin: 0 auto; padding: 0 20px 96px; }
+
+  /* ---------- Sticky header / progress ---------- */
+  header.top {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  .top-inner { max-width: 760px; margin: 0 auto; padding: 18px 20px 14px; }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--accent-strong);
+    margin: 0 0 6px;
+  }
+  h1 {
+    font-size: 22px;
+    font-weight: 700;
+    margin: 0 0 4px;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+  .dek {
+    color: var(--text-muted);
+    font-size: 13.5px;
+    margin: 0 0 14px;
+    max-width: 60ch;
+  }
+
+  .progress-row { display: flex; align-items: center; gap: 12px; }
+  .progress-track {
+    flex: 1;
+    height: 8px;
+    border-radius: 5px;
+    background: var(--surface-2);
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .progress-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--accent), var(--accent-strong));
+    transition: width 240ms ease;
+  }
+  .progress-count {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 12.5px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    min-width: 5.5em;
+    text-align: right;
+  }
+  .reset-btn {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-muted);
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 9px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .reset-btn:hover { border-color: var(--warn); color: var(--warn); }
+  .io-status {
+    display: block;
+    margin-top: 6px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-muted);
+    min-height: 1.4em;
+  }
+  .io-status.error { color: var(--warn); }
+  .reset-btn:focus-visible, a:focus-visible, input:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent-strong);
+    outline-offset: 2px;
+  }
+
+  /* ---------- Prereqs ---------- */
+  .prereqs {
+    margin-top: 22px;
+    background: var(--warn-wash);
+    border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .prereqs h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--warn);
+    margin: 0 0 10px;
+    font-family: var(--font-mono);
+  }
+  .prereqs ul { margin: 0; padding-left: 1.1em; }
+  .prereqs li { margin-bottom: 6px; }
+  .prereqs li:last-child { margin-bottom: 0; }
+  .prereqs code, .checklist code, .callout code {
+    font-family: var(--font-mono);
+    font-size: 0.92em;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.05em 0.35em;
+  }
+
+  /* ---------- Sections ---------- */
+  section.phase {
+    margin-top: 30px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .phase-head {
+    padding: 18px 20px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .phase-num {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: var(--accent-strong);
+    text-transform: uppercase;
+  }
+  .phase-title { font-size: 17px; font-weight: 700; margin: 3px 0 6px; }
+  .phase-desc { color: var(--text-muted); font-size: 13.5px; margin: 0; }
+  .phase-sub-count {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-muted);
+    float: right;
+    font-weight: 500;
+  }
+
+  .callout {
+    margin: 14px 20px 0;
+    padding: 10px 13px;
+    border-radius: 8px;
+    font-size: 13px;
+    background: var(--surface-2);
+    border-left: 3px solid var(--text-muted);
+    color: var(--text-muted);
+  }
+  .callout.setup { border-left-color: var(--accent); background: var(--accent-wash); color: var(--text); }
+  .callout.restart { border-left-color: var(--warn); background: var(--warn-wash); color: var(--text); }
+  .callout strong { color: var(--text); }
+
+  ol.checklist { list-style: none; margin: 0; padding: 6px 8px 10px; counter-reset: step; }
+  .step {
+    display: grid;
+    grid-template-columns: 22px 1fr;
+    gap: 10px;
+    padding: 11px 12px;
+    border-radius: 8px;
+    align-items: start;
+  }
+  .step:hover { background: var(--surface-2); }
+  .step input[type="checkbox"] {
+    appearance: none;
+    width: 19px;
+    height: 19px;
+    margin-top: 1px;
+    border-radius: 5px;
+    border: 1.5px solid var(--border);
+    background: var(--surface);
+    cursor: pointer;
+    position: relative;
+    flex-shrink: 0;
+  }
+  .step input[type="checkbox"]:checked {
+    background: var(--pass);
+    border-color: var(--pass);
+  }
+  .step input[type="checkbox"]:checked::after {
+    content: "";
+    position: absolute;
+    left: 5px; top: 1px;
+    width: 5px; height: 10px;
+    border: solid white;
+    border-width: 0 2px 2px 0;
+    transform: rotate(40deg);
+  }
+  .step-text { font-size: 14px; }
+  .step-text.done { color: var(--text-muted); text-decoration: line-through; text-decoration-color: var(--border); }
+  .expect {
+    display: block;
+    margin-top: 5px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--pass);
+    line-height: 1.5;
+  }
+  .expect::before { content: "→ "; opacity: 0.7; }
+  .bug-note {
+    display: block;
+    margin-top: 5px;
+    font-size: 12.5px;
+    color: var(--warn);
+  }
+  .bug-note::before { content: "⚑ "; }
+
+  footer {
+    margin-top: 34px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 12.5px;
+    font-family: var(--font-mono);
+  }
+
+  @media (max-width: 480px) {
+    h1 { font-size: 19px; }
+    .step { grid-template-columns: 20px 1fr; padding: 10px 8px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="top-inner">
+    <p class="eyebrow">Manual QA · CWL Enrollment Redesign</p>
+    <h1>CWL Player Pool Verification</h1>
+    <p class="dek">Every rule (a–h), every live-DEV bug fix from this session — one pass, in dependency order. Check items off as you go; your progress is saved in this browser. Use Save/Load to back it up to a file — the browser's own storage can be lost if you move this file, switch profiles, or clear site data. The first Save Progress asks you to pick a folder (e.g. this checklist's own tests/ dir); every save and load after that reads/writes straight there with no dialog — use Change Save Folder… to pick somewhere else.</p>
+    <div class="progress-row">
+      <div class="progress-track"><div class="progress-fill" id="fill"></div></div>
+      <span class="progress-count" id="count">0 / 0</span>
+      <button class="reset-btn" id="save-progress">Save Progress…</button>
+      <button class="reset-btn" id="change-save-folder" title="Pick a different folder for Save Progress">Change Save Folder…</button>
+      <button class="reset-btn" id="load-progress">Load Progress…</button>
+      <input type="file" id="load-progress-file" accept="application/json" style="display:none">
+      <button class="reset-btn" id="reset">Reset</button>
+    </div>
+    <span class="io-status" id="io-status"></span>
+  </div>
+</header>
+
+<div class="shell">
+
+  <div class="prereqs">
+    <h2>Before you start</h2>
+    <ul>
+      <li><strong>Restart the DEV bot process.</strong> Sections 1, 2, 4, 5, and three of the fixes in Section 6 (shared-clan Remove, unchecked-clan seeding, ownership message) are Python backend changes — they silently keep running the <em>old</em> code until the process restarts. The frontend/Worker fixes (paste handling, button alignment, the proxy routes) are already live on DEV and need no restart.</li>
+      <li><strong>Two test guilds that share at least one real clan</strong> — needed for Section 4 and 6D. <code>The QCrew</code> + <code>CoC | Stay</code> worked for this during development.</li>
+      <li><strong>One test guild with a multi-clan family</strong>, and a linked test account with players spread across more than one of those clans (some in a clan currently marked participating, some not) — needed for Section 1. This is the exact shape of the original bug report.</li>
+      <li><strong>A guest-clan candidate with no real linked Leader/Co-Leader in either guild</strong> (<code>!!AKATSUKI!!</code> worked for this) — needed for 6D's "unresolved owner" case.</li>
+    </ul>
+  </div>
+
+  <!-- SECTION 1 -->
+  <section class="phase" data-phase="1">
+    <div class="phase-head">
+      <span class="phase-sub-count" data-sub></span>
+      <p class="phase-num">Section 1 · Root-Cause Fix</p>
+      <h2 class="phase-title">Family-wide player pool (Rule b)</h2>
+      <p class="phase-desc">The bug that started this whole redesign: a member with accounts in several family clans only got DMed for the ones in a clan someone remembered to check.</p>
+    </div>
+    <div class="callout setup"><strong>Setup:</strong> in <em>Configure Participating Clans</em>, leave at least one family clan unchecked, and confirm your test account has a linked player in that unchecked clan <em>and</em> in a checked one.</div>
+    <ol class="checklist">
+      <li class="step"><input type="checkbox" data-id="s1-1"><span class="step-text">Click <strong>Start Enrollment</strong> for the season.<span class="expect">Summary's "Seeded" count includes the unchecked clan's current members, not just the checked clan's.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s1-2"><span class="step-text">Check the test account's DMs.<span class="expect">One enrollment DM per linked player — including the one in the unchecked clan.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s1-3"><span class="step-text">Open <strong>Manage Enrollment</strong>.<span class="expect">The unchecked clan's members appear under Unassigned (there's no column for a non-participating clan) — not missing entirely.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s1-4"><span class="step-text">Confirm a player from a genuinely unrelated clan (not in this guild's family at all) still does <em>not</em> appear anywhere.<span class="expect">Pool is family-wide, not "everyone the bot has ever seen."</span></span></li>
+    </ol>
+  </section>
+
+  <!-- SECTION 2 -->
+  <section class="phase" data-phase="2">
+    <div class="phase-head">
+      <span class="phase-sub-count" data-sub></span>
+      <p class="phase-num">Section 2 · Reliability</p>
+      <h2 class="phase-title">DM retry and failure reporting</h2>
+      <p class="phase-desc">A Discord error for one recipient must never silently kill the rest of the batch, and the admin should always learn who wasn't reached.</p>
+    </div>
+    <ol class="checklist">
+      <li class="step"><input type="checkbox" data-id="s2-1"><span class="step-text">Run Start Enrollment against a normal-sized pool.<span class="expect">Every DM-able recipient gets contacted; the summary's "Contacted" count matches.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s2-2"><span class="step-text">Pick one test account, disable "Allow DMs from server members" for this server (or block the bot), then run Start Enrollment again with them in the pool.<span class="expect">Summary lists that account under a "Blocked" line by name — <em>and everyone else in the pool still got contacted normally.</em></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s2-3"><span class="step-text">Re-enable "Allow DMs from server members" (or unblock the bot) for that account.<span class="expect">Nothing to see yet — just clears the way for the next step.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s2-4"><span class="step-text">Click <strong>Notify New Pool Members</strong> (Hub message or <code>/clan management</code>).<span class="expect">That account now receives a fresh Confirm/Opt Out DM — a blocked recipient is never marked as already-DMed internally, specifically so re-enabling DMs and retrying via this button reaches them (project owner's spec, 2026-08-19). Nobody who was already successfully contacted gets a duplicate DM.</span></span></li>
+    </ol>
+  </section>
+
+  <!-- SECTION 3 -->
+  <section class="phase" data-phase="3">
+    <div class="phase-head">
+      <span class="phase-sub-count" data-sub></span>
+      <p class="phase-num">Section 3 · Rules c–g</p>
+      <h2 class="phase-title">Guest clan &amp; guest player management</h2>
+      <p class="phase-desc">The whole "Configure Participating Clans" Guests panel — invite, uncheck, remove, and the new player-level removal list.</p>
+    </div>
+    <ol class="checklist">
+      <li class="step"><input type="checkbox" data-id="s3-1"><span class="step-text">Open the Guests search row.<span class="expect">The old "Send enrollment DM immediately" checkbox is gone entirely — just the search box.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-2"><span class="step-text">Search for an individual guest player and click Add.<span class="expect">Status reads "Added … to the enrollment pool." No DM goes out yet — confirm nothing arrives in that account's DMs.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-3"><span class="step-text">Open Manage Enrollment.<span class="expect">That guest player shows up, guest-badged, status pending — present in the pool despite never having been DMed.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-4"><span class="step-text">Search for a guest <em>clan</em> and click Add — <strong>before</strong> clicking Save.<span class="expect">A <strong>Remove</strong> button appears next to it in the table immediately, not only after Save+reopen.<span class="bug-note">2026-08-19: previously the button was missing entirely until the page was saved and reopened.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-4b"><span class="step-text">Click that Remove button (still unsaved) and confirm.<span class="expect">The row disappears immediately, no error — it's removed locally without a failed network call, since nothing was ever persisted for it.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-4c"><span class="step-text">Search for the same guest clan again, Add it, then <strong>Save</strong> this time.<span class="expect">It lands in the clan table, checked by default, with its own column once enrollment runs/refreshes — and the Remove button is still there after the save/reopen, same as before.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-4d"><span class="step-text">On a <strong>brand-new</strong> season, add a cross-guild-shared guest clan (e.g. StayCalm) <em>before</em> clicking Start Enrollment, then Start Enrollment. Open Manage Teams.<span class="expect">Your own real family-clan members (e.g. TheQCrew's players) land in <strong>their own</strong> clan's column — never in the guest clan's column, even if their historical CWL-attack data happens to be recorded under the guest clan's tag.<span class="bug-note">2026-08-19: this was the actual root cause — "when staycalm gets added during the very start of adding the new season the theqcrew members get auto assigned to staycalm and not to the qcrew as they should." Compare against starting the exact same season <em>without</em> the guest clan present — family members should auto-assign correctly either way.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-4e"><span class="step-text">Repeat s3-4d a second time after a full delete-season / re-create cycle with the guest clan present each time (so stale shared-roster entries from the previous cycle exist).<span class="expect">Family-clan members <em>still</em> land in their own clan's column — a leftover placement from the earlier cycle must not drag them back into the guest clan.<span class="bug-note">2026-08-19: this second pass is what the first fix attempt missed — the bug spanned two layers, and only reproduced once a stale (non-deliberate) shared-roster row from a previous cycle was present. If you drag a player into the guest clan <em>deliberately</em>, though, that placement must still survive (see s3-7b) — this only overrides automatic leftovers.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-4f"><span class="step-text">Add a guest clan that is <strong>completely foreign to this bot</strong> — one that is <em>not</em> a member clan of any guild the bot serves and has no channel subscription (e.g. Hohenloher Land, as opposed to StayCalm which another guild already tracks). Save, then open Manage Enrollment.<span class="expect">Its real current members appear in the pool (Unassigned/pending, with correct names and TH levels) — exactly like a guest clan the bot already happens to track.<span class="bug-note">2026-08-19: this was broken for <em>every</em> genuinely-foreign guest clan and had never been caught, because every guest clan used in testing until now was some other guild's own member clan and so was already being tracked for unrelated reasons. Do this test with a clan nobody on the bot subscribes to, or it proves nothing.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-4g"><span class="step-text">Repeat s3-4f both ways round: once adding the foreign guest clan <em>before</em> Start Enrollment, once adding it <em>after</em> enrollment is already open.<span class="expect">Members show up in the pool in both cases — these are two separate code paths and both had the same gap.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-4h"><span class="step-text">On the <strong>foreign</strong> guest clan from s3-4f/s3-4g (one no other guild tracks), after its members have been seeded, <strong>uncheck</strong> it (leave it on the roster, don't Remove), Save, then open Manage Teams.<span class="expect">Its members fall back to <strong>Unassigned</strong> — not into an "Assigned to other Guild" column. No other guild is involved, so that label would be wrong.<span class="bug-note">2026-08-19: this showed 41 members under "Assigned to other Guild" for Hohenloher Land, a clan tracked by no other guild at all.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-4i"><span class="step-text"><strong>Re-check</strong> that same clan and Save.<span class="expect">The same members reappear in its own column, in the same assignments as before — confirming the uncheck in s3-4h was purely cosmetic and didn't lose the assignment data.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-5"><span class="step-text"><strong>Uncheck</strong> a <em>plain</em> (never cross-guild-shared) guest clan that already has real signed-up members, then Save.<span class="expect">The clan drops off the active roster/column, but its members are still sitting in Manage Enrollment afterward — not purged. (This is the opposite of the old behavior.)</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-5b"><span class="step-text">Repeat the same uncheck+Save on a clan that <em>is</em> genuinely cross-guild shared (shows a "Managed by another guild" badge) with real signed-up members.<span class="expect">Same result — members still sitting in Manage Enrollment afterward, not purged.<span class="bug-note">2026-08-19: this exact case was still broken after the plain-clan fix above shipped — "Members vanished from player pool after uncheck for StayCalm." Verify it specifically, it's the freshest fix.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-6"><span class="step-text">Click <strong>Remove</strong> on that same (unchecked, non-shared) guest clan, confirm via the inline Yes/Cancel.<span class="expect">Row disappears from the table entirely, and <em>now</em> its members disappear from Manage Enrollment too.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-7"><span class="step-text">Repeat Remove on a guest clan that <em>is</em> cross-guild shared with another guild.<span class="expect">Same result — members purged from your local pool this time too.<span class="bug-note">Previously this silently left members behind for shared clans — verify this specific case, it's the freshest fix.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-7b"><span class="step-text">On a cross-guild-shared guest clan's column in Manage Teams, drag-and-drop a player who is <strong>NOT</strong> a real/current member of that shared clan (e.g. one of TheQCrew's own family members, or an individually-invited guest) <em>into</em> that shared clan's column (a deliberate placement), then go back and click <strong>Remove</strong> on that shared clan (confirm).<span class="expect">Every OTHER member of that clan is purged as normal, but the one you deliberately drag-assigned still shows up afterward — in an "Assigned to other Guild" column (or similar), not vanished — even though the whole clan was just removed.<span class="bug-note">2026-08-19: a deliberate placement used to get silently deleted by Remove the instant after being preserved — verify it now survives Remove, not just a plain Uncheck (rule: "assigned players remain in their rosters... becomes a guest player automatically" even when the clan is removed). Important: the player must genuinely belong to THIS guild's own pool (family member or individually-invited guest) and NOT be a real member of the shared clan itself — see s3-7g for that other case, which must NOT survive.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-7c"><span class="step-text">After Removing a cross-guild-shared guest clan (the step above or a fresh one), open <strong>Remove Guest Players…</strong> and check the list carefully.<span class="expect">No former member of the just-removed shared clan lingers there as an unexplained "individually removable" guest — only genuinely individually-invited players (and orphans from a <em>plain</em>, never-shared guest clan, per s3-6) should ever appear.<span class="bug-note">2026-08-19: a shared clan's roster member who'd since left that clan in real life could get stuck exactly like this forever — verify a fresh Remove no longer leaves anyone behind.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-7d"><span class="step-text">After Removing a shared guest clan, open Manage Teams and check the <strong>"Assigned to other Guild"</strong> column.<span class="expect">It's empty, or only contains players you deliberately drag-assigned there yourself (per s3-7b) — no real family-clan member (e.g. a genuine current TheQCrew player) should ever show up there. If one does, they belong in Unassigned instead.<span class="bug-note">2026-08-19: a real family-clan member whose prior-CWL-history auto-assignment had pointed at the removed guest clan used to get stuck here forever ("the qcrew members were falsely auto-assigned to staycalm... after removing staycalm the error becomes obvious").</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-7e"><span class="step-text">On a plain (never cross-guild-shared) guest clan, drag-and-drop a real member <em>into that same clan's own column</em> (a deliberate placement pointing AT the clan itself, not elsewhere), then click <strong>Remove</strong> on that clan.<span class="expect">That player is purged along with everyone else — they do <strong>not</strong> show up in "Assigned to other Guild" and do <strong>not</strong> linger in Remove Guest Players. There is no other guild involved for a plain clan, so there's nothing to preserve.<span class="bug-note">2026-08-19: a manually drag-assigned member of a NEVER-shared guest clan (Hohenloher Land, player Akaza) stayed behind after Remove — the deliberate-placement preservation rule wrongly applied even though no other guild was involved. Contrast with s3-7b, which is the genuinely-shared case where preservation IS correct.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-7f"><span class="step-text">Hover the headline of the <strong>"Assigned to other Guild"</strong> column (when it's showing at least one player, e.g. from s3-7b).<span class="expect">A tooltip appears explaining that these players have a real placement in another guild's clan and that dragging one elsewhere evicts them from that other guild's roster too.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-7g"><span class="step-text">On a cross-guild-shared guest clan's column, drag-and-drop a <strong>real, current member of that same clan</strong> into <em>its own</em> column (a deliberate self-assignment, not a cross-assignment), then click <strong>Remove</strong> on that clan.<span class="expect">That player is purged along with everyone else — they do <strong>not</strong> show up in "Assigned to other Guild" and do <strong>not</strong> linger in Remove Guest Players.<span class="bug-note">2026-08-19: "STY - Basement," a real StayCalm member manually assigned into StayCalm's own column, stayed behind after Remove — the shared-clan preservation rule wrongly applied even though this player was never "one of our own guild's members assigned to another guild's roster," just a foreign player whose guest invitation ended. Contrast with s3-7b (the genuinely-preserved case) and s3-7e (the same bug's plain-clan sibling, Akaza/Hohenloher Land).</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-7h"><span class="step-text">Repeat s3-7g but stop after the self-assignment and just <strong>Uncheck</strong> the shared clan (Save) — do <em>not</em> click Remove.<span class="expect">Even on a mere Uncheck, that same real member does <strong>not</strong> show up in "Assigned to other Guild" — Uncheck is cosmetic, but it shouldn't fabricate a placement that was never real.<span class="bug-note">2026-08-19: this was a DEEPER instance of the s3-7g bug — the local mirror that "Assigned to other Guild" is built from gets written by the Uncheck path itself, before Remove's own cleanup ever runs, so fixing only the Remove-side cleanup left this exact case broken on a plain Uncheck.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-8"><span class="step-text">Add a brand-new guest clan, leave it <strong>unchecked</strong>, Save (enrollment already open).<span class="expect">Its current members appear in Manage Enrollment as Unassigned/pending — seeded despite never being checked.<span class="bug-note">Also freshly fixed — this is the AKATSUKI scenario.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-9"><span class="step-text">Click <strong>Remove Guest Players…</strong> with no guest players present.<span class="expect">A clear "No guest players in the pool right now" message — not a blank panel, not an error.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s3-10"><span class="step-text">With one or more guest players present, open the panel, select some, click Remove Selected.<span class="expect">They vanish from both the panel and Manage Enrollment.</span></span></li>
+    </ol>
+  </section>
+
+  <!-- SECTION 4 -->
+  <section class="phase" data-phase="4">
+    <div class="phase-head">
+      <span class="phase-sub-count" data-sub></span>
+      <p class="phase-num">Section 4 · Rule h</p>
+      <h2 class="phase-title">Cross-guild dedup &amp; response propagation</h2>
+      <p class="phase-desc">One DM per player per season, globally — and a response given to one guild shows up on every guild's board automatically.</p>
+    </div>
+    <div class="callout setup"><strong>Setup:</strong> needs the two-guild shared clan from the prerequisites, both pooling the same real player for the same season.</div>
+    <ol class="checklist">
+      <li class="step"><input type="checkbox" data-id="s4-1"><span class="step-text">Run Start Enrollment in Guild A first.<span class="expect">The shared player gets one DM, sent via Guild A.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s4-2"><span class="step-text">Now pool the same player in Guild B (add/Start Enrollment there) for the same season.<span class="expect">No second DM arrives. Guild B's board already shows their real current status (pending/whatever it is), not a blank slot.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s4-3"><span class="step-text">As the test player, click Confirm (or Decline) on the DM from Guild A.<span class="expect">Both Guild A's <em>and</em> Guild B's Manage Enrollment boards show the new status — with zero action taken in Guild B.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s4-5"><span class="step-text">Add a fresh guest player/clan to an already-open event so someone in the pool hasn't been DMed yet.<span class="expect">A <strong>Notify New Pool Members</strong> button appears — both on the CWL Management Hub message and in <code>/clan management</code>. It's <strong>green</strong> and sits <em>below</em> the main Configure/Manage Teams/Delete Season button row, not above the season-select dropdown.<span class="bug-note">2026-08-19: was grey and positioned above the dropdown before this fix.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s4-6"><span class="step-text">Click it.<span class="expect">Only the not-yet-contacted player(s) get DMed — nobody already-confirmed gets a repeat. Once everyone's been reached, the button stops appearing on refresh.</span></span></li>
+    </ol>
+  </section>
+
+  <!-- SECTION 5 -->
+  <section class="phase" data-phase="5">
+    <div class="phase-head">
+      <span class="phase-sub-count" data-sub></span>
+      <p class="phase-num">Section 5 · UI polish</p>
+      <h2 class="phase-title">Frontend fixes found live in DEV</h2>
+      <p class="phase-desc">No bot restart needed for any of these — already live on the deployed Worker/Pages build.</p>
+    </div>
+    <ol class="checklist">
+      <li class="step"><input type="checkbox" data-id="s5-1"><span class="step-text">Open Remove Guest Players, and separately click Remove on a guest clan.<span class="expect">No <code>404 not found</code> error toast anywhere in either flow.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s5-2"><span class="step-text">Click into the Guests search box and paste (Ctrl/Cmd+V) a name or tag from your clipboard.<span class="expect">Results appear normally.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s5-3"><span class="step-text">Clear the field and paste a second time.<span class="expect">Still works — no need to close and reopen the view to "unstick" it.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s5-4"><span class="step-text">Look at any guest clan row's checkbox and Remove button.<span class="expect">Sitting on one line, vertically centered against each other — not stacked or offset.</span></span></li>
+    </ol>
+  </section>
+
+  <!-- SECTION 6 -->
+  <section class="phase" data-phase="6">
+    <div class="phase-head">
+      <span class="phase-sub-count" data-sub></span>
+      <p class="phase-num">Section 6 · Ownership messaging</p>
+      <h2 class="phase-title">Shared-clan ownership notice</h2>
+      <p class="phase-desc">The Hub notification for a newly-shared clan must never claim a resolved owner it doesn't actually have.</p>
+    </div>
+    <ol class="checklist">
+      <li class="step"><input type="checkbox" data-id="s6-1"><span class="step-text">Invite <code>!!AKATSUKI!!</code> (or another clan with no linked, present Leader/Co-Leader in either guild) as a guest clan in one of your two shared-test guilds, and Save.<span class="expect">The "Shared CWL Clan" notice says ownership is <strong>unresolved</strong> — it does not claim "recognized owner (real in-game Leader/Co-Leader)" for anyone.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s6-2"><span class="step-text">Repeat with a clan that <em>does</em> have a real, linked, verified Leader or Co-Leader present in one of the guilds.<span class="expect">The notice correctly names that guild as the recognized owner.</span></span></li>
+    </ol>
+  </section>
+
+  <!-- SECTION 7 -->
+  <section class="phase" data-phase="7">
+    <div class="phase-head">
+      <span class="phase-sub-count" data-sub></span>
+      <p class="phase-num">Section 7 · Sanity check</p>
+      <h2 class="phase-title">Ordinary flow, unaffected</h2>
+      <p class="phase-desc">None of the above should have disturbed the plain, no-guests-involved path.</p>
+    </div>
+    <ol class="checklist">
+      <li class="step"><input type="checkbox" data-id="s7-1"><span class="step-text">Add New Season → Configure Participating Clans (family clans only, all checked) → Start Enrollment → confirm a DM → Manage Enrollment board → Finalize.<span class="expect">Every step behaves exactly as it did before this session's changes.</span></span></li>
+    </ol>
+  </section>
+
+  <!-- SECTION 8 -->
+  <section class="phase" data-phase="8">
+    <div class="phase-head">
+      <span class="phase-sub-count" data-sub></span>
+      <p class="phase-num">Section 8 · New feature</p>
+      <h2 class="phase-title">Guest-player provenance (right-click removal)</h2>
+      <p class="phase-desc">A guest player added because their whole clan was invited can only be removed by removing that clan — never individually, from either the board's context menu or the Remove Guest Players panel.</p>
+    </div>
+    <div class="callout setup"><strong>Setup:</strong> one participating family clan, one guest clan with a couple of real current members, and one player individually invited as a guest via search (not a member of the guest clan).</div>
+    <ol class="checklist">
+      <li class="step"><input type="checkbox" data-id="s8-1"><span class="step-text">On Manage Enrollment, right-click the card of the individually-invited guest player.<span class="expect">A small context menu appears with a single "Remove guest player" option.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s8-2"><span class="step-text">Click it.<span class="expect">The player disappears from the board shortly after (footer status briefly shows "Removed"). No page reload needed.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s8-3"><span class="step-text">Right-click the card of one of the guest CLAN's real members (guest-badged, same as any other guest).<span class="expect">Same context menu appears — it looks identical, there's no visual difference between the two kinds of guest.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s8-4"><span class="step-text">Click "Remove guest player" on that clan member.<span class="expect">An inline error in the footer explains they were added by the guest clan and only removing the whole clan removes them — the card stays put, nothing is deleted.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s8-5"><span class="step-text">Click elsewhere on the page (or press Escape) while the context menu is open, without choosing an option.<span class="expect">The menu closes with no action taken.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s8-6"><span class="step-text">Open Configure Participating Clans → Remove Guest Players….<span class="expect">Only the individually-invited guest player(s) are listed — the guest clan's real members do NOT appear in this list at all, even though they're guest-badged on the board.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s8-7"><span class="step-text">In the Guests search box, search for and try to Add a player who is already a current member of the guest clan you invited.<span class="expect">A clear error explains they're already in the pool via that guest clan and can't be added individually — no duplicate entry appears on the board.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s8-8"><span class="step-text">Individually invite a guest player who is <em>not yet</em> in any guest clan on the roster. Confirm they show up in Remove Guest Players….<span class="expect">Listed, same as any other individually-invited guest.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s8-9"><span class="step-text">Now invite that same player's real clan as a guest clan too, and Save.<span class="expect">Reopen Remove Guest Players… — that player has disappeared from the list (their provenance flipped to clan-derived the moment their clan joined the roster, no action needed on the player itself). Right-clicking their board card and choosing Remove now gives the same "added by the guest clan" error as step 8-4.<span class="bug-note">This is race condition 2 from the spec — "clan invitation beats individual invitation."</span></span></span></li>
+    </ol>
+  </section>
+
+  <!-- SECTION 9 -->
+  <section class="phase" data-phase="9">
+    <div class="phase-head">
+      <span class="phase-sub-count" data-sub></span>
+      <p class="phase-num">Section 9 · Bug fix</p>
+      <h2 class="phase-title">Delete Season: DM dedup + stale DM cleanup</h2>
+      <p class="phase-desc">Deleting a season and starting a new one for the same season string must DM everyone fresh, and the old DMs' dead buttons should get cleaned up.</p>
+    </div>
+    <div class="callout setup"><strong>Setup:</strong> a season with at least one real, DM-able pooled player, enrollment already started.</div>
+    <ol class="checklist">
+      <li class="step"><input type="checkbox" data-id="s9-1"><span class="step-text">Start Enrollment for a season, confirm the test player received the Confirm/Opt Out DM.<span class="expect">DM arrives as normal.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s9-2"><span class="step-text">In <code>/clan management</code>, use <strong>Delete Season</strong> on that same season, confirm the deletion.<span class="expect">The season is gone from CWL Management.</span></span></li>
+      <li class="step"><input type="checkbox" data-id="s9-3"><span class="step-text">Check the test player's DMs shortly after.<span class="expect">The earlier Confirm/Opt Out DM is gone (deleted), not just non-functional-looking.<span class="bug-note">Previously this DM sat there forever with live-looking but dead buttons.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s9-4"><span class="step-text">Add New Season using the exact same season string as the one you just deleted, configure the same participating clan(s), Start Enrollment again.<span class="expect">The test player gets a brand-new Confirm/Opt Out DM.<span class="bug-note">This is the core bug: previously Start Enrollment silently contacted nobody the second time around, with no error shown to the admin.</span></span></span></li>
+      <li class="step"><input type="checkbox" data-id="s9-5"><span class="step-text">Confirm via the new DM's button.<span class="expect">Works normally — status updates on the Manage Enrollment board.</span></span></li>
+    </ol>
+  </section>
+
+  <footer>CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md · commit 400fec6</footer>
+</div>
+
+<script>
+  (function () {
+    var boxes = Array.prototype.slice.call(document.querySelectorAll('.step input[type="checkbox"]'));
+    var STORE_KEY = 'cwl-qa-checklist-v1';
+
+    function load() {
+      try { return JSON.parse(localStorage.getItem(STORE_KEY) || '{}'); } catch (e) { return {}; }
+    }
+    function save(state) {
+      try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {}
+    }
+
+    function updateProgress() {
+      var total = boxes.length, done = 0;
+      document.querySelectorAll('section.phase').forEach(function (sec) {
+        var secBoxes = sec.querySelectorAll('input[type="checkbox"]');
+        var secDone = Array.prototype.filter.call(secBoxes, function (b) { return b.checked; }).length;
+        sec.querySelector('[data-sub]').textContent = secDone + ' / ' + secBoxes.length;
+      });
+      boxes.forEach(function (b) { if (b.checked) done++; });
+      document.getElementById('count').textContent = done + ' / ' + total;
+      document.getElementById('fill').style.width = (total ? (done / total * 100) : 0) + '%';
+    }
+
+    var state = load();
+    boxes.forEach(function (b) {
+      var id = b.getAttribute('data-id');
+      // Force BOTH true and false explicitly, not just true (2026-08-19 fix — "when new items
+      // are inserted the checked items need to move along; currently an insert leads to a
+      // displacement of the checkmarks"). These <input> elements carry no name/id attribute (only
+      // data-id), so Chrome's own "restore form values on reload" feature — which runs before
+      // this script and is keyed by DOM POSITION among same-type inputs when no name/id exists —
+      // still applies its own (position-based) checked/unchecked state on every plain reload.
+      // Inserting a new item earlier in the list shifts every later box's position by one, so
+      // Chrome's restore re-applies the position's OLD checked state to whichever box now happens
+      // to sit there — the "checkmarks displaced" symptom. This data-id-keyed localStorage state
+      // is the only authoritative source of truth and must always win, so both branches are set
+      // unconditionally here instead of only ever turning a checkbox on.
+      var checked = !!state[id];
+      b.checked = checked;
+      b.closest('.step').querySelector('.step-text').classList.toggle('done', checked);
+      b.addEventListener('change', function () {
+        var st = load();
+        st[id] = b.checked;
+        save(st);
+        b.closest('.step').querySelector('.step-text').classList.toggle('done', b.checked);
+        updateProgress();
+      });
+    });
+
+    document.getElementById('reset').addEventListener('click', function () {
+      save({});
+      boxes.forEach(function (b) {
+        b.checked = false;
+        b.closest('.step').querySelector('.step-text').classList.remove('done');
+      });
+      updateProgress();
+      setIoStatus('');
+    });
+
+    // Save/Load Progress (2026-08-19) — localStorage alone is tied to this exact file:// path in
+    // this exact browser profile; it's silently gone if the file is moved/renamed, a different
+    // profile/machine is used, or the browser clears local-file site data. These two buttons back
+    // the same state (data-id -> checked) up to/from a plain JSON file the user keeps themselves,
+    // independent of any of that.
+    var ioStatusEl = document.getElementById('io-status');
+    var ioStatusTimer = null;
+    function setIoStatus(text, isError) {
+      if (ioStatusTimer) { clearTimeout(ioStatusTimer); ioStatusTimer = null; }
+      ioStatusEl.textContent = text;
+      ioStatusEl.classList.toggle('error', !!isError);
+      if (text) { ioStatusTimer = setTimeout(function () { ioStatusEl.textContent = ''; }, 6000); }
+    }
+
+    // Edge/Chrome's File System Access API lets the user pick exactly where this goes (e.g. this
+    // checklist's own tests/ folder) instead of it always landing in Downloads. showSaveFilePicker
+    // alone turned out NOT to reliably remember that folder on file:// pages (Chromium's "last
+    // used directory" heuristic doesn't consistently apply there — live-tested, it fell back to
+    // the OS default Documents folder on the second save). So instead this pins an actual
+    // FileSystemDirectoryHandle: picked once via showDirectoryPicker(), persisted in IndexedDB,
+    // and reused directly on every later save with no dialog at all (just a one-time-per-session
+    // permission reconfirmation the File System Access API itself requires for a restored handle).
+    // Feature-detected with a plain-download fallback for browsers without the API (Firefox).
+    var DB_NAME = 'cwl-qa-checklist-fs';
+    var STORE_NAME = 'handles';
+    var DIR_KEY = 'saveDir';
+
+    function openHandleDb() {
+      return new Promise(function (resolve, reject) {
+        var req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = function () { req.result.createObjectStore(STORE_NAME); };
+        req.onsuccess = function () { resolve(req.result); };
+        req.onerror = function () { reject(req.error); };
+      });
+    }
+    function getStoredDirHandle() {
+      return openHandleDb().then(function (db) {
+        return new Promise(function (resolve, reject) {
+          var tx = db.transaction(STORE_NAME, 'readonly');
+          var req = tx.objectStore(STORE_NAME).get(DIR_KEY);
+          req.onsuccess = function () { resolve(req.result || null); };
+          req.onerror = function () { reject(req.error); };
+        });
+      }).catch(function () { return null; });
+    }
+    function setStoredDirHandle(handle) {
+      return openHandleDb().then(function (db) {
+        return new Promise(function (resolve, reject) {
+          var tx = db.transaction(STORE_NAME, 'readwrite');
+          tx.objectStore(STORE_NAME).put(handle, DIR_KEY);
+          tx.oncomplete = function () { resolve(); };
+          tx.onerror = function () { reject(tx.error); };
+        });
+      });
+    }
+    function ensureReadWritePermission(dirHandle) {
+      return dirHandle.queryPermission({ mode: 'readwrite' }).then(function (state) {
+        if (state === 'granted') return true;
+        return dirHandle.requestPermission({ mode: 'readwrite' }).then(function (r) { return r === 'granted'; });
+      });
+    }
+
+    function downloadFallback(text) {
+      var blob = new Blob([text], { type: 'application/json' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'cwl-qa-checklist-progress.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setIoStatus('Saved to cwl-qa-checklist-progress.json in your Downloads folder (this browser doesn\'t support picking a folder — move it into tests/ if you want it there).');
+    }
+
+    var fsApiSupported = !!(window.showDirectoryPicker && window.indexedDB);
+
+    function writeIntoDir(dirHandle, text) {
+      return dirHandle.getFileHandle('cwl-qa-checklist-progress.json', { create: true }).then(function (fileHandle) {
+        return fileHandle.createWritable().then(function (writable) {
+          return writable.write(text).then(function () { return writable.close(); }).then(function () {
+            setIoStatus('Saved to ' + dirHandle.name + '/cwl-qa-checklist-progress.json.');
+          });
+        });
+      });
+    }
+
+    function pickAndStoreDir() {
+      return window.showDirectoryPicker({ mode: 'readwrite' }).then(function (dirHandle) {
+        return setStoredDirHandle(dirHandle).then(function () { return dirHandle; });
+      });
+    }
+
+    document.getElementById('save-progress').addEventListener('click', function () {
+      var payload = { checklist: 'cwl-qa-checklist', version: 1, savedAt: new Date().toISOString(), state: load() };
+      var text = JSON.stringify(payload, null, 2);
+      if (!fsApiSupported) {
+        downloadFallback(text);
+        return;
+      }
+      getStoredDirHandle().then(function (dirHandle) {
+        if (!dirHandle) return pickAndStoreDir();
+        return ensureReadWritePermission(dirHandle).then(function (ok) {
+          return ok ? dirHandle : pickAndStoreDir();
+        });
+      }).then(function (dirHandle) {
+        return writeIntoDir(dirHandle, text);
+      }).catch(function (err) {
+        if (err && err.name === 'AbortError') return; // user cancelled the folder picker — no-op
+        downloadFallback(text);
+      });
+    });
+
+    document.getElementById('change-save-folder').addEventListener('click', function () {
+      pickAndStoreDir().then(function (dirHandle) {
+        setIoStatus('Save Progress will now write into ' + dirHandle.name + '/.');
+      }).catch(function (err) {
+        if (err && err.name === 'AbortError') return;
+        setIoStatus('Could not change the save folder: ' + err.message, true);
+      });
+    });
+
+    // Applies a progress file's text content to the checkboxes + localStorage — shared by both
+    // the automatic (stored-directory-handle) load path below and the manual file-picker
+    // fallback, so "load from the remembered folder" and "load an arbitrary file" behave
+    // identically once the bytes are in hand.
+    function applyLoadedText(text, sourceName) {
+      var parsed;
+      try { parsed = JSON.parse(text); } catch (e) {
+        setIoStatus('Could not load: not a valid JSON file.', true);
+        return;
+      }
+      var incoming = parsed && typeof parsed === 'object' && parsed.state && typeof parsed.state === 'object'
+        ? parsed.state
+        : null;
+      if (!incoming) {
+        setIoStatus('Could not load: not a recognized progress file.', true);
+        return;
+      }
+      save(incoming);
+      var appliedCount = 0;
+      boxes.forEach(function (b) {
+        var id = b.getAttribute('data-id');
+        var checked = !!incoming[id];
+        b.checked = checked;
+        b.closest('.step').querySelector('.step-text').classList.toggle('done', checked);
+        if (checked) appliedCount++;
+      });
+      updateProgress();
+      setIoStatus('Loaded ' + appliedCount + ' checked item(s) from ' + sourceName + '.');
+    }
+
+    var loadFileInput = document.getElementById('load-progress-file');
+    function loadViaFilePicker() {
+      loadFileInput.value = '';
+      loadFileInput.click();
+    }
+    loadFileInput.addEventListener('change', function () {
+      var file = loadFileInput.files && loadFileInput.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function () { applyLoadedText(String(reader.result), file.name); };
+      reader.onerror = function () { setIoStatus('Could not read that file.', true); };
+      reader.readAsText(file);
+    });
+
+    // Reads straight from the SAME remembered folder/filename Save Progress writes to — no
+    // dialog — falling back to the manual file picker for any reason that isn't possible (no
+    // folder remembered yet, permission lost, or nothing saved there yet).
+    document.getElementById('load-progress').addEventListener('click', function () {
+      if (!fsApiSupported) { loadViaFilePicker(); return; }
+      var dirName = '';
+      getStoredDirHandle().then(function (dirHandle) {
+        if (!dirHandle) throw new Error('no stored folder yet');
+        dirName = dirHandle.name;
+        return ensureReadWritePermission(dirHandle).then(function (ok) {
+          if (!ok) throw new Error('permission not granted');
+          return dirHandle.getFileHandle('cwl-qa-checklist-progress.json');
+        });
+      }).then(function (fileHandle) {
+        return fileHandle.getFile();
+      }).then(function (file) {
+        return file.text().then(function (text) { applyLoadedText(text, dirName + '/' + file.name); });
+      }).catch(function () {
+        loadViaFilePicker();
+      });
+    });
+
+    updateProgress();
+  })();
+</script>
+</body>
+</html>

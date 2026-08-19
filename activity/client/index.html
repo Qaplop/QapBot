@@ -475,6 +475,34 @@
       }
       .hover-popup-name { font-weight: 600; margin-bottom: 4px; }
       .hover-popup-line { color: #b5bac1; line-height: 1.5; }
+      /* Right-click "Remove guest player" context menu (2026-08-19) — modeled on
+         .player-hover-popup above but pointer-events: auto (it needs a clickable item) and no
+         max-width (a single menu item, not a wrapped info block). */
+      .player-context-menu {
+        position: fixed;
+        z-index: 25;
+        background: #111214;
+        border: 1px solid #3f4147;
+        border-radius: 6px;
+        padding: 4px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+        pointer-events: auto;
+      }
+      .player-context-menu-item {
+        display: block;
+        width: 100%;
+        white-space: nowrap;
+        background: none;
+        border: none;
+        border-radius: 4px;
+        padding: 6px 12px;
+        font-size: 0.8rem;
+        font-family: inherit;
+        color: #f2f3f5;
+        text-align: left;
+        cursor: pointer;
+      }
+      .player-context-menu-item:hover { background: #3f4147; }
       /* CWL-stats section header (2026-08-16) — a touch of top margin separates it from the
          identity/status lines above; otherwise matches .hover-popup-name's own weight/color. */
       .hover-popup-header { font-weight: 600; margin-top: 6px; line-height: 1.5; }

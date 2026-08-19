@@ -1,6 +1,589 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-19 (96)
+- Removed dead code (project owner, after learning the "one-click admin-confirm" button
+  referenced in the manual QA checklist doesn't exist in the live UI: "Ah, got it. That is
+  deprecated code. In the first version we had a withdraw button. But it had a broken logic.
+  Remove that code completely and also all corresponding doc entries... we don't need any kind of
+  admin function to change a player's enrollment status").
+  - This endpoint had already been flagged, twice, as a known cleanup opportunity in
+    `CWL_ROSTER_PLANNING_PLAN.md`'s own history (its board button was removed in favor of
+    drag-and-drop-only well before this session, but the backend/Worker plumbing and its test
+    coverage were left in place "as a separate, deliberate decision"). Confirmed via a fresh grep
+    of `activity/client/src` before removing anything: zero callers anywhere in the current UI.
+  - `qapbot/web_bridge.py`: deleted `handle_post_cwl_enrollment_signup` and its sync helper
+    `_apply_cwl_enrollment_signup_sync` outright, plus the `POST /api/cwl/enrollment/signup`
+    route registration. `propagate_cwl_player_response` (still genuinely used, by
+    `CwlSignupResponseButton.callback` — the real DM-response path) is untouched.
+  - `activity/server/src/index.ts`: removed the matching `/cwl/enrollment/signup` proxy route.
+  - `activity/client/src/types.ts`: `EnrollmentPlayer.signup_status` keeps the `'withdrawn'` value
+    in its type (any pre-existing DB row carrying it must still render without crashing) but the
+    comment now says plainly that its one writer is gone, not "a future non-board caller."
+  - `tests/discord/test_web_bridge.py`: removed all 9 tests exercising the deleted endpoint
+    directly. Two OTHER tests that merely used it as a convenient trigger for unrelated behavior
+    (cross-guild `enrollment/wait` release; a shared-clan sync side effect) were adapted to
+    trigger the same real behavior through the still-live drag-and-drop `enrollment/assign`
+    endpoint instead — the way an admin actually makes that kind of write today.
+  - Updated every stale docstring/comment left pointing at the deleted functions:
+    `handle_post_cwl_enrollment_guest`'s and its own internal Pitfall-26 comment (`web_bridge.py`),
+    `propagate_cwl_player_response`'s and `get_event_shared_clans_by_tag_sync`'s docstrings
+    (`QBdiscocmdshelper_cwl.py`), the Pitfall 26 example list
+    (`qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md`), and both planning docs
+    (`CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md`, `CWL_ROSTER_PLANNING_PLAN.md` — closing out
+    their own "known cleanup opportunity"/"kept as-is" notes with what actually happened).
+  - Removed the corresponding stale manual-QA-checklist step (s4-4, "admin-confirm... one-click
+    button") — it described a feature that never existed in the shipped UI.
+  - `tsc --noEmit` clean in both `activity/client` and `activity/server`. Full backend suite:
+    2129 passed, 4 deselected (down from 2138 — 9 genuinely dead tests removed, none replaced).
+    Deployed both `activity/client` and `activity/server` to DEV.
+
+2026-08-19 (95)
+- Fixed (live bug report, project owner, spotted while re-checking the s3-7c manual QA step —
+  and while I was in the middle of adding the (94) tooltip): "STY - Basement" — a genuine current
+  member of the shared clan StayCalm, deliberately drag-assigned into StayCalm's OWN column while
+  it was a guest clan on TheQCrew's board — lingered after StayCalm was Removed, either as an
+  unexplained "Assigned to other Guild" entry or in "Remove Guest Players," instead of being
+  purged like every other real StayCalm member. This is the genuinely-shared-clan sibling of (92)
+  (Akaza/Hohenloher Land), which (92)'s `shared_clan_id is not None` carve-out didn't cover.
+  - Root cause, per the project owner's own correction of the (92)/(94) framing, verbatim:
+    "assigning one of its own members to itself and then removing that clan again should not
+    leave that manually assigned player in the guild's pool... the assigned to other guild case
+    serves a different purpose, namely a player that is rightfully member of the current player
+    pool (e.g. because he is a member of this guild) but is assigned to another guild's roster."
+    (92)'s fix preserved ANY deliberate placement pointing at a genuinely-shared clan_tag,
+    including one where the player IS a real direct member of clan_tag itself — but such a player
+    was never "one of this guild's own, assigned elsewhere"; they're simply a foreign player whose
+    temporary guest invitation just ended.
+  - `qapbot/QBdiscocmdshelper_cwl.py`: `_cleanup_local_pool_for_plain_clan_deactivation_sync`'s
+    preservation condition now also requires `current_clan_by_tag.get(tag) != clan_tag` when
+    `shared_clan_id is not None` and the placement points at `clan_tag` itself — preserved only
+    when the player's own LIVE current clan genuinely differs from the clan being removed (the
+    real cross-assignment case), purged otherwise. A player whose current clan actually IS
+    clan_tag falls straight through to the normal candidate-purge logic, shared or not.
+  - `qapbot/web_bridge.py`: `handle_get_cwl_guest_players` also gained a defense-in-depth filter
+    excluding any player whose `assigned_clan_tag` points at a non-participating clan (i.e., is
+    showing in "Assigned to other Guild") from the individually-removable list — matters for the
+    legitimate cross-assignment case, whose local row deliberately survives Remove and must never
+    be offered for a LOCAL-only removal that would silently break the real cross-guild placement.
+  - New tests: `test_shared_guest_clan_remove_purges_own_member_deliberately_placed_into_own_column`
+    (`tests/unit/test_cwl_clan_ownership.py`), plus two end-to-end tests in
+    `tests/discord/test_web_bridge.py` — one confirming the legitimate case still survives and is
+    excluded from "Remove Guest Players," one confirming the bug case is now fully purged. Both
+    backend fixes verified via revert-confirm-restore — reverting either one independently
+    reproduced its own exact symptom. Full suite: 2137 passed, 4 deselected. Python backend
+    change — needs the DEV/PROD bot process restarted to take effect.
+  - **Follow-up same day, second root cause found** (project owner, after reviewing the fix above:
+    "this is a subtle shift of intent when we introduced the remove button functionality... it
+    doesn't make sense to keep players of a completely removed clan in that pool when that player
+    doesn't have any stake left within the current guild... check if there are similar edge
+    cases"). The fix above only touched `_cleanup_local_pool_for_plain_clan_deactivation_sync`,
+    which runs ONLY from the explicit Remove button (rule f) — but
+    `detach_guild_from_shared_clan_on_deactivation`'s own write-time "orphaned-assignment
+    preservation" mirror (the thing that ACTUALLY creates the local "Assigned to other Guild" row
+    in the first place) ran unconditionally for every `admin_override`-sourced shared-roster
+    player, real self-member or genuine cross-assignment alike — and this function fires on a mere
+    UNCHECK too, not just Remove. So a real member deliberately self-assigned into their own
+    clan's column would show as "Assigned to other Guild" the moment the clan was unchecked,
+    before Remove (and its cleanup) ever ran at all.
+    - `qapbot/QBdiscocmdshelper_cwl.py`: the mirror-write loop now also excludes `tag not in
+      members_by_tag` (the same live-current-membership set the function's OTHER
+      direction — cross-assigned-into-my-own-clan — already computes just above it), so a real
+      direct member of the clan being deactivated never gets mirrored at all, Uncheck or Remove.
+    - New `test_detach_does_not_mirror_a_real_members_own_deliberate_self_assignment`
+      (`tests/unit/test_cwl_clan_ownership.py`), calling `detach_guild_from_shared_clan_on_
+      deactivation` directly (not through `remove_cwl_guest_clan`) to isolate the write-time fix
+      from the cleanup-time one. Verified via revert-confirm-restore. Full suite: 2138 passed, 4
+      deselected.
+    - Audited the rest of `_cleanup_local_pool_for_plain_clan_deactivation_sync` and
+      `detach_guild_from_shared_clan_on_deactivation` for the same "no independent stake, still
+      preserved" pattern — found no other instance; every other protection path
+      (family-clan/other-active-guest-clan direct membership, linked-account sweep, genuine
+      cross-assignment into one of the guild's own clans) already requires a real, independent
+      connection to this guild by construction.
+    - Documented the corrected, canonical rule in `CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md`
+      ("Assigned to other Guild" semantics section) and updated the stale docstring language in
+      both functions plus `remove_cwl_guest_clan`'s own docstring to match — this took two rounds
+      of live bug reports to get right, so it's now recorded as the single source of truth rather
+      than left implicit in test cases alone.
+
+2026-08-19 (94)
+- Added (project owner's spec, following the (92) explanation below): a hover tooltip on the
+  "Assigned to other Guild" column's headline in Manage Enrollment
+  (`activity/client/src/enrollmentBoard.ts`). Explains, on hover, that these players carry a real
+  deliberate placement in a clan managed by another guild, and that dragging one elsewhere on this
+  board evicts them from that other guild's roster too (verified against
+  `handle_post_cwl_enrollment_assign`/`assign_cwl_player_sync`: every drag-and-drop move routes
+  through the same conflict-purge that clears a player from any other shared clan they're
+  currently confirmed in — this is a real, not merely local, consequence). Uses a plain native
+  `title` attribute, same lightweight pattern as the skill-metric/status-icon tooltips just below
+  it in the same file, rather than the async hover-popup machinery built for player cards — the
+  text is static and needs no per-hover data fetch. `tsc --noEmit` clean. Deployed to DEV
+  (`npm run deploy:dev`, per standing DEV-deploy permission).
+
+2026-08-19 (93)
+- Fixed: the manual QA checklist's (`tests/cwl_enrollment_manual_qa_checklist.html`) own saved-
+  progress restore only ever turned a checkbox ON (`if (state[id]) { checked = true }`), never
+  explicitly OFF. These `<input>` elements carry no `name`/`id` attribute (only `data-id`), so
+  Chrome's own "restore form values on reload" feature — which runs BEFORE this page's script and
+  falls back to matching by DOM POSITION among same-type inputs when there's nothing else to key
+  off — still applied its own stale, position-based checked/unchecked state on every reload.
+  Inserting a new checklist item earlier in the list shifts every later item's position by one, so
+  Chrome's restore then reapplied the old position's checked state to whichever item now sits
+  there — visible as checkmarks "displaced" onto the wrong items after an insert (live bug report,
+  project owner: "When new items are inserted into the qa checklist the checked items need to move
+  along. Currently a insert leads to a displacement of the checkmarks."). Fixed by setting both
+  branches (checked AND unchecked) unconditionally from the `data-id`-keyed `localStorage` state on
+  every load, so it always wins over whatever Chrome's own restore had already set. No automated
+  test runner covers this standalone file; verified with a syntax check plus a standalone
+  simulation of the exact stale-native-state scenario.
+
+2026-08-19 (92)
+- Fixed (live bug report, project owner: he added Hohenloher Land as a guest clan, manually
+  drag-assigned its own real member Akaza INTO Hohenloher Land's own column, then clicked Remove
+  on Hohenloher Land — Akaza stayed behind in the pool, visible in "Remove Guest Players…", instead
+  of being purged like every other member).
+  - Root cause: `_cleanup_local_pool_for_plain_clan_deactivation_sync`'s deliberate-placement
+    preservation rule (`assignment_source=='admin_override'` and `locked`) preserved such a
+    placement "wherever it currently points," with no exception for pointing AT the clan being
+    removed itself. The rule exists so a player deliberately cross-assigned into a DIFFERENT clan
+    (or into a clan genuinely shared with another guild) survives removal — but Hohenloher Land was
+    never shared with anyone, so there was no "other guild" for Akaza to belong to; the whole
+    column was simply gone, and Akaza should have fallen through to the normal purge like any other
+    member.
+  - `qapbot/QBdiscocmdshelper_cwl.py`: the exception now also requires `shared_clan_id is not
+    None` when the placement points at `clan_tag` itself — preserved only when the placement
+    points elsewhere, OR `clan_tag` really is/was a genuine cross-guild shared clan. Caught via a
+    two-round revert-confirm-restore: an initial, too-narrow fix (excluding ANY placement pointing
+    at `clan_tag`) broke a pre-existing test
+    (`test_remove_guest_clan_still_preserves_a_deliberate_admin_override_placement`) covering the
+    legitimate case — a player deliberately placed into a clan that genuinely IS shared with (and
+    owned by) another guild, where "Assigned to other Guild" is accurate and must survive removal.
+  - Two new tests in `tests/unit/test_cwl_clan_ownership.py`: one confirming a deliberate
+    cross-assignment to a different plain clan still survives, one reproducing Akaza's exact
+    scenario (now purged). Full suite: 2134 passed, 4 deselected. Python backend change — needs
+    the DEV/PROD bot process restarted to take effect. The already-affected live row
+    (`#YUCUPV2UU`/Akaza) needs one more Add+Remove cycle after the restart to clear, since it
+    predates this fix.
+
+2026-08-19 (91)
+- Fixed (live bug report, project owner, right after verifying (90) worked: "I unchecked
+  Hohenloher Land but kept it as a guest clan... Hohenloher Land ist not tracked on another guild
+  so after unchecking it, Hohenloher Land has no other cwl ongoing. Hence the players should have
+  been moved back to the Unassigned pool") — unchecking a plain, never-shared guest clan showed
+  its (previously seeded/assigned) members in the "Assigned to other Guild" pseudo-column, even
+  though no other guild is involved at all.
+  - Root cause: unchecking a plain guest clan is deliberately cosmetic (rule f,
+    CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md, 2026-08-18) — its `cwl_assignments` rows are left
+    untouched so a re-check brings the roster straight back. But `_build_enrollment_payload_sync`
+    (`qapbot/web_bridge.py`) surfaced that dormant `assigned_clan_tag` unconditionally, and the
+    frontend's orphaned-column heuristic (`enrollmentBoard.ts`: `assigned_clan_tag` not among the
+    columns actually sent) can't distinguish "this points at a real cross-guild shared clan" from
+    "this points at my own clan I just unchecked" — both simply aren't in `clans` (participating
+    only).
+  - Fix: `_build_enrollment_payload_sync` now drops an assignment pointing at a non-participating
+    clan tag unless `db.get_cwl_shared_clan_sync(clan_tag, season)` confirms it's a genuine
+    cross-guild shared clan (the same signal used elsewhere in this feature, e.g.
+    `_prepare_and_save_clan_config_sync`). A dropped assignment falls back to `None` →
+    Unassigned; the underlying DB row is untouched, so re-checking the clan still restores it. The
+    genuine case — a real shared clan removed/detached, which legitimately means "another guild
+    controls this now" — is unaffected and still shows correctly.
+  - New `test_enrollment_get_unchecked_plain_guest_clan_members_fall_back_to_unassigned`
+    (`tests/discord/test_web_bridge.py`), verified via revert-confirm-restore (the revert
+    reproduced the exact reported symptom: `assigned_clan_tag == '#GUESTCLAN'` instead of `None`).
+    Full suite: 2133 passed, 4 deselected. Python backend change — needs the DEV/PROD bot process
+    restarted to take effect.
+
+2026-08-19 (90)
+- Fixed (live bug report, project owner: "I added Hoehenloher Land as a guest clan but its members
+  don't show up in the player pool"): a CWL guest clan that no guild on this bot tracks
+  independently contributed ZERO players to the enrollment pool — an empty column, forever.
+  - Root cause (NOT a regression from (84)-(89) — the affected code is untouched in HEAD): every
+    pool seed in this feature ultimately reads `get_current_clan_members_sync()`, i.e.
+    `user_players.current_clan_tag`. That table is only ever populated by `coc_cache.py`'s
+    `update_player_info_in_user_accounts()`, which is deliberately gated on
+    `clans.has_active_subscriptions` (the 2026-08-14 scope-bug incident: running it for every clan
+    the shared `get_clan()` cache touches polluted `user_players` with thousands of CWL-opponent
+    members and made every clan fetch slow). `has_active_subscriptions` is computed in
+    `update_all_clan_subscription_statuses()` from channel subscriptions + guild `member_clans` +
+    `member_families` ONLY — a CWL **guest** clan is in none of those sets. Confirmed against the
+    live DEV DB: `#LGYLJQVP` (Hohenloher Land) has `has_active_subscriptions=0` and 0
+    `user_players` rows, vs `#2C9UR9GJY` (StayCalm) with 1 and 47. That is exactly why the bug was
+    invisible in every earlier round of guest-clan testing — StayCalm is another guild's own
+    member clan and so was already tracked for unrelated reasons.
+  - `qapbot/QBdiscocmdshelper_cwl.py`: new `ensure_cwl_clan_membership_tracked(clan_tags)` — for
+    any clan on a CWL roster with no tracked members at all, fetches it once from the CoC API and
+    runs the same population path the regular poll cycle uses, creating the UNASSIGNED-pool
+    `user_players` rows (real name/TH/clan) the seeds then find. Scoped to clans an admin has
+    explicitly put on a CWL roster, and only when they have no data whatsoever, so it never
+    reintroduces the 2026-08-14 blanket-tracking behavior. Best-effort: an API failure logs and
+    the save/Start Enrollment still completes.
+  - Wired into BOTH entry points, which had the identical gap: `start_cwl_enrollment()` (guest
+    clan already on the roster when enrollment starts) and `auto_assign_prior_cwl_members()`
+    (guest clan added after enrollment is open).
+  - Deliberately does NOT flip `has_active_subscriptions` for the guest clan: that would
+    permanently ratchet `track_war_updates` on (one-way, by design) for a clan along for a single
+    season. Tradeoff documented in the new function's docstring — the snapshot refreshes on the
+    next add/Start Enrollment rather than on the poll cycle.
+  - Two new tests in `tests/integration/test_cwl_guest_clan_live_scenario.py`, one per entry
+    point, both verified via revert-confirm-restore (each fails on its own when only its own call
+    site is reverted). Full suite: 2132 passed, 4 deselected. Python backend change — needs the
+    DEV/PROD bot process restarted to take effect.
+  - Recovery for the already-affected live season: after the restart, Remove the guest clan and
+    re-add it. The re-add path is what re-runs the seed (an ordinary Save does not, since the clan
+    is no longer "newly added to the roster").
+
+2026-08-19 (89)
+- Fixed (found during a review of (85)-(88), at the project owner's request after several rounds
+  of narrow fixes kept failing to resolve the live symptom): the MASS-SCALE cause of "the qcrew
+  members were falsely auto-assigned to staycalm" was still present. (88) only masked the subset
+  where a player's live current clan happened to equal their auto-assign target.
+  - Root cause: `assign_cwl_player_sync`'s `deliberate=False` guard decided "this player already
+    has a real claim elsewhere" from `shared_clan_ids_to_clear` — a set that by construction holds
+    EVERY participating shared clan whether or not the player is in it (it exists to drive the
+    eviction sweep below, where a miss is a harmless no-op delete). So with any shared guest clan
+    on the roster, every auto-assigned player whose live current clan didn't equal their target
+    got an `orphaned_elsewhere` assignment written pointing at that guest clan — with zero
+    relationship to it and no row on its roster at all. The assignment write was not even guarded
+    by `other_shared_row is not None`, so it fired for players the guard had just failed to find.
+    This matches the live DB exactly: the affected QCrew players had
+    `assignment_source='orphaned_elsewhere'` pointing at StayCalm while being absent from
+    StayCalm's `cwl_shared_clan_players` roster entirely.
+  - Notably this hit every family member of a NON-participating family clan (The Marines /
+    Marines II in the live guild) who had CWL history for a participating clan — their current
+    clan differs from their target by definition, so (88)'s equality check never saved them. That
+    plausibly accounts for much of the 26-player pile-up in StayCalm's column.
+  - `qapbot/QBdiscocmdshelper_cwl.py`: the guard now derives the player's REAL competing
+    placements from `find_cwl_shared_clan_memberships_for_player_sync` (rows with `assigned=1`)
+    instead of the eviction set, and skips any placement whose roster row can't actually be found.
+    It also now scans ALL of the player's placements for a deliberate (`admin_override`) one
+    rather than judging by whichever happened to be enumerated first — previously a deliberate
+    placement could be missed, and silently evicted, if an automatic one sorted ahead of it.
+  - New `test_start_enrollment_never_assigns_a_player_into_an_unrelated_shared_clan`, verified via
+    revert-confirm-restore (the revert reproduced the exact reported symptom). Also added
+    `tests/integration/test_cwl_guest_clan_live_scenario.py` — two end-to-end tests driving the
+    project owner's real setup (QCrew + shared StayCalm, enrollment then Remove) the way an admin
+    actually does, since this scenario repeatedly stayed broken while narrower unit tests all
+    passed. Full suite: 2130 passed, 4 deselected. `tsc --noEmit` clean. Python backend change —
+    needs the DEV/PROD bot process restarted to take effect.
+- Reviewed and found correct (no change needed): the (85)/(86) removal-side cleanup interactions,
+  the (84) `admin_override`/`locked` mirror write, the `_detach_or_prune_one_shared_clan` DRY
+  refactor (verified behaviorally identical to both call sites it replaced), the
+  `sent_message_out` out-param (appends only on the success path, backwards compatible), and the
+  frontend `is_guest: true` change (the clan-config POST body is field-picked server-side, so the
+  extra field is never read).
+
+2026-08-19 (88)
+- Fixed the SECOND half of (87)'s root cause — the symptom persisted after (87) because the bug
+  spanned two layers, and (87) only fixed the first. Live bug report, project owner (repeatedly,
+  after (87) shipped): "are you fucking kidding me! Same bug!!!" Diagnosed properly this time by
+  querying the live DEV DB rather than reasoning from the code alone: the affected QCrew players'
+  `cwl_assignments` rows carried `assignment_source='orphaned_elsewhere'` — a value written by
+  exactly ONE code path, which immediately identified the real culprit.
+  - (87) correctly made `start_cwl_enrollment` redirect a genuine current family-clan member's
+    auto-assign target to their own real clan. But `assign_cwl_player_sync`'s `deliberate=False`
+    conflict guard then silently DISCARDED that corrected target: it saw an existing
+    `cwl_shared_clan_players` row for a different clan and treated it as an untouchable real
+    placement — mirroring the player straight back to that other clan via its "orphaned_elsewhere"
+    path — without ever checking whether that row was itself deliberate or merely a stale
+    leftover (`source='auto_assigned'`) from an earlier season/test cycle.
+  - `qapbot/QBdiscocmdshelper_cwl.py`: that guard now only treats a conflicting shared placement
+    as untouchable when it's either genuinely deliberate (`source='admin_override'` — a real human
+    drag, unconditionally protected, matching the locked-local-assignment rule beside it) or NOT
+    contradicted by the player's own live `user_players.current_clan_tag`. A non-deliberate row
+    the player's live membership flatly contradicts no longer wins; the normal write/eviction
+    proceeds and purges it.
+  - New `test_start_enrollment_current_clan_beats_a_stale_non_deliberate_shared_placement`
+    (reproduces the exact live scenario; the revert-confirm step reproduced the reported symptom
+    precisely — `#SHAREDCLAN` instead of `#CLAN1`). The two existing sibling tests covering the
+    deliberate-`admin_override` case still pass unchanged, confirming that protection is intact.
+    Full suite: 2127 passed, 4 deselected. Python backend change — needs the DEV/PROD bot process
+    restarted to take effect.
+
+2026-08-19 (87)
+- Fixed the ACTUAL root cause of (86)'s symptom, not just its cleanup-side fallout: Start
+  Enrollment's own initial auto-assignment seed was placing real family-clan members (e.g.
+  TheQCrew's own players) into a shared/guest clan's column (StayCalm) instead of their own —
+  live bug report, project owner, verbatim: "when staycalm gets added during the very start of
+  adding the new season the theqcrew members get auto assigned to staycalm and not to the qcrew
+  as they should! when i start the season newly without stay calm... then the auto assign works
+  correctly."
+  - Root cause: `resolve_prior_cwl_assignments()` assigns every candidate purely by their own
+    LAST REAL CWL ATTACK, anywhere — by design, independent of their current clan (documented,
+    2026-08-14 spec: "assign to wherever they last actually played, not wherever they're
+    currently rostered"), so a player is correctly placed even if their own current clan isn't
+    participating this season. But that same rule meant a genuine CURRENT family-clan member
+    whose historical last attack happened to be for a different, ALSO-participating clan (most
+    commonly a guest clan just added) got assigned there instead of their own real clan — no
+    matter how live and unambiguous their current membership is.
+  - `qapbot/QBdiscocmdshelper_cwl.py`: `start_cwl_enrollment()` now overrides `resolve_prior_cwl_
+    assignments()`'s result for any candidate who is a genuine CURRENT member of a clan that IS
+    participating — but ONLY ever redirects an EXISTING entry, never creates a new one for a
+    candidate that function correctly left out (permanently opted-out accounts, players with no
+    real CWL history at all) — confirmed by two existing tests that would otherwise regress.
+  - New `test_current_family_clan_membership_beats_stale_history_for_a_guest_clan`, verified via
+    revert-confirm-restore. Full suite: 2126 passed, 4 deselected. Python backend change — needs
+    the DEV/PROD bot process restarted to take effect.
+  - Note: (85)/(86) (the cleanup-side fixes for a clan being REMOVED) remain valid and necessary
+    for their own scenarios (Remove/detach) — this fix addresses the SEED that was placing real
+    family members wrong in the first place, so with both in place the symptom shouldn't recur.
+
+2026-08-19 (86)
+- Fixed: real family-clan members (e.g. TheQCrew's own players) whose prior-CWL-history seed had
+  placed them into a shared/guest clan's column got stuck rendering as "Assigned to other Guild"
+  forever once that guest clan was removed, instead of falling back to Unassigned — live bug
+  report, project owner, verbatim: "the qcrew members were falsely auto-assigned to staycalm...
+  after removing staycalm the error becomes obvious." Confirmed against the live DEV DB (their
+  `cwl_assignments` rows still pointed at StayCalm's already-removed tag).
+  - `_cleanup_local_pool_for_plain_clan_deactivation_sync()` already correctly refused to delete
+    a genuine family/other-active-guest-clan member's pool membership (their signup) — it just
+    never cleared the resulting DANGLING assignment once the clan it pointed at left the roster.
+    New `_clear_stale_assignment_if_any()` helper now deletes that stale pointer (assignment
+    only, never the signup) for every one of the three "protected, keep the signup" branches —
+    a genuine deliberate `admin_override`+`locked` placement is still fully untouched regardless
+    of where it points, unaffected by this.
+  - `qapbot/QBdiscocmdshelper_cwl.py`. Existing `test_plain_guest_clan_detach_never_deletes_a_
+    genuine_family_members_signup` updated (it had been asserting the old, buggy "left
+    completely untouched" behavior); new `test_remove_shared_guest_clan_clears_stale_pointer_
+    for_a_real_family_member` reproduces the exact live scenario. Verified via revert-confirm-
+    restore. Full suite: 2125 passed, 4 deselected. Python backend change — needs the DEV/PROD
+    bot process restarted to take effect.
+
+2026-08-19 (85)
+- Fixed: removing a cross-guild-shared guest clan could leave some of its former roster members
+  permanently stuck in the local player pool as oddly "individually removable" guest players the
+  admin never actually invited — live bug report, project owner (initially misreported by me as
+  "unrelated individually-invited players"; corrected after re-checking the live dev log and DB:
+  "I NEVER ADDED THOSE GUESTS MANUALLY THROUGH THE PLAYER GUEST INVITE FEATURE!!!").
+  - Root cause: `sync_cwl_shared_clan_roster_to_local_pools()` mirrors every shared-roster player
+    into this guild's own local `cwl_signups` as a `source='guest_invite'` placeholder the moment
+    a shared clan is added — so its local pool has something to show — but writes no local
+    `cwl_assignments` row and no `origin_shared_clan_id`. `_cleanup_local_pool_for_plain_clan_
+    deactivation_sync`'s candidate set only ever looked at (a) live current members of the clan
+    being removed and (b) local assignments pointing at it — a player who'd since left that clan
+    in real life matched neither, so their mirror row became permanently invisible to Remove's
+    cleanup and just sat there forever.
+  - `qapbot/QBdiscocmdshelper_cwl.py`: `remove_cwl_guest_clan()` now looks up the shared clan
+    once and threads its id into the local cleanup; `_cleanup_local_pool_for_plain_clan_
+    deactivation_sync()` (new optional `shared_clan_id` param) now also includes every player
+    still on that shared roster in its candidate set, regardless of their current live clan — the
+    same preservation rules (admin_override+locked, family/other-guest-clan membership, linked-
+    account sweep) still apply on top, so a genuine deliberate placement or real family member
+    pulled in this way is still correctly kept.
+  - New `test_remove_guest_clan_purges_local_mirror_for_a_player_who_since_left_the_shared_clan`,
+    verified via revert-confirm-restore. Full suite: 2124 passed, 4 deselected. Python backend
+    change — needs the DEV/PROD bot process restarted to take effect.
+  - Diagnosed by reading the live DEV `qapbot.log` and querying `data/qapbot.db` read-only
+    (`sqlite3 -readonly`) to confirm the actual `source`/`current_clan_tag` values instead of
+    guessing — this is what caught my initial wrong diagnosis.
+
+2026-08-19 (84)
+- Fixed: a deliberate drag-and-drop placement (admin_override) into a cross-guild-shared guest
+  clan's column got silently deleted the instant after Remove tried to preserve it — confirmed
+  by the project owner as a real bug, not intended behavior: "assigned players remain in their
+  rosters... becomes a guest player automatically" is meant to hold even when the clan is
+  removed, not just on a mere Uncheck. Root cause: `detach_guild_from_shared_clan_on_
+  deactivation`'s shared-roster mirror-write stamped the new local row with
+  `assignment_source="orphaned_on_detach"`/`locked=False`, but the very next step in
+  `remove_cwl_guest_clan` (`_cleanup_local_pool_for_plain_clan_deactivation_sync`, which runs
+  unconditionally right after) only ever preserves a row with
+  `assignment_source=="admin_override"` and `locked`.
+  - `qapbot/QBdiscocmdshelper_cwl.py`: that mirror-write now stamps
+    `assignment_source="admin_override"`/`locked=True` — the SAME live values a real drag-and-
+    drop placement already carries — so it's recognized and preserved by both Uncheck and a
+    subsequent (or immediate) Remove alike. `locked`/`assignment_source` aren't surfaced to the
+    frontend payload at all (checked), so this couldn't affect anything UI-facing besides the
+    intended fix.
+  - `tests/unit/test_cwl_clan_ownership.py`: existing mirror test extended to assert the new
+    values; new `test_remove_guest_clan_still_preserves_a_deliberate_admin_override_placement`
+    (the sibling of the existing "Remove purges the rest of the pool" test — this proves the ONE
+    exception). Verified via revert-confirm-restore. Full suite: 2122 passed, 4 deselected.
+  - New manual QA step (`tests/cwl_enrollment_manual_qa_checklist.html`, s3-7b): drag-assign a
+    player into a shared guest clan's column, Remove that clan, confirm the drag-assigned player
+    still shows up afterward while everyone else in that clan is purged. Python backend change —
+    needs the DEV/PROD bot process restarted to take effect.
+
+2026-08-19 (83)
+- Fixed: the Configure Participating Clans "Remove" button for a guest clan only appeared after
+  Save + reopen — adding a clan via the Guests search left it Remove-less until persisted (live
+  bug report, project owner: "the remove button should appear immediately at adding the clan").
+  A freshly-added row deliberately left `is_guest` unset client-side before this fix (every clan
+  the Guests search can add is a guest by construction, so it's now always set to `true`
+  immediately). Clicking Remove on a still-unsaved row no longer fires a network call against a
+  clan the backend has never heard of — a new `persistedClanTags` snapshot (taken once before any
+  client-side Add) lets `removeGuestClanRow` skip straight to the local `working`-array cleanup
+  for a row that was never actually saved.
+  - `activity/client/src/clanConfigTable.ts`, `activity/client/src/types.ts`. `tsc --noEmit`
+    clean. No automated frontend test suite exists for this Activity — manual QA checklist
+    updated instead.
+- DRY refactor (project owner's request, prompted by reviewing (82)'s fix): extracted
+  `_detach_or_prune_one_shared_clan()` — the detach-this-guild/repoint-ownership/prune-if-last
+  logic that `prune_or_detach_shared_clans_before_deletion` (whole-season delete) and
+  `detach_guild_from_shared_clan_on_deactivation` (single-clan uncheck) each carried as
+  byte-for-byte duplicated code (both already called the other a "narrower sibling" in their own
+  docstrings, acknowledging it). Both now call the one shared helper. Pure refactor, no behavior
+  change — full suite still 2121 passed, 4 deselected after.
+  - Also checked for genuinely DEAD code left behind by (82)'s fix specifically: none found —
+    the local variables (`non_preserved_tags`, `family_clan_tags`, etc.) that only existed to
+    support the now-removed deletion loop were already deleted along with it in (82).
+  - `qapbot/QBdiscocmdshelper_cwl.py`. Python backend change — needs the DEV/PROD bot process
+    restarted to take effect.
+
+2026-08-19 (82)
+- Fixed: unchecking a genuinely cross-guild-SHARED guest clan (e.g. "StayCalm, Managed by
+  another guild") with real signed-up members, then Save, purged those members from the local
+  player pool — live-tested report, project owner: "Members vanished from player pool after
+  uncheck for StayCalm." Rule f's original fix (2026-08-18) only ever addressed the PLAIN
+  (never-shared) guest-clan uncheck path; it never touched a completely separate destructive
+  branch inside `detach_guild_from_shared_clan_on_deactivation`'s shared-clan handling, which
+  still deleted every non-`admin_override` shared-roster player's local `cwl_signups`/
+  `cwl_assignments` row on every mere uncheck+Save — a leftover from a 2026-08-16 fix that
+  predated rule f and was never revisited when rule f shipped.
+  - `qapbot/QBdiscocmdshelper_cwl.py`: `_detach_guild_from_shared_clan_on_deactivation_sync()` no
+    longer deletes anything — a shared-roster player's existing local mirror (if any) is left
+    completely untouched on uncheck now, exactly like the plain-clan branch. The `admin_override`
+    mirror-write behavior (so a deliberately drag-and-drop-placed player doesn't vanish entirely
+    once their clan stops being a column) is unchanged. Deletion of the local pool still only
+    ever happens via the explicit "Remove" button (`remove_cwl_guest_clan`), shared or not.
+  - `tests/unit/test_cwl_clan_ownership.py`: the one existing test that directly asserted the old
+    (now-wrong) deletion behavior — predating rule f, never updated when rule f shipped — is
+    rewritten to assert survival instead. New end-to-end regression test in
+    `tests/discord/test_web_bridge.py` hits the real `/api/cwl/clan-config` endpoint with a
+    genuine two-guild shared clan (the gap the plain-clan-only sibling test never covered).
+    Verified via revert-confirm-restore. Full suite: 2121 passed, 4 deselected. Python backend
+    change — needs the DEV/PROD bot process restarted to take effect.
+
+2026-08-19 (81)
+- Verified: "Notify New Pool Members" (CWL Management) already correctly gates on BOTH conditions
+  the project owner specified — `has_cwl_pool_members_missing_dm()` (`QBdiscocmdshelper_cwl.py`)
+  returns false (button hidden) when the event is still `draft`/`cancelled` (enrollment not
+  started) OR when every DM-able pool member already has `dm_sent=1`; both already covered by
+  existing tests (`test_notify_new_members_button_absent_while_draft`,
+  `..._absent_when_everyone_already_dmed`). No logic bug found there.
+- Changed: the button itself, per project owner's spec — green (`ButtonStyle.success`, was grey
+  `secondary`) and moved to row 4, the last row Discord allows, so it always renders below the
+  main action-button row (Configure Participating Clans / Manage Teams / Delete Season) instead
+  of above the season-select dropdown.
+  - `qapbot/ui_cwl_roster.py`: `add_cwl_management_components()`.
+  - Existing `test_notify_new_members_button_present_when_someone_missing_dm` updated to assert
+    the new row/style, verified via revert-confirm-restore. Full suite: 2120 passed, 4 deselected.
+    Python backend change — needs the DEV/PROD bot process restarted to take effect.
+
+2026-08-19 (80)
+- Verified (no code change needed): a "Blocked" recipient (DMs disabled or bot blocked) from
+  Start Enrollment's DM batch was already correctly never marked as `dm_sent` in
+  `cwl_player_season_status` — `_send_cwl_enrollment_dm_batch` only ever calls
+  `mark_cwl_player_dm_sent_sync` inside its `if sent:` branch, never for the `blocked`/`failed`
+  outcomes. Confirmed by the project owner's own intent (2026-08-19): this is deliberate, so an
+  admin can inform an affected player, they can re-enable DMs/unblock the bot, and the admin's
+  **Notify New Pool Members** retry then actually reaches them instead of the global dedup
+  silently treating them as already-contacted forever.
+  - New `test_blocked_recipient_is_not_marked_as_dm_sent`
+    (`tests/integration/test_cwl_start_enrollment.py`) locks this invariant in, verified via
+    revert-confirm-restore. Full suite: 2120 passed, 4 deselected.
+  - New manual QA step (`tests/cwl_enrollment_manual_qa_checklist.html`, s2-4): re-enable DMs for
+    the blocked test account, click Notify New Pool Members, confirm they now receive a fresh DM.
+
+2026-08-19 (79)
+- Follow-up to (78): that fix only stops a FUTURE Delete Season from leaving orphaned
+  `cwl_player_season_status` rows behind — it does nothing for a row already orphaned by an
+  OLDER deletion that happened before (78) shipped, which is exactly what a live retest still
+  hit (project owner: "Well, the DM still doesn't work... No DM for my test user"). Made the
+  dedup check itself self-healing instead of relying only on cleanup-at-delete-time.
+  - `qapbot/db_manager.py`: `get_cwl_player_season_dm_status_bulk_sync()` (the actual gate
+    `_send_cwl_enrollment_dm_batch` checks before DMing anyone) now only trusts a `dm_sent=1` row
+    if it's still traceable to a LIVE `cwl_events` row — either the event that sent the DM or the
+    event that recorded a genuine response. An orphaned row (from ANY now-deleted event,
+    regardless of when or how it was deleted) is excluded from the result entirely, which the
+    caller's `.get(tag, False)` then reads as "never contacted" — no one-time backfill migration
+    needed, this heals every existing orphaned row the next time it's checked.
+  - 2 new tests (one exercising the exact "simulate the old buggy delete" scenario), verified via
+    revert-confirm-restore; 2 pre-existing tests updated to back their dm_sent rows with real
+    `cwl_events` rows instead of synthetic event ids (which the new trust check correctly no
+    longer honors). Full suite: 2119 passed, 4 deselected. Python backend change — needs the
+    DEV/PROD bot process restarted to take effect once deployed.
+
+2026-08-19 (78)
+- Fixed: "Delete Season" (mainly for testing/starting over) silently broke Start Enrollment for
+  any NEW event later created for the same season string — every pooled player's `dm_sent=1`
+  flag in `cwl_player_season_status` (a global, cross-guild table deliberately NOT cascaded from
+  `cwl_events`, so cross-guild dedup survives event deletion) was still standing from the deleted
+  event, so the new event's Start Enrollment silently DMed nobody at all (live-tested report,
+  project owner). Also: the deleted event's already-sent DMs kept sitting in players' DMs with
+  live-looking (but now non-functional) Confirm/Opt Out buttons.
+  - `qapbot/db_manager.py`: `delete_cwl_event_sync()` now also clears any
+    `cwl_player_season_status` row entirely attributable to the event being deleted (its DM was
+    sent via this event, and it was never responded to via any OTHER still-existing event) — a
+    row whose response came via a different, still-live event (the cross-guild shared-clan case)
+    is left untouched, preserving that dedup. New `get_cwl_player_season_status_dm_refs_for_event_sync()`
+    reads the (discord_id, message_id, channel_id) refs before that clear happens.
+  - New `dm_sent_via_message_id`/`dm_sent_via_channel_id` columns on `cwl_player_season_status`,
+    populated by `mark_cwl_player_dm_sent_sync()` (now optionally accepts them) — the actual DM
+    message is captured via a new optional `sent_message_out` out-param on
+    `CacheManager.send_user_dm_detailed()` (an out-param rather than widening its widely-depended-
+    on `(bool, outcome)` return tuple), threaded through `send_cwl_signup_template_dm()`.
+  - New `cleanup_stale_cwl_enrollment_dms()` (`qapbot/QBdiscocmdshelper_cwl.py`) best-effort
+    deletes those now-orphaned DM messages (preferred over editing them, per project owner) —
+    called from `CwlDeleteSeasonConfirmView._on_confirm()` (`ui_cwl_roster.py`) right after the
+    event delete. Every failure mode (DMs closed, message/user already gone, any other API
+    hiccup) is silently non-fatal, since there's nothing left to roll back to by that point.
+  - 14 new tests across `tests/unit/test_db_manager_cwl_roster.py`,
+    `tests/unit/test_cwl_enrollment_dm_cleanup.py` (new file), `tests/discord/test_ui_cwl_roster.py`,
+    and `tests/integration/test_cwl_start_enrollment.py`, the core dedup fix verified via a
+    revert-confirm-restore cycle. Full suite: 2118 passed, 4 deselected. Python backend change —
+    needs the DEV/PROD bot process restarted to take effect once deployed.
+
+2026-08-19 (77)
+- Fixed: "Configure Member Clans & Families" (`/clan management`) showed every one of a clan
+  family's own member clans as its own separate, redundant "individual clan" toggle button too —
+  e.g. a 12-clan family produced 12 extra buttons alongside the one family button, even though the
+  family button alone already grants the member role for all 12 (live-tested report, project
+  owner: "why does this view show the individual members of a clan family as buttons... remove
+  the unnecessary family clans from the button list").
+  - `qapbot/ui_clan_management.py`: `MemberClansConfigurationView._add_family_buttons()` now
+    records which clan tags belong to the (at most 5, Discord's per-view button cap) families it
+    actually renders as buttons; `_add_clan_buttons()` skips a separate button for any clan in
+    that set — UNLESS that clan is already individually selected from before this fix (legacy
+    state), in which case it still gets a button so it stays toggle-off-able rather than getting
+    permanently stuck. A clan whose family didn't make the 5-family cap still gets its own
+    button too, since the family toggle isn't reachable in this view for it.
+  - New `tests/discord/test_ui_clan_management_member_clan_buttons.py` (3 tests), each verified
+    via a revert-confirm-restore cycle. Full suite: 2108 passed, 4 deselected. Python backend
+    change — needs the DEV/PROD bot process restarted to take effect.
+
+2026-08-19 (76)
+- Added: CWL guest-player provenance — a guest player added because their clan was invited as a
+  guest clan can no longer be removed individually (project owner's spec, verbatim: "Only removing
+  the whole guest clan will remove that player"). Deliberately DERIVED from live current-clan
+  membership on every check (`get_cwl_guest_clan_tags_sync`, new in `QBdiscocmdshelper_cwl.py`)
+  rather than a persisted "how were you added" column/flag — this is what makes the spec's two
+  race conditions fall out for free, with no write-time flag-flip logic anywhere:
+  1. Adding a player individually who is already a current member of a guest clan already on the
+     event roster is now rejected with a 409 (`POST /api/cwl/enrollment/guest`) instead of
+     silently creating a redundant, independently-removable signup row.
+  2. A previously individually-invited player is automatically reclassified as clan-derived the
+     moment their clan is later added as a guest clan ("clan invitation beats individual
+     invitation") — nothing has to notice and flip anything, the next classification check just
+     starts returning a different answer.
+  - `GET /api/cwl/enrollment/guest-players` (the "Remove Guest Players" panel's list) now excludes
+    clan-derived players — only individually-invited ones are offered for individual removal.
+  - `POST /api/cwl/enrollment/guest-players/remove` now classifies every requested tag and rejects
+    any clan-derived ones with a clear reason instead of deleting them, returning
+    `{"ok": true, "removed": [...], "rejected": [...]}` (previously just `{"ok": true}`) — still
+    removes every valid tag in the same request. The Hub-message refresh/enrollment-version bump
+    now only fire when something was actually removed.
+  - New: right-click "Remove guest player" context menu on the Manage Teams (enrollment) board —
+    shown for any guest-badged card; a rejection from the backend (clan-derived) surfaces as an
+    inline error via the board's existing footer status line, same as any other failed action.
+    `activity/client/src/enrollmentBoard.ts`, `main.ts`, new `.player-context-menu` CSS in
+    `index.html`. The Configure Participating Clans panel's own remove flow
+    (`clanConfigTable.ts`) now also surfaces any `rejected` entries from the same endpoint instead
+    of assuming every requested removal always succeeds.
+  - `qapbot/QBdiscocmdshelper_cwl.py`, `qapbot/web_bridge.py`. Six new regression tests in
+    `tests/discord/test_web_bridge.py`, each verified via a revert-confirm-restore cycle. Full
+    suite: 2105 passed, 4 deselected. `tsc --noEmit` clean. Python backend changes — need the DEV
+    bot process restarted to take effect once deployed.
+
 2026-08-18 (75)
 - Fixed: the "Shared CWL Clan" notification always claimed "Your guild is the recognized owner
   (real in-game Leader/Co-Leader)" even when `resolve_cwl_clan_owner()` couldn't find a

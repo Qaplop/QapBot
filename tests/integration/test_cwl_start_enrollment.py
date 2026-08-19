@@ -166,7 +166,7 @@ async def test_seeds_signups_and_dms_linked_confirmed_accounts(db, monkeypatch):
 
     sent_dms = []
 
-    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
         sent_dms.append((user_id, message, view))
         return True, "sent"
 
@@ -190,6 +190,48 @@ async def test_seeds_signups_and_dms_linked_confirmed_accounts(db, monkeypatch):
     signup = db.get_cwl_signup_sync(db.get_cwl_event_sync("1005", "2026-08")["id"], "#P1")
     assert signup["status"] == "pending"
     assert signup["source"] == "template_confirm"
+
+
+@pytest.mark.asyncio
+async def test_deleting_and_recreating_same_season_dms_again(db, monkeypatch):
+    """2026-08-19 live bug report: an admin started enrollment, deleted the season ("Delete
+    Season" — mainly for testing/starting over), then started a brand-new event for the SAME
+    season string expecting fresh DMs. Before the fix, cwl_player_season_status.dm_sent (global,
+    keyed by (player_tag, cwl_season) — deliberately not cascaded from cwl_events) was still
+    standing from the deleted event, so the second Start Enrollment silently DMed nobody at all."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    await _seed_guild_and_clan(db, "1006")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(db, "d1", "#P1")
+    event_id = await _make_event(db, "1006", "2026-08")
+
+    sent_dms = []
+
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
+        sent_dms.append(user_id)
+        return True, "sent"
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
+
+    first_summary = await start_cwl_enrollment(1006, "2026-08")
+    assert first_summary["contacted"] == 1
+    assert sent_dms == ["d1"]
+
+    assert db.delete_cwl_event_sync(event_id) is True
+    await _make_event(db, "1006", "2026-08")  # new event, same season string
+
+    second_summary = await start_cwl_enrollment(1006, "2026-08")
+
+    assert second_summary["contacted"] == 1  # must DM again — the old event is gone for good
+    assert sent_dms == ["d1", "d1"]
 
 
 @pytest.mark.asyncio
@@ -218,7 +260,7 @@ async def test_one_recipients_dm_failure_does_not_abort_the_rest_of_the_batch(db
 
     contacted = []
 
-    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
         if user_id == "d1":
             return False, "failed"
         contacted.append(user_id)
@@ -235,6 +277,56 @@ async def test_one_recipients_dm_failure_does_not_abort_the_rest_of_the_batch(db
     assert summary["failed"] == ["Player"]  # d1's player_name, reported back for follow-up
     assert summary["blocked"] == []
     assert db.get_cwl_event_sync("1030", "2026-08")["status"] == "signup_open"
+
+
+@pytest.mark.asyncio
+async def test_blocked_recipient_is_not_marked_as_dm_sent(db, monkeypatch):
+    """2026-08-19, project owner's question after live-testing the "Blocked (DMs disabled or bot
+    blocked, not retried)" summary line: a recipient who never actually received the DM must NOT
+    be recorded as dm_sent — otherwise they'd be silently skipped forever by the global dedup
+    (get_cwl_player_season_dm_status_bulk_sync) even after re-enabling DMs, with no way to ever
+    reach them again short of a DB fix. Confirms _send_cwl_enrollment_dm_batch's own contract
+    (mark_cwl_player_dm_sent_sync is only ever called inside `if sent:`) holds end-to-end, and
+    that every OTHER recipient in the same batch is still reached normally."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    await _seed_guild_and_clan(db, "1031")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(db, "d1", "#P1")  # blocks the bot / DMs disabled
+    await _seed_current_clan_member(db, "d2", "#P2")  # must still be reached normally
+    await _make_event(db, "1031", "2026-08")
+
+    contacted = []
+
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
+        if user_id == "d1":
+            return False, "blocked"
+        contacted.append(user_id)
+        return True, "sent"
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
+
+    summary = await start_cwl_enrollment(1031, "2026-08")
+
+    assert summary["contacted"] == 1
+    assert contacted == ["d2"]
+    assert summary["blocked"] == ["Player"]  # d1's player_name
+    assert summary["failed"] == []
+
+    # The blocked recipient never got a cwl_player_season_status row at all — never DMed means
+    # never marked DMed, so they're still eligible to be reached the moment DMs are re-enabled.
+    assert db.get_cwl_player_season_status_sync("#P1", "2026-08") is None
+    # The reached recipient DOES have one, dm_sent=1, as normal.
+    status = db.get_cwl_player_season_status_sync("#P2", "2026-08")
+    assert status is not None
+    assert status["dm_sent"] == 1
 
 
 @pytest.mark.asyncio
@@ -279,7 +371,7 @@ async def test_non_participating_family_clan_members_are_still_pooled_and_dmed(d
 
     contacted = []
 
-    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
         contacted.append(user_id)
         return True, "sent"
 
@@ -319,12 +411,21 @@ async def test_globally_already_dmed_player_is_seeded_with_real_status_but_not_r
     await _seed_current_clan_member(db, "d2", "#P2")  # never contacted by anyone yet
     await _make_event(db, "1032", "2026-08")
 
-    db.mark_cwl_player_dm_sent_sync("#P1", "2026-08", "Player", "d1", 999, 999, "2026-08-17T09:00Z")
-    db.set_cwl_player_response_status_sync("#P1", "2026-08", "Player", "d1", "confirmed", "2026-08-17T09:05Z", 999, 999)
+    # A REAL other guild's event (2026-08-19 follow-up fix: the bulk dedup lookup now only trusts
+    # a dm_sent=1 row if it's still traceable to a live cwl_events row — see
+    # get_cwl_player_season_dm_status_bulk_sync's own docstring) — this is what "some OTHER
+    # guild's Start Enrollment already DMed and they confirmed" actually looks like in production.
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('999')")
+    await db.conn.commit()
+    other_event_id = db.create_cwl_event_sync("999", "2026-08", "otherdiscordid")
+    db.mark_cwl_player_dm_sent_sync("#P1", "2026-08", "Player", "d1", other_event_id, 999, "2026-08-17T09:00Z")
+    db.set_cwl_player_response_status_sync(
+        "#P1", "2026-08", "Player", "d1", "confirmed", "2026-08-17T09:05Z", other_event_id, 999,
+    )
 
     contacted = []
 
-    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
         contacted.append(user_id)
         return True, "sent"
 
@@ -409,7 +510,7 @@ async def test_dm_guard_only_dms_the_configured_server_admin_in_dev(db, monkeypa
 
     sent_to = []
 
-    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
         sent_to.append(user_id)
         return True, "sent"
 
@@ -445,7 +546,7 @@ async def test_dm_guard_only_dms_the_configured_server_admin_in_prod(db, monkeyp
 
     sent_to = []
 
-    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
         sent_to.append(user_id)
         return True, "sent"
 
@@ -483,7 +584,7 @@ async def test_dm_guard_also_dms_enrolled_testers_in_prod(db, monkeypatch):
 
     sent_to = []
 
-    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
         sent_to.append(user_id)
         return True, "sent"
 
@@ -519,7 +620,7 @@ async def test_dm_guard_ignores_testers_in_dev(db, monkeypatch):
 
     sent_to = []
 
-    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
         sent_to.append(user_id)
         return True, "sent"
 
@@ -551,7 +652,7 @@ async def test_prod_mode_is_unaffected_when_dm_guard_disabled(db, monkeypatch):
 
     sent_to = []
 
-    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None):
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
         sent_to.append(user_id)
         return True, "sent"
 
@@ -624,6 +725,45 @@ async def test_seeds_auto_assignments_for_a_guest_clans_own_current_members(db, 
     assert len(assignments) == 1
     assert assignments[0]["player_tag"] == "#P1"
     assert assignments[0]["assigned_clan_tag"] == "#GUESTCLAN"
+
+
+@pytest.mark.asyncio
+async def test_current_family_clan_membership_beats_stale_history_for_a_guest_clan(db, monkeypatch):
+    """Live bug report, project owner, verbatim: "when staycalm gets added during the very start
+    of adding the new season the theqcrew members get auto assigned to staycalm and not to the
+    qcrew as they should." resolve_prior_cwl_assignments() assigns purely by "last real CWL
+    attack," independent of current clan (by design, for players whose current clan isn't
+    participating) — but a player who is a genuine CURRENT member of a clan that IS participating
+    must never have their own real, live family-clan membership overridden by some earlier
+    season's attack history for a totally different (here: guest) clan."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    guild_id = 10103
+    await _seed_guild_and_clan(db, str(guild_id), clan_tag="#CLAN1")  # "The QCrew"
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#GUESTCLAN', 'StayCalm')")
+    await db.conn.commit()
+    # #P1 is a genuine CURRENT member of the guild's own family clan (#CLAN1)...
+    await _seed_current_clan_member(db, "d1", "#P1", "#CLAN1")
+    # ...but their last REAL CWL attack on record was for #GUESTCLAN (StayCalm) — e.g. from
+    # before they transferred into #CLAN1.
+    await _seed_cwl_war(db, "#GUESTCLAN", [("#P1", "Alpha")])
+
+    event_id = db.create_cwl_event_sync(str(guild_id), "2026-08", "creator")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#CLAN1", "participating": True},
+        {"clan_tag": "#GUESTCLAN", "participating": True},
+    ])
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
+
+    summary = await start_cwl_enrollment(guild_id, "2026-08")
+
+    assert summary["assigned"] == 1
+    assignments = db.get_cwl_assignments_sync(event_id)
+    assert len(assignments) == 1
+    assert assignments[0]["player_tag"] == "#P1"
+    assert assignments[0]["assigned_clan_tag"] == "#CLAN1"  # their real current clan wins
 
 
 @pytest.mark.asyncio
@@ -853,6 +993,106 @@ async def test_start_enrollment_shows_confirmed_shared_guest_as_orphaned_when_sh
 
     shared_players = {p["player_tag"]: p for p in db.get_cwl_shared_clan_players_sync(shared_id)}
     assert shared_players["#QMANIAC"]["assigned"] == 1  # untouched, still placed there
+
+
+@pytest.mark.asyncio
+async def test_start_enrollment_current_clan_beats_a_stale_non_deliberate_shared_placement(db, monkeypatch):
+    """The actual live root cause (2026-08-19, project owner, verbatim: "the qcrew members were
+    falsely auto-assigned to staycalm... theqcrew members get auto assigned to staycalm and not
+    to the qcrew as they should" — traced through two layers: start_cwl_enrollment's own auto-
+    assign already correctly redirects a genuine current family-clan member's target to their own
+    real clan (see the sibling test on resolve_prior_cwl_assignments' call site), but
+    assign_cwl_player_sync's conflict guard was silently discarding that corrected target right
+    back to a stale cwl_shared_clan_players row from an EARLIER, unrelated season/event cycle —
+    UNLIKE the sibling tests above, that stale row is NOT admin_override (a real deliberate
+    placement, which must always still win regardless — see test_start_enrollment_never_double_
+    books_a_confirmed_shared_clan_guest), it's just a leftover 'auto_assigned' guess with nothing
+    deliberate behind it, and the player's own live current clan flatly contradicts it."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    await _seed_guild_and_clan(db, "1022", clan_tag="#CLAN1")  # "The QCrew"
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#SHAREDCLAN', 'StayCalm')")
+    await db.conn.commit()
+
+    event_id = db.create_cwl_event_sync("1022", "2026-08", "creator")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#CLAN1", "participating": True},
+        {"clan_tag": "#SHAREDCLAN", "participating": True},
+    ])
+    shared_id = db.create_cwl_shared_clan_sync("#SHAREDCLAN", "2026-08", "1022", event_id, "unresolved_first_claimer")
+    db.add_guild_to_shared_clan_sync(shared_id, "1022", event_id)
+    # Stale — a passive auto-assign guess from an earlier cycle (NOT admin_override), left behind
+    # even though this player is now a genuine current member of #CLAN1.
+    db.set_cwl_shared_clan_player_assignment_sync(shared_id, "#QMANIAC", "QManiac", "d1", True, "auto_assigned", "1022")
+
+    await _seed_current_clan_member(db, "d1", "#QMANIAC", "#CLAN1")
+    await _seed_cwl_war(db, "#SHAREDCLAN", [("#QMANIAC", "QManiac")])  # stale history too
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
+
+    summary = await start_cwl_enrollment(1022, "2026-08")
+
+    assert summary["ok"] is True
+    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event_id)}
+    assert assignments.get("#QMANIAC") == "#CLAN1"  # their own real current clan wins
+    shared_players = {p["player_tag"]: p for p in db.get_cwl_shared_clan_players_sync(shared_id)}
+    assert "#QMANIAC" not in shared_players  # stale placement purged, not left dangling
+
+
+@pytest.mark.asyncio
+async def test_start_enrollment_never_assigns_a_player_into_an_unrelated_shared_clan(db, monkeypatch):
+    """2026-08-19 review finding — the real, mass-scale cause of "the qcrew members were falsely
+    auto-assigned to staycalm" (project owner's live report: a guild's OWN members piled into a
+    guest clan's column en masse, 26 in one screenshot).
+
+    assign_cwl_player_sync's `deliberate=False` guard was deciding "this player already has a real
+    claim elsewhere" from `shared_clan_ids_to_clear` — a set that, by construction, contains EVERY
+    participating shared clan whether or not the player is in it (it exists to drive the eviction
+    sweep, where a miss is a harmless no-op delete). So with any shared guest clan on the roster,
+    every auto-assigned player whose live current clan didn't happen to equal their auto-assign
+    target got an `orphaned_elsewhere` assignment written pointing at that guest clan — with zero
+    relationship to it and no row on its roster at all.
+
+    Here #LONER is a current member of a family clan that isn't participating, with real CWL
+    history for the guild's own participating #CLAN1, and nothing whatsoever to do with
+    #SHAREDCLAN."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+    monkeypatch.setattr(CACHE, "db_manager", db)
+
+    gid = "1023"
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (gid,))
+    for tag, name in [("#CLAN1", "QCrew"), ("#CLAN2", "QCrew2"), ("#SHAREDCLAN", "StayCalm")]:
+        await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (tag, name))
+    await db.conn.commit()
+    CACHE.server_config[gid] = {"member_clans": ["#CLAN1", "#CLAN2"], "member_families": []}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync(gid, "2026-08", "creator")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#CLAN1", "participating": True},
+        {"clan_tag": "#SHAREDCLAN", "participating": True},
+        {"clan_tag": "#CLAN2", "participating": False},
+    ])
+    shared_id = db.create_cwl_shared_clan_sync("#SHAREDCLAN", "2026-08", gid, event_id, "unresolved_first_claimer")
+    db.add_guild_to_shared_clan_sync(shared_id, gid, event_id)
+
+    await _seed_current_clan_member(db, "d1", "#LONER", "#CLAN2")
+    await _seed_cwl_war(db, "#CLAN1", [("#LONER", "Loner")])
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
+
+    await start_cwl_enrollment(int(gid), "2026-08")
+
+    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event_id)}
+    assert assignments.get("#LONER") == "#CLAN1"  # their real CWL history, not the guest clan
+    assert "#LONER" not in {p["player_tag"] for p in db.get_cwl_shared_clan_players_sync(shared_id)}
 
 
 @pytest.mark.asyncio

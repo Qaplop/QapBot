@@ -705,6 +705,69 @@ async def test_cwl_delete_season_confirm_view_confirm_deletes_and_refreshes(db, 
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_cwl_delete_season_confirm_view_retracts_stale_enrollment_dms(db, mock_interaction, monkeypatch):
+    """2026-08-19 live bug report: Delete Season left every recipient's Confirm/Opt Out DM
+    buttons sitting live-looking (though no longer functional) in their DMs. _on_confirm must
+    snapshot the DM refs BEFORE delete_cwl_event_sync() clears cwl_player_season_status (see that
+    function's own docstring), then best-effort retract the actual DM messages."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlDeleteSeasonConfirmView
+
+    await _seed_guild_and_clans(db, "448", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["448"] = {}
+
+    event_id = db.create_cwl_event_sync("448", "2026-09", "discordid1")
+    db.mark_cwl_player_dm_sent_sync(
+        "#P1", "2026-09", "PlayerOne", "10", event_id, 448, "2026-08-19T09:00Z", "msg1", "chan1",
+    )
+
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+    confirm_view = CwlDeleteSeasonConfirmView(parent_view=parent, guild_id=448, event_id=event_id, season="2026-09")
+
+    cleanup_mock = AsyncMock(return_value={"deleted": 1, "failed": 0})
+    monkeypatch.setattr("qapbot.QBdiscocmdshelper_cwl.cleanup_stale_cwl_enrollment_dms", cleanup_mock)
+
+    await confirm_view._on_confirm(mock_interaction)
+
+    cleanup_mock.assert_awaited_once()
+    call_args = cleanup_mock.await_args
+    assert call_args.args[0] is mock_interaction.client
+    assert call_args.args[1] == [
+        {"player_tag": "#P1", "discord_id": "10", "message_id": "msg1", "channel_id": "chan1"}
+    ]
+    # The dm_sent record it referenced is now gone too (delete_cwl_event_sync's own cleanup).
+    assert db.get_cwl_player_season_status_sync("#P1", "2026-09") is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_delete_season_confirm_view_skips_cleanup_when_nobody_was_dmed(db, mock_interaction, monkeypatch):
+    """No dm_refs to retract — the Discord-API cleanup call must not even be attempted."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlDeleteSeasonConfirmView
+
+    await _seed_guild_and_clans(db, "449", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["449"] = {}
+
+    event_id = db.create_cwl_event_sync("449", "2026-09", "discordid1")
+
+    parent = MagicMock()
+    parent.refresh_cwl_view = AsyncMock()
+    confirm_view = CwlDeleteSeasonConfirmView(parent_view=parent, guild_id=449, event_id=event_id, season="2026-09")
+
+    cleanup_mock = AsyncMock()
+    monkeypatch.setattr("qapbot.QBdiscocmdshelper_cwl.cleanup_stale_cwl_enrollment_dms", cleanup_mock)
+
+    await confirm_view._on_confirm(mock_interaction)
+
+    cleanup_mock.assert_not_awaited()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_cwl_delete_season_confirm_view_warns_about_shared_clans(db, mock_interaction):
     """2026-08-15 (delete-season guard) — a clan shared with another guild shows up in the
     warning text, but deleting still proceeds: this guild's own event is fully removed while
@@ -1352,7 +1415,10 @@ async def test_notify_new_members_button_present_when_someone_missing_dm(db):
 
     button = _notify_new_members_button(view)
     assert button is not None
-    assert button.row == 2  # type: ignore[union-attr]
+    # 2026-08-19, project owner's spec: green (not grey), and below the main action-button line
+    # (row 3), not above it.
+    assert button.row == 4  # type: ignore[union-attr]
+    assert button.style == discord.ButtonStyle.success  # type: ignore[union-attr]
 
 
 # ---------------------------------------------------------------------------

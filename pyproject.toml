@@ -40,7 +40,7 @@ typeCheckingMode = "strict"
 pythonVersion = "3.14"
 venvPath = "."
 venv = "venv"
-exclude = ["venv", "data", "archive", "archive_old", "__pycache__", ".claude", ".workspace_tools"]
+exclude = ["venv", "data", "archive", "archive_old", "__pycache__", ".claude", ".workspace_tools", "**/node_modules", "**/.*"]
 
 # The "unknown type propagated from an untyped source" rule family is turned off project-wide.
 # Two untyped sources dominate here: (1) unittest.mock objects (MagicMock/AsyncMock) throughout

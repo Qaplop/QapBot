@@ -1035,8 +1035,8 @@ with its sync DB work:
   not a style one. Examples: `ensure_cwl_clan_sharing`'s two branches
   (`_attach_guild_to_existing_shared_clan_sync`/`_create_new_shared_clan_sync`),
   `auto_assign_prior_cwl_members`, `evict_guild_from_shared_clan`,
-  `handle_post_cwl_enrollment_signup`/`_assign`/`_guest` and `handle_post_clan_config` in
-  `web_bridge.py` (`_apply_cwl_enrollment_signup_sync`/`_prepare_and_save_clan_config_sync`).
+  `handle_post_cwl_enrollment_assign`/`_guest` and `handle_post_clan_config` in `web_bridge.py`
+  (`_prepare_and_save_clan_config_sync`).
 - **Pattern B — wrap call-by-call.** A function that already has a real `await` in the middle
   (e.g. `prune_or_detach_shared_clans_before_deletion`/`detach_guild_from_shared_clan_on_deactivation`,
   both of which `await resolve_cwl_clan_owner()` mid-sequence) was never atomic across that
@@ -1249,3 +1249,55 @@ every existing route in `index.ts` already uses (see any `api.get(...)`/`api.pos
 there — query-string forwarding for GET, `{ ...body, discord_user_id: discordUserId }` for
 POST). `npm run typecheck` in `activity/server` catches a malformed route but NOT a missing one
 — only an actual live request (or manually diffing the two files' endpoint lists) surfaces that.
+
+---
+
+## Pitfall 31: `user_players` only has rows for clans with `has_active_subscriptions` — a CWL guest clan has none
+
+Symptom (2026-08-19, live-tested in DEV): a guest clan added to a CWL season showed a board column
+with **zero** players, forever. `Save` succeeded, the clan row persisted, the auto-assign/pool seed
+ran without error, and every unit test of the seed passed. Nothing in the log looked wrong.
+
+Root cause: everything in the CWL enrollment feature that asks "who is in this clan right now"
+goes through `db_manager.get_current_clan_members_sync()`, which reads
+`user_players.current_clan_tag`. That table is populated by exactly one writer —
+`coc_cache.py`'s `update_player_info_in_user_accounts()`, including the UNASSIGNED-pool rows it
+creates for never-linked players. Since the 2026-08-14 scope-bug incident, that call is gated on
+`clans.has_active_subscriptions`:
+
+```python
+if clan_data.get("has_active_subscriptions"):
+    await self.update_player_info_in_user_accounts(clan_obj, self.cache_manager)
+```
+
+and `has_active_subscriptions` is recomputed in `cache_manager.update_all_clan_subscription_statuses()`
+from **channel subscriptions + guild `member_clans` + guild `member_families`** — nothing else.
+A CWL **guest** clan is in none of those sets, so it has zero `user_players` rows and every seed
+reads an empty member list.
+
+Why it hid for so long: a guest clan that happens to be some *other* guild's own member clan is
+tracked for unrelated reasons and works fine. Only a genuinely foreign clan — one no guild on the
+bot subscribes to — exposes the gap. Every guest clan used in testing until this report was of the
+former kind.
+
+Two general lessons beyond CWL:
+
+1. **`user_players` is not a general "who's in clan X" table.** It is a projection of the clans
+   this bot is *subscribed* to. Before building any feature on `get_current_clan_members_sync()`
+   (or `current_clan_tag` directly), ask whether the clans involved are guaranteed to be in
+   `tracked_tags`. If a user can name an arbitrary clan, they are not.
+2. **Diagnose with the live DB, not the code.** Two queries settled "did our recent fixes break
+   this?" instantly:
+   ```
+   sqlite3 -readonly data/qapbot.db "SELECT clan_tag, has_active_subscriptions FROM clans WHERE clan_tag IN (...)"
+   sqlite3 -readonly data/qapbot.db "SELECT current_clan_tag, COUNT(*) FROM user_players GROUP BY 1"
+   ```
+   `0`/`0 rows` for the broken clan vs `1`/`47 rows` for the working one named the root cause
+   directly, where reading the seed code had produced several plausible-but-wrong theories.
+
+Fix pattern (`QBdiscocmdshelper_cwl.ensure_cwl_clan_membership_tracked`): for a clan a user has
+explicitly put on a roster and which has **no** tracked members at all, fetch it once via
+`CACHE.coc_clan_cache.get_clan()` and run `update_player_info_in_user_accounts()` on the result —
+the same population path, just on demand. Do **not** add such clans to `tracked_tags` to fix this:
+`_calculate_track_war_updates()` is a one-way ratchet, so that permanently enables war polling for
+a clan that is only relevant for one season.

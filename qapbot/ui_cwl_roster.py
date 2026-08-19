@@ -381,19 +381,22 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     # "Notify New Pool Members" (rule h, 2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md)
     # — shown only once enrollment has actually started AND there's at least one pool member who
     # hasn't been sent the enrollment DM yet, by ANY guild, this season (see
-    # has_cwl_pool_members_missing_dm's own docstring). Omitted entirely rather than just
-    # disabled — matching "Add New Season"'s own "don't show what's currently pointless"
-    # convention above — since this button has nothing to do the overwhelming majority of the
-    # time. Row 2 is free (row 1: season select, row 3: the 4 buttons above).
+    # has_cwl_pool_members_missing_dm's own docstring — it checks both conditions: event status
+    # not in draft/cancelled, and at least one DM-able pool tag with dm_sent still false). Omitted
+    # entirely rather than just disabled — matching "Add New Season"'s own "don't show what's
+    # currently pointless" convention above — since this button has nothing to do the overwhelming
+    # majority of the time. Row 4 (2026-08-19, project owner's spec: below the main action-button
+    # line, not above it) is the last row Discord allows (0-4) and otherwise unused here, so this
+    # always renders as the final row regardless of how many of the rows above it are present.
     if event is not None and event["status"] not in ("draft", "cancelled"):
         from qapbot.QBdiscocmdshelper_cwl import has_cwl_pool_members_missing_dm
 
         if has_cwl_pool_members_missing_dm(guild_id, season):
             notify_new_members_button = discord.ui.Button(
                 label=t('cwl.management.button_notify_new_members', guild_id=guild_id),
-                style=discord.ButtonStyle.secondary,
+                style=discord.ButtonStyle.success,
                 custom_id="cwl_management_notify_new_members",
-                row=2,
+                row=4,
             )
             notify_new_members_button.callback = _make_cwl_management_notify_new_members_callback(view)  # type: ignore[assignment]
             view.add_item(notify_new_members_button)  # type: ignore[arg-type]
@@ -912,12 +915,28 @@ class CwlDeleteSeasonConfirmView(discord.ui.View):
             # prune_or_detach_shared_clans_before_deletion's docstring for the full rationale.
             from qapbot.QBdiscocmdshelper_cwl import prune_or_detach_shared_clans_before_deletion
             await prune_or_detach_shared_clans_before_deletion(self.guild_id, self.event_id, self.season)
+            # Snapshot which players got an enrollment DM via THIS event, and where, BEFORE
+            # delete_cwl_event_sync() below clears their cwl_player_season_status rows (2026-08-19
+            # fix, live bug report — see that function's own docstring for why it clears them at
+            # all) — this is the only chance to retract those now-orphaned DMs' dangling Confirm/
+            # Opt Out buttons afterward.
+            dm_refs = await asyncio.to_thread(
+                db.get_cwl_player_season_status_dm_refs_for_event_sync, self.event_id
+            )
             # to_thread()-wrapped even though this callback already deferred above (so THIS
             # interaction is safe from the 3s ack deadline either way) — an un-wrapped sync write
             # here would still freeze the whole event loop for every OTHER concurrent guild/
             # interaction while it waits on _sync_write_lock/busy_timeout. See Pitfall 26,
             # COPILOT_PITFALLS_COOKBOOK.md.
             await asyncio.to_thread(db.delete_cwl_event_sync, self.event_id)
+            if dm_refs:
+                from qapbot.QBdiscocmdshelper_cwl import cleanup_stale_cwl_enrollment_dms
+                cleanup_result = await cleanup_stale_cwl_enrollment_dms(interaction.client, dm_refs)
+                logging.info(
+                    f"[CWL-ENROLLMENT] Delete Season for event {self.event_id}: retracted "
+                    f"{cleanup_result['deleted']}/{len(dm_refs)} stale enrollment DM(s), "
+                    f"{cleanup_result['failed']} could not be removed."
+                )
         # The season select (Phase E.3) can't keep pointing at a season that no longer has an
         # event — clear the persisted selection so the next open falls back to
         # resolve_selected_cwl_season()'s other-events/calendar-default resolution.

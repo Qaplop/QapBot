@@ -4076,21 +4076,34 @@ class MemberClansConfigurationView(discord.ui.View):
     def _add_family_buttons(self):
         """Add buttons for each clan family to toggle entire family membership."""
         from qapbot.cache_manager import CACHE
-        
+
         # Use only available families (passed during initialization)
         # These are filtered to show only families that have subscriptions or member clans
         all_families_to_show = dict(self.clan_families)
-        
+
         # Also include any selected member families (in case they were deselected from subscriptions)
         for family_id in self.member_families:
             if family_id not in all_families_to_show and family_id in CACHE.clan_families:
                 all_families_to_show[family_id] = CACHE.clan_families[family_id]
-        
-        if not all_families_to_show:
+
+        shown_families = list(all_families_to_show.items())[:5]  # Limit to 5 families
+
+        # Every clan belonging to one of THESE displayed families gets no separate "individual
+        # clan" toggle button in _add_clan_buttons() below (2026-08-19, live bug report: a
+        # 12-clan family showed all 12 member clans as their own redundant buttons too, even
+        # though the family button already grants membership for every one of them). Scoped to
+        # just the families actually rendered here — not every family this guild has — so a clan
+        # whose family didn't make the 5-family cap above still gets its own button, since that's
+        # its only way to be individually selectable in that case.
+        self._family_member_clan_tags: set = set()
+        for _family_id, family_data in shown_families:
+            self._family_member_clan_tags.update(family_data.get("clans", []))
+
+        if not shown_families:
             return
-        
+
         row = 0
-        for family_id, family_data in list(all_families_to_show.items())[:5]:  # Limit to 5 families
+        for family_id, family_data in shown_families:
             family_name = family_data.get("name", "Unknown Family")
             
             # Check if family is in member_families
@@ -4119,13 +4132,23 @@ class MemberClansConfigurationView(discord.ui.View):
         return callback
     
     def _add_clan_buttons(self):
-        """Add buttons for each available clan to toggle membership."""
+        """Add buttons for each available clan to toggle membership — excluding any clan already
+        covered by one of the family buttons above (see _add_family_buttons' own comment on
+        self._family_member_clan_tags for why: that family's button already grants membership to
+        every one of its clans, so offering a separate individual button for the same clan too is
+        redundant) UNLESS that clan is already individually selected (self.member_clans) from
+        before this fix existed — that clan still needs its own button so the admin can toggle it
+        back off; only NEW individual selections of an already-family-covered clan are blocked."""
         from qapbot.cache_manager import CACHE
-        
+
+        family_member_clan_tags = getattr(self, '_family_member_clan_tags', set())
         # Use guild_clans from parent ClanManagementView (single source of truth),
         # sorted alphabetically by clan name (not tag) for a stable, readable order
         clans_to_show = sorted(
-            self.clan_management_view.guild_clans,
+            (
+                tag for tag in self.clan_management_view.guild_clans
+                if tag not in family_member_clan_tags or tag in self.member_clans
+            ),
             key=lambda tag: (CACHE.get_clan_name(tag, tag) or tag).lower()  # type: ignore[arg-type]
         )
         

@@ -378,6 +378,69 @@ class TestCwlCascadeDelete:
         assert db.get_cwl_event_sync("222", "2026-09") is None
         assert db.get_cwl_event_clans_sync(event_id) == []
 
+    async def test_delete_cwl_event_sync_clears_dm_sent_for_this_event(self, db):
+        """2026-08-19 live bug report: deleting a season and immediately starting a new one for
+        the SAME season string silently DMed nobody, because cwl_player_season_status.dm_sent
+        (deliberately not cascaded from cwl_events — see its own CREATE TABLE comment) was still
+        standing from the deleted event. delete_cwl_event_sync() must now clear it for any row
+        entirely attributable to the event being deleted."""
+        await _seed_guild_and_clan(db, guild_id="223", clan_tag="#CLAN1")
+        event_id = db.create_cwl_event_sync("223", "2026-09", "discordid1")
+        db.mark_cwl_player_dm_sent_sync(
+            "#P1", "2026-09", "PlayerOne", "10", event_id, 223, "2026-08-19T09:00Z", "msg1", "chan1",
+        )
+
+        assert db.get_cwl_player_season_status_sync("#P1", "2026-09")["dm_sent"] == 1
+
+        assert db.delete_cwl_event_sync(event_id) is True
+
+        assert db.get_cwl_player_season_status_sync("#P1", "2026-09") is None
+
+    async def test_delete_cwl_event_sync_preserves_dm_sent_responded_via_another_event(self, db):
+        """A player who DID respond via a DIFFERENT, still-existing event (the cross-guild
+        shared-clan case) must keep their dm_sent record — deleting THIS event must not make
+        them eligible for a duplicate DM through the other, still-live event."""
+        await _seed_guild_and_clan(db, guild_id="224", clan_tag="#CLAN1")
+        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('225')")
+        await db.conn.commit()
+        event_id = db.create_cwl_event_sync("224", "2026-09", "discordid1")
+        other_event_id = db.create_cwl_event_sync("225", "2026-09", "discordid1")
+        db.mark_cwl_player_dm_sent_sync(
+            "#P1", "2026-09", "PlayerOne", "10", event_id, 224, "2026-08-19T09:00Z", "msg1", "chan1",
+        )
+        db.set_cwl_player_response_status_sync(
+            "#P1", "2026-09", "PlayerOne", "10", "confirmed", "2026-08-19T09:05Z", other_event_id, 225,
+        )
+
+        assert db.delete_cwl_event_sync(event_id) is True
+
+        status = db.get_cwl_player_season_status_sync("#P1", "2026-09")
+        assert status is not None
+        assert status["dm_sent"] == 1
+        assert status["status"] == "confirmed"
+
+    async def test_get_cwl_player_season_status_dm_refs_for_event_sync(self, db):
+        await _seed_guild_and_clan(db, guild_id="226", clan_tag="#CLAN1")
+        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('227')")
+        await db.conn.commit()
+        event_id = db.create_cwl_event_sync("226", "2026-09", "discordid1")
+        other_event_id = db.create_cwl_event_sync("227", "2026-09", "discordid1")
+        db.mark_cwl_player_dm_sent_sync(
+            "#P1", "2026-09", "PlayerOne", "10", event_id, 226, "2026-08-19T09:00Z", "msg1", "chan1",
+        )
+        # Responded via a DIFFERENT still-existing event — must NOT be offered up for retraction,
+        # matching delete_cwl_event_sync()'s own scoping (it won't be deleted either).
+        db.mark_cwl_player_dm_sent_sync(
+            "#P2", "2026-09", "PlayerTwo", "20", event_id, 226, "2026-08-19T09:00Z", "msg2", "chan2",
+        )
+        db.set_cwl_player_response_status_sync(
+            "#P2", "2026-09", "PlayerTwo", "20", "confirmed", "2026-08-19T09:05Z", other_event_id, 227,
+        )
+
+        refs = db.get_cwl_player_season_status_dm_refs_for_event_sync(event_id)
+
+        assert refs == [{"player_tag": "#P1", "discord_id": "10", "message_id": "msg1", "channel_id": "chan1"}]
+
 
 class TestGuildConfigCwlColumns:
     @pytest.mark.integration
@@ -1180,17 +1243,23 @@ class TestCwlPlayerSeasonStatus:
     surface directly rather than through start_cwl_enrollment()."""
 
     async def test_dm_sent_round_trip_and_bulk_lookup(self, db):
+        # dm_sent_via_event_id must point to a REAL cwl_events row for the bulk dedup lookup to
+        # trust it (2026-08-19 follow-up fix — see get_cwl_player_season_dm_status_bulk_sync's own
+        # docstring: a dm_sent=1 row whose event no longer exists self-heals to "never DMed").
+        await _seed_guild_and_clan(db, guild_id="100", clan_tag="#CLAN1")
+        event_id = db.create_cwl_event_sync("100", "2026-08", "discordid1")
+
         assert db.get_cwl_player_season_status_sync("#P1", "2026-08") is None
         assert db.get_cwl_player_season_dm_status_bulk_sync(["#P1", "#P2"], "2026-08") == {}
 
-        ok = db.mark_cwl_player_dm_sent_sync("#P1", "2026-08", "Player One", "d1", 1, 100, "2026-08-18T09:00Z")
+        ok = db.mark_cwl_player_dm_sent_sync("#P1", "2026-08", "Player One", "d1", event_id, 100, "2026-08-18T09:00Z")
         assert ok is True
 
         row = db.get_cwl_player_season_status_sync("#P1", "2026-08")
         assert row is not None
         assert row["dm_sent"] == 1
         assert row["dm_sent_at"] == "2026-08-18T09:00Z"
-        assert row["dm_sent_via_event_id"] == 1
+        assert row["dm_sent_via_event_id"] == event_id
         assert row["dm_sent_via_guild_id"] == "100"
         assert row["status"] == "pending"  # untouched default — dm_sent and status are independent
         assert row["responded_at"] is None
@@ -1202,6 +1271,23 @@ class TestCwlPlayerSeasonStatus:
 
         # A different season for the same player is a completely separate record.
         assert db.get_cwl_player_season_status_sync("#P1", "2026-09") is None
+
+    async def test_dm_sent_bulk_lookup_self_heals_when_event_no_longer_exists(self, db):
+        """2026-08-19 follow-up fix, live bug report: delete_cwl_event_sync() only cleans up
+        cwl_player_season_status rows at the MOMENT of a delete going forward — this covers rows
+        already left orphaned by an OLDER delete (from before that fix shipped, or any other way
+        the referenced event stopped existing) without needing a one-time backfill migration."""
+        await _seed_guild_and_clan(db, guild_id="101", clan_tag="#CLAN1")
+        event_id = db.create_cwl_event_sync("101", "2026-08", "discordid1")
+        db.mark_cwl_player_dm_sent_sync("#P1", "2026-08", "Player One", "d1", event_id, 101, "2026-08-18T09:00Z")
+        assert db.get_cwl_player_season_dm_status_bulk_sync(["#P1"], "2026-08") == {"#P1": True}
+
+        # Simulates the pre-fix delete_cwl_event_sync(): removes the event WITHOUT touching
+        # cwl_player_season_status at all, leaving dm_sent=1 pointing at a now-nonexistent event.
+        await db.conn.execute("DELETE FROM cwl_events WHERE id = ?", (event_id,))
+        await db.conn.commit()
+
+        assert db.get_cwl_player_season_dm_status_bulk_sync(["#P1"], "2026-08") == {}
 
     async def test_re_marking_dm_sent_updates_in_place_without_touching_status(self, db):
         db.mark_cwl_player_dm_sent_sync("#P1", "2026-08", "Player One", "d1", 1, 100, "2026-08-18T09:00Z")

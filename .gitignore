@@ -257,3 +257,7 @@ activity/**/.env.local
 activity/**/.env.*.local
 .repo_*backup*/
 .claude/
+
+# Manual QA checklist's own browser Save-Progress state — personal local test progress, not
+# repo content (the checklist itself, tests/cwl_enrollment_manual_qa_checklist.html, IS tracked).
+tests/cwl-qa-checklist-progress.json

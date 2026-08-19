@@ -1327,6 +1327,7 @@ class CacheManager:
         message: str,
         view: Optional['discord.ui.View'] = None,
         embed: Optional['discord.Embed'] = None,
+        sent_message_out: Optional[list] = None,
     ) -> Tuple[bool, Literal["sent", "blocked", "failed"]]:
         """
         Send DM to user, handling fetch and metadata update internally, and retrying a
@@ -1361,6 +1362,14 @@ class CacheManager:
             if not sent and outcome == "blocked":
                 # tell the admin this recipient has DMs closed, retrying won't help
                 ...
+
+        sent_message_out (2026-08-19, optional) — a caller that needs the actual sent
+        discord.Message back (e.g. to remember its id for later cleanup, like the CWL enrollment
+        DM's Delete-Season retraction) passes a list here and this appends the Message to it on
+        success. A new out-param rather than widening the (bool, outcome) return tuple, since that
+        tuple is unpacked by name at every existing call site (including this method's own
+        send_user_dm() wrapper) — widening it would force every one of those to change too, for a
+        detail only one caller actually needs.
         """
         import discord
 
@@ -1374,7 +1383,9 @@ class CacheManager:
         last_error: Optional[Exception] = None
         for attempt in range(1, DM_SEND_MAX_RETRIES + 1):
             try:
-                await user.send(message, view=view, embed=embed)
+                sent_message = await user.send(message, view=view, embed=embed)
+                if sent_message_out is not None:
+                    sent_message_out.append(sent_message)
                 # Preview is truncated, not the full message, to keep this readable and avoid
                 # logging anything sensitive (e.g. a confirm link) in full.
                 preview = message[:60] + ('…' if len(message) > 60 else '') if message else ''

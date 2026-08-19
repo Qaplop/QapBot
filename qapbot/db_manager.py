@@ -2253,7 +2253,17 @@ class WarHistoryDB:
         # `dm_sent_via_*`/`responded_via_*` are audit-only, deliberately NOT foreign keys (same
         # rationale as cwl_signups.origin_shared_clan_id) — the event/guild that first sent the DM
         # or recorded the response may later be deleted (Delete Season) without this global record
-        # needing to be touched or cascaded.
+        # needing to be touched or cascaded, EXCEPT when the row is entirely attributable to that
+        # one event (its DM was sent via this event, and it was never responded to via any OTHER
+        # still-existing event) — delete_cwl_event_sync() explicitly clears exactly that subset
+        # (2026-08-19 fix, live bug report: deleting a season and starting a new one for the same
+        # season string left dm_sent=1 standing for every pooled player, so the new event's Start
+        # Enrollment silently DMed nobody). A row whose response came via a DIFFERENT, still-live
+        # event (cross-guild shared clan) is untouched — that dedup must still survive.
+        # `dm_sent_via_message_id`/`dm_sent_via_channel_id` (2026-08-19) — the actual DM message
+        # this was sent as, so a deleted event's now-orphaned DMs (dead Confirm/Opt Out buttons)
+        # can be retracted; see delete_cwl_event_sync()'s caller (CwlDeleteSeasonConfirmView.
+        # _on_confirm, ui_cwl_roster.py) for the cleanup itself.
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS cwl_player_season_status (
                 id                     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2265,6 +2275,8 @@ class WarHistoryDB:
                 dm_sent_at             TEXT,
                 dm_sent_via_event_id   INTEGER,
                 dm_sent_via_guild_id   TEXT,
+                dm_sent_via_message_id TEXT,
+                dm_sent_via_channel_id TEXT,
                 status                 TEXT    NOT NULL DEFAULT 'pending',
                 responded_at           TEXT,
                 responded_via_event_id INTEGER,
@@ -2423,6 +2435,8 @@ class WarHistoryDB:
         await self._add_column_if_missing("guild_config", "timezone_name", "TEXT NOT NULL DEFAULT 'UTC'")
         await self._add_column_if_missing("cwl_event_clans", "participating", "INTEGER NOT NULL DEFAULT 1")
         await self._add_column_if_missing("cwl_signups", "origin_shared_clan_id", "INTEGER")
+        await self._add_column_if_missing("cwl_player_season_status", "dm_sent_via_message_id", "TEXT")
+        await self._add_column_if_missing("cwl_player_season_status", "dm_sent_via_channel_id", "TEXT")
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cwl_signups_origin_shared_clan "
             "ON cwl_signups(origin_shared_clan_id, player_tag) WHERE origin_shared_clan_id IS NOT NULL"
@@ -3574,7 +3588,19 @@ class WarHistoryDB:
         """Delete a cwl_events row outright — cascades to cwl_event_clans/cwl_signups/
         cwl_assignments (ON DELETE CASCADE). Used by the admin "Delete Season" action (mainly
         for testing/starting over), not part of the normal draft->announced lifecycle, which
-        uses update_cwl_event_status_sync() instead."""
+        uses update_cwl_event_status_sync() instead.
+
+        Also clears any cwl_player_season_status row entirely attributable to THIS event (2026-
+        08-19 fix, live bug report — see the table's own CREATE TABLE comment for the full
+        rationale): cwl_player_season_status is deliberately not cascaded via foreign key, since
+        it's meant to survive event deletion for cross-guild dedup, but that meant a deleted-then-
+        immediately-recreated season silently DMed nobody (every pooled player's dm_sent=1 flag
+        from the deleted event was still standing). A row whose response came via a DIFFERENT,
+        still-existing event is left untouched — that cross-guild dedup still has to survive.
+        Callers that need the (discord_id, message_id, channel_id) of the DMs this is about to
+        forget — e.g. to retract them — MUST read
+        get_cwl_player_season_status_dm_refs_for_event_sync(event_id) first; this call wipes
+        exactly the rows that query would return."""
         import sqlite3
 
         if not self.db_path:
@@ -3583,6 +3609,14 @@ class WarHistoryDB:
         with self._sync_conn() as conn:
             try:
                 with self._sync_write_lock:
+                    conn.execute(
+                        """
+                        DELETE FROM cwl_player_season_status
+                        WHERE dm_sent_via_event_id = ?
+                          AND (responded_via_event_id IS NULL OR responded_via_event_id = ?)
+                        """,
+                        (event_id, event_id),
+                    )
                     conn.execute("DELETE FROM cwl_events WHERE id = ?", (event_id,))
                     if self._should_commit():
                         conn.commit()
@@ -3591,6 +3625,41 @@ class WarHistoryDB:
                 logging.error(f"[DB-WRITE-SYNC] delete_cwl_event_sync failed for event {event_id}: {e}")
                 conn.rollback()
                 return False
+
+    def get_cwl_player_season_status_dm_refs_for_event_sync(self, event_id: int) -> List[Dict[str, Any]]:
+        """Every (player_tag, discord_id, message_id, channel_id) for a DM this exact event sent
+        that's still eligible to be cleaned up if the event is about to be deleted — same scoping
+        delete_cwl_event_sync() itself uses (see its own docstring), read BEFORE that call wipes
+        the row away. Used by "Delete Season" (CwlDeleteSeasonConfirmView._on_confirm,
+        ui_cwl_roster.py) to best-effort retract the now-orphaned DM messages so their dangling
+        Confirm/Opt Out buttons don't sit there looking live forever."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT player_tag, discord_id, dm_sent_via_message_id, dm_sent_via_channel_id
+                    FROM cwl_player_season_status
+                    WHERE dm_sent_via_event_id = ?
+                      AND dm_sent_via_message_id IS NOT NULL
+                      AND discord_id IS NOT NULL
+                      AND (responded_via_event_id IS NULL OR responded_via_event_id = ?)
+                    """,
+                    (event_id, event_id),
+                ).fetchall()
+                return [
+                    {"player_tag": row[0], "discord_id": row[1], "message_id": row[2], "channel_id": row[3]}
+                    for row in rows
+                ]
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-QUERY-SYNC] get_cwl_player_season_status_dm_refs_for_event_sync failed for event {event_id}: {e}"
+                )
+                return []
 
     def set_cwl_event_clans_sync(self, event_id: int, clan_configs: List[Dict[str, Any]]) -> bool:
         """Replace an event's full cwl_event_clans set in one atomic DELETE + INSERT (matches
@@ -4394,7 +4463,16 @@ class WarHistoryDB:
         no row (never contacted) is simply absent from the returned dict — callers use
         `.get(tag, False)`. Chunked manually (not via _chunked_in_query_sync, which has no slot
         for the extra cwl_season parameter) to stay under SQLite's ~999 host-parameter limit for a
-        large pool (CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 4's same concern)."""
+        large pool (CWL_PROD_PERFORMANCE_FIX_PLAN.md Step 4's same concern).
+
+        A dm_sent=1 row is only trusted here if it's still traceable to a LIVE event — either the
+        event that sent the DM (dm_sent_via_event_id) or the event that recorded a genuine
+        response (responded_via_event_id) still actually exists in cwl_events. Otherwise it's
+        excluded from the result entirely, which callers' `.get(tag, False)` then reads as "never
+        contacted" (2026-08-19 follow-up fix, live bug report: delete_cwl_event_sync() only
+        cleans up rows at the MOMENT of a delete going forward — this self-heals any row already
+        left orphaned by a delete that happened before that fix shipped, without needing a
+        one-time backfill migration)."""
         import sqlite3
 
         if not self.db_path:
@@ -4410,8 +4488,16 @@ class WarHistoryDB:
                     chunk = player_tags[i:i + chunk_size]
                     placeholders = ",".join("?" for _ in chunk)
                     rows = conn.execute(
-                        f"SELECT player_tag, dm_sent FROM cwl_player_season_status "
-                        f"WHERE cwl_season = ? AND player_tag IN ({placeholders})",
+                        f"""
+                        SELECT player_tag, dm_sent FROM cwl_player_season_status
+                        WHERE cwl_season = ? AND player_tag IN ({placeholders})
+                          AND (
+                            dm_sent = 0
+                            OR dm_sent_via_event_id IN (SELECT id FROM cwl_events)
+                            OR (responded_via_event_id IS NOT NULL
+                                AND responded_via_event_id IN (SELECT id FROM cwl_events))
+                          )
+                        """,
                         [cwl_season, *chunk],
                     ).fetchall()
                     for row in rows:
@@ -4455,10 +4541,16 @@ class WarHistoryDB:
     def mark_cwl_player_dm_sent_sync(
         self, player_tag: str, cwl_season: str, player_name: Optional[str], discord_id: Optional[str],
         event_id: int, guild_id: int, sent_at: str,
+        message_id: Optional[str] = None, channel_id: Optional[str] = None,
     ) -> bool:
         """Record that the enrollment DM went out to this player for this season — touches ONLY
         the dm_sent* columns, never `status` (see the table's own CREATE TABLE comment). Upserts
-        so the first guild to ever DM this player for a season creates the row."""
+        so the first guild to ever DM this player for a season creates the row.
+
+        message_id/channel_id (2026-08-19, optional, default None for any caller that doesn't
+        have them) — the actual DM message, so a later Delete Season can retract it (see
+        delete_cwl_event_sync's own docstring). Optional rather than required so this doesn't
+        force every existing caller to thread ids it may not have through unrelated call sites."""
         import sqlite3
 
         if not self.db_path:
@@ -4471,8 +4563,9 @@ class WarHistoryDB:
                         """
                         INSERT INTO cwl_player_season_status
                             (player_tag, cwl_season, player_name, discord_id, dm_sent, dm_sent_at,
-                             dm_sent_via_event_id, dm_sent_via_guild_id)
-                        VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                             dm_sent_via_event_id, dm_sent_via_guild_id, dm_sent_via_message_id,
+                             dm_sent_via_channel_id)
+                        VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
                         ON CONFLICT(player_tag, cwl_season) DO UPDATE SET
                             player_name = excluded.player_name,
                             discord_id = excluded.discord_id,
@@ -4480,9 +4573,14 @@ class WarHistoryDB:
                             dm_sent_at = excluded.dm_sent_at,
                             dm_sent_via_event_id = excluded.dm_sent_via_event_id,
                             dm_sent_via_guild_id = excluded.dm_sent_via_guild_id,
+                            dm_sent_via_message_id = excluded.dm_sent_via_message_id,
+                            dm_sent_via_channel_id = excluded.dm_sent_via_channel_id,
                             updated_at = datetime('now')
                         """,
-                        (player_tag, cwl_season, player_name, discord_id, sent_at, event_id, str(guild_id)),
+                        (
+                            player_tag, cwl_season, player_name, discord_id, sent_at, event_id, str(guild_id),
+                            message_id, channel_id,
+                        ),
                     )
                     if self._should_commit():
                         conn.commit()

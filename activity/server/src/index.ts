@@ -245,27 +245,6 @@ api.get('/cwl/player-stats', async (c) => {
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500 | 503)
 })
 
-api.post('/cwl/enrollment/signup', async (c) => {
-  const discordUserId = await verifiedDiscordUserId(c)
-  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
-
-  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
-
-  let body: Record<string, unknown>
-  try {
-    body = await c.req.json()
-  } catch {
-    return c.json({ error: 'invalid JSON body' }, 400)
-  }
-
-  const upstream = await fetch(`${c.env.BRIDGE_URL}/api/cwl/enrollment/signup`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': c.env.BRIDGE_SECRET },
-    body: JSON.stringify({ ...body, discord_user_id: discordUserId }),
-  })
-  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 404 | 409 | 503)
-})
-
 api.post('/cwl/enrollment/assign', async (c) => {
   const discordUserId = await verifiedDiscordUserId(c)
   if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)

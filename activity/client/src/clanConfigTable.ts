@@ -124,9 +124,18 @@ export function renderClanConfigTable(
   // here) rather than reusing `working`'s own player data, since guest PLAYERS aren't part of
   // `working` at all (that array is clans only).
   onGuestPlayersList: () => Promise<GuestPlayerPoolEntry[]>,
-  onGuestPlayersRemove: (playerTags: string[]) => Promise<void>,
+  onGuestPlayersRemove: (
+    playerTags: string[],
+  ) => Promise<{ rejected: { player_tag: string; clan_name: string }[] }>,
 ): void {
   const working: ClanConfig[] = payload.clans.map((c) => ({ ...c }))
+  // Immutable snapshot of which clans already exist on the SAVED roster, taken once here before
+  // any Add/Remove mutates `working` — removeGuestClanRow (below) uses this to tell "removing a
+  // clan the backend has never heard of yet" (a freshly-added, still-unsaved row — nothing to
+  // call the backend about, just drop it from `working`) apart from "removing a clan that's
+  // actually persisted" (needs the real onGuestClanRemove network call) (2026-08-19, project
+  // owner's spec: the Remove button must appear immediately on Add, not only after Save+reopen).
+  const persistedClanTags = new Set(payload.clans.map((c) => c.clan_tag))
 
   container.innerHTML = ''
 
@@ -194,8 +203,16 @@ export function renderClanConfigTable(
   // `existingClanTags`/`updateSelectAllState`/`updateReadOnlyNoticeVisibility` even though those
   // are declared further down in this function body — none of that matters until this actually
   // runs, long after the whole render has finished (a user click, not initial render).
+  //
+  // Skips the network call entirely for a clan NOT in persistedClanTags (2026-08-19) — a
+  // freshly-added, still-unsaved row the backend has never heard of; onGuestClanRemove would
+  // just 404 against a cwl_event_clans row that doesn't exist yet. "Remove" on a row like that is
+  // exactly the same as it always silently was before Save existed: drop it from `working` and
+  // move on.
   async function removeGuestClanRow(clan: ClanConfig, row: HTMLTableRowElement): Promise<void> {
-    await onGuestClanRemove(clan.clan_tag)
+    if (persistedClanTags.has(clan.clan_tag)) {
+      await onGuestClanRemove(clan.clan_tag)
+    }
     const index = working.indexOf(clan)
     if (index !== -1) working.splice(index, 1)
     existingClanTags.delete(clan.clan_tag)
@@ -376,6 +393,12 @@ export function renderClanConfigTable(
             shared_with: clanResult.already_shared_with
               ? { is_owner: false, other_guild_ids: [], other_guild_names: [clanResult.already_shared_with] }
               : null,
+            // Always a guest by construction — the Guests search only ever offers clans outside
+            // the guild's own family (2026-08-19, project owner's spec: the Remove button must
+            // show up immediately on Add, not only after Save+reopen). removeGuestClanRow's own
+            // persistedClanTags check is what keeps clicking it here from firing a network call
+            // against a clan the backend has never heard of yet.
+            is_guest: true,
           }
           working.push(newClan)
           existingClanTags.add(clanResult.clan_tag)
@@ -604,9 +627,30 @@ export function renderClanConfigTable(
       selectionStatus.textContent = 'Removing…'
       selectionStatus.className = 'guests-status'
       try {
-        await onGuestPlayersRemove(selected)
-        guestPlayersPanel.style.display = 'none'
-        guestPlayersPanel.innerHTML = ''
+        const { rejected } = await onGuestPlayersRemove(selected)
+        if (rejected.length === 0) {
+          guestPlayersPanel.style.display = 'none'
+          guestPlayersPanel.innerHTML = ''
+          return
+        }
+        // Race condition (2026-08-19, guest-player provenance feature): the list above is already
+        // pre-filtered to individually-invited players by onGuestPlayersList, so landing here
+        // means one of them got reclassified as clan-derived (their clan was invited as a guest
+        // clan) in the moment between that fetch and this click — rare, but the backend is the
+        // final authority, not this stale-by-the-time-of-click snapshot. Any tags NOT in
+        // `rejected` were still removed successfully.
+        const rejectedNames = rejected.map((r) => {
+          const player = players.find((p) => p.player_tag === r.player_tag)
+          const label = player ? (player.player_name ?? player.player_tag) : r.player_tag
+          return `${label} (added via guest clan ${r.clan_name})`
+        })
+        selectionStatus.textContent = `Could not remove: ${rejectedNames.join(', ')}. Remove the whole guest clan instead.`
+        selectionStatus.className = 'guests-status error'
+        removeSelectedButton.disabled = false
+        cancelSelectionButton.disabled = false
+        for (const cb of checkboxes) {
+          if (!rejected.some((r) => r.player_tag === cb.value)) cb.checked = false
+        }
       } catch (err) {
         console.error(err)
         selectionStatus.textContent = `Failed: ${(err as Error).message}`

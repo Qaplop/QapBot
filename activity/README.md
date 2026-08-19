@@ -56,6 +56,26 @@ you just got.
 without manually swapping one shared file before every deploy. Plain `npm run dev`/`npm run
 build` (no mode flag) still fall back to `.env.local`.
 
+## Editing `client/src/*` does not ship anything by itself
+
+The live Discord Activity iframe loads the built Cloudflare Pages bundle in `client/dist/`, not
+the TypeScript source — `npm run dev`/`tsc --noEmit` only validate the source, they don't touch
+what's deployed. After any change to `client/src/*.ts` (or its `index.html`/CSS) that needs to be
+testable live, redeploy in the same step:
+
+```
+cd activity/client && npm run deploy:dev
+```
+
+(2026-08-19 incident: a same-session fix to `clanConfigTable.ts` was implemented and
+typecheck-verified correctly, but the bundle was never rebuilt/redeployed. The user tested it live
+hours later, saw the old broken behavior, and reasonably reported it as a fresh regression — it
+was actually just an undeployed fix. `ls -la dist/assets` vs. `src/*.ts` mtimes is the fast way to
+confirm/rule this out if a "regression" is reported for something that was supposedly just fixed.)
+
+PROD (`npm run deploy:prod`) still needs explicit user confirmation before every deploy — this
+redeploy-on-edit habit applies to DEV only.
+
 ## Local development
 
 Discord cannot embed `localhost` URLs directly — for local iteration once Phase A's spike is

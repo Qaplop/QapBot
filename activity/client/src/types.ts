@@ -18,11 +18,15 @@ export type ClanConfig = {
   shared_with: { is_owner: boolean; other_guild_ids: string[]; other_guild_names: string[] } | null
   /** True when this clan is NOT part of the guild's own CWL family (2026-08-18,
    * CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md rule f) — drives the "Remove" button, which must
-   * never be offered for a real family clan. GET-only, computed server-side from
+   * never be offered for a real family clan. GET-only from the backend, computed server-side from
    * resolve_guild_member_clan_tags(); a freshly-added guest clan (still unsaved, from the Guests
-   * search "Add" click) is constructed client-side and deliberately does NOT set this field
-   * (stays `undefined`/falsy) — Remove is only offered for a clan that's actually on the saved
-   * roster, since removing an unsaved row is just "don't click Save." */
+   * search "Add" click) is constructed client-side and sets this to `true` too (2026-08-19,
+   * project owner's spec: Remove must appear immediately on Add, not only after Save+reopen —
+   * every clan the Guests search can add is a guest by construction, so this is always correct
+   * for that path). clanConfigTable.ts's removeGuestClanRow separately tracks which clan tags are
+   * actually persisted (`persistedClanTags`, snapshotted from this same payload before any
+   * client-side Add) so that clicking Remove on a still-unsaved row never fires a network call
+   * against a clan the backend has never heard of yet. */
   is_guest?: boolean
 }
 
@@ -53,7 +57,7 @@ export type EnrollmentClan = {
 }
 
 /** `signup_status` is null when the player is a current clan member who hasn't signed up (or
- * responded to anything) at all yet — still shown on the board, ready for a 1-click Confirm.
+ * responded to anything) at all yet — still shown on the board, waiting on their own DM response.
  * `assigned_clan_tag` is null for "Unassigned" — the `cwl_assignments` table has no row for
  * this player, never a nullable value on that row itself (see the plan doc's data model note). */
 export type EnrollmentPlayer = {
@@ -61,9 +65,12 @@ export type EnrollmentPlayer = {
   player_name: string | null
   discord_id: string | null
   // The board only ever displays pending/confirmed/declined — the true statuses a member's own
-  // DM response can produce. 'withdrawn' remains a value the bridge can send (legacy data, or a
-  // future non-board caller of POST /api/cwl/enrollment/signup) but the board treats it the same
-  // as null/unknown rather than giving it its own icon — see enrollmentBoard.ts's isVisibleStatus().
+  // DM response can produce. 'withdrawn' is legacy-only (2026-08-19: its one writer, the board's
+  // now-removed 1-click admin confirm/withdraw control and its POST /api/cwl/enrollment/signup
+  // endpoint, was deleted outright — dead code with no real caller, per CWL_ROSTER_PLANNING_
+  // PLAN.md's own "known cleanup opportunity" note) — kept in the type purely so any pre-existing
+  // DB row still carrying it renders without crashing; the board treats it the same as
+  // null/unknown rather than giving it its own icon — see enrollmentBoard.ts's isVisibleStatus().
   signup_status: 'pending' | 'confirmed' | 'declined' | 'withdrawn' | null
   assigned_clan_tag: string | null
   th_level: number | null

@@ -211,6 +211,31 @@ async function setup(): Promise<void> {
             attack_defense_ratio: number | null
           }
         },
+        // Right-click "Remove guest player" (2026-08-19, guest-player provenance feature) — same
+        // endpoint the Configure Participating Clans panel above uses, single-tag. A guest-clan-
+        // derived player comes back in `rejected` (this card offers the menu to every guest
+        // player, clan-derived or not — see buildCard's own comment for why) — surfaced as a
+        // thrown Error so the board's existing onRemoveGuestPlayer .catch() shows it inline via
+        // the footer status text, same as every other action failure on this board.
+        async (playerTag: string) => {
+          const removeResponse = await fetch('/api/cwl/enrollment/guest-players/remove', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+            body: JSON.stringify({ guild_id: guildId, player_tags: [playerTag] }),
+          })
+          if (!removeResponse.ok) {
+            const body = await removeResponse.text()
+            throw new Error(`${removeResponse.status}: ${body}`)
+          }
+          const { rejected } = (await removeResponse.json()) as {
+            rejected: { player_tag: string; clan_name: string }[]
+          }
+          if (rejected.length > 0) {
+            throw new Error(
+              `This player was added by guest clan ${rejected[0].clan_name} — only removing the whole guest clan will remove them.`,
+            )
+          }
+        },
       )
 
       // Event-driven live-update (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8 —
@@ -419,6 +444,10 @@ async function setup(): Promise<void> {
           const body = await removeResponse.text()
           throw new Error(`${removeResponse.status}: ${body}`)
         }
+        const { rejected } = (await removeResponse.json()) as {
+          rejected: { player_tag: string; clan_name: string }[]
+        }
+        return { rejected }
       },
     )
   } catch (err) {

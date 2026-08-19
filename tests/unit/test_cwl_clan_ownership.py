@@ -996,8 +996,14 @@ async def test_detach_mirrors_confirmed_shared_roster_into_local_orphaned_assign
 
     # Mirrored locally: still shows as assigned to #CLAN1 (now a non-existent column for guild
     # 100), instead of vanishing from the board entirely.
-    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(target_event_id)}
-    assert assignments["#STUCK"] == "#CLAN1"
+    assignments_by_tag = {a["player_tag"]: a for a in db.get_cwl_assignments_sync(target_event_id)}
+    assert assignments_by_tag["#STUCK"]["assigned_clan_tag"] == "#CLAN1"
+    # Mirrored as assignment_source="admin_override"/locked=True — the SAME live values a real
+    # drag-and-drop placement carries (2026-08-19 fix, project owner's spec: this placement must
+    # survive a later Remove too, not just Uncheck — only these exact values are what
+    # _cleanup_local_pool_for_plain_clan_deactivation_sync preserves).
+    assert assignments_by_tag["#STUCK"]["assignment_source"] == "admin_override"
+    assert assignments_by_tag["#STUCK"]["locked"] == 1
     signup = db.get_cwl_signup_sync(target_event_id, "#STUCK")
     assert signup is not None
     assert signup["origin_shared_clan_id"] == shared_clan_id
@@ -1024,6 +1030,44 @@ async def test_detach_does_not_mirror_a_non_confirmed_shared_roster_player(db, m
     assert db.get_cwl_signup_sync(target_event_id, "#PENDING_PLAYER") is None
     assignments = {a["player_tag"] for a in db.get_cwl_assignments_sync(target_event_id)}
     assert "#PENDING_PLAYER" not in assignments
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_detach_does_not_mirror_a_real_members_own_deliberate_self_assignment(db, monkeypatch):
+    """2026-08-19 live bug report, project owner — the write-time counterpart of
+    test_shared_guest_clan_remove_purges_own_member_deliberately_placed_into_own_column below:
+    "STY - Basement," a genuine current member of the shared clan itself, deliberately
+    drag-assigned into that same clan's OWN column, still got mirrored into a local "Assigned to
+    other Guild" placement — and since this mirror is the ONLY thing detach_guild_from_shared_
+    clan_on_deactivation does on a plain UNCHECK (the destructive cleanup that would otherwise
+    catch this only runs from the explicit Remove button, per rule f), this showed up even before
+    Remove was ever clicked. Contrast with test_detach_mirrors_confirmed_shared_roster_into_local_
+    orphaned_assignment above (#STUCK, no known live current clan — the genuinely preservable
+    case). Project owner's correction of the framing, verbatim: "the assigned to other guild case
+    serves a different purpose, namely a player that is rightfully member of the current player
+    pool... but is assigned to another guild's roster" — a real direct member of the clan itself
+    was never "rightfully in this guild's pool" to begin with."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    # #BASEMENT is a genuine CURRENT member of #CLAN1 itself (the shared clan), deliberately
+    # drag-assigned into its own column.
+    await _seed_current_clan_member(db, "77", "#BASEMENT", "#CLAN1")
+    db.set_cwl_shared_clan_player_assignment_sync(shared_clan_id, "#BASEMENT", "Basement", "77", True, "admin_override", "100")
+
+    await detach_guild_from_shared_clan_on_deactivation(100, target_event_id, "2026-09", "#CLAN1")
+
+    # No local mirror written at all — nothing to preserve here, this is a mere Uncheck, not
+    # even a Remove yet.
+    assert db.get_cwl_signup_sync(target_event_id, "#BASEMENT") is None
+    assignments = {a["player_tag"] for a in db.get_cwl_assignments_sync(target_event_id)}
+    assert "#BASEMENT" not in assignments
+    # The shared roster itself is untouched either way (this function never writes to it).
+    shared_players = {p["player_tag"] for p in db.get_cwl_shared_clan_players_sync(shared_clan_id)}
+    assert "#BASEMENT" in shared_players
 
 
 @pytest.mark.discord
@@ -1055,32 +1099,33 @@ async def test_detach_does_not_mirror_an_auto_seeded_or_auto_assigned_confirmed_
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_detach_deletes_stale_local_mirror_for_non_admin_override_player(db, monkeypatch):
-    """Live-testing feedback (2026-08-16, project owner's spec, verbatim, repeated and
-    emphasized): "The STY members still show up in both pools 'Assigned to other guild' and
-    'Unassigned'. Fix this now and adhere to my instructions." The sibling test above only
-    proves a non-admin_override player never gets a NEW local mirror row — it doesn't cover a
-    player who already HAS a local cwl_signups/cwl_assignments row from earlier, while the clan
-    was still active, via sync_cwl_shared_clan_roster_to_local_pools() (or an earlier detach
-    before this filter existed). Detaching now must actively delete that stale mirror, not just
-    skip re-creating it, or the player keeps showing up in Unassigned (signup with no assignment)
-    or Assigned to other Guild (signup + assignment) forever."""
+async def test_detach_no_longer_deletes_a_players_existing_local_mirror(db, monkeypatch):
+    """SUPERSEDED 2026-08-19 (rule f, live bug report: "Members vanished from player pool after
+    uncheck for StayCalm" — a genuinely cross-guild-shared clan). This test used to assert the
+    OPPOSITE — that detaching actively deletes a player's existing local cwl_signups/
+    cwl_assignments mirror (from while the clan was still an active, participating column) —
+    which was correct behavior BEFORE rule f existed (2026-08-16 fix, project owner's spec at the
+    time, verbatim: "The STY members still show up in both pools..."). Rule f (2026-08-18)
+    requires a mere uncheck+Save to be purely cosmetic for the player pool here too, exactly like
+    the plain-clan branch (shared is None) — this test was never revisited when rule f shipped,
+    so it kept locking in the pre-rule-f (now wrong) behavior. Deletion now only ever happens via
+    the explicit "Remove" button (remove_cwl_guest_clan)."""
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
 
     monkeypatch.setattr(CACHE, "db_manager", db)
     shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     db.set_cwl_shared_clan_player_assignment_sync(shared_clan_id, "#AUTO_PLAYER", "Auto", "77", True, "auto_assigned", "100")
-    # Stale local mirror, as if sync_cwl_shared_clan_roster_to_local_pools() (or an earlier,
-    # pre-filter detach) already wrote it while the clan was still active.
+    # Existing local mirror, as if sync_cwl_shared_clan_roster_to_local_pools() already wrote it
+    # while the clan was still active/participating.
     db.upsert_cwl_signup_sync(target_event_id, "#AUTO_PLAYER", "Auto", "77", None, "guest_invite", "pending")
     db.upsert_cwl_assignment_sync(target_event_id, "#AUTO_PLAYER", "#CLAN1", assignment_source="orphaned_on_detach", locked=False)
 
     await detach_guild_from_shared_clan_on_deactivation(100, target_event_id, "2026-09", "#CLAN1")
 
-    assert db.get_cwl_signup_sync(target_event_id, "#AUTO_PLAYER") is None
+    assert db.get_cwl_signup_sync(target_event_id, "#AUTO_PLAYER") is not None
     assignments = {a["player_tag"] for a in db.get_cwl_assignments_sync(target_event_id)}
-    assert "#AUTO_PLAYER" not in assignments
+    assert "#AUTO_PLAYER" in assignments
 
 
 @pytest.mark.discord
@@ -1169,6 +1214,162 @@ async def test_remove_guest_clan_purges_local_pool_even_when_clan_is_shared(db, 
     assert db.get_cwl_event_clans_sync(owner_event_id) == []  # the clan row itself is gone too
 
 
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_remove_guest_clan_still_preserves_a_deliberate_admin_override_placement(db, monkeypatch):
+    """2026-08-19 fix, project owner's spec, verbatim, confirmed explicitly: "'assigned players
+    remain in their rosters... becomes a guest player automatically' even when the clan is
+    removed" — NOT just on a mere Uncheck. Before this fix, detach_guild_from_shared_clan_on_
+    deactivation's shared-roster mirror-write used a softer assignment_source ("orphaned_on_
+    detach"/locked=False) that _cleanup_local_pool_for_plain_clan_deactivation_sync's own
+    preservation check didn't recognize — so remove_cwl_guest_clan silently deleted the very
+    placement it was supposed to preserve, the instant after the shared-detach step wrote it.
+    This is the sibling of test_remove_guest_clan_purges_local_pool_even_when_clan_is_shared
+    above: that test proves ordinary (non-deliberate) members DO get purged by Remove; this one
+    proves a genuine deliberate placement still does NOT, exactly like it survives a mere
+    Uncheck (test_detach_mirrors_confirmed_shared_roster_into_local_orphaned_assignment)."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": [], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    # #STUCK was drag-assigned INTO the shared clan itself from guild 100's own board — a genuine
+    # deliberate placement, exactly like the mere-Uncheck sibling test's setup.
+    db.set_cwl_shared_clan_player_assignment_sync(shared_clan_id, "#STUCK", "Stuck", "77", True, "admin_override", "100")
+
+    await remove_cwl_guest_clan(100, target_event_id, "2026-09", "#CLAN1")
+
+    signup = db.get_cwl_signup_sync(target_event_id, "#STUCK")
+    assert signup is not None  # NOT purged, unlike an ordinary member
+    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(target_event_id)}
+    assert assignments.get("#STUCK") == "#CLAN1"
+    # The clan itself is still fully removed — only the deliberate placement survives.
+    assert db.get_cwl_event_clans_sync(target_event_id) == []
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_remove_guest_clan_preserves_a_member_drag_assigned_into_a_family_clan(db, monkeypatch):
+    """The OTHER direction of the same rule (2026-08-19 fix, live bug report, project owner,
+    verbatim: "I dragged a StayCalm member to TheQCrew's roster and then I removed StayCalm.
+    According to our rule that member should have stayed but is gone now"). Distinct from the
+    sibling test above (which drags a player INTO the shared clan's own column) — here a real
+    CURRENT member of the shared clan being removed is manually drag-assigned the OTHER way,
+    into one of the guild's own family clans instead. Their local cwl_assignments row points at
+    the FAMILY clan, not the shared clan being removed — _cleanup_local_pool_for_plain_clan_
+    deactivation_sync's preservation check used to only look at an assignment scoped to the clan
+    being removed, so it never found this one and deleted it (and the player's signup) anyway."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": ["#FAMILY_CLAN"], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#FAMILY_CLAN', 'Family Clan')")
+    await db.conn.commit()
+    # #DRAGGED is a real CURRENT member of #CLAN1 (the shared clan about to be removed)...
+    await _seed_current_clan_member(db, "77", "#DRAGGED", "#CLAN1")
+    db.upsert_cwl_signup_sync(target_event_id, "#DRAGGED", "Dragged", "77", None, "auto_assigned", "pending")
+    # ...but was manually drag-assigned into the guild's own family clan instead — assign_cwl_
+    # player_sync's real values for a Manage Enrollment drag (handle_post_cwl_enrollment_assign,
+    # web_bridge.py: source="admin_override", locked=True).
+    db.upsert_cwl_assignment_sync(target_event_id, "#DRAGGED", "#FAMILY_CLAN", assignment_source="admin_override", locked=True)
+
+    await remove_cwl_guest_clan(100, target_event_id, "2026-09", "#CLAN1")
+
+    signup = db.get_cwl_signup_sync(target_event_id, "#DRAGGED")
+    assert signup is not None  # NOT purged
+    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(target_event_id)}
+    assert assignments.get("#DRAGGED") == "#FAMILY_CLAN"  # placement survives, fully untouched
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_remove_guest_clan_purges_local_mirror_for_a_player_who_since_left_the_shared_clan(db, monkeypatch):
+    """2026-08-19 fix, live bug report, project owner, verbatim: "I NEVER ADDED THOSE GUESTS
+    MANUALLY THROUGH THE PLAYER GUEST INVITE FEATURE!!!" — followed by tracing the real sequence:
+    a shared clan's roster member gets mirrored into this guild's own local cwl_signups by
+    sync_cwl_shared_clan_roster_to_local_pools as a source='guest_invite' placeholder the moment
+    the shared clan is added (never a manual invite), with no cwl_assignments row and no
+    origin_shared_clan_id written. If that player has since left the shared clan in real life,
+    they were invisible to BOTH of this cleanup's other candidate sources (not a live clan_tag
+    member, no local assignment pointing at clan_tag) — their mirror row lingered forever, later
+    showing up as an oddly "individually removable" guest player the admin never actually
+    invited."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan, sync_cwl_shared_clan_roster_to_local_pools
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": [], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    # #FORMER_MEMBER was a genuine participant of #CLAN1 (tracked on the SHARED roster, not this
+    # guild's local tables) while #CLAN1 was active on guild 100's board.
+    db.set_cwl_shared_clan_player_status_sync(
+        shared_clan_id, "#FORMER_MEMBER", "Former", "77", "pending", "auto_seeded", "100",
+    )
+    # sync_cwl_shared_clan_roster_to_local_pools mirrors it into guild 100's own local cwl_signups
+    # — exactly what the real seeding flow does (auto_assign_prior_cwl_members_sync's Step 2, via
+    # this same function), never anything the admin clicked themselves.
+    sync_cwl_shared_clan_roster_to_local_pools(shared_clan_id)
+    assert db.get_cwl_signup_sync(target_event_id, "#FORMER_MEMBER")["source"] == "guest_invite"
+
+    # ...but #FORMER_MEMBER has SINCE left #CLAN1 in real life — now a member of some unrelated
+    # clan the guild has never heard of.
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#UNRELATED', 'Unrelated Clan')")
+    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('77', '77')")
+    await db.conn.execute(
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
+        "VALUES ('77', '#FORMER_MEMBER', 'Former', 1, '#UNRELATED')"
+    )
+    await db.conn.commit()
+
+    await remove_cwl_guest_clan(100, target_event_id, "2026-09", "#CLAN1")
+
+    assert db.get_cwl_signup_sync(target_event_id, "#FORMER_MEMBER") is None  # the fix
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_remove_shared_guest_clan_clears_stale_pointer_for_a_real_family_member(db, monkeypatch):
+    """The exact live scenario, reproduced (2026-08-19, project owner, verbatim: "the qcrew
+    members were falsely auto-assigned to staycalm. On the other hand... after removing staycalm
+    the error becomes obvious"). A player who is a genuine CURRENT member of the guild's own
+    family clan (TheQCrew) somehow ended up with a non-deliberate local assignment pointing at
+    #CLAN1 (a shared guest clan, e.g. from a prior-CWL-history seed that predates them joining
+    the family clan). Confirmed via the live dev log/DB: their signup must survive (they're a
+    real pool member) but the stale assignment must be cleared — left alone, the board renders
+    them stuck in "Assigned to other Guild" forever once #CLAN1 is removed, even though they're
+    just an ordinary family-clan member who should show as Unassigned."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": ["#FAMILY_CLAN"], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#FAMILY_CLAN', 'Family Clan')")
+    await db.conn.commit()
+    await _seed_current_clan_member(db, "77", "#QCREW_MEMBER", "#FAMILY_CLAN")
+    db.upsert_cwl_signup_sync(target_event_id, "#QCREW_MEMBER", "QMember", "77", None, "template_confirm", "confirmed")
+    # Non-deliberate — e.g. resolve_prior_cwl_assignments seeded them into #CLAN1 based on stale
+    # prior-CWL-attack history, before real-world data caught up to them now being a #FAMILY_CLAN
+    # member. NOT admin_override/locked (that's the sibling test's scenario, correctly preserved
+    # as-is regardless).
+    db.upsert_cwl_assignment_sync(target_event_id, "#QCREW_MEMBER", "#CLAN1", assignment_source="suggested", locked=False)
+
+    await remove_cwl_guest_clan(100, target_event_id, "2026-09", "#CLAN1")
+
+    signup = db.get_cwl_signup_sync(target_event_id, "#QCREW_MEMBER")
+    assert signup is not None  # pool membership survives
+    assert signup["status"] == "confirmed"  # their real response is untouched
+    assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(target_event_id)}
+    assert "#QCREW_MEMBER" not in assignments  # stale pointer cleared — falls back to Unassigned
+
+
 # ---------------------------------------------------------------------------
 # detach_guild_from_shared_clan_on_deactivation — the `shared is None` branch: a PLAIN guest clan
 # (never cross-guild shared with anyone else). 2026-08-16 follow-up, live-testing feedback,
@@ -1211,11 +1412,12 @@ async def test_plain_guest_clan_detach_removes_auto_assigned_and_auto_seeded_pla
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_plain_guest_clan_remove_preserves_deliberate_admin_override_assignment(db, monkeypatch):
-    """A genuine human drag-and-drop placement must survive — same "Assigned to other Guild"
-    treatment the shared-clan branch gives its own admin_override players, except here the local
-    cwl_assignments row already IS the real assignment (no shared table to mirror from), so
-    preserving it is simply not deleting it."""
+async def test_plain_guest_clan_remove_preserves_deliberate_cross_assignment_to_a_different_clan(db, monkeypatch):
+    """A genuine human drag-and-drop placement into a DIFFERENT clan than the one being removed
+    must survive — same "Assigned to other Guild" treatment the shared-clan branch gives its own
+    admin_override players (see test_detach_converts_cross_assigned_real_member_into_a_guest_player
+    above), except here the local cwl_assignments row already IS the real assignment (no shared
+    table to mirror from), so preserving it is simply not deleting it."""
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
 
@@ -1223,18 +1425,97 @@ async def test_plain_guest_clan_remove_preserves_deliberate_admin_override_assig
     monkeypatch.setattr(CACHE, "server_config", {"301": {"member_clans": [], "member_families": []}})
     monkeypatch.setattr(CACHE, "clan_families", {})
     await _seed_guild_and_clan(db, "301", "#GUESTCLAN")
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHERCLAN', 'Other Clan')")
+    await db.conn.commit()
     event_id = db.create_cwl_event_sync("301", "2026-09", "111")
-    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#GUESTCLAN", "participating": True}])
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#GUESTCLAN", "participating": True}, {"clan_tag": "#OTHERCLAN", "participating": True},
+    ])
     await _seed_current_clan_member(db, "10", "#DRAGGED", "#GUESTCLAN")
     db.upsert_cwl_signup_sync(event_id, "#DRAGGED", "Dragged", "10", None, "admin_added", "pending")
-    db.upsert_cwl_assignment_sync(event_id, "#DRAGGED", "#GUESTCLAN", assignment_source="admin_override", locked=True)
+    db.upsert_cwl_assignment_sync(event_id, "#DRAGGED", "#OTHERCLAN", assignment_source="admin_override", locked=True)
 
     await remove_cwl_guest_clan(301, event_id, "2026-09", "#GUESTCLAN")
 
     signup = db.get_cwl_signup_sync(event_id, "#DRAGGED")
     assert signup is not None
     assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event_id)}
-    assert assignments.get("#DRAGGED") == "#GUESTCLAN"  # still "Assigned to other Guild" once deactivated
+    assert assignments.get("#DRAGGED") == "#OTHERCLAN"  # untouched, still a real placement
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_plain_guest_clan_remove_purges_deliberate_assignment_into_the_removed_clan_itself(db, monkeypatch):
+    """2026-08-19 live bug report, project owner: he added Hohenloher Land as a guest clan, then
+    manually drag-assigned its own real member Akaza INTO Hohenloher Land's own column (not a
+    cross-assignment elsewhere) — then clicked Remove on Hohenloher Land. Akaza still lingered in
+    the pool (visible in "Remove Guest Players…") instead of being purged like every other member.
+
+    Root cause: the deliberate-placement preservation check preserved an admin_override/locked
+    assignment "wherever it currently points," with no exception for pointing AT clan_tag itself.
+    The whole point of preservation is "a cross-assignment into a DIFFERENT clan survives its
+    origin clan's removal" (see the sibling test above) — there's nothing to preserve when the
+    placement points at the clan being fully removed: that column/roster is gone entirely, so a
+    player manually placed into their own clan's column must be purged exactly like any other
+    ordinary (non-deliberate) direct member of that clan."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "server_config", {"307": {"member_clans": [], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    await _seed_guild_and_clan(db, "307", "#GUESTCLAN")
+    event_id = db.create_cwl_event_sync("307", "2026-09", "111")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#GUESTCLAN", "participating": True}])
+    await _seed_current_clan_member(db, "10", "#AKAZA", "#GUESTCLAN")
+    db.upsert_cwl_signup_sync(event_id, "#AKAZA", "Akaza", "10", None, "auto_seeded", "pending")
+    db.upsert_cwl_assignment_sync(event_id, "#AKAZA", "#GUESTCLAN", assignment_source="admin_override", locked=True)
+
+    await remove_cwl_guest_clan(307, event_id, "2026-09", "#GUESTCLAN")
+
+    assert db.get_cwl_signup_sync(event_id, "#AKAZA") is None
+    assignments = {a["player_tag"] for a in db.get_cwl_assignments_sync(event_id)}
+    assert "#AKAZA" not in assignments
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_shared_guest_clan_remove_purges_own_member_deliberately_placed_into_own_column(db, monkeypatch):
+    """2026-08-19 live bug report, project owner — the SAME symptom as the Akaza/Hohenloher-Land
+    test above recurred for a genuinely cross-guild-SHARED clan (StayCalm), which the first fix's
+    `shared_clan_id is not None` carve-out didn't cover: "when adding a cross-linked clan from
+    another guild, then assigning one of its own members to itself and then removing that clan
+    again should not leave that manually assigned player in the guild's pool... the 'assigned to
+    other guild' case serves a different purpose, namely a player that is rightfully a member of
+    the current player pool (e.g. because he is a member of this guild) but is assigned to another
+    guild's roster — those are the players that should appear in that category."
+
+    #BASEMENT here is a genuine CURRENT member of the shared clan itself (#CLAN1) — not a member
+    of guild 100's own pool by any other measure — drag-assigned into #CLAN1's OWN column while it
+    was a guest clan on guild 100's board. #CLAN1 being genuinely shared (owned by guild 200) is
+    not enough on its own to preserve this: #BASEMENT was never "one of guild 100's own players
+    assigned to another guild," they're simply a foreign player whose guest invitation just ended,
+    same as every other ordinary member of the removed clan."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
+
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": [], "member_families": []}})
+    monkeypatch.setattr(CACHE, "clan_families", {})
+    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    # A genuine CURRENT member of #CLAN1 (the shared clan itself), deliberately drag-assigned
+    # into its own column from guild 100's own board — mirrors what a real admin drag actually
+    # produces (assignment_source="admin_override", locked=True — see web_bridge.py:
+    # handle_post_cwl_enrollment_assign).
+    await _seed_current_clan_member(db, "10", "#BASEMENT", "#CLAN1")
+    db.upsert_cwl_signup_sync(target_event_id, "#BASEMENT", "Basement", "10", None, "admin_added", "pending")
+    db.upsert_cwl_assignment_sync(target_event_id, "#BASEMENT", "#CLAN1", assignment_source="admin_override", locked=True)
+
+    await remove_cwl_guest_clan(100, target_event_id, "2026-09", "#CLAN1")
+
+    assert db.get_cwl_signup_sync(target_event_id, "#BASEMENT") is None
+    assignments = {a["player_tag"] for a in db.get_cwl_assignments_sync(target_event_id)}
+    assert "#BASEMENT" not in assignments
 
 
 @pytest.mark.discord
@@ -1242,7 +1523,12 @@ async def test_plain_guest_clan_remove_preserves_deliberate_admin_override_assig
 async def test_plain_guest_clan_detach_never_deletes_a_genuine_family_members_signup(db, monkeypatch):
     """A player who is a CURRENT member of one of this guild's own family clans must never have
     their local signup deleted, even if they also happen to carry old auto_assigned/auto_seeded
-    history from the guest clan (e.g. from before they moved into the family clan)."""
+    history from the guest clan (e.g. from before they moved into the family clan) — but their
+    now-stale ASSIGNMENT pointing at the just-removed guest clan IS cleared (2026-08-19 fix, live
+    bug report, project owner: "the qcrew members were falsely auto-assigned to staycalm... after
+    removing staycalm the error becomes obvious" — real family-clan members were stuck rendering
+    as "Assigned to other Guild" forever otherwise, since this cleanup already correctly refused
+    to delete their pool membership but never cleared the resulting dangling pointer)."""
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import remove_cwl_guest_clan
 
@@ -1265,10 +1551,11 @@ async def test_plain_guest_clan_detach_never_deletes_a_genuine_family_members_si
     await remove_cwl_guest_clan(302, event_id, "2026-09", "#GUESTCLAN")
 
     signup = db.get_cwl_signup_sync(event_id, "#REAL_SIGNUP")
-    assert signup is not None
+    assert signup is not None  # pool membership survives
     assert signup["source"] == "template_confirm"
+    assert signup["status"] == "confirmed"  # their real response is untouched too
     assignments = {a["player_tag"]: a["assigned_clan_tag"] for a in db.get_cwl_assignments_sync(event_id)}
-    assert assignments.get("#REAL_SIGNUP") == "#GUESTCLAN"  # left completely untouched
+    assert "#REAL_SIGNUP" not in assignments  # the stale pointer is cleared — falls back to Unassigned
 
 
 # ---------------------------------------------------------------------------

@@ -281,6 +281,11 @@ export function renderEnrollmentBoard(
   // the last three cwl seaons") — one player's own recent-CWL stats, fetched per-hover. Also
   // optional, same reasoning as onResolveClanNames above.
   onFetchPlayerStats?: (playerTag: string) => Promise<PlayerStats>,
+  // Right-click "Remove guest player" (2026-08-19, guest-player provenance feature, project
+  // owner's spec: "allows the user to remove a guest player by right-clicking"). Optional, same
+  // reasoning as onResolveClanNames above — a caller that omits it just doesn't get the
+  // context-menu affordance (buildCard's contextmenu listener is itself gated on this being set).
+  onRemoveGuestPlayer?: (playerTag: string) => Promise<void>,
 ): EnrollmentBoardHandle {
   const working: EnrollmentPlayer[] = payload.players.map((p) => ({ ...p }))
   const byTag = new Map(working.map((p) => [p.player_tag, p]))
@@ -361,6 +366,64 @@ export function renderEnrollmentBoard(
       activeTooltip = null
     }
   }
+
+  // Right-click "Remove guest player" context menu (2026-08-19) — a single-item menu, positioned
+  // at the click point rather than anchored to the card (unlike the hover pop-up above, which
+  // anchors to the card itself since it opens on a stationary hover, not a click at a specific
+  // spot). Same viewport-clamping idea as positionTooltip, simplified to one point instead of an
+  // anchor rect.
+  let activeContextMenu: HTMLElement | null = null
+
+  function hideContextMenu(): void {
+    if (activeContextMenu) {
+      activeContextMenu.remove()
+      activeContextMenu = null
+    }
+  }
+
+  function showContextMenu(player: EnrollmentPlayer, x: number, y: number): void {
+    hideContextMenu()
+    const el = document.createElement('div')
+    el.className = 'player-context-menu'
+    const item = document.createElement('button')
+    item.className = 'player-context-menu-item'
+    item.textContent = 'Remove guest player'
+    item.addEventListener('click', () => {
+      hideContextMenu()
+      if (!onRemoveGuestPlayer) return
+      status.textContent = `Removing ${displayName(player)}...`
+      status.className = 'save-status'
+      onRemoveGuestPlayer(player.player_tag)
+        .then(() => {
+          status.textContent = `${displayName(player)} removed.`
+          status.className = 'save-status'
+        })
+        .catch((err: unknown) => {
+          console.error(err)
+          status.textContent = `Action failed: ${(err as Error).message}`
+          status.className = 'save-status error'
+        })
+    })
+    el.appendChild(item)
+    document.body.appendChild(el)
+    const menuRect = el.getBoundingClientRect()
+    const margin = 8
+    const left = Math.min(x, window.innerWidth - menuRect.width - margin)
+    const top = Math.min(y, window.innerHeight - menuRect.height - margin)
+    el.style.left = `${Math.max(margin, left)}px`
+    el.style.top = `${Math.max(margin, top)}px`
+    activeContextMenu = el
+  }
+
+  // Dismiss on any click elsewhere, scroll, or Escape — same "outside interaction closes it"
+  // behavior every native OS/browser context menu already has. Registered once for the life of
+  // this board render, same as the resize listener above (this module has no unmount hook to
+  // unregister it from — every other module-lifetime listener here follows the same pattern).
+  document.addEventListener('click', hideContextMenu)
+  document.addEventListener('scroll', hideContextMenu, true)
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') hideContextMenu()
+  })
 
   // mouseenter handler — schedules showTooltip() after HOVER_TOOLTIP_DELAY_MS instead of calling
   // it directly, so the pop-up (and its clan-name/player-stats fetches) only ever fires for a
@@ -616,6 +679,21 @@ export function renderEnrollmentBoard(
     }
     card.addEventListener('mouseenter', () => scheduleTooltip(player, card))
     card.addEventListener('mouseleave', hideTooltip)
+    // Only guest players are ever individually removable this way (project owner's spec: "allows
+    // the user to remove a guest player by right-clicking") — a regular member's card gets no
+    // custom menu at all, falling through to whatever the browser's own default context menu is.
+    // Guest-clan-derived players DO still get the menu (they look identical to individually
+    // invited ones from here — there's nothing client-side to tell them apart without asking the
+    // backend); the rejection with its explanatory message comes back from onRemoveGuestPlayer's
+    // own POST instead, same "let the backend be the single source of truth" approach the rest of
+    // this board already uses for the actual pool data.
+    if (player.is_guest && onRemoveGuestPlayer) {
+      card.addEventListener('contextmenu', (e) => {
+        e.preventDefault()
+        hideTooltip()
+        showContextMenu(player, e.clientX, e.clientY)
+      })
+    }
     card.draggable = true
     card.addEventListener('dragstart', (e) => {
       hideTooltip()
@@ -764,6 +842,19 @@ export function renderEnrollmentBoard(
     const nameSpan = document.createElement('span')
     nameSpan.className = 'column-header-name-text'
     nameSpan.textContent = clanTag === null ? 'Unassigned' : isOrphanedColumn ? 'Assigned to other Guild' : (clan?.name ?? clanTag)
+    // Headline hover explanation (2026-08-19, project owner's spec: "explains to the user that
+    // these clans are already assigned and should be handled with care") — a plain native `title`
+    // tooltip, same lightweight pattern already used for the skill-metric label and the
+    // status-icon tooltips just below (skill.title/icon.title) rather than the full async
+    // hover-popup machinery built for player cards, since this text is static and needs no
+    // per-hover data fetch. Only this one column needs it — every other header's own name (a
+    // clan) or "Unassigned" is already self-explanatory.
+    if (isOrphanedColumn) {
+      nameSpan.title =
+        'These players have a real, deliberate placement in a clan managed by another guild — ' +
+        'not just a leftover on this board. Dragging one elsewhere evicts them from that other ' +
+        "guild's roster too, so leave them here unless you specifically mean to undo that placement."
+    }
     nameLine.appendChild(nameSpan)
     const countSpan = document.createElement('span')
     countSpan.className = 'column-count'
@@ -885,6 +976,7 @@ export function renderEnrollmentBoard(
     // (once the user moves the mouse again) shows a fresh one against the new card, same as a
     // native browser tooltip would also disappear when its anchor element is replaced.
     hideTooltip()
+    hideContextMenu()
     board.innerHTML = ''
     // Populated by buildColumn() while it builds each column's cards (still detached from the
     // document at that point, so offsetTop/offsetHeight would read zero) — sized in a second

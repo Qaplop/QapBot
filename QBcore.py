@@ -655,7 +655,7 @@ Runtime statistics for the periodic update cycle.
 """
 
 # Nightly maintenance duration history
-nightly_maintenance_durations: "deque[float]" = deque(maxlen=10)
+nightly_maintenance_durations: deque[float] = deque(maxlen=10)
 """
 Rolling window of the last 10 completed nightly-maintenance run durations
 (seconds), oldest first. Populated by run_nightly_maintenance_routine() in
