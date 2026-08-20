@@ -2118,6 +2118,56 @@ async def test_enrollment_get_prefers_live_th_level_over_war_attacks_fallback(db
     assert players_by_tag["#P1"]["th_level"] == 16
 
 
+@pytest.mark.asyncio
+async def test_enrollment_get_uses_cached_th_level_for_clanless_pooled_player(db, bridge_config, client, monkeypatch):
+    """A pooled player (cwl_signups row) who has since left every family/participating clan —
+    current_clan_tag NULL in user_players, so get_current_clan_members_sync structurally can't
+    return them — must still show their real, cached th_level rather than falling all the way
+    through to (possibly much older, or entirely absent) war_attacks history (2026-08-20, live bug
+    report: players who left their clan after being pooled showed a blank TH badge despite the
+    bot already having their TH cached from before they left)."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "791", {"#CLAN2": "Beta"})
+    CACHE.db_manager = db
+    CACHE.server_config["791"] = {"member_clans": ["#CLAN2"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("791", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN2", "participating": True}])
+    # Stale war_attacks history (TH10) predating a cached, more recent user_players.th_level (12).
+    await db.conn.execute(
+        "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
+        "VALUES ('war2', '#CLAN2', '#OPP', 0, '', '2026-01-01T10:00')"
+    )
+    await db.conn.execute(
+        "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
+        "VALUES ('war2', '#CLAN2', '2026-01-01T10:00', 'Departed', '#P2', 10, 1, 0)"
+    )
+    # current_clan_tag left NULL: this player has left every clan the bot tracks.
+    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('11', '11')")
+    await db.conn.execute(
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag, th_level) "
+        "VALUES ('11', '#P2', 'Departed', 1, NULL, 12)"
+    )
+    await db.conn.commit()
+    db.upsert_cwl_signup_sync(event_id, "#P2", "Departed", "11", None, "template_confirm", "pending")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(791, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "791", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+    assert players_by_tag["#P2"]["th_level"] == 12
+
+
 @pytest.mark.discord
 @pytest.mark.asyncio
 async def test_enrollment_get_no_event_returns_empty(db, bridge_config, client, monkeypatch):
