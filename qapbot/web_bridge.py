@@ -715,7 +715,10 @@ def _search_cwl_guests_sync(guild_id: int, query: str) -> List[Dict[str, Any]]:
     `already_shared_with` (that other guild's display name, or its raw ID if unresolvable) so
     the frontend can highlight it and prompt for confirmation before adding.
 
-    Player hits: two match paths merged and deduped by player_tag —
+    Player hits, excluding anyone who already has a cwl_signups row for this event (2026-08-20
+    fix, live bug report: an already-invited guest kept reappearing in later searches) — same
+    reasoning as the clan exclusion above, just player-scoped instead of participating-clan-
+    scoped. Two match paths merged and deduped by player_tag —
       1. CACHE.search_player_names() (name substring, already powers /whois) plus a direct tag
          match/prefix if `query` looks like a tag.
       2. Discord-account display-name substring over CACHE.user_accounts — each of THAT
@@ -759,11 +762,15 @@ def _search_cwl_guests_sync(guild_id: int, query: str) -> List[Dict[str, Any]]:
 
     guild_id_str = str(guild_id)
     already_participating: Set[str] = set()
+    already_invited_player_tags: Set[str] = set()
     season = resolve_selected_cwl_season(guild_id)
     event = db.get_cwl_event_sync(guild_id_str, season)
     if event is not None:
         already_participating = {
             c["clan_tag"] for c in db.get_cwl_event_clans_sync(event["id"]) if c.get("participating", 1)
+        }
+        already_invited_player_tags = {
+            s["player_tag"] for s in db.get_cwl_signups_for_event_sync(event["id"])
         }
 
     import QBcore
@@ -784,11 +791,13 @@ def _search_cwl_guests_sync(guild_id: int, query: str) -> List[Dict[str, Any]]:
         return hits
 
     def _finalize_player_hits(player_hits: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not player_hits:
+        tags = [tag for tag in player_hits if tag not in already_invited_player_tags]
+        if not tags:
             return []
-        links = db.get_player_links_sync(list(player_hits.keys()))
+        links = db.get_player_links_sync(tags)
         out: List[Dict[str, Any]] = []
-        for tag, hit in player_hits.items():
+        for tag in tags:
+            hit = player_hits[tag]
             link = links.get(tag, {})
             entry: Dict[str, Any] = {
                 "type": "player",
@@ -971,6 +980,22 @@ def _build_api_clan_hit_sync(guild_id: int, clan_tag: str) -> Optional[Dict[str,
     }
 
 
+def _player_already_cwl_invited_sync(guild_id: int, player_tag: str) -> bool:
+    """True when player_tag already has a cwl_signups row for this guild's currently-selected
+    event — the API-fallback counterpart of _build_api_clan_hit_sync's already-participating
+    clan check, so the fallback can't resurface a guest already in the pool either."""
+    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+
+    db = CACHE.db_manager
+    if db is None:
+        return False
+    season = resolve_selected_cwl_season(guild_id)
+    event = db.get_cwl_event_sync(str(guild_id), season)
+    if event is None:
+        return False
+    return db.get_cwl_signup_sync(event["id"], player_tag) is not None
+
+
 def _persist_api_player_hit_sync(player_tag: str, player_name: str) -> Dict[str, Any]:
     """Writes an API-discovered player into player_name_index (which mirrors into
     player_name_search/player_name_fts), so the very next keystroke finds it in the DB without
@@ -998,9 +1023,13 @@ async def _resolve_guest_tag_via_coc_api(guild_id: int, query: str) -> Optional[
     """Clan-then-player CoC API lookup for `query`, returning one guest-search hit or None.
 
     None means "nothing to add": the query isn't a well-formed tag, the API doesn't know it, the
-    lookup failed, or it resolved to a clan this guild is already participating with. Callers
-    keep whatever the DB search produced in that case (including its raw unverified placeholder),
-    so an API outage degrades to exactly the pre-2026-08-20 behavior."""
+    lookup failed, it resolved to a clan this guild is already participating with, or it resolved
+    to a player already invited to this guild's currently-selected event (2026-08-20 fix, live
+    bug report: an already-invited guest resurfaced through this fallback even after the DB
+    search itself was taught to exclude them — an exact-tag re-search for someone invited by tag
+    alone, with no player_name_index entry, finds nothing "real" in the DB and falls through to
+    here). Callers keep whatever the DB search produced in that case (including its raw
+    unverified placeholder), so an API outage degrades to exactly the pre-2026-08-20 behavior."""
     import coc
 
     from qapbot.QBdiscocmdshelper import normalize_clan_tag
@@ -1024,6 +1053,8 @@ async def _resolve_guest_tag_via_coc_api(guild_id: int, query: str) -> Optional[
     if player is None:
         if clan_definitely_absent:
             _record_guest_tag_api_miss(tag)
+        return None
+    if await asyncio.to_thread(_player_already_cwl_invited_sync, guild_id, tag):
         return None
 
     logging.info(f"[GUEST-SEARCH] {tag} resolved to player {player.name} via CoC API")

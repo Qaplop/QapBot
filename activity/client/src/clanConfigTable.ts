@@ -346,6 +346,12 @@ export function renderClanConfigTable(
   function renderGuestResults(results: GuestSearchResult[]): void {
     guestsResults.innerHTML = ''
     for (const result of results) {
+      // A guest clan added but not yet Saved has no backend cwl_event_clans row yet, so the
+      // server-side search can't exclude it itself (2026-08-20 fix, live bug report: an
+      // already-invited guest kept reappearing in later searches) — existingClanTags is this
+      // table's own live set of what's already on it, persisted or not.
+      if (result.type === 'clan' && existingClanTags.has(result.clan_tag)) continue
+
       const row = document.createElement('div')
       row.className = 'guest-result'
 

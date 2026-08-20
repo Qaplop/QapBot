@@ -2451,6 +2451,37 @@ async def test_guest_search_returns_player_hit_by_name(db, bridge_config, client
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_guest_search_excludes_already_invited_guest_player(db, bridge_config, client, monkeypatch):
+    """2026-08-20 fix, live bug report: a player already invited as a guest kept reappearing in
+    later searches. A player_tag with an existing cwl_signups row for this event must be
+    excluded from the result list, same as an already-participating clan already is."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "805", {"#OUTSIDE_CLAN": "Outside"})
+    CACHE.db_manager = db
+    CACHE.server_config["805"] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {}
+    _seed_player_names(db, {"#GUEST1": "GuestPlayer"})
+    CACHE.user_accounts = {}
+    await _seed_current_clan_member(db, "555", "#GUEST1", "#OUTSIDE_CLAN")
+
+    event_id = db.create_cwl_event_sync("805", "2026-09", "discordid1")
+    db.upsert_cwl_signup_sync(event_id, "#GUEST1", "GuestPlayer", "555", None, "guest_invite", "pending")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(805, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=805&discord_user_id=42&q=guest",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == []
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_guest_search_returns_player_hit_via_discord_account_name(db, bridge_config, client, monkeypatch):
     """Searching a Discord display name surfaces that account's linked players directly,
     flattened — not a nested 'discord_user' result type (see _search_cwl_guests docstring)."""
@@ -2588,6 +2619,36 @@ async def test_guest_search_unknown_tag_resolved_as_player_via_coc_api(db, bridg
     assert db.search_player_tags_by_prefix_sync("#APIPLAY1") == [
         {"player_tag": "#APIPLAY1", "player_name": "ApiPlayer"}
     ]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_coc_api_fallback_excludes_already_invited_player(db, bridge_config, client, monkeypatch):
+    """2026-08-20 fix, live bug report: a guest invited by typing an exact tag (no
+    player_name_index entry) reappeared on a later search of that same tag, since the DB search
+    found nothing "real" and fell through to the CoC API fallback, which had no equivalent
+    exclusion — mirrors _build_api_clan_hit_sync's already-participating clan check."""
+    import coc  # type: ignore[import-untyped]
+    from types import SimpleNamespace
+
+    from qapbot.cache_manager import CACHE
+
+    await _setup_api_fallback_guild(db, "854", monkeypatch)
+    event_id = db.create_cwl_event_sync("854", "2026-09", "discordid1")
+    db.upsert_cwl_signup_sync(event_id, "#APIPLAY2", "ApiPlayer", "555", None, "guest_invite", "pending")
+    monkeypatch.setattr(
+        CACHE.coc_clan_cache, "get_clan", AsyncMock(side_effect=coc.NotFound(MagicMock(), "gone"))
+    )
+    get_player_mock = AsyncMock(return_value=SimpleNamespace(tag="#APIPLAY2", name="ApiPlayer"))
+    monkeypatch.setattr(CACHE, "get_player", get_player_mock)
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=854&discord_user_id=42&q=%23APIPLAY2",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == []
 
 
 @pytest.mark.discord

@@ -1,6 +1,18 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-20 (3)
+- Fixed: Configure Participating Clans' Guests search kept showing a player already invited as a
+  guest (or a clan already participating) again in later searches. Clans were already excluded
+  via already_participating; players had no equivalent check. _search_cwl_guests_sync now also
+  excludes any player_tag with an existing cwl_signups row for the guild's current event, and the
+  CoC-API fallback (_resolve_guest_tag_via_coc_api, new `_player_already_cwl_invited_sync` check)
+  got the same exclusion, since an exact-tag guest invite with no player_name_index entry could
+  otherwise still fall through to it. Frontend: a guest clan added but not yet Saved (so it has
+  no backend row yet) is now filtered out of rendered results via the table's own existingClanTags
+  set. Files: qapbot/web_bridge.py, activity/client/src/clanConfigTable.ts. 2138 tests pass
+  (`.\run_tests.ps1`); frontend typecheck/build not run (no node/npm in this environment).
+
 2026-08-20 (2)
 - Fixed: A player invited manually as a guest during the draft phase never received the
   enrollment DM when "Start Enrollment" ran — it only arrived once an admin pressed "Notify New
