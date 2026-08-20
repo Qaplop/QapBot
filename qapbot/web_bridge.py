@@ -595,6 +595,28 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
             else:
                 assigned_clan_by_tag.pop(tag, None)
 
+    # Cross-guild PRIVATE placement mirror (2026-08-20, live bug report, project owner: "Killer
+    # and Qaplop show up in unassigned pool instead of being highlighted as being assigned already
+    # in another guild" — a player pooled here via cwl_enrollment_include_all_linked_accounts'
+    # account-wide expansion, who is ALREADY deliberately placed in a DIFFERENT guild's own
+    # (private, non-shared) CWL roster this season. That real placement lives purely in the other
+    # guild's own cwl_assignments — this guild has no local record of it at all, so it rendered as
+    # plain Unassigned instead of the "Assigned to other Guild" pseudo-column a cross-guild SHARED
+    # clan placement already gets via the merge just above. Only checked for players still missing
+    # a local assignment after every other source above — a real local/shared placement always
+    # wins outright, this is purely a display fallback for "we don't have one, does someone else."
+    # Batched (find_cwl_players_private_placements_in_other_guilds_sync), never once per player —
+    # the same function handle_post_cwl_enrollment_guest and assign_cwl_player_sync already use
+    # (singly) to REFUSE creating this exact conflict in the first place; this is that same signal
+    # reused to correctly DISPLAY a conflict that already existed before either guard ran (e.g.
+    # seeded via account-wide expansion, never through the guest-invite endpoint at all).
+    unresolved_tags = [tag for tag in players_by_tag if tag not in assigned_clan_by_tag]
+    other_guild_placements = db.find_cwl_players_private_placements_in_other_guilds_sync(
+        unresolved_tags, season, str(guild_id)
+    )
+    for tag, placement in other_guild_placements.items():
+        assigned_clan_by_tag[tag] = placement["clan_tag"]
+
     # Fallback chain for player_tags live_th_by_tag didn't cover (e.g. a signed-up player who has
     # since left every participating clan, so get_current_clan_members_sync no longer returns
     # them) — bounded to just this payload's own player_tags (never the whole war_attacks table,

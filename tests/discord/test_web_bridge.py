@@ -2160,6 +2160,53 @@ async def test_enrollment_get_prefers_live_th_level_over_war_attacks_fallback(db
 
 
 @pytest.mark.asyncio
+async def test_enrollment_get_mirrors_a_private_placement_in_another_guild(db, bridge_config, client, monkeypatch):
+    """2026-08-20 live bug report, project owner: player Killer, already deliberately placed in
+    "The Marines" guild's own (private, non-shared) CWL roster this season, got pooled into
+    "The QCrew" guild too (via cwl_enrollment_include_all_linked_accounts' account-wide
+    expansion) and showed up as plain Unassigned there — no hint they already have a real home
+    elsewhere, unlike the identical situation for a cross-guild SHARED clan (which already gets
+    the "Assigned to other Guild" pseudo-column via the shared-clan merge just above this fix in
+    _build_enrollment_payload). The Marines/QCrew clans here are NOT shared with each other at
+    all — Killer's real placement lives purely in Marines' own private cwl_assignments, which
+    QCrew's board has no local record of until this fix's cross-guild mirror runs."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "832", {"#MARINES2": "The Marines II"})
+    await _seed_guild_and_clans(db, "833", {"#QCREW2": "The QCrew"})
+    CACHE.db_manager = db
+    CACHE.server_config["832"] = {"member_clans": ["#MARINES2"], "member_families": []}
+    CACHE.server_config["833"] = {"member_clans": ["#QCREW2"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    marines_event_id = db.create_cwl_event_sync("832", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(marines_event_id, [{"clan_tag": "#MARINES2", "participating": True}])
+    db.upsert_cwl_assignment_sync(
+        marines_event_id, "#KILLER", "#MARINES2", assignment_source="suggested", locked=False
+    )
+
+    qcrew_event_id = db.create_cwl_event_sync("833", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(qcrew_event_id, [{"clan_tag": "#QCREW2", "participating": True}])
+    # Pooled in QCrew's own event (e.g. via account-wide expansion) but never locally assigned
+    # anywhere here — this is the exact shape that showed as plain Unassigned before the fix.
+    db.upsert_cwl_signup_sync(qcrew_event_id, "#KILLER", "Killer", None, None, "template_confirm", "confirmed")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(833, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "833", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    killer = next(p for p in body["players"] if p["player_tag"] == "#KILLER")
+    assert killer["assigned_clan_tag"] == "#MARINES2"
+
+
+@pytest.mark.asyncio
 async def test_enrollment_get_uses_cached_th_level_for_clanless_pooled_player(db, bridge_config, client, monkeypatch):
     """A pooled player (cwl_signups row) who has since left every family/participating clan —
     current_clan_tag NULL in user_players, so get_current_clan_members_sync structurally can't

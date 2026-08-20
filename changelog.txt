@@ -1,6 +1,26 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-20 (12)
+- Fixed: a player already deliberately placed in one guild's private CWL roster this season, then
+  pooled into a second guild's roster via cwl_enrollment_include_all_linked_accounts' account-wide
+  expansion, showed as plain Unassigned there instead of "Assigned to other Guild" (live bug
+  report, project owner: Killer/Qaplop, already placed in "The Marines" guild, pooled but not
+  flagged in "The QCrew" guild after Start Enrollment). This was the display-side gap explicitly
+  deferred in today's earlier guest-player double-booking fix (Pitfall 32) — that fix already
+  blocks the actual double-booking write (guest-invite and deliberate-drag both correctly refuse),
+  but nothing mirrored an already-existing cross-guild private placement into the board's display
+  for a player who reached the pool through a THIRD path (account-wide expansion) that was never
+  audited. Code-path unification: db_manager.find_cwl_player_private_placement_in_other_guilds_
+  sync is now a thin single-tag wrapper around a new batched sibling,
+  find_cwl_players_private_placements_in_other_guilds_sync — one query implementation now backs
+  all three use sites (guest-invite guard, assign-time guard, and this new read-time mirror in
+  _build_enrollment_payload). Follow-up documented in Pitfall 32
+  (qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md).
+  Files: qapbot/db_manager.py, qapbot/web_bridge.py. 1 new test
+  (test_enrollment_get_mirrors_a_private_placement_in_another_guild,
+  tests/discord/test_web_bridge.py). 2146 tests pass (.\run_tests.ps1).
+
 2026-08-20 (11)
 - Fixed: Start Enrollment's auto-assign put player Killer ("The Marines" family, PROD) into "The
   Marines" instead of "The Marines II", despite Killer's real last-season CWL history genuinely

@@ -4947,49 +4947,89 @@ class WarHistoryDB:
                 )
                 return []
 
-    def find_cwl_player_private_placement_in_other_guilds_sync(
-        self, player_tag: str, season: str, exclude_guild_id: str
-    ) -> List[Dict[str, Any]]:
-        """Every OTHER guild's cwl_assignments row placing player_tag into one of ITS OWN clans
-        this season (2026-08-20, guest-player cross-guild conflict fix — see
-        handle_post_cwl_enrollment_guest's and assign_cwl_player_sync's own docstrings for the
-        bug this guards against: an individually-invited guest player is a completely separate
-        code path from a guest CLAN, so it never gets the cross-guild conflict-purge/preservation
-        machinery cwl_shared_clan_players already has — silently letting the same player end up
-        deliberately placed in two different guilds' rosters for the same season, which real CWL
-        rules never allow).
+    def find_cwl_players_private_placements_in_other_guilds_sync(
+        self, player_tags: List[str], season: str, exclude_guild_id: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """Batched sibling of find_cwl_player_private_placement_in_other_guilds_sync (that method
+        is now a thin single-tag wrapper around this one — same query, one implementation) —
+        player_tag -> {"guild_id", "clan_tag"} for every one of player_tags that has a PRIVATE
+        (non-cross-guild-shared) cwl_assignments placement in some OTHER guild's own event this
+        season. A cwl_assignments row, by construction, only ever exists for a target clan that
+        ISN'T cross-guild-shared — assign_cwl_player_sync routes any shared target through
+        cwl_shared_clan_players instead (see that table's own CREATE TABLE comment) and clears any
+        stale cwl_assignments row when it does — so a hit here always means a genuine, independent
+        placement this guild has no visibility or authority over, never a shared clan already
+        covered by the existing cross-guild machinery.
 
-        A cwl_assignments row, by construction, only ever exists for a PRIVATE (not
-        cross-guild-shared) target clan — assign_cwl_player_sync routes any target that IS shared
-        through cwl_shared_clan_players instead (see that table's own CREATE TABLE comment) and
-        clears any stale cwl_assignments row when it does. So a hit here always means a genuine,
-        independent placement this guild has no visibility or authority over — never a shared
-        clan already covered by the existing cross-guild machinery.
+        Used two ways (2026-08-20): (1) singly, by handle_post_cwl_enrollment_guest and
+        assign_cwl_player_sync, to REFUSE creating a second, conflicting placement — see those
+        call sites' own docstrings for the guest-player cross-guild double-booking bug this guards
+        against; (2) batched, by _build_enrollment_payload (web_bridge.py), to MIRROR an already-
+        existing private placement into the 'Assigned to other Guild' pseudo-column for a player
+        who's merely pooled here (e.g. via the cwl_enrollment_include_all_linked_accounts
+        account-wide expansion) but never actually assigned anywhere locally — without this, such
+        a player showed as plain Unassigned, giving no hint they already have a real home
+        elsewhere, unlike the identical situation for a cross-guild SHARED clan (live bug report,
+        project owner, 2026-08-20: "Killer and Qaplop show up in unassigned pool instead of being
+        highlighted as being assigned already in another guild" — the exact same class of gap
+        already fixed for the deliberate-invite/deliberate-drag write paths, just never closed on
+        the read/display side). Batched in one query (DATABASE_ARCHITECTURE.md query anti-pattern
+        — never one query per pooled player) rather than once per player_tag.
 
-        Returns one dict per matching guild: guild_id, clan_tag."""
+        A player_tag with more than one matching row (multiple other guilds — shouldn't normally
+        happen, but not structurally impossible) keeps whichever row the query returns first;
+        which one is not guaranteed. Returns nothing for a player_tag with no such placement."""
         import sqlite3
 
         if not self.db_path:
             raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not player_tags:
+            return {}
 
         with self._sync_conn() as conn:
             try:
-                rows = conn.execute(
-                    """
-                    SELECT ce.guild_id AS guild_id, ca.assigned_clan_tag AS clan_tag
-                    FROM cwl_assignments ca
-                    JOIN cwl_events ce ON ce.id = ca.event_id
-                    WHERE ca.player_tag = ? AND ce.cwl_season = ? AND ce.guild_id != ?
-                    """,
-                    (player_tag, season, exclude_guild_id),
-                ).fetchall()
-                return [dict(row) for row in rows]
+                # Manual chunking, not _chunked_in_query_sync — that helper only ever appends the
+                # IN-clause's own chunk as parameters, with no slot for the two fixed trailing ones
+                # (season, exclude_guild_id) every chunk also needs. player_tags realistically
+                # never exceeds a guild's own pool size (never thousands), but the 900-per-chunk
+                # cap still applies defensively, matching every other IN-clause query in this file.
+                placements: Dict[str, Dict[str, Any]] = {}
+                chunk_size = 900
+                for i in range(0, len(player_tags), chunk_size):
+                    chunk = player_tags[i:i + chunk_size]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = conn.execute(
+                        f"""
+                        SELECT ce.guild_id AS guild_id, ca.player_tag AS player_tag, ca.assigned_clan_tag AS clan_tag
+                        FROM cwl_assignments ca
+                        JOIN cwl_events ce ON ce.id = ca.event_id
+                        WHERE ca.player_tag IN ({placeholders}) AND ce.cwl_season = ? AND ce.guild_id != ?
+                        """,
+                        [*chunk, season, exclude_guild_id],
+                    ).fetchall()
+                    for row in rows:
+                        placements.setdefault(
+                            row["player_tag"], {"guild_id": row["guild_id"], "clan_tag": row["clan_tag"]}
+                        )
+                return placements
             except sqlite3.Error as e:
                 logging.error(
-                    f"[DB-QUERY-SYNC] find_cwl_player_private_placement_in_other_guilds_sync failed "
-                    f"for {player_tag}/{season}: {e}"
+                    f"[DB-QUERY-SYNC] find_cwl_players_private_placements_in_other_guilds_sync failed "
+                    f"for {len(player_tags)} tags/{season}: {e}"
                 )
-                return []
+                return {}
+
+    def find_cwl_player_private_placement_in_other_guilds_sync(
+        self, player_tag: str, season: str, exclude_guild_id: str
+    ) -> List[Dict[str, Any]]:
+        """Single-tag convenience wrapper around find_cwl_players_private_placements_in_other_
+        guilds_sync — see that method's docstring for the full rationale. Returns one dict
+        (guild_id, clan_tag) per matching row, or an empty list if player_tag has no private
+        placement in any other guild this season."""
+        placement = self.find_cwl_players_private_placements_in_other_guilds_sync(
+            [player_tag], season, exclude_guild_id
+        ).get(player_tag)
+        return [placement] if placement is not None else []
 
     def get_cwl_shared_clan_sync(self, clan_tag: str, season: str) -> Optional[Dict[str, Any]]:
         """The cwl_shared_clans row for (clan_tag, season), or None if this clan isn't

@@ -1352,6 +1352,28 @@ whether a safety mechanism built for one on-ramp — here, `cwl_shared_clan_play
 cross-guild machinery — was ever actually wired into the other, rather than assuming "guests are
 handled" covers both.
 
+**Follow-up (2026-08-20, same day, live bug report, project owner):** the deferred display gap
+above turned out to matter sooner than expected, and through a THIRD on-ramp neither this pitfall's
+original fix nor Pitfall 33 touched: `cwl_enrollment_include_all_linked_accounts` (account-wide
+expansion — a Discord account that qualifies via one participating-clan player also pools its
+OTHER linked players, wherever they currently play). Reproduced live: player Killer, already
+deliberately placed in "The Marines" guild's own private CWL roster this season, got pooled into
+"The QCrew" guild too via this expansion and showed up as plain Unassigned there — no hint they
+already have a real home elsewhere, exactly the deferred gap's predicted symptom. Closed by
+extending `find_cwl_player_private_placement_in_other_guilds_sync` into a proper batched sibling,
+`find_cwl_players_private_placements_in_other_guilds_sync(player_tags, season, exclude_guild_id)`
+(the single-tag version is now a thin wrapper around it — **one query implementation now backs
+all three use sites**: the guest-invite guard, the assign-time guard, and this new read-time
+mirror in `_build_enrollment_payload`), which mirrors a still-unresolved private placement into
+`assigned_clan_tag` for any pooled player who has no local assignment of their own — the exact
+same "Assigned to other Guild" pseudo-column a cross-guild SHARED clan placement already gets via
+the merge just above it, now working identically for the private case. Confirms the general
+lesson above generalizes past "two on-ramps": **any** path that can populate a guild's pool
+(explicit invite, drag, auto-assign, OR bulk/account-wide expansion) needs to either write through
+the one general placement guard (`assign_cwl_player_sync`) or be covered by the display-time
+mirror — auditing only the write paths that looked like "assignment" missed the read-time gap
+until a THIRD, bulk seeding path exposed it.
+
 ## Pitfall 33: a "current clan beats stale history" override, meant for a GUEST clan, also fired for the family's OWN other clan
 
 Symptom (2026-08-20, live bug report, project owner, PROD — "The Marines" family, 2 clans): right
