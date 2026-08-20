@@ -139,11 +139,21 @@ directory.
   flips `bot_settings.tracker_enabled` (the *runtime* switch); `/bug`/`/feature` reply
   ephemerally that the tracker is off. There is no way to disable command *registration* itself
   short of running that instance in DEV mode.
-- **MCP setup**: set `TRACKER_BRIDGE_URL`/`TRACKER_BRIDGE_SECRET`/`TRACKER_ADMIN_ID` in your
-  shell/`.env` before launching VS Code or Claude Code — `.mcp.json`/`.vscode/mcp.json`
-  reference them via `${env:...}`, never as literals (Cardinal Rule 16).
-- **Attachments on disk**: `CONFIG.tracker_data_dir` (default `data/tracker`), one subdirectory
-  per item (`0001/`, `0002/`, ...). Kept indefinitely — no automatic purge (plan §8.3).
+- **MCP setup**: set `TRACKER_BRIDGE_URL`/`TRACKER_BRIDGE_SECRET`/`TRACKER_ADMIN_ID` in `.env`.
+  `tracker_mcp.py` calls `load_dotenv(override=False)` itself (same convention as
+  `qapbot/config.py`), so `.env` alone is sufficient — never put these as literals in
+  `.mcp.json`/`.vscode/mcp.json` (Cardinal Rule 16). `.vscode/mcp.json` still passes them via
+  `${env:...}`/`${workspaceFolder}`, which VS Code resolves against its own environment;
+  `.mcp.json` (Claude Code CLI) does *not* reliably expand `${env:...}`/`${workspaceFolder}` —
+  it uses a literal `command`/`cwd` path and relies on `.env` alone for the secrets.
+- **After editing `.mcp.json`**: Claude Code only re-reads MCP server config at CLI startup —
+  restart the session (`claude`) and approve the server (it shows "⏸ Pending approval" until
+  then) before the tracker tools become available.
+- **Attachments on disk**: `CONFIG.tracker_data_dir` (default `tracker`, project root — like
+  `investigate_dir`, deliberately NOT under `data_dir`/`PROD_DATA_DIR`'s SSD, since attachment
+  storage isn't performance-critical and benefits from the HDD's larger free space; override
+  with `TRACKER_DATA_DIR`), one subdirectory per item (`0001/`, `0002/`, ...). Kept indefinitely
+  — no automatic purge (plan §8.3).
 
 ## See also
 

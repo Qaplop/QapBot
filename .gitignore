@@ -265,6 +265,11 @@ activity/**/.env.*.local
 # §6.2) — reporter-uploaded content must never land in git.
 .tracker-cache/
 
+# Bug/feature tracker's own attachment storage (CONFIG.tracker_data_dir, default "tracker" at
+# project root — moved off data/ on 2026-08-20, tracker item #0004, so it needed its own entry
+# here since it's no longer covered by the data/ ignore above). Same "never commit" reason.
+/tracker/
+
 # Manual QA checklist's own browser Save-Progress state — personal local test progress, not
 # repo content (the checklist itself, tests/cwl_enrollment_manual_qa_checklist.html, IS tracked).
 tests/cwl-qa-checklist-progress.json

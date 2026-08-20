@@ -166,6 +166,31 @@ class MyModal(discord.ui.Modal, title="My Modal Title"):
         await interaction.followup.send("Done", ephemeral=True)
 ```
 
+### Select Menus Inside Modals (discord.py 2.6+)
+Plain `discord.ui.Select`/etc. can't be added to a `Modal` directly — wrap it in
+`discord.ui.Label` (Components V2), still as a class attribute per Cardinal Rule 10:
+```python
+class MyModal(discord.ui.Modal, title="..."):
+    my_select = discord.ui.Label(
+        text="Choice",
+        component=discord.ui.Select(
+            options=[discord.SelectOption(label=v, value=v, default=(v == "A")) for v in ("A", "B")],
+        ),
+    )
+
+    def _set_options(self, current: str) -> None:
+        # Rebuild per-instance (translated labels, correct `default=`) same as any other
+        # per-request Select — see "Select Dropdown Persistence" below.
+        self.my_select.component.options = [...]
+
+    async def on_submit(self, interaction):
+        value = self.my_select.component.values[0]  # NOT .value — that's TextInput's attr
+```
+`Label.text` is the visible field label (max 45 chars); the wrapped component has no
+`.callback` dispatch inside a modal — its submitted value(s) just land on the component
+itself (`.value` for `TextInput`, `.values` for any `BaseSelect`), read after `on_submit`
+fires. Real-world example: `qapbot/ui_tracker.py`'s `TrackerItemModal.environment_select`.
+
 ### Select Dropdown Persistence
 ```python
 # Mark selected option with default=True

@@ -62,6 +62,28 @@ STATUS_COLOR: Dict[str, discord.Color] = {
 # DM the reporter only on these key transitions (plan §8.4) — not on intermediate statuses.
 DM_NOTIFY_STATUSES = {"implemented", "done", "rejected"}
 
+# Environment selector (replaces the old freetext field, BUG_FEATURE_TRACKER.md workflow
+# improvements) — PROD is the default per that request.
+ENVIRONMENT_VALUES: Tuple[str, str, str] = ("PROD", "DEV", "BOTH")
+_ENVIRONMENT_LABEL_KEYS = {
+    "PROD": 'ui_components.tracker.environment_prod',
+    "DEV": 'ui_components.tracker.environment_dev',
+    "BOTH": 'ui_components.tracker.environment_both',
+}
+
+
+def _normalize_environment(value: Optional[str]) -> str:
+    """Maps a legacy freetext Environment value (from before the PROD/DEV/BOTH selector) onto
+    one of ENVIRONMENT_VALUES. Unset defaults to PROD (the new default); any other non-empty
+    text defaults to BOTH — the more inclusive guess, since the reporter clearly meant
+    *something* by it."""
+    key = (value or "").strip().lower()
+    if key in ("prod", "production"):
+        return "PROD"
+    if key in ("dev", "development"):
+        return "DEV"
+    return "BOTH" if key else "PROD"
+
 # Attachment limits (plan §5.5)
 MAX_ATTACHMENTS_PER_ITEM = 5
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
@@ -443,7 +465,7 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
     constructor args are set: fresh submission (neither), editing a still-open draft
     (draft_view), or editing an already-posted item (item_number)."""
 
-    # TextInput MUST be class attributes for discord.py's Modal system (Cardinal Rule 10).
+    # TextInput/Label MUST be class attributes for discord.py's Modal system (Cardinal Rule 10).
     title_input = discord.ui.TextInput(label="Title", required=True, max_length=100)
     description_input = discord.ui.TextInput(
         label="Description", style=discord.TextStyle.paragraph, required=True, max_length=4000
@@ -451,7 +473,14 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
     details_input = discord.ui.TextInput(
         label="Details", style=discord.TextStyle.paragraph, required=False, max_length=4000
     )
-    environment_input = discord.ui.TextInput(label="Environment", required=False, max_length=20)
+    # Label-wrapped Select (discord.py 2.6+ Components V2) — see CODE_STRUCTURE.md § Discord.py
+    # Patterns "Select Menus Inside Modals" for why this replaces a plain TextInput here.
+    environment_select = discord.ui.Label(
+        text="Environment",
+        component=discord.ui.Select(
+            options=[discord.SelectOption(label=v, value=v, default=(v == "PROD")) for v in ENVIRONMENT_VALUES],
+        ),
+    )
 
     def __init__(
         self,
@@ -478,9 +507,9 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         self.description_input.default = initial_description
         self.details_input.default = initial_details
         if item_type == "bug":
-            self.environment_input.default = initial_environment
+            self._set_environment_options(initial_environment)
         else:
-            self.remove_item(self.environment_input)
+            self.remove_item(self.environment_select)
 
     def _localize(self) -> None:
         title_key = 'ui_components.tracker.modal_title_bug' if self.item_type == 'bug' else 'ui_components.tracker.modal_title_feature'
@@ -489,8 +518,17 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         self.title_input.label = t('ui_components.tracker.field_title', user_id=self.user_id, guild_id=self.guild_id)
         self.description_input.label = t('ui_components.tracker.field_description', user_id=self.user_id, guild_id=self.guild_id)
         self.details_input.label = t(details_key, user_id=self.user_id, guild_id=self.guild_id)
-        self.environment_input.label = t('ui_components.tracker.field_environment', user_id=self.user_id, guild_id=self.guild_id)
-        self.environment_input.placeholder = t('ui_components.tracker.field_environment_placeholder', user_id=self.user_id, guild_id=self.guild_id)
+        self.environment_select.text = t('ui_components.tracker.field_environment', user_id=self.user_id, guild_id=self.guild_id)
+
+    def _set_environment_options(self, initial_environment: str) -> None:
+        current = _normalize_environment(initial_environment)
+        self.environment_select.component.options = [
+            discord.SelectOption(
+                label=t(_ENVIRONMENT_LABEL_KEYS[value], user_id=self.user_id, guild_id=self.guild_id),
+                value=value, default=(value == current),
+            )
+            for value in ENVIRONMENT_VALUES
+        ]
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         from qapbot.cache_manager import CACHE
@@ -498,7 +536,7 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         title_val = self.title_input.value.strip()
         description_val = self.description_input.value.strip()
         details_val = (self.details_input.value or "").strip()
-        environment_val = (self.environment_input.value or "").strip() if self.item_type == "bug" else ""
+        environment_val = self.environment_select.component.values[0] if self.item_type == "bug" else ""
 
         if self.item_number is not None:
             # Editing an already-posted item (Edit button, plan §2.3).
@@ -1136,8 +1174,13 @@ class TrackerStatusSelectView(discord.ui.View):
 
 def _format_testcase_message(item: Dict[str, Any], testcases: List[Dict[str, Any]]) -> str:
     guild_id = _lang_guild_id(item)
+    # Same status badge (emoji + text) as build_tracker_embed()'s item title, so the test-case
+    # message shows the same visible "done" indicator once the item is actually done — not just
+    # a wall of checked boxes with no link back to the item's own status.
+    status_text = t(f'ui_components.tracker.status_{item["status"]}', guild_id=guild_id)
+    header = t('ui_components.tracker.testcase_message_header', guild_id=guild_id, item_number=f"{item['item_number']:04d}", title=item["title"])
     lines = [
-        t('ui_components.tracker.testcase_message_header', guild_id=guild_id, item_number=f"{item['item_number']:04d}", title=item["title"]),
+        f"{header}  [{status_text}]",
         "",
     ]
     by_env: Dict[str, List[Dict[str, Any]]] = {}

@@ -6,7 +6,9 @@ PyPI SDK — that package isn't a project dependency, and the wire surface neede
 Claude Code extension (`.mcp.json`) launch this the same way: one process per client,
 `python -m qapbot.mcp.tracker_mcp`.
 
-Env vars (see `.mcp.json` / `.vscode/mcp.json`):
+Env vars (see `.mcp.json` / `.vscode/mcp.json`, falling back to `.env` — loaded below, same
+convention as `qapbot/config.py` — since the CLI host's `${env:VAR}` substitution isn't
+guaranteed to see the user's shell environment):
     TRACKER_BRIDGE_URL     e.g. `http://127.0.0.1:PORT` for a DEV-owned tracker, or the PROD
                            cloudflared tunnel hostname (plan §3.1/§6.4).
     TRACKER_BRIDGE_SECRET  the bridge's shared X-Bridge-Secret.
@@ -25,8 +27,14 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
+from dotenv import load_dotenv
+
 from qapbot.mcp.tracker_bridge_client import TrackerBridgeClient, TrackerBridgeError
 from qapbot.mcp.tracker_envelope import sanitize_field, wrap_untrusted
+
+# override=False: values the MCP host already put in os.environ (via .mcp.json's `env` block)
+# take priority; .env only fills in what the host didn't provide.
+load_dotenv(override=False)
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="[tracker-mcp] %(message)s")
 
@@ -131,8 +139,9 @@ def _client_from_env() -> TrackerBridgeClient:
 
 def _workspace_cache_dir() -> str:
     """`.tracker-cache/` under the current working directory — the MCP client launches this
-    process with the workspace as cwd (`${workspaceFolder}` in .mcp.json), and this directory
-    must stay .gitignore'd since it holds reporter-uploaded content (plan §6.2)."""
+    process with the workspace as cwd (`cwd` in `.mcp.json`, `${workspaceFolder}` in
+    `.vscode/mcp.json`), and this directory must stay .gitignore'd since it holds
+    reporter-uploaded content (plan §6.2)."""
     return os.path.join(os.getcwd(), CACHE_DIR_NAME)
 
 

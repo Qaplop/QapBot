@@ -198,7 +198,9 @@ class BotConfig:
     # PROD's real tracker channels and, with an env-var toggle, could post real-looking
     # bug/feature items into PROD's actual channels using DEV test data. See load_config().
     tracker_enabled: bool = False
-    tracker_data_dir: str = "data/tracker"  # Where per-item attachment copies live (§3.3)
+    tracker_data_dir: str = "tracker"  # Where per-item attachment copies live (§3.3) — project
+    # root (HDD), not under data_dir/PROD_DATA_DIR (SSD): not performance-critical, and the
+    # HDD's much larger free space fits growing attachment history better (2026-08-20 follow-up).
 
 
 def load_config() -> BotConfig:
@@ -383,7 +385,10 @@ def load_config() -> BotConfig:
     # Bug/feature tracker — no env var, see BotConfig.tracker_enabled comment for why (PROD DB
     # copies to DEV carry PROD's real tracker channel IDs along with them).
     tracker_enabled = not is_dev_mode
-    tracker_data_dir = os.getenv("TRACKER_DATA_DIR", os.path.join(data_dir, "tracker"))
+    # Project root (HDD), like investigate_dir above — not under data_dir/PROD_DATA_DIR (SSD):
+    # attachment storage isn't performance-critical and benefits from the HDD's larger free
+    # space (2026-08-20 follow-up, project owner; tracker item #0004).
+    tracker_data_dir = os.getenv("TRACKER_DATA_DIR", "tracker")
 
     # Create config object
     config = BotConfig(

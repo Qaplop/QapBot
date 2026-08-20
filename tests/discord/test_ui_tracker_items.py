@@ -146,12 +146,12 @@ async def test_build_tracker_embed_truncates_long_description(db):
 
 def test_modal_removes_environment_field_for_feature():
     modal = TrackerItemModal("feature", guild_id=None, user_id="1")
-    assert modal.environment_input not in modal.children
+    assert modal.environment_select not in modal.children
 
 
 def test_modal_keeps_environment_field_for_bug():
     modal = TrackerItemModal("bug", guild_id=None, user_id="1")
-    assert modal.environment_input in modal.children
+    assert modal.environment_select in modal.children
 
 
 def test_modal_title_differs_by_type():

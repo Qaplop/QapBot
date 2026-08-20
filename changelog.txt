@@ -1,6 +1,41 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-21 (3)
+- Changed: bug/feature tracker attachment storage relocated off the SSD — CONFIG.tracker_data_dir
+  default changed from `data/tracker` (follows PROD_DATA_DIR on PROD) to `tracker` (project
+  root, HDD), mirroring the existing investigate_dir pattern; TRACKER_DATA_DIR env override
+  still works. Not performance-critical, and the HDD has far more free space. Added `/tracker/`
+  to .gitignore since it's no longer covered by the blanket `data/` ignore. Code-only — actual
+  on-disk file move is manual (project owner, tracker item #0004). Files: qapbot/config.py,
+  .gitignore, qapbot/docs/BUG_FEATURE_TRACKER.md. 2255 tests pass.
+
+2026-08-21 (2)
+- Fixed/Changed: bug/feature tracker workflow-message polish (tracker item #0003) — (1)
+  status_done's checkmark emoji was ✔️ (renders dark/uncolored in Discord's default font),
+  changed to ✅ to match status_implemented's green. (2) The test-case sign-off message now
+  carries the same status badge as the item embed's title (e.g. "[✅ Done]"), so passing all
+  test cases is visibly reflected there too, not just on the item card. (3) TrackerItemModal's
+  Environment field was freetext (TextInput); replaced with a PROD/DEV/Both radio-style
+  selector (discord.ui.Label-wrapped discord.ui.Select — discord.py 2.6+ Components V2, new
+  pattern for this codebase, documented in CODE_STRUCTURE.md), defaulting to PROD. Legacy
+  freetext values (e.g. "beide") are normalized on Edit: recognized DEV/PROD map directly,
+  anything else falls back to BOTH. Files: qapbot/ui_tracker.py, qapbot/translations/en.json,
+  qapbot/translations/de.json, qapbot/docs/CODE_STRUCTURE.md,
+  tests/discord/test_ui_tracker_items.py. 2255 tests pass.
+
+2026-08-21 (1)
+- Fixed: tracker MCP bridge was unreachable — two independent issues. `.mcp.json`'s
+  `${workspaceFolder}`/`${env:...}` substitution isn't reliably resolved by the Claude Code CLI
+  host (unlike VS Code), so `command`/`cwd` are now literal paths and TRACKER_BRIDGE_URL/
+  TRACKER_BRIDGE_SECRET/TRACKER_ADMIN_ID are read from `.env` via `load_dotenv(override=False)`
+  in tracker_mcp.py itself (same convention as qapbot/config.py) instead of `.mcp.json`'s `env`
+  block. Separately, `.env`'s TRACKER_BRIDGE_SECRET had a stray leading `=` (copy/paste
+  artifact) so it never matched prod's WEB_BRIDGE_SECRET — fixed the value (not tracked in git).
+  Verified end-to-end against bridge-prod.qapbot.uk: list/get/set_status/comment/add_testcases
+  all round-trip correctly. Files: .mcp.json, qapbot/mcp/tracker_mcp.py,
+  qapbot/docs/BUG_FEATURE_TRACKER.md. 2255 tests pass.
+
 2026-08-20 (19)
 - Changed: bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md §3.1, follow-up to Phase 1) —
   removed the TRACKER_ENABLED env var entirely; CONFIG.tracker_enabled is now hard-coded to
