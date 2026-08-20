@@ -4112,6 +4112,51 @@ class WarHistoryDB:
             clan_tags.setdefault(row["player_tag"], row["current_clan_tag"])
         return clan_tags
 
+    def get_cached_th_levels_for_players_sync(self, player_tags: List[str]) -> Dict[str, int]:
+        """player_tag -> th_level from user_players, for ANY player_tag regardless of current
+        clan (third th_level source for _build_enrollment_payload, 2026-08-20 — see
+        get_most_recent_th_levels_sync's own docstring for the other two: a live current-clan
+        scan, then this, then war_attacks history).
+
+        user_players.th_level has no per-write timestamp, so it can't be date-compared against
+        war_attacks.date directly — but it's kept fresh by coc_cache.py's
+        update_player_info_in_user_accounts() on every clan-poll cycle for ANY clan this bot
+        tracks (not just this guild's own family/participating clans), which runs far more often
+        than a player fights a tracked war. In practice this is therefore at least as fresh as
+        war_attacks for the same player whenever both exist, which is why it's tried BEFORE that
+        fallback here rather than after: a player who left their tracked clan yesterday still has
+        yesterday's real TH cached here, while their most recent war_attacks row could easily be
+        months old. Same verified-wins-per-player_tag dedup as get_current_clan_tags_for_players_sync
+        (a player_tag can have both a verified owner row and a separate UNASSIGNED-pool row)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not player_tags:
+            return {}
+
+        with self._sync_conn() as conn:
+            try:
+                rows = self._chunked_in_query_sync(
+                    conn,
+                    """
+                    SELECT player_tag, th_level, verified
+                    FROM user_players
+                    WHERE player_tag IN ({placeholders}) AND th_level IS NOT NULL
+                    ORDER BY verified DESC
+                    """,
+                    player_tags,
+                )
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cached_th_levels_for_players_sync failed: {e}")
+                return {}
+
+        rows = sorted(rows, key=lambda r: not r["verified"])
+        th_levels: Dict[str, int] = {}
+        for row in rows:
+            th_levels.setdefault(row["player_tag"], int(row["th_level"]))
+        return th_levels
+
     def get_player_owners_for_tags_sync(self, player_tags: List[str]) -> Dict[str, str]:
         """player_tag -> discord_id (verbatim, including the 'UNASSIGNED' sentinel) for whichever
         of player_tags have a user_players row. This is the indexed (idx_user_players_player_tag)

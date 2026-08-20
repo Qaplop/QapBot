@@ -595,12 +595,20 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
             else:
                 assigned_clan_by_tag.pop(tag, None)
 
-    # Fallback only for player_tags live_th_by_tag didn't cover (e.g. a signed-up player who has
+    # Fallback chain for player_tags live_th_by_tag didn't cover (e.g. a signed-up player who has
     # since left every participating clan, so get_current_clan_members_sync no longer returns
     # them) — bounded to just this payload's own player_tags (never the whole war_attacks table,
-    # see DATABASE_ARCHITECTURE.md's query anti-patterns).
+    # see DATABASE_ARCHITECTURE.md's query anti-patterns). Two further sources, tried in recency
+    # order (2026-08-20, live bug report: a player who left their tracked clan showed a blank TH
+    # badge despite the bot already having their TH cached): user_players.th_level first — kept
+    # fresh by every clan poll this bot runs, for ANY clan, not just this guild's own, so it's
+    # almost always at least as current as a war_attacks row — then war_attacks history last, for
+    # the rare player_tag with no user_players row at all (e.g. added via a search that only
+    # confirmed a tag exists, never fetched/cached a full profile).
     fallback_tags = [tag for tag in players_by_tag if tag not in live_th_by_tag]
-    th_levels_by_tag = db.get_most_recent_th_levels_sync(fallback_tags)
+    cached_th_by_tag = db.get_cached_th_levels_for_players_sync(fallback_tags)
+    war_fallback_tags = [tag for tag in fallback_tags if tag not in cached_th_by_tag]
+    th_levels_by_tag = db.get_most_recent_th_levels_sync(war_fallback_tags)
     # Same idea, for current_clan_tag (2026-08-15 bugfix): get_current_clan_members_sync above is
     # clan-scoped to all_member_clan_tags, so a guest/account-wide-expanded player whose real
     # current clan is neither in the guild's family nor itself participating this season never
@@ -614,7 +622,9 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
     avg_stars_by_tag = compute_avg_stars_per_attack(list(players_by_tag.keys()))
     for player_tag, player in players_by_tag.items():
         player["assigned_clan_tag"] = assigned_clan_by_tag.get(player_tag)
-        th_level = live_th_by_tag.get(player_tag, th_levels_by_tag.get(player_tag))
+        th_level = live_th_by_tag.get(
+            player_tag, cached_th_by_tag.get(player_tag, th_levels_by_tag.get(player_tag))
+        )
         player["th_level"] = th_level
         player["th_icon_url"] = th_icon_url(th_level) if th_level is not None else None
         player["skill_score"] = skill_scores_by_tag.get(player_tag)

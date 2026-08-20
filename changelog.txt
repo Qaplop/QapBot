@@ -1,6 +1,29 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-20 (6)
+- Fixed: a pooled CWL player who left every family/participating clan after being signed up
+  showed a blank TH badge on the enrollment board, even though the bot already had their TH
+  cached (live bug report, project owner, screenshot from PROD: several StayFamily players
+  showing no TH level or clan). `_build_enrollment_payload`'s th_level resolution only tried a
+  live current-clan-member scan, then war_attacks history — never `user_players.th_level`
+  directly, which is kept fresh by every clan poll this bot runs (any clan, not just this guild's
+  own) and in practice is at least as current as a war_attacks row. Added
+  `get_cached_th_levels_for_players_sync()` (db_manager.py) as a second-priority source, tried
+  before the war_attacks fallback. Investigated the "clanless" part too, per project owner's
+  request ("not plausible that 142 players guild wide are clanless, this must be a bug"): that
+  142 figure was my own mistake, not a bug — it was an unscoped whole-database count across every
+  guild this bot serves, misreported as guild-specific. Properly scoped to this one event: 11 of
+  129 signed-up players are currently clanless, which checks out — coc_cache.py's
+  update_player_info_in_user_accounts() correctly clears current_clan_tag the moment a
+  clan-poll no longer finds a tracked player in that clan's live roster, and Start Enrollment
+  pools players who were current clan members at signup time (source: get_current_clan_members_
+  sync) but keeps them in the roster (by design) if they later leave — real clan churn during a
+  multi-day signup window, not a data bug.
+  Files: qapbot/web_bridge.py, qapbot/db_manager.py. 1 new backend test
+  (test_enrollment_get_uses_cached_th_level_for_clanless_pooled_player,
+  tests/discord/test_web_bridge.py). 2142 tests pass (.\run_tests.ps1).
+
 2026-08-20 (5)
 - Fixed: right-clicking a guest player on the enrollment board and choosing "Remove guest player"
   removed them server-side and updated the footer status to "<name> removed.", but the card itself
