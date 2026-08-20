@@ -191,6 +191,14 @@ class BotConfig:
     # to False only once the feature is ready for real players to be DMed.
     cwl_dm_restrict_to_admin: bool = True
 
+    # Bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md). No env var — always the inverse of
+    # is_dev_mode (True on PROD, False on DEV), not independently configurable. 2026-08-20
+    # follow-up, project owner: PROD's DB — including bot_settings' tracker channel IDs — is
+    # regularly copied to DEV for realistic-data testing, so DEV would otherwise inherit
+    # PROD's real tracker channels and, with an env-var toggle, could post real-looking
+    # bug/feature items into PROD's actual channels using DEV test data. See load_config().
+    tracker_enabled: bool = False
+    tracker_data_dir: str = "data/tracker"  # Where per-item attachment copies live (§3.3)
 
 
 def load_config() -> BotConfig:
@@ -372,6 +380,11 @@ def load_config() -> BotConfig:
     else:
         cwl_dm_restrict_to_admin = os.getenv("CWL_DM_RESTRICT_TO_ADMIN", "true").lower() in ("true", "1", "yes")
 
+    # Bug/feature tracker — no env var, see BotConfig.tracker_enabled comment for why (PROD DB
+    # copies to DEV carry PROD's real tracker channel IDs along with them).
+    tracker_enabled = not is_dev_mode
+    tracker_data_dir = os.getenv("TRACKER_DATA_DIR", os.path.join(data_dir, "tracker"))
+
     # Create config object
     config = BotConfig(
         coc_email=coc_email,
@@ -401,6 +414,8 @@ def load_config() -> BotConfig:
         web_bridge_port=web_bridge_port,
         web_bridge_secret=web_bridge_secret,
         cwl_dm_restrict_to_admin=cwl_dm_restrict_to_admin,
+        tracker_enabled=tracker_enabled,
+        tracker_data_dir=tracker_data_dir,
     )
     
     # Validate configuration (fail fast on startup)

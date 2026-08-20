@@ -363,6 +363,24 @@ The `get_clan_attack_history_sync()` method in `db_manager.py` aggregates `SUM(s
 **Cross-Restart State**:
 - `bot_metadata` - Key-value store for state that must survive bot restarts
   (e.g. one-time migration markers, last-run timestamps).
+- `bot_testers` - Bot-wide (not per-guild) allowlist of Discord user IDs for DM-testing gates.
+
+**Bug/Feature Tracker** (`BUG_FEATURE_TRACKER_PLAN.md`, Phases 1-7 — 2026-08-20; full item
+lifecycle, bridge, and MCP server, see the dedicated `BUG_FEATURE_TRACKER.md` doc):
+- `bot_settings` - Bot-wide key/value settings, composite `PRIMARY KEY (guild_id, key)` with
+  `guild_id = ''` meaning global (the only scope wired up today). Distinct from `bot_metadata`
+  above: this table is for admin-configurable settings (e.g. tracker channel IDs), not
+  internal cross-restart bookkeeping.
+- `tracker_items` - One row per filed bug/feature report. `item_number` (AUTOINCREMENT) is a
+  single shared `#NNNN` pool across both `item_type` values ('bug'/'feature'). Hot-only, no
+  `history` mirror (Rule 1 parity does not apply; Rule 14 named-column access still does).
+- `tracker_attachments` - Junction: tracker items ↔ uploaded files, `ON DELETE CASCADE`.
+  `local_path` is the on-disk copy under `CONFIG.tracker_data_dir` (agent-readable, no expiring
+  CDN URL); `discord_url` is the bot's own re-upload, not the reporter's original attachment URL.
+- `tracker_testcases` - Junction: tracker items ↔ manual test-case rows, `ON DELETE CASCADE`.
+  `seq` orders rows within one `(item_number, environment)` pair.
+- `tracker_items.test_channel_id` / `test_message_id` (added via `_add_column_if_missing` inside
+  `_create_tracker_schema()` itself, Phase 5) - pointer to the posted `#qapbot-test` message.
 
 **CWL Round Tracking** (2026-05-09 - Complete):
 - `cwl_league_groups` - One row per (clan × season) capturing which group each clan belongs to.

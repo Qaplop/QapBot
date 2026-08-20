@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -2107,6 +2108,157 @@ async def handle_post_cwl_activity_closed(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+# ---------------------------------------------------------------------------
+# Bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md Phase 6) — reuses the existing shared
+# X-Bridge-Secret (plan §6.4/§8.7: holding it grants tracker-admin + CWL-endpoint access,
+# accepted for a single-admin setup). X-Tracker-Admin is attribution-only — whose name shows
+# up on status changes/comments the agent posts — deliberately NOT authentication, since it's
+# self-asserted by whoever already holds the real secret.
+# ---------------------------------------------------------------------------
+
+def _tracker_admin_label(request: web.Request) -> str:
+    return request.headers.get("X-Tracker-Admin") or "agent"
+
+
+async def handle_get_tracker_items(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    status = request.query.get("status")
+    item_type = request.query.get("type")
+    try:
+        limit = int(request.query.get("limit", "50"))
+    except ValueError:
+        limit = 50
+
+    items = await CACHE.db_manager.list_tracker_items(status=status, item_type=item_type, limit=limit)  # type: ignore[union-attr]
+    payload = [
+        {
+            "item_number": it["item_number"], "item_type": it["item_type"], "status": it["status"],
+            "title": it["title"], "reporter_id": it["reporter_id"], "reporter_name": it["reporter_name"],
+            "created_at": it["created_at"],
+        }
+        for it in items
+    ]
+    return web.json_response({"items": payload})
+
+
+async def handle_get_tracker_item(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        item_number = int(request.match_info["item_number"])
+    except ValueError:
+        return web.json_response({"error": "invalid item_number"}, status=400)
+
+    item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
+    if item is None:
+        return web.json_response({"error": "not found"}, status=404)
+    attachments = await CACHE.db_manager.get_tracker_attachments(item_number)  # type: ignore[union-attr]
+    testcases = await CACHE.db_manager.get_tracker_testcases(item_number)  # type: ignore[union-attr]
+    return web.json_response({
+        "item": dict(item),
+        "attachments": [
+            {"id": a["id"], "filename": a["filename"], "original_name": a["original_name"],
+             "content_type": a["content_type"], "size_bytes": a["size_bytes"]}
+            for a in attachments
+        ],
+        "testcases": [dict(c) for c in testcases],
+    })
+
+
+async def handle_get_tracker_attachment(request: web.Request) -> web.StreamResponse:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        item_number = int(request.match_info["item_number"])
+        attachment_id = int(request.match_info["attachment_id"])
+    except ValueError:
+        return web.json_response({"error": "invalid id"}, status=400)
+
+    attachments = await CACHE.db_manager.get_tracker_attachments(item_number)  # type: ignore[union-attr]
+    match = next((a for a in attachments if a["id"] == attachment_id), None)
+    if match is None:
+        return web.json_response({"error": "not found"}, status=404)
+
+    # Path containment check: local_path is always written under CONFIG.tracker_data_dir at
+    # attachment-store time (ui_tracker._persist_attachment) — this re-verifies it rather than
+    # trusting the stored value blindly, matching the untrusted-input posture of plan §6.6.
+    from qapbot.config import CONFIG
+    local_path = os.path.abspath(match["local_path"])
+    tracker_root = os.path.abspath(CONFIG.tracker_data_dir)
+    if os.path.commonpath([local_path, tracker_root]) != tracker_root:
+        return web.json_response({"error": "invalid path"}, status=400)
+    if not os.path.exists(local_path):
+        return web.json_response({"error": "file missing on disk"}, status=404)
+    return web.FileResponse(local_path)
+
+
+async def handle_post_tracker_status(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from qapbot.ui_tracker import STATUS_VALUES, apply_status_change
+
+    try:
+        item_number = int(request.match_info["item_number"])
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid body"}, status=400)
+    new_status = body.get("status")
+    if new_status not in STATUS_VALUES:
+        return web.json_response({"error": f"status must be one of {list(STATUS_VALUES)}"}, status=400)
+
+    try:
+        item = await apply_status_change(item_number, new_status, note=body.get("note"), actor_id=_tracker_admin_label(request))
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=404)
+    return web.json_response({"ok": True, "item": dict(item)})
+
+
+async def handle_post_tracker_comment(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from qapbot.ui_tracker import post_comment
+
+    try:
+        item_number = int(request.match_info["item_number"])
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid body"}, status=400)
+    text = (body.get("text") or "").strip()
+    if not text:
+        return web.json_response({"error": "text required"}, status=400)
+
+    try:
+        await post_comment(item_number, text, _tracker_admin_label(request))
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=404)
+    return web.json_response({"ok": True})
+
+
+async def handle_post_tracker_testcases(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from qapbot.ui_tracker import post_test_cases
+
+    try:
+        item_number = int(request.match_info["item_number"])
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid body"}, status=400)
+    cases = body.get("cases")
+    if not isinstance(cases, list) or not cases:
+        return web.json_response({"error": "cases required (non-empty list)"}, status=400)
+    for case in cases:
+        if not isinstance(case, dict) or case.get("environment") not in ("DEV", "PROD") or not case.get("description"):
+            return web.json_response({"error": "each case needs environment (DEV/PROD) and description"}, status=400)
+
+    try:
+        item = await post_test_cases(item_number, cases, actor_id=_tracker_admin_label(request))
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=404)
+    return web.json_response({"ok": True, "item": dict(item)})
+
+
 def create_app() -> web.Application:
     app = web.Application(middlewares=[_access_log_middleware])
     app.router.add_get("/api/health", handle_health)
@@ -2125,6 +2277,12 @@ def create_app() -> web.Application:
     app.router.add_post("/api/cwl/enrollment/guest-players/remove", handle_post_cwl_guest_players_remove)
     app.router.add_post("/api/cwl/shared-clan/evict", handle_post_cwl_shared_clan_evict)
     app.router.add_post("/api/cwl/activity-closed", handle_post_cwl_activity_closed)
+    app.router.add_get("/api/tracker/items", handle_get_tracker_items)
+    app.router.add_get("/api/tracker/items/{item_number}", handle_get_tracker_item)
+    app.router.add_get("/api/tracker/items/{item_number}/attachments/{attachment_id}", handle_get_tracker_attachment)
+    app.router.add_post("/api/tracker/items/{item_number}/status", handle_post_tracker_status)
+    app.router.add_post("/api/tracker/items/{item_number}/comment", handle_post_tracker_comment)
+    app.router.add_post("/api/tracker/items/{item_number}/testcases", handle_post_tracker_testcases)
     return app
 
 

@@ -1,6 +1,93 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-20 (19)
+- Changed: bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md §3.1, follow-up to Phase 1) —
+  removed the TRACKER_ENABLED env var entirely; CONFIG.tracker_enabled is now hard-coded to
+  `not is_dev_mode` in load_config(), so PROD always registers /bug and /feature and DEV never
+  can, in any .env configuration. Project owner's report: PROD's DB (including bot_settings'
+  tracker channel IDs) is routinely copied to DEV wholesale for realistic-data testing, so an
+  independently-configurable env var — even one meant only for "safe" DEV testing — could leave
+  DEV pointed at PROD's real tracker channels and post real-looking items into them. Files:
+  qapbot/config.py, QapBot.py, README.md, BUG_FEATURE_TRACKER_PLAN.md,
+  qapbot/docs/BUG_FEATURE_TRACKER.md, tests/unit/test_config_coverage.py (TestTrackerEnabled,
+  3 tests). 2255 tests pass.
+
+2026-08-20 (18)
+- Added: Phase 8 (Documentation) of the bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md) —
+  new qapbot/docs/BUG_FEATURE_TRACKER.md (architecture, schema, Discord surface, agent
+  integration, runbook); updated qapbot/docs/CODE_STRUCTURE.md and DATABASE_ARCHITECTURE.md;
+  Pitfall 34 added to qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md (expiring Discord CDN attachment
+  URLs — download immediately, never defer past send_modal()) with a pointer in
+  .github/copilot-instructions.md. Marked the plan doc IMPLEMENTED with per-phase "as shipped
+  vs. as designed" notes. No code changes. 2252 tests pass (unchanged from Phase 7).
+
+2026-08-20 (17)
+- Added: Phase 7 (MCP server & IDE wiring) of the bug/feature tracker
+  (BUG_FEATURE_TRACKER_PLAN.md) — new qapbot/mcp/ package: tracker_mcp.py (hand-rolled
+  JSON-RPC 2.0 stdio server exposing tracker_list_items/tracker_get_item/tracker_set_status/
+  tracker_comment/tracker_add_testcases — not the `mcp` PyPI package, which isn't a project
+  dependency), tracker_bridge_client.py (aiohttp client against web_bridge.py's /api/tracker/*),
+  tracker_envelope.py (untrusted-input sanitizing/wrapping for reporter-supplied text — plan
+  §6.6, prompt-injection mitigation). New .mcp.json (Claude Code) and .vscode/mcp.json (VS
+  Code Copilot Chat — different top-level key from .mcp.json), .gitignore entry for
+  .tracker-cache/, optional .github/prompts/analyse-bug.prompt.md. Files: qapbot/mcp/__init__.py,
+  tracker_mcp.py, tracker_bridge_client.py, tracker_envelope.py (all new), .mcp.json,
+  .vscode/mcp.json, .gitignore, .github/prompts/analyse-bug.prompt.md,
+  tests/unit/test_tracker_mcp.py (new, 28 tests). 2252 tests pass.
+
+2026-08-20 (16)
+- Added: Phase 6 (Bridge endpoints) of the bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md) —
+  new /api/tracker/* routes in qapbot/web_bridge.py (list/get items, download attachment bytes
+  with path-containment validation, POST status/comment/testcases), reusing the existing
+  X-Bridge-Secret gate; X-Tracker-Admin header is attribution-only. Handlers delegate to
+  qapbot/ui_tracker.py's apply_status_change()/post_comment()/post_test_cases() — one place
+  each of those things happens regardless of caller (Discord or agent). Files:
+  qapbot/web_bridge.py, tests/integration/test_web_bridge_tracker.py (new, 19 tests).
+  2224 tests pass.
+
+2026-08-20 (15)
+- Added: Phases 3-5 (/bug + /feature commands, attachments, status lifecycle & test-case loop)
+  of the bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md) — the full item lifecycle in
+  qapbot/ui_tracker.py: TrackerItemModal/TrackerDraftView (modal -> draft preview -> post),
+  build_tracker_embed()/_post_tracker_item() (posted item + discussion thread),
+  TrackerItemButton (restart-safe DynamicItem: Edit/Add files/Status/Test cases),
+  attachment pre-download-on-modal-open + the 5-minute upload-window mechanism (wired into
+  QapBot.py's on_message, before its DM-fallback branch), apply_status_change()/
+  TrackerStatusSelectView (status dropdown + reporter DMs on implemented/done/rejected),
+  post_test_cases()/TrackerTestPassButton/TrackerTestFailButton (test-case sign-off loop,
+  auto-transition to done, Failed reverts to in_progress keeping passed environments), and a
+  new on_raw_reaction_add listener (handle_tracker_test_reaction — the bot had none before)
+  for the 👍 sign-off shortcut. New /bug, /feature commands (QBdiscordcmds.py, registered only
+  when CONFIG.tracker_enabled) + /help entries. Files: qapbot/ui_tracker.py, QBdiscordcmds.py,
+  QapBot.py, qapbot/db_manager.py (test_channel_id/test_message_id columns +
+  get_tracker_item_by_test_message_id), qapbot/translations/{en,de}.json (57 new tracker.* +
+  2 help keys), README.md, tests/discord/test_ui_tracker_items.py (new, 29 tests). 2205 tests
+  pass.
+
+2026-08-20 (14)
+- Added: Phase 2 (`/admin → Bot Setup`) of the bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md)
+  — new BOT_SETUP admin action lets the bot admin configure the three tracker channels (bug
+  reports, feature requests, manual test cases) and toggle the tracker's runtime enabled flag.
+  New qapbot/ui_tracker.py (BotSetupView, start_bot_setup()); new CACHE.tracker_settings +
+  load_tracker_settings()/set_tracker_setting() write-through in cache_manager.py (Rule 3); new
+  ui_components.bot_setup.* i18n keys in en.json/de.json. Files: qapbot/ui_tracker.py (new),
+  qapbot/cache_manager.py, QBdiscordcmds.py, qapbot/translations/{en,de}.json,
+  tests/discord/test_ui_bot_setup.py (new, 10 tests). 2176 tests pass.
+
+2026-08-20 (13)
+- Added: Phase 1 (Persistence & config) of the bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md)
+  — no user-visible change yet. New hot-only tables bot_settings/tracker_items/
+  tracker_attachments/tracker_testcases in db_manager.WarHistoryDB._create_tracker_schema(),
+  plus the full db_manager CRUD surface from the plan's §4.5 (bot setting get/set/list; tracker
+  item create/get/list/update; attachment add/list; testcase set/get + per-testcase/
+  per-environment sign-off). update_tracker_item(**fields) validates against a column
+  whitelist so caller-supplied field names never reach the SQL identifier position. New
+  CONFIG.tracker_enabled/CONFIG.tracker_data_dir (TRACKER_ENABLED/TRACKER_DATA_DIR env vars,
+  deliberately unsuffixed — the plan's single-owning-instance design sets these independently
+  per host, not from is_dev_mode). Files: qapbot/db_manager.py, qapbot/config.py,
+  tests/unit/test_tracker_db.py (new, 20 tests). 2166 tests pass.
+
 2026-08-20 (12)
 - Fixed: a player already deliberately placed in one guild's private CWL roster this season, then
   pooled into a second guild's roster via cwl_enrollment_include_all_linked_accounts' account-wide

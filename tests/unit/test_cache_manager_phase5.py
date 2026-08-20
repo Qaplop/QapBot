@@ -553,6 +553,7 @@ class TestLoadAll:
         cm.load_notification_state = AsyncMock()
         cm.load_server_config = AsyncMock()
         cm.load_testers = AsyncMock()
+        cm.load_tracker_settings = AsyncMock()
         cm.validate_clan_cache_consistency = AsyncMock()
         cm.load_all_temp_war_stats = MagicMock()
         await cm.load_all()
@@ -564,4 +565,5 @@ class TestLoadAll:
         cm.load_notification_state.assert_awaited_once()
         cm.load_server_config.assert_awaited_once()
         cm.load_testers.assert_awaited_once()
+        cm.load_tracker_settings.assert_awaited_once()
         cm.validate_clan_cache_consistency.assert_awaited_once()

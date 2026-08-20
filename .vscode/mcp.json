@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "qapbot-tracker": {
+      "command": "${workspaceFolder}/venv/Scripts/python.exe",
+      "args": ["-m", "qapbot.mcp.tracker_mcp"],
+      "env": {
+        "TRACKER_BRIDGE_URL": "${env:TRACKER_BRIDGE_URL}",
+        "TRACKER_BRIDGE_SECRET": "${env:TRACKER_BRIDGE_SECRET}",
+        "TRACKER_ADMIN_ID": "${env:TRACKER_ADMIN_ID}"
+      }
+    }
+  }
+}

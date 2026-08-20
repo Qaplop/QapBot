@@ -996,6 +996,51 @@ async def highlightme(interaction: discord.Interaction):
     _log_cmd_done(interaction, "highlightme")
     await interaction.followup.send(t('commands.highlightme.success', guild_id=guild_id, count=reposted), ephemeral=True)
 
+
+# ---------------------------------------------------------------------------
+# Bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md Phase 3) — thin wrappers around the shared
+# qapbot.ui_tracker.start_tracker_item() coroutine; only item_type differs between the two.
+# Registered conditionally (CONFIG.tracker_enabled) in QapBot.py's _setup_hook() — see plan §3.1.
+# ---------------------------------------------------------------------------
+
+@app_commands.command(name="bug", description=dev_mode + "Report a bug to the QapBot maintainer.")
+@app_commands.describe(
+    attachment1="Optional screenshot/log file",
+    attachment2="Optional screenshot/log file",
+    attachment3="Optional screenshot/log file",
+)
+@app_commands.checks.cooldown(2, 300.0, key=lambda i: i.user.id)
+async def bug(
+    interaction: discord.Interaction,
+    attachment1: Optional[discord.Attachment] = None,
+    attachment2: Optional[discord.Attachment] = None,
+    attachment3: Optional[discord.Attachment] = None,
+) -> None:
+    """Open the bug-report modal (works in any guild the bot serves, and in DMs)."""
+    _log_cmd(interaction, "bug")
+    from qapbot.ui_tracker import start_tracker_item
+    await start_tracker_item(interaction, "bug", attachment1, attachment2, attachment3)
+
+
+@app_commands.command(name="feature", description=dev_mode + "Request a feature for QapBot.")
+@app_commands.describe(
+    attachment1="Optional screenshot/mockup file",
+    attachment2="Optional screenshot/mockup file",
+    attachment3="Optional screenshot/mockup file",
+)
+@app_commands.checks.cooldown(2, 300.0, key=lambda i: i.user.id)
+async def feature(
+    interaction: discord.Interaction,
+    attachment1: Optional[discord.Attachment] = None,
+    attachment2: Optional[discord.Attachment] = None,
+    attachment3: Optional[discord.Attachment] = None,
+) -> None:
+    """Open the feature-request modal (works in any guild the bot serves, and in DMs)."""
+    _log_cmd(interaction, "feature")
+    from qapbot.ui_tracker import start_tracker_item
+    await start_tracker_item(interaction, "feature", attachment1, attachment2, attachment3)
+
+
 def _get_help_command_dm_status() -> Dict[str, bool]:
     """Maps /help's display names to their command's `.guild_only` flag, so /help can filter
     itself to only the commands actually invokable from a DM.
@@ -1021,6 +1066,8 @@ def _get_help_command_dm_status() -> Dict[str, bool]:
         "ping": ping.guild_only,
         "status": status.guild_only,
         "help": help.guild_only,
+        "bug": bug.guild_only,
+        "feature": feature.guild_only,
     }
 
 
@@ -1052,6 +1099,8 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
         "subscribe", "unsubscribe", "subscriptions", "leaderboard", "highlightme", "analyse cwl_league_group",
         "analyse cwl_opponent", "clan management", "admin", "list", "whois", "ping", "status", "help"
     ]
+    if CONFIG.tracker_enabled:
+        available_commands += ["bug", "feature"]
     if is_dm:
         dm_status = _get_help_command_dm_status()
         available_commands = [c for c in available_commands if not dm_status.get(c, True)]
@@ -1135,6 +1184,8 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
         t('commands.help.category_administration', user_id=user_id, guild_id=guild_id): ["clan management", "admin", "list"],
         t('commands.help.category_bot_info', user_id=user_id, guild_id=guild_id): ["ping", "status", "help"],
     }
+    if CONFIG.tracker_enabled:
+        categories[t('commands.help.category_tracker', user_id=user_id, guild_id=guild_id)] = ["bug", "feature"]
     if is_dm:
         dm_status = _get_help_command_dm_status()
         categories = {
@@ -1254,6 +1305,7 @@ async def do_maintenance_shutdown() -> None:
     app_commands.Choice(name="List All Subscriptions - View all subscriptions (bot admin)", value="LIST_ALL_SUBSCRIPTIONS"),
     app_commands.Choice(name="Test Notify - Test war notifications for a clan (bot admin)", value="TEST_NOTIFY"),
     app_commands.Choice(name="Manage Testers - Add/remove users who receive live-testing DMs (bot admin)", value="MANAGE_TESTERS"),
+    app_commands.Choice(name="Bot Setup - Configure tracker channels (bot admin)", value="BOT_SETUP"),
     app_commands.Choice(name="Remove Clan - Remove a clan from tracking (admin)", value="REMOVE_CLAN"),
     app_commands.Choice(name="List all tracked Clans - List all tracked clans with names and tags (admin)", value="LIST_CLANS"),
     app_commands.Choice(name="Import Player Registration Data - Import player accounts from ClashPerk embed (bot admin)", value="IMPORT_DATA"),
@@ -2491,6 +2543,24 @@ async def admin(
             view=view,
             ephemeral=True
         )
+        return
+
+    # Handle BOT_SETUP action (bot admin only) — BUG_FEATURE_TRACKER_PLAN.md Phase 2
+    if action_norm == "BOT_SETUP":
+        if not await _safe_defer(interaction, thinking=True, ephemeral=True):
+            return
+        if interaction.guild is None:
+            await interaction.followup.send(t('commands.errors.dms_only_error', guild_id=None), ephemeral=True)
+            return
+        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+        if not check_bot_admin_only(interaction, SERVER_ADMIN):
+            await interaction.followup.send(
+                t('commands.errors.bot_admin_only', user_id=str(interaction.user.id), guild_id=interaction.guild.id),
+                ephemeral=True
+            )
+            return
+        from qapbot.ui_tracker import start_bot_setup
+        await start_bot_setup(interaction)
         return
 
     # Handle START_UPDATE_CYCLE action (bot admin only)

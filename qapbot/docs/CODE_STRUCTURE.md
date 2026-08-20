@@ -534,6 +534,39 @@ all rebuild/button-handler paths so the reference is never lost.
   `db_manager.py` functions — a second UI in front of the same data, not a second data store.
 - `GET /api/health`: unauthenticated liveness check (used by the tunnel setup to confirm
   reachability end-to-end).
+- `/api/tracker/*` (BUG_FEATURE_TRACKER_PLAN.md Phase 6): list/get items, download attachment
+  bytes, and the three write endpoints (status/comment/testcases) — all gated by the same
+  `X-Bridge-Secret` as the CWL routes above (deliberate, single-admin trade-off, plan §6.4/§8.7);
+  `X-Tracker-Admin` is attribution-only, never authentication. Handlers delegate the actual
+  DB+Discord work to `qapbot/ui_tracker.py` (`apply_status_change()`, `post_comment()`,
+  `post_test_cases()`) rather than duplicating it.
+
+🟩 qapbot/ui_tracker.py (BUG_FEATURE_TRACKER_PLAN.md, Phases 2-5)
+- Discord UI layer for the bug/feature tracker — kept separate from `ui_clan_management.py`
+  (plan §5.1). `BotSetupView` (`/admin` → Bot Setup); `TrackerItemModal`/`TrackerDraftView`/
+  `start_tracker_item()` (the `/bug`/`/feature` modal → draft-preview → post flow);
+  `build_tracker_embed()`/`_post_tracker_item()` (posted item + discussion thread);
+  `TrackerItemButton` (restart-safe `DynamicItem`: Edit/Add files/Status/Test cases);
+  the upload-window mechanism (`_upload_windows`, `handle_tracker_upload_message()` — called
+  from `QapBot.py`'s `on_message`); `apply_status_change()`/`TrackerStatusSelectView` (status
+  lifecycle); `post_test_cases()`/`TrackerTestPassButton`/`TrackerTestFailButton`/
+  `handle_tracker_test_reaction()` (test-case sign-off loop + the 👍-reaction shortcut, called
+  from `QapBot.py`'s `on_raw_reaction_add`). CACHE.tracker_settings caches `bot_settings`
+  (Rule 3); everything else (items/attachments/testcases) reads fresh via `CACHE.db_manager.*`
+  each time, not cached — matches how other low-frequency admin-facing rows are handled.
+
+🟫 qapbot/mcp/ (BUG_FEATURE_TRACKER_PLAN.md Phase 7)
+- `tracker_mcp.py`: stdio MCP server (`python -m qapbot.mcp.tracker_mcp`), hand-rolled
+  JSON-RPC 2.0 (no `mcp` PyPI dependency — the wire surface needed is small). Exposes 5 tools
+  (`tracker_list_items`/`tracker_get_item`/`tracker_set_status`/`tracker_comment`/
+  `tracker_add_testcases`) to VS Code Copilot Chat (`.vscode/mcp.json`) and Claude Code
+  (`.mcp.json`) against the web bridge's `/api/tracker/*` endpoints.
+- `tracker_bridge_client.py`: thin async HTTP client (reuses `aiohttp`, already a dependency).
+- `tracker_envelope.py`: the plan §6.6 untrusted-data mitigations — `sanitize_field()` (strips
+  control chars, neutralizes ``` fences, caps length) and `wrap_untrusted()` (labelled
+  `<user_report trust="untrusted">` envelope). Every reporter-supplied field goes through both
+  before it reaches a tool result — bug/feature reports are arbitrary Discord-user text fed
+  straight into an agent's context, a textbook prompt-injection surface.
 
 🟫 qapbot/coc_health.py
 - CoC API retry wrapper: `coc_retry(operation, operation_name, max_retries=2)`
@@ -1071,7 +1104,22 @@ kept here only for functions not narrated elsewhere.
 ├── create_app()                            # builds the aiohttp.web.Application + routes
 ├── handle_get_clan_config() / handle_post_clan_config()  # admin-reverified, same db_manager
 │                                                          # calls the Discord-side UI uses
-└── handle_health()                         # unauthenticated liveness check
+├── handle_health()                         # unauthenticated liveness check
+└── handle_{get,post}_tracker_*()           # /api/tracker/* — see Main Files entry above
+
+🟩 qapbot/ui_tracker.py
+├── start_tracker_item() / TrackerItemModal / TrackerDraftView   # /bug, /feature flow
+├── build_tracker_embed() / _post_tracker_item() / _refresh_item_message()
+├── TrackerItemButton                       # DynamicItem: Edit/Add files/Status/Test cases
+├── handle_tracker_upload_message()         # called from QapBot.py's on_message
+├── apply_status_change() / TrackerStatusSelectView
+├── post_test_cases() / TrackerTestPassButton / TrackerTestFailButton
+└── handle_tracker_test_reaction()          # called from QapBot.py's on_raw_reaction_add
+
+🟫 qapbot/mcp/tracker_mcp.py
+├── handle_request() / run_stdio_server()   # JSON-RPC 2.0 stdio loop
+├── call_tool() / TOOLS                     # 5 tools, dispatched to tracker_bridge_client.py
+└── render_item_markdown() / cache_path_for_item()  # .tracker-cache/NNNN/ mirror (plan §6.2)
 
 🟫 qapbot/coc_health.py
 ├── coc_retry()                    # main wrapper — routes all CoC API exceptions

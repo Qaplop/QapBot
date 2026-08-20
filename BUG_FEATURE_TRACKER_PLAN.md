@@ -1,6 +1,7 @@
 # Bug & Feature Tracker — Concept and Implementation Plan
 
-Status: **PROPOSED** (not yet implemented)
+Status: **IMPLEMENTED** — Phases 1-8 all shipped 2026-08-20 (see each phase's checklist below
+for what shipped as designed vs. what was simplified along the way)
 Created: 2026-08-20
 Owner doc: this file (project root, per Cardinal Rule 15)
 
@@ -186,24 +187,37 @@ When an item flips to `implemented` (from the Discord button *or* from the agent
 
 databases**, so if both instances served the tracker they would both mint `#0001`.
 
-**Decision:** exactly one instance owns the tracker, selected by config:
+**Decision (2026-08-20 revision — see §8.1 for the original, superseded version):** exactly
+one instance owns the tracker, PROD, hard-coded — **not** an env var:
 
-```
-TRACKER_ENABLED=1        # only set on the owning instance
+```python
+# qapbot/config.py, load_config()
+tracker_enabled = not is_dev_mode
 ```
 
-- **Owner: PROD** (always online, real reporters — confirmed, see §8.1). The DEV bot ignores
-  `/bug`, `/feature` and the tracker channels entirely when `TRACKER_ENABLED` is unset —
-  the commands are simply not registered.
-- **DEV development is still possible**: `TRACKER_ENABLED` may be set on DEV while building
-  and testing the feature — separate DB, separate test channels, throwaway IDs. "PROD owns
-  the tracker" describes the steady state (which instance mints the *canonical* `#NNNN`
-  pool), not a restriction on development.
-- **Enablement semantics** (three switches, defined precedence): the env var is the
-  *capability* switch — it alone decides whether `/bug`/`/feature` get registered at command
-  sync. The `bot_settings.tracker_enabled` DB flag is the *runtime* switch — toggled by the
-  "Disable tracker" button in Bot Setup; while off, the (still-registered) commands reply
-  ephemerally that the tracker is disabled. No re-sync needed to toggle at runtime.
+- **Owner: PROD, unconditionally.** `CONFIG.tracker_enabled` is always the inverse of
+  `is_dev_mode` — no `TRACKER_ENABLED` env var exists. DEV can never register `/bug`/`/feature`,
+  full stop.
+- **Why not an env var (original design, superseded):** the first version of this plan made
+  `TRACKER_ENABLED` a deliberately-unsuffixed env var, settable independently per host so DEV
+  could enable it temporarily for feature development. In discussion with the project owner
+  this turned out to be actively dangerous given the *actual* DEV/PROD workflow: PROD's DB is
+  regularly copied to DEV wholesale for realistic-data testing, and `bot_settings` (including
+  the tracker's own channel IDs) travels with it. With an env-var toggle, a shared `.env`
+  (`TRACKER_ENABLED=1`, read identically by both hosts) — or even a DEV-only override meant for
+  "safe" throwaway testing — could still leave DEV pointed at PROD's *real* tracker channels
+  the moment someone ran `/admin` → Bot Setup on DEV without noticing the copied config already
+  pointed at production. Hard-coding to `not is_dev_mode` removes the footgun entirely: there is
+  no configuration state in which DEV can register these commands. Consequence: there is
+  currently no way to live-test the Discord-side tracker commands on DEV — iterate via the
+  unit/discord/integration test suites instead (`tests/discord/test_ui_tracker_items.py` etc.),
+  same as any other DEV-mode-gated feature that needs this kind of isolation.
+- **Enablement semantics (two switches, not three):** `CONFIG.tracker_enabled` is the
+  *capability* switch — decides whether `/bug`/`/feature` get registered at command sync, fixed
+  per-process at startup (PROD-only). The `bot_settings.tracker_enabled` DB flag is the
+  *runtime* switch — toggled by the "Disable tracker" button in Bot Setup; while off, the
+  (still-registered) commands reply ephemerally that the tracker is disabled. No re-sync needed
+  to toggle at runtime.
 - Consequence: the agent-facing API (§6) points at PROD's bridge URL
   (`TRACKER_BRIDGE_URL`, via the existing named `cloudflared` tunnel).
 
@@ -597,67 +611,126 @@ Mandatory mitigations, to be implemented in the MCP layer, not bolted on later:
 Each phase is independently shippable and testable. Run `.\run_tests.ps1` after every phase
 and add a `changelog.txt` entry at the top (per the changelog convention).
 
-### Phase 1 — Persistence & config (no user-visible change)
-- `bot_settings`, `tracker_items`, `tracker_attachments`, `tracker_testcases` DDL in
-  `initialize_database()`; `_add_column_if_missing` calls in the migration block.
-- db_manager CRUD methods (§4.5), all reads via `aiosqlite.Row` + named access.
-- `CONFIG.tracker_enabled` + `CONFIG.tracker_data_dir` in [qapbot/config.py](qapbot/config.py).
-- Tests: `tests/unit/test_tracker_db.py` — create/read/update, ID pool shared across types,
-  cascade delete, idempotent re-init.
+### Phase 1 — Persistence & config (no user-visible change) ✅ DONE 2026-08-20
+- [x] `bot_settings`, `tracker_items`, `tracker_attachments`, `tracker_testcases` DDL in
+  `initialize_database()` (`_create_tracker_schema()`). `test_channel_id`/`test_message_id`
+  (§4.4) are deliberately deferred to Phase 5's `_add_column_if_missing` migration block —
+  they're not needed until the test-case loop exists.
+- [x] db_manager CRUD methods (§4.5: `get_bot_setting`/`set_bot_setting`/`get_all_bot_settings`,
+  `create_tracker_item`/`get_tracker_item`/`list_tracker_items`/`update_tracker_item`/
+  `set_tracker_item_message`, `add_tracker_attachment`/`get_tracker_attachments`,
+  `set_tracker_testcases`/`get_tracker_testcases`/`mark_tracker_testcase_passed`/
+  `mark_tracker_environment_passed`), all reads via `aiosqlite.Row` + named access.
+  `update_tracker_item(**fields)` validates against a column whitelist
+  (`_TRACKER_ITEM_UPDATABLE_COLUMNS`) so caller-supplied field names can never reach the SQL
+  identifier position.
+- [x] `CONFIG.tracker_enabled` + `CONFIG.tracker_data_dir` in [qapbot/config.py](qapbot/config.py).
+  `TRACKER_DATA_DIR` is an env var; `tracker_enabled` is **not** — as of the 2026-08-20 §3.1
+  revision it's hard-coded to `not is_dev_mode` (originally shipped as an unsuffixed
+  `TRACKER_ENABLED` env var, superseded the same day once the actual DEV/PROD workflow — PROD
+  DB copies to DEV carrying real tracker channel IDs — made an independently-configurable
+  toggle a footgun). See `TestTrackerEnabled` in `tests/unit/test_config_coverage.py`.
+- [x] Tests: `tests/unit/test_tracker_db.py` — 20 tests: create/read/list/update, ID pool
+  shared across bug/feature types, attachment + testcase cascade delete, idempotent re-init,
+  bot_settings guild scoping, per-environment testcase sign-off semantics.
 
-### Phase 2 — `/admin → Bot Setup`
-- `BotSetupView` in `qapbot/ui_tracker.py`; `BOT_SETUP` choice + routing in `/admin`.
-- i18n keys under `ui_components.bot_setup.*` in `en.json` + `de.json`.
-- Tests: `tests/discord/test_ui_bot_setup.py` — admin gate, channel persistence,
-  select re-render keeps the current selection (Rule 8).
+This phase was schema + db_manager only, per the "independently shippable" design — Phases
+2-8 (below) build everything Discord-visible and agent-facing on top of it.
 
-### Phase 3 — `/bug` and `/feature` (text only)
-- Shared `start_tracker_item()`, `TrackerItemModal`, `TrackerDraftView`, `TrackerItemButton`.
-- ID allocation, embed rendering, channel posting, thread creation, edit flow.
-- `add_dynamic_items()` registration + `fully_initialized` gate.
-- `/help` entries + README command list.
-- Tests: `tests/discord/test_ui_tracker.py` — modal submit → draft → post; edit permission
-  (reporter or admin only); startup gate blocks clicks.
+### Phase 2 — `/admin → Bot Setup` ✅ DONE 2026-08-20
+- [x] `BotSetupView` in `qapbot/ui_tracker.py`; `BOT_SETUP` choice + routing in `/admin`.
+  Bot-wide settings cached on `CACHE.tracker_settings` (Rule 3) via new
+  `load_tracker_settings()`/`set_tracker_setting()` in `cache_manager.py`.
+- [x] i18n keys under `ui_components.bot_setup.*` in `en.json` + `de.json`.
+- [x] Tests: `tests/discord/test_ui_bot_setup.py` — 10 tests: admin gate, channel select
+  pre-filled from current settings (Rule 8), save persists via `CACHE`, toggle flips/persists
+  `tracker_enabled`, close deletes the message, `start_bot_setup()` entry point.
 
-### Phase 4 — Attachments
-- `attachment1..3` command params; upload-window `on_message` listener; download, sanitise,
-  size/type limits, on-disk store, bot re-upload into the item message.
-- Tests: `tests/unit/test_tracker_attachments.py` — filename sanitising (path traversal,
-  unicode, duplicates), size/count limits, type allow-list.
+### Phases 3-5 — `/bug`/`/feature`, attachments, status lifecycle & test-case loop ✅ DONE 2026-08-20
+Implemented together (one coherent Discord-UI pass through `qapbot/ui_tracker.py`) rather than
+as three separate diffs — the modal/draft/post flow, attachments, and status/test-case buttons
+all live on the same posted item message and shared enough plumbing that splitting them would
+have meant threading the same code through twice.
 
-### Phase 5 — Status lifecycle & test-case loop
-- `TrackerStatusSelect`, implemented-flagging, `#qapbot-test` message rendering,
-  `TrackerTestCaseButton` buttons, `on_raw_reaction_add` 👍 handler, auto-transition to `done`.
-- Tests: `tests/discord/test_ui_tracker_testcases.py` — per-environment sign-off, 👍 marks all,
-  non-admin reaction ignored, item transitions to `done` only when all environments pass.
+- [x] `start_tracker_item()`, `TrackerItemModal` (type-aware fields, `remove_item()` drops
+  Environment for features), `TrackerDraftView` (Edit/Add attachments/Submit/Discard).
+- [x] ID allocation, `build_tracker_embed()`, channel posting + discussion thread
+  (`_post_tracker_item()`), edit-in-place (`Edit` button, reporter-or-admin gated).
+- [x] Attachments: `attachment1..3` params pre-downloaded via a background `asyncio.Task`
+  started right after `send_modal()` (Pitfall 34 — CDN URLs expire while the modal is open);
+  the 5-minute upload window (`_upload_windows` + `handle_tracker_upload_message()`, wired into
+  `QapBot.py`'s existing `on_message` *before* its DM-fallback branch) covers pasted
+  screenshots and the `Add files` button on an already-posted item. Sanitized filenames
+  (`_sanitize_attachment_filename()`) strip path separators AND any `..` substring, not just
+  leading ones. Simplified from the plan: no separate content-type allow-list/"⚠️ unverified
+  file type" flag — every attachment is stored and re-uploaded as-is (files are never executed
+  or parsed regardless, so the allow-list would only have gated inline embed rendering, which
+  Discord already handles safely client-side).
+- [x] `TrackerItemButton` (`DynamicItem`, actions edit/addfiles/status/testcases),
+  `TrackerTestPassButton`/`TrackerTestFailButton` — all three registered via
+  `add_dynamic_items()` in `QapBot.py`'s `_setup_hook()`, each with its own
+  `fully_initialized`-gated `interaction_check()` (Pitfall 20).
+- [x] `apply_status_change()` + `TrackerStatusSelectView` (admin-only dropdown opened by the
+  Status button); DMs the reporter on `implemented`/`done`/`rejected` only.
+- [x] `post_test_cases()` (bridge/MCP-only — the Discord "Test cases" button is a jump link
+  once one exists, not a composer, matching §2.3's own description), auto-transition to
+  `testing` on post and to `done` once every environment with cases is fully passed.
+  `mark_testing_failed()`: `❌ Failed` is a single item-wide button (no per-environment
+  variant — matches the §2.4 mockup's one button, not the `tracker:testfail:N:ENV` custom-id
+  shape sketched in §5.1), reverts to `in_progress`, keeps already-passed environments' flags.
+- [x] `handle_tracker_test_reaction()` — new `on_raw_reaction_add` listener in `QapBot.py`
+  (the bot had none before), bot-admin only, marks every pending environment passed.
+- [x] `/help` entries (`bug`/`feature`, new `category_tracker`) + `README.md` command list.
+- [x] Tests: `tests/discord/test_ui_tracker_items.py` (29) — filename sanitizing, embed
+  truncation, modal field removal, draft preview, status transitions incl. DM gating, test-case
+  posting/sign-off/auto-done/fail-revert, the 👍-reaction shortcut, upload-window consume/
+  expire/leave-open semantics.
 
-### Phase 6 — Bridge endpoints
-- `/api/tracker/*` handlers + routes in `create_app()`; admin re-verification.
-- Tests: `tests/integration/test_web_bridge_tracker.py` — secret required, admin required,
-  status change propagates to the Discord embed (mocked), testcase POST creates rows.
+### Phase 6 — Bridge endpoints ✅ DONE 2026-08-20
+- [x] `/api/tracker/*` handlers + routes in `create_app()` (`qapbot/web_bridge.py`) — reuses
+  the existing `X-Bridge-Secret` gate (`_check_secret()`), no per-request admin re-verification
+  (unlike the CWL routes) since the plan's auth model (§6.4/§8.7) treats the shared secret
+  itself as tracker-admin; `X-Tracker-Admin` is attribution-only. Attachment download validates
+  path containment under `CONFIG.tracker_data_dir` via `os.path.commonpath()`.
+- [x] Tests: `tests/integration/test_web_bridge_tracker.py` — 19 tests: secret required/wrong,
+  list/get/attachment reads incl. path-traversal rejection, status/comment/testcases writes
+  incl. validation errors and DM-on-implemented.
 
-### Phase 7 — MCP server & IDE wiring
-- `qapbot/mcp/tracker_mcp.py` (stdio), `.vscode/mcp.json`, `.mcp.json`, `.gitignore` entry for
-  `.tracker-cache/`, optional `.github/prompts/analyse-bug.prompt.md`.
-- Untrusted-data envelope + escaping (§6.6).
-- Tests: `tests/unit/test_tracker_mcp.py` — envelope wrapping, escaping, cache path
-  containment, tool schema validity.
+### Phase 7 — MCP server & IDE wiring ✅ DONE 2026-08-20
+- [x] `qapbot/mcp/tracker_mcp.py` — hand-rolled JSON-RPC 2.0 stdio server (newline-delimited
+  JSON), **not** the `mcp` PyPI package (not a project dependency; the wire surface needed —
+  `initialize`/`tools/list`/`tools/call` — is small enough that adding a new dependency wasn't
+  worth it). `qapbot/mcp/tracker_bridge_client.py` (aiohttp client, no new dependency),
+  `qapbot/mcp/tracker_envelope.py` (§6.6 sanitizing/wrapping).
+- [x] `.mcp.json` (`mcpServers` key, Claude Code's schema), `.vscode/mcp.json` (`servers` key,
+  VS Code's schema — the plan's single shared snippet undersold that these two tools use
+  different top-level keys), `.gitignore` entry for `.tracker-cache/`, optional
+  `.github/prompts/analyse-bug.prompt.md`.
+- [x] Tests: `tests/unit/test_tracker_mcp.py` — 28 tests: envelope wrapping/escaping, cache
+  path containment, tool schema validity, JSON-RPC dispatch (initialize/tools list/tools call/
+  unknown method/notification), `call_tool()` behavior against a mocked bridge client.
 
-### Phase 8 — Documentation
-- New `qapbot/docs/BUG_FEATURE_TRACKER.md` (architecture, schema, agent workflow, runbook).
-- Update `qapbot/docs/CODE_STRUCTURE.md` (new module), `qapbot/docs/DATABASE_ARCHITECTURE.md`
-  (new tables), `README.md` (commands + env vars), `qapbot/docs/TEST_CONCEPT.md` if new tiers.
-- Add a Pitfall entry to `qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md` for the
-  expiring-CDN-attachment trap (§3.3) — it is exactly the kind of thing that silently breaks
-  weeks later.
+### Phase 8 — Documentation ✅ DONE 2026-08-20
+- [x] New `qapbot/docs/BUG_FEATURE_TRACKER.md` (architecture, schema, Discord surface, agent
+  integration, runbook).
+- [x] Updated `qapbot/docs/CODE_STRUCTURE.md` (new `ui_tracker.py`/`qapbot/mcp/` entries, both
+  the module-summary and function-tree sections), `qapbot/docs/DATABASE_ARCHITECTURE.md`
+  (already covered the base 4 tables from Phase 1; added the Phase 5 `test_channel_id`/
+  `test_message_id` columns), `README.md` (commands + `TRACKER_DATA_DIR` env var — done
+  incrementally across Phases 1-3, not deferred to this phase).
+  `qapbot/docs/TEST_CONCEPT.md` needed no change — no new test tier, just more files under the
+  existing unit/discord/integration tiers.
+- [x] Pitfall 34 added to `qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md` (+ pointer in
+  `.github/copilot-instructions.md`'s pitfalls list) for the expiring-CDN-attachment-URL trap.
 
 ---
 
 ## 8. Decisions (resolved 2026-08-20)
 
-1. **Tracker owner: PROD.** `TRACKER_ENABLED` is set only on the PROD instance;
-   `TRACKER_BRIDGE_URL` for the MCP server points at PROD's bridge (via the existing named
-   `cloudflared` tunnel, same path the Activity uses). DEV does not register `/bug`/`/feature`.
+1. **Tracker owner: PROD, unconditionally — `CONFIG.tracker_enabled = not is_dev_mode`, no env
+   var (revised same day, see §3.1).** `TRACKER_BRIDGE_URL` for the MCP server points at
+   PROD's bridge (via the existing named `cloudflared` tunnel, same path the Activity uses).
+   DEV can never register `/bug`/`/feature`, in any configuration.
 2. **Test sign-off: bot admin only.** Same permission check as status changes
    (`check_bot_admin_only`) — no separate `tester` role for now; can be added later without a
    schema change (just widen the permission check).
@@ -692,18 +765,40 @@ and add a `changelog.txt` entry at the top (per the changelog convention).
 
 ## 9. Cardinal-Rule Checklist for the Implementer
 
-- [ ] Rule 1/14 — new tables are hot-only; still use `aiosqlite.Row` + `row["col"]` everywhere.
-- [ ] Rule 3 — tracker config cached on `CACHE`, no shadow dicts.
-- [ ] Rule 4 — search before adding helpers (channel-select builder, embed builder, sanitiser).
-- [ ] Rule 6 — every user-facing string through `t()`; ephemeral passes `user_id` **and** `guild_id`.
-- [ ] Rule 7 — modal submit: `defer()` then `followup`.
-- [ ] Rule 8 — rebuilt selects set `default=True` on the current option.
-- [ ] Rule 10 — TextInputs as class attributes; no `title=` in `super().__init__()`.
-- [ ] Rule 11 — all DB access via `CACHE.db_manager.*`.
-- [ ] Rule 12 — idempotent DDL; new-column DDL after `_add_column_if_missing`, never inline.
-- [ ] Rule 15 — docs and `/help` updated in the same change.
-- [ ] Rule 16 — no real hostnames/paths/secrets in any committed file.
-- [ ] Pitfall 13/15 — defensive message delete/fetch handling.
-- [ ] Pitfall 20 — `fully_initialized` gate on every persistent view / dynamic item.
-- [ ] Pitfall 22 — listener registration guarded against the double module import.
-- [ ] `.\run_tests.ps1` passes; real pass count recorded in `changelog.txt`.
+- [x] Rule 1/14 — new tables are hot-only; still use `aiosqlite.Row` + `row["col"]` everywhere.
+- [x] Rule 3 — bot-wide settings cached on `CACHE.tracker_settings`, no shadow dicts. Items/
+  attachments/testcases are deliberately **not** cached (read fresh via `CACHE.db_manager.*`
+  each time) — low-frequency admin-facing rows, matching how other non-hot-path tables
+  (e.g. individual `cwl_events` rows) are already handled elsewhere in this codebase.
+- [x] Rule 4 — reused `ChannelConfigurationView`'s select idiom, `ManageTestersView`'s
+  upload/delete-message pattern, and `CwlSignupResponseButton`'s `DynamicItem` template
+  structure rather than inventing new idioms.
+- [x] Rule 6 — every user-facing string through `t()` (57 `ui_components.tracker.*` +
+  12 `ui_components.bot_setup.*` keys, en+de parity verified); ephemeral paths pass both
+  `user_id` and `guild_id`.
+- [x] Rule 7 — modal submit: `defer()` then `followup`.
+- [x] Rule 8 — rebuilt channel selects (`BotSetupView`) set `default_values`/`default=True` on
+  the currently-configured option; the status dropdown does the same for the current status.
+- [x] Rule 10 — TextInputs as class attributes; no `title=` in `super().__init__()` (`self.title`
+  is set as a plain instance attribute post-construction for type-aware modal titles, same
+  established idiom this codebase already uses for i18n'd labels).
+- [x] Rule 11 — all DB access via `CACHE.db_manager.*`.
+- [x] Rule 12 — idempotent DDL; `test_channel_id`/`test_message_id`'s `_add_column_if_missing`
+  calls live inside `_create_tracker_schema()` itself (not `_create_maindata_schema()`'s
+  migration block) since `tracker_items` is created a few lines earlier in that same method —
+  an early attempt to place them in the maindata migration block broke on a fresh DB (table
+  didn't exist yet at that point in `_create_schema()`'s call order), caught by
+  `test_reinitialize_is_idempotent` before it ever shipped.
+- [x] Rule 15 — docs and `/help` updated in the same change, every phase.
+- [x] Rule 16 — no real hostnames/paths/secrets; `.mcp.json`/`.vscode/mcp.json` reference
+  `TRACKER_BRIDGE_URL`/`TRACKER_BRIDGE_SECRET`/`TRACKER_ADMIN_ID` via `${env:...}` only.
+- [x] Pitfall 13/15 — defensive message delete/fetch handling throughout (`discord.NotFound:
+  pass`, generic `Exception`: log and skip).
+- [x] Pitfall 20 — `fully_initialized` gate in `interaction_check()` on every tracker
+  `DynamicItem` (`TrackerItemButton`, `TrackerTestPassButton`, `TrackerTestFailButton`).
+- [x] Pitfall 22 — the new `on_raw_reaction_add` listener uses `@QBcore.bot.event` (plain
+  `setattr`, safe under the double module import) not `@QBcore.bot.listen()` (append-based,
+  unsafe); the upload-window hook was added by directly editing the existing `on_message`
+  body, not registering a second handler.
+- [x] `.\run_tests.ps1` passes — 2252 tests pass; real pass count recorded in `changelog.txt`
+  at each phase.

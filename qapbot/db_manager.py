@@ -1580,6 +1580,10 @@ class WarHistoryDB:
         logging.info("[DB-SCHEMA] Verifying bot testers table...")
         await self._create_bot_testers_schema()
 
+        # Bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md Phase 1) — hot-only, no history mirror
+        logging.info("[DB-SCHEMA] Verifying bug/feature tracker tables...")
+        await self._create_tracker_schema()
+
         # History schema (schema 'history', attached database) — hot/history DB split
         logging.info("[DB-SCHEMA] Verifying history.* tables + indexes...")
         await self._create_history_schema()
@@ -2537,6 +2541,340 @@ class WarHistoryDB:
         await self._ensure_connection()
         async with self._write_lock:
             await self._conn.execute("DELETE FROM bot_testers WHERE discord_id = ?", (discord_id,))
+            await self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md Phase 1)
+    # ------------------------------------------------------------------
+
+    async def _create_tracker_schema(self) -> None:
+        """Create the bug/feature tracker tables (idempotent). Hot-only — no history mirror,
+        so Cardinal Rule 1 parity does not apply here, but every read still uses named column
+        access (Cardinal Rule 14) per BUG_FEATURE_TRACKER_PLAN.md §4."""
+        await self._ensure_connection()
+
+        # Bot-wide (not per-guild) key/value settings. guild_id defaults to '' (global) —
+        # only scope wired up today; the column exists from day one so a future per-guild
+        # tracker needs no migration (plan §4.1).
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                guild_id   TEXT NOT NULL DEFAULT '',
+                key        TEXT NOT NULL,
+                value      TEXT,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (guild_id, key)
+            )
+        """)
+
+        # Shared #NNNN ID pool for both bugs and features (single AUTOINCREMENT table).
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS tracker_items (
+                item_number        INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_type          TEXT    NOT NULL,
+                status              TEXT    NOT NULL DEFAULT 'open',
+                title               TEXT    NOT NULL,
+                description         TEXT    NOT NULL,
+                details             TEXT,
+                environment         TEXT,
+                reporter_id         TEXT    NOT NULL,
+                reporter_name       TEXT    NOT NULL,
+                guild_id            TEXT,
+                channel_id          TEXT,
+                message_id          TEXT,
+                thread_id           TEXT,
+                implemented_note    TEXT,
+                implemented_at      TEXT,
+                closed_at           TEXT,
+                last_edited_by      TEXT,
+                last_edited_at      TEXT,
+                created_at          TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_at          TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracker_items_status ON tracker_items(status, item_type)"
+        )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracker_items_reporter ON tracker_items(reporter_id)"
+        )
+
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS tracker_attachments (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_number   INTEGER NOT NULL,
+                filename      TEXT    NOT NULL,
+                original_name TEXT    NOT NULL,
+                content_type  TEXT,
+                size_bytes    INTEGER NOT NULL,
+                local_path    TEXT    NOT NULL,
+                discord_url   TEXT,
+                created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (item_number) REFERENCES tracker_items(item_number) ON DELETE CASCADE
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracker_attachments_item ON tracker_attachments(item_number)"
+        )
+
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS tracker_testcases (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_number   INTEGER NOT NULL,
+                environment   TEXT    NOT NULL,
+                seq           INTEGER NOT NULL,
+                description   TEXT    NOT NULL,
+                passed        BOOLEAN NOT NULL DEFAULT 0,
+                passed_by     TEXT,
+                passed_at     TEXT,
+                created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (item_number) REFERENCES tracker_items(item_number) ON DELETE CASCADE
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracker_testcases_item ON tracker_testcases(item_number, environment, seq)"
+        )
+
+        # Test-case message pointer (plan §4.4, Phase 5) — deliberately not in tracker_items'
+        # original CREATE TABLE above (Phase 1): not needed until the test-case loop exists.
+        # Placed here (not in _create_maindata_schema()'s migration block) since tracker_items
+        # itself is created a few lines above in this same idempotent method, not there.
+        await self._add_column_if_missing("tracker_items", "test_channel_id", "TEXT")
+        await self._add_column_if_missing("tracker_items", "test_message_id", "TEXT")
+
+        await self._conn.commit()
+        logging.debug("[DB-SCHEMA] Bug/feature tracker tables verified")
+
+    # -- bot_settings -----------------------------------------------------
+
+    async def get_bot_setting(self, key: str, guild_id: Optional[str] = None) -> Optional[str]:
+        """Return the stored value for *key* in the given scope ('' = global), or None if unset."""
+        await self._ensure_connection()
+        cursor = await self._conn.execute(
+            "SELECT value FROM bot_settings WHERE guild_id = ? AND key = ?",
+            (guild_id or "", key),
+        )
+        row = await cursor.fetchone()
+        return row["value"] if row else None
+
+    async def set_bot_setting(self, key: str, value: Optional[str], guild_id: Optional[str] = None) -> None:
+        """Upsert *key* → *value* in the given scope ('' = global)."""
+        await self._ensure_connection()
+        async with self._write_lock:
+            await self._conn.execute(
+                "INSERT INTO bot_settings (guild_id, key, value, updated_at) VALUES (?, ?, ?, datetime('now'))"
+                " ON CONFLICT(guild_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (guild_id or "", key, value),
+            )
+            await self._conn.commit()
+
+    async def get_all_bot_settings(self, guild_id: Optional[str] = None) -> Dict[str, Optional[str]]:
+        """Return every key/value pair set in the given scope ('' = global)."""
+        await self._ensure_connection()
+        cursor = await self._conn.execute(
+            "SELECT key, value FROM bot_settings WHERE guild_id = ?", (guild_id or "",)
+        )
+        return {row["key"]: row["value"] for row in await cursor.fetchall()}
+
+    # -- tracker_items ------------------------------------------------------
+
+    async def create_tracker_item(
+        self,
+        item_type: str,
+        title: str,
+        description: str,
+        reporter_id: str,
+        reporter_name: str,
+        details: Optional[str] = None,
+        environment: Optional[str] = None,
+        guild_id: Optional[str] = None,
+    ) -> int:
+        """Allocate the next global #NNNN and insert a new tracker item. Returns the new
+        item_number."""
+        await self._ensure_connection()
+        async with self._write_lock:
+            cursor = await self._conn.execute(
+                "INSERT INTO tracker_items "
+                "(item_type, title, description, details, environment, reporter_id, "
+                " reporter_name, guild_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (item_type, title, description, details, environment, reporter_id, reporter_name, guild_id),
+            )
+            await self._conn.commit()
+            return cast(int, cursor.lastrowid)
+
+    async def get_tracker_item(self, item_number: int) -> Optional[Dict[str, Any]]:
+        """Return one tracker item as a dict, or None if it doesn't exist."""
+        await self._ensure_connection()
+        cursor = await self._conn.execute(
+            "SELECT * FROM tracker_items WHERE item_number = ?", (item_number,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_tracker_items(
+        self,
+        status: Optional[str] = None,
+        item_type: Optional[str] = None,
+        reporter_id: Optional[str] = None,
+        guild_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """List tracker items, most recently created first, filtered by any combination of
+        status/item_type/reporter_id/guild_id (all optional)."""
+        await self._ensure_connection()
+        clauses: List[str] = []
+        params: List[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if item_type is not None:
+            clauses.append("item_type = ?")
+            params.append(item_type)
+        if reporter_id is not None:
+            clauses.append("reporter_id = ?")
+            params.append(reporter_id)
+        if guild_id is not None:
+            clauses.append("guild_id = ?")
+            params.append(guild_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        cursor = await self._conn.execute(
+            f"SELECT * FROM tracker_items {where} ORDER BY created_at DESC, item_number DESC LIMIT ?",
+            params,
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    # Columns update_tracker_item() is allowed to touch — whitelisted so **fields can never
+    # smuggle an arbitrary SQL identifier into the query (fields come from Discord UI/MCP input).
+    _TRACKER_ITEM_UPDATABLE_COLUMNS = frozenset({
+        "status", "title", "description", "details", "environment",
+        "channel_id", "message_id", "thread_id",
+        "implemented_note", "implemented_at", "closed_at",
+        "last_edited_by", "last_edited_at",
+        "test_channel_id", "test_message_id",
+    })
+
+    async def update_tracker_item(self, item_number: int, **fields: Any) -> None:
+        """Update arbitrary columns on a tracker item. Always bumps updated_at. Raises
+        ValueError if a field name isn't in the update whitelist."""
+        if not fields:
+            return
+        unknown = set(fields) - self._TRACKER_ITEM_UPDATABLE_COLUMNS
+        if unknown:
+            raise ValueError(f"update_tracker_item: unsupported field(s) {sorted(unknown)}")
+        await self._ensure_connection()
+        set_clause = ", ".join(f"{col} = ?" for col in fields)
+        params = list(fields.values()) + [item_number]
+        async with self._write_lock:
+            await self._conn.execute(
+                f"UPDATE tracker_items SET {set_clause}, updated_at = datetime('now') WHERE item_number = ?",
+                params,
+            )
+            await self._conn.commit()
+
+    async def set_tracker_item_message(
+        self, item_number: int, channel_id: str, message_id: str, thread_id: Optional[str] = None
+    ) -> None:
+        """Record where a tracker item was posted in Discord."""
+        await self.update_tracker_item(
+            item_number, channel_id=channel_id, message_id=message_id, thread_id=thread_id
+        )
+
+    async def get_tracker_item_by_test_message_id(self, test_message_id: str) -> Optional[Dict[str, Any]]:
+        """Return the tracker item whose test-case message is *test_message_id*, or None.
+        Used by the 👍-reaction shortcut (raw, not cached, so it works after restarts)."""
+        await self._ensure_connection()
+        cursor = await self._conn.execute(
+            "SELECT * FROM tracker_items WHERE test_message_id = ?", (test_message_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    # -- tracker_attachments --------------------------------------------
+
+    async def add_tracker_attachment(
+        self,
+        item_number: int,
+        filename: str,
+        original_name: str,
+        size_bytes: int,
+        local_path: str,
+        content_type: Optional[str] = None,
+        discord_url: Optional[str] = None,
+    ) -> int:
+        """Record one downloaded/re-uploaded attachment for a tracker item. Returns the new
+        attachment id."""
+        await self._ensure_connection()
+        async with self._write_lock:
+            cursor = await self._conn.execute(
+                "INSERT INTO tracker_attachments "
+                "(item_number, filename, original_name, content_type, size_bytes, local_path, discord_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (item_number, filename, original_name, content_type, size_bytes, local_path, discord_url),
+            )
+            await self._conn.commit()
+            return cast(int, cursor.lastrowid)
+
+    async def get_tracker_attachments(self, item_number: int) -> List[Dict[str, Any]]:
+        """Return every attachment recorded for a tracker item, oldest first."""
+        await self._ensure_connection()
+        cursor = await self._conn.execute(
+            "SELECT * FROM tracker_attachments WHERE item_number = ? ORDER BY id ASC",
+            (item_number,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    # -- tracker_testcases ------------------------------------------------
+
+    async def set_tracker_testcases(self, item_number: int, cases: List[Dict[str, Any]]) -> None:
+        """Replace the full test-case set for an item atomically. *cases* is a list of
+        {environment, description} dicts; seq is assigned per-environment in list order."""
+        await self._ensure_connection()
+        seq_by_env: Dict[str, int] = {}
+        rows = []
+        for case in cases:
+            env = case["environment"]
+            seq_by_env[env] = seq_by_env.get(env, 0) + 1
+            rows.append((item_number, env, seq_by_env[env], case["description"]))
+        async with self._write_lock:
+            await self._conn.execute("DELETE FROM tracker_testcases WHERE item_number = ?", (item_number,))
+            if rows:
+                await self._conn.executemany(
+                    "INSERT INTO tracker_testcases (item_number, environment, seq, description) "
+                    "VALUES (?, ?, ?, ?)",
+                    rows,
+                )
+            await self._conn.commit()
+
+    async def get_tracker_testcases(self, item_number: int) -> List[Dict[str, Any]]:
+        """Return every test case for an item, ordered by environment then seq."""
+        await self._ensure_connection()
+        cursor = await self._conn.execute(
+            "SELECT * FROM tracker_testcases WHERE item_number = ? ORDER BY environment ASC, seq ASC",
+            (item_number,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def mark_tracker_testcase_passed(self, testcase_id: int, user_id: str) -> None:
+        """Mark a single test case passed (per-testcase sign-off)."""
+        await self._ensure_connection()
+        async with self._write_lock:
+            await self._conn.execute(
+                "UPDATE tracker_testcases SET passed = 1, passed_by = ?, passed_at = datetime('now') "
+                "WHERE id = ?",
+                (user_id, testcase_id),
+            )
+            await self._conn.commit()
+
+    async def mark_tracker_environment_passed(self, item_number: int, environment: str, user_id: str) -> None:
+        """Mark every not-yet-passed test case for one environment of an item passed in one
+        go (per-environment button, or the 👍-reaction shortcut marking every environment)."""
+        await self._ensure_connection()
+        async with self._write_lock:
+            await self._conn.execute(
+                "UPDATE tracker_testcases SET passed = 1, passed_by = ?, passed_at = datetime('now') "
+                "WHERE item_number = ? AND environment = ? AND passed = 0",
+                (user_id, item_number, environment),
+            )
             await self._conn.commit()
 
     async def _ensure_clan_exists(self, clan_tag: str) -> None:

@@ -170,6 +170,12 @@ class CacheManager:
         # cwl_dm_restrict_to_admin-style live-testing guard. Managed via /admin's
         # MANAGE_TESTERS action (bot-admin only). See load_testers()/add_tester()/remove_tester().
         self.testers: Set[str] = set()
+        # Bug/feature tracker bot-wide settings (BUG_FEATURE_TRACKER_PLAN.md) — tracker channel
+        # IDs, tracker_guild_id, and the runtime tracker_enabled flag. Global scope only
+        # (bot_settings.guild_id='') — the only scope wired up today. Managed via /admin's
+        # BOT_SETUP action (bot-admin only, ui_tracker.BotSetupView).
+        # See load_tracker_settings()/set_tracker_setting().
+        self.tracker_settings: Dict[str, Optional[str]] = {}
         # Temporary war stats and clan history for in-memory management
         self.temp_war_stats: Dict[str, Dict[str, Any]] = {}  # clan_tag -> player_tag -> stats
         # Lightweight war metadata cached alongside temp_war_stats (state, start_time, end_time, type, is_cwl, war_tag, opponent_tag)
@@ -2119,6 +2125,37 @@ class CacheManager:
             logging.error(f"[DB-WRITE-THROUGH] Failed to remove tester {discord_id}: {e}")
             raise
 
+    async def load_tracker_settings(self) -> None:
+        """Load the bug/feature tracker's bot-wide settings (global scope) from database.
+
+        Raises:
+            SystemExit: On critical loading errors
+        """
+        if not self.db_manager:
+            raise RuntimeError("Database manager not initialized")
+
+        try:
+            self.tracker_settings = await self.db_manager.get_all_bot_settings()
+            logging.info(f"[DB-READ] Loaded {len(self.tracker_settings)} tracker setting(s) from database")
+        except Exception as e:
+            logging.error(f"[DB-READ] Failed to load tracker settings from database: {e}")
+            raise SystemExit(1)
+
+    async def set_tracker_setting(self, key: str, value: Optional[str]) -> None:
+        """Set one bug/feature tracker setting (global scope), with immediate DB persistence
+        (write-through).
+
+        Raises:
+            Exception: If database write fails (cache is still updated)
+        """
+        try:
+            self.tracker_settings[key] = value
+            await self.db_manager.set_bot_setting(key, value)  # type: ignore[union-attr]
+            logging.info(f"[DB-WRITE-THROUGH] Set tracker setting {key}={value!r}")
+        except Exception as e:
+            logging.error(f"[DB-WRITE-THROUGH] Failed to persist tracker setting {key}: {e}")
+            raise
+
     async def load_server_config(self) -> None:
         """
         Load server configuration from database.
@@ -2393,6 +2430,9 @@ class CacheManager:
         self._current_load_operation = "load_testers"
         logging.info("Starting cache load_all() - loading testers...")
         await self.load_testers()
+        self._current_load_operation = "load_tracker_settings"
+        logging.info("Starting cache load_all() - loading tracker settings...")
+        await self.load_tracker_settings()
         self._current_load_operation = "validate_clan_cache_consistency"
         # Validate consistency between server_config and clan_name_cache
         logging.info("Starting cache load_all() - validating clan cache consistency...")

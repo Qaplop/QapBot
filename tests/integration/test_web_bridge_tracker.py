@@ -1,0 +1,299 @@
+"""Tests for the bug/feature tracker's web bridge endpoints (BUG_FEATURE_TRACKER_PLAN.md
+Phase 6, §6.4): the shared-secret gate, item list/detail/attachment reads, and the
+status/comment/testcases write endpoints.
+"""
+# pyright: reportPrivateUsage=false, reportOptionalMemberAccess=false, reportArgumentType=false
+from __future__ import annotations
+
+import dataclasses
+import os
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from aiohttp.test_utils import TestClient, TestServer
+
+os.environ.setdefault("DISCORD_TOKEN", "test-token")
+
+from qapbot.config import CONFIG
+from qapbot.db_manager import WarHistoryDB
+
+SECRET = "test-secret"
+
+
+@pytest.fixture
+async def db(tmp_path):
+    db_path = tmp_path / "qapbot_test.db"
+    manager = WarHistoryDB()
+    await manager.initialize(str(db_path))
+    try:
+        yield manager
+    finally:
+        await manager.close()
+
+
+@pytest.fixture(autouse=True)
+def _wire_cache(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    monkeypatch.setattr(CACHE, "tracker_settings", {})
+
+
+@pytest.fixture
+def bridge_config(monkeypatch):
+    config = dataclasses.replace(CONFIG, web_bridge_secret=SECRET, web_bridge_port=1)
+    monkeypatch.setattr("qapbot.config.CONFIG", config)
+    return config
+
+
+@pytest.fixture
+async def client(bridge_config):
+    from qapbot.web_bridge import create_app
+    async with TestClient(TestServer(create_app())) as c:
+        yield c
+
+
+def _wire_bot(monkeypatch, channel=None, user=None):
+    import QBcore
+    bot = MagicMock()
+    bot.get_channel = MagicMock(return_value=channel)
+    bot.fetch_channel = AsyncMock(return_value=channel)
+    bot.get_user = MagicMock(return_value=user)
+    bot.fetch_user = AsyncMock(return_value=user)
+    monkeypatch.setattr(QBcore, "bot", bot)
+    return bot
+
+
+def _fake_channel():
+    channel = AsyncMock()
+    message = AsyncMock()
+    message.id = 999
+    channel.send = AsyncMock(return_value=message)
+    channel.fetch_message = AsyncMock(return_value=None)
+    return channel
+
+
+async def _make_item(db, **overrides):
+    kwargs = dict(item_type="bug", title="t", description="d", reporter_id="111", reporter_name="A")
+    kwargs.update(overrides)
+    return await db.create_tracker_item(**kwargs)
+
+
+# -- auth gate ------------------------------------------------------------
+
+async def test_list_items_requires_secret(client):
+    resp = await client.get("/api/tracker/items")
+    assert resp.status == 403
+
+
+async def test_list_items_rejects_wrong_secret(client):
+    resp = await client.get("/api/tracker/items", headers={"X-Bridge-Secret": "wrong"})
+    assert resp.status == 403
+
+
+# -- list / get ----------------------------------------------------------
+
+async def test_list_items_returns_seeded_items(client, db):
+    await _make_item(db, title="first")
+    await _make_item(db, item_type="feature", title="second")
+    resp = await client.get("/api/tracker/items", headers={"X-Bridge-Secret": SECRET})
+    assert resp.status == 200
+    body = await resp.json()
+    assert len(body["items"]) == 2
+
+
+async def test_list_items_filters_by_type(client, db):
+    await _make_item(db, item_type="bug")
+    await _make_item(db, item_type="feature")
+    resp = await client.get("/api/tracker/items?type=feature", headers={"X-Bridge-Secret": SECRET})
+    body = await resp.json()
+    assert len(body["items"]) == 1
+    assert body["items"][0]["item_type"] == "feature"
+
+
+async def test_get_item_returns_full_detail(client, db):
+    item_number = await _make_item(db, details="steps")
+    await db.add_tracker_attachment(
+        item_number, filename="1_shot.png", original_name="shot.png",
+        size_bytes=10, local_path="x", content_type="image/png",
+    )
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "d"}])
+
+    resp = await client.get(f"/api/tracker/items/{item_number}", headers={"X-Bridge-Secret": SECRET})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["item_number"] == item_number
+    assert len(body["attachments"]) == 1
+    assert len(body["testcases"]) == 1
+
+
+async def test_get_item_404_for_missing(client):
+    resp = await client.get("/api/tracker/items/99999", headers={"X-Bridge-Secret": SECRET})
+    assert resp.status == 404
+
+
+# -- attachment bytes + path containment -----------------------------------
+
+async def test_get_attachment_streams_file(client, db, tmp_path, bridge_config, monkeypatch):
+    item_number = await _make_item(db)
+    tracker_dir = str(tmp_path / "tracker_data")
+    file_dir = os.path.join(tracker_dir, f"{item_number:04d}")
+    os.makedirs(file_dir, exist_ok=True)
+    full_path = os.path.join(file_dir, "1_shot.png")
+    with open(full_path, "wb") as f:
+        f.write(b"hello")
+    aid = await db.add_tracker_attachment(
+        item_number, filename="1_shot.png", original_name="shot.png",
+        size_bytes=5, local_path=full_path, content_type="image/png",
+    )
+    monkeypatch.setattr("qapbot.config.CONFIG", dataclasses.replace(bridge_config, tracker_data_dir=tracker_dir))
+
+    resp = await client.get(f"/api/tracker/items/{item_number}/attachments/{aid}", headers={"X-Bridge-Secret": SECRET})
+    assert resp.status == 200
+    body = await resp.read()
+    assert body == b"hello"
+
+
+async def test_get_attachment_rejects_path_outside_tracker_root(client, db, tmp_path, bridge_config, monkeypatch):
+    item_number = await _make_item(db)
+    outside_file = tmp_path / "outside.txt"
+    outside_file.write_bytes(b"secret")
+    aid = await db.add_tracker_attachment(
+        item_number, filename="1_x.txt", original_name="x.txt",
+        size_bytes=6, local_path=str(outside_file), content_type="text/plain",
+    )
+    monkeypatch.setattr("qapbot.config.CONFIG", dataclasses.replace(bridge_config, tracker_data_dir=str(tmp_path / "tracker_data")))
+
+    resp = await client.get(f"/api/tracker/items/{item_number}/attachments/{aid}", headers={"X-Bridge-Secret": SECRET})
+    assert resp.status == 400
+
+
+async def test_get_attachment_404_for_unknown_id(client, db):
+    item_number = await _make_item(db)
+    resp = await client.get(f"/api/tracker/items/{item_number}/attachments/999", headers={"X-Bridge-Secret": SECRET})
+    assert resp.status == 404
+
+
+# -- status ----------------------------------------------------------------
+
+async def test_post_status_updates_item(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/status",
+        json={"status": "triaged"},
+        headers={"X-Bridge-Secret": SECRET, "X-Tracker-Admin": "claude"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "triaged"
+    assert body["item"]["last_edited_by"] == "claude"
+
+
+async def test_post_status_rejects_invalid_value(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/status",
+        json={"status": "not_a_real_status"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 400
+
+
+async def test_post_status_implemented_dms_reporter(client, db, monkeypatch):
+    fake_user = AsyncMock()
+    _wire_bot(monkeypatch, channel=None, user=fake_user)
+    item_number = await _make_item(db, reporter_id="222")
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/status",
+        json={"status": "implemented", "note": "fixed in commit abc123"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 200
+    fake_user.send.assert_awaited_once()
+    body = await resp.json()
+    assert body["item"]["implemented_note"] == "fixed in commit abc123"
+
+
+async def test_post_status_404_for_missing_item(client, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    resp = await client.post(
+        "/api/tracker/items/99999/status", json={"status": "triaged"}, headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 404
+
+
+# -- comment -----------------------------------------------------------
+
+async def test_post_comment_requires_thread(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/comment", json={"text": "hi"}, headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 404
+
+
+async def test_post_comment_posts_to_thread(client, db, monkeypatch):
+    thread = AsyncMock()
+    _wire_bot(monkeypatch, channel=thread)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, thread_id="777")
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/comment",
+        json={"text": "which clan tag?"},
+        headers={"X-Bridge-Secret": SECRET, "X-Tracker-Admin": "claude"},
+    )
+    assert resp.status == 200
+    thread.send.assert_awaited_once()
+
+
+async def test_post_comment_requires_text(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, thread_id="777")
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/comment", json={"text": "  "}, headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 400
+
+
+# -- testcases ---------------------------------------------------------
+
+async def test_post_testcases_creates_and_posts(client, db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_tracker import TRACKER_SETTING_TEST_CHANNEL
+    CACHE.tracker_settings[TRACKER_SETTING_TEST_CHANNEL] = "1"
+    channel = _fake_channel()
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases",
+        json={"cases": [{"environment": "DEV", "description": "run /leaderboard"}]},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "testing"
+    channel.send.assert_awaited_once()
+
+
+async def test_post_testcases_validates_case_shape(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases",
+        json={"cases": [{"environment": "QA", "description": "bad env"}]},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 400
+
+
+async def test_post_testcases_requires_non_empty_list(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases", json={"cases": []}, headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 400

@@ -1418,3 +1418,35 @@ it being true in practice. A live-testing fix aimed at one narrow failure mode (
 history overriding a real current clan) had a checkable, specific distinguishing signal available
 the whole time (family membership) and simply never used it, so it silently regressed every
 adjacent case (in-family clan transfers) it was never actually meant to touch.
+
+## Pitfall 34: a Discord attachment's CDN URL is signed and expires — download it the moment you receive it, not when you're ready to use it
+
+Design-time trap identified while building the bug/feature tracker (`BUG_FEATURE_TRACKER_PLAN.md`
+§3.3, §2.2), not (yet) a confirmed live incident — documented here because it's exactly the kind
+of thing that silently breaks weeks after shipping, the first time someone leaves a Discord modal
+open for a few minutes with attachments already selected.
+
+The trap: `discord.Attachment.url` on any attachment (a slash-command attachment parameter, a
+plain message's `message.attachments`, anything) is a **signed, time-limited CDN URL** — it works
+fine right after the message/interaction arrives, then starts returning HTTP 403 once the
+signature expires. Code that stores the URL string and defers the actual download to "whenever
+this item eventually gets processed" (a modal the user might sit in for minutes, a queued
+background job, a value merely passed through and read later) will intermittently 403 depending on
+timing that has nothing to do with the code's own correctness — it looks like a flaky Discord API,
+not a design bug, which is what makes it slow to diagnose.
+
+Fix pattern used here (`qapbot/ui_tracker.py`, `start_tracker_item()`): call
+`await attachment.read()` (which streams the bytes over HTTP right then, not just the URL) as a
+background `asyncio.create_task()` **immediately after** `interaction.response.send_modal()` —
+never after the modal's `on_submit()` fires, since discord.py's Modal contract requires
+`send_modal()` to be the interaction's first response, so the download can't happen first, only in
+parallel. `on_submit()` then `await`s that already-in-flight task instead of starting a fresh
+download against a URL that may already be dead.
+
+General lesson: anywhere an `Attachment`/its `.url` is captured for later use — not just
+modals — download the bytes (`await attachment.read()`) as close to receipt as possible, and pass
+the bytes (or a path to bytes already written to disk) onward, never the bare attachment object or
+its URL, if there's any gap between "received" and "processed" larger than the current event-loop
+tick. The bot's own re-upload into a posted item (`_build_discord_files()`) exists for exactly this
+reason on the *durable-storage* side too: a bot-owned copy never expires, but the user's original
+CDN link always eventually does.

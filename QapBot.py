@@ -2731,6 +2731,15 @@ async def _setup_hook():
         QBdiscordcmds.whois_slash,  # type: ignore[misc]
     ]
 
+    # Bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md §3.1) — PROD-only, no env var: DEV must
+    # never register these commands. A copy of PROD's DB onto DEV (routine for realistic-data
+    # testing) carries PROD's real tracker channel IDs (bot_settings) along with it, so an
+    # independently-configurable toggle would let DEV post real-looking items into PROD's
+    # actual channels. CONFIG.tracker_enabled is always `not is_dev_mode` (qapbot/config.py).
+    if CONFIG.tracker_enabled:
+        COMMANDS.append(QBdiscordcmds.bug)  # type: ignore[misc]
+        COMMANDS.append(QBdiscordcmds.feature)  # type: ignore[misc]
+
     # Command groups
     COMMAND_GROUPS = [
         QBdiscordcmds.clan_group,
@@ -2809,6 +2818,14 @@ async def _setup_hook():
     from qapbot.ui_cwl_roster import CwlSignupResponseButton
     QBcore.bot.add_dynamic_items(CwlSignupResponseButton)
     logging.info("[SETUP_HOOK] Registered persistent CwlSignupResponseButton dynamic item for restart-surviving DM buttons")
+
+    # Bug/feature tracker item buttons (BUG_FEATURE_TRACKER_PLAN.md Phase 3/5) — DynamicItems so
+    # a bot restart between posting an item/test-case message and a click still resolves
+    # correctly. Registered unconditionally (harmless no-op on DEV, where tracker_enabled is
+    # always False — no tracker message ever exists there to carry these custom_ids).
+    from qapbot.ui_tracker import TrackerItemButton, TrackerTestPassButton, TrackerTestFailButton
+    QBcore.bot.add_dynamic_items(TrackerItemButton, TrackerTestPassButton, TrackerTestFailButton)
+    logging.info("[SETUP_HOOK] Registered persistent tracker item/test-case dynamic items for restart-surviving buttons")
 
     # CWL clan-config web bridge (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase B) — no-ops unless
     # WEB_BRIDGE_PORT/WEB_BRIDGE_SECRET are both configured, so this is a no-op for any
@@ -3519,6 +3536,15 @@ async def on_message(message: discord.Message) -> None:
     a DM. Slash commands typed from DMs go through normal application-command
     dispatch, not this handler.
     """
+    # Bug/feature tracker upload window (BUG_FEATURE_TRACKER_PLAN.md §5.4) — must run BEFORE
+    # the DM fallback below: a file uploaded in a DM during an open window belongs to the
+    # tracker, not the generic "use /help" reply. Directly edited into this handler (not a
+    # second @QBcore.bot.event) since a second on_message registration would silently replace
+    # this one instead of adding to it (discord.py's Client.event() does plain setattr).
+    from qapbot.ui_tracker import handle_tracker_upload_message
+    if await handle_tracker_upload_message(message):
+        return
+
     if not message.author.bot and message.guild is None:
         from qapbot.i18n import t
 
@@ -3535,6 +3561,20 @@ async def on_message(message: discord.Message) -> None:
     # so this is currently a no-op — kept for correctness per discord.py's documented contract,
     # and as a safety net if a prefix command is ever added.
     await QBcore.bot.process_commands(message)
+
+
+@QBcore.bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    """Bug/feature tracker's 👍 test-case sign-off shortcut (BUG_FEATURE_TRACKER_PLAN.md §2.4,
+    §5.4) — the bot had no on_raw_reaction_add listener before this. Raw (not cached) so it
+    keeps working after a restart. Delegates entirely to handle_tracker_test_reaction(), which
+    no-ops for anything that isn't 👍 on a known test-case message from the bot admin.
+    """
+    from qapbot.ui_tracker import handle_tracker_test_reaction
+    try:
+        await handle_tracker_test_reaction(payload)
+    except Exception as e:
+        logging.error(f"[TRACKER] on_raw_reaction_add handler failed: {e}", exc_info=True)
 
 
 async def cleanup_stale_ui_messages() -> None:

@@ -165,6 +165,9 @@ action. There is no separate `/clans`, `/list_families`, `/list_players`, `/list
 - `/status` - Show bot status: uptime, memory usage, cache statistics
 - `/ping` - Check bot latency
 - `/help` - Show help information
+- `/bug` - Report a bug (opens a modal); works in any server the bot serves and in DMs. Only
+  registered in PROD mode — see `BUG_FEATURE_TRACKER_PLAN.md`.
+- `/feature` - Request a feature (opens a modal); same availability as `/bug`.
 
 ### Admin Commands
 - `/admin` - Administrative diagnostic actions and utilities; pick an `action` (permission scope
@@ -309,6 +312,8 @@ migration job moves data older than the retention window from hot to history —
 | `HISTORY_MIGRATION_ADMIN_BUDGET_MINUTES` | Cap on the migration step specifically when triggered via `/admin` "Execute Nightly Maintenance" — deliberately much shorter than the scheduled-window budget above, since `/admin` is an interactive, user-awaited command whose actual purpose is the maintenance steps (checkpoint/VACUUM/REINDEX/ANALYZE), not migration progress (the per-cycle chunk already carries that), and the Discord interaction token expires after ~15 min. | No | `1` |
 | `WEB_BRIDGE_PORT` / `WEB_BRIDGE_SECRET` | CWL Clan-Config Discord Activity bridge (PROD) — `127.0.0.1`-only port and shared secret for `qapbot/web_bridge.py`. Both must be set to start the bridge; a `cloudflared` tunnel makes it reachable from the Cloudflare Worker. See `qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md` and `activity/README.md`. | No | `0` / *(empty, disabled)* |
 | `WEB_BRIDGE_PORT_DEV` / `WEB_BRIDGE_SECRET_DEV` | Same, for DEV mode (`DISCORD_GUILD_ID` > 0) | No | `0` / *(empty, disabled)* |
+| *(none — the bug/feature tracker)* | `/bug`/`/feature` registration is not env-var-controlled: `CONFIG.tracker_enabled` is always `not is_dev_mode` (PROD-only), not independently configurable. DEV must never register these commands — a copy of PROD's DB onto DEV (routine for realistic-data testing) carries PROD's real tracker channel IDs along with it, and an env-var toggle would let DEV post real-looking items into those live channels. See `BUG_FEATURE_TRACKER_PLAN.md` §3.1. | - | - |
+| `TRACKER_DATA_DIR` | Directory for on-disk copies of tracker item attachments (agent-readable local files). | No | `data/tracker` |
 
 ## 🏭 Production Environment
 

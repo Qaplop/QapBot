@@ -105,6 +105,36 @@ class TestLoadConfigDev:
 
 
 # ---------------------------------------------------------------------------
+# Bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md) — tracker_enabled has no env var; it's
+# always the inverse of is_dev_mode, since PROD DB copies to DEV (for realistic-data testing)
+# carry PROD's real bot_settings tracker channel IDs along with them, so DEV must never be able
+# to register the commands regardless of anything in .env.
+# ---------------------------------------------------------------------------
+
+class TestTrackerEnabled:
+    def test_prod_mode_is_tracker_enabled(self):
+        env = _base_env(dev=False)
+        with patch.dict(os.environ, env, clear=True):
+            from qapbot.config import load_config
+            assert load_config().tracker_enabled is True
+
+    def test_dev_mode_is_tracker_disabled(self):
+        env = _base_env(dev=True)
+        with patch.dict(os.environ, env, clear=True):
+            from qapbot.config import load_config
+            cfg = load_config()
+            assert cfg.is_dev_mode is True
+            assert cfg.tracker_enabled is False
+
+    def test_tracker_enabled_env_var_has_no_effect(self):
+        """No TRACKER_ENABLED env var exists any more — setting one must do nothing."""
+        env = {**_base_env(dev=True), "TRACKER_ENABLED": "1"}
+        with patch.dict(os.environ, env, clear=True):
+            from qapbot.config import load_config
+            assert load_config().tracker_enabled is False
+
+
+# ---------------------------------------------------------------------------
 # Safe integer fallbacks
 # ---------------------------------------------------------------------------
 

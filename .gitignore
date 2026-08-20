@@ -182,11 +182,14 @@ cython_debug/
 .abstra/
 
 # Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore
 #  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#  and can be added to the global gitignore or merged into this file. However, if you prefer,
 #  you could uncomment the following to ignore the entire vscode folder
-.vscode/
+.vscode/*
+# Exception: the tracker MCP server config is meant to be checked in (BUG_FEATURE_TRACKER_PLAN.md
+# §6.5) so Copilot Chat picks it up for every contributor, unlike personal editor settings.
+!.vscode/mcp.json
 
 # Ruff stuff:
 .ruff_cache/
@@ -257,6 +260,10 @@ activity/**/.env.local
 activity/**/.env.*.local
 .repo_*backup*/
 .claude/
+
+# Bug/feature tracker MCP server's local markdown/attachment mirror (BUG_FEATURE_TRACKER_PLAN.md
+# §6.2) — reporter-uploaded content must never land in git.
+.tracker-cache/
 
 # Manual QA checklist's own browser Save-Progress state — personal local test progress, not
 # repo content (the checklist itself, tests/cwl_enrollment_manual_qa_checklist.html, IS tracked).
