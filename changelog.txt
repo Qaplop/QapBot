@@ -1,6 +1,25 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-20 (11)
+- Fixed: Start Enrollment's auto-assign put player Killer ("The Marines" family, PROD) into "The
+  Marines" instead of "The Marines II", despite Killer's real last-season CWL history genuinely
+  being for The Marines II (live bug report, project owner). Verified against real data
+  (get_last_real_cwl_attack_clan_sync called directly against the DEV backup) that the auto-assign
+  function itself was correct — the bug was one layer up, in start_cwl_enrollment's 2026-08-19
+  "current clan beats stale history" override, which redirected to a player's current clan
+  whenever it was participating, with no check on what the history it discarded actually pointed
+  at. That override's own docstring already said its target was "most commonly a guest clan", but
+  the code never encoded that — it fired for ANY participating current clan, including another one
+  of the SAME multi-clan family's own clans, discarding perfectly valid one-season-old in-family
+  history in favor of a normal post-season clan transfer. Added the missing
+  `prior_assignments[tag] not in family_clan_tags` guard — the override now only fires when the
+  history it's about to discard points outside the guild's own clan family. New Pitfall 33
+  (qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md) and pitfall #27 (copilot-instructions.md).
+  File: qapbot/QBdiscocmdshelper_cwl.py. 1 new test
+  (test_current_clan_does_not_beat_history_pointing_at_another_family_clan,
+  tests/integration/test_cwl_start_enrollment.py). 2145 tests pass (.\run_tests.ps1).
+
 2026-08-20 (10)
 - Added: hover explanations (plain native `title` tooltips, no delay — static text, no DB/API
   cost) for every Sort by/Show radio option and every legend item on the enrollment board

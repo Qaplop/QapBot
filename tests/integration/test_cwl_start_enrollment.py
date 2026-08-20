@@ -853,6 +853,50 @@ async def test_current_family_clan_membership_beats_stale_history_for_a_guest_cl
 
 
 @pytest.mark.asyncio
+async def test_current_clan_does_not_beat_history_pointing_at_another_family_clan(db, monkeypatch):
+    """2026-08-20 live bug report, project owner ("The Marines" family, PROD): player Killer's
+    last real CWL attack was for the family's own #MARINES2 ("The Marines II") last season; they
+    have since transferred to the family's other clan, #MARINES1 ("The Marines"), completely
+    normal end-of-season churn within the same multi-clan family. The 2026-08-19 override above
+    (see test_current_family_clan_membership_beats_stale_history_for_a_guest_clan) redirected them
+    to #MARINES1 anyway, purely because #MARINES1 is also participating this season — its actual
+    intended scope (per its own docstring, "most commonly a guest clan") was history pointing
+    OUTSIDE the family, never history pointing at the family's own other clan. #MARINES2 must win
+    here: it's real, one-season-old, in-family CWL history, not stale foreign data."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    guild_id = 10104
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (str(guild_id),))
+    for tag, name in [("#MARINES1", "The Marines"), ("#MARINES2", "The Marines II")]:
+        await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (tag, name))
+    await db.conn.commit()
+    CACHE.server_config[str(guild_id)] = {"member_clans": ["#MARINES1", "#MARINES2"], "member_families": []}
+    monkeypatch.setattr(CACHE, "db_manager", db)
+
+    # Killer is a genuine CURRENT member of #MARINES1...
+    await _seed_current_clan_member(db, "d1", "#KILLER", "#MARINES1")
+    # ...but their last REAL CWL attack on record was for #MARINES2 — the family's OTHER clan,
+    # last season.
+    await _seed_cwl_war(db, "#MARINES2", [("#KILLER", "Killer")])
+
+    event_id = db.create_cwl_event_sync(str(guild_id), "2026-08", "creator")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#MARINES1", "participating": True},
+        {"clan_tag": "#MARINES2", "participating": True},
+    ])
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
+
+    summary = await start_cwl_enrollment(guild_id, "2026-08")
+
+    assert summary["assigned"] == 1
+    assignments = db.get_cwl_assignments_sync(event_id)
+    assert len(assignments) == 1
+    assert assignments[0]["player_tag"] == "#KILLER"
+    assert assignments[0]["assigned_clan_tag"] == "#MARINES2"  # real in-family history wins
+
+
+@pytest.mark.asyncio
 async def test_departed_member_is_not_auto_assigned(db, monkeypatch):
     """A player with CWL history for this clan who is no longer a current member (per
     user_players.current_clan_tag) must not get auto-assigned — matches current membership."""

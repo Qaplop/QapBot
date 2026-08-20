@@ -2307,17 +2307,30 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     # path in this feature.
     prior_assignments = resolve_prior_cwl_assignments(list(current_member_tags), participating_clan_tags)
     # A player's CURRENT clan wins over resolve_prior_cwl_assignments' stale "last real CWL
-    # attack" history whenever that current clan is itself a valid, participating target
-    # (2026-08-19 fix, live bug report, project owner: "when staycalm gets added during the very
-    # start of adding the new season the theqcrew members get auto assigned to staycalm and not
-    # to the qcrew as they should"). resolve_prior_cwl_assignments' own documented design
-    # ("assign to wherever they last actually played, not wherever they're currently rostered")
-    # is still exactly right for a player whose CURRENT clan isn't participating this season (or
-    # isn't tracked at all) — there's nowhere better to put them, that's the whole reason history
-    # is consulted in the first place. But for a player who is a genuine CURRENT member of a clan
-    # that IS participating, that's unambiguously where they actually belong right now; some
-    # earlier season's history for a totally different participating clan (most commonly a guest
-    # clan) must never override that live fact.
+    # attack" history whenever that current clan is itself a valid, participating target AND the
+    # history it's overriding points OUTSIDE the guild's own clan family (2026-08-19 fix, live bug
+    # report, project owner: "when staycalm gets added during the very start of adding the new
+    # season the theqcrew members get auto assigned to staycalm and not to the qcrew as they
+    # should"). resolve_prior_cwl_assignments' own documented design ("assign to wherever they
+    # last actually played, not wherever they're currently rostered") is still exactly right for a
+    # player whose CURRENT clan isn't participating this season (or isn't tracked at all) — there's
+    # nowhere better to put them, that's the whole reason history is consulted in the first place.
+    # But for a player who is a genuine CURRENT member of a clan that IS participating, that's
+    # unambiguously where they actually belong right now; some earlier season's history for a
+    # totally different participating clan OUTSIDE the family (a guest clan — this override's
+    # actual original bug) must never override that live fact.
+    #
+    # The family-membership guard (2026-08-20 fix, live bug report, project owner: a multi-clan
+    # family's own player who genuinely played CWL for the family's OTHER clan (#2JYQ909PC, "The
+    # Marines II") last season, then transferred to this family's #2J00L8YRU ("The Marines")
+    # afterward — completely normal end-of-season churn — got redirected away from their accurate,
+    # one-season-old history to their new current clan anyway, purely because that new clan also
+    # happens to participate this season) is what the original fix's own docstring already called
+    # out as the intended scope ("most commonly a guest clan") but the code never actually encoded:
+    # it redirected on ANY participating current clan, not specifically a foreign/guest one. History
+    # that already points at one of the family's OWN clans is real, current-family CWL history, not
+    # stale foreign data — it must be left alone; only history pointing outside the family gets
+    # redirected to the player's real current (participating) clan.
     #
     # Only ever REDIRECTS an existing entry — never ADDS one for a tag resolve_prior_cwl_
     # assignments left out entirely. That set already reflects every other exclusion this
@@ -2329,9 +2342,14 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     # which lock this scoping in).
     current_clan_by_tag = {m["player_tag"]: m["clan_tag"] for m in all_members}
     participating_set = set(participating_clan_tags)
+    family_clan_tags = set(resolve_guild_member_clan_tags(guild_id))
     for tag in list(prior_assignments):
         current_clan = current_clan_by_tag.get(tag)
-        if current_clan is not None and current_clan in participating_set:
+        if (
+            current_clan is not None
+            and current_clan in participating_set
+            and prior_assignments[tag] not in family_clan_tags
+        ):
             prior_assignments[tag] = current_clan
     # Whole loop bundled into one asyncio.to_thread() hop (2026-08-16, Pitfall 26,
     # COPILOT_PITFALLS_COOKBOOK.md) rather than one hop per player — it's pure sync work with no

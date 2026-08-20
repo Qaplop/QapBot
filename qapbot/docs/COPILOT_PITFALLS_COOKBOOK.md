@@ -1351,3 +1351,48 @@ a guest PLAYER; more generally, a bulk/structured path vs. an individual/ad-hoc 
 whether a safety mechanism built for one on-ramp — here, `cwl_shared_clan_players`'s whole
 cross-guild machinery — was ever actually wired into the other, rather than assuming "guests are
 handled" covers both.
+
+## Pitfall 33: a "current clan beats stale history" override, meant for a GUEST clan, also fired for the family's OWN other clan
+
+Symptom (2026-08-20, live bug report, project owner, PROD — "The Marines" family, 2 clans): right
+after Start Enrollment ran, player Killer — a genuine current member of "The Marines" — landed in
+"The Marines" column despite having played CWL for "The Marines II" (the *same family's other
+clan*) just last season. Verified against the real data (`get_last_real_cwl_attack_clan_sync`
+called directly): Killer's last real CWL attack (`2026-08-09`, `is_cwl=1`) genuinely was for The
+Marines II — several *regular* (non-CWL) war attacks for The Marines afterward, correctly excluded
+by the query's own `is_cwl=1` filter, confirmed they really did transfer clans after CWL ended.
+The auto-assign function itself (`get_last_real_cwl_attack_clan_sync`) was working exactly as
+designed — the bug was one layer up.
+
+Root cause: `start_cwl_enrollment`'s own post-`resolve_prior_cwl_assignments` override (the
+2026-08-19 fix for "theqcrew members get auto assigned to staycalm" — see Pitfall 32's sibling
+incidents and `test_current_family_clan_membership_beats_stale_history_for_a_guest_clan`)
+redirects a player's auto-assign target to their live current clan whenever that current clan is
+itself participating this season — with **no check on what the history it's overriding actually
+points at**. The original bug's own docstring already named the intended scope in passing
+("some earlier season's history for a totally different participating clan (**most commonly a
+guest clan**)") but the code never encoded that distinction — it fired for ANY participating
+current clan, including, as here, another one of the SAME multi-clan family's own clans. A player
+switching between a family's own clans between seasons (Marines II → Marines) is completely
+normal churn and produces perfectly valid, one-season-old, in-family history — nothing like the
+original bug's out-of-family guest-clan mixup — but the override couldn't tell the two apart and
+discarded the correct, fresher signal (real CWL history) in favor of the wrong one (current clan)
+every time.
+
+Fix: added a `prior_assignments[tag] not in family_clan_tags` guard (`family_clan_tags =
+resolve_guild_member_clan_tags(guild_id)`, already computed nearby in the same function) — the
+override now only redirects when the history it's about to discard points OUTSIDE the guild's own
+clan family. History pointing at another of the family's own clans is left alone, matching
+`resolve_prior_cwl_assignments`' own original design ("assign to wherever they last actually
+played, not wherever they're currently rostered"). Verified against all three existing override
+tests (still pass — none of them involve a family clan on both sides) plus a new one,
+`test_current_clan_does_not_beat_history_pointing_at_another_family_clan`
+(`tests/integration/test_cwl_start_enrollment.py`), locking in the Marines/Marines II scenario.
+
+General lesson: when a fix's own code comment says "most commonly a guest clan" (or any other
+"usually X" qualifier) but the actual `if` condition doesn't test for X at all, that gap is a live
+bug waiting for the "not X" case to occur — encode the qualifier explicitly rather than relying on
+it being true in practice. A live-testing fix aimed at one narrow failure mode (foreign/guest-clan
+history overriding a real current clan) had a checkable, specific distinguishing signal available
+the whole time (family membership) and simply never used it, so it silently regressed every
+adjacent case (in-family clan transfers) it was never actually meant to touch.
