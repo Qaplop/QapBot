@@ -1,6 +1,22 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-20 (4)
+- Fixed: Guests search still showed a player who was already a current member of the guild's own
+  participating clan (not a guest at all), and would still show a family clan with no
+  cwl_event_clans row yet. (3)'s fix only excluded already-*invited* players (an existing
+  cwl_signups row) and already-*participating* clans — too narrow a definition of "already ours".
+- Changed: extracted `resolve_cwl_pool_clan_tags_sync(guild_id, event_id)` (QBdiscocmdshelper_cwl.py)
+  — the guild's whole clan family unioned with every clan configured for the event, participating
+  or not (rule b/f) — and made it the single source for "this guild's own lineup," reused by
+  start_cwl_enrollment, resolve_cwl_pool_dm_targets_sync, AND now the Guests search. The search now
+  excludes: any clan in that union; any current member of a clan in that union; anyone with an
+  existing cwl_signups row. The CoC-API fallback's equivalent checks
+  (_build_api_clan_hit_sync/_player_already_in_cwl_pool_sync, renamed from
+  _player_already_cwl_invited_sync) were broadened the same way.
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/web_bridge.py, CWL_ROSTER_PLANNING_PLAN.md.
+  2141 tests pass (`.\run_tests.ps1`).
+
 2026-08-20 (3)
 - Fixed: Configure Participating Clans' Guests search kept showing a player already invited as a
   guest (or a clan already participating) again in later searches. Clans were already excluded

@@ -486,6 +486,27 @@ def resolve_guild_member_clan_tags(guild_id: int) -> List[str]:
     return tags
 
 
+def resolve_cwl_pool_clan_tags_sync(guild_id: int, event_id: Optional[int]) -> List[str]:
+    """The guild's whole clan family unioned with every clan configured for event_id —
+    participating or not (rule b/f, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md: pool membership
+    ignores the participating toggle, and unchecking a guest clan leaves its members pooled) —
+    the definition of "this guild's own lineup for the season," which a guest, by definition, is
+    never part of. event_id=None (no CWL event exists yet for the guild's selected season) still
+    returns the family half — that's not conditional on a season existing.
+
+    Single source for this union, shared by start_cwl_enrollment, resolve_cwl_pool_dm_targets_sync
+    and the Guests search's own already-in-the-lineup exclusion (web_bridge.py) — three near-
+    identical inline unions were already drifting apart once (2026-08-20, see
+    resolve_cwl_pool_dm_targets_sync's own docstring), so a fourth inline copy for the search
+    wasn't an option."""
+    family_tags = set(resolve_guild_member_clan_tags(guild_id))
+    db = CACHE.db_manager
+    if db is None or event_id is None:
+        return list(family_tags)
+    all_clans = db.get_cwl_event_clans_sync(event_id)
+    return list(family_tags | {c["clan_tag"] for c in all_clans})
+
+
 def get_cwl_guest_clan_tags_sync(db: Any, event_id: int, guild_id: int) -> Set[str]:
     """Every clan currently on this event's roster (checked or unchecked — rule f means an
     unchecked guest clan's members stay pooled too) that is NOT part of the guild's own family —
@@ -2131,7 +2152,7 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     # itself is UNCHANGED below — it still restricts the auto-assignment TARGET (only a clan
     # actually fielding a CWL roster this season is a valid assignment destination) and the
     # cross-guild sharing check above.
-    pool_candidate_tags = list(set(resolve_guild_member_clan_tags(guild_id)) | {c["clan_tag"] for c in all_clans})
+    pool_candidate_tags = resolve_cwl_pool_clan_tags_sync(guild_id, event["id"])
     # A guest clan added to the roster BEFORE Start Enrollment hits the same untracked-clan gap as
     # one added after it (2026-08-19, live bug report — see ensure_cwl_clan_membership_tracked's
     # own docstring): with no user_players rows, it contributes nothing to `participants` here and
@@ -2329,10 +2350,7 @@ def resolve_cwl_pool_dm_targets_sync(
     all_clans = db.get_cwl_event_clans_sync(event_id)
     members = preloaded_members
     if members is None:
-        pool_clan_tags = list(
-            set(resolve_guild_member_clan_tags(guild_id)) | {c["clan_tag"] for c in all_clans}
-        )
-        members = db.get_current_clan_members_sync(pool_clan_tags)
+        members = db.get_current_clan_members_sync(resolve_cwl_pool_clan_tags_sync(guild_id, event_id))
 
     pool: Dict[str, Dict[str, Any]] = {}
     optout_by_tag: Dict[str, bool] = {}

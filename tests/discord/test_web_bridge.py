@@ -2341,6 +2341,65 @@ async def test_guest_search_returns_clan_hits_excluding_already_participating(db
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_guest_search_excludes_family_clan_not_yet_configured_for_event(db, bridge_config, client, monkeypatch):
+    """2026-08-20 fix, live bug report: a family clan with no cwl_event_clans row yet (never
+    explicitly checked/configured for this event) still showed up as an addable "guest" —
+    excluding only already-*participating* clans missed this case. A guild's own family clan is
+    never a guest candidate regardless of whether it's been configured for the event at all."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "856", {"#CLAN1": "Marines"})
+    CACHE.db_manager = db
+    CACHE.server_config["856"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Marines"}}
+    CACHE.user_accounts = {}
+
+    db.create_cwl_event_sync("856", "2026-09", "discordid1")
+    # No set_cwl_event_clans_sync call — #CLAN1 has no cwl_event_clans row at all yet.
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(856, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=856&discord_user_id=42&q=marine",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == []
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_excludes_current_member_of_family_clan(db, bridge_config, client, monkeypatch):
+    """2026-08-20 fix, live bug report: a current member of the guild's own family clan kept
+    showing up as an addable "guest" whenever they had no cwl_signups row of their own yet (e.g.
+    before Start Enrollment has run) — excluding only already-invited signups missed this case.
+    A current member of any clan in this guild's own lineup is never a guest candidate."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "857", {"#CLAN1": "Marines"})
+    CACHE.db_manager = db
+    CACHE.server_config["857"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.clan_name_cache = {}
+    _seed_player_names(db, {"#FAM1": "FamilyPlayer"})
+    CACHE.user_accounts = {}
+    await _seed_current_clan_member(db, "555", "#FAM1", "#CLAN1")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(857, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=857&discord_user_id=42&q=family",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == []
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_guest_search_highlights_clan_already_on_another_guilds_roster(db, bridge_config, client, monkeypatch):
     """2026-08-15 (cross-guild shared CWL clans, project owner's spec): a clan already
     participating in ANOTHER guild's event for the same season is still shown (never hidden),
@@ -2644,6 +2703,39 @@ async def test_guest_search_coc_api_fallback_excludes_already_invited_player(db,
 
     resp = await client.get(
         "/api/cwl/guest-search?guild_id=854&discord_user_id=42&q=%23APIPLAY2",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == []
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_coc_api_fallback_excludes_current_family_clan_member(
+    db, bridge_config, client, monkeypatch
+):
+    """Same exclusion, reached via the family-membership half rather than the signup half — a
+    current member of the guild's own family clan with no player_name_index entry must not be
+    resurfaced by the CoC API fallback either."""
+    import coc  # type: ignore[import-untyped]
+    from types import SimpleNamespace
+
+    from qapbot.cache_manager import CACHE
+
+    await _setup_api_fallback_guild(db, "855", monkeypatch)
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#CLAN1', 'Marines')")
+    await db.conn.commit()
+    CACHE.server_config["855"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    await _seed_current_clan_member(db, "555", "#APIPLAY3", "#CLAN1")
+    monkeypatch.setattr(
+        CACHE.coc_clan_cache, "get_clan", AsyncMock(side_effect=coc.NotFound(MagicMock(), "gone"))
+    )
+    get_player_mock = AsyncMock(return_value=SimpleNamespace(tag="#APIPLAY3", name="ApiPlayer"))
+    monkeypatch.setattr(CACHE, "get_player", get_player_mock)
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=855&discord_user_id=42&q=%23APIPLAY3",
         headers={"X-Bridge-Secret": "test-secret"},
     )
     assert resp.status == 200
