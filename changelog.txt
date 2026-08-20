@@ -1,6 +1,19 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-20 (8)
+- Fixed: every bridge-action error on the Activity frontend (guest-invite conflicts, drag-assign
+  conflicts, save/search/evict/remove failures) showed the raw `{status}: {"error":"..."}` — status
+  code and JSON braces included — instead of just the backend's own carefully-written message (live
+  bug report, project owner, screenshot: "Failed to add MasterBrainEro: 409:
+  {"error":"MasterBrainEro is already placed in StayMad's CWL roster..."}" instead of just the
+  message itself). Added `errorFromResponse()` (main.ts) — parses the JSON body and extracts
+  `.error` when present, falling back to the old raw `{status}: {body}` shape only for a
+  non-JSON response (proxy/gateway error page, empty body). Replaced all 9 of this file's
+  `throw new Error(\`${x.status}: ${body}\`)` call sites with it.
+  File: activity/client/src/main.ts. `tsc --noEmit` clean. Deployed to DEV
+  (`npm run deploy:dev`, per standing DEV-deploy permission).
+
 2026-08-20 (7)
 - Fixed: individually guest-inviting a player into a guild's CWL pool (Guests search → Add) never
   checked whether that same player was already deliberately placed in a DIFFERENT guild's own

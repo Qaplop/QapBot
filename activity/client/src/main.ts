@@ -33,6 +33,25 @@ const clientId = import.meta.env.VITE_CLIENT_ID as string | undefined
 // same top-level browsing context alive across repeated launches within one Discord session.
 const CACHED_TOKEN_KEY = 'cwl-activity-access-token'
 
+// Every bridge endpoint that can fail returns `{"error": "human-readable message"}` — this turns
+// that into an Error whose .message is just the human-readable text, not the raw response (status
+// code + JSON) every one of this file's fetch call sites used to throw verbatim (2026-08-20, live
+// bug report: an admin saw "Failed to add MasterBrainEro: 409:
+// {"error":"MasterBrainEro is already placed in..."}" — the status code and JSON braces are
+// noise the backend's own carefully-written message shouldn't have to fight through). Falls back
+// to the raw `${status}: ${body}` shape only when the body isn't the expected JSON error shape at
+// all (a proxy/gateway error page, an empty body, etc.) — better a rough fallback than swallowing
+// a real failure silently.
+function errorFromResponse(status: number, rawBody: string): Error {
+  try {
+    const parsed = JSON.parse(rawBody) as { error?: unknown }
+    if (typeof parsed.error === 'string' && parsed.error.length > 0) return new Error(parsed.error)
+  } catch {
+    // Not JSON at all — fall through to the raw shape below.
+  }
+  return new Error(`${status}: ${rawBody}`)
+}
+
 async function setup(): Promise<void> {
   const root = document.getElementById('app')
   if (!root) return
@@ -173,7 +192,7 @@ async function setup(): Promise<void> {
           })
           if (!response.ok) {
             const body = await response.text()
-            throw new Error(`${response.status}: ${body}`)
+            throw errorFromResponse(response.status, body)
           }
         },
         async (reason: string) => {
@@ -225,7 +244,7 @@ async function setup(): Promise<void> {
           })
           if (!removeResponse.ok) {
             const body = await removeResponse.text()
-            throw new Error(`${removeResponse.status}: ${body}`)
+            throw errorFromResponse(removeResponse.status, body)
           }
           const { rejected } = (await removeResponse.json()) as {
             rejected: { player_tag: string; clan_name: string }[]
@@ -360,7 +379,7 @@ async function setup(): Promise<void> {
         })
         if (!saveResponse.ok) {
           const body = await saveResponse.text()
-          throw new Error(`${saveResponse.status}: ${body}`)
+          throw errorFromResponse(saveResponse.status, body)
         }
       },
       closeActivity,
@@ -374,7 +393,7 @@ async function setup(): Promise<void> {
         )
         if (!searchResponse.ok) {
           const body = await searchResponse.text()
-          throw new Error(`${searchResponse.status}: ${body}`)
+          throw errorFromResponse(searchResponse.status, body)
         }
         const body = (await searchResponse.json()) as GuestSearchResponse
         // A search superseded while queued behind the bridge's single-flight guard (Step 3) —
@@ -397,7 +416,7 @@ async function setup(): Promise<void> {
         })
         if (!guestResponse.ok) {
           const body = await guestResponse.text()
-          throw new Error(`${guestResponse.status}: ${body}`)
+          throw errorFromResponse(guestResponse.status, body)
         }
       },
       async (clanTag: string, targetGuildId: string) => {
@@ -408,7 +427,7 @@ async function setup(): Promise<void> {
         })
         if (!evictResponse.ok) {
           const body = await evictResponse.text()
-          throw new Error(`${evictResponse.status}: ${body}`)
+          throw errorFromResponse(evictResponse.status, body)
         }
       },
       async (clanTag: string) => {
@@ -419,7 +438,7 @@ async function setup(): Promise<void> {
         })
         if (!removeResponse.ok) {
           const body = await removeResponse.text()
-          throw new Error(`${removeResponse.status}: ${body}`)
+          throw errorFromResponse(removeResponse.status, body)
         }
       },
       async () => {
@@ -429,7 +448,7 @@ async function setup(): Promise<void> {
         )
         if (!listResponse.ok) {
           const body = await listResponse.text()
-          throw new Error(`${listResponse.status}: ${body}`)
+          throw errorFromResponse(listResponse.status, body)
         }
         const body = (await listResponse.json()) as { players: GuestPlayerPoolEntry[] }
         return body.players
@@ -442,7 +461,7 @@ async function setup(): Promise<void> {
         })
         if (!removeResponse.ok) {
           const body = await removeResponse.text()
-          throw new Error(`${removeResponse.status}: ${body}`)
+          throw errorFromResponse(removeResponse.status, body)
         }
         const { rejected } = (await removeResponse.json()) as {
           rejected: { player_tag: string; clan_name: string }[]
