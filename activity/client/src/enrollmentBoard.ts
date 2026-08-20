@@ -536,15 +536,19 @@ export function renderEnrollmentBoard(
   legendLabel.textContent = 'User response:'
   legend.append(
     legendLabel,
-    buildLegendItem(pendingIconUrl, STATUS_LABEL.pending),
-    buildLegendItem(gcheckIconUrl, STATUS_LABEL.confirmed),
-    buildLegendItem(redxIconUrl, STATUS_LABEL.declined),
+    buildLegendItem(pendingIconUrl, STATUS_LABEL.pending, 'Sent the enrollment DM, no response yet.'),
+    buildLegendItem(gcheckIconUrl, STATUS_LABEL.confirmed, 'Confirmed participation via the enrollment DM.'),
+    buildLegendItem(redxIconUrl, STATUS_LABEL.declined, 'Declined (opted out) via the enrollment DM.'),
     // Trailing comma appended to this item's own label text, not as a separate flex child
     // (2026-08-16, live-testing feedback: the guest swatch below doesn't belong to the "User
     // response:" group — a comma marks that boundary, but as a sibling flex item it'd pick up the
     // row's own gap on both sides and float away from "Not Linked" instead of reading as one
     // word).
-    buildLegendItem(unlinkedIconUrl, UNLINKED_LABEL, ','),
+    buildLegendItem(
+      unlinkedIconUrl, UNLINKED_LABEL,
+      "No Discord account is linked to this player, so they can't receive or respond to the enrollment DM.",
+      ',',
+    ),
     // Guest indicator (2026-08-16, live-testing feedback: "what is the meaning of the small
     // yellow band" — the .guest-card left-accent already had a hover tooltip, but that's not
     // discoverable without hovering every card; a legend entry is) — a small swatch reproducing
@@ -1075,9 +1079,16 @@ export function renderEnrollmentBoard(
   return { applyPolledUpdate }
 }
 
-function buildLegendItem(iconUrl: string, label: string, suffix = ''): HTMLElement {
+// `explanation` is a plain native `title` tooltip (2026-08-20, project owner's spec: "add tooltip
+// explanations for all setting options and also for the legend items... here the hover doesn't
+// need to be delayed since the info is static and no db or api cost come from these") — same
+// lightweight pattern as the orphaned-column headline/skill-metric/status-icon tooltips elsewhere
+// in this file, deliberately not the async hover-popup machinery built for player cards, since
+// this text is static and needs no per-hover data fetch or artificial delay.
+function buildLegendItem(iconUrl: string, label: string, explanation: string, suffix = ''): HTMLElement {
   const item = document.createElement('span')
   item.className = 'legend-item'
+  item.title = explanation
   const icon = document.createElement('img')
   icon.className = 'legend-icon'
   icon.src = iconUrl
@@ -1089,6 +1100,9 @@ function buildLegendItem(iconUrl: string, label: string, suffix = ''): HTMLEleme
 function buildGuestLegendItem(): HTMLElement {
   const item = document.createElement('span')
   item.className = 'legend-item'
+  item.title =
+    "This player (or the clan they came from) isn't part of this guild's own clan family — " +
+    'invited individually via the Guests search, or a member of a guest clan added to the roster.'
   const swatch = document.createElement('span')
   swatch.className = 'legend-guest-swatch'
   item.append(swatch, 'Guest (from another clan/guild)')
@@ -1104,14 +1118,23 @@ function buildSortSelector(initial: SortOrder, onChange: (order: SortOrder) => v
   label.textContent = 'Sort by:'
   wrap.appendChild(label)
 
-  const options: { value: SortOrder; label: string }[] = [
-    { value: 'th', label: 'TH Level' },
-    { value: 'skill', label: 'Player Skill' },
-    { value: 'alpha', label: 'Alphabetical' },
+  const options: { value: SortOrder; label: string; explanation: string }[] = [
+    {
+      value: 'th', label: 'TH Level',
+      explanation: 'Highest Town Hall first. Same-TH players are then ordered by skill score, then name.',
+    },
+    {
+      value: 'skill', label: 'Player Skill',
+      explanation:
+        'Highest skill score first, regardless of the Show: setting on the right (this always sorts ' +
+        'by Skill Score specifically). Ties are broken by TH level, then name.',
+    },
+    { value: 'alpha', label: 'Alphabetical', explanation: 'Player name, A to Z.' },
   ]
   for (const option of options) {
     const optionLabel = document.createElement('label')
     optionLabel.className = 'sort-option'
+    optionLabel.title = option.explanation
     const radio = document.createElement('input')
     radio.type = 'radio'
     radio.name = 'cwl-sort-order'
@@ -1135,13 +1158,22 @@ function buildMetricSelector(initial: DisplayMetric, onChange: (metric: DisplayM
   label.textContent = 'Show:'
   wrap.appendChild(label)
 
-  const options: { value: DisplayMetric; label: string }[] = [
-    { value: 'avg_stars', label: 'Avg Stars/Attack' },
-    { value: 'skill', label: 'Skill Score' },
+  // Wording matches updateSkillExplainer()'s own text below the selector — same explanation,
+  // just available on hover instead of only once "Skill Score" is already selected.
+  const options: { value: DisplayMetric; label: string; explanation: string }[] = [
+    {
+      value: 'avg_stars', label: 'Avg Stars/Attack',
+      explanation: "Plain average stars per attack over each player's CWL attacks in the last 3 months.",
+    },
+    {
+      value: 'skill', label: 'Skill Score',
+      explanation: "League-weighted average stars/attack over each player's CWL attacks in the last 3 months.",
+    },
   ]
   for (const option of options) {
     const optionLabel = document.createElement('label')
     optionLabel.className = 'sort-option'
+    optionLabel.title = option.explanation
     const radio = document.createElement('input')
     radio.type = 'radio'
     radio.name = 'cwl-display-metric'

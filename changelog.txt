@@ -1,6 +1,15 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-20 (10)
+- Added: hover explanations (plain native `title` tooltips, no delay — static text, no DB/API
+  cost) for every Sort by/Show radio option and every legend item on the enrollment board
+  (project owner's spec). Show:'s wording matches the existing skill-explainer text below the
+  selector; Player Skill's tooltip clarifies it always sorts by Skill Score specifically,
+  independent of the Show: selection.
+  File: activity/client/src/enrollmentBoard.ts. `tsc --noEmit` clean. Deployed to DEV
+  (`npm run deploy:dev`, per standing DEV-deploy permission).
+
 2026-08-20 (9)
 - Changed: "Sort by: TH Level" on the enrollment board now uses player skill (skill_score) as a
   secondary tiebreaker within the same TH level, before falling back to name — previously tied
