@@ -397,6 +397,14 @@ export function renderEnrollmentBoard(
         .then(() => {
           status.textContent = `${displayName(player)} removed.`
           status.className = 'save-status'
+          // The POST already confirmed the removal server-side (unlike handleDrop's optimistic-
+          // then-confirm flow above) — pull the card out of `working` now instead of waiting for
+          // the next long-poll cycle (up to ~25s) to notice via applyPolledUpdate. Otherwise the
+          // footer says "removed" while the tile visibly stays put (live bug report, project
+          // owner, 2026-08-20: "the footer shows removal but the tile remains").
+          const idx = working.findIndex((p) => p.player_tag === player.player_tag)
+          if (idx !== -1) working.splice(idx, 1)
+          renderBoard()
         })
         .catch((err: unknown) => {
           console.error(err)

@@ -1,6 +1,17 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-20 (5)
+- Fixed: right-clicking a guest player on the enrollment board and choosing "Remove guest player"
+  removed them server-side and updated the footer status to "<name> removed.", but the card itself
+  stayed on the board until the next long-poll refresh (up to ~25s later) — live bug report,
+  project owner: "the footer shows removal but the tile remains." The context-menu handler never
+  mutated the local `working` array or called `renderBoard()` on success, unlike `handleDrop`'s
+  optimistic-update pattern elsewhere in the same file. Now splices the removed player out of
+  `working` and re-renders immediately once the POST confirms.
+  File: activity/client/src/enrollmentBoard.ts. `tsc --noEmit` clean. Deployed to DEV
+  (`npm run deploy:dev`, per standing DEV-deploy permission).
+
 2026-08-20 (4)
 - Fixed: Guests search still showed a player who was already a current member of the guild's own
   participating clan (not a guest at all), and would still show a family clan with no
