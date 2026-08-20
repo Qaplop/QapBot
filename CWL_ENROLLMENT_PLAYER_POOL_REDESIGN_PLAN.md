@@ -214,6 +214,28 @@ candidate set changes. The existing `cwl_enrollment_include_all_linked_accounts`
   287-293/415/420-423, `main.ts` 361-378, `types.ts`'s guest-add return type).
 - **Rule c/d**: already correct as-is (guest player/clan additions seed the pool without DMing) —
   verify only, no code change beyond rule e's removal.
+  - **Corrected 2026-08-20 (live bug report).** Only the *pool-add* half was actually correct.
+    Rule c's other half — "receives the enrollment DM once enrollment actually starts" — never
+    worked for an individually-invited guest PLAYER: `start_cwl_enrollment` built its DM targets
+    purely from `get_current_clan_members_sync(pool_candidate_tags)`, and a guest's real current
+    clan is by definition none of this guild's pooled clans, so they were structurally invisible
+    to that scan. They stayed in the pool un-DMed until an admin pressed rule h's "Notify New
+    Pool Members."
+
+    The underlying defect was that §5's planned shared `resolve_cwl_pool_players_for_event`
+    helper was never actually built — Start Enrollment, that button, and the button's gating
+    check `has_cwl_pool_members_missing_dm` each resolved "the pool" their own way, so a player
+    could be in one's idea of the pool and not another's. Fixed by finally extracting it:
+    `resolve_cwl_pool_dm_targets_sync(guild_id, event_id, season, preloaded_members=None)` in
+    `QBdiscocmdshelper_cwl.py`, now the single source for all three. It unions current clan
+    members (family ∪ every configured event clan, rule b/f), this event's `cwl_signups` rows
+    (the only trace of an individually-invited guest) and shared-clan rosters, honours
+    `cwl_permanent_optout` for every source, resolves `discord_id` from `user_players` when a row
+    carries none, and owns the `skipped_optout`/`skipped_unlinked` counts. Sending was already
+    shared via `_send_cwl_enrollment_dm_batch`. Two side effects, both corrections: the button no
+    longer DMs permanently-opted-out players, and no longer runs the heavy board payload builder
+    (`_build_enrollment_payload_sync`) just to collect recipients. Guest CLANS were never
+    affected (rule d: their members ARE current members of a pooled clan).
 - **Rule f**: stop the automatic destructive cascade on uncheck — remove the call to
   `_cleanup_local_pool_for_plain_clan_deactivation_sync` from
   `detach_guild_from_shared_clan_on_deactivation`'s non-shared branch (triggered today from
@@ -362,6 +384,14 @@ conventions (`.github/copilot-instructions.md`).
     check (`has_cwl_pool_members_missing_dm`, `QBdiscocmdshelper_cwl.py`) is therefore a
     separate, cheap, plain-sync function mirroring `start_cwl_enrollment`'s own pool
     computation instead.
+    - **Reverted 2026-08-20** — this deviation was the bug. Three independent pool computations
+      (this check, the button, Start Enrollment) meant a guest player could be in one's idea of
+      the pool and not another's, which is exactly what happened. The shared helper this section
+      originally called for now exists as `resolve_cwl_pool_dm_targets_sync` and all three use
+      it; the sync/async objection dissolves because it's a plain **synchronous** function (a
+      handful of indexed lookups, nothing like `_build_enrollment_payload_sync`) that the async
+      callers wrap in `asyncio.to_thread()` and the render path calls directly. See the rule c/d
+      correction note earlier in this file.
   - `propagate_cwl_player_response`'s sync half was also called directly (not via the async
     wrapper) from `web_bridge.py`'s `_apply_cwl_enrollment_signup_sync`, itself already the sync
     half of one atomic `asyncio.to_thread()` hop — **removed 2026-08-19** along with the rest of

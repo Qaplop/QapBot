@@ -1,6 +1,39 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-20 (2)
+- Fixed: A player invited manually as a guest during the draft phase never received the
+  enrollment DM when "Start Enrollment" ran — it only arrived once an admin pressed "Notify New
+  Pool Members". Root cause: the two actions resolved their recipients through completely
+  separate code — Start Enrollment from a clan-scoped get_current_clan_members_sync() scan (which
+  a guest is structurally invisible to: their current clan is by definition none of the guild's
+  pooled clans), the button from the board payload builder.
+- Changed: Unified all three pool-resolution paths onto one new
+  `resolve_cwl_pool_dm_targets_sync()` — Start Enrollment, "Notify New Pool Members" and that
+  button's gating check `has_cwl_pool_members_missing_dm()` (a third hand-rolled copy) now share
+  one definition of the pool: current clan members ∪ this event's cwl_signups rows ∪ shared-clan
+  rosters, deduped, opt-out honoured for every source, discord_id resolved from user_players when
+  a row carries none. DM sending was already shared (`_send_cwl_enrollment_dm_batch`). Two side
+  effects, both corrections: the button no longer DMs permanently-opted-out players, and no
+  longer runs the heavy skill-score/avg-stars payload build just to collect recipients.
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/web_bridge.py, qapbot/db_manager.py
+  (get_player_links_sync now also returns cwl_permanent_optout),
+  CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md. 2136 tests pass.
+
+2026-08-20 (1)
+- Added: CWL "Configure Participating Clans" Guests search now falls back to a live CoC API
+  lookup when the DB knows nothing about a well-formed tag (project owner's spec). Clan first,
+  then player, both through the cache_manager wrappers — which is also what persists the result:
+  `coc_clan_cache.get_clan()` already inserts a new clan with the league-gated
+  `track_war_updates` (M3+ → True, below → False), and a player hit is written via
+  `update_player_name_index_sync()`. Already-participating clans stay excluded; a failed/absent
+  lookup keeps the previous raw-tag placeholder, so an API outage degrades to the old behavior.
+  10-minute negative cache prevents an API call per keystroke on no-match queries.
+  File: qapbot/web_bridge.py. Docs: CWL_ROSTER_PLANNING_PLAN.md (new dated section, supersedes
+  two decisions in the original 2026-08-15 Guests section). Tests: 5 new in
+  tests/discord/test_web_bridge.py — NOT RUN: this workspace checkout has no venv and no
+  project dependencies installed, so `.\run_tests.ps1` cannot execute here.
+
 2026-08-19 (96)
 - Removed dead code (project owner, after learning the "one-click admin-confirm" button
   referenced in the manual QA checklist doesn't exist in the live UI: "Ah, got it. That is

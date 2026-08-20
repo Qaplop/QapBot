@@ -656,15 +656,21 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
 
 async def notify_new_cwl_pool_members(guild_id: int, season: str) -> Dict[str, Any]:
     """Rule h's "Notify New Pool Members" action (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_
-    REDESIGN_PLAN.md) — for an event past `draft`, re-resolves the actual current pool (reuses
-    _build_enrollment_payload_sync, same reasoning as handle_get_cwl_guest_players above — this
-    is a real button-click callback, not the synchronous UI-render path, so the heavier payload
-    build is safe here) and runs it through the shared DM batch helper. The batch helper's own
-    global dm_sent dedup (QBdiscocmdshelper_cwl.py) means this is naturally "only the
-    not-yet-contacted ones" — no separate filtering needed here. The button-gating check
-    (has_cwl_pool_members_missing_dm, QBdiscocmdshelper_cwl.py) is a separate, cheaper function —
-    it runs on the synchronous CWL Management screen render path, which can't await this one."""
-    from qapbot.QBdiscocmdshelper_cwl import _send_cwl_enrollment_dm_batch
+    REDESIGN_PLAN.md) — for an event past `draft`, re-resolves the actual current pool and runs
+    it through the shared DM batch helper. Both the pool resolution
+    (resolve_cwl_pool_dm_targets_sync) and the sending (_send_cwl_enrollment_dm_batch) are the
+    exact same functions start_cwl_enrollment uses, so this button and Start Enrollment can't
+    drift apart about who counts as a pool member (2026-08-20 — see
+    resolve_cwl_pool_dm_targets_sync's docstring for the bug that came of them not being shared).
+    The batch helper's own global dm_sent dedup (QBdiscocmdshelper_cwl.py) means this is
+    naturally "only the not-yet-contacted ones" — no separate filtering needed here. The
+    button-gating check (has_cwl_pool_members_missing_dm, QBdiscocmdshelper_cwl.py) is a
+    separate, cheaper function — it runs on the synchronous CWL Management screen render path,
+    which can't await this one."""
+    from qapbot.QBdiscocmdshelper_cwl import (
+        _send_cwl_enrollment_dm_batch,
+        resolve_cwl_pool_dm_targets_sync,
+    )
 
     db = CACHE.db_manager
     if db is None:
@@ -675,12 +681,8 @@ async def notify_new_cwl_pool_members(guild_id: int, season: str) -> Dict[str, A
     if event["status"] in ("draft", "cancelled"):
         return {"ok": False, "error": "not_open"}
 
-    payload = await asyncio.to_thread(_build_enrollment_payload_sync, guild_id)
-    dm_targets = [
-        {"player_tag": p["player_tag"], "player_name": p["player_name"], "discord_id": p["discord_id"]}
-        for p in payload["players"] if p["discord_id"]
-    ]
-    dm_result = await _send_cwl_enrollment_dm_batch(event["id"], guild_id, season, dm_targets)
+    pool = await asyncio.to_thread(resolve_cwl_pool_dm_targets_sync, guild_id, event["id"], season)
+    dm_result = await _send_cwl_enrollment_dm_batch(event["id"], guild_id, season, pool["targets"])
     return {"ok": True, **dm_result}
 
 
@@ -788,12 +790,17 @@ def _search_cwl_guests_sync(guild_id: int, query: str) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for tag, hit in player_hits.items():
             link = links.get(tag, {})
-            out.append({
+            entry: Dict[str, Any] = {
                 "type": "player",
                 "player_tag": tag,
                 "player_name": link.get("player_name") or hit["player_name"],
                 "discord_id": link.get("discord_id"),
-            })
+            }
+            # Internal-only marker, stripped before the response leaves
+            # handle_get_cwl_guest_search() — see _resolve_guest_tag_via_coc_api().
+            if hit.get("unverified"):
+                entry["unverified"] = True
+            out.append(entry)
         return out
 
     if query.startswith("@"):
@@ -857,11 +864,15 @@ def _search_cwl_guests_sync(guild_id: int, query: str) -> List[Dict[str, Any]]:
             for match in db.search_player_tags_by_prefix_sync(upper_query, limit=GUEST_SEARCH_CAP):
                 player_hits.setdefault(match["player_tag"], match)
         # A tag typed exactly that the index doesn't know about at all — still offered as a raw
-        # hit (name falls back to the tag itself) so the admin can add it directly; whether it's
-        # actually a real CoC tag is only found out once something tries to use it. Added
+        # hit (name falls back to the tag itself) so the admin can add it directly. Marked
+        # `unverified` so handle_get_cwl_guest_search() can tell "the DB found nothing real" from
+        # "the DB found something", which is what gates the CoC API fallback
+        # (_resolve_guest_tag_via_coc_api); the marker never reaches the frontend. Added
         # regardless of the cap above (a single entry — the final [:12] slice below re-caps it).
         if len(upper_query) >= 5 and upper_query not in player_hits:
-            player_hits[upper_query] = {"player_tag": upper_query, "player_name": upper_query}
+            player_hits[upper_query] = {
+                "player_tag": upper_query, "player_name": upper_query, "unverified": True
+            }
     else:
         for match in CACHE.search_player_names(query, limit=25):
             player_hits[match["player_tag"]] = {"player_tag": match["player_tag"], "player_name": match["player_name"]}
@@ -883,6 +894,140 @@ def _search_cwl_guests_sync(guild_id: int, query: str) -> List[Dict[str, Any]]:
             results.append(capped_players[i])
 
     return results
+
+
+# CoC API fallback for an unknown-but-well-formed tag (2026-08-20). When the DB search above
+# finds nothing real for a query that normalize_clan_tag() accepts, ask the CoC API directly:
+# clan first, then player. Both go through the cache_manager wrappers (Cardinal Rule 9), which is
+# also what makes the "add it to the DB immediately" half free — coc_clan_cache.get_clan()'s
+# _update_clan_metadata() already inserts a never-before-seen clan with the league-gated
+# track_war_updates value (M3+ → True, below → False), so there is deliberately no separate clan
+# write here; duplicating it would be a second source of that tier rule.
+#
+# Negative-result cache: a miss is NOT cached by coc_clan_cache (only successes are), and this
+# search fires per debounced keystroke, so without this a run of no-match queries that happen to
+# look like tags ("MARINES" normalizes fine) would issue two API calls each, every keystroke.
+# Only a definitive coc.NotFound for BOTH lookups is recorded — a transient API error must stay
+# retryable.
+_GUEST_TAG_API_MISS_TTL_SECONDS = 600.0
+_GUEST_TAG_API_MISS_CAP = 256
+_guest_tag_api_misses: Dict[str, float] = {}
+
+
+def _guest_tag_api_miss_is_active(tag: str) -> bool:
+    expiry = _guest_tag_api_misses.get(tag)
+    if expiry is None:
+        return False
+    if expiry <= time.monotonic():
+        del _guest_tag_api_misses[tag]
+        return False
+    return True
+
+
+def _record_guest_tag_api_miss(tag: str) -> None:
+    now = time.monotonic()
+    for stale_tag, expiry in list(_guest_tag_api_misses.items()):
+        if expiry <= now:
+            del _guest_tag_api_misses[stale_tag]
+    while len(_guest_tag_api_misses) >= _GUEST_TAG_API_MISS_CAP:
+        _guest_tag_api_misses.pop(next(iter(_guest_tag_api_misses)))
+    _guest_tag_api_misses[tag] = now + _GUEST_TAG_API_MISS_TTL_SECONDS
+
+
+def _build_api_clan_hit_sync(guild_id: int, clan_tag: str) -> Optional[Dict[str, Any]]:
+    """Same clan-hit shape (and same already-participating exclusion / already_shared_with
+    annotation) _search_cwl_guests_sync produces, for a clan the API just revealed. Returns None
+    when the clan is already participating in this guild's own event — the scan excludes those
+    deliberately, and the API fallback must not smuggle them back in as addable."""
+    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+
+    import QBcore
+
+    db = CACHE.db_manager
+    if db is None:
+        return None
+    guild_id_str = str(guild_id)
+    season = resolve_selected_cwl_season(guild_id)
+    event = db.get_cwl_event_sync(guild_id_str, season)
+    if event is not None:
+        for clan in db.get_cwl_event_clans_sync(event["id"]):
+            if clan["clan_tag"] == clan_tag and clan.get("participating", 1):
+                return None
+
+    already_shared_with = None
+    other_claims = db.find_cwl_clan_participation_across_guilds_sync(
+        clan_tag, season, exclude_guild_id=guild_id_str
+    )
+    if other_claims:
+        other_guild = QBcore.bot.get_guild(int(other_claims[0]["guild_id"]))
+        already_shared_with = other_guild.name if other_guild else other_claims[0]["guild_id"]
+
+    return {
+        "type": "clan",
+        "clan_tag": clan_tag,
+        "clan_name": CACHE.get_clan_name(clan_tag, clan_tag) or clan_tag,
+        "clan_tier": CACHE.get_clan_war_league(clan_tag),
+        "already_shared_with": already_shared_with,
+    }
+
+
+def _persist_api_player_hit_sync(player_tag: str, player_name: str) -> Dict[str, Any]:
+    """Writes an API-discovered player into player_name_index (which mirrors into
+    player_name_search/player_name_fts), so the very next keystroke finds it in the DB without
+    another API call, and returns it in _finalize_player_hits' shape."""
+    from datetime import datetime, timezone
+
+    db = CACHE.db_manager
+    discord_id = None
+    if db is not None:
+        db.update_player_name_index_sync(
+            [(player_tag, player_name, datetime.now(timezone.utc).isoformat())]
+        )
+        link = db.get_player_links_sync([player_tag]).get(player_tag, {})
+        player_name = link.get("player_name") or player_name
+        discord_id = link.get("discord_id")
+    return {
+        "type": "player",
+        "player_tag": player_tag,
+        "player_name": player_name,
+        "discord_id": discord_id,
+    }
+
+
+async def _resolve_guest_tag_via_coc_api(guild_id: int, query: str) -> Optional[Dict[str, Any]]:
+    """Clan-then-player CoC API lookup for `query`, returning one guest-search hit or None.
+
+    None means "nothing to add": the query isn't a well-formed tag, the API doesn't know it, the
+    lookup failed, or it resolved to a clan this guild is already participating with. Callers
+    keep whatever the DB search produced in that case (including its raw unverified placeholder),
+    so an API outage degrades to exactly the pre-2026-08-20 behavior."""
+    import coc
+
+    from qapbot.QBdiscocmdshelper import normalize_clan_tag
+
+    tag = normalize_clan_tag(query)
+    if not tag or _guest_tag_api_miss_is_active(tag):
+        return None
+
+    clan_definitely_absent = False
+    try:
+        await CACHE.coc_clan_cache.get_clan(tag)
+    except coc.NotFound:
+        clan_definitely_absent = True
+    except Exception as e:
+        logging.warning(f"[GUEST-SEARCH] CoC clan lookup for {tag} failed: {e}")
+    else:
+        logging.info(f"[GUEST-SEARCH] {tag} resolved to a clan via CoC API")
+        return await asyncio.to_thread(_build_api_clan_hit_sync, guild_id, tag)
+
+    player = await CACHE.get_player(tag)
+    if player is None:
+        if clan_definitely_absent:
+            _record_guest_tag_api_miss(tag)
+        return None
+
+    logging.info(f"[GUEST-SEARCH] {tag} resolved to player {player.name} via CoC API")
+    return await asyncio.to_thread(_persist_api_player_hit_sync, tag, player.name)
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -1190,7 +1335,11 @@ async def handle_get_cwl_guest_search(request: web.Request) -> web.Response:
     every other route here; a plain empty-results response (not an error) for a query with no
     hits. Runs off the event loop via asyncio.to_thread (2026-08-17, Pitfall 26,
     COPILOT_PITFALLS_COOKBOOK.md — this incident is exactly why READ paths need the same
-    treatment as writes, not just this one) with the single-flight guard described above."""
+    treatment as writes, not just this one) with the single-flight guard described above.
+
+    When the DB search comes back with nothing real and the query is a well-formed CoC tag, falls
+    back to a live CoC API lookup that also persists the hit — see
+    _resolve_guest_tag_via_coc_api()."""
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
     try:
@@ -1214,6 +1363,18 @@ async def handle_get_cwl_guest_search(request: web.Request) -> web.Response:
             # frontend throw the result away.
             return web.json_response({"results": [], "stale": True})
         results = await asyncio.to_thread(_search_cwl_guests_sync, guild_id, query)
+
+    # Nothing real in the DB for a query that looks like a tag → ask the CoC API and persist
+    # whatever it finds (2026-08-20) — see _resolve_guest_tag_via_coc_api(). Deliberately outside
+    # the single-flight semaphore: it awaits network I/O, and holding the per-admin lock across
+    # that would serialize an admin's keystrokes behind a remote call.
+    if not any(not r.get("unverified") for r in results):
+        api_hit = await _resolve_guest_tag_via_coc_api(guild_id, query)
+        if api_hit is not None:
+            results = [api_hit]
+
+    for result in results:
+        result.pop("unverified", None)
 
     return web.json_response({"results": results})
 

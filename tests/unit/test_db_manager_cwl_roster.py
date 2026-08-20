@@ -1098,7 +1098,10 @@ class TestGetPlayerLinks:
         links = db.get_player_links_sync(["#P1", "#NEVER_LINKED"])
 
         assert list(links.keys()) == ["#P1"]
-        assert links["#P1"] == {"player_name": "Player", "discord_id": "d1", "verified": True}
+        assert links["#P1"] == {
+            "player_name": "Player", "discord_id": "d1", "verified": True,
+            "cwl_permanent_optout": False,
+        }
 
     @pytest.mark.integration
     async def test_empty_tags_returns_empty(self, db):
@@ -1193,7 +1196,10 @@ class TestChunkedInQuery:
         links = db.get_player_links_sync(tags)
 
         assert len(links) == len(linked_indices)
-        assert links[tags[0]] == {"player_name": "Player0", "discord_id": "d0", "verified": True}
+        assert links[tags[0]] == {
+        "player_name": "Player0", "discord_id": "d0", "verified": True,
+        "cwl_permanent_optout": False,
+    }
         assert tags[1] not in links
 
     @pytest.mark.integration

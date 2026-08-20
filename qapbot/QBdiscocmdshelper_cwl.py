@@ -519,13 +519,13 @@ def has_cwl_pool_members_missing_dm(guild_id: int, season: str) -> bool:
     the enrollment DM by ANY guild this season. Drives the "Notify New Pool Members" button
     (add_cwl_management_components, ui_cwl_roster.py).
 
-    Deliberately plain-synchronous, NOT the heavier web_bridge.py's _build_enrollment_payload_sync
-    reuse notify_new_cwl_pool_members() itself uses — add_cwl_management_components() is the
-    synchronous CWL Management screen render path (Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md:
-    every DB call in that function is a direct, cheap, indexed lookup with no asyncio.to_thread
-    wrapping, since it runs straight on the event loop), which cannot await anything — so this
-    mirrors start_cwl_enrollment's own cheap pool_candidate_tags computation (rule b) instead of
-    the full skill-score/avg-stars payload builder."""
+    Answers "would pressing that button actually reach anyone?", so it resolves the pool through
+    the very same resolve_cwl_pool_dm_targets_sync() the button itself (and Start Enrollment)
+    uses — anything else risks the button appearing for a pool the action then declines to DM, or
+    vice versa. Safe on this call path despite running straight on the event loop (Pitfall 26,
+    COPILOT_PITFALLS_COOKBOOK.md — add_cwl_management_components() is the synchronous CWL
+    Management screen render): the resolver is a handful of indexed lookups, not the
+    skill-score/avg-stars board payload builder."""
     db = CACHE.db_manager
     if db is None:
         return False
@@ -533,19 +533,14 @@ def has_cwl_pool_members_missing_dm(guild_id: int, season: str) -> bool:
     if event is None or event["status"] in ("draft", "cancelled"):
         return False
 
-    all_clans = db.get_cwl_event_clans_sync(event["id"])
-    pool_candidate_tags = list(set(resolve_guild_member_clan_tags(guild_id)) | {c["clan_tag"] for c in all_clans})
-    tags_with_discord = {m["player_tag"] for m in db.get_current_clan_members_sync(pool_candidate_tags) if m["discord_id"]}
-    # Individually-invited guest players may not be a current member of any configured clan at
-    # all (get_current_clan_members_sync wouldn't find them) — their only trace is their own
-    # cwl_signups row.
-    for signup in db.get_cwl_signups_for_event_sync(event["id"]):
-        if signup["discord_id"]:
-            tags_with_discord.add(signup["player_tag"])
+    tags_with_discord = [
+        target["player_tag"]
+        for target in resolve_cwl_pool_dm_targets_sync(guild_id, event["id"], season)["targets"]
+    ]
     if not tags_with_discord:
         return False
 
-    dm_status = db.get_cwl_player_season_dm_status_bulk_sync(list(tags_with_discord), season)
+    dm_status = db.get_cwl_player_season_dm_status_bulk_sync(tags_with_discord, season)
     return not all(dm_status.get(tag, False) for tag in tags_with_discord)
 
 
@@ -2176,10 +2171,8 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     )
 
     signups_to_create: List[Dict[str, Any]] = []
-    dm_targets: List[Dict[str, Any]] = []
     for participant in participants:
         if participant["cwl_permanent_optout"]:
-            summary["skipped_optout"] += 1
             continue
         existing_global = global_status_by_tag.get(participant["player_tag"])
         signups_to_create.append({
@@ -2190,16 +2183,25 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
             "source": "template_confirm",
             "status": existing_global["status"] if existing_global else "pending",
         })
-        if participant["discord_id"]:
-            dm_targets.append(participant)
-        else:
-            summary["skipped_unlinked"] += 1
 
     if signups_to_create:
         # asyncio.to_thread()-wrapped (2026-08-16, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — a
         # real bulk write, potentially every member across every participating clan.
         await asyncio.to_thread(db.bulk_create_cwl_signups_sync, event["id"], signups_to_create)
         summary["seeded"] = len(signups_to_create)
+
+    # Recipients come from the SAME pool resolver the "Notify New Pool Members" button uses, run
+    # after the seed above so it sees the complete pool (2026-08-20 fix — see
+    # resolve_cwl_pool_dm_targets_sync's docstring for the bug that made sharing it necessary).
+    # `participants` is handed over so its clan-member scan and account-wide expansion aren't
+    # redone; the resolver adds the sources that scan structurally can't see (guest players,
+    # shared-clan rosters) and owns both skip counts, so they're defined in exactly one place.
+    pool = await asyncio.to_thread(
+        resolve_cwl_pool_dm_targets_sync, guild_id, event["id"], season, participants,
+    )
+    dm_targets = pool["targets"]
+    summary["skipped_optout"] = pool["skipped_optout"]
+    summary["skipped_unlinked"] = pool["skipped_unlinked"]
 
     # Auto-assignment seed — the initial "who probably plays where" suggestion, from each
     # player's own last real CWL attack, anywhere (2026-08-14 redesign — see
@@ -2284,6 +2286,95 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     await asyncio.to_thread(db.update_cwl_event_status_sync, event["id"], "signup_open")
     summary["ok"] = True
     return summary
+
+
+def resolve_cwl_pool_dm_targets_sync(
+    guild_id: int, event_id: int, season: str,
+    preloaded_members: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """The single definition of "who is in this event's player pool, and can we DM them" — shared
+    by start_cwl_enrollment() and notify_new_cwl_pool_members() (the "Notify New Pool Members"
+    button, web_bridge.py) so the two can never disagree about the pool. Both used to resolve
+    their own recipients independently (Start Enrollment from a clan-scoped current-member scan,
+    the button from the heavyweight board payload `_build_enrollment_payload_sync`), which is
+    exactly how a manually-invited guest player ended up reachable by one and invisible to the
+    other (2026-08-20 live bug report).
+
+    The pool is the union of three sources, deduped by player_tag, first non-empty discord_id
+    winning:
+      1. current members of the guild's whole clan family unioned with every clan configured for
+         this event — participating or not (rule b/f, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md);
+      2. this event's existing cwl_signups rows — the only way an individually-invited guest
+         player is reachable at all, since their real current clan is by definition none of the
+         above (deliberately not filtered by `source`: every row here is in the pool, see
+         Cardinal Rule 24 on not gating behavior on a static write-time marker);
+      3. cross-guild shared clans' rosters (cwl_shared_clan_players), whose players may have no
+         local row of either kind.
+
+    Returns {"targets", "skipped_optout", "skipped_unlinked"} — targets are the
+    {player_tag, player_name, discord_id} dicts _send_cwl_enrollment_dm_batch() consumes, and the
+    two counts are what the Start Enrollment summary reports. cwl_permanent_optout is honoured
+    for every source, not just source 1 (its per-account "never DM me about CWL" semantics don't
+    care how the player got pooled). preloaded_members lets start_cwl_enrollment pass the member
+    list it already fetched (plus its account-wide expansion) rather than re-running that scan.
+
+    Plain synchronous function (Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — no `await` anywhere
+    inside, so callers wrap the whole thing in one asyncio.to_thread() hop.
+    """
+    db = CACHE.db_manager
+    result: Dict[str, Any] = {"targets": [], "skipped_optout": 0, "skipped_unlinked": 0}
+    if db is None:
+        return result
+
+    all_clans = db.get_cwl_event_clans_sync(event_id)
+    members = preloaded_members
+    if members is None:
+        pool_clan_tags = list(
+            set(resolve_guild_member_clan_tags(guild_id)) | {c["clan_tag"] for c in all_clans}
+        )
+        members = db.get_current_clan_members_sync(pool_clan_tags)
+
+    pool: Dict[str, Dict[str, Any]] = {}
+    optout_by_tag: Dict[str, bool] = {}
+
+    def _merge(player_tag: str, player_name: Optional[str], discord_id: Optional[str]) -> None:
+        entry = pool.setdefault(
+            player_tag, {"player_tag": player_tag, "player_name": None, "discord_id": None}
+        )
+        entry["player_name"] = entry["player_name"] or player_name
+        entry["discord_id"] = entry["discord_id"] or discord_id
+
+    for member in members:
+        optout_by_tag[member["player_tag"]] = bool(member["cwl_permanent_optout"])
+        _merge(member["player_tag"], member["player_name"], member["discord_id"])
+
+    for signup in db.get_cwl_signups_for_event_sync(event_id):
+        _merge(signup["player_tag"], signup["player_name"], signup["discord_id"])
+
+    for clan in all_clans:
+        if not clan.get("participating", 1):
+            continue
+        shared = db.get_cwl_shared_clan_sync(clan["clan_tag"], season)
+        if shared is None:
+            continue
+        for shared_player in db.get_cwl_shared_clan_players_sync(shared["id"]):
+            _merge(shared_player["player_tag"], shared_player["player_name"], shared_player["discord_id"])
+
+    # Sources 2/3 carry no opt-out flag and may carry no discord_id at all (the Guests search can
+    # add a tag it found no Discord link for) — user_players is the authority for both.
+    unknown_tags = [tag for tag in pool if tag not in optout_by_tag]
+    for tag, link in (db.get_player_links_sync(unknown_tags) if unknown_tags else {}).items():
+        optout_by_tag[tag] = link["cwl_permanent_optout"]
+        _merge(tag, link["player_name"], link["discord_id"])
+
+    for entry in pool.values():
+        if optout_by_tag.get(entry["player_tag"]):
+            result["skipped_optout"] += 1
+        elif entry["discord_id"]:
+            result["targets"].append(entry)
+        else:
+            result["skipped_unlinked"] += 1
+    return result
 
 
 async def _send_cwl_enrollment_dm_batch(

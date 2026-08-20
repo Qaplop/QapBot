@@ -2,6 +2,8 @@
 the shared-secret gate, the guild-admin re-verification (including the configured
 super-admin bypass), and the GET/POST clan-config endpoints' actual behavior.
 """
+# pyright: reportPrivateUsage=false, reportOptionalMemberAccess=false, reportArgumentType=false
+# pyright: reportAttributeAccessIssue=false, reportUnusedVariable=false, reportDeprecated=false
 from __future__ import annotations
 
 import asyncio
@@ -2501,6 +2503,167 @@ async def test_guest_search_raw_unindexed_tag_still_returned(db, bridge_config, 
     assert body["results"] == [
         {"type": "player", "player_tag": "#NEVERSEEN", "player_name": "#NEVERSEEN", "discord_id": None}
     ]
+
+
+# ---------------------------------------------------------------------------
+# CoC API fallback for an unknown-but-well-formed tag (2026-08-20) — see
+# qapbot/web_bridge.py's _resolve_guest_tag_via_coc_api().
+# ---------------------------------------------------------------------------
+
+async def _setup_api_fallback_guild(db, guild_id: str, monkeypatch) -> None:
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, guild_id, {})
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id] = {"member_clans": [], "member_families": []}
+    CACHE.clan_name_cache = {}
+    CACHE.user_accounts = {}
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(int(guild_id), 42, is_admin=True))
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_unknown_tag_resolved_as_clan_via_coc_api(db, bridge_config, client, monkeypatch):
+    """A well-formed tag the DB has never seen triggers a live clan lookup; the hit comes back
+    with the real name/tier the API-populated clan_name_cache now holds, replacing the raw
+    unverified placeholder entirely."""
+    from types import SimpleNamespace
+
+    from qapbot.cache_manager import CACHE
+
+    await _setup_api_fallback_guild(db, "850", monkeypatch)
+
+    async def _fake_get_clan(tag):
+        # Mirrors coc_clan_cache._update_clan_metadata()'s real side effect: a never-before-seen
+        # clan lands in clan_name_cache (and the DB) as part of the fetch itself.
+        CACHE.clan_name_cache[tag] = {"name": "Api Clan", "war_league": "Master League III"}
+        return SimpleNamespace(tag=tag, name="Api Clan")
+
+    monkeypatch.setattr(CACHE.coc_clan_cache, "get_clan", AsyncMock(side_effect=_fake_get_clan))
+    monkeypatch.setattr(CACHE, "get_player", AsyncMock(return_value=None))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=850&discord_user_id=42&q=%23APICLAN1",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == [{
+        "type": "clan", "clan_tag": "#APICLAN1", "clan_name": "Api Clan",
+        "clan_tier": "Master League III", "already_shared_with": None,
+    }]
+    CACHE.get_player.assert_not_awaited()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_unknown_tag_resolved_as_player_via_coc_api(db, bridge_config, client, monkeypatch):
+    """No clan by that tag, but a player — the hit carries the API's real name and is written
+    into player_name_index (and its mirrors), so the next keystroke finds it without an API
+    call."""
+    import coc  # type: ignore[import-untyped]
+    from types import SimpleNamespace
+
+    from qapbot.cache_manager import CACHE
+
+    await _setup_api_fallback_guild(db, "851", monkeypatch)
+    monkeypatch.setattr(
+        CACHE.coc_clan_cache, "get_clan", AsyncMock(side_effect=coc.NotFound(MagicMock(), "gone"))
+    )
+    monkeypatch.setattr(
+        CACHE, "get_player", AsyncMock(return_value=SimpleNamespace(tag="#APIPLAY1", name="ApiPlayer"))
+    )
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=851&discord_user_id=42&q=%23APIPLAY1",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == [
+        {"type": "player", "player_tag": "#APIPLAY1", "player_name": "ApiPlayer", "discord_id": None}
+    ]
+    assert db.search_player_tags_by_prefix_sync("#APIPLAY1") == [
+        {"player_tag": "#APIPLAY1", "player_name": "ApiPlayer"}
+    ]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_unknown_tag_absent_from_coc_api_keeps_raw_placeholder(
+    db, bridge_config, client, monkeypatch
+):
+    """Neither a clan nor a player — the pre-fallback behavior is preserved unchanged (raw hit,
+    name = the tag), and the internal `unverified` marker never reaches the frontend."""
+    import coc  # type: ignore[import-untyped]
+
+    from qapbot.cache_manager import CACHE
+
+    await _setup_api_fallback_guild(db, "852", monkeypatch)
+    monkeypatch.setattr(
+        CACHE.coc_clan_cache, "get_clan", AsyncMock(side_effect=coc.NotFound(MagicMock(), "gone"))
+    )
+    monkeypatch.setattr(CACHE, "get_player", AsyncMock(return_value=None))
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=852&discord_user_id=42&q=%23APIGH0ST",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["results"] == [
+        {"type": "player", "player_tag": "#APIGH0ST", "player_name": "#APIGH0ST", "discord_id": None}
+    ]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_db_hit_never_triggers_coc_api(db, bridge_config, client, monkeypatch):
+    """The fallback is a last resort: any real DB hit must short-circuit it, so a normal search
+    never costs a CoC API call."""
+    from qapbot.cache_manager import CACHE
+
+    await _setup_api_fallback_guild(db, "853", monkeypatch)
+    CACHE.clan_name_cache = {"#KN0WNCLAN": {"name": "Known Clan"}}
+    monkeypatch.setattr(CACHE.coc_clan_cache, "get_clan", AsyncMock())
+    monkeypatch.setattr(CACHE, "get_player", AsyncMock())
+
+    resp = await client.get(
+        "/api/cwl/guest-search?guild_id=853&discord_user_id=42&q=known",
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert [r["clan_tag"] for r in body["results"] if r["type"] == "clan"] == ["#KN0WNCLAN"]
+    CACHE.coc_clan_cache.get_clan.assert_not_awaited()
+    CACHE.get_player.assert_not_awaited()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_guest_search_api_miss_is_negative_cached(db, bridge_config, client, monkeypatch):
+    """A definitive double-NotFound is remembered briefly so a run of keystrokes over the same
+    non-existent tag doesn't re-issue two API calls each time."""
+    import coc  # type: ignore[import-untyped]
+
+    from qapbot.cache_manager import CACHE
+    from qapbot import web_bridge
+
+    await _setup_api_fallback_guild(db, "854", monkeypatch)
+    web_bridge._guest_tag_api_misses.clear()
+    get_clan = AsyncMock(side_effect=coc.NotFound(MagicMock(), "gone"))
+    monkeypatch.setattr(CACHE.coc_clan_cache, "get_clan", get_clan)
+    monkeypatch.setattr(CACHE, "get_player", AsyncMock(return_value=None))
+
+    for _ in range(3):
+        resp = await client.get(
+            "/api/cwl/guest-search?guild_id=854&discord_user_id=42&q=%23APIMISS1",
+            headers={"X-Bridge-Secret": "test-secret"},
+        )
+        assert resp.status == 200
+    assert get_clan.await_count == 1
 
 
 @pytest.mark.discord

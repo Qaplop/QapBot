@@ -4025,11 +4025,13 @@ class WarHistoryDB:
         return players
 
     def get_player_links_sync(self, player_tags: List[str]) -> Dict[str, Dict[str, Any]]:
-        """player_tag -> {discord_id, player_name, verified} for whichever of player_tags are
-        linked to a Discord account (user_players), regardless of current clan — a player_tag
-        with no linked account simply isn't a key in the returned dict. Used by the CWL guest
-        search (web_bridge.py's _search_cwl_guests_sync) to show whether a found player can actually
-        be DMed, without needing clan context the way get_current_clan_members_sync does."""
+        """player_tag -> {discord_id, player_name, verified, cwl_permanent_optout} for whichever of
+        player_tags are linked to a Discord account (user_players), regardless of current clan — a
+        player_tag with no linked account simply isn't a key in the returned dict. Used by the CWL
+        guest search (web_bridge.py's _search_cwl_guests_sync) to show whether a found player can
+        actually be DMed, without needing clan context the way get_current_clan_members_sync does,
+        and by start_cwl_enrollment() to resolve exactly that for an already-pooled guest player
+        no clan-scoped query can reach."""
         import sqlite3
 
         if not self.db_path:
@@ -4042,7 +4044,7 @@ class WarHistoryDB:
                 rows = self._chunked_in_query_sync(
                     conn,
                     """
-                    SELECT player_tag, player_name, discord_id, verified
+                    SELECT player_tag, player_name, discord_id, verified, cwl_permanent_optout
                     FROM user_players
                     WHERE player_tag IN ({placeholders})
                     ORDER BY verified DESC
@@ -4065,6 +4067,7 @@ class WarHistoryDB:
                 "player_name": row["player_name"],
                 "discord_id": discord_id if discord_id and discord_id != "UNASSIGNED" else None,
                 "verified": bool(row["verified"]),
+                "cwl_permanent_optout": bool(row["cwl_permanent_optout"]),
             }
         return links
 

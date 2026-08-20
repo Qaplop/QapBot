@@ -193,6 +193,92 @@ async def test_seeds_signups_and_dms_linked_confirmed_accounts(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dms_a_guest_player_invited_during_draft(db, monkeypatch):
+    """2026-08-20 live bug report: a player manually invited as a guest during the draft phase
+    got no enrollment DM when Start Enrollment ran — only the rule-h "Notify New Pool Members"
+    button ever reached them. A guest's real current clan is by definition none of this guild's
+    pooled clans, so start_cwl_enrollment's get_current_clan_members_sync() scan can't see them;
+    their already-existing cwl_signups row is now folded into the DM targets separately."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    await _seed_guild_and_clan(db, "1015")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHERCLAN', 'Other')")
+    await db.conn.commit()
+    await _seed_current_clan_member(db, "d1", "#P1")
+    # The guest: linked, but plays in a clan this guild has nothing to do with.
+    await _seed_current_clan_member(db, "d9", "#GUEST", clan_tag="#OTHERCLAN")
+    # ...and a second guest whose signup row carries no discord_id (the Guests search can add a
+    # tag it found no link for) — the link must still be resolved so they get DMed too.
+    await _seed_current_clan_member(db, "d8", "#GUEST2", clan_tag="#OTHERCLAN")
+    event_id = await _make_event(db, "1015", "2026-08")
+    db.upsert_cwl_signup_sync(event_id, "#GUEST", "GuestOne", "d9", None, "guest_invite", "pending")
+    db.upsert_cwl_signup_sync(event_id, "#GUEST2", "GuestTwo", None, None, "guest_invite", "pending")
+
+    sent_dms = []
+
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
+        sent_dms.append(user_id)
+        return True, "sent"
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
+
+    summary = await start_cwl_enrollment(1015, "2026-08")
+
+    assert summary["ok"] is True
+    assert sorted(sent_dms) == ["d1", "d8", "d9"]
+    assert summary["contacted"] == 3
+    # Guests were already pooled by the invite — Start Enrollment must not re-seed them.
+    assert summary["seeded"] == 1
+    assert db.get_cwl_signup_sync(event_id, "#GUEST")["source"] == "guest_invite"
+
+
+@pytest.mark.asyncio
+async def test_skips_a_permanently_opted_out_guest_player(db, monkeypatch):
+    """The pooled-guest DM pass above must honour cwl_permanent_optout exactly like the
+    current-member pass does."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    await _seed_guild_and_clan(db, "1016")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHERCLAN', 'Other')")
+    await db.conn.commit()
+    await _seed_current_clan_member(
+        db, "d9", "#GUEST", clan_tag="#OTHERCLAN", cwl_permanent_optout=True,
+    )
+    event_id = await _make_event(db, "1016", "2026-08")
+    db.upsert_cwl_signup_sync(event_id, "#GUEST", "GuestOne", "d9", None, "guest_invite", "pending")
+
+    sent_dms = []
+
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
+        sent_dms.append(user_id)
+        return True, "sent"
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
+
+    summary = await start_cwl_enrollment(1016, "2026-08")
+
+    assert summary["ok"] is True
+    assert sent_dms == []
+    assert summary["skipped_optout"] == 1
+
+
+@pytest.mark.asyncio
 async def test_deleting_and_recreating_same_season_dms_again(db, monkeypatch):
     """2026-08-19 live bug report: an admin started enrollment, deleted the season ("Delete
     Season" — mainly for testing/starting over), then started a brand-new event for the SAME
