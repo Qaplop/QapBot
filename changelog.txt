@@ -1,6 +1,30 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-20 (7)
+- Fixed: individually guest-inviting a player into a guild's CWL pool (Guests search → Add) never
+  checked whether that same player was already deliberately placed in a DIFFERENT guild's own
+  private (non-shared) CWL roster this season (live bug report, project owner: added MasterBrainEro
+  as a guest player to TheQCrew's pool while they were already placed in StayMad's roster in STAY
+  Family — the invite silently succeeded, leaving the player one drag away from a genuine
+  double-booking across two guilds for the same season, something real CWL rules never allow).
+  Root cause: a guest CLAN becomes a real cwl_shared_clans entry and gets the full cross-guild
+  conflict-purge treatment via assign_cwl_player_sync; an individually-invited guest PLAYER writes
+  straight into the inviting guild's own local tables with none of that awareness — the two
+  existing "already in the pool" guards on this endpoint only ever looked at THIS guild's own
+  tables. Added db_manager.find_cwl_player_private_placement_in_other_guilds_sync() and wired it
+  into two places: handle_post_cwl_enrollment_guest now refuses the invite itself (409, same
+  pattern as the existing guest-clan-conflict check), and assign_cwl_player_sync now refuses a
+  DELIBERATE placement too (defense-in-depth for a signup that slipped through before this fix),
+  surfaced by handle_post_cwl_enrollment_assign as a 409. A non-deliberate auto-assign guess just
+  quietly skips instead, matching the existing shared-clan defer philosophy. New Pitfall 32
+  (qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md) and Cardinal-adjacent pitfall #26 (copilot-
+  instructions.md).
+  Files: qapbot/db_manager.py, qapbot/QBdiscocmdshelper_cwl.py, qapbot/web_bridge.py. 2 new
+  backend tests (test_enrollment_guest_add_rejects_when_player_already_placed_in_another_guild,
+  test_enrollment_assign_rejects_player_already_placed_in_another_guild,
+  tests/discord/test_web_bridge.py). 2144 tests pass (.\run_tests.ps1).
+
 2026-08-20 (6)
 - Fixed: a pooled CWL player who left every family/participating clan after being signed up
   showed a blank TH badge on the enrollment board, even though the bot already had their TH

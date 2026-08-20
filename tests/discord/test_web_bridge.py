@@ -1284,6 +1284,47 @@ async def test_enrollment_guest_add_rejects_when_player_already_in_guest_clan(db
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_enrollment_guest_add_rejects_when_player_already_placed_in_another_guild(
+    db, bridge_config, client, monkeypatch
+):
+    """2026-08-20 live bug report: a player already deliberately placed in a DIFFERENT guild's
+    own (private, non-shared) CWL clan this season must not be individually guest-invitable here
+    — unlike a guest CLAN, an individual guest-player invite has no cross-guild conflict handling
+    at all, so this used to silently succeed and leave the player one drag away from a genuine
+    double-booking across two guilds' rosters for the same season."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "830", {"#HOME": "Home"})
+    await _seed_guild_and_clans(db, "831", {"#OTHERCLAN": "Other"})
+    CACHE.db_manager = db
+    CACHE.server_config["830"] = {"member_clans": ["#HOME"], "member_families": []}
+    CACHE.server_config["831"] = {"member_clans": ["#OTHERCLAN"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    other_event_id = db.create_cwl_event_sync("831", "2026-09", "discordid1")
+    db.upsert_cwl_assignment_sync(other_event_id, "#ELSEWHERE", "#OTHERCLAN", assignment_source="admin_override", locked=True)
+
+    event_id = db.create_cwl_event_sync("830", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#HOME", "participating": True}])
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(830, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    resp = await client.post(
+        "/api/cwl/enrollment/guest",
+        json={"guild_id": 830, "discord_user_id": 42, "player_tag": "#ELSEWHERE", "player_name": "Elsewhere"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert "already placed" in body["error"]
+    assert db.get_cwl_signup_sync(event_id, "#ELSEWHERE") is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_guest_player_reclassified_when_clan_later_invited_as_guest(db, bridge_config, client, monkeypatch):
     """Race condition 2 (project owner's spec, verbatim): "When a guest player is invited
     individually and then his clan is invited as a guest clan then the status of that player
@@ -2312,6 +2353,47 @@ async def test_enrollment_assign_no_event_returns_409(db, bridge_config, client,
         headers={"X-Bridge-Secret": "test-secret"},
     )
     assert resp.status == 409
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_assign_rejects_player_already_placed_in_another_guild(db, bridge_config, client, monkeypatch):
+    """2026-08-20 live bug report companion to test_enrollment_guest_add_rejects_when_player_
+    already_placed_in_another_guild: even if a conflicting signup somehow already exists locally
+    (e.g. seeded before this fix shipped), the actual placement write must still refuse rather
+    than silently double-booking the player into two guilds' rosters for the same season."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "788", {"#HOME2": "Home2"})
+    await _seed_guild_and_clans(db, "789", {"#OTHERCLAN2": "Other2"})
+    CACHE.db_manager = db
+    CACHE.server_config["788"] = {"member_clans": ["#HOME2"], "member_families": []}
+    CACHE.server_config["789"] = {"member_clans": ["#OTHERCLAN2"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    other_event_id = db.create_cwl_event_sync("789", "2026-09", "discordid1")
+    db.upsert_cwl_assignment_sync(
+        other_event_id, "#ELSEWHERE2", "#OTHERCLAN2", assignment_source="admin_override", locked=True
+    )
+
+    event_id = db.create_cwl_event_sync("788", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#HOME2", "participating": True}])
+    db.upsert_cwl_signup_sync(event_id, "#ELSEWHERE2", "Elsewhere2", None, None, "guest_invite", "pending")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(788, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    resp = await client.post(
+        "/api/cwl/enrollment/assign",
+        json={"guild_id": 788, "discord_user_id": 42, "player_tag": "#ELSEWHERE2", "clan_tag": "#HOME2"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert "already placed" in body["error"].lower()
+    assert db.get_cwl_assignments_sync(event_id) == []
 
 
 @pytest.mark.discord

@@ -972,7 +972,7 @@ def assign_cwl_player_sync(
     signup_source: str = "admin_added",
     locked: bool = False,
     deliberate: bool = True,
-) -> None:
+) -> Optional[str]:
     """The one general "place a player into a CWL pool" write path (2026-08-16, live-testing
     feedback, project owner's spec, verbatim: "we should have one general method that assigns
     players to any pool and the race condition checks should all be implemented there so that we
@@ -1048,12 +1048,54 @@ def assign_cwl_player_sync(
     than deferring to it. This is what makes start_cwl_enrollment's own "current clan beats stale
     history" override (see resolve_prior_cwl_assignments' call site) actually take effect
     end-to-end — without this, that override's corrected target got silently discarded right back
-    to the stale shared-clan entry the instant it reached this function."""
+    to the stale shared-clan entry the instant it reached this function.
+
+    Returns None on a normal write (or a no-op defer, matching this function's pre-2026-08-20
+    behavior of returning nothing either way) — or an error string when a DELIBERATE placement
+    was refused because the player already has a private (non-cross-guild-shared) placement in a
+    DIFFERENT guild's own CWL roster this season (2026-08-20, live bug report: guest-inviting a
+    player individually — a completely separate code path from a guest CLAN, so it never went
+    through any of the cross-guild conflict machinery above — let them get dragged into a SECOND,
+    fully independent placement in a second guild's roster for the same season, something real
+    CWL rules never allow. Unlike a same-guild shared-clan conflict, a private cross-guild
+    conflict is refused rather than silently evicting the player from the other guild's board —
+    this guild has no authority or visibility to safely do that on another guild's behalf; a
+    human admin needs to resolve it directly, in that other guild, first). A non-deliberate
+    (auto-assign) placement instead just quietly skips, the same as every other conflict this
+    function already defers on above — see the check itself for why it doesn't also attempt the
+    shared-clan branch's "mirror into an orphaned local assignment" treatment."""
     db = CACHE.db_manager
     if db is None:
-        return
+        return None
 
     shared_clans_by_tag = get_event_shared_clans_by_tag_sync(event_id, season)
+
+    if target_clan_tag is not None:
+        other_private_placement = next(
+            iter(db.find_cwl_player_private_placement_in_other_guilds_sync(player_tag, season, str(guild_id))),
+            None,
+        )
+        if other_private_placement is not None:
+            if not deliberate:
+                # An automatic guess never creates a real conflict — just skip. Unlike the
+                # shared-clan defer logic below, there's no local record here to mirror an
+                # "Assigned to other Guild" placeholder into without also teaching
+                # _build_enrollment_payload's purge step (web_bridge.py) to preserve a private
+                # (non-shared) orphaned assignment — out of scope for this fix; the player simply
+                # stays plain Unassigned here rather than being silently double-booked.
+                return None
+            other_clan_name = CACHE.get_clan_name(
+                other_private_placement["clan_tag"], other_private_placement["clan_tag"]
+            ) or other_private_placement["clan_tag"]
+            import QBcore
+
+            other_guild = QBcore.bot.get_guild(int(other_private_placement["guild_id"]))
+            other_guild_name = other_guild.name if other_guild else f"guild {other_private_placement['guild_id']}"
+            return (
+                f"Already placed in {other_clan_name}'s CWL roster in {other_guild_name} this "
+                f"season — remove that placement first (in that guild's own board) before "
+                f"assigning them here."
+            )
 
     shared_clan_ids_to_clear: Dict[int, str] = {
         shared["id"]: tag for tag, shared in shared_clans_by_tag.items() if tag != target_clan_tag
@@ -1195,6 +1237,7 @@ def assign_cwl_player_sync(
             event_id, player_tag, str(target_clan_tag),
             assignment_source=assignment_source or source, suggested_clan_tag=str(target_clan_tag), locked=locked,
         )
+    return None
 
 
 async def ensure_cwl_clan_membership_tracked(clan_tags: Iterable[str]) -> None:

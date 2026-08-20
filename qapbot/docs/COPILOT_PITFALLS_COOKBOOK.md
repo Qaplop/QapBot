@@ -1301,3 +1301,53 @@ explicitly put on a roster and which has **no** tracked members at all, fetch it
 the same population path, just on demand. Do **not** add such clans to `tracked_tags` to fix this:
 `_calculate_track_war_updates()` is a one-way ratchet, so that permanently enables war polling for
 a clan that is only relevant for one season.
+
+## Pitfall 32: an individually-invited guest PLAYER has none of the cross-guild conflict protection a guest CLAN gets
+
+Symptom (2026-08-20, live bug report, project owner): a player already deliberately placed in
+`StayMad`'s CWL roster (guild "STAY Family") was added as an individual guest player to a
+completely different guild ("The QCrew")'s own CWL pool via the Guests search's "Add" button. The
+add succeeded silently and the player showed up as plain Unassigned in the new guild — no warning,
+no "Assigned to other Guild" badge, nothing indicating they already had a real home elsewhere.
+Dragging them into a column there would have given them a second, fully independent placement in
+a second guild's roster for the same season — something real CWL rules never allow, and something
+neither guild's admin would have any way to notice until CWL day.
+
+Root cause: this feature has TWO structurally different ways to add a guest, and only one of them
+is cross-guild-aware. A guest **clan** (`_search_cwl_guests_sync` → `cwl_event_clans`) becomes a
+real `cwl_shared_clans` entry the moment a second guild also has it, and from then on every
+placement into it — auto-assign seed or deliberate drag — flows through
+`assign_cwl_player_sync`'s elaborate conflict-purge/preservation machinery (eviction on a
+deliberate drag, defer-and-mirror-into-"Assigned to other Guild" on an automatic guess). A guest
+**player** (`handle_post_cwl_enrollment_guest` → a plain `cwl_signups` row, `source='guest_invite'`)
+never touches any of that: it writes straight into the inviting guild's own local tables with zero
+awareness that the same `player_tag` might already have a private (non-shared) `cwl_assignments`
+row sitting in a totally different guild's own event for the same season.
+
+The two "already in the pool" guards this endpoint already had (`_search_cwl_guests_sync`
+excluding already-invited tags, the guest-clan-membership check in
+`handle_post_cwl_enrollment_guest`) only look at **this guild's own** tables — neither one queries
+across guilds, so neither one could ever have caught this.
+
+Fix: `db_manager.find_cwl_player_private_placement_in_other_guilds_sync(player_tag, season,
+exclude_guild_id)` — a `cwl_assignments` row, by construction, only ever represents a PRIVATE
+(non-shared) placement (a shared target always routes through `cwl_shared_clan_players` instead,
+per that table's own CREATE TABLE comment), so any hit here is a genuine, independent placement
+this guild has no visibility or authority over. Wired into two places: (1)
+`handle_post_cwl_enrollment_guest` refuses the invite itself (409, same pattern as the existing
+guest-clan-conflict check); (2) `assign_cwl_player_sync` refuses a **deliberate** placement
+(returns an error string instead of `None`, surfaced by `handle_post_cwl_enrollment_assign` as a
+409) as defense-in-depth for a signup that already slipped through before this fix, or any other
+future write path. A **non-deliberate** (auto-assign seed) placement just quietly skips instead —
+matching the existing "an automatic guess never creates a real conflict" philosophy for shared-clan
+conflicts, but deliberately NOT attempting that branch's "mirror into an orphaned local assignment"
+treatment: doing so would also require teaching `_build_enrollment_payload`'s purge step
+(`web_bridge.py`) to preserve a private (non-shared) orphaned assignment, which was left out of
+scope as a follow-up rather than a correctness gap — the player simply stays plain Unassigned
+there instead of being double-booked.
+
+General lesson: when a feature has two on-ramps for conceptually the same thing (a guest CLAN vs.
+a guest PLAYER; more generally, a bulk/structured path vs. an individual/ad-hoc one), audit
+whether a safety mechanism built for one on-ramp — here, `cwl_shared_clan_players`'s whole
+cross-guild machinery — was ever actually wired into the other, rather than assuming "guests are
+handled" covers both.

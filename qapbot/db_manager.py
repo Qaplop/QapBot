@@ -4947,6 +4947,50 @@ class WarHistoryDB:
                 )
                 return []
 
+    def find_cwl_player_private_placement_in_other_guilds_sync(
+        self, player_tag: str, season: str, exclude_guild_id: str
+    ) -> List[Dict[str, Any]]:
+        """Every OTHER guild's cwl_assignments row placing player_tag into one of ITS OWN clans
+        this season (2026-08-20, guest-player cross-guild conflict fix — see
+        handle_post_cwl_enrollment_guest's and assign_cwl_player_sync's own docstrings for the
+        bug this guards against: an individually-invited guest player is a completely separate
+        code path from a guest CLAN, so it never gets the cross-guild conflict-purge/preservation
+        machinery cwl_shared_clan_players already has — silently letting the same player end up
+        deliberately placed in two different guilds' rosters for the same season, which real CWL
+        rules never allow).
+
+        A cwl_assignments row, by construction, only ever exists for a PRIVATE (not
+        cross-guild-shared) target clan — assign_cwl_player_sync routes any target that IS shared
+        through cwl_shared_clan_players instead (see that table's own CREATE TABLE comment) and
+        clears any stale cwl_assignments row when it does. So a hit here always means a genuine,
+        independent placement this guild has no visibility or authority over — never a shared
+        clan already covered by the existing cross-guild machinery.
+
+        Returns one dict per matching guild: guild_id, clan_tag."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT ce.guild_id AS guild_id, ca.assigned_clan_tag AS clan_tag
+                    FROM cwl_assignments ca
+                    JOIN cwl_events ce ON ce.id = ca.event_id
+                    WHERE ca.player_tag = ? AND ce.cwl_season = ? AND ce.guild_id != ?
+                    """,
+                    (player_tag, season, exclude_guild_id),
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-QUERY-SYNC] find_cwl_player_private_placement_in_other_guilds_sync failed "
+                    f"for {player_tag}/{season}: {e}"
+                )
+                return []
+
     def get_cwl_shared_clan_sync(self, clan_tag: str, season: str) -> Optional[Dict[str, Any]]:
         """The cwl_shared_clans row for (clan_tag, season), or None if this clan isn't
         (yet) shared for that season."""

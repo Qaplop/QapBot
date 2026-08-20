@@ -1341,10 +1341,17 @@ async def handle_post_cwl_enrollment_assign(request: web.Request) -> web.Respons
     # asyncio.to_thread()-wrapped (2026-08-16, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — this
     # bridge handler shares the bot's event loop (see module docstring), so an un-wrapped sync
     # write here freezes the whole bot exactly like an interaction callback would.
-    await asyncio.to_thread(
+    error_message = await asyncio.to_thread(
         assign_cwl_player_sync, guild_id, event["id"], season, player_tag, clan_tag,
         source="admin_override", locked=True,
     )
+    # 2026-08-20: a private cross-guild placement conflict (see assign_cwl_player_sync's own
+    # docstring) refuses the write entirely rather than silently double-booking the player into
+    # two guilds' rosters for the same season — surfaced here the same way the guest-invite
+    # endpoint's own cross-guild conflict is (409, plain error string), before any Hub-message
+    # refresh or version bump runs for what would otherwise look like a no-op successful drop.
+    if error_message is not None:
+        return web.json_response({"error": error_message}, status=409)
 
     try:
         await refresh_cwl_management_hub_message(guild_id, "cwl_management")
@@ -1481,6 +1488,19 @@ async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response
     # reject an individual add if the player's LIVE current clan is already a guest clan on this
     # event's roster — they're already in the pool via that clan (rule f), so a second,
     # individual add would be redundant and would wrongly make them independently removable.
+    #
+    # Race condition 2 (2026-08-20, live bug report, project owner: guest-inviting a player
+    # individually while they were already deliberately placed in a DIFFERENT guild's own CWL
+    # roster this season left them showing as plain Unassigned here — nothing at all like the
+    # "Assigned to other Guild" treatment a shared-clan conflict already gets. An individual
+    # guest-player invite is a completely separate code path from a guest CLAN and never gets
+    # cwl_shared_clan_players' cross-guild conflict machinery; without this check, dragging them
+    # into a column here would then give them a SECOND, fully independent placement in a second
+    # guild's roster for the same season — something real CWL rules never allow, and something
+    # this guild has no authority to silently resolve on another guild's behalf. Blocked here
+    # (not silently evicted from the other guild) for the same reason a locked local assignment
+    # elsewhere is never silently overridden either — see find_cwl_player_private_placement_in_
+    # other_guilds_sync's own docstring.
     # asyncio.to_thread()-wrapped as one atomic unit (2026-08-16, Pitfall 26,
     # COPILOT_PITFALLS_COOKBOOK.md) — this bridge handler shares the bot's event loop with the
     # Discord gateway/interactions (see module docstring), so a sync DB call made directly here
@@ -1489,22 +1509,40 @@ async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response
         guest_clan_tags = get_cwl_guest_clan_tags_sync(db, event["id"], guild_id)
         current_clan_tag = db.get_current_clan_tags_for_players_sync([player_tag]).get(player_tag)
         if current_clan_tag and current_clan_tag in guest_clan_tags:
-            return current_clan_tag
+            clan_name = CACHE.get_clan_name(current_clan_tag, current_clan_tag) or current_clan_tag
+            return (
+                f"{player_name} is already in the player pool as a member of guest clan "
+                f"{clan_name} — they can't be added individually. Remove the whole guest "
+                f"clan to remove them."
+            )
+
+        other_placements = db.find_cwl_player_private_placement_in_other_guilds_sync(
+            player_tag, season, str(guild_id)
+        )
+        if other_placements:
+            import QBcore
+
+            placement = other_placements[0]
+            other_clan_name = (
+                CACHE.get_clan_name(placement["clan_tag"], placement["clan_tag"]) or placement["clan_tag"]
+            )
+            other_guild = QBcore.bot.get_guild(int(placement["guild_id"]))
+            other_guild_name = other_guild.name if other_guild else f"guild {placement['guild_id']}"
+            return (
+                f"{player_name} is already placed in {other_clan_name}'s CWL roster in "
+                f"{other_guild_name} this season — they can't be individually guest-invited "
+                f"while that placement stands."
+            )
+
         db.upsert_cwl_signup_sync(
             event["id"], player_tag, player_name, guest_discord_id, None,
             source="guest_invite", status="pending",
         )
         return None
 
-    blocking_clan_tag = await asyncio.to_thread(_check_and_upsert_sync)
-    if blocking_clan_tag is not None:
-        clan_name = CACHE.get_clan_name(blocking_clan_tag, blocking_clan_tag) or blocking_clan_tag
-        return web.json_response(
-            {"error": f"{player_name} is already in the player pool as a member of guest clan "
-                       f"{clan_name} — they can't be added individually. Remove the whole guest "
-                       f"clan to remove them."},
-            status=409,
-        )
+    error_message = await asyncio.to_thread(_check_and_upsert_sync)
+    if error_message is not None:
+        return web.json_response({"error": error_message}, status=409)
 
     try:
         await refresh_cwl_management_hub_message(guild_id, "cwl_management")
