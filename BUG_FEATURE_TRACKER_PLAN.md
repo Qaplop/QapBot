@@ -20,7 +20,7 @@ including a closing loop back into Discord with manual test cases to tick off.
 |---|---|
 | `/admin` → `Bot Setup` screen configuring 3 channels | Per-guild trackers (one central tracker only, see §3.1) |
 | `/bug` and `/feature` (shared implementation, different target channel) | Voting / upvotes on feature requests |
-| Text description + screenshots + arbitrary file attachments | Automatic code-fix generation without a human in the loop |
+| Text description + screenshots (incl. clipboard paste, §2.2) + arbitrary file attachments | Automatic code-fix generation without a human in the loop |
 | Global `#NNNN` ID pool shared by bugs and features | GitHub Issues as the primary store (see §6.3 alternative) |
 | Post-submit editing by the reporter | Public roadmap rendering |
 | Status lifecycle incl. "implemented" flagging | SLA / due dates / assignees beyond a single "claimed by" |
@@ -83,13 +83,25 @@ into the central tracker guild's channels regardless of where they were filed.
    ```
 
 3. `📎 Add attachments` opens a 5-minute **upload window**: the bot replies "upload your files
-   in this channel now — I'll pick them up and delete your upload message". A scoped
+   in this channel now — paste a screenshot with Ctrl+V, drag a file in, or use the
+   attachment button — I'll pick them up and delete your upload message". A scoped
    `on_message` listener (see §5.4) captures attachments from that user in that channel,
    downloads the bytes, deletes the user's upload message, and refreshes the draft preview.
    *(Rationale: Discord modals cannot contain file inputs, and slash-command attachment
    options are capped and awkward for "a few more screenshots". The optional
    `attachment1..3` params cover the common case with zero friction; the upload window covers
    the rest.)*
+
+   ⚠️ **Clipboard-paste screenshots (Ctrl+V) work here for free** — pasting an image into
+   Discord's normal message compose box turns it into a `message.attachments` entry exactly
+   like a dragged-in file, entirely native Discord client behaviour that needs zero bot-side
+   code. This is *why* the upload window (a plain message, not a modal) is the documented,
+   recommended path for screenshots rather than the `attachment1..3` command params: those are
+   a native OS file-picker only — Discord does not support pasting an image directly into a
+   slash-command attachment option. Call this out explicitly in the actual "upload your files"
+   prompt text (as drafted above) so reporters discover it instead of hunting for a paste
+   target that doesn't exist on the command params. Same applies verbatim to the `Add files`
+   button (§2.3) and its identical upload-window flow.
 4. `✅ Submit` → allocates the next global `#NNNN`, persists the item, and posts to the
    configured channel.
 
