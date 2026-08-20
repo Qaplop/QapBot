@@ -215,7 +215,13 @@ function sortPlayers(players: EnrollmentPlayer[], order: SortOrder): EnrollmentP
   return [...players].sort((a, b) => {
     if (order === 'th') {
       const diff = (b.th_level ?? -1) - (a.th_level ?? -1)
-      return diff !== 0 ? diff : byName(a, b)
+      if (diff !== 0) return diff
+      // Secondary criterion (2026-08-20, project owner's spec): within the same TH level, sort
+      // by player skill next, same skill_score field the 'skill' sort mode itself sorts by —
+      // before falling back to name. Mirrors that branch's own th_level tiebreak, just with the
+      // two criteria's priority swapped.
+      const skillDiff = (b.skill_score ?? -1) - (a.skill_score ?? -1)
+      return skillDiff !== 0 ? skillDiff : byName(a, b)
     }
     if (order === 'skill') {
       const diff = (b.skill_score ?? -1) - (a.skill_score ?? -1)

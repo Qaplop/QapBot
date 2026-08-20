@@ -1,6 +1,15 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-20 (9)
+- Changed: "Sort by: TH Level" on the enrollment board now uses player skill (skill_score) as a
+  secondary tiebreaker within the same TH level, before falling back to name — previously tied
+  straight to name, so same-TH players sorted arbitrarily by whatever order they happened to be
+  in (project owner's spec). Mirrors the existing "Player Skill" sort mode's own th_level
+  tiebreak, just with the two criteria's priority swapped.
+  File: activity/client/src/enrollmentBoard.ts. `tsc --noEmit` clean. Deployed to DEV
+  (`npm run deploy:dev`, per standing DEV-deploy permission).
+
 2026-08-20 (8)
 - Fixed: every bridge-action error on the Activity frontend (guest-invite conflicts, drag-assign
   conflicts, save/search/evict/remove failures) showed the raw `{status}: {"error":"..."}` — status
