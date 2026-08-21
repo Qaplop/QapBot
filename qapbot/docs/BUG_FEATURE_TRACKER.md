@@ -154,6 +154,13 @@ directory.
   storage isn't performance-critical and benefits from the HDD's larger free space; override
   with `TRACKER_DATA_DIR`), one subdirectory per item (`0001/`, `0002/`, ...). Kept indefinitely
   — no automatic purge (plan §8.3).
+- **Claude Code finishing a tracker-linked item**: never move an item to `implemented` without
+  also posting at least one test case (`tracker_add_testcases` MCP tool, or the bridge's
+  `POST /api/tracker/items/{n}/testcases` with `{"cases": [{"environment": "PROD"|"DEV"|"BOTH",
+  "description": "..."}]}` when MCP isn't wired up in the session) — see
+  `.github/copilot-instructions.md` Cardinal Rule 15. Posting the test case is what actually
+  drives `post_test_cases()`'s automatic `implemented → testing` transition; skipping it leaves
+  the item in a state the tracker's own lifecycle doesn't expect anyone to leave it in.
 
 ## See also
 
