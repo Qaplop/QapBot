@@ -5,6 +5,16 @@ for what shipped as designed vs. what was simplified along the way)
 Created: 2026-08-20
 Owner doc: this file (project root, per Cardinal Rule 15)
 
+**Amendment (tracker item #0006, 2026-08-21):** the original design below has `/bug` and
+`/feature` posting to two separate channels (a bug-reports channel and a feature-requests
+channel). The project owner decided this split was a mistake ("a design decision that I
+regret") and asked to unify them. As shipped now: `/bug` and `/feature` share ONE configured
+channel — `TRACKER_SETTING_FEATURE_CHANNEL`/`tracker_feature_channel_id` is retired, and
+`/admin` → *Bot Setup* only has two channel slots (bug & feature reports, manual test cases),
+not three. The sections below describing the original 3-channel design are left as-is for
+historical context — see `qapbot/docs/BUG_FEATURE_TRACKER.md`'s Runbook for the current,
+accurate state.
+
 ---
 
 ## 1. Goal

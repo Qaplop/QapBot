@@ -40,9 +40,11 @@ from qapbot.i18n import t
 # bot_settings keys (plan §4.1) — global scope (guild_id='') only, the sole scope wired up today.
 TRACKER_SETTING_GUILD_ID = "tracker_guild_id"
 TRACKER_SETTING_BUG_CHANNEL = "tracker_bug_channel_id"
-TRACKER_SETTING_FEATURE_CHANNEL = "tracker_feature_channel_id"
 TRACKER_SETTING_TEST_CHANNEL = "tracker_test_channel_id"
 TRACKER_SETTING_ENABLED = "tracker_enabled"
+# tracker_feature_channel_id (tracker item #0006, 2026-08-21) is retired — bugs and features now
+# share TRACKER_SETTING_BUG_CHANNEL. A pre-existing bot_settings row under that old key, if any,
+# is simply never read any more; nothing needs to delete it.
 
 # Item/status metadata (plan §4.2)
 ITEM_TYPE_EMOJI = {"bug": "🐞", "feature": "💡"}
@@ -110,17 +112,21 @@ def _lang_guild_id(item: Dict[str, Any]) -> Optional[int]:
 
 
 class BotSetupView(discord.ui.View):
-    """`/admin -> Bot Setup`: configure the three bot-wide tracker channels (bug reports,
-    feature requests, manual test cases) plus the runtime enabled/disabled flag. Edits a
-    single message in place, mirroring ChannelConfigurationView's idiom in
-    ui_clan_management.py (plan §2.1). Short-lived, session-scoped — an ordinary timed view,
-    not a DynamicItem (plan §5.1).
+    """`/admin -> Bot Setup`: configure the two bot-wide tracker channels (bug/feature reports,
+    manual test cases) plus the runtime enabled/disabled flag. Edits a single message in place,
+    mirroring ChannelConfigurationView's idiom in ui_clan_management.py (plan §2.1). Short-lived,
+    session-scoped — an ordinary timed view, not a DynamicItem (plan §5.1).
+
+    Tracker item #0006 (2026-08-21): bugs and feature requests used to post to two separate
+    channels (a "bug" slot and a "feature" slot); the project owner asked to unify them — both
+    `/bug` and `/feature` now post to the single "bug" slot's channel below (the old
+    tracker_feature_channel_id bot_settings key is retired, see the comment near the setting
+    constants above). Only "bug" (now serving both item types) and "test" remain as slots.
     """
 
     # (slot_key, bot_settings key, i18n label key) — one ChannelSelect row per slot.
     _SLOTS: Tuple[Tuple[str, str, str], ...] = (
         ("bug", TRACKER_SETTING_BUG_CHANNEL, "ui_components.bot_setup.bug_label"),
-        ("feature", TRACKER_SETTING_FEATURE_CHANNEL, "ui_components.bot_setup.feature_label"),
         ("test", TRACKER_SETTING_TEST_CHANNEL, "ui_components.bot_setup.test_label"),
     )
 
@@ -234,7 +240,6 @@ class BotSetupView(discord.ui.View):
             'ui_components.bot_setup.header',
             user_id=self.user_id, guild_id=self.guild.id,
             bug_channel=channel_text("bug"),
-            feature_channel=channel_text("feature"),
             test_channel=channel_text("test"),
             status=t(status_key, user_id=self.user_id, guild_id=self.guild.id),
         )
@@ -293,7 +298,6 @@ async def start_bot_setup(interaction: discord.Interaction) -> None:
 
     current_channel_ids = {
         "bug": CACHE.tracker_settings.get(TRACKER_SETTING_BUG_CHANNEL),
-        "feature": CACHE.tracker_settings.get(TRACKER_SETTING_FEATURE_CHANNEL),
         "test": CACHE.tracker_settings.get(TRACKER_SETTING_TEST_CHANNEL),
     }
     tracker_enabled = CACHE.tracker_settings.get(TRACKER_SETTING_ENABLED) != "0"
@@ -703,8 +707,9 @@ class TrackerDraftView(discord.ui.View):
         for index, pending in enumerate(self.pending_attachments, start=1):
             await _persist_attachment(item_number, index, pending)
 
-        channel_setting = TRACKER_SETTING_BUG_CHANNEL if self.item_type == "bug" else TRACKER_SETTING_FEATURE_CHANNEL
-        channel_id_str = CACHE.tracker_settings.get(channel_setting)
+        # Bugs and features share one channel (tracker item #0006) — item_type no longer
+        # selects between two settings, just which emoji/label the posted embed itself shows.
+        channel_id_str = CACHE.tracker_settings.get(TRACKER_SETTING_BUG_CHANNEL)
         message = None
         if channel_id_str:
             message, _thread = await _post_tracker_item(item_number, int(channel_id_str))
@@ -757,8 +762,8 @@ async def start_tracker_item(
         )
         return
 
-    channel_setting = TRACKER_SETTING_BUG_CHANNEL if item_type == "bug" else TRACKER_SETTING_FEATURE_CHANNEL
-    if not CACHE.tracker_settings.get(channel_setting):
+    # Bugs and features share one channel (tracker item #0006).
+    if not CACHE.tracker_settings.get(TRACKER_SETTING_BUG_CHANNEL):
         await interaction.response.send_message(
             t('ui_components.tracker.tracker_not_configured', user_id=user_id, guild_id=guild_id), ephemeral=True
         )

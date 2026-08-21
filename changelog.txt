@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-21 (6)
+- Changed: unified the bug/feature tracker's report channels (tracker item #0006) — `/bug` and
+  `/feature` now both post to the single channel configured via `/admin` → *Bot Setup*, instead
+  of two separate ones. Retired the `TRACKER_SETTING_FEATURE_CHANNEL`
+  (`tracker_feature_channel_id`) bot_settings key: `BotSetupView._SLOTS` dropped the "feature"
+  slot (two channel selectors now instead of three), and the two item_type-ternary channel
+  lookups in `qapbot/ui_tracker.py` (`TrackerDraftView._on_submit`, `start_tracker_item`) always
+  resolve to `TRACKER_SETTING_BUG_CHANNEL` regardless of item_type. `item_type` still
+  distinguishes bug vs. feature in the posted embed/emoji and DM text — only channel routing
+  changed. Everything posted before this change is unaffected (each item stores its own
+  channel_id/message_id once posted; nothing needed backfilling). Files: qapbot/ui_tracker.py,
+  qapbot/translations/en.json, qapbot/translations/de.json, qapbot/docs/BUG_FEATURE_TRACKER.md,
+  BUG_FEATURE_TRACKER_PLAN.md, tests/discord/test_ui_bot_setup.py,
+  tests/discord/test_ui_tracker_items.py. 2277 tests pass.
+
 2026-08-21 (5)
 - Changed: removed the CWL enrollment DM restrict-to-admin toggle for PROD (tracker item #0007)
   — the feature is now considered production-ready, so enrollment/assignment DMs go to every

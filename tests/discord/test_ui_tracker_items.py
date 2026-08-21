@@ -14,6 +14,7 @@ os.environ.setdefault("DISCORD_TOKEN", "test-token")
 
 from qapbot.db_manager import WarHistoryDB
 from qapbot.ui_tracker import (
+    TRACKER_SETTING_BUG_CHANNEL,
     TRACKER_SETTING_ENABLED,
     TRACKER_SETTING_TEST_CHANNEL,
     TrackerDraftView,
@@ -177,6 +178,31 @@ def test_draft_preview_no_attachments_shows_none():
         reporter_id="1", reporter_name="A", guild_id=None, channel_id=1, user_id="1",
     )
     assert "none" in draft.format_preview().lower()
+
+
+# -- submit posts to the shared bug/feature channel (tracker item #0006) -----
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("item_type", ["bug", "feature"])
+async def test_on_submit_posts_to_the_shared_bug_channel(db, monkeypatch, mock_interaction, item_type):
+    """Both /bug and /feature must resolve to TRACKER_SETTING_BUG_CHANNEL now that the separate
+    feature channel setting is retired — only one channel is ever configured any more."""
+    from qapbot.cache_manager import CACHE
+
+    channel = _fake_channel()
+    _wire_bot(monkeypatch, channel=channel)
+    monkeypatch.setattr(CACHE, "tracker_settings", {TRACKER_SETTING_BUG_CHANNEL: "42"})
+
+    draft = TrackerDraftView(
+        item_type=item_type, title="T", description="D", details="", environment="",
+        reporter_id="111", reporter_name="A", guild_id=None, channel_id=1, user_id="1",
+    )
+    draft.message = AsyncMock()
+
+    await draft._on_submit(mock_interaction)
+
+    assert draft.submitted is True
+    channel.send.assert_awaited_once()
 
 
 # -- status transitions -------------------------------------------------

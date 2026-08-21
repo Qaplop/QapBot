@@ -134,7 +134,10 @@ directory.
 
 - **Enable the tracker**: nothing to set — `/bug`/`/feature` are registered automatically on
   PROD startup (`CONFIG.tracker_enabled = not is_dev_mode`). Just run `/admin` → *Bot Setup* on
-  PROD to configure the three channels (bug reports, feature requests, manual test cases).
+  PROD to configure the two channels (bug & feature reports, manual test cases). `/bug` and
+  `/feature` both post to the same reports channel (tracker item #0006, 2026-08-21 — they used
+  to have separate channels; `item_type` still distinguishes them in the embed/emoji, just not
+  in routing any more).
 - **Disable at runtime without restarting**: `/admin` → *Bot Setup* → "Disable tracker" — this
   flips `bot_settings.tracker_enabled` (the *runtime* switch); `/bug`/`/feature` reply
   ephemerally that the tracker is off. There is no way to disable command *registration* itself

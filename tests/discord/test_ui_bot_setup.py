@@ -14,7 +14,6 @@ os.environ.setdefault("DISCORD_TOKEN", "test-token")
 from qapbot.ui_tracker import (
     TRACKER_SETTING_BUG_CHANNEL,
     TRACKER_SETTING_ENABLED,
-    TRACKER_SETTING_FEATURE_CHANNEL,
     TRACKER_SETTING_GUILD_ID,
     TRACKER_SETTING_TEST_CHANNEL,
     BotSetupView,
@@ -82,8 +81,12 @@ def test_channel_select_prefilled_with_current_channel():
     bug_select = next(item for item in view.children if getattr(item, "custom_id", None) == "tracker_setup_channel_bug")
     assert [dv.id for dv in bug_select.default_values] == [bug_channel.id]
 
-    feature_select = next(item for item in view.children if getattr(item, "custom_id", None) == "tracker_setup_channel_feature")
-    assert feature_select.default_values == []
+    # Only "bug" (now serving both bugs and features) and "test" slots exist any more.
+    slot_custom_ids = {
+        item.custom_id for item in view.children
+        if isinstance(item, discord.ui.ChannelSelect)
+    }
+    assert slot_custom_ids == {"tracker_setup_channel_bug", "tracker_setup_channel_test"}
 
 
 @pytest.mark.discord
@@ -144,14 +147,13 @@ async def test_on_save_persists_every_configured_channel_and_guild_id(mock_inter
 
     guild = _make_guild()
     guild.id = 555
-    view = _make_view(guild=guild, current_channel_ids={"bug": "111", "feature": "222"})
+    view = _make_view(guild=guild, current_channel_ids={"bug": "111"})
     view.message = AsyncMock()
 
     await view._on_save(mock_interaction)
 
     calls = {call.args[0]: call.args[1] for call in set_setting.await_args_list}
     assert calls[TRACKER_SETTING_BUG_CHANNEL] == "111"
-    assert calls[TRACKER_SETTING_FEATURE_CHANNEL] == "222"
     assert TRACKER_SETTING_TEST_CHANNEL not in calls  # never configured, never written
     assert calls[TRACKER_SETTING_GUILD_ID] == "555"
 

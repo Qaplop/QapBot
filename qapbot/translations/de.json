@@ -376,9 +376,8 @@
       "placeholder_clan_search": "Gib Clan-Namen oder Tag ein (z.B. 'Dark' oder '#2C9UR9GJY')"
     },
     "bot_setup": {
-      "header": "🛠️ **Bot-Einrichtung — Fehler-/Feature-Tracker**\n\n🐞 Fehlermeldungen      →  {bug_channel}\n💡 Feature-Wünsche      →  {feature_channel}\n🧪 Manuelle Testfälle   →  {test_channel}\n\nTracker-Status: {status}",
-      "bug_label": "Fehlermeldungen",
-      "feature_label": "Feature-Wünsche",
+      "header": "🛠️ **Bot-Einrichtung — Fehler-/Feature-Tracker**\n\n🐞💡 Fehlermeldungen & Feature-Wünsche  →  {bug_channel}\n🧪 Manuelle Testfälle   →  {test_channel}\n\nTracker-Status: {status}",
+      "bug_label": "Fehlermeldungen & Feature-Wünsche",
       "test_label": "manuelle Testfälle",
       "select_placeholder": "Wähle den Kanal für {label}...",
       "channel_not_set": "❌ Nicht festgelegt",

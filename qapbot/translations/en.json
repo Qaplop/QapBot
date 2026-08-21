@@ -376,9 +376,8 @@
       "placeholder_clan_search": "Enter clan name or tag (e.g., 'Dark' or '#2C9UR9GJY')"
     },
     "bot_setup": {
-      "header": "🛠️ **Bot Setup — Issue Tracker**\n\n🐞 Bug reports        →  {bug_channel}\n💡 Feature requests   →  {feature_channel}\n🧪 Manual test cases  →  {test_channel}\n\nTracker status: {status}",
-      "bug_label": "bug reports",
-      "feature_label": "feature requests",
+      "header": "🛠️ **Bot Setup — Issue Tracker**\n\n🐞💡 Bug & feature reports  →  {bug_channel}\n🧪 Manual test cases  →  {test_channel}\n\nTracker status: {status}",
+      "bug_label": "bug & feature reports",
       "test_label": "manual test cases",
       "select_placeholder": "Select {label} channel...",
       "channel_not_set": "❌ Not set",
