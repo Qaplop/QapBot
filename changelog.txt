@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-21 (9)
+- Fixed: linked accounts shown as grey/"not linked" on the CWL Manage Enrollment board
+  (tracker item #0013). user_players' UNIQUE is (discord_id, player_tag), not player_tag alone,
+  so one tag can hold both a real owner row and a stray 'UNASSIGNED' row — and since a plain
+  /link never sets verified=1, the two are TIED on `verified`, leaving the dedup winner to
+  undefined SQLite row order. When UNASSIGNED won, callers mapped discord_id to None and
+  enrollmentBoard.ts's `discord_id == null` check rendered the player grey. Added an explicit
+  `(discord_id = 'UNASSIGNED') ASC` tiebreak to all SEVEN affected queries in db_manager.py —
+  and, critically, mirrored it in the FIVE Python re-sorts too: _chunked_in_query_sync's own
+  docstring notes a per-chunk ORDER BY doesn't hold across chunks, and Python's stable sort
+  would otherwise preserve chunk order among ties and silently discard the SQL preference
+  (get_current_clan_tags_for_players_sync/get_cached_th_levels_for_players_sync gained
+  discord_id in their SELECT purely to mirror it). Plus a new idempotent startup cleanup,
+  _cleanup_stray_unassigned_duplicates(), removing UNASSIGNED rows whose tag already has a real
+  owner — verified against a copy of the live PROD DB: removes exactly the known #GP9VJ0RGC
+  stray while correctly leaving #2LGCGP8VR (two genuine owners) untouched. Files:
+  qapbot/db_manager.py, tests/integration/test_db_manager.py. 2300 tests pass.
+
 2026-08-21 (8)
 - Fixed: "My Accounts" (/register -> 📋 My Accounts) was permanently unusable for users with many
   linked accounts — AccountManagementView._build_message_content() built an unbounded message, so

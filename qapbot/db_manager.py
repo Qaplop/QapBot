@@ -1593,6 +1593,37 @@ class WarHistoryDB:
         logging.info(f"[DB-SCHEMA] Schema verified in {_elapsed:.2f}s")
 
         await self._backfill_player_name_search_if_needed()
+        await self._cleanup_stray_unassigned_duplicates()
+
+    async def _cleanup_stray_unassigned_duplicates(self) -> None:
+        """Idempotent cleanup of UNASSIGNED-pool rows for player_tags that already have a real
+        owner (2026-08-21, tracker #0013; Cardinal Rule 12 — safe to re-run every startup, a
+        no-op once none remain).
+
+        user_players' UNIQUE is (discord_id, player_tag), not player_tag alone, so one tag can
+        legitimately hold rows under two different discord_ids. The 2026-08-21 UNASSIGNED-pool
+        race (fixed in coc_cache.py by a per-clan_tag lock, see COPILOT_PITFALLS_COOKBOOK.md
+        Pitfall 35) could leave a tag with BOTH its real owner row and a stray 'UNASSIGNED' one.
+        The dedup tiebreak added alongside this makes reads prefer the real owner, but the stray
+        row itself still lingers — this removes it. Only ever deletes an UNASSIGNED row when a
+        non-UNASSIGNED row for the same tag exists, so a genuinely unlinked player (UNASSIGNED
+        row only) is never touched."""
+        cursor = await self._conn.execute(
+            """
+            DELETE FROM user_players
+            WHERE discord_id = 'UNASSIGNED'
+              AND player_tag IN (
+                  SELECT player_tag FROM user_players WHERE discord_id != 'UNASSIGNED'
+              )
+            """
+        )
+        removed = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+        await self._conn.commit()
+        if removed:
+            logging.info(
+                f"[DB-CLEANUP] Removed {removed} stray UNASSIGNED user_players row(s) whose "
+                f"player_tag already has a real owner (tracker #0013)"
+            )
 
     async def _backfill_player_name_search_if_needed(self) -> None:
         """One-time idempotent backfill of player_name_search/player_name_fts from
@@ -4287,7 +4318,7 @@ class WarHistoryDB:
                            cwl_permanent_optout, cwl_default_preferred_league_rank, th_level
                     FROM user_players
                     WHERE current_clan_tag IN ({placeholders})
-                    ORDER BY verified DESC
+                    ORDER BY verified DESC, (discord_id = 'UNASSIGNED') ASC
                     """,
                     clan_tags,
                 )
@@ -4299,7 +4330,11 @@ class WarHistoryDB:
         # any exists — an unverified/disputed second linker never overwrites it. Re-sorted here
         # (rather than trusting per-chunk ORDER BY) because chunking can split one player_tag's
         # candidate rows across chunks, and concatenation doesn't preserve global order.
-        rows = sorted(rows, key=lambda r: not r["verified"])
+        # The UNASSIGNED tiebreak (2026-08-21, tracker #0013) must be mirrored in BOTH the SQL
+        # and this Python sort: a real owner and a stray UNASSIGNED row are normally TIED on
+        # `verified` (a plain /link never sets verified=1), and Python's stable sort would
+        # otherwise preserve chunk order among ties and silently discard the SQL preference.
+        rows = sorted(rows, key=lambda r: (not r["verified"], r["discord_id"] == "UNASSIGNED"))
         members_by_tag: Dict[str, sqlite3.Row] = {}
         for row in rows:
             members_by_tag.setdefault(row["player_tag"], row)
@@ -4351,7 +4386,7 @@ class WarHistoryDB:
                            cwl_permanent_optout, cwl_default_preferred_league_rank, th_level
                     FROM user_players
                     WHERE discord_id IN ({placeholders})
-                    ORDER BY verified DESC
+                    ORDER BY verified DESC, (discord_id = 'UNASSIGNED') ASC
                     """,
                     discord_ids,
                 ).fetchall()
@@ -4402,7 +4437,7 @@ class WarHistoryDB:
                     SELECT player_tag, player_name, discord_id, verified, cwl_permanent_optout
                     FROM user_players
                     WHERE player_tag IN ({placeholders})
-                    ORDER BY verified DESC
+                    ORDER BY verified DESC, (discord_id = 'UNASSIGNED') ASC
                     """,
                     player_tags,
                 )
@@ -4412,7 +4447,9 @@ class WarHistoryDB:
 
         # Same verified-wins-per-player_tag dedup as get_current_clan_members_sync — re-sorted
         # globally first since chunking (Step 4) can split one player_tag's rows across chunks.
-        rows = sorted(rows, key=lambda r: not r["verified"])
+        # UNASSIGNED tiebreak mirrored from the SQL above (see that function for why both halves
+        # are required).
+        rows = sorted(rows, key=lambda r: (not r["verified"], r["discord_id"] == "UNASSIGNED"))
         links: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             if row["player_tag"] in links:
@@ -4448,10 +4485,10 @@ class WarHistoryDB:
                 rows = self._chunked_in_query_sync(
                     conn,
                     """
-                    SELECT player_tag, current_clan_tag, verified
+                    SELECT player_tag, current_clan_tag, verified, discord_id
                     FROM user_players
                     WHERE player_tag IN ({placeholders}) AND current_clan_tag IS NOT NULL
-                    ORDER BY verified DESC
+                    ORDER BY verified DESC, (discord_id = 'UNASSIGNED') ASC
                     """,
                     player_tags,
                 )
@@ -4461,7 +4498,9 @@ class WarHistoryDB:
 
         # Re-sorted globally first (Step 4) — chunking can split one player_tag's rows across
         # chunks, so a per-chunk ORDER BY alone would not guarantee verified-wins here.
-        rows = sorted(rows, key=lambda r: not r["verified"])
+        # discord_id is selected solely so this Python mirror of the SQL's UNASSIGNED tiebreak
+        # can compare it (2026-08-21, tracker #0013) — it is not part of the returned mapping.
+        rows = sorted(rows, key=lambda r: (not r["verified"], r["discord_id"] == "UNASSIGNED"))
         clan_tags: Dict[str, str] = {}
         for row in rows:
             clan_tags.setdefault(row["player_tag"], row["current_clan_tag"])
@@ -4495,10 +4534,10 @@ class WarHistoryDB:
                 rows = self._chunked_in_query_sync(
                     conn,
                     """
-                    SELECT player_tag, th_level, verified
+                    SELECT player_tag, th_level, verified, discord_id
                     FROM user_players
                     WHERE player_tag IN ({placeholders}) AND th_level IS NOT NULL
-                    ORDER BY verified DESC
+                    ORDER BY verified DESC, (discord_id = 'UNASSIGNED') ASC
                     """,
                     player_tags,
                 )
@@ -4506,7 +4545,8 @@ class WarHistoryDB:
                 logging.error(f"[DB-QUERY-SYNC] get_cached_th_levels_for_players_sync failed: {e}")
                 return {}
 
-        rows = sorted(rows, key=lambda r: not r["verified"])
+        # discord_id selected only to mirror the SQL's UNASSIGNED tiebreak here (tracker #0013).
+        rows = sorted(rows, key=lambda r: (not r["verified"], r["discord_id"] == "UNASSIGNED"))
         th_levels: Dict[str, int] = {}
         for row in rows:
             th_levels.setdefault(row["player_tag"], int(row["th_level"]))
@@ -4540,7 +4580,7 @@ class WarHistoryDB:
                     SELECT player_tag, discord_id, verified
                     FROM user_players
                     WHERE player_tag IN ({placeholders})
-                    ORDER BY verified DESC
+                    ORDER BY verified DESC, (discord_id = 'UNASSIGNED') ASC
                     """,
                     player_tags,
                 )
@@ -4550,7 +4590,10 @@ class WarHistoryDB:
 
         # Re-sorted globally first (Step 4-style chunking) — a per-chunk ORDER BY alone would
         # not guarantee verified-wins once one player_tag's candidate rows split across chunks.
-        rows = sorted(rows, key=lambda r: not r["verified"])
+        # UNASSIGNED tiebreak mirrored from the SQL above (tracker #0013). Note this function
+        # deliberately RETURNS the raw 'UNASSIGNED' sentinel — the tiebreak only decides which
+        # row wins when a tag has both a real owner and a stray UNASSIGNED row.
+        rows = sorted(rows, key=lambda r: (not r["verified"], r["discord_id"] == "UNASSIGNED"))
         owners: Dict[str, str] = {}
         for row in rows:
             owners.setdefault(row["player_tag"], row["discord_id"])
@@ -4579,7 +4622,7 @@ class WarHistoryDB:
                     SELECT player_tag, discord_id, verified
                     FROM user_players
                     WHERE current_clan_tag = ?
-                    ORDER BY verified DESC
+                    ORDER BY verified DESC, (discord_id = 'UNASSIGNED') ASC
                     """,
                     (clan_tag,),
                 ).fetchall()

@@ -318,3 +318,107 @@ class TestCwlGroupExpansion:
         # Querying the new season must not pull in the old season's members.
         result = await db.get_active_cwl_group_member_tags("2026-06", ["#C1"])
         assert set(result) == {"#C1", "#C3"}
+
+
+@pytest.mark.integration
+class TestUnassignedTiebreak:
+    """A player_tag can hold rows under BOTH a real discord_id and the 'UNASSIGNED' sentinel
+    (UNIQUE is (discord_id, player_tag), not player_tag alone). Since a plain /link never sets
+    verified=1, those two rows are normally TIED on `verified` — so without an explicit
+    tiebreak the winner is decided by physical row order, and when UNASSIGNED won, callers
+    mapped discord_id to None and the CWL board rendered the player as grey/unlinked
+    (tracker #0013, confirmed live on PROD for #GP9VJ0RGC).
+
+    Each test inserts the two rows in BOTH orders: a single-order test passes even with the
+    old, broken behaviour, which is exactly how this survived since 2026-08-10.
+    """
+
+    REAL_ID = "555000111"
+
+    async def _seed(self, db, unassigned_first: bool):
+        await db.save_clan("#CLANX", "Clan X")
+        rows = [("UNASSIGNED", 0), (self.REAL_ID, 0)]
+        if not unassigned_first:
+            rows.reverse()
+        for discord_id, verified in rows:
+            await db.save_user(discord_id, {
+                "display_name": discord_id,
+                "players": [{
+                    "player_tag": "#DUPE", "player_name": "Dupe",
+                    "verified": bool(verified), "th_level": 15,
+                    "current_clan_tag": "#CLANX",
+                }],
+            })
+
+    @pytest.mark.parametrize("unassigned_first", [True, False])
+    async def test_current_clan_members_prefers_real_owner(self, db, unassigned_first):
+        await self._seed(db, unassigned_first)
+        members = db.get_current_clan_members_sync(["#CLANX"])
+        entry = next(m for m in members if m["player_tag"] == "#DUPE")
+        assert entry["discord_id"] == self.REAL_ID
+
+    @pytest.mark.parametrize("unassigned_first", [True, False])
+    async def test_player_owners_for_tags_prefers_real_owner(self, db, unassigned_first):
+        await self._seed(db, unassigned_first)
+        owners = db.get_player_owners_for_tags_sync(["#DUPE"])
+        assert owners["#DUPE"] == self.REAL_ID
+
+    @pytest.mark.parametrize("unassigned_first", [True, False])
+    async def test_player_links_prefers_real_owner(self, db, unassigned_first):
+        await self._seed(db, unassigned_first)
+        links = db.get_player_links_sync(["#DUPE"])
+        assert links["#DUPE"]["discord_id"] == self.REAL_ID
+
+    @pytest.mark.parametrize("unassigned_first", [True, False])
+    async def test_player_owners_for_clan_prefers_real_owner(self, db, unassigned_first):
+        await self._seed(db, unassigned_first)
+        owners = db.get_player_owners_for_clan_sync("#CLANX")
+        assert owners["#DUPE"] == self.REAL_ID
+
+    async def test_verified_still_beats_unverified_regardless_of_sentinel(self, db):
+        """The pre-existing verified-wins rule must still take precedence over the new
+        tiebreak — a VERIFIED UNASSIGNED row beats an unverified real owner."""
+        await db.save_clan("#CLANY", "Clan Y")
+        await db.save_user(self.REAL_ID, {
+            "display_name": "real",
+            "players": [{"player_tag": "#V", "player_name": "V", "verified": False,
+                         "current_clan_tag": "#CLANY"}],
+        })
+        await db.save_user("UNASSIGNED", {
+            "display_name": "UNASSIGNED",
+            "players": [{"player_tag": "#V", "player_name": "V", "verified": True,
+                         "current_clan_tag": "#CLANY"}],
+        })
+        owners = db.get_player_owners_for_tags_sync(["#V"])
+        assert owners["#V"] == "UNASSIGNED"
+
+    async def test_cleanup_removes_only_stray_unassigned_rows(self, db):
+        await self._seed(db, unassigned_first=True)
+        # A genuinely unlinked player: UNASSIGNED row only, must survive.
+        await db.save_user("UNASSIGNED", {
+            "display_name": "UNASSIGNED",
+            "players": [
+                {"player_tag": "#DUPE", "player_name": "Dupe", "current_clan_tag": "#CLANX"},
+                {"player_tag": "#LONELY", "player_name": "Lonely", "current_clan_tag": "#CLANX"},
+            ],
+        })
+
+        await db._cleanup_stray_unassigned_duplicates()
+
+        cur = await db.conn.execute(
+            "SELECT discord_id FROM user_players WHERE player_tag='#DUPE'"
+        )
+        assert [r["discord_id"] for r in await cur.fetchall()] == [self.REAL_ID]
+
+        cur = await db.conn.execute(
+            "SELECT discord_id FROM user_players WHERE player_tag='#LONELY'"
+        )
+        assert [r["discord_id"] for r in await cur.fetchall()] == ["UNASSIGNED"]
+
+    async def test_cleanup_is_idempotent(self, db):
+        await self._seed(db, unassigned_first=True)
+        await db._cleanup_stray_unassigned_duplicates()
+        await db._cleanup_stray_unassigned_duplicates()  # must not raise or over-delete
+        cur = await db.conn.execute("SELECT COUNT(*) AS c FROM user_players WHERE player_tag='#DUPE'")
+        row = await cur.fetchone()
+        assert row["c"] == 1
