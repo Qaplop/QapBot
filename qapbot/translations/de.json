@@ -475,6 +475,7 @@
       "notification_label": "Einstellungen ändern für:",
       "button_clan_notifications": "⚙️ Ganzer Clan",
       "button_user_notifications": "👤 Einzelner Benutzer",
+      "button_custodians": "🛡️ Betreuer",
       "button_toggle_role_system_disable": "🔴 Rollensystem deaktivieren",
       "button_toggle_role_system_enable": "🟢 Rollensystem aktivieren",
       "button_configure_roles": "⚙️ Rollen konfigurieren",
@@ -580,6 +581,7 @@
       "war_channel_notification_time": "⏰ Krieg endet in **{time}**",
       "war_channel_notification_players_field": "📋 Spieler",
       "war_channel_notification_footer": "Spieler mit ausstehenden Angriffen",
+      "war_channel_notification_custodians_line": "⚠️ {mentions} — es gibt noch offene Angriffe, bitte kurz nachsehen!",
       "config_language_block": "🌐 **Serversprache: {language_name}**",
       "config_registration_block_title": "🎉 Registrierungsnachricht",
       "config_registration_status": "Status: {status}",
@@ -660,6 +662,13 @@
       "button_save": "✅ Konfiguration speichern",
       "placeholder_newbie_role": "Wähle Neuling-Rolle für automatische Zuweisung...",
       "placeholder_member_role": "Wähle Mitglieds-Rolle für automatische Zuweisung..."
+    },
+    "custodian_configuration": {
+      "placeholder_user_select": "Wähle bis zu 5 Betreuer für die @Erwähnung...",
+      "button_clear": "❌ Alle löschen",
+      "button_save": "✅ Konfiguration speichern",
+      "updated_message": "**Kriegsbenachrichtigungs-Betreuer**\n\nAktuell ausgewählt: {mentions}\n\nKlicke auf 'Konfiguration speichern', um die Änderung zu übernehmen.",
+      "saved_message": "✅ Betreuer gespeichert: {mentions}"
     },
     "notification_settings": {
       "button_back_to_first": "⬅️ Zurück zur ersten Seite",
@@ -814,6 +823,7 @@
       "unlink_player_confirm_verified": "🛑 **WARNUNG: DIESES KONTO IST API-VERIFIZIERT** 🛑\n\nDu bist dabei, **{player_name} ({player_tag})** von <@{discord_user_id}> zu entkoppeln.\n\nDieser Spieler hat die **API-Verifizierung** abgeschlossen (nachgewiesener Besitz des Spielkontos). Das Entkoppeln wird:\n• Die Verbindung zwischen Discord und dem Spielkonto entfernen\n• Den verifizierten Status sofort löschen\n• Erfordern, dass sich der Spieler bei einer erneuten Verknüpfung wieder mit einem API-Token verifiziert\n\n**Bist du absolut sicher, dass du dieses VERIFIZIERTE Konto entkoppeln möchtest?**\nStandardmäßig ist **Abbrechen** ausgewählt - du musst explizit bestätigen.",
       "clan_notifications_header": "**Clan-weite Benachrichtigungseinstellungen**\n\n⚠️ Mit dieser Funktion setzt du die Benachrichtigungseinstellungen für alle Benutzer in diesem Clan und überschreibst bestehende Einstellungen! Verwende dies mit Vorsicht! ⚠️\n\nWähle Werte für alle Optionen und klicke dann auf 'Auf alle Benutzer anwenden'.",
       "user_notifications_header": "**Benutzer-Benachrichtigungseinstellungen**\n\nWähle einen Discord-Benutzer aus, um seine Benachrichtigungseinstellungen für diesen Clan zu konfigurieren.",
+      "custodians_header": "**Kriegsbenachrichtigungs-Betreuer**\n\nWähle bis zu 5 Discord-Benutzer aus, die bei jeder Kriegsbenachrichtigung dieses Clans im Kanal @erwähnt werden, damit sie eine Push-Benachrichtigung erhalten und sicherstellen können, dass niemand einen Angriff verpasst.",
       "configure_roles_header": "**Rollen konfigurieren**\n\nWähle Rollen für automatische Zuweisung bei Spielerverifizierung.\n\n**Aktuelle Neuling-Rolle:** {newbie_display}\n*Wird allen neu verifizierten Spielern zugewiesen*\n\n**Aktuelle Mitglieds-Rolle:** {member_display}\n*Wird zugewiesen, wenn in Mitglieds-Clans verifiziert*\n\nVerwende die Dropdown-Menüs unten, um neue Rollen auszuwählen.",
       "configure_roles_updated": "**Rollen konfigurieren**\n\n**Ausgewählte Neuling-Rolle:** {newbie_display}\n**Ausgewählte Mitglieds-Rolle:** {member_display}\n\nKlicke **Konfiguration speichern**, um Änderungen anzuwenden.",
       "member_clans_header": "**Mitglieds-Clans & Familien konfigurieren**\n\nWähle ganze Clan-Familien oder einzelne Clans aus, um die Mitglieds-Rolle zu erteilen.\n\n**Aktuell konfiguriert:**\n{display_text}\n\n🏰 = Clan-Familie | Verwende Buttons, um Clans/Familien umzuschalten.",

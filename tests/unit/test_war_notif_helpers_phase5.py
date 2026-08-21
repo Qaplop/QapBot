@@ -607,3 +607,85 @@ class TestSendChannelWarNotification:
 
         result = await self._fn()("#CLAN1", self._war_data(), [self._player()])
         assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_custodians_mentioned_when_configured(self, monkeypatch):
+        import discord
+
+        monkeypatch.setattr("qapbot.war_notifications._get_hours_until_war_end", lambda wd: 0.5)  # type: ignore[misc]
+        monkeypatch.setattr("qapbot.war_notifications._get_war_id", lambda ct, wd: "W1")  # type: ignore[misc]
+        monkeypatch.setattr("qapbot.war_notifications._is_channel_notification_sent", lambda wid, gid: False)  # type: ignore[misc]
+        monkeypatch.setattr("qapbot.war_notifications._record_channel_notification", AsyncMock())
+        monkeypatch.setattr("qapbot.war_notifications.normalize_player_name", lambda n: n)  # type: ignore[misc]
+        # NOTE: _send_channel_war_notification does `from qapbot.i18n import t` locally (not just
+        # at module scope), so a monkeypatch of `qapbot.war_notifications.t` gets shadowed by that
+        # re-import on every call. Patching `qapbot.i18n.t` itself is what the local import
+        # actually resolves against.
+        monkeypatch.setattr("qapbot.i18n.t", lambda key, **kw: kw.get("mentions", key))  # type: ignore[misc]
+
+        cache = MagicMock()
+        cache.subscriptions = {"111": {"ch1": [{"clan_tag": "#CLAN1"}]}}
+        cache.clan_families = {}
+        cache.server_config = {"111": {
+            "channel_war_notifications_enabled": True,
+            "war_notification_channel_id": "999",
+            "war_notification_threshold_hours": 1.0,
+            "clan_custodians": {"#CLAN1": ["111", "222"]},
+        }}
+        monkeypatch.setattr("qapbot.cache_manager.CACHE", cache)
+
+        config = MagicMock()
+        config.is_dev_mode = False
+        monkeypatch.setattr("qapbot.war_notifications.CONFIG", config)
+
+        channel = AsyncMock(spec=discord.TextChannel)
+        bot = AsyncMock()
+        bot.get_channel = MagicMock(return_value=channel)
+        bot.fetch_channel = AsyncMock(return_value=channel)
+        monkeypatch.setattr("QBcore.bot", bot)
+
+        result = await self._fn()("#CLAN1", self._war_data(), [self._player()])
+        assert result == 1
+        channel.send.assert_awaited_once()
+        _, kwargs = channel.send.call_args
+        assert kwargs["content"] == "<@111> <@222>"
+        assert kwargs["allowed_mentions"].users is True
+        assert kwargs["allowed_mentions"].everyone is False
+        assert kwargs["allowed_mentions"].roles is False
+
+    @pytest.mark.asyncio
+    async def test_no_content_when_no_custodians_configured(self, monkeypatch):
+        import discord
+
+        monkeypatch.setattr("qapbot.war_notifications._get_hours_until_war_end", lambda wd: 0.5)  # type: ignore[misc]
+        monkeypatch.setattr("qapbot.war_notifications._get_war_id", lambda ct, wd: "W1")  # type: ignore[misc]
+        monkeypatch.setattr("qapbot.war_notifications._is_channel_notification_sent", lambda wid, gid: False)  # type: ignore[misc]
+        monkeypatch.setattr("qapbot.war_notifications._record_channel_notification", AsyncMock())
+        monkeypatch.setattr("qapbot.war_notifications.normalize_player_name", lambda n: n)  # type: ignore[misc]
+        monkeypatch.setattr("qapbot.i18n.t", lambda key, **kw: key)  # type: ignore[misc]
+
+        cache = MagicMock()
+        cache.subscriptions = {"111": {"ch1": [{"clan_tag": "#CLAN1"}]}}
+        cache.clan_families = {}
+        cache.server_config = {"111": {
+            "channel_war_notifications_enabled": True,
+            "war_notification_channel_id": "999",
+            "war_notification_threshold_hours": 1.0,
+        }}
+        monkeypatch.setattr("qapbot.cache_manager.CACHE", cache)
+
+        config = MagicMock()
+        config.is_dev_mode = False
+        monkeypatch.setattr("qapbot.war_notifications.CONFIG", config)
+
+        channel = AsyncMock(spec=discord.TextChannel)
+        bot = AsyncMock()
+        bot.get_channel = MagicMock(return_value=channel)
+        bot.fetch_channel = AsyncMock(return_value=channel)
+        monkeypatch.setattr("QBcore.bot", bot)
+
+        result = await self._fn()("#CLAN1", self._war_data(), [self._player()])
+        assert result == 1
+        channel.send.assert_awaited_once()
+        _, kwargs = channel.send.call_args
+        assert kwargs["content"] is None

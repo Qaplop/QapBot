@@ -646,7 +646,17 @@ class ClanManagementView(discord.ui.View):
         )
         user_settings_button.callback = self._on_user_notification_settings  # type: ignore[assignment]
         self.add_item(user_settings_button)  # type: ignore[arg-type]
-    
+
+        # Button 3: Per-clan war-notification custodians (@mention config)
+        custodians_button = discord.ui.Button(
+            label=t('ui_components.clan_management.button_custodians', guild_id=guild_id),
+            style=discord.ButtonStyle.primary,
+            custom_id="clan_mgmt_custodians",
+            row=4
+        )
+        custodians_button.callback = self._on_custodians  # type: ignore[assignment]
+        self.add_item(custodians_button)  # type: ignore[arg-type]
+
     def _add_role_management_buttons(self):
         """Add role management buttons for configuring auto-role assignment."""
         from qapbot.cache_manager import CACHE
@@ -1418,7 +1428,33 @@ class ClanManagementView(discord.ui.View):
         guild_id = interaction.guild.id if interaction.guild else None
         header = t('ui_components.prompts.user_notifications_header', user_id=user_id, guild_id=guild_id)
         await interaction.followup.send(header, view=user_settings_view, ephemeral=True)  # type: ignore[arg-type]
-    
+
+    async def _on_custodians(self, interaction: discord.Interaction) -> None:
+        """Handle Custodians button - open per-clan war-notification @mention configuration. Admin-only."""
+        # Check admin permission first
+        if not await self._check_admin_permission(interaction):
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        from qapbot.cache_manager import CACHE
+        from qapbot.i18n import t
+
+        guild_id = str(interaction.guild.id) if interaction.guild else None
+        current_custodian_ids = CACHE.server_config.get(guild_id, {}).get("clan_custodians", {}).get(self.clan_tag, []) if guild_id else []
+
+        custodians_view = CustodianConfigurationView(
+            guild=interaction.guild,
+            clan_tag=self.clan_tag,
+            current_custodian_ids=current_custodian_ids,
+            timeout=300
+        )
+
+        user_id = str(interaction.user.id)
+        guild_id_int = interaction.guild.id if interaction.guild else None
+        header = t('ui_components.prompts.custodians_header', user_id=user_id, guild_id=guild_id_int)
+        await interaction.followup.send(header, view=custodians_view, ephemeral=True)  # type: ignore[arg-type]
+
     async def _on_toggle_role_system(self, interaction: discord.Interaction) -> None:
         """Handle Enable/Disable Role System button - toggle automatic role assignment. Admin-only."""
         # Check admin permission first
@@ -3574,6 +3610,168 @@ class RoleConfigurationView(discord.ui.View):
             error_msg = t('ui_components.errors.error_saving_configuration', user_id=user_id, guild_id=guild_id, error=str(e))
             await interaction.followup.send(error_msg, ephemeral=True)
             logging.error(f"Error saving role configuration: {e}", exc_info=True)
+
+
+CUSTODIAN_LIMIT = 5
+
+
+class CustodianConfigurationView(discord.ui.View):
+    """
+    View for configuring the Discord users @mentioned in one clan's channel war notification.
+
+    Provides:
+    - A UserSelect (0-5 users) scoped to the clan this view was opened for
+    - A Clear button
+    - An Apply button that persists the full set and refreshes the ephemeral message
+
+    Args:
+        guild: Discord guild object
+        clan_tag: Normalized clan tag this custodian list applies to
+        current_custodian_ids: Currently configured custodian Discord user IDs (as strings)
+        timeout: View timeout in seconds
+    """
+    def __init__(
+        self,
+        guild: discord.Guild,
+        clan_tag: str,
+        current_custodian_ids: List[str],
+        timeout: int = 300
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.clan_tag = clan_tag
+        self.custodian_ids: List[str] = list(current_custodian_ids)
+        self._rebuild_counter = 0
+
+        self._add_user_select()
+        self._add_clear_button()
+        self._add_apply_button()
+
+    def _add_user_select(self):
+        """Add the custodian user selector, scoped to this clan."""
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+
+        default_values = [discord.Object(id=int(uid)) for uid in self.custodian_ids] or None
+
+        # Dynamic custom_id forces Discord to treat this as a new component after rebuilds
+        # (same fix as ClanManagementLinkAccountView._add_user_select() for stale selections).
+        user_select = discord.ui.UserSelect(
+            placeholder=t('ui_components.custodian_configuration.placeholder_user_select', guild_id=guild_id),
+            min_values=0,
+            max_values=CUSTODIAN_LIMIT,
+            custom_id=f"custodian_select_{self._rebuild_counter}",
+            row=0,
+            default_values=default_values  # type: ignore[arg-type]
+        )
+        user_select.callback = self._on_user_select  # type: ignore[assignment]
+        self.add_item(user_select)  # type: ignore[arg-type]
+
+    def _add_clear_button(self):
+        """Add clear-all button."""
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+
+        clear_button = discord.ui.Button(
+            label=t('ui_components.custodian_configuration.button_clear', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="clear_custodians",
+            row=1,
+            disabled=(len(self.custodian_ids) == 0)
+        )
+        clear_button.callback = self._on_clear  # type: ignore[assignment]
+        self.add_item(clear_button)  # type: ignore[arg-type]
+
+    def _add_apply_button(self):
+        """Add apply button to save changes."""
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+
+        apply_button = discord.ui.Button(
+            label=t('ui_components.custodian_configuration.button_save', guild_id=guild_id),
+            style=discord.ButtonStyle.success,
+            custom_id="apply_custodian_config",
+            row=1
+        )
+        apply_button.callback = self._on_apply  # type: ignore[assignment]
+        self.add_item(apply_button)  # type: ignore[arg-type]
+
+    def _rebuild_view(self):
+        """Rebuild view with updated selection state."""
+        self._rebuild_counter += 1
+        self.clear_items()
+        self._add_user_select()
+        self._add_clear_button()
+        self._add_apply_button()
+
+    def _current_mentions_text(self) -> str:
+        if not self.custodian_ids:
+            return "❌ None selected"
+        return " ".join(f"<@{uid}>" for uid in self.custodian_ids)
+
+    async def _on_user_select(self, interaction: discord.Interaction) -> None:
+        """Handle custodian selection."""
+        await interaction.response.defer(thinking=False, ephemeral=False)
+
+        self.custodian_ids = interaction.data.get('values', [])  # type: ignore[union-attr]
+        self._rebuild_view()
+
+        from qapbot.i18n import t
+        user_id = str(interaction.user.id)
+        guild_id_for_t = interaction.guild.id if interaction.guild else None
+        msg = t('ui_components.custodian_configuration.updated_message',
+                user_id=user_id, guild_id=guild_id_for_t,
+                mentions=self._current_mentions_text())
+
+        await interaction.edit_original_response(
+            content=msg,
+            view=self
+        )
+
+    async def _on_clear(self, interaction: discord.Interaction) -> None:
+        """Handle clear-all button."""
+        await interaction.response.defer(thinking=False, ephemeral=False)
+
+        self.custodian_ids = []
+        self._rebuild_view()
+
+        from qapbot.i18n import t
+        user_id = str(interaction.user.id)
+        guild_id_for_t = interaction.guild.id if interaction.guild else None
+        msg = t('ui_components.custodian_configuration.updated_message',
+                user_id=user_id, guild_id=guild_id_for_t,
+                mentions=self._current_mentions_text())
+
+        await interaction.edit_original_response(
+            content=msg,
+            view=self
+        )
+
+    async def _on_apply(self, interaction: discord.Interaction) -> None:
+        """Persist the custodian configuration for this clan."""
+        await interaction.response.defer(thinking=False, ephemeral=True)
+
+        from qapbot.cache_manager import CACHE
+
+        guild_id = str(self.guild.id)
+
+        await CACHE.db_manager.save_guild_clan_custodians(guild_id, self.clan_tag, self.custodian_ids)
+
+        if guild_id not in CACHE.server_config:
+            CACHE.server_config[guild_id] = {}
+        clan_custodians = CACHE.server_config[guild_id].setdefault("clan_custodians", {})
+        if self.custodian_ids:
+            clan_custodians[self.clan_tag] = self.custodian_ids
+        else:
+            clan_custodians.pop(self.clan_tag, None)
+
+        from qapbot.i18n import t
+        user_id = str(interaction.user.id)
+        guild_id_for_t = interaction.guild.id if interaction.guild else None
+        msg = t('ui_components.custodian_configuration.saved_message',
+                user_id=user_id, guild_id=guild_id_for_t,
+                mentions=self._current_mentions_text())
+        await interaction.followup.send(msg, ephemeral=True)
 
 
 class AddClanFamilyModal(discord.ui.Modal, title="Add Clan or Family"):

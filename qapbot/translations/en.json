@@ -475,6 +475,7 @@
       "notification_label": "Change settings for:",
       "button_clan_notifications": "⚙️ Whole Clan",
       "button_user_notifications": "👤 Single User",
+      "button_custodians": "🛡️ Custodians",
       "button_toggle_role_system_disable": "🔴 Disable Role System",
       "button_toggle_role_system_enable": "🟢 Enable Role System",
       "button_configure_roles": "⚙️ Configure Roles",
@@ -580,6 +581,7 @@
       "war_channel_notification_time": "⏰ War ends in **{time}**",
       "war_channel_notification_players_field": "📋 Players",
       "war_channel_notification_footer": "Players with pending attacks",
+      "war_channel_notification_custodians_line": "⚠️ {mentions} — attacks are still pending, please check in!",
       "config_language_block": "🌐 **Server Language: {language_name}**",
       "config_registration_block_title": "🎉 Registration Message",
       "config_registration_status": "Status: {status}",
@@ -660,6 +662,13 @@
       "button_save": "✅ Save Configuration",
       "placeholder_newbie_role": "Select newbie role for automatic assignment...",
       "placeholder_member_role": "Select member role for automatic assignment..."
+    },
+    "custodian_configuration": {
+      "placeholder_user_select": "Select up to 5 custodians to @mention...",
+      "button_clear": "❌ Clear All",
+      "button_save": "✅ Save Configuration",
+      "updated_message": "**War Notification Custodians**\n\nCurrently selected: {mentions}\n\nClick 'Save Configuration' to apply.",
+      "saved_message": "✅ Custodians saved: {mentions}"
     },
     "notification_settings": {
       "button_back_to_first": "⬅️ Back to first page",
@@ -814,6 +823,7 @@
       "unlink_player_confirm_verified": "🛑 **WARNING: THIS ACCOUNT IS API-VERIFIED** 🛑\n\nYou are about to unlink **{player_name} ({player_tag})** from <@{discord_user_id}>.\n\nThis player has completed **API verification** (proven in-game account ownership). Unlinking will:\n• Remove the Discord ↔ in-game account connection\n• Clear the account's verified status immediately\n• Require the player to verify again with an API token if ever re-linked\n\n**Are you absolutely sure you want to unlink this VERIFIED account?**\nThis defaults to **Cancel** - you must explicitly confirm.",
       "clan_notifications_header": "**Clan-Wide Notification Settings**\n\n⚠️ With this function you will set the notification settings for all users in this clan overriding existing settings! Use with caution! ⚠️\n\nSelect values for all options, then click 'Apply to All Users'.",
       "user_notifications_header": "**User Notification Settings**\n\nSelect a Discord user to configure their notification settings for this clan.",
+      "custodians_header": "**War Notification Custodians**\n\nSelect up to 5 Discord users to @mention whenever this clan's war notification posts to the channel, so they get pushed a notification and can help make sure nobody misses an attack.",
       "configure_roles_header": "**Configure Roles**\n\nSelect roles for automatic assignment upon player verification.\n\n**Current Newbie Role:** {newbie_display}\n*Assigned to all newly verified players*\n\n**Current Member Role:** {member_display}\n*Assigned when verified in member clans*\n\nUse the dropdowns below to select new roles.",
       "configure_roles_updated": "**Configure Roles**\n\n**Selected Newbie Role:** {newbie_display}\n**Selected Member Role:** {member_display}\n\nClick **Save Configuration** to apply changes.",
       "member_clans_header": "**Configure Member Clans & Families**\n\nSelect entire clan families or individual clans to grant the member role.\n\n**Currently Configured:**\n{display_text}\n\n🏰 = Clan Family | Use buttons to toggle clans/families.",

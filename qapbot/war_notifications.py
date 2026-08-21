@@ -1453,9 +1453,21 @@ async def _send_channel_war_notification(clan_tag: str, war_data: Dict[str, Any]
                 inline=False
             )
             
+            # Build custodian @mention line, if any custodians are configured for this clan
+            custodian_ids = guild_config.get("clan_custodians", {}).get(clan_tag, [])
+            mention_content: Optional[str] = None
+            if custodian_ids:
+                mentions = " ".join(f"<@{uid}>" for uid in custodian_ids)
+                mention_content = t('ui_components.basic_config.war_channel_notification_custodians_line',
+                                     guild_id=guild_id_int, mentions=mentions)
+
             # Send to channel
             if isinstance(channel, (discord.TextChannel, discord.Thread)):
-                await channel.send(embed=embed)
+                await channel.send(
+                    content=mention_content,
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False)
+                )
             logging.info(f"✅ Sent channel war notification to guild {guild_id} channel {war_notification_channel_id} for {len(players_to_notify)} players")
             
             # Record that channel notification was sent for this war+guild

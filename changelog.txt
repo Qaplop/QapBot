@@ -1,6 +1,23 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-21 (4)
+- Added: per-clan war-notification custodians (tracker item #0005) — `/clan management` →
+  notifications mode now has a "Custodians" button letting an admin pick up to 5 Discord users
+  per member clan (any guild member, via `discord.ui.UserSelect`) who get `@mentioned` in that
+  clan's channel war notification, so they get pushed a Discord notification when players still
+  have pending attacks. New table `guild_clan_custodians` (mirrors `guild_clan_roles` but allows
+  multiple rows per clan_tag), loaded into `CACHE.server_config[guild_id]["clan_custodians"]`
+  alongside the rest of guild config — no separate CACHE plumbing needed. Mention content is
+  added to `_send_channel_war_notification`'s `channel.send()` call with an explicit
+  `AllowedMentions(users=True, everyone=False, roles=False)` (first deliberate mention from an
+  unattended periodic post); guilds with no custodians configured see byte-identical behavior to
+  before. DM reminders are untouched. Files: qapbot/db_manager.py, qapbot/ui_clan_management.py,
+  qapbot/war_notifications.py, qapbot/translations/en.json, qapbot/translations/de.json,
+  qapbot/docs/DATABASE_ARCHITECTURE.md, tests/integration/test_guild_roles.py,
+  tests/unit/test_war_notif_helpers_phase5.py, tests/discord/test_ui_clan_management_custodians.py
+  (new). Plan: plans/tracker-0005-clan-war-notification-custodians.md. 2271 tests pass.
+
 2026-08-21 (3)
 - Changed: bug/feature tracker attachment storage relocated off the SSD — CONFIG.tracker_data_dir
   default changed from `data/tracker` (follows PROD_DATA_DIR on PROD) to `tracker` (project

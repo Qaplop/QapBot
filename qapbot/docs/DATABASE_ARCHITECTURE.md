@@ -353,6 +353,9 @@ The `get_clan_attack_history_sync()` method in `db_manager.py` aggregates `SUM(s
   independent of each other.
 - `guild_clan_roles` - Per-clan Discord role IDs scoped to a guild (one role id per
   clan_tag within a guild_id); backs per-clan role assignment.
+- `guild_clan_custodians` - Per-clan war-notification custodians scoped to a guild (multiple
+  discord_user_id rows per clan_tag within a guild_id, up to 5, selected via `/clan management`
+  → notifications mode); their IDs are @mentioned in the channel war notification for that clan.
 - `subscriptions` - Channel subscriptions for updates
 - `leaderboard_messages` - Discord message tracking for updates
 
@@ -499,6 +502,7 @@ Steps 9 & 11):
 - `guild_member_families.family_tag` → `clan_families.family_tag` ON DELETE CASCADE
 - `guild_member_clans.guild_id` → `guild_config.guild_id` ON DELETE CASCADE
 - `guild_member_clans.clan_tag` → `clans.clan_tag` ON DELETE CASCADE
+- `guild_clan_custodians.guild_id` → `guild_config.guild_id` ON DELETE CASCADE
 - `notification_state.discord_id` → `users.discord_id` ON DELETE CASCADE
 
 **Intentional exceptions:**

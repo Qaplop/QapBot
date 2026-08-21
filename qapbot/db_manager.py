@@ -2339,6 +2339,23 @@ class WarHistoryDB:
             "CREATE INDEX IF NOT EXISTS idx_guild_clan_roles_guild_id ON guild_clan_roles(guild_id)"
         )
 
+        # Per-clan war-notification custodians: Discord users @mentioned in the channel war
+        # notification for a given clan within a guild (multiple rows per clan_tag, unlike
+        # guild_clan_roles above which holds at most one row per clan_tag).
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS guild_clan_custodians (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                clan_tag TEXT NOT NULL,
+                discord_user_id TEXT NOT NULL,
+                FOREIGN KEY (guild_id) REFERENCES guild_config(guild_id) ON DELETE CASCADE,
+                UNIQUE (guild_id, clan_tag, discord_user_id)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_guild_clan_custodians_guild_id ON guild_clan_custodians(guild_id)"
+        )
+
         # Subscriptions table
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -8564,6 +8581,15 @@ class WarHistoryDB:
         )
         clan_roles: Dict[str, str] = {r[0]: r[1] for r in await clan_roles_cursor.fetchall()}
 
+        # Load per-clan war-notification custodians (multiple Discord users per clan_tag)
+        custodians_cursor = await self._conn.execute(
+            "SELECT clan_tag, discord_user_id FROM guild_clan_custodians WHERE guild_id = ?",
+            (guild_id,)
+        )
+        clan_custodians: Dict[str, List[str]] = {}
+        for custodian_row in await custodians_cursor.fetchall():
+            clan_custodians.setdefault(custodian_row["clan_tag"], []).append(custodian_row["discord_user_id"])
+
         # Access by column name – immune to column order changes from ALTER TABLE migrations.
         return {
             "language": row["language"],
@@ -8592,6 +8618,7 @@ class WarHistoryDB:
             "member_families": families,
             "member_clans": clans,
             "clan_roles": clan_roles,
+            "clan_custodians": clan_custodians,
             "cwl_hub_channel_id": row["cwl_hub_channel_id"],
             "cwl_hub_message_id": row["cwl_hub_message_id"],
             "cwl_hub_message_enabled": bool(row["cwl_hub_message_enabled"]) if row["cwl_hub_message_enabled"] is not None else False,
@@ -8796,6 +8823,21 @@ class WarHistoryDB:
                 "DELETE FROM guild_clan_roles WHERE guild_id = ? AND clan_tag = ?",
                 (guild_id, clan_tag)
             )
+            await self._conn.commit()
+
+    async def save_guild_clan_custodians(self, guild_id: str, clan_tag: str, user_ids: List[str]) -> None:
+        """Replace the full set of war-notification custodians for a guild+clan (upsert-by-replace)."""
+        await self._ensure_connection()
+        async with self._write_lock:
+            await self._conn.execute(
+                "DELETE FROM guild_clan_custodians WHERE guild_id = ? AND clan_tag = ?",
+                (guild_id, clan_tag)
+            )
+            if user_ids:
+                await self._conn.executemany(
+                    "INSERT INTO guild_clan_custodians (guild_id, clan_tag, discord_user_id) VALUES (?, ?, ?)",
+                    [(guild_id, clan_tag, uid) for uid in user_ids]
+                )
             await self._conn.commit()
 
     async def get_subscriptions_by_channel(self, guild_id: str, channel_id: str) -> Dict[str, Dict[str, Any]]:

@@ -151,3 +151,74 @@ class TestGuildClanRolesCRUD:
         row = await cursor.fetchone()
         assert row is not None
         assert row["cnt"] == 0
+
+
+@pytest.mark.integration
+class TestGuildClanCustodiansCRUD:
+    """save_guild_clan_custodians + get_guild_config returns clan_custodians."""
+
+    async def test_save_and_retrieve_custodians(self, db: "WarHistoryDB"):
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        await db.save_guild_clan_custodians(GUILD_ID, "#CLAN1", ["111", "222"])
+
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert loaded["clan_custodians"] == {"#CLAN1": ["111", "222"]}
+
+    async def test_replace_overwrites_previous_set(self, db: "WarHistoryDB"):
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        await db.save_guild_clan_custodians(GUILD_ID, "#CLAN1", ["111", "222"])
+        await db.save_guild_clan_custodians(GUILD_ID, "#CLAN1", ["333"])
+
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert loaded["clan_custodians"]["#CLAN1"] == ["333"]
+
+    async def test_empty_list_clears_custodians(self, db: "WarHistoryDB"):
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        await db.save_guild_clan_custodians(GUILD_ID, "#CLAN1", ["111"])
+        await db.save_guild_clan_custodians(GUILD_ID, "#CLAN1", [])
+
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert "#CLAN1" not in loaded["clan_custodians"]
+
+    async def test_multiple_clans_independent(self, db: "WarHistoryDB"):
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        await db.save_guild_clan_custodians(GUILD_ID, "#A", ["1"])
+        await db.save_guild_clan_custodians(GUILD_ID, "#B", ["2", "3"])
+
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert loaded["clan_custodians"]["#A"] == ["1"]
+        assert loaded["clan_custodians"]["#B"] == ["2", "3"]
+
+        await db.save_guild_clan_custodians(GUILD_ID, "#A", [])
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert "#A" not in loaded["clan_custodians"]
+        assert loaded["clan_custodians"]["#B"] == ["2", "3"]
+
+    async def test_custodians_empty_when_none_saved(self, db: "WarHistoryDB"):
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert loaded["clan_custodians"] == {}
+
+    async def test_cascade_delete_on_guild_config_removal(self, db: "WarHistoryDB"):
+        """Deleting guild_config should cascade-delete guild_clan_custodians."""
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        await db.save_guild_clan_custodians(GUILD_ID, "#CLAN1", ["111"])
+
+        async with db._write_lock:  # type: ignore[reportPrivateUsage]
+            await db.conn.execute(  # type: ignore[union-attr]
+                "DELETE FROM guild_config WHERE guild_id = ?", (GUILD_ID,)
+            )
+            await db.conn.commit()  # type: ignore[union-attr]
+
+        cursor = await db.conn.execute(  # type: ignore[union-attr]
+            "SELECT COUNT(*) AS cnt FROM guild_clan_custodians WHERE guild_id = ?", (GUILD_ID,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["cnt"] == 0
