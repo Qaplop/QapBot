@@ -24,6 +24,15 @@ import discord
 from qapbot.cache_manager import CACHE
 from qapbot.constants import CWL_LEAGUE_ORDER
 
+# Serializes start_cwl_enrollment() per (guild_id, season) — 2026-08-21 hardening, same bug class
+# and same fix shape as CoCClanCache._update_locks (COPILOT_PITFALLS_COOKBOOK.md Pitfall 35).
+# The only server-side guard was `event["status"] != "draft"`, and that status isn't written until
+# AFTER the whole DM batch finishes — for a ~120-recipient blast under load that window is minutes
+# long, during which a second trigger (another admin, another device, a freshly reopened confirm
+# dialog) sails straight past the check and starts a duplicate run. The UI's button-disable only
+# protects the one already-rendered message, not a new one.
+_enrollment_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
+
 
 def cwl_league_rank(tier: Optional[str]) -> int:
     """Numeric rank for sorting clans by CWL tier, highest league first (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md
@@ -1561,7 +1570,7 @@ async def prune_or_detach_shared_clans_before_deletion(guild_id: int, event_id: 
 
 def _cleanup_local_pool_for_plain_clan_deactivation_sync(
     db: Any, guild_id: int, event_id: int, clan_tag: str, shared_clan_id: Optional[int] = None,
-) -> None:
+) -> List[str]:
     """The LOCAL-table counterpart of the SHARED-clan orphaned-preservation/stale-mirror cleanup
     in detach_guild_from_shared_clan_on_deactivation (see that function's own `shared is None`
     branch for why this exists — 2026-08-16 follow-up, live-testing feedback). A plain guest clan
@@ -1661,7 +1670,7 @@ def _cleanup_local_pool_for_plain_clan_deactivation_sync(
     if shared_clan_id is not None:
         candidate_tags.update(p["player_tag"] for p in db.get_cwl_shared_clan_players_sync(shared_clan_id))
     if not candidate_tags:
-        return
+        return []
 
     family_clan_tags = set(resolve_guild_member_clan_tags(guild_id))
     other_active_guest_clan_tags = {
@@ -1712,6 +1721,7 @@ def _cleanup_local_pool_for_plain_clan_deactivation_sync(
         if assignment is not None and assignment["assigned_clan_tag"] == clan_tag:
             db.delete_cwl_assignment_sync(event_id, tag)
 
+    purged_tags: List[str] = []
     for tag in candidate_tags:
         assignment = all_assignments_by_tag.get(tag)
         if (
@@ -1765,6 +1775,17 @@ def _cleanup_local_pool_for_plain_clan_deactivation_sync(
                       # setting is currently on — matches what a fresh add would produce right now
         db.delete_cwl_assignment_sync(event_id, tag)
         db.delete_cwl_signup_sync(event_id, tag)
+        purged_tags.append(tag)
+
+    # Returned so the ASYNC caller can retract these players' now-dangling enrollment DMs
+    # (2026-08-21, tracker #0011). It can't be done here: this is a plain sync function run via
+    # asyncio.to_thread, while cleanup_stale_cwl_enrollment_dms() is async and needs a live bot.
+    logging.info(
+        f"[CWL-POOL-CLEANUP] guild={guild_id} event={event_id} clan={clan_tag} deactivated: "
+        f"purged={len(purged_tags)} kept={len(candidate_tags) - len(purged_tags)} "
+        f"(of {len(candidate_tags)} candidate tag(s))"
+    )
+    return purged_tags
 
 
 async def detach_guild_from_shared_clan_on_deactivation(guild_id: int, event_id: int, season: str, clan_tag: str) -> None:
@@ -2000,11 +2021,21 @@ async def remove_cwl_guest_clan(guild_id: int, event_id: int, season: str, clan_
     shared = await asyncio.to_thread(db.get_cwl_shared_clan_sync, clan_tag, season)
     if shared is not None:
         await detach_guild_from_shared_clan_on_deactivation(guild_id, event_id, season, clan_tag)
-    await asyncio.to_thread(
+    purged_tags = await asyncio.to_thread(
         _cleanup_local_pool_for_plain_clan_deactivation_sync, db, guild_id, event_id, clan_tag,
         shared["id"] if shared is not None else None,
     )
     await asyncio.to_thread(db.delete_cwl_event_clan_sync, event_id, clan_tag)
+
+    # Retract the purged players' now-dangling enrollment DMs (2026-08-21, tracker #0011). Their
+    # cwl_signups row is gone, so clicking Confirm/Opt Out would report "this sign-up is no longer
+    # valid (the season may have been deleted)" — misleading, since the season is very much alive;
+    # only their clan left the roster. Delete-Season already does exactly this
+    # (CwlDeleteSeasonConfirmView._on_confirm, ui_cwl_roster.py); this path never did.
+    # Deliberately scoped to purged_tags: players the cleanup PRESERVED keep their pool
+    # membership, so their DM is still live and must not be retracted.
+    if purged_tags:
+        await _retract_enrollment_dms_for_tags(event_id, purged_tags, context=f"clan {clan_tag} removed")
 
 
 def purge_orphaned_shared_clan_guests_sync(shared_clan_id: int, player_tag: str) -> None:
@@ -2082,6 +2113,17 @@ def _seed_prior_cwl_assignments_sync(
 
 
 async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
+    """Per-(guild_id, season)-serialized wrapper around the real implementation below — see
+    _enrollment_locks' comment at the top of this module for why. Concurrent calls for the SAME
+    guild+season queue up rather than overlapping; the second one then re-reads the event and
+    correctly bails with error='not_draft', because the first run has by then written the
+    draft -> signup_open transition. Different guilds/seasons are unaffected."""
+    lock = _enrollment_locks.setdefault((str(guild_id), season), asyncio.Lock())
+    async with lock:
+        return await _start_cwl_enrollment_locked(guild_id, season)
+
+
+async def _start_cwl_enrollment_locked(guild_id: int, season: str) -> Dict[str, Any]:
     """The single "Start Enrollment" admin action (CWL_ROSTER_PLANNING_PLAN.md Phase 2): seeds
     cwl_signups from the participating clans' *current* membership, sends the confirm/opt-out DM
     blast to every resolved account, and transitions the event draft -> signup_open. Re-fetches
@@ -2367,6 +2409,18 @@ async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
 
     await asyncio.to_thread(db.update_cwl_event_status_sync, event["id"], "signup_open")
     summary["ok"] = True
+    # Success-path audit line (2026-08-21) — this action previously logged NOTHING on success,
+    # which is exactly why tracker #0011's investigation couldn't tell from a full day of PROD
+    # logs whether/when it had run, or how its DM set compared to the seeded signup rows.
+    logging.info(
+        f"[CWL-ENROLLMENT] Start Enrollment complete: guild={guild_id} season={season} "
+        f"event={event['id']} seeded={summary['seeded']} contacted={summary['contacted']} "
+        f"assigned={summary['assigned']} skipped_optout={summary['skipped_optout']} "
+        f"skipped_unlinked={summary['skipped_unlinked']} "
+        f"skipped_dm_guard={summary['skipped_dm_guard']} "
+        f"skipped_already_dm_globally={summary['skipped_already_dm_globally']} "
+        f"blocked={len(summary['blocked'])} failed={len(summary['failed'])}"
+    )
     return summary
 
 
@@ -2550,6 +2604,41 @@ async def send_cwl_signup_template_dm(
     message_id = str(dm_message.id) if dm_message is not None else None
     channel_id = str(dm_message.channel.id) if dm_message is not None else None
     return sent, outcome, message_id, channel_id
+
+
+async def _retract_enrollment_dms_for_tags(
+    event_id: int, player_tags: List[str], context: str,
+) -> None:
+    """Retract the enrollment DMs of specific players whose signup rows were just purged
+    (2026-08-21, tracker #0011). Thin async bridge so a plain-sync cleanup running under
+    asyncio.to_thread can still get its DMs retracted: the sync side returns the affected tags,
+    this resolves their DM refs and hands them to cleanup_stale_cwl_enrollment_dms().
+
+    Uses QBcore.bot rather than taking a bot/interaction parameter — the only production caller
+    (remove_cwl_guest_clan, reached from web_bridge.py's clan-config save) has no interaction in
+    scope, and this matches how other non-interaction contexts in this codebase reach the client.
+    Best-effort throughout, exactly like the Delete-Season path it mirrors."""
+    import QBcore
+
+    db = CACHE.db_manager
+    bot = getattr(QBcore, "bot", None)
+    if db is None or bot is None:
+        return
+
+    wanted = set(player_tags)
+    all_refs = await asyncio.to_thread(
+        db.get_cwl_player_season_status_dm_refs_for_event_sync, event_id
+    )
+    dm_refs = [r for r in all_refs if r["player_tag"] in wanted]
+    if not dm_refs:
+        return
+
+    result = await cleanup_stale_cwl_enrollment_dms(bot, dm_refs)
+    logging.info(
+        f"[CWL-ENROLLMENT] {context} (event {event_id}): retracted "
+        f"{result['deleted']}/{len(dm_refs)} now-stale enrollment DM(s), "
+        f"{result['failed']} could not be removed."
+    )
 
 
 async def cleanup_stale_cwl_enrollment_dms(bot: Any, dm_refs: List[Dict[str, Any]]) -> Dict[str, int]:

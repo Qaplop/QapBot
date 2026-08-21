@@ -1,6 +1,26 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-21 (10)
+- Changed/Fixed: hardened CWL enrollment against the gaps found investigating tracker item #0011
+  (3 of one reporter's accounts got an enrollment DM but no cwl_signups row, so clicking Confirm
+  reported "sign-up no longer valid"). The exact trigger stayed unproven — neither action logged
+  anything on its success path, which is itself fixed here — so this closes every confirmed hole
+  rather than claiming one root cause. (1) start_cwl_enrollment() had NO concurrency guard: its
+  only gate is `status != 'draft'`, and that status isn't written until after the whole DM batch,
+  so for a ~120-recipient blast under load a second trigger (another admin/device, a reopened
+  confirm dialog) could start a duplicate run minutes later — now serialized per
+  (guild_id, season) via `_enrollment_locks`, same shape as the coc_cache.py fix in ec76063.
+  (2) Removing a clan from a season purged its non-protected members' cwl_signups rows but never
+  retracted their already-sent enrollment DMs (Delete Season has always done this) — those
+  players were left with live-looking Confirm/Opt Out buttons that report a deleted season, which
+  is misleading since only their clan left. `_cleanup_local_pool_for_plain_clan_deactivation_sync`
+  now returns the purged tags and `remove_cwl_guest_clan` retracts exactly those DMs via the new
+  `_retract_enrollment_dms_for_tags()` bridge (the sync cleanup can't await the async retraction
+  itself; preserved players' DMs are deliberately left alone). (3) Both actions now log on
+  success. Files: qapbot/QBdiscocmdshelper_cwl.py, tests/unit/test_cwl_enrollment_hardening.py
+  (new). 2306 tests pass.
+
 2026-08-21 (9)
 - Fixed: linked accounts shown as grey/"not linked" on the CWL Manage Enrollment board
   (tracker item #0013). user_players' UNIQUE is (discord_id, player_tag), not player_tag alone,
