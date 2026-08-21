@@ -1347,6 +1347,51 @@ async def handle_cleanup_messages_all(bot: Any, cache: Any, username: str) -> st
 # =============================================================================
 
 
+def _estimate_dict_size_mb(d: Any, sample: int = 200) -> float:
+    """Rough deep size of a {key: value} cache, in MB, from a sample of its entries.
+
+    Added 2026-08-21 (tracker #0009): the memory report used to print entry counts only, so
+    there was no way to tell from it which cache actually held the RSS — the 7.1 GB PROD
+    investigation had to measure by hand to discover that temp_war_objects (~61 KB/entry) dwarfs
+    clan_name_cache (a flat metadata dict) despite having ~20x fewer entries.
+
+    Samples rather than walking everything: these dicts run to hundreds of thousands of entries
+    and this is called from an interactive admin command. sys.getsizeof is shallow, so one level
+    of dict/list values is added explicitly — good enough to rank caches against each other,
+    which is the whole point; it is not an exact figure.
+    """
+    import sys
+    try:
+        total_entries = len(d)
+        if not total_entries:
+            return 0.0
+
+        def _deep(value: Any, depth: int = 0) -> int:
+            size = sys.getsizeof(value)
+            if depth >= 2:
+                return size
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    size += sys.getsizeof(k) + _deep(v, depth + 1)
+            elif isinstance(value, (list, tuple, set)):
+                for item in value:
+                    size += _deep(item, depth + 1)
+            return size
+
+        sampled = 0
+        sampled_bytes = 0
+        for key, value in d.items():
+            sampled_bytes += sys.getsizeof(key) + _deep(value)
+            sampled += 1
+            if sampled >= sample:
+                break
+        if not sampled:
+            return 0.0
+        return (sampled_bytes / sampled) * total_entries / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
 def _build_cache_summary(cache: Any) -> list[str]:
     """Build human-readable cache size summary lines."""
     lines: list[str] = []
@@ -1359,29 +1404,45 @@ def _build_cache_summary(cache: Any) -> list[str]:
         except Exception:
             coc_mb = 0.0
         lines.append(f"  coc_clan_cache      : {coc_entries} entries, ~{coc_mb:.1f} MB")
-        lines.append(f"  clan_name_cache     : {len(cache.clan_name_cache)} clans")
+        # Real byte sizes for the three biggest structures (2026-08-21, tracker #0009). These
+        # reported entry counts ONLY, which is why a 7.1 GB RSS investigation couldn't even bound
+        # which cache was responsible without an ad-hoc live measurement. Sampled rather than
+        # walked in full — see _estimate_dict_size_mb.
+        _cnc_mb = _estimate_dict_size_mb(cache.clan_name_cache)
+        lines.append(f"  clan_name_cache     : {len(cache.clan_name_cache)} clans, ~{_cnc_mb:.1f} MB")
         lines.append(f"  subscriptions       : {sum(len(v) for v in cache.subscriptions.values())} channels across {len(cache.subscriptions)} guilds")
         lines.append(f"  leaderboard_messages: {len(cache.leaderboard_messages)} entries")
         lines.append(f"  user_accounts       : {len(cache.user_accounts)} users")
         lines.append(f"  notification_state  : {len(cache.notification_state)} wars")
         lines.append(f"  clan_history        : {len(cache.clan_history)} clans loaded (lazy)")
         lines.append(f"  history_cache       : {len(cache.history_cache)} filtered slices")
-        lines.append(f"  temp_war_stats      : {len(cache.temp_war_stats)} clans")
+        _tws_mb = _estimate_dict_size_mb(cache.temp_war_stats)
+        lines.append(f"  temp_war_stats      : {len(cache.temp_war_stats)} clans, ~{_tws_mb:.1f} MB")
         from qapbot.cache_manager import MAX_TEMP_WAR_OBJECTS as _mwo_cap
-        lines.append(f"  temp_war_objects    : {len(cache.temp_war_objects)} clans (cap={_mwo_cap:,})")
+        _two_mb = _estimate_dict_size_mb(cache.temp_war_objects)
+        _two_len = len(cache.temp_war_objects)
+        _projected = (_two_mb / _two_len * _mwo_cap) if _two_len else 0.0
+        lines.append(
+            f"  temp_war_objects    : {_two_len} clans, ~{_two_mb:.1f} MB "
+            f"(cap={_mwo_cap:,} ≈ {_projected / 1024:.1f} GB at cap)"
+        )
         lines.append(f"  server_config       : {len(cache.server_config)} guilds")
     except Exception as _ce:
         lines.append(f"  (error reading CACHE sizes: {_ce})")
     return lines
 
 
-def _build_gc_type_counts(top_n: int = 15, max_scan: int = 200_000) -> list[tuple[str, int]]:
+def _build_gc_type_counts(top_n: int = 15, max_scan: int = 5_000_000) -> list[tuple[str, int]]:
     """Return top-N GC object types by count.
 
     max_scan caps the number of objects iterated so this never hangs during
     CWL season when millions of cached objects are live (4+ GB RSS).
-    The sample is still representative: object lists are ordered by generation
-    so the most numerous types appear early.
+
+    Raised from 200k to 5M on 2026-08-21 (tracker #0009): at 200k the scan hit its cap almost
+    immediately on PROD and reported a near-useless '199,997 tuples + <scan capped>', which said
+    nothing about the actual heap composition. Counting types is cheap per object (no deep
+    traversal), so a limit high enough to actually finish on a multi-GB heap is worth the extra
+    fraction of a second on what is an explicitly-requested admin diagnostic.
     """
     import gc
     type_counts: dict[str, int] = {}
@@ -1493,7 +1554,26 @@ def save_memtrace_snapshot(cache: Any) -> str:
     for tname, cnt in top_types:
         lines.append(f"  {tname:<40} {cnt:>10,}")
 
-    lines.append(f"\n[TRACEMALLOC — top 50 allocation sites by cumulative size]")
+    # Trace-window warning (2026-08-21, tracker #0009). tracemalloc is started ON DEMAND, minutes
+    # before this snapshot — NOT at process start — so the totals below cover only that short
+    # window and are blind to every long-lived object allocated before it (i.e. essentially the
+    # whole resident heap). Comparing this section's ~150 MB against a 7.1 GB RSS is what sent the
+    # first investigation of #0009 hunting for phantom native allocations. Use [CACHE STRUCTURE
+    # SIZES] above for what is actually resident.
+    _baseline_time = getattr(QBcore, '_memtrace_baseline_time', None)
+    lines.append(
+        f"\n[TRACEMALLOC — top 50 allocation sites by cumulative size]"
+    )
+    lines.append(
+        f"  NOTE: tracing started on demand"
+        + (f" at {_baseline_time}" if _baseline_time else "")
+        + " — these figures cover only that short window, NOT the full "
+        + f"{uptime_str} uptime. Objects allocated before tracing began are invisible here, so"
+    )
+    lines.append(
+        "        this total will NOT add up to RSS. For what is actually resident, "
+        "read [CACHE STRUCTURE SIZES] above."
+    )
     for i, stat in enumerate(top_stats[:50], 1):
         lines.append(f"  {i:>3}. {stat}")
 

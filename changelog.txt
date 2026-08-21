@@ -1,6 +1,26 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-21 (11)
+- Changed: memory-report instrumentation for tracker item #0009 (huge memory consumption). The
+  originally-planned fix — pruning "stale" clan_name_cache entries — was invalidated during
+  validation: measured against a copy of the live PROD DB it would have matched ZERO rows at 90
+  days AND at 30, because refresh_stale_passive_clans() already refreshes every passive clan
+  roughly monthly, so nothing is ever that stale. It would also have been unsafe: five
+  ON DELETE CASCADE FKs reference clans(clan_tag) (incl. cwl_event_clans/cwl_assignments) and FK
+  enforcement is on at runtime, so deleting clan rows could cascade into live CWL rosters. Fixed
+  the actual blocker instead — the report couldn't tell you which cache held the memory:
+  clan_name_cache/temp_war_stats/temp_war_objects now report estimated MB (new sampling helper
+  _estimate_dict_size_mb), temp_war_objects additionally projects its size at cap (its own code
+  comment measures ~61 KB/entry, so the 100k cap is ~6.1 GB BY DESIGN — the likely real driver,
+  vs ~433 MB for clan_name_cache at PROD's 438k entries). The TRACEMALLOC section now states
+  that tracing starts on demand minutes before the snapshot and therefore cannot add up to RSS —
+  comparing its ~150 MB against 7.1 GB is what sent the first analysis chasing phantom native
+  allocations. GC type-count scan cap raised 200k -> 5M (at 200k it capped out instantly on PROD
+  and reported nothing useful). #0009 stays OPEN pending real numbers from this instrumentation.
+  Files: qapbot/QBdiscocmdshelper_admin_command.py,
+  tests/unit/test_memory_report_instrumentation.py (new). 2314 tests pass.
+
 2026-08-21 (10)
 - Changed/Fixed: hardened CWL enrollment against the gaps found investigating tracker item #0011
   (3 of one reporter's accounts got an enrollment DM but no cwl_signups row, so clicking Confirm
