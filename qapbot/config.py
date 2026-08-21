@@ -180,15 +180,16 @@ class BotConfig:
     web_bridge_port: int = 0
     web_bridge_secret: str = ""
 
-    # CWL roster-planning feature under active development (CWL_ROSTER_PLANNING_PLAN.md):
-    # while True, any CWL-related DM (signup confirm/opt-out blast, future assignment
-    # notifications) is only actually delivered to CONFIG.server_admin's own Discord
-    # account — every other resolved recipient is skipped (their DB rows are still
-    # written; only DM *delivery* is guarded, so the data stays realistic to test
-    # against). Independent of is_dev_mode and set separately per host from the shared
-    # .env file (DEV/PROD-suffixed like web_bridge_* above) so it can be enabled on
-    # PROD too while live-testing there, not just DEV. Defaults to True (safe) — flip
-    # to False only once the feature is ready for real players to be DMed.
+    # CWL roster-planning feature (CWL_ROSTER_PLANNING_PLAN.md): while True, any CWL-related DM
+    # (signup confirm/opt-out blast, enrollment/assignment notifications) is only actually
+    # delivered to CONFIG.server_admin's own Discord account — every other resolved recipient is
+    # skipped (their DB rows are still written; only DM *delivery* is guarded, so the data stays
+    # realistic to test against). PROD/DEV now behave asymmetrically on purpose (tracker item
+    # #0007, 2026-08-21): the feature is considered production-ready, so `load_config()` hardcodes
+    # this to False on PROD unconditionally (no env var, no opt-out) — enrollment DMs go to every
+    # eligible player. DEV keeps the opt-in toggle: defaults to True (restricted) unless
+    # CWL_DM_RESTRICT_TO_ADMIN_DEV=false is explicitly set, so DEV never blasts real-looking DMs
+    # by accident. This default (`True`) only matters as the DEV fallback now.
     cwl_dm_restrict_to_admin: bool = True
 
     # Bug/feature tracker (BUG_FEATURE_TRACKER_PLAN.md). No env var — always the inverse of
@@ -374,13 +375,14 @@ def load_config() -> BotConfig:
     except ValueError:
         web_bridge_port = 0
 
-    # CWL DM safety toggle (feature under active development) — DEV/PROD-suffixed like
-    # web_bridge_* above, so it can be set independently for a DEV host and a PROD host
-    # sharing one .env file. Defaults to "true" (restricted) on both.
+    # CWL DM safety toggle. DEV keeps the opt-in env var (defaults to restricted unless
+    # CWL_DM_RESTRICT_TO_ADMIN_DEV=false is explicitly set). PROD no longer reads an env var at
+    # all — tracker item #0007 (2026-08-21) removed the toggle for PROD: the feature is
+    # production-ready, so PROD is always unrestricted (every eligible player gets DMed).
     if is_dev_mode:
         cwl_dm_restrict_to_admin = os.getenv("CWL_DM_RESTRICT_TO_ADMIN_DEV", "true").lower() in ("true", "1", "yes")
     else:
-        cwl_dm_restrict_to_admin = os.getenv("CWL_DM_RESTRICT_TO_ADMIN", "true").lower() in ("true", "1", "yes")
+        cwl_dm_restrict_to_admin = False
 
     # Bug/feature tracker — no env var, see BotConfig.tracker_enabled comment for why (PROD DB
     # copies to DEV carry PROD's real tracker channel IDs along with them).

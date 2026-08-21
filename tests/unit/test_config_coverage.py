@@ -135,6 +135,40 @@ class TestTrackerEnabled:
 
 
 # ---------------------------------------------------------------------------
+# CWL DM restrict-to-admin toggle (CWL_ROSTER_PLANNING_PLAN.md). Tracker item #0007
+# (2026-08-21) removed the toggle for PROD entirely — PROD must always be unrestricted
+# regardless of any env var. DEV keeps the opt-in toggle: defaults to restricted (True)
+# unless CWL_DM_RESTRICT_TO_ADMIN_DEV=false is explicitly set.
+# ---------------------------------------------------------------------------
+
+class TestCwlDmRestrictToAdmin:
+    def test_prod_is_always_unrestricted(self):
+        env = _base_env(dev=False)
+        with patch.dict(os.environ, env, clear=True):
+            from qapbot.config import load_config
+            assert load_config().cwl_dm_restrict_to_admin is False
+
+    def test_prod_ignores_env_var_entirely(self):
+        """PROD reads no env var for this any more — even an explicit 'true' must not restrict."""
+        env = {**_base_env(dev=False), "CWL_DM_RESTRICT_TO_ADMIN": "true"}
+        with patch.dict(os.environ, env, clear=True):
+            from qapbot.config import load_config
+            assert load_config().cwl_dm_restrict_to_admin is False
+
+    def test_dev_defaults_to_restricted_when_unset(self):
+        env = _base_env(dev=True)
+        with patch.dict(os.environ, env, clear=True):
+            from qapbot.config import load_config
+            assert load_config().cwl_dm_restrict_to_admin is True
+
+    def test_dev_can_opt_out_explicitly(self):
+        env = {**_base_env(dev=True), "CWL_DM_RESTRICT_TO_ADMIN_DEV": "false"}
+        with patch.dict(os.environ, env, clear=True):
+            from qapbot.config import load_config
+            assert load_config().cwl_dm_restrict_to_admin is False
+
+
+# ---------------------------------------------------------------------------
 # Safe integer fallbacks
 # ---------------------------------------------------------------------------
 

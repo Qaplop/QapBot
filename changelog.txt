@@ -1,6 +1,18 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-21 (5)
+- Changed: removed the CWL enrollment DM restrict-to-admin toggle for PROD (tracker item #0007)
+  — the feature is now considered production-ready, so enrollment/assignment DMs go to every
+  eligible player on PROD. `load_config()` (`qapbot/config.py`) now hardcodes
+  `cwl_dm_restrict_to_admin = False` unconditionally when `not is_dev_mode`, reading no env var
+  at all for PROD any more (can't be silently re-restricted by a stale `.env` value). DEV is
+  unchanged: still defaults to restricted (admin-only), opt out per-host via
+  `CWL_DM_RESTRICT_TO_ADMIN_DEV=false`. Removed the now-dead unsuffixed `CWL_DM_RESTRICT_TO_ADMIN`
+  var from `.env`/`.env.example`. The DM guard itself (`QBdiscocmdshelper_cwl.py`) needed no code
+  change — it already just reads the config flag. Files: qapbot/config.py, .env, .env.example,
+  CWL_ROSTER_PLANNING_PLAN.md, tests/unit/test_config_coverage.py. 2275 tests pass.
+
 2026-08-21 (4)
 - Added: per-clan war-notification custodians (tracker item #0005) — `/clan management` →
   notifications mode now has a "Custodians" button letting an admin pick up to 5 Discord users
