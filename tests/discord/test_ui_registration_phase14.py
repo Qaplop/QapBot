@@ -192,3 +192,82 @@ async def test_on_refresh_click_api_error_does_not_crash(monkeypatch: pytest.Mon
 
     cache.persist_user.assert_not_awaited()
     interaction.edit_original_response.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# _build_message_content — 2000-char safety net (2026-08-21 PROD incident)
+#
+# A user with many linked accounts produced an overview longer than Discord's
+# 2000-char content limit, so every "My Accounts" click raised
+# HTTPException 400 / 50035 and the button was permanently unusable for them.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_build_message_content_truncates_long_account_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Many linked accounts must not push the message past Discord's limit."""
+    import qapbot.ui_registration as ui
+
+    cache = FakeCache()
+    cache.user_accounts["123"] = {
+        "players": [_user_player(f"#P{i}", name=f"Player{i}") for i in range(80)]
+    }
+    monkeypatch.setattr(ui, "CACHE", cache)
+    monkeypatch.setattr(ui, "t", identity_t)
+
+    view = ui.AccountManagementView(user_id="123", guild_id=1, display_name="Alice")
+    content = view._build_message_content()
+
+    # NOTE: _build_message_content does a function-local `from qapbot.i18n import t`, which
+    # shadows the module-level monkeypatch above — so the REAL translation renders here, and
+    # asserting on real text (rather than the key) is what actually proves the key exists.
+    assert len(content) < ui._DISCORD_MESSAGE_CHAR_LIMIT
+    assert "more account(s)" in content
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_build_message_content_keeps_short_list_untruncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The common case (a handful of accounts) is unchanged — no truncation note."""
+    import qapbot.ui_registration as ui
+
+    cache = FakeCache()
+    cache.user_accounts["123"] = {
+        "players": [_user_player(f"#P{i}", name=f"Player{i}") for i in range(3)]
+    }
+    monkeypatch.setattr(ui, "CACHE", cache)
+    monkeypatch.setattr(ui, "t", identity_t)
+
+    view = ui.AccountManagementView(user_id="123", guild_id=1, display_name="Alice")
+    content = view._build_message_content()
+
+    assert len(content) < ui._DISCORD_MESSAGE_CHAR_LIMIT
+    assert "more account(s)" not in content
+    assert "Player2 (#P2)" in content  # all three still listed
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_build_message_content_clamps_oversized_status_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The final clamp catches overflow from text appended AFTER the player-list budget.
+
+    status_message is caller-supplied and interpolated raw, so capping only the player list
+    does not by itself keep the result under Discord's limit.
+    """
+    import qapbot.ui_registration as ui
+
+    cache = FakeCache()
+    cache.user_accounts["123"] = {"players": [_user_player("#P1")]}
+    monkeypatch.setattr(ui, "CACHE", cache)
+    monkeypatch.setattr(ui, "t", identity_t)
+
+    view = ui.AccountManagementView(user_id="123", guild_id=1, display_name="Alice")
+    content = view._build_message_content(status_message="X" * 5000)
+
+    assert len(content) <= ui._DISCORD_MESSAGE_CHAR_LIMIT

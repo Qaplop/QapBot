@@ -16,6 +16,13 @@ from qapbot.cache_manager import CACHE
 from qapbot.ui_common import GenericSelectView, TrackedView, update_user_metadata_from_interaction
 from qapbot.ui_notifications import WarNotificationPromptView
 
+# Discord's hard cap on a message's `content` field. Exceeding it raises
+# HTTPException 400 / error code 50035 ("Must be 2000 or fewer in length").
+_DISCORD_MESSAGE_CHAR_LIMIT = 2000
+# How much of that budget AccountManagementView's per-player list may occupy, leaving room for
+# the title, overview template, an optional status message and the selection prompt.
+_PLAYER_LIST_CHAR_BUDGET = 1400
+
 
 async def _clan_filter_callback(
     interaction: discord.Interaction,
@@ -1085,24 +1092,48 @@ class AccountManagementView(discord.ui.View):
                           detail=" · ".join(detail_parts))
 
             player_lines.append(line)
-        
+
+        # Cap the per-player list so a user with many linked accounts can't blow Discord's
+        # 2000-char message limit (2026-08-21 PROD incident: a reporter with 12 accounts hit
+        # HTTPException 400/50035 on every click, and since show_overview() doesn't wrap
+        # send_message() in try/except, the "My Accounts" button was permanently unusable for
+        # them). Budget leaves room for the title, the overview template, an optional
+        # status_message and the selection prompt, all appended after this.
         player_list = "\n".join(player_lines) if player_lines else "None"  # type: ignore[arg-type]
-        
+        if len(player_list) > _PLAYER_LIST_CHAR_BUDGET:
+            kept_lines: List[str] = []
+            running_len = 0
+            for player_line in player_lines:
+                if running_len + len(player_line) + 1 > _PLAYER_LIST_CHAR_BUDGET:
+                    break
+                kept_lines.append(player_line)
+                running_len += len(player_line) + 1
+            player_list = "\n".join(kept_lines) + "\n" + t(
+                'playerregistration.account_management_truncated',
+                guild_id=self.guild_id, remaining=len(player_lines) - len(kept_lines),
+            )
+
         overview_text = t('playerregistration.account_management_title', guild_id=self.guild_id) + "\n\n" + \
                        t('playerregistration.account_management_overview',
                          guild_id=self.guild_id,
                          display_name=self.display_name,
                          total=len(user_players),
                          player_list=player_list)
-        
+
         # Add status message before selection prompt if provided
         if status_message:
             overview_text += f"\n\n{status_message}"
-        
+
         # Add selection prompt only if requested
         if show_selection_prompt:
             overview_text += "\n\n" + t('playerregistration.account_management_select_prompt', guild_id=self.guild_id)
-        
+
+        # Last-resort clamp: the budget above only bounds the player list, while the title,
+        # template, caller-supplied status_message and prompt are all appended afterwards — so
+        # only this guarantees the value actually sent to Discord is under the hard limit.
+        if len(overview_text) > _DISCORD_MESSAGE_CHAR_LIMIT:
+            overview_text = overview_text[:_DISCORD_MESSAGE_CHAR_LIMIT - 1] + "…"
+
         return overview_text
     
     async def show_overview(self, interaction: discord.Interaction):

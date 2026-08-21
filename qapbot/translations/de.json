@@ -73,6 +73,7 @@
     "account_management_overview": "**Benutzer:** {display_name}\n**Konten insgesamt:** {total}\n\n**Spielerkonten:**\n{player_list}",
     "account_management_player_format": "{primary_emoji}• {player_name} ({player_tag}) {verify_emoji}",
     "account_management_player_clan": " · {detail}",
+    "account_management_truncated": "*…und {remaining} weitere(s) Konto/Konten — zu viele zur Anzeige hier.*",
     "button_refresh_accounts": "🔄 Aktualisieren",
     "account_management_refreshed": "✅ Spielerdaten von CoC API aktualisiert.",
     "account_management_primary_indicator": "⭐ ",

@@ -73,6 +73,7 @@
     "account_management_overview": "**User:** {display_name}\n**Total Accounts:** {total}\n\n**Player Accounts:**\n{player_list}",
     "account_management_player_format": "{primary_emoji}• {player_name} ({player_tag}) {verify_emoji}",
     "account_management_player_clan": " · {detail}",
+    "account_management_truncated": "*…and {remaining} more account(s) — too many to display here.*",
     "button_refresh_accounts": "🔄 Refresh",
     "account_management_refreshed": "✅ Player data updated from CoC API.",
     "account_management_primary_indicator": "⭐ ",

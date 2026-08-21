@@ -1,6 +1,19 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-21 (8)
+- Fixed: "My Accounts" (/register -> 📋 My Accounts) was permanently unusable for users with many
+  linked accounts — AccountManagementView._build_message_content() built an unbounded message, so
+  a user with 12 linked accounts exceeded Discord's 2000-char content limit and every click raised
+  HTTPException 400 (50035); show_overview() doesn't wrap send_message() in try/except, so the
+  button simply never worked for them (confirmed live on PROD: 10 identical failures 20:40-20:44).
+  The per-player list is now capped (_PLAYER_LIST_CHAR_BUDGET) with an "…and N more" note, plus a
+  final hard clamp on the assembled text — the title, overview template, caller-supplied
+  status_message and selection prompt are all appended AFTER the list budget, so only the final
+  clamp actually guarantees the sent value is under the limit. Files: qapbot/ui_registration.py,
+  qapbot/translations/en.json, qapbot/translations/de.json,
+  tests/discord/test_ui_registration_phase14.py. 2289 tests pass.
+
 2026-08-21 (7)
 - Fixed: live PROD incident — a race in `coc_cache.py`'s `update_player_info_in_user_accounts()`
   (reachable both from the periodic poll loop and, on demand, from
