@@ -6607,6 +6607,12 @@ class ClanManagementUnlinkPlayerConfirmView(discord.ui.View):
         from qapbot.QBdiscocmdshelper import unlink_player
         from qapbot.i18n import t
 
+        # Defer immediately (2026-08-21 incident fix) — same reasoning as
+        # UnlinkConfirmView._on_confirm in ui_registration.py: unlink_player() + role sync can
+        # take several seconds under load, well past Discord's 3s ack window for a bare
+        # interaction.response call.
+        await interaction.response.defer(thinking=False, ephemeral=True)
+
         player_tag = self.player_data.get("tag", "")
         player_name = self.player_data.get("name", "Unknown")
         discord_user_id = str(self.player_data.get("discord_user_id", ""))
@@ -6617,7 +6623,7 @@ class ClanManagementUnlinkPlayerConfirmView(discord.ui.View):
 
         if not success:
             error_msg = t('ui_components.errors.unlink_player_not_found', guild_id=guild_id)
-            await interaction.response.edit_message(content=error_msg, view=None)
+            await interaction.edit_original_response(content=error_msg, view=None)
             return
 
         # Role sync mirrors the self-service unlink flow (UnlinkConfirmView._on_confirm
@@ -6641,7 +6647,7 @@ class ClanManagementUnlinkPlayerConfirmView(discord.ui.View):
             player_tag=player_tag,
             discord_user_id=discord_user_id
         )
-        await interaction.response.edit_message(content=success_msg, view=None)
+        await interaction.edit_original_response(content=success_msg, view=None)
 
         # Refresh the original clan management message, mirroring the post-link refresh
         # in ClanManagementLinkAccountView._on_submit

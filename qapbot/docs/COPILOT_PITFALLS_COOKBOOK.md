@@ -1450,3 +1450,71 @@ its URL, if there's any gap between "received" and "processed" larger than the c
 tick. The bot's own re-upload into a posted item (`_build_discord_files()`) exists for exactly this
 reason on the *durable-storage* side too: a bot-owned copy never expires, but the user's original
 CDN link always eventually does.
+
+## Pitfall 35: two independent callers of the same "detect-then-persist" function racing on a shared in-memory list can poison it forever, not just once
+
+Symptom (2026-08-21, confirmed live on PROD): right after a CWL "Start Enrollment" DM blast (120
+players, Stay family) — the first time the `cwl_dm_restrict_to_admin` toggle was ever off on
+PROD (tracker item #0007) — the log filled with repeating `[DB-WRITE] Transaction failed for
+save_user(UNASSIGNED): UNIQUE constraint failed: user_players.discord_id, user_players.player_tag`,
+plus unrelated players' self-service "Unlink" confirmations throwing
+`discord.errors.NotFound: 404 (10062) Unknown interaction`. The two looked like separate problems
+reported together; only one was.
+
+Root cause (the data-integrity half): `coc_cache.py`'s `update_player_info_in_user_accounts()` —
+the function that discovers "never-tracked" players in a clan's live roster and adds them to the
+shared `UNASSIGNED` pseudo-account — is called from **two independent places**: the normal
+periodic Phase-1 poll loop, and (on demand) `QBdiscocmdshelper_cwl.py`'s
+`ensure_cwl_clan_membership_tracked()`, itself called from `start_cwl_enrollment()` — i.e. exactly
+the flow this DM blast ran. Its "who already owns this player_tag" check is a **DB read**
+(`get_player_owners_for_tags_sync()`), while the actual mutation is an **in-memory list append**
+followed by a persist at the very end of the same call. If the SAME clan is processed by both
+call sites while it currently has zero tracked members (true here — Stay's clan had just hit that
+state, which is exactly `ensure_cwl_clan_membership_tracked()`'s trigger condition), both read the
+DB before either has written anything, both see the same player as unowned, and both append the
+identical player dict to the SAME shared `CACHE.user_accounts["UNASSIGNED"]["players"]` list
+object. The second `persist_user("UNASSIGNED")` — a DELETE-then-bulk-INSERT of that whole list —
+then hits SQLite's `UNIQUE(discord_id, player_tag)` constraint.
+
+**The part that turned one race into a two-hour incident**: nothing ever removed the duplicate
+from the in-memory list after the failed write. `_save_user_impl` correctly rolls back its own
+transaction on failure (the DB itself was never corrupted — confirmed by reading the code, not
+just log-guessing), but the poisoned Python list stayed poisoned. Every *subsequent*,
+completely unrelated `persist_user("UNASSIGNED")` call — including other players' legitimate
+self-service unlinks, which route through the same pseudo-account — kept re-attempting to save
+the same duplicate-laden list and kept failing identically. Confirmed directly in the log: three
+different unlink attempts by different users, minutes apart, all died on the exact same
+constraint. One race, indefinitely repeating collateral damage, until a process restart reloads
+`CACHE.user_accounts` clean from the (still-correct) DB.
+
+Secondary finding (the "Unknown interaction" half, a separate bug that just became visible under
+the same load spike): `UnlinkConfirmView._on_confirm` (`ui_registration.py`) and
+`ClanManagementUnlinkPlayerConfirmView._on_confirm` (`ui_clan_management.py`) both went straight
+into slow work (`unlink_player()` + `sync_roles_for_user()`) and called
+`interaction.response.edit_message()` as their *first* response — no `defer()`. Under the DM
+blast's load (`get_current_war`/`get_league_war` calls were logged taking 15–25s each), that
+routinely blew Discord's 3-second ack window. This was always latent, just never exposed by normal
+load before.
+
+Fix, three parts:
+1. **Serialize the racing function per clan_tag.** `CoCClanCache.__init__` gained
+   `self._update_locks: Dict[str, asyncio.Lock]`; `update_player_info_in_user_accounts()` is now a
+   thin wrapper that acquires `self._update_locks.setdefault(clan_tag, asyncio.Lock())` before
+   calling the (otherwise unchanged) renamed `_update_player_info_in_user_accounts_locked()`. Two
+   different clan_tags still run fully concurrently — only same-clan_tag calls now queue.
+2. **Defense-in-depth de-dup at the write boundary**, independent of whether every race is ever
+   found: `db_manager.py`'s `_replace_user_players_rows()` now drops (and logs) any repeated
+   `player_tag` before building the INSERT, keeping the first occurrence — turns "hard crash that
+   poisons every future call" into "silently corrected, logged, still works."
+3. **`defer()` immediately** as the first line of both `_on_confirm` handlers, switching their
+   response calls from `interaction.response.edit_message()` to `interaction.edit_original_response()`.
+
+General lesson: a "detect whether X already exists, then mutate a shared collection, then persist
+it" function is only safe under a single caller unless it's explicitly serialized — and a second
+call site can arrive from a direction you didn't design the first one around (here: an on-demand
+CWL helper nobody thought of as "a second entry point into the periodic poll's own logic," because
+it calls the exact same shared function rather than duplicating it). Separately: when a write
+fails, ask not just "is the on-disk data still correct" (it was — the transaction rolled back) but
+"is the in-memory state I'm about to reuse next time still correct" — an object mutated *before*
+the failing write, then never repaired after, silently becomes permanent poison for every future
+caller that shares it, which is a much larger blast radius than the single failed call suggests.

@@ -1,6 +1,30 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-21 (7)
+- Fixed: live PROD incident — a race in `coc_cache.py`'s `update_player_info_in_user_accounts()`
+  (reachable both from the periodic poll loop and, on demand, from
+  `QBdiscocmdshelper_cwl.py`'s `ensure_cwl_clan_membership_tracked()`, itself triggered by a CWL
+  "Start Enrollment" DM blast) could append the same player twice to the shared in-memory
+  `UNASSIGNED` pool before either caller persisted, causing `save_user("UNASSIGNED")` to hit
+  SQLite's `UNIQUE(discord_id, player_tag)` constraint — and since nothing ever repaired the
+  poisoned in-memory list afterward, every subsequent unrelated caller of that pseudo-account
+  (including other players' legitimate self-service unlinks) kept failing identically for hours.
+  Fixed with a per-clan_tag `asyncio.Lock` in `CoCClanCache` (same-clan_tag calls now serialize;
+  different clan_tags still run concurrently) plus a defense-in-depth de-dup by `player_tag` in
+  `db_manager.py`'s `_replace_user_players_rows()` before the INSERT. Also fixed a separate,
+  related bug exposed by the same load spike: `UnlinkConfirmView._on_confirm`
+  (qapbot/ui_registration.py) and `ClanManagementUnlinkPlayerConfirmView._on_confirm`
+  (qapbot/ui_clan_management.py) never deferred before their slow work (unlink + role sync),
+  blowing Discord's 3s interaction-ack window under load and throwing "Unknown interaction"
+  (10062) — both now `defer()` immediately and use `edit_original_response()`. Full root-cause
+  trace + incident writeup: qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md Pitfall 35. Files:
+  qapbot/coc_cache.py, qapbot/db_manager.py, qapbot/ui_registration.py,
+  qapbot/ui_clan_management.py, .github/copilot-instructions.md,
+  qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md, tests/integration/test_db_manager.py,
+  tests/unit/test_coc_cache_coverage.py, tests/discord/test_ui_registration_unlink_confirm.py
+  (new), tests/discord/test_ui_clan_management_unlink_confirm.py (new). 2286 tests pass.
+
 2026-08-21 (6)
 - Changed: unified the bug/feature tracker's report channels (tracker item #0006) — `/bug` and
   `/feature` now both post to the single channel configured via `/admin` → *Bot Setup*, instead

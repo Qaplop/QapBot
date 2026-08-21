@@ -45,6 +45,41 @@ class TestUsers:
         await db.delete_user("12345")
         assert await db.get_user("12345") is None
 
+    @pytest.mark.integration
+    async def test_save_user_dedupes_duplicate_player_tag(self, db):
+        """2026-08-21 PROD incident: a race in coc_cache.py could hand save_user() a players
+        list with the same player_tag twice (e.g. UNASSIGNED pool). Before this fix that raised
+        sqlite3.IntegrityError on the UNIQUE(discord_id, player_tag) constraint and, because
+        nothing ever removed the duplicate from the in-memory list, poisoned every subsequent
+        save_user() call for that discord_id. Now it silently keeps the first occurrence."""
+        await db.save_user(
+            "UNASSIGNED",
+            {
+                "display_name": "UNASSIGNED",
+                "players": [
+                    {"player_tag": "#DUPTAG", "player_name": "First"},
+                    {"player_tag": "#OTHER", "player_name": "Other"},
+                    {"player_tag": "#DUPTAG", "player_name": "Second"},
+                ],
+            },
+        )
+
+        user = await db.get_user("UNASSIGNED")
+        assert user is not None
+        tags = sorted(p["player_tag"] for p in user["players"])
+        assert tags == ["#DUPTAG", "#OTHER"]
+        dup_entry = next(p for p in user["players"] if p["player_tag"] == "#DUPTAG")
+        assert dup_entry["player_name"] == "First"  # first occurrence wins
+
+        # A second, unrelated save must still succeed — proves the pool isn't poisoned.
+        await db.save_user(
+            "UNASSIGNED",
+            {"display_name": "UNASSIGNED", "players": [{"player_tag": "#OTHER", "player_name": "Other"}]},
+        )
+        user_after = await db.get_user("UNASSIGNED")
+        assert user_after is not None
+        assert [p["player_tag"] for p in user_after["players"]] == ["#OTHER"]
+
 
 class TestDbPhase2:
     @pytest.mark.integration

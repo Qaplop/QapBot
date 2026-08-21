@@ -8400,7 +8400,30 @@ class WarHistoryDB:
                 exist, so current_clan_tag is cleared for every player instead of failing again.
         """
         await self._conn.execute("DELETE FROM user_players WHERE discord_id = ?", (discord_id,))
+
+        # Defense-in-depth de-dup by player_tag (2026-08-21 incident fix). The UNIQUE(discord_id,
+        # player_tag) constraint is the real guarantee; this just turns "two callers raced and
+        # this list ended up with the same player_tag twice" into a logged, silently-corrected
+        # no-op instead of a hard IntegrityError — which, left uncaught, poisoned the in-memory
+        # UNASSIGNED-pool list forever (every subsequent save_user("UNASSIGNED") from ANY
+        # unrelated caller kept re-attempting the same duplicate and kept failing identically).
+        # See CoCClanCache._update_locks (coc_cache.py) for the actual race this defends against;
+        # that fix should make this branch dead code in practice, but a caller-list duplicate is
+        # cheap to guard against here regardless of what produced it. Keeps the FIRST occurrence.
+        seen_tags: set = set()
+        deduped_players: List[Dict[str, Any]] = []
         for player in players:
+            tag = player.get("player_tag")
+            if tag in seen_tags:
+                logging.warning(
+                    f"[DB-WRITE] save_user({discord_id}): dropping duplicate player_tag {tag} "
+                    "before insert (caller passed the same tag twice)"
+                )
+                continue
+            seen_tags.add(tag)
+            deduped_players.append(player)
+
+        for player in deduped_players:
             await self._conn.execute("""
                 INSERT INTO user_players
                 (discord_id, player_tag, player_name, verified, th_level, current_clan_tag, is_primary)

@@ -59,6 +59,17 @@ class CoCClanCache:
         self.soft_ttl_seconds = soft_ttl_seconds
         self.hard_ttl_seconds = hard_ttl_seconds
         self._refreshing: set[str] = set()  # Clan tags currently being refreshed in background
+        # Serializes update_player_info_in_user_accounts() per clan_tag (2026-08-21 incident fix)
+        # — this method can be entered concurrently for the SAME clan from two independent call
+        # sites (the periodic Phase-1 poll loop, and QBdiscocmdshelper_cwl.py's on-demand
+        # ensure_cwl_clan_membership_tracked()). Without this lock, both read the DB's current
+        # "who already owns this player_tag" snapshot before either has persisted its own
+        # newly-discovered UNASSIGNED-pool players, so both append the SAME player dict to the
+        # shared in-memory list — the second save_user("UNASSIGNED") then hits SQLite's
+        # UNIQUE(discord_id, player_tag) constraint. Confirmed live on PROD 2026-08-21: a CWL
+        # "Start Enrollment" run (120-player DM blast, Stay family) raced the periodic loop on a
+        # just-added clan with zero prior tracked members.
+        self._update_locks: Dict[str, asyncio.Lock] = {}
         self.cache_manager: Optional['CacheManager'] = None  # Set after CacheManager initialization
         # Note: Logging may not be configured yet during module import, so use try/except
         try:
@@ -570,6 +581,14 @@ class CoCClanCache:
         return changed, new_name_out
 
     async def update_player_info_in_user_accounts(self, clan_obj: 'coc.Clan', cache_manager: 'CacheManager') -> None:
+        """Per-clan-tag-serialized wrapper — see _update_locks' comment in __init__ for why. The
+        actual logic is unchanged, in _update_player_info_in_user_accounts_locked() below."""
+        clan_tag_str: str = str(clan_obj.tag)  # type: ignore[attr-defined]
+        lock = self._update_locks.setdefault(clan_tag_str, asyncio.Lock())
+        async with lock:
+            await self._update_player_info_in_user_accounts_locked(clan_obj, cache_manager)
+
+    async def _update_player_info_in_user_accounts_locked(self, clan_obj: 'coc.Clan', cache_manager: 'CacheManager') -> None:
         """
         Update TH level and clan info for every player this clan-info API response mentions —
         registered accounts and the UNASSIGNED pool alike (2026-08-14: UNASSIGNED used to be

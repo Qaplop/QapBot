@@ -8,9 +8,10 @@ _update_clan_metadata (dirty tracking), update_player_info_in_user_accounts.
 # pyright: reportUnusedImport=false
 from __future__ import annotations
 
+import asyncio
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -640,6 +641,65 @@ class TestUpdatePlayerInfoDbIndexed:
         await c.update_player_info_in_user_accounts(clan_mock, cm)
 
         cm.persist_user.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# update_player_info_in_user_accounts — per-clan_tag serialization (2026-08-21
+# PROD incident: this method could run concurrently for the SAME clan from two
+# independent call sites — the periodic poll loop and QBdiscocmdshelper_cwl.py's
+# on-demand ensure_cwl_clan_membership_tracked() — racing on the UNASSIGNED-pool
+# "who's already tracked" check and duplicating a player_tag in user_players.
+# ---------------------------------------------------------------------------
+
+class TestUpdatePlayerInfoConcurrency:
+    @staticmethod
+    def _make_slow_impl(events: List[str], delay: float = 0.05):
+        async def _impl(clan_obj: Any, cache_manager: Any) -> None:
+            events.append(f"start:{clan_obj.tag}")
+            await asyncio.sleep(delay)
+            events.append(f"end:{clan_obj.tag}")
+        return _impl
+
+    @pytest.mark.asyncio
+    async def test_same_clan_tag_calls_are_serialized(self, monkeypatch):
+        c = CoCClanCache()
+        events: List[str] = []
+        monkeypatch.setattr(
+            c, "_update_player_info_in_user_accounts_locked", self._make_slow_impl(events)
+        )
+
+        clan_a1 = MagicMock(tag="#CLAN1")
+        clan_a2 = MagicMock(tag="#CLAN1")
+        cm = MagicMock()
+
+        await asyncio.gather(
+            c.update_player_info_in_user_accounts(clan_a1, cm),
+            c.update_player_info_in_user_accounts(clan_a2, cm),
+        )
+
+        # The second call's "start" must never appear before the first's "end" — proves the
+        # per-clan_tag lock actually serializes them rather than letting both run at once.
+        assert events == ["start:#CLAN1", "end:#CLAN1", "start:#CLAN1", "end:#CLAN1"]
+
+    @pytest.mark.asyncio
+    async def test_different_clan_tags_are_not_serialized(self, monkeypatch):
+        c = CoCClanCache()
+        events: List[str] = []
+        monkeypatch.setattr(
+            c, "_update_player_info_in_user_accounts_locked", self._make_slow_impl(events)
+        )
+
+        clan_a = MagicMock(tag="#CLAN1")
+        clan_b = MagicMock(tag="#CLAN2")
+        cm = MagicMock()
+
+        await asyncio.gather(
+            c.update_player_info_in_user_accounts(clan_a, cm),
+            c.update_player_info_in_user_accounts(clan_b, cm),
+        )
+
+        # Both must start before either finishes — different clan_tags must not block each other.
+        assert set(events[:2]) == {"start:#CLAN1", "start:#CLAN2"}
 
 
 # ---------------------------------------------------------------------------

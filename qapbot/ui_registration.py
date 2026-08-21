@@ -1415,10 +1415,17 @@ class UnlinkConfirmView(discord.ui.View):
         """Handle Confirm button - unlink the player and update view."""
         from qapbot.QBdiscocmdshelper import unlink_player
         from qapbot.i18n import t
-        
+
+        # Defer immediately (2026-08-21 incident fix) — unlink_player() + role sync below can
+        # take several seconds under load (DB write contention, CoC API calls), well past
+        # Discord's 3s ack window for a bare interaction.response call. Confirmed live on PROD:
+        # a CWL DM blast's load caused this exact handler to blow the window and throw
+        # "Unknown interaction" (10062) on every edit_message() call below.
+        await interaction.response.defer(thinking=False, ephemeral=True)
+
         player_tag = self.player_data.get("player_tag", "")
         player_name = self.player_data.get("player_name", "Unknown")
-        
+
         success = await unlink_player(self.user_id, player_tag)
 
         if success:
@@ -1443,7 +1450,7 @@ class UnlinkConfirmView(discord.ui.View):
                            player_name=player_name,
                            player_tag=player_tag)
                 message += "\n\n" + t('playerregistration.account_management_no_accounts', guild_id=self.guild_id)
-                await interaction.response.edit_message(content=message, view=None)
+                await interaction.edit_original_response(content=message, view=None)
             else:
                 # Create fresh AccountManagementView with updated data
                 new_view = AccountManagementView(self.user_id, self.guild_id, self.parent_view.display_name)
@@ -1455,14 +1462,14 @@ class UnlinkConfirmView(discord.ui.View):
                                player_tag=player_tag)
                 
                 overview_text = new_view._build_message_content(status_message=f"✅ {success_msg}")  # type: ignore[attr-defined]
-                
-                await interaction.response.edit_message(content=overview_text, view=new_view)
+
+                await interaction.edit_original_response(content=overview_text, view=new_view)
             
             logging.info(f"USER ACTION: {interaction.user} unlinked {player_name} ({player_tag})")
         else:
             message = t('playerregistration.player_not_found', guild_id=self.guild_id)
             overview_text = self.parent_view._build_message_content(status_message=f"❌ {message}")  # type: ignore[attr-defined]
-            await interaction.response.edit_message(content=overview_text, view=self.parent_view)
+            await interaction.edit_original_response(content=overview_text, view=self.parent_view)
     
     async def _on_cancel(self, interaction: discord.Interaction):
         """Handle Cancel button - restore parent view."""
