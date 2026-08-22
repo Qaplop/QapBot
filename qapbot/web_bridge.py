@@ -1365,6 +1365,215 @@ async def handle_get_cwl_player_stats(request: web.Request) -> web.Response:
     return web.json_response(stats)
 
 
+# The only statuses an admin may set from the board's right-click menu (2026-08-22, tracker
+# #0014). Deliberately excludes 'withdrawn' — legacy-only, its one writer was deleted 2026-08-19
+# (see activity/client/src/types.ts's EnrollmentPlayer.signup_status comment).
+ADMIN_SETTABLE_ENROLLMENT_STATUSES: Tuple[str, ...] = ("confirmed", "declined", "pending")
+
+
+async def handle_post_cwl_enrollment_status(request: web.Request) -> web.Response:
+    """Admin override of one player's enrollment status from the Manage Enrollment board's
+    right-click menu (2026-08-22, tracker #0014, project owner's spec: "allows guild admins to
+    change the enrollment status of every member of the player pool ... Confirmed / Declined /
+    Pending (sends DM again!)").
+
+    "Last action wins" (the spec's explicit conflict rule, both directions) needs no new
+    machinery here: this handler and the player's own DM button (CwlSignupResponseButton.
+    callback, ui_cwl_roster.py) write the SAME global row through the SAME function
+    (propagate_cwl_player_response), which upserts with no ordering guard — so whichever write
+    lands later is the one that stands. The one thing that could break that symmetry is
+    retracting the player's DM out from under them, which is why only the `pending` branch below
+    deletes it: after an admin sets confirmed/declined the DM deliberately stays live, so the
+    player can still answer and still win.
+
+    `pending` additionally retracts the old DM and sends a fresh one to the account's CURRENT
+    owner — the re-send goes through _send_cwl_enrollment_dm_batch() rather than a hand-rolled
+    send, so it inherits that helper's signup-row seeding (Pitfall 38: a DM sent without a
+    cwl_signups row carries a permanently dead button).
+    """
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        guild_id = int(body["guild_id"])
+        discord_user_id = int(body["discord_user_id"])
+        player_tag = str(body["player_tag"]).upper()
+        status = str(body["status"])
+    except (KeyError, ValueError, TypeError):
+        return web.json_response({"error": "invalid request body"}, status=400)
+
+    if status not in ADMIN_SETTABLE_ENROLLMENT_STATUSES:
+        return web.json_response({"error": f"unsupported status '{status}'"}, status=400)
+
+    # Same gate as POST /api/cwl/enrollment/assign, the board's other write action — the board is
+    # itself opened behind _check_cwl_admin_or_leader_permission (ui_cwl_roster.py), so an
+    # admin-only gate here would let a leader open the board and then silently fail on this one
+    # action.
+    if not await _resolve_admin_or_leader(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
+
+    db = CACHE.db_manager
+    if db is None:
+        return web.json_response({"error": "database not ready"}, status=503)
+
+    from datetime import datetime, timezone
+
+    from qapbot.QBdiscocmdshelper_cwl import (
+        _send_cwl_enrollment_dm_batch,
+        cleanup_stale_cwl_enrollment_dms,
+        propagate_cwl_player_response,
+        resolve_selected_cwl_season,
+    )
+    from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+
+    season = resolve_selected_cwl_season(guild_id)
+    event = await asyncio.to_thread(db.get_cwl_event_sync, str(guild_id), season)
+    if event is None:
+        return web.json_response({"error": f"no CWL event exists yet for season {season}"}, status=409)
+    # Same guard notify_new_cwl_pool_members() already applies before DMing: a draft event hasn't
+    # enrolled anyone yet and a cancelled one is dead, so there is no enrollment status to
+    # override in either.
+    if event["status"] in ("draft", "cancelled"):
+        return web.json_response(
+            {"error": f"enrollment is not open for season {season} (event is {event['status']})"},
+            status=409,
+        )
+    event_id = event["id"]
+
+    # One to_thread hop for the whole read-then-write unit (Pitfall 26) — this handler shares the
+    # bot's event loop with the Discord gateway (see module docstring), and the reads below feed
+    # straight into the write with no await in between.
+    def _apply_status_sync() -> Dict[str, Any]:
+        signup = db.get_cwl_signup_sync(event_id, player_tag) or {}
+        global_row = db.get_cwl_player_season_status_sync(player_tag, season) or {}
+        # Live ownership wins over either snapshot (Pitfall 37) — cwl_signups.dmed_discord_id and
+        # cwl_player_season_status.dmed_discord_id both record who was DMed at some earlier point,
+        # never who owns the account now.
+        #
+        # The fallback distinguishes two cases get_player_links_sync deliberately reports
+        # differently, because only one of them is safe to fall back on:
+        #   - tag ABSENT from the dict  = user_players has no row at all (a guest tag added by
+        #     search that was never linked). Keep whatever recipient was recorded rather than
+        #     blanking it — same fallback CwlSignupResponseButton.callback makes.
+        #   - tag PRESENT, discord_id None = the account sits in the UNASSIGNED pool, i.e. nobody
+        #     owns it right now. Falling back here would re-stamp the stale owner onto the row
+        #     (exactly the self-perpetuating staleness Pitfall 37 describes) and, on the `pending`
+        #     branch, aim a fresh DM at someone who no longer owns the account.
+        links = db.get_player_links_sync([player_tag])
+        if player_tag in links:
+            owner_discord_id = links[player_tag].get("discord_id")
+        else:
+            owner_discord_id = signup.get("dmed_discord_id") or global_row.get("dmed_discord_id")
+        link = links.get(player_tag) or {}
+        player_name = (
+            signup.get("player_name") or global_row.get("player_name") or link.get("player_name") or player_tag
+        )
+        responded_at = (
+            None if status == "pending" else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        )
+        # Creates the local row when the player had none — a pooled family member the board shows
+        # but Start Enrollment never seeded a signup for still needs somewhere to hold the status.
+        db.upsert_cwl_signup_sync(
+            event_id, player_tag, player_name, owner_discord_id,
+            signup.get("preferred_league_rank"), "admin_status", status, responded_at=responded_at,
+        )
+        return {
+            "owner_discord_id": owner_discord_id,
+            "player_name": player_name,
+            "responded_at": responded_at,
+            # Only meaningful for the `pending` branch below — the DM to retract, if this player
+            # was ever actually DMed for this season.
+            "dm_message_id": global_row.get("dm_sent_via_message_id"),
+            "dm_recipient_id": global_row.get("dmed_discord_id"),
+        }
+
+    context = await asyncio.to_thread(_apply_status_sync)
+
+    # Global source of truth + every OTHER guild's local mirror (rule h) — the same call the DM
+    # button makes, which is what makes "last action wins" hold across both write paths.
+    affected_guild_ids = await propagate_cwl_player_response(
+        player_tag, season, status, context["responded_at"], context["player_name"],
+        context["owner_discord_id"], event_id, guild_id,
+    )
+
+    dm_result: Optional[Dict[str, Any]] = None
+    if status == "pending":
+        dm_result = await _reset_and_resend_enrollment_dm(
+            db, event_id, guild_id, season, player_tag, context,
+            cleanup_stale_cwl_enrollment_dms, _send_cwl_enrollment_dm_batch,
+        )
+
+    try:
+        await refresh_cwl_management_hub_message(guild_id, "cwl_management")
+    except Exception as e:
+        logging.warning(f"[WEB-BRIDGE] Saved enrollment status but could not refresh the Hub message: {e}")
+    await bump_enrollment_version(guild_id)
+    for other_guild_id in affected_guild_ids:
+        await bump_enrollment_version(other_guild_id)
+
+    return web.json_response({"ok": True, "status": status, "dm": dm_result})
+
+
+async def _reset_and_resend_enrollment_dm(
+    db: Any, event_id: int, guild_id: int, season: str, player_tag: str, context: Dict[str, Any],
+    cleanup_stale_cwl_enrollment_dms: Any, send_dm_batch: Any,
+) -> Dict[str, Any]:
+    """The `pending` half of handle_post_cwl_enrollment_status(): retract the old enrollment DM,
+    clear the global dm_sent record, and send a fresh DM to the account's current owner.
+
+    Split out purely to keep the handler readable — it has no other caller. The two helper
+    functions are passed in rather than re-imported so the handler's single import block stays
+    the one place this module reaches into QBdiscocmdshelper_cwl.
+
+    Returns a small outcome dict the frontend surfaces in the board's footer, so an admin can see
+    WHY no DM went out when one didn't: {"sent": bool, "reason": str|None}.
+    """
+    import QBcore
+
+    bot = getattr(QBcore, "bot", None)
+    # Best-effort retraction, exactly like the Delete-Season path — a DM that can't be removed is
+    # no worse than the pre-fix behavior, and must never block the status reset itself.
+    if bot is not None and context["dm_message_id"] and context["dm_recipient_id"]:
+        try:
+            await cleanup_stale_cwl_enrollment_dms(
+                bot,
+                [{
+                    "player_tag": player_tag,
+                    "dmed_discord_id": context["dm_recipient_id"],
+                    "message_id": context["dm_message_id"],
+                }],
+            )
+        except Exception as e:
+            logging.warning(f"[WEB-BRIDGE] Could not retract the old enrollment DM for {player_tag}: {e}")
+
+    # Must happen BEFORE the re-send: _send_cwl_enrollment_dm_batch()'s global dedup would
+    # otherwise report skipped_already_dm_globally and send nothing at all.
+    await asyncio.to_thread(db.clear_cwl_player_dm_sent_sync, player_tag, season)
+
+    if not context["owner_discord_id"]:
+        # No linked Discord account — the status reset still stands (the board shows them as
+        # pending again), there is simply nobody to ask.
+        return {"sent": False, "reason": "unlinked"}
+
+    batch = await send_dm_batch(
+        event_id, guild_id, season,
+        [{
+            "player_tag": player_tag,
+            "player_name": context["player_name"],
+            "discord_id": context["owner_discord_id"],
+        }],
+    )
+    if batch["contacted"]:
+        return {"sent": True, "reason": None}
+    if batch["blocked"]:
+        return {"sent": False, "reason": "blocked"}
+    if batch["skipped_unlinked"]:
+        return {"sent": False, "reason": "unlinked"}
+    if batch["skipped_dm_guard"]:
+        return {"sent": False, "reason": "dm_guard"}
+    return {"sent": False, "reason": "failed"}
+
+
 async def handle_post_cwl_enrollment_assign(request: web.Request) -> web.Response:
     """Drag-and-drop move on the Manage Enrollment board. clan_tag: null means the card was
     dropped on the Unassigned column."""
@@ -2458,6 +2667,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/cwl/clan-names", handle_get_cwl_clan_names)
     app.router.add_get("/api/cwl/player-stats", handle_get_cwl_player_stats)
     app.router.add_post("/api/cwl/enrollment/assign", handle_post_cwl_enrollment_assign)
+    app.router.add_post("/api/cwl/enrollment/status", handle_post_cwl_enrollment_status)
     app.router.add_get("/api/cwl/guest-search", handle_get_cwl_guest_search)
     app.router.add_post("/api/cwl/enrollment/guest", handle_post_cwl_enrollment_guest)
     app.router.add_post("/api/cwl/enrollment/guest-clan/remove", handle_post_cwl_guest_clan_remove)

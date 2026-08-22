@@ -5161,6 +5161,59 @@ class WarHistoryDB:
                 conn.rollback()
                 return False
 
+    def clear_cwl_player_dm_sent_sync(self, player_tag: str, cwl_season: str) -> bool:
+        """Undo mark_cwl_player_dm_sent_sync() for one player+season — the exact inverse, touching
+        ONLY the dm_sent* columns and never `status` (the table's two-write-method split, see its
+        own CREATE TABLE comment; this is a third method on the dm_sent side rather than widening
+        the status one).
+
+        Added 2026-08-22 for tracker #0014's admin "set status back to Pending" action. Without
+        it, _send_cwl_enrollment_dm_batch()'s global dm_sent dedup
+        (get_cwl_player_season_dm_status_bulk_sync) would count the player as already contacted
+        this season and silently refuse the re-send the admin explicitly asked for.
+
+        A no-op (returns True) when no row exists for this player+season — never contacted means
+        there is nothing to clear, which is already the desired end state.
+
+        Args:
+            player_tag: The player whose DM record should be reset.
+            cwl_season: The CWL season the record belongs to ("YYYY-MM").
+
+        Returns:
+            True on success (including the no-row no-op), False if the write failed.
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        """
+                        UPDATE cwl_player_season_status
+                        SET dm_sent = 0,
+                            dm_sent_at = NULL,
+                            dm_sent_via_event_id = NULL,
+                            dm_sent_via_guild_id = NULL,
+                            dm_sent_via_message_id = NULL,
+                            dm_sent_via_channel_id = NULL,
+                            updated_at = datetime('now')
+                        WHERE player_tag = ? AND cwl_season = ?
+                        """,
+                        (player_tag, cwl_season),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] clear_cwl_player_dm_sent_sync failed for {player_tag}/{cwl_season}: {e}"
+                )
+                conn.rollback()
+                return False
+
     def set_cwl_player_response_status_sync(
         self, player_tag: str, cwl_season: str, player_name: Optional[str], dmed_discord_id: Optional[str],
         status: str, responded_at: Optional[str], event_id: int, guild_id: int,

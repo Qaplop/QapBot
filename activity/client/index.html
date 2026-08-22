@@ -503,6 +503,15 @@
         cursor: pointer;
       }
       .player-context-menu-item:hover { background: #3f4147; }
+      /* Cascading submenu (2026-08-22, tracker #0014's "Set enrollment status") — its own panel
+         on document.body rather than a child of the root menu, so it isn't clipped by the root's
+         box; same reasoning as the hover pop-up above. Sits one z-index above the root menu so
+         it always paints over it when the two overlap near a viewport edge. */
+      .player-context-submenu { z-index: 26; }
+      /* The parent row of a submenu — its ▸ marker is part of the label text (see
+         showContextMenu), so the only styling it needs is a little breathing room on the right so
+         the marker never crowds the panel edge. */
+      .player-context-menu-item.has-submenu { padding-right: 8px; }
       /* CWL-stats section header (2026-08-16) — a touch of top margin separates it from the
          identity/status lines above; otherwise matches .hover-popup-name's own weight/color. */
       .hover-popup-header { font-weight: 600; margin-top: 6px; line-height: 1.5; }

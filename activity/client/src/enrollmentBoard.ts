@@ -2,7 +2,7 @@ import gcheckIconUrl from './assets/gcheck.svg'
 import pendingIconUrl from './assets/pending.svg'
 import redxIconUrl from './assets/redx.svg'
 import unlinkedIconUrl from './assets/unlinked.svg'
-import type { EnrollmentPayload, EnrollmentPlayer } from './types'
+import type { AdminSettableStatus, EnrollmentPayload, EnrollmentPlayer, SetStatusResult } from './types'
 
 type SortOrder = 'th' | 'skill' | 'alpha'
 
@@ -300,6 +300,11 @@ export function renderEnrollmentBoard(
   // reasoning as onResolveClanNames above — a caller that omits it just doesn't get the
   // context-menu affordance (buildCard's contextmenu listener is itself gated on this being set).
   onRemoveGuestPlayer?: (playerTag: string) => Promise<void>,
+  // Right-click "Set enrollment status" (2026-08-22, tracker #0014, project owner's spec: guild
+  // admins must be able to "change the enrollment status of every member of the player pool").
+  // Optional, same reasoning as onResolveClanNames above — a caller that omits it just doesn't
+  // get that submenu (buildContextMenuEntries is itself gated on this being set).
+  onSetEnrollmentStatus?: (playerTag: string, status: AdminSettableStatus) => Promise<SetStatusResult>,
 ): EnrollmentBoardHandle {
   const working: EnrollmentPlayer[] = payload.players.map((p) => ({ ...p }))
   const byTag = new Map(working.map((p) => [p.player_tag, p]))
@@ -381,60 +386,215 @@ export function renderEnrollmentBoard(
     }
   }
 
-  // Right-click "Remove guest player" context menu (2026-08-19) — a single-item menu, positioned
-  // at the click point rather than anchored to the card (unlike the hover pop-up above, which
-  // anchors to the card itself since it opens on a stationary hover, not a click at a specific
-  // spot). Same viewport-clamping idea as positionTooltip, simplified to one point instead of an
-  // anchor rect.
+  // Right-click context menu (2026-08-19 as a single "Remove guest player" item; generalized
+  // 2026-08-22 for tracker #0014's "Set enrollment status" submenu) — positioned at the click
+  // point rather than anchored to the card (unlike the hover pop-up above, which anchors to the
+  // card itself since it opens on a stationary hover, not a click at a specific spot). Same
+  // viewport-clamping idea as positionTooltip, simplified to one point instead of an anchor rect.
+  //
+  // `submenu` renders a nested panel that opens on hover/focus of its parent row, the way a
+  // native OS context menu's cascading item does. Only one level of nesting is supported — that
+  // is all this board needs, and a general N-level menu would be considerably more machinery
+  // than two hardcoded actions justify.
+  type ContextMenuEntry = {
+    label: string
+    onSelect?: () => void
+    submenu?: { label: string; onSelect: () => void }[]
+  }
+
   let activeContextMenu: HTMLElement | null = null
+  // Teardown for whichever submenu panel the currently-open menu has showing, if any. The panel
+  // lives on document.body (not inside activeContextMenu — it has to escape the root menu's own
+  // box), so removing the root alone would strand it there; showContextMenu() sets this so every
+  // dismissal path (outside click, scroll, Escape, or simply opening another menu) can close both.
+  let closeActiveSubmenu: (() => void) | null = null
 
   function hideContextMenu(): void {
+    if (closeActiveSubmenu) {
+      closeActiveSubmenu()
+      closeActiveSubmenu = null
+    }
     if (activeContextMenu) {
       activeContextMenu.remove()
       activeContextMenu = null
     }
   }
 
-  function showContextMenu(player: EnrollmentPlayer, x: number, y: number): void {
-    hideContextMenu()
-    const el = document.createElement('div')
-    el.className = 'player-context-menu'
-    const item = document.createElement('button')
-    item.className = 'player-context-menu-item'
-    item.textContent = 'Remove guest player'
-    item.addEventListener('click', () => {
-      hideContextMenu()
-      if (!onRemoveGuestPlayer) return
-      status.textContent = `Removing ${displayName(player)}...`
-      status.className = 'save-status'
-      onRemoveGuestPlayer(player.player_tag)
-        .then(() => {
-          status.textContent = `${displayName(player)} removed.`
-          status.className = 'save-status'
-          // The POST already confirmed the removal server-side (unlike handleDrop's optimistic-
-          // then-confirm flow above) — pull the card out of `working` now instead of waiting for
-          // the next long-poll cycle (up to ~25s) to notice via applyPolledUpdate. Otherwise the
-          // footer says "removed" while the tile visibly stays put (live bug report, project
-          // owner, 2026-08-20: "the footer shows removal but the tile remains").
-          const idx = working.findIndex((p) => p.player_tag === player.player_tag)
-          if (idx !== -1) working.splice(idx, 1)
-          renderBoard()
-        })
-        .catch((err: unknown) => {
-          console.error(err)
-          status.textContent = `Action failed: ${(err as Error).message}`
-          status.className = 'save-status error'
-        })
-    })
-    el.appendChild(item)
-    document.body.appendChild(el)
-    const menuRect = el.getBoundingClientRect()
+  /** Clamp one absolutely-positioned menu panel into the viewport at (x, y). Shared by the root
+   * menu and its submenu so a right-click near the right/bottom edge never pushes either off
+   * screen. */
+  function positionMenuPanel(el: HTMLElement, x: number, y: number): void {
+    const rect = el.getBoundingClientRect()
     const margin = 8
-    const left = Math.min(x, window.innerWidth - menuRect.width - margin)
-    const top = Math.min(y, window.innerHeight - menuRect.height - margin)
+    const left = Math.min(x, window.innerWidth - rect.width - margin)
+    const top = Math.min(y, window.innerHeight - rect.height - margin)
     el.style.left = `${Math.max(margin, left)}px`
     el.style.top = `${Math.max(margin, top)}px`
+  }
+
+  function showContextMenu(entries: ContextMenuEntry[], x: number, y: number): void {
+    hideContextMenu()
+    if (entries.length === 0) return
+    const el = document.createElement('div')
+    el.className = 'player-context-menu'
+    // At most one submenu panel is open at a time — opening a different parent row (or hovering
+    // a plain row) closes whatever was showing, same as a native cascading menu.
+    let openSubmenu: HTMLElement | null = null
+    const closeSubmenu = (): void => {
+      if (openSubmenu) {
+        openSubmenu.remove()
+        openSubmenu = null
+      }
+    }
+    // hideContextMenu() only holds the root element, so hand it the submenu teardown too —
+    // otherwise a dismissal (outside click / scroll / Escape) would leave an orphaned submenu
+    // panel attached to document.body forever.
+    closeActiveSubmenu = closeSubmenu
+
+    for (const entry of entries) {
+      const item = document.createElement('button')
+      item.className = 'player-context-menu-item'
+      item.textContent = entry.submenu ? `${entry.label} ▸` : entry.label
+      if (entry.submenu) {
+        item.classList.add('has-submenu')
+        const openThisSubmenu = (): void => {
+          closeSubmenu()
+          const panel = document.createElement('div')
+          panel.className = 'player-context-menu player-context-submenu'
+          for (const sub of entry.submenu ?? []) {
+            const subItem = document.createElement('button')
+            subItem.className = 'player-context-menu-item'
+            subItem.textContent = sub.label
+            subItem.addEventListener('click', (e) => {
+              e.stopPropagation()
+              hideContextMenu()
+              sub.onSelect()
+            })
+            panel.appendChild(subItem)
+          }
+          document.body.appendChild(panel)
+          // Opens to the right of the parent row, vertically aligned with it — positionMenuPanel
+          // pulls it back inside the viewport when there isn't room on the right.
+          const itemRect = item.getBoundingClientRect()
+          positionMenuPanel(panel, itemRect.right, itemRect.top)
+          openSubmenu = panel
+        }
+        item.addEventListener('mouseenter', openThisSubmenu)
+        // Keyboard/touch parity — a click on the parent row toggles the submenu instead of doing
+        // nothing (the row has no action of its own).
+        item.addEventListener('click', (e) => {
+          e.stopPropagation()
+          if (openSubmenu) closeSubmenu()
+          else openThisSubmenu()
+        })
+      } else {
+        item.addEventListener('mouseenter', closeSubmenu)
+        item.addEventListener('click', (e) => {
+          e.stopPropagation()
+          hideContextMenu()
+          entry.onSelect?.()
+        })
+      }
+      el.appendChild(item)
+    }
+
+    document.body.appendChild(el)
+    positionMenuPanel(el, x, y)
     activeContextMenu = el
+  }
+
+  /** The menu entries for one player card. "Set enrollment status" is offered for every player in
+   * the pool (2026-08-22, tracker #0014, project owner's spec: "change the enrollment status of
+   * every member of the player pool"); "Remove guest player" stays guest-only, exactly as before. */
+  function buildContextMenuEntries(player: EnrollmentPlayer): ContextMenuEntry[] {
+    const entries: ContextMenuEntry[] = []
+
+    if (onSetEnrollmentStatus) {
+      const setStatus = (next: AdminSettableStatus, verb: string): void => {
+        status.textContent = `${verb} ${displayName(player)}...`
+        status.className = 'save-status'
+        onSetEnrollmentStatus(player.player_tag, next)
+          .then((result) => {
+            // The POST already confirmed the write server-side, so reflect it now rather than
+            // waiting up to ~25s for the long poll to notice — same reasoning as the guest-
+            // removal entry below.
+            const target = byTag.get(player.player_tag)
+            if (target) target.signup_status = next
+            status.textContent = describeStatusResult(player, next, result)
+            status.className = 'save-status'
+            renderBoard()
+          })
+          .catch((err: unknown) => {
+            console.error(err)
+            status.textContent = `Action failed: ${(err as Error).message}`
+            status.className = 'save-status error'
+          })
+      }
+      entries.push({
+        label: 'Set enrollment status',
+        submenu: [
+          { label: 'Confirmed', onSelect: () => setStatus('confirmed', 'Confirming') },
+          { label: 'Declined', onSelect: () => setStatus('declined', 'Declining') },
+          // The "(sends DM again!)" suffix is the project owner's own wording from the feature
+          // request — this action destroys the player's existing DM, so the menu says so up front
+          // rather than surprising the admin after the fact.
+          { label: 'Pending (sends DM again!)', onSelect: () => setStatus('pending', 'Resetting') },
+        ],
+      })
+    }
+
+    // Only guest players are ever individually removable this way (project owner's spec: "allows
+    // the user to remove a guest player by right-clicking"). Guest-clan-derived players DO still
+    // get the entry (they look identical to individually invited ones from here — there's nothing
+    // client-side to tell them apart without asking the backend); the rejection with its
+    // explanatory message comes back from onRemoveGuestPlayer's own POST instead, same "let the
+    // backend be the single source of truth" approach the rest of this board already uses for the
+    // actual pool data.
+    if (player.is_guest && onRemoveGuestPlayer) {
+      entries.push({
+        label: 'Remove guest player',
+        onSelect: () => {
+          status.textContent = `Removing ${displayName(player)}...`
+          status.className = 'save-status'
+          onRemoveGuestPlayer(player.player_tag)
+            .then(() => {
+              status.textContent = `${displayName(player)} removed.`
+              status.className = 'save-status'
+              // The POST already confirmed the removal server-side (unlike handleDrop's optimistic-
+              // then-confirm flow above) — pull the card out of `working` now instead of waiting for
+              // the next long-poll cycle (up to ~25s) to notice via applyPolledUpdate. Otherwise the
+              // footer says "removed" while the tile visibly stays put (live bug report, project
+              // owner, 2026-08-20: "the footer shows removal but the tile remains").
+              const idx = working.findIndex((p) => p.player_tag === player.player_tag)
+              if (idx !== -1) working.splice(idx, 1)
+              renderBoard()
+            })
+            .catch((err: unknown) => {
+              console.error(err)
+              status.textContent = `Action failed: ${(err as Error).message}`
+              status.className = 'save-status error'
+            })
+        },
+      })
+    }
+
+    return entries
+  }
+
+  /** Footer text after a successful status change. Only the `pending` branch has anything extra
+   * to say — its whole point is the re-sent DM, so the admin needs to see when one did NOT
+   * actually go out (nobody linked, DMs closed, the admin-restrict DM guard). */
+  function describeStatusResult(
+    player: EnrollmentPlayer, next: AdminSettableStatus, result: SetStatusResult,
+  ): string {
+    const who = displayName(player)
+    if (next !== 'pending') return `${who} set to ${next}.`
+    if (result?.dm?.sent) return `${who} reset to pending — a new enrollment DM was sent.`
+    const reason = result?.dm?.reason
+    if (reason === 'unlinked') return `${who} reset to pending — no linked Discord account to DM.`
+    if (reason === 'blocked') return `${who} reset to pending — their DMs are closed, no DM sent.`
+    if (reason === 'dm_guard') return `${who} reset to pending — DM sending is restricted, no DM sent.`
+    return `${who} reset to pending — the DM could not be sent.`
   }
 
   // Dismiss on any click elsewhere, scroll, or Escape — same "outside interaction closes it"
@@ -705,19 +865,19 @@ export function renderEnrollmentBoard(
     }
     card.addEventListener('mouseenter', () => scheduleTooltip(player, card))
     card.addEventListener('mouseleave', hideTooltip)
-    // Only guest players are ever individually removable this way (project owner's spec: "allows
-    // the user to remove a guest player by right-clicking") — a regular member's card gets no
-    // custom menu at all, falling through to whatever the browser's own default context menu is.
-    // Guest-clan-derived players DO still get the menu (they look identical to individually
-    // invited ones from here — there's nothing client-side to tell them apart without asking the
-    // backend); the rejection with its explanatory message comes back from onRemoveGuestPlayer's
-    // own POST instead, same "let the backend be the single source of truth" approach the rest of
-    // this board already uses for the actual pool data.
-    if (player.is_guest && onRemoveGuestPlayer) {
+    // OUTDATED (2026-08-22, tracker #0014): the menu is no longer guest-only — see
+    // buildContextMenuEntries() for which entries each card actually gets. Its own comments carry
+    // the guest-removal reasoning this comment used to hold.
+    // Which entries exist is decided per card by buildContextMenuEntries(); a card that ends up
+    // with none (no callbacks wired at all) still falls through to the browser's own default
+    // context menu, since showContextMenu() returns early on an empty list and preventDefault()
+    // only runs when there is something to show.
+    const contextMenuEntries = buildContextMenuEntries(player)
+    if (contextMenuEntries.length > 0) {
       card.addEventListener('contextmenu', (e) => {
         e.preventDefault()
         hideTooltip()
-        showContextMenu(player, e.clientX, e.clientY)
+        showContextMenu(contextMenuEntries, e.clientX, e.clientY)
       })
     }
     card.draggable = true

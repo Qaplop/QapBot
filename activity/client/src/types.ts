@@ -156,3 +156,23 @@ export type GuestPlayerPoolEntry = {
  * guard; `results` is always `[]` in that case (the request-id guard client-side already prevents
  * an out-of-order response from rendering, so a `stale: true` response is simply discarded). */
 export type GuestSearchResponse = { results: GuestSearchResult[]; stale?: boolean }
+
+/** The three statuses an admin may set from the board's right-click "Set enrollment status"
+ * submenu (2026-08-22, tracker #0014). A strict subset of EnrollmentPlayer.signup_status:
+ * `null` isn't settable (it means "no row yet", not a choice) and `withdrawn` is legacy-only.
+ * Must stay in sync with ADMIN_SETTABLE_ENROLLMENT_STATUSES in qapbot/web_bridge.py, which
+ * rejects anything else with a 400. */
+export type AdminSettableStatus = 'confirmed' | 'declined' | 'pending'
+
+/** POST /api/cwl/enrollment/status's response shape. `dm` is null for confirmed/declined (those
+ * deliberately never touch the player's DM — see the bridge handler's docstring on why that is
+ * what makes "last action wins" hold) and is populated only for `pending`, whose whole point is
+ * retracting the old DM and sending a fresh one. `reason` is only meaningful when `sent` is
+ * false: 'unlinked' (nobody owns the account), 'blocked' (DMs closed / bot blocked), 'dm_guard'
+ * (CONFIG.cwl_dm_restrict_to_admin is on and this recipient isn't exempt), or 'failed'
+ * (transient error, retries exhausted). */
+export type SetStatusResult = {
+  ok: boolean
+  status: AdminSettableStatus
+  dm: { sent: boolean; reason: 'unlinked' | 'blocked' | 'dm_guard' | 'failed' | null } | null
+}

@@ -5097,3 +5097,424 @@ async def test_activity_closed_never_fails_when_hub_refresh_errors(db, bridge_co
         headers={"X-Bridge-Secret": "test-secret"},
     )
     assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# POST /api/cwl/enrollment/status — admin enrollment-status override from the Manage Enrollment
+# board's right-click menu (2026-08-22, tracker #0014). Confirmed/Declined deliberately leave the
+# player's DM live (that's what keeps "last action wins" symmetric); only Pending retracts it,
+# clears the global dm_sent dedup, and sends a fresh one.
+# ---------------------------------------------------------------------------
+
+def _fake_dm_bot(guild_id: int, discord_user_id: int, deleted_message_ids: list):
+    """_fake_admin_bot plus a working fetch_user -> dm_channel -> fetch_message -> delete chain,
+    so cleanup_stale_cwl_enrollment_dms() can actually retract a DM and record which one."""
+    bot = _fake_admin_bot(guild_id, discord_user_id, is_admin=True)
+
+    message = MagicMock()
+
+    async def _delete():
+        deleted_message_ids.append(message.id)
+
+    message.delete = _delete
+
+    dm_channel = MagicMock()
+    dm_channel.fetch_message = AsyncMock(side_effect=lambda mid: (setattr(message, "id", mid), message)[1])
+
+    user = MagicMock()
+    user.dm_channel = dm_channel
+    bot.fetch_user = AsyncMock(return_value=user)
+    return bot
+
+
+async def _seed_status_event(db, guild_id: str, season: str = "2026-09"):
+    """One signup_open event with a single participating clan and one linked, pooled player."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, guild_id, {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha", "war_league": "Master League II"}}
+    CACHE.server_config[guild_id] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync(guild_id, season, "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    db.update_cwl_event_status_sync(event_id, "signup_open")
+
+    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('70', 'Owner')")
+    await db.conn.execute(
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
+        "VALUES ('70', '#P1', 'PlayerOne', 1, '#CLAN1')"
+    )
+    await db.conn.commit()
+    return event_id
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_status_confirmed_writes_local_and_global_and_sends_no_dm(
+    db, bridge_config, client, monkeypatch,
+):
+    from qapbot.cache_manager import CACHE
+
+    event_id = await _seed_status_event(db, "840")
+    db.upsert_cwl_signup_sync(event_id, "#P1", "PlayerOne", "70", None, "template_confirm", "pending")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(840, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+    sent = []
+    monkeypatch.setattr(
+        CACHE, "send_user_dm_detailed",
+        AsyncMock(side_effect=lambda *a, **kw: (sent.append(a), (True, "sent"))[1]),
+    )
+
+    resp = await client.post(
+        "/api/cwl/enrollment/status",
+        json={"guild_id": 840, "discord_user_id": 42, "player_tag": "#P1", "status": "confirmed"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True and body["status"] == "confirmed"
+    # dm is null for confirmed/declined — those never touch the player's DM at all.
+    assert body["dm"] is None
+
+    signup = db.get_cwl_signup_sync(event_id, "#P1")
+    assert signup["status"] == "confirmed"
+    assert signup["responded_at"] is not None
+    global_row = db.get_cwl_player_season_status_sync("#P1", "2026-09")
+    assert global_row["status"] == "confirmed"
+    # The player's own DM stays live so they can still overwrite this — that IS "last action wins".
+    assert sent == []
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_status_declined_creates_a_signup_row_when_none_existed(
+    db, bridge_config, client, monkeypatch,
+):
+    """A pooled family member the board shows but Start Enrollment never seeded a cwl_signups row
+    for still needs somewhere to hold the admin's decision."""
+    event_id = await _seed_status_event(db, "841")
+    assert db.get_cwl_signup_sync(event_id, "#P1") is None
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(841, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    resp = await client.post(
+        "/api/cwl/enrollment/status",
+        json={"guild_id": 841, "discord_user_id": 42, "player_tag": "#P1", "status": "declined"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+
+    signup = db.get_cwl_signup_sync(event_id, "#P1")
+    assert signup is not None
+    assert signup["status"] == "declined"
+    # Live ownership (user_players), never a stale snapshot — Pitfall 37.
+    assert signup["dmed_discord_id"] == "70"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_status_pending_retracts_old_dm_clears_dm_sent_and_resends(
+    db, bridge_config, client, monkeypatch,
+):
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    event_id = await _seed_status_event(db, "842")
+    db.upsert_cwl_signup_sync(event_id, "#P1", "PlayerOne", "70", None, "template_confirm", "confirmed")
+    db.mark_cwl_player_dm_sent_sync(
+        "#P1", "2026-09", "PlayerOne", "70", event_id, 842, "2026-08-20T09:00Z",
+        message_id="55501", channel_id="99901",
+    )
+
+    deleted: list = []
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_dm_bot(842, 42, deleted))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    contacted = []
+
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
+        contacted.append(user_id)
+        dm_message = MagicMock()
+        dm_message.id = 77702
+        dm_message.channel.id = 99901
+        if sent_message_out is not None:
+            sent_message_out.append(dm_message)
+        return True, "sent"
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
+
+    resp = await client.post(
+        "/api/cwl/enrollment/status",
+        json={"guild_id": 842, "discord_user_id": 42, "player_tag": "#P1", "status": "pending"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["dm"] == {"sent": True, "reason": None}
+
+    # The stale DM was retracted...
+    assert deleted == [55501]
+    # ...and a fresh one went to the account's current owner.
+    assert contacted == ["70"]
+    assert db.get_cwl_signup_sync(event_id, "#P1")["status"] == "pending"
+    assert db.get_cwl_signup_sync(event_id, "#P1")["responded_at"] is None
+    global_row = db.get_cwl_player_season_status_sync("#P1", "2026-09")
+    assert global_row["status"] == "pending"
+    # Re-marked by the fresh send — the point is that clear_cwl_player_dm_sent_sync ran in
+    # between, so the batch's global dedup didn't skip it (it would otherwise still be 55501).
+    assert global_row["dm_sent"] == 1
+    assert global_row["dm_sent_via_message_id"] == "77702"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_status_pending_for_unlinked_player_still_resets_but_reports_unlinked(
+    db, bridge_config, client, monkeypatch,
+):
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "843", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["843"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    event_id = db.create_cwl_event_sync("843", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    db.update_cwl_event_status_sync(event_id, "signup_open")
+    # A guest tag added by search that was never linked to any Discord account.
+    db.upsert_cwl_signup_sync(event_id, "#GUEST", "Guesty", None, None, "guest_invite", "confirmed")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(843, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+    contacted = []
+    monkeypatch.setattr(
+        CACHE, "send_user_dm_detailed",
+        AsyncMock(side_effect=lambda uid, *a, **kw: (contacted.append(uid), (True, "sent"))[1]),
+    )
+
+    resp = await client.post(
+        "/api/cwl/enrollment/status",
+        json={"guild_id": 843, "discord_user_id": 42, "player_tag": "#GUEST", "status": "pending"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["dm"] == {"sent": False, "reason": "unlinked"}
+    # The status reset still stands — there is simply nobody to ask.
+    assert db.get_cwl_signup_sync(event_id, "#GUEST")["status"] == "pending"
+    assert contacted == []
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_status_propagates_to_another_guild_pooling_the_same_player(
+    db, bridge_config, client, monkeypatch,
+):
+    """rule h: the admin's decision is the season's global truth, so every OTHER guild that has
+    this player pooled sees it on their own board too — same fan-out the DM button already does."""
+    event_id = await _seed_status_event(db, "844")
+    db.upsert_cwl_signup_sync(event_id, "#P1", "PlayerOne", "70", None, "template_confirm", "pending")
+
+    await _seed_guild_and_clans(db, "845", {"#CLAN2": "Beta"})
+    other_event_id = db.create_cwl_event_sync("845", "2026-09", "discordid2")
+    db.set_cwl_event_clans_sync(other_event_id, [{"clan_tag": "#CLAN2", "participating": True}])
+    db.upsert_cwl_signup_sync(other_event_id, "#P1", "PlayerOne", "70", None, "template_confirm", "pending")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(844, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    resp = await client.post(
+        "/api/cwl/enrollment/status",
+        json={"guild_id": 844, "discord_user_id": 42, "player_tag": "#P1", "status": "confirmed"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    assert db.get_cwl_signup_sync(other_event_id, "#P1")["status"] == "confirmed"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_dm_button_overrides_a_later_admin_status_last_action_wins(
+    db, bridge_config, client, monkeypatch,
+):
+    """The spec's conflict rule, in the direction that matters most: the admin sets Confirmed
+    while the player's DM is still sitting unanswered, then the player clicks Opt Out. The
+    player's answer is the later action, so it must win — which it does precisely because
+    Confirmed never retracted their DM."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlSignupResponseButton
+
+    event_id = await _seed_status_event(db, "846")
+    db.upsert_cwl_signup_sync(event_id, "#P1", "PlayerOne", "70", None, "template_confirm", "pending")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(846, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    resp = await client.post(
+        "/api/cwl/enrollment/status",
+        json={"guild_id": 846, "discord_user_id": 42, "player_tag": "#P1", "status": "confirmed"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    assert db.get_cwl_player_season_status_sync("#P1", "2026-09")["status"] == "confirmed"
+
+    interaction = MagicMock()
+    interaction.user.id = 70
+    interaction.response.edit_message = AsyncMock()
+    interaction.response.send_message = AsyncMock()
+    CACHE.db_manager = db
+
+    await CwlSignupResponseButton("optout", event_id, "#P1").callback(interaction)
+
+    assert db.get_cwl_signup_sync(event_id, "#P1")["status"] == "declined"
+    assert db.get_cwl_player_season_status_sync("#P1", "2026-09")["status"] == "declined"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_status_rejects_bad_status_non_admin_and_missing_event(
+    db, bridge_config, client, monkeypatch,
+):
+    await _seed_status_event(db, "847")
+    import QBcore
+
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(847, 42, is_admin=True))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+
+    # 400 — 'withdrawn' is legacy-only and deliberately not admin-settable.
+    resp = await client.post(
+        "/api/cwl/enrollment/status",
+        json={"guild_id": 847, "discord_user_id": 42, "player_tag": "#P1", "status": "withdrawn"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 400
+
+    # 403 — neither admin nor leader.
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(847, 42, is_admin=False))
+    resp = await client.post(
+        "/api/cwl/enrollment/status",
+        json={"guild_id": 847, "discord_user_id": 42, "player_tag": "#P1", "status": "confirmed"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 403
+
+    # 403 — the shared-secret gate, ahead of everything else.
+    resp = await client.post(
+        "/api/cwl/enrollment/status",
+        json={"guild_id": 847, "discord_user_id": 42, "player_tag": "#P1", "status": "confirmed"},
+        headers={"X-Bridge-Secret": "wrong"},
+    )
+    assert resp.status == 403
+
+    # 409 — the guild has no event for the selected season at all.
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(848, 42, is_admin=True))
+    resp = await client.post(
+        "/api/cwl/enrollment/status",
+        json={"guild_id": 848, "discord_user_id": 42, "player_tag": "#P1", "status": "confirmed"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 409
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_status_rejects_a_draft_event(db, bridge_config, client, monkeypatch):
+    """Nothing has been enrolled yet in a draft event, so there is no status to override — the
+    same guard notify_new_cwl_pool_members() already applies before DMing anyone."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "849", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["849"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    event_id = db.create_cwl_event_sync("849", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    # left in its default 'draft' status
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(849, 42, is_admin=True))
+
+    resp = await client.post(
+        "/api/cwl/enrollment/status",
+        json={"guild_id": 849, "discord_user_id": 42, "player_tag": "#P1", "status": "confirmed"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 409
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_status_pending_never_redms_a_stale_owner_of_an_unassigned_account(
+    db, bridge_config, client, monkeypatch,
+):
+    """Pitfall 37: an account moved to the UNASSIGNED pool has no owner at all right now. Both
+    snapshots (cwl_signups.dmed_discord_id and cwl_player_season_status.dmed_discord_id) still
+    name whoever was DMed months ago — falling back to them would re-stamp that stale owner AND
+    aim a fresh DM at someone who no longer owns the account."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "850", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config["850"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    event_id = db.create_cwl_event_sync("850", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    db.update_cwl_event_status_sync(event_id, "signup_open")
+
+    # The account is in the UNASSIGNED pool — a real user_players row exists, but nobody owns it.
+    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('UNASSIGNED', '-')")
+    await db.conn.execute(
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
+        "VALUES ('UNASSIGNED', '#ORPHAN', 'Orphan', 0, '#CLAN1')"
+    )
+    await db.conn.commit()
+    # ...while both snapshots still name the previous owner.
+    db.upsert_cwl_signup_sync(event_id, "#ORPHAN", "Orphan", "999", None, "template_confirm", "confirmed")
+    db.mark_cwl_player_dm_sent_sync(
+        "#ORPHAN", "2026-09", "Orphan", "999", event_id, 850, "2026-08-20T09:00Z",
+        message_id="55502", channel_id="99902",
+    )
+
+    deleted: list = []
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_dm_bot(850, 42, deleted))
+    monkeypatch.setattr("qapbot.ui_cwl_roster.refresh_cwl_management_hub_message", AsyncMock())
+    contacted = []
+    monkeypatch.setattr(
+        CACHE, "send_user_dm_detailed",
+        AsyncMock(side_effect=lambda uid, *a, **kw: (contacted.append(uid), (True, "sent"))[1]),
+    )
+
+    resp = await client.post(
+        "/api/cwl/enrollment/status",
+        json={"guild_id": 850, "discord_user_id": 42, "player_tag": "#ORPHAN", "status": "pending"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    assert (await resp.json())["dm"] == {"sent": False, "reason": "unlinked"}
+
+    # The old owner's DM is still retracted (it points at an account they no longer own)...
+    assert deleted == [55502]
+    # ...but no new DM was aimed at them, and the row no longer re-stamps them as the recipient.
+    assert contacted == []
+    signup = db.get_cwl_signup_sync(event_id, "#ORPHAN")
+    assert signup["status"] == "pending"
+    assert signup["dmed_discord_id"] is None

@@ -1,6 +1,23 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (24)
+- Added: Guild admins/leads can now set any pooled player's CWL enrollment status from the
+  Manage Enrollment board (ticket #0014). The player card's right-click menu grew a
+  "Set enrollment status" submenu -- Confirmed / Declined / Pending (sends DM again!) -- and is
+  no longer guest-only. New `POST /api/cwl/enrollment/status` writes the local `cwl_signups` row
+  and fans out via the existing `propagate_cwl_player_response()`, so the admin's value is the
+  season's global truth in every guild. "Last action wins" needs no extra machinery: both write
+  paths upsert the same row, and Confirmed/Declined deliberately leave the player's DM live so
+  they can still overwrite it. Only "Pending" retracts the old DM, clears the global dm_sent
+  record (new `clear_cwl_player_dm_sent_sync()` -- without it the batch's dedup would silently
+  skip the re-send) and re-sends via `_send_cwl_enrollment_dm_batch()`, reporting back whether a
+  DM actually went out. Files: qapbot/web_bridge.py, qapbot/db_manager.py,
+  activity/server/src/index.ts, activity/client/src/{enrollmentBoard,main,types}.ts,
+  activity/client/index.html, CWL_ROSTER_PLANNING_PLAN.md,
+  tests/discord/test_web_bridge.py, plans/implemented/tracker-0014-admin-enrollment-status.md.
+  2485 tests pass; client+server typecheck and build clean.
+
 2026-08-22 (23)
 - Added: DM invite + auto-grant-on-join for tracker reporters who aren't guild members (ticket
   #0021 follow-up) -- most reporters file via DM and never join the server, so "Reply to

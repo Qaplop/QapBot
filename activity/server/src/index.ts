@@ -266,6 +266,29 @@ api.post('/cwl/enrollment/assign', async (c) => {
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 409 | 503)
 })
 
+// Admin enrollment-status override from the board's right-click menu (2026-08-22, tracker
+// #0014) — same verify-identity-then-proxy shape as /cwl/enrollment/assign above.
+api.post('/cwl/enrollment/status', async (c) => {
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  let body: Record<string, unknown>
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  const upstream = await fetch(`${c.env.BRIDGE_URL}/api/cwl/enrollment/status`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': c.env.BRIDGE_SECRET },
+    body: JSON.stringify({ ...body, discord_user_id: discordUserId }),
+  })
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 409 | 503)
+})
+
 // Activity-closed notification (2026-08-16, live-testing feedback: iPad's Hub message launch
 // buttons stayed visibly disabled after closing the Activity) — same verify-then-proxy shape as
 // every other route here, fired from main.ts's closeActivity() on every close, not just a save.

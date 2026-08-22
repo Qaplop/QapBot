@@ -8,12 +8,14 @@ import { DiscordSDK, RPCCloseCodes } from '@discord/embedded-app-sdk'
 import { renderClanConfigTable } from './clanConfigTable'
 import { renderEnrollmentBoard } from './enrollmentBoard'
 import type {
+  AdminSettableStatus,
   ClanConfig,
   ClanConfigPayload,
   EnrollmentPayload,
   GuestPlayerPoolEntry,
   GuestSearchResponse,
   ScreenPayload,
+  SetStatusResult,
   WaitResponse,
 } from './types'
 
@@ -254,6 +256,23 @@ async function setup(): Promise<void> {
               `This player was added by guest clan ${rejected[0].clan_name} — only removing the whole guest clan will remove them.`,
             )
           }
+        },
+        // Right-click "Set enrollment status" (2026-08-22, tracker #0014). Unlike every other
+        // action on this board, the response BODY matters and is handed back to the caller: the
+        // `pending` branch's whole point is the re-sent DM, and only the bridge knows whether one
+        // actually went out (the account may be unlinked, DMs closed, or the admin-restrict guard
+        // active) — the board turns that into the footer line, see describeStatusResult().
+        async (playerTag: string, nextStatus: AdminSettableStatus) => {
+          const statusResponse = await fetch('/api/cwl/enrollment/status', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+            body: JSON.stringify({ guild_id: guildId, player_tag: playerTag, status: nextStatus }),
+          })
+          if (!statusResponse.ok) {
+            const body = await statusResponse.text()
+            throw errorFromResponse(statusResponse.status, body)
+          }
+          return (await statusResponse.json()) as SetStatusResult
         },
       )
 
