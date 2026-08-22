@@ -101,6 +101,13 @@ async def test_list_items_returns_seeded_items(client, db):
     assert len(body["items"]) == 2
 
 
+async def test_list_items_includes_priority(client, db):
+    await _make_item(db, priority="HIGH")
+    resp = await client.get("/api/tracker/items", headers={"X-Bridge-Secret": SECRET})
+    body = await resp.json()
+    assert body["items"][0]["priority"] == "HIGH"
+
+
 async def test_list_items_filters_by_type(client, db):
     await _make_item(db, item_type="bug")
     await _make_item(db, item_type="feature")
@@ -277,6 +284,35 @@ async def test_post_testcases_creates_and_posts(client, db, monkeypatch):
     body = await resp.json()
     assert body["item"]["status"] == "testing"
     channel.send.assert_awaited_once()
+
+
+async def test_post_testcases_accepts_per_case_priority(client, db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_tracker import TRACKER_SETTING_TEST_CHANNEL
+    CACHE.tracker_settings[TRACKER_SETTING_TEST_CHANNEL] = "1"
+    channel = _fake_channel()
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases",
+        json={"cases": [{"environment": "DEV", "description": "run it", "priority": "HIGH"}]},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 200
+    cases = await db.get_tracker_testcases(item_number)
+    assert cases[0]["priority"] == "HIGH"
+
+
+async def test_post_testcases_rejects_invalid_priority(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases",
+        json={"cases": [{"environment": "DEV", "description": "x", "priority": "URGENT"}]},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 400
 
 
 async def test_post_testcases_validates_case_shape(client, db, monkeypatch):

@@ -483,7 +483,8 @@ that each listener appears exactly once.
     `⚠️ unverified file type` and never auto-opened by any tooling;
   - files are never executed, never unzipped, never parsed by the bot.
 - Rate limiting: the command cooldown above plus a hard cap of open items per reporter
-  (e.g. 10) to prevent flooding.
+  (e.g. 10) to prevent flooding. **Removed 2026-08-22** per the project owner's explicit
+  request ("I want to be able to file as many as I wish") — see `BUG_FEATURE_TRACKER.md`.
 - **Editing the item message must preserve its attachments**: `message.edit()` without an
   `attachments` kwarg keeps them, but passing `attachments=[...]` *replaces* the full set —
   one careless status-change edit silently strips every file. Status/embed updates therefore

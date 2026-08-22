@@ -191,6 +191,30 @@ class MyModal(discord.ui.Modal, title="..."):
 itself (`.value` for `TextInput`, `.values` for any `BaseSelect`), read after `on_submit`
 fires. Real-world example: `qapbot/ui_tracker.py`'s `TrackerItemModal.environment_select`.
 
+### Radio Groups Inside Modals (discord.py 2.7+)
+When the choice must render as actual radio buttons rather than a dropdown, use
+`discord.ui.RadioGroup` (still Label-wrapped, same idiom as Select above) instead of
+`discord.ui.Select`:
+```python
+class MyModal(discord.ui.Modal, title="..."):
+    my_radio = discord.ui.Label(
+        text="Choice",
+        component=discord.ui.RadioGroup(
+            options=[discord.RadioGroupOption(label=v, value=v, default=(v == "A")) for v in ("A", "B")],
+        ),
+    )
+
+    async def on_submit(self, interaction):
+        value = self.my_radio.component.value  # singular .value, NOT .values — RadioGroup is
+        # single-select by construction, unlike BaseSelect's .values list.
+```
+2-10 options (`RadioGroupOption`, not `SelectOption`). Rebuild `.options` per-instance the same
+way as a Select (translated labels, correct `default=`) — see "Select Dropdown Persistence"
+below; the same persistence rule applies. Real-world example: `qapbot/ui_tracker.py`'s
+`TrackerItemModal.environment_select`/`priority_select` (converted from Select to RadioGroup,
+tracker item request 2026-08-22, per the project owner's explicit ask for radio buttons over
+dropdowns in that modal).
+
 ### Select Dropdown Persistence
 ```python
 # Mark selected option with default=True

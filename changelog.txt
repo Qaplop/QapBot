@@ -1,6 +1,41 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (9)
+- Fixed: four of the five paths that CREATE a cwl_signups row hardcoded status='pending' instead
+  of adopting the player's existing global response from cwl_player_season_status the way
+  start_cwl_enrollment already does -- the cross-guild "orphaned elsewhere" mirror, drag-and-drop
+  placement, the auto_seeded pool seed, and the guest invite. A player who had already confirmed
+  or declined via another guild's DM would reappear as Pending in the guild that pooled them
+  next, contradicting what they had already said (rule h: "no need to manage anything manually").
+  Latent, not active, at fix time: 0 live rows had drifted, but 31 of 116 global rows already
+  held a real response, so the precondition was fully in place. All four now go through a new
+  _seed_status_from_global_sync() helper; seeding stays create-only, so an existing local row is
+  never overwritten. Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/web_bridge.py,
+  tests/unit/test_cwl_signup_snapshot_staleness.py. 2384 tests pass.
+
+2026-08-22 (8)
+- Added: three tracker-UX changes requested by the project owner. (1) Removed the hard cap of 10
+  open items per reporter in start_tracker_item() -- /bug and /feature now always open the modal
+  regardless of how many open items that reporter already has (MAX_OPEN_ITEMS_PER_REPORTER /
+  _OPEN_STATUSES_EXCLUDED / the too_many_open_items translation deleted). (2) Added a Priority
+  field (HIGH/MEDIUM/LOW, default MEDIUM) to bugs and features (tracker_items.priority) and,
+  separately, per individual test-case row (tracker_testcases.priority) -- there's no Discord
+  modal for composing test cases, so that one is set by whoever calls tracker_add_testcases (the
+  MCP tool's description now tells the agent to judge each case's priority individually) or the
+  bridge's POST .../testcases. Both new columns are TEXT NOT NULL DEFAULT 'MEDIUM' via
+  _add_column_if_missing(). Shown as an emoji in the item embed title/description, the draft
+  preview, and next to each test-case checkbox. (3) Converted the modal's Environment dropdown
+  (a discord.ui.Select) to discord.ui.RadioGroup (discord.py 2.7+, actual radio buttons, not a
+  dropdown) per explicit request, and used the same RadioGroup for the new Priority field --
+  CODE_STRUCTURE.md gained a "Radio Groups Inside Modals" section documenting the pattern
+  (singular .value, not BaseSelect's .values list). Files: qapbot/ui_tracker.py,
+  qapbot/db_manager.py, qapbot/web_bridge.py, qapbot/mcp/tracker_mcp.py,
+  qapbot/translations/{en,de}.json, qapbot/docs/{CODE_STRUCTURE,DATABASE_ARCHITECTURE,
+  BUG_FEATURE_TRACKER}.md, BUG_FEATURE_TRACKER_PLAN.md, .github/copilot-instructions.md,
+  tests/discord/test_ui_tracker_items.py, tests/unit/test_tracker_db.py,
+  tests/unit/test_tracker_mcp.py, tests/integration/test_web_bridge_tracker.py. 2379 tests pass.
+
 2026-08-22 (7)
 - Fixed: follow-up audit of the (4) snapshot-staleness fix found three WRITE paths still copying
   an outdated owner from one snapshot table into another -- _migrate_local_clan_roster_to_shared()

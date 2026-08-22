@@ -89,6 +89,34 @@ async def test_create_and_get_tracker_item(db):
 
 
 @pytest.mark.asyncio
+async def test_create_tracker_item_defaults_priority_to_medium(db):
+    item_number = await db.create_tracker_item(
+        item_type="bug", title="t", description="d", reporter_id="1", reporter_name="A"
+    )
+    item = await db.get_tracker_item(item_number)
+    assert item["priority"] == "MEDIUM"
+
+
+@pytest.mark.asyncio
+async def test_create_tracker_item_accepts_explicit_priority(db):
+    item_number = await db.create_tracker_item(
+        item_type="bug", title="t", description="d", reporter_id="1", reporter_name="A", priority="HIGH",
+    )
+    item = await db.get_tracker_item(item_number)
+    assert item["priority"] == "HIGH"
+
+
+@pytest.mark.asyncio
+async def test_update_tracker_item_updates_priority(db):
+    item_number = await db.create_tracker_item(
+        item_type="bug", title="t", description="d", reporter_id="1", reporter_name="A"
+    )
+    await db.update_tracker_item(item_number, priority="LOW")
+    item = await db.get_tracker_item(item_number)
+    assert item["priority"] == "LOW"
+
+
+@pytest.mark.asyncio
 async def test_get_tracker_item_missing_returns_none(db):
     assert await db.get_tracker_item(9999) is None
 
@@ -209,6 +237,24 @@ async def test_set_and_get_tracker_testcases(db):
     dev_cases = [c for c in cases if c["environment"] == "DEV"]
     assert [c["seq"] for c in dev_cases] == [1, 2]
     assert all(c["passed"] == 0 for c in cases)
+    assert all(c["priority"] == "MEDIUM" for c in cases)  # default when omitted
+
+
+@pytest.mark.asyncio
+async def test_set_tracker_testcases_stores_explicit_priority_per_case(db):
+    item_number = await db.create_tracker_item(
+        item_type="bug", title="t", description="d", reporter_id="1", reporter_name="A"
+    )
+    await db.set_tracker_testcases(item_number, [
+        {"environment": "DEV", "description": "critical path", "priority": "HIGH"},
+        {"environment": "DEV", "description": "edge case", "priority": "LOW"},
+        {"environment": "PROD", "description": "unspecified"},
+    ])
+    cases = await db.get_tracker_testcases(item_number)
+    by_desc = {c["description"]: c["priority"] for c in cases}
+    assert by_desc["critical path"] == "HIGH"
+    assert by_desc["edge case"] == "LOW"
+    assert by_desc["unspecified"] == "MEDIUM"
 
 
 @pytest.mark.asyncio

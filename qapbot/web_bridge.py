@@ -1583,9 +1583,14 @@ async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response
                 f"while that placement stands."
             )
 
+        # A guest invited AFTER they already answered another guild's DM must show that real
+        # response, not a fresh 'pending' contradicting it (rule h) — same seeding
+        # start_cwl_enrollment does. 2026-08-22.
+        from qapbot.QBdiscocmdshelper_cwl import _seed_status_from_global_sync
+
         db.upsert_cwl_signup_sync(
             event["id"], player_tag, player_name, guest_discord_id, None,
-            source="guest_invite", status="pending",
+            source="guest_invite", status=_seed_status_from_global_sync(db, player_tag, season),
         )
         return None
 
@@ -2160,6 +2165,7 @@ async def handle_get_tracker_items(request: web.Request) -> web.Response:
     payload = [
         {
             "item_number": it["item_number"], "item_type": it["item_type"], "status": it["status"],
+            "priority": it["priority"],
             "title": it["title"], "reporter_id": it["reporter_id"], "reporter_name": it["reporter_name"],
             "created_at": it["created_at"],
         }
@@ -2277,6 +2283,8 @@ async def handle_post_tracker_testcases(request: web.Request) -> web.Response:
     for case in cases:
         if not isinstance(case, dict) or case.get("environment") not in ("DEV", "PROD") or not case.get("description"):
             return web.json_response({"error": "each case needs environment (DEV/PROD) and description"}, status=400)
+        if "priority" in case and case["priority"] not in ("HIGH", "MEDIUM", "LOW"):
+            return web.json_response({"error": "priority must be one of HIGH/MEDIUM/LOW"}, status=400)
 
     try:
         item = await post_test_cases(item_number, cases, actor_id=_tracker_admin_label(request))

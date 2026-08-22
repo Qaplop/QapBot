@@ -104,7 +104,9 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "tracker_add_testcases",
         "description": (
             "Post manual test cases for a tracker item into the #qapbot-test channel, "
-            "transitioning the item to 'testing'."
+            "transitioning the item to 'testing'. Assign each case its own `priority` "
+            "(HIGH/MEDIUM/LOW) based on your judgment of how critical that specific case is to "
+            "verify — defaults to MEDIUM if omitted."
         ),
         "inputSchema": {
             "type": "object",
@@ -117,6 +119,11 @@ TOOLS: List[Dict[str, Any]] = [
                         "properties": {
                             "environment": {"type": "string", "enum": ["DEV", "PROD"]},
                             "description": {"type": "string"},
+                            "priority": {
+                                "type": "string",
+                                "enum": ["HIGH", "MEDIUM", "LOW"],
+                                "description": "How critical this specific case is to verify. Defaults to MEDIUM if omitted.",
+                            },
                         },
                         "required": ["environment", "description"],
                     },
@@ -182,7 +189,8 @@ async def render_item_markdown(client: TrackerBridgeClient, item_number: int) ->
 
     testcases = detail.get("testcases", [])
     testcase_lines = [
-        f"- [{'x' if c['passed'] else ' '}] ({c['environment']}) {c['description']}" for c in testcases
+        f"- [{'x' if c['passed'] else ' '}] ({c['environment']}, {c.get('priority') or 'MEDIUM'}) {c['description']}"
+        for c in testcases
     ]
 
     body_lines = [
@@ -196,7 +204,8 @@ async def render_item_markdown(client: TrackerBridgeClient, item_number: int) ->
         body_lines.append(wrap_untrusted(item_number, "details", sanitize_field(item["details"])))
     body_lines += [
         "",
-        f"type: {item['item_type']}  ·  status: {item['status']}  ·  environment: {item.get('environment') or '-'}",
+        f"type: {item['item_type']}  ·  status: {item['status']}  ·  priority: {item.get('priority') or 'MEDIUM'}"
+        f"  ·  environment: {item.get('environment') or '-'}",
         f"reporter_id: {item['reporter_id']}  ·  reporter_name: {sanitize_field(item['reporter_name'], 100)}  ·  created_at: {item['created_at']}",
     ]
     if attachment_lines:
@@ -220,7 +229,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> str:
         if not items:
             return "No items match."
         return "\n".join(
-            f"#{it['item_number']:04d} [{it['item_type']}] {it['status']} — "
+            f"#{it['item_number']:04d} [{it['item_type']}] {it['status']} ({it.get('priority') or 'MEDIUM'}) — "
             f"{sanitize_field(it['title'], 150)} (reporter: {sanitize_field(it['reporter_name'], 60)})"
             for it in items
         )

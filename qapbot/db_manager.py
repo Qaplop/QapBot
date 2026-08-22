@@ -2689,6 +2689,12 @@ class WarHistoryDB:
         await self._add_column_if_missing("tracker_items", "test_channel_id", "TEXT")
         await self._add_column_if_missing("tracker_items", "test_message_id", "TEXT")
 
+        # Priority (HIGH/MEDIUM/LOW, tracker item request 2026-08-22) — one per bug/feature item,
+        # and separately per individual test case row (an MCP/bridge caller decides each case's
+        # priority; there is no Discord modal for composing test cases, see post_test_cases()).
+        await self._add_column_if_missing("tracker_items", "priority", "TEXT NOT NULL DEFAULT 'MEDIUM'")
+        await self._add_column_if_missing("tracker_testcases", "priority", "TEXT NOT NULL DEFAULT 'MEDIUM'")
+
         await self._conn.commit()
         logging.debug("[DB-SCHEMA] Bug/feature tracker tables verified")
 
@@ -2734,6 +2740,7 @@ class WarHistoryDB:
         reporter_name: str,
         details: Optional[str] = None,
         environment: Optional[str] = None,
+        priority: str = "MEDIUM",
         guild_id: Optional[str] = None,
     ) -> int:
         """Allocate the next global #NNNN and insert a new tracker item. Returns the new
@@ -2742,9 +2749,9 @@ class WarHistoryDB:
         async with self._write_lock:
             cursor = await self._conn.execute(
                 "INSERT INTO tracker_items "
-                "(item_type, title, description, details, environment, reporter_id, "
-                " reporter_name, guild_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (item_type, title, description, details, environment, reporter_id, reporter_name, guild_id),
+                "(item_type, title, description, details, environment, priority, reporter_id, "
+                " reporter_name, guild_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (item_type, title, description, details, environment, priority, reporter_id, reporter_name, guild_id),
             )
             await self._conn.commit()
             return cast(int, cursor.lastrowid)
@@ -2794,7 +2801,7 @@ class WarHistoryDB:
     # Columns update_tracker_item() is allowed to touch — whitelisted so **fields can never
     # smuggle an arbitrary SQL identifier into the query (fields come from Discord UI/MCP input).
     _TRACKER_ITEM_UPDATABLE_COLUMNS = frozenset({
-        "status", "title", "description", "details", "environment",
+        "status", "title", "description", "details", "environment", "priority",
         "channel_id", "message_id", "thread_id",
         "implemented_note", "implemented_at", "closed_at",
         "last_edited_by", "last_edited_at",
@@ -2875,20 +2882,25 @@ class WarHistoryDB:
 
     async def set_tracker_testcases(self, item_number: int, cases: List[Dict[str, Any]]) -> None:
         """Replace the full test-case set for an item atomically. *cases* is a list of
-        {environment, description} dicts; seq is assigned per-environment in list order."""
+        {environment, description, priority?} dicts (priority one of HIGH/MEDIUM/LOW, defaulting
+        to MEDIUM when omitted or unrecognized — the caller, e.g. an MCP agent, decides each
+        case's priority individually); seq is assigned per-environment in list order."""
         await self._ensure_connection()
         seq_by_env: Dict[str, int] = {}
         rows = []
         for case in cases:
             env = case["environment"]
             seq_by_env[env] = seq_by_env.get(env, 0) + 1
-            rows.append((item_number, env, seq_by_env[env], case["description"]))
+            priority = str(case.get("priority") or "").strip().upper()
+            if priority not in ("HIGH", "MEDIUM", "LOW"):
+                priority = "MEDIUM"
+            rows.append((item_number, env, seq_by_env[env], case["description"], priority))
         async with self._write_lock:
             await self._conn.execute("DELETE FROM tracker_testcases WHERE item_number = ?", (item_number,))
             if rows:
                 await self._conn.executemany(
-                    "INSERT INTO tracker_testcases (item_number, environment, seq, description) "
-                    "VALUES (?, ?, ?, ?)",
+                    "INSERT INTO tracker_testcases (item_number, environment, seq, description, priority) "
+                    "VALUES (?, ?, ?, ?, ?)",
                     rows,
                 )
             await self._conn.commit()

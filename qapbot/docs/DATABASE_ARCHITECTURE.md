@@ -384,6 +384,12 @@ lifecycle, bridge, and MCP server, see the dedicated `BUG_FEATURE_TRACKER.md` do
   `seq` orders rows within one `(item_number, environment)` pair.
 - `tracker_items.test_channel_id` / `test_message_id` (added via `_add_column_if_missing` inside
   `_create_tracker_schema()` itself, Phase 5) - pointer to the posted `#qapbot-test` message.
+- `tracker_items.priority` / `tracker_testcases.priority` (added via `_add_column_if_missing`,
+  2026-08-22) - `TEXT NOT NULL DEFAULT 'MEDIUM'`, one of HIGH/MEDIUM/LOW. Item priority is set by
+  the reporter in the `/bug`/`/feature` modal (a `discord.ui.RadioGroup`, not a dropdown — see
+  `CODE_STRUCTURE.md` § Radio Groups Inside Modals); test-case priority is set per row by whoever
+  calls `tracker_add_testcases`/`set_tracker_testcases()` (no Discord modal composes test cases,
+  see `BUG_FEATURE_TRACKER.md`) and defaults to MEDIUM when omitted.
 
 **CWL Round Tracking** (2026-05-09 - Complete):
 - `cwl_league_groups` - One row per (clan × season) capturing which group each clan belongs to.

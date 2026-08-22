@@ -14,6 +14,7 @@ os.environ.setdefault("DISCORD_TOKEN", "test-token")
 
 from qapbot.db_manager import WarHistoryDB
 from qapbot.ui_tracker import (
+    PRIORITY_VALUES,
     TRACKER_SETTING_BUG_CHANNEL,
     TRACKER_SETTING_DONE_TESTING_CHANNEL,
     TRACKER_SETTING_ENABLED,
@@ -29,6 +30,7 @@ from qapbot.ui_tracker import (
     mark_environment_passed_and_refresh,
     mark_testing_failed,
     post_test_cases,
+    start_tracker_item,
     _register_upload_window,
     _upload_windows,
 )
@@ -151,6 +153,27 @@ async def test_build_tracker_embed_includes_status_and_environment(db):
 
 
 @pytest.mark.asyncio
+async def test_build_tracker_embed_includes_priority(db):
+    item_number = await _make_item(db, item_type="bug", priority="HIGH")
+    item = await db.get_tracker_item(item_number)
+    embed = build_tracker_embed(item)
+    assert "🔴" in embed.title
+    assert "High" in embed.description
+
+
+@pytest.mark.asyncio
+async def test_build_tracker_embed_defaults_priority_when_missing(db):
+    """A pre-migration row (or a caller that never set priority) falls back to MEDIUM rather
+    than raising/blank."""
+    item_number = await _make_item(db, item_type="bug")
+    item = await db.get_tracker_item(item_number)
+    item = dict(item)
+    item["priority"] = None
+    embed = build_tracker_embed(item)
+    assert "🟡" in embed.title
+
+
+@pytest.mark.asyncio
 async def test_build_tracker_embed_truncates_long_description(db):
     long_desc = "x" * 5000
     item_number = await _make_item(db, description=long_desc)
@@ -178,6 +201,36 @@ def test_modal_title_differs_by_type():
     assert bug_modal.title != feature_modal.title
 
 
+def test_modal_environment_and_priority_are_radio_groups_not_dropdowns():
+    """Discord.py's plain `.Select` renders as a dropdown; `.RadioGroup` renders as actual
+    radio buttons — the project owner explicitly asked for radio buttons here."""
+    modal = TrackerItemModal("bug", guild_id=None, user_id="1")
+    assert isinstance(modal.environment_select.component, discord.ui.RadioGroup)
+    assert isinstance(modal.priority_select.component, discord.ui.RadioGroup)
+
+
+def test_modal_keeps_priority_field_for_both_bug_and_feature():
+    bug_modal = TrackerItemModal("bug", guild_id=None, user_id="1")
+    feature_modal = TrackerItemModal("feature", guild_id=None, user_id="1")
+    assert bug_modal.priority_select in bug_modal.children
+    assert feature_modal.priority_select in feature_modal.children
+
+
+def test_modal_priority_defaults_to_medium():
+    modal = TrackerItemModal("bug", guild_id=None, user_id="1")
+    options = modal.priority_select.component.options
+    default_values = [o.value for o in options if o.default]
+    assert default_values == ["MEDIUM"]
+    assert {o.value for o in options} == set(PRIORITY_VALUES)
+
+
+def test_modal_priority_honors_initial_value_on_edit():
+    modal = TrackerItemModal("bug", guild_id=None, user_id="1", initial_priority="HIGH")
+    options = modal.priority_select.component.options
+    default_values = [o.value for o in options if o.default]
+    assert default_values == ["HIGH"]
+
+
 # -- TrackerDraftView preview ---------------------------------------------
 
 def test_draft_preview_lists_pending_attachments():
@@ -195,6 +248,23 @@ def test_draft_preview_no_attachments_shows_none():
         reporter_id="1", reporter_name="A", guild_id=None, channel_id=1, user_id="1",
     )
     assert "none" in draft.format_preview().lower()
+
+
+def test_draft_preview_shows_priority():
+    draft = TrackerDraftView(
+        item_type="bug", title="T", description="D", details="", environment="",
+        reporter_id="1", reporter_name="A", guild_id=None, channel_id=1, user_id="1",
+        priority="HIGH",
+    )
+    assert "High" in draft.format_preview()
+
+
+def test_draft_preview_defaults_priority_to_medium_when_unset():
+    draft = TrackerDraftView(
+        item_type="bug", title="T", description="D", details="", environment="",
+        reporter_id="1", reporter_name="A", guild_id=None, channel_id=1, user_id="1",
+    )
+    assert draft.priority_text == "MEDIUM"
 
 
 # -- submit posts to the shared bug/feature channel (tracker item #0006) -----
@@ -220,6 +290,23 @@ async def test_on_submit_posts_to_the_shared_bug_channel(db, monkeypatch, mock_i
 
     assert draft.submitted is True
     channel.send.assert_awaited_once()
+
+
+# -- no cap on open items (removed 2026-08-22 per project owner request) ----
+
+@pytest.mark.asyncio
+async def test_start_tracker_item_opens_modal_regardless_of_existing_open_item_count(db, monkeypatch, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    monkeypatch.setattr(CACHE, "tracker_settings", {TRACKER_SETTING_BUG_CHANNEL: "42"})
+
+    reporter_id = str(mock_interaction.user.id)
+    for _ in range(25):  # far past the old MAX_OPEN_ITEMS_PER_REPORTER=10 cap
+        await _make_item(db, item_type="bug", reporter_id=reporter_id)
+
+    await start_tracker_item(mock_interaction, "bug")
+
+    mock_interaction.response.send_modal.assert_awaited_once()
+    mock_interaction.response.send_message.assert_not_awaited()
 
 
 # -- status transitions -------------------------------------------------
@@ -381,6 +468,26 @@ async def test_post_test_cases_transitions_to_testing(db, monkeypatch):
     assert item["status"] == "testing"
     assert item["test_message_id"] is not None
     channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_post_test_cases_renders_per_case_priority(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_TEST_CHANNEL] = "1"
+    channel = _fake_channel()
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db, item_type="bug")
+    await post_test_cases(
+        item_number,
+        [
+            {"environment": "DEV", "description": "critical path", "priority": "HIGH"},
+            {"environment": "DEV", "description": "no priority given"},
+        ],
+        actor_id="1",
+    )
+    content = channel.send.call_args[0][0]
+    assert "🔴" in content  # HIGH
+    assert "🟡" in content  # unspecified defaults to MEDIUM
 
 
 @pytest.mark.asyncio

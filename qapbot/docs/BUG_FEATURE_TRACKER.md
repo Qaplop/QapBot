@@ -42,12 +42,19 @@ apply, but Rule 14 named-column access still does):
 - `tracker_items` — one row per filed bug/feature. `item_number` (AUTOINCREMENT) is a single
   shared `#NNNN` pool across both `item_type` values. See `db_manager.py`'s
   `_TRACKER_ITEM_UPDATABLE_COLUMNS` whitelist for which columns `update_tracker_item(**fields)`
-  is allowed to touch (never build a raw SQL identifier from caller input).
+  is allowed to touch (never build a raw SQL identifier from caller input). `priority`
+  (HIGH/MEDIUM/LOW, default MEDIUM) is set by the reporter in the modal.
 - `tracker_attachments` — junction, `ON DELETE CASCADE`. `local_path` is the on-disk copy
   under `CONFIG.tracker_data_dir` (agent-readable, immune to Discord's expiring CDN URLs);
   `discord_url` is the bot's own re-upload.
 - `tracker_testcases` — junction, `ON DELETE CASCADE`. `seq` orders rows within one
-  `(item_number, environment)` pair.
+  `(item_number, environment)` pair. `priority` (HIGH/MEDIUM/LOW, default MEDIUM) is set
+  per-row by whoever calls `tracker_add_testcases` (there is no Discord modal for composing
+  test cases — see below) and shown next to each case in the posted test-case message.
+
+There is no cap on how many open items one reporter can have — `/bug`/`/feature` always opens
+the modal (removed 2026-08-22 per the project owner's request; see `BUG_FEATURE_TRACKER_PLAN.md`
+for the original rationale).
 
 Status lifecycle:
 
@@ -114,7 +121,7 @@ GET  /api/tracker/items/{n}
 GET  /api/tracker/items/{n}/attachments/{aid}
 POST /api/tracker/items/{n}/status     {status, note}
 POST /api/tracker/items/{n}/comment    {text}
-POST /api/tracker/items/{n}/testcases  {cases: [{environment, description}]}
+POST /api/tracker/items/{n}/testcases  {cases: [{environment, description, priority?}]}
 ```
 
 All handlers delegate the actual DB+Discord work to `qapbot/ui_tracker.py`
@@ -175,7 +182,9 @@ directory.
 - **Claude Code finishing a tracker-linked item**: never move an item to `implemented` without
   also posting at least one test case (`tracker_add_testcases` MCP tool, or the bridge's
   `POST /api/tracker/items/{n}/testcases` with `{"cases": [{"environment": "PROD"|"DEV"|"BOTH",
-  "description": "..."}]}` when MCP isn't wired up in the session) — see
+  "description": "...", "priority": "HIGH"|"MEDIUM"|"LOW"}]}` — priority is optional per case
+  (defaults to MEDIUM), pick it based on how critical that specific case is to verify — when MCP
+  isn't wired up in the session) — see
   `.github/copilot-instructions.md` Cardinal Rule 15. Posting the test case is what actually
   drives `post_test_cases()`'s automatic `implemented → testing` transition; skipping it leaves
   the item in a state the tracker's own lifecycle doesn't expect anyone to leave it in.

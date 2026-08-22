@@ -90,13 +90,28 @@ def _normalize_environment(value: Optional[str]) -> str:
         return "DEV"
     return "BOTH" if key else "PROD"
 
+
+# Priority selector — bugs, features, and (per test case row) test cases (tracker item request
+# 2026-08-22). MEDIUM is the default; an unrecognized/legacy-empty value normalizes to it.
+PRIORITY_VALUES: Tuple[str, str, str] = ("HIGH", "MEDIUM", "LOW")
+DEFAULT_PRIORITY = "MEDIUM"
+_PRIORITY_LABEL_KEYS = {
+    "HIGH": 'ui_components.tracker.priority_high',
+    "MEDIUM": 'ui_components.tracker.priority_medium',
+    "LOW": 'ui_components.tracker.priority_low',
+}
+PRIORITY_EMOJI = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
+
+
+def _normalize_priority(value: Optional[str]) -> str:
+    key = (value or "").strip().upper()
+    return key if key in PRIORITY_VALUES else DEFAULT_PRIORITY
+
 # Attachment limits (plan §5.5)
 MAX_ATTACHMENTS_PER_ITEM = 5
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024
 UPLOAD_WINDOW_SECONDS = 300
-MAX_OPEN_ITEMS_PER_REPORTER = 10
-_OPEN_STATUSES_EXCLUDED = {"done", "rejected", "duplicate"}
 
 
 def _now_iso() -> str:
@@ -497,12 +512,23 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
     details_input = discord.ui.TextInput(
         label="Details", style=discord.TextStyle.paragraph, required=False, max_length=4000
     )
-    # Label-wrapped Select (discord.py 2.6+ Components V2) — see CODE_STRUCTURE.md § Discord.py
-    # Patterns "Select Menus Inside Modals" for why this replaces a plain TextInput here.
+    # Label-wrapped RadioGroup (discord.py 2.7+ Components V2) — see CODE_STRUCTURE.md §
+    # Discord.py Patterns "Radio Groups Inside Modals" for why this replaces a plain
+    # TextInput/Select here. RadioGroup renders as actual radio buttons (not a dropdown),
+    # per the project owner's explicit ask (tracker item request 2026-08-22).
     environment_select = discord.ui.Label(
         text="Environment",
-        component=discord.ui.Select(
-            options=[discord.SelectOption(label=v, value=v, default=(v == "PROD")) for v in ENVIRONMENT_VALUES],
+        component=discord.ui.RadioGroup(
+            options=[discord.RadioGroupOption(label=v, value=v, default=(v == "PROD")) for v in ENVIRONMENT_VALUES],
+        ),
+    )
+    priority_select = discord.ui.Label(
+        text="Priority",
+        component=discord.ui.RadioGroup(
+            options=[
+                discord.RadioGroupOption(label=v, value=v, default=(v == DEFAULT_PRIORITY))
+                for v in PRIORITY_VALUES
+            ],
         ),
     )
 
@@ -518,6 +544,7 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         initial_description: str = "",
         initial_details: str = "",
         initial_environment: str = "",
+        initial_priority: str = "",
     ):
         super().__init__()
         self.item_type = item_type
@@ -530,6 +557,7 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         self.title_input.default = initial_title
         self.description_input.default = initial_description
         self.details_input.default = initial_details
+        self._set_priority_options(initial_priority)
         if item_type == "bug":
             self._set_environment_options(initial_environment)
         else:
@@ -543,15 +571,26 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         self.description_input.label = t('ui_components.tracker.field_description', user_id=self.user_id, guild_id=self.guild_id)
         self.details_input.label = t(details_key, user_id=self.user_id, guild_id=self.guild_id)
         self.environment_select.text = t('ui_components.tracker.field_environment', user_id=self.user_id, guild_id=self.guild_id)
+        self.priority_select.text = t('ui_components.tracker.field_priority', user_id=self.user_id, guild_id=self.guild_id)
 
     def _set_environment_options(self, initial_environment: str) -> None:
         current = _normalize_environment(initial_environment)
         self.environment_select.component.options = [
-            discord.SelectOption(
+            discord.RadioGroupOption(
                 label=t(_ENVIRONMENT_LABEL_KEYS[value], user_id=self.user_id, guild_id=self.guild_id),
                 value=value, default=(value == current),
             )
             for value in ENVIRONMENT_VALUES
+        ]
+
+    def _set_priority_options(self, initial_priority: str) -> None:
+        current = _normalize_priority(initial_priority)
+        self.priority_select.component.options = [
+            discord.RadioGroupOption(
+                label=t(_PRIORITY_LABEL_KEYS[value], user_id=self.user_id, guild_id=self.guild_id),
+                value=value, default=(value == current),
+            )
+            for value in PRIORITY_VALUES
         ]
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -560,7 +599,8 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         title_val = self.title_input.value.strip()
         description_val = self.description_input.value.strip()
         details_val = (self.details_input.value or "").strip()
-        environment_val = self.environment_select.component.values[0] if self.item_type == "bug" else ""
+        environment_val = self.environment_select.component.value if self.item_type == "bug" else ""
+        priority_val = _normalize_priority(self.priority_select.component.value)
 
         if self.item_number is not None:
             # Editing an already-posted item (Edit button, plan §2.3).
@@ -570,6 +610,7 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
                 title=title_val, description=description_val,
                 details=details_val or None,
                 environment=(environment_val or None) if self.item_type == "bug" else None,
+                priority=priority_val,
                 last_edited_by=str(interaction.user.id), last_edited_at=_now_iso(),
             )
             item = await CACHE.db_manager.get_tracker_item(self.item_number)
@@ -587,6 +628,7 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
             self.draft_view.description_text = description_val
             self.draft_view.details_text = details_val
             self.draft_view.environment_text = environment_val
+            self.draft_view.priority_text = priority_val
             await self.draft_view.refresh()
             return
 
@@ -611,6 +653,7 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         draft = TrackerDraftView(
             item_type=self.item_type,
             title=title_val, description=description_val, details=details_val, environment=environment_val,
+            priority=priority_val,
             reporter_id=str(interaction.user.id), reporter_name=str(interaction.user),
             guild_id=self.guild_id, channel_id=interaction.channel.id if interaction.channel else 0,
             user_id=self.user_id, pending_attachments=pending_attachments,
@@ -626,6 +669,7 @@ class TrackerDraftView(discord.ui.View):
     def __init__(
         self, item_type: str, title: str, description: str, details: str, environment: str,
         reporter_id: str, reporter_name: str, guild_id: Optional[int], channel_id: int, user_id: str,
+        priority: str = "",
         pending_attachments: Optional[List[Dict[str, Any]]] = None, timeout: int = 900,
     ):
         super().__init__(timeout=timeout)
@@ -634,6 +678,7 @@ class TrackerDraftView(discord.ui.View):
         self.description_text = description
         self.details_text = details
         self.environment_text = environment
+        self.priority_text = _normalize_priority(priority)
         self.reporter_id = reporter_id
         self.reporter_name = reporter_name
         self.guild_id = guild_id
@@ -672,6 +717,8 @@ class TrackerDraftView(discord.ui.View):
             lines += ["", f"**{t(details_key, user_id=self.user_id, guild_id=self.guild_id)}**", self.details_text]
         if self.environment_text:
             lines += ["", f"**{t('ui_components.tracker.field_environment', user_id=self.user_id, guild_id=self.guild_id)}:** {self.environment_text}"]
+        priority_label = t(_PRIORITY_LABEL_KEYS[self.priority_text], user_id=self.user_id, guild_id=self.guild_id)
+        lines += ["", f"**{t('ui_components.tracker.field_priority', user_id=self.user_id, guild_id=self.guild_id)}:** {PRIORITY_EMOJI[self.priority_text]} {priority_label}"]
         if self.pending_attachments:
             names = ", ".join(a["original_name"] for a in self.pending_attachments)
             lines += ["", t('ui_components.tracker.draft_attachments', user_id=self.user_id, guild_id=self.guild_id, list=names)]
@@ -691,6 +738,7 @@ class TrackerDraftView(discord.ui.View):
             self.item_type, self.guild_id, self.user_id, draft_view=self,
             initial_title=self.title_text, initial_description=self.description_text,
             initial_details=self.details_text, initial_environment=self.environment_text,
+            initial_priority=self.priority_text,
         )
         await interaction.response.send_modal(modal)
 
@@ -721,6 +769,7 @@ class TrackerDraftView(discord.ui.View):
             reporter_id=self.reporter_id, reporter_name=self.reporter_name,
             details=self.details_text or None,
             environment=(self.environment_text or None) if self.item_type == "bug" else None,
+            priority=self.priority_text,
             guild_id=str(self.guild_id) if self.guild_id else None,
         )
 
@@ -789,14 +838,6 @@ async def start_tracker_item(
         )
         return
 
-    existing_items = await CACHE.db_manager.list_tracker_items(reporter_id=user_id, limit=100)
-    open_count = sum(1 for it in existing_items if it["status"] not in _OPEN_STATUSES_EXCLUDED)
-    if open_count >= MAX_OPEN_ITEMS_PER_REPORTER:
-        await interaction.response.send_message(
-            t('ui_components.tracker.too_many_open_items', user_id=user_id, guild_id=guild_id, count=open_count), ephemeral=True
-        )
-        return
-
     modal = TrackerItemModal(item_type, guild_id, user_id)
     await interaction.response.send_modal(modal)
 
@@ -815,14 +856,19 @@ def build_tracker_embed(item: Dict[str, Any]) -> discord.Embed:
     color = STATUS_COLOR.get(status, discord.Color.blue())
     guild_id = _lang_guild_id(item)
     status_text = t(f'ui_components.tracker.status_{status}', guild_id=guild_id)
+    priority = _normalize_priority(item.get("priority"))
 
     embed = discord.Embed(
-        title=f"{emoji} #{item['item_number']:04d} · {_truncate(item['title'], 180)}  [{status_text}]",
+        title=f"{PRIORITY_EMOJI[priority]} {emoji} #{item['item_number']:04d} · {_truncate(item['title'], 180)}  [{status_text}]",
         color=color,
     )
     reporter_line = t(
         'ui_components.tracker.reported_by', guild_id=guild_id,
         reporter_id=item['reporter_id'], created_at=item['created_at'],
+    )
+    reporter_line += (
+        f"  ·  {t('ui_components.tracker.field_priority', guild_id=guild_id)}: "
+        f"{t(_PRIORITY_LABEL_KEYS[priority], guild_id=guild_id)}"
     )
     if item.get("environment"):
         reporter_line += f"  ·  {t('ui_components.tracker.field_environment', guild_id=guild_id)}: {item['environment']}"
@@ -1182,6 +1228,7 @@ class TrackerItemButton(
             item["item_type"], guild_id, str(interaction.user.id), item_number=self.item_number,
             initial_title=item["title"], initial_description=item["description"],
             initial_details=item.get("details") or "", initial_environment=item.get("environment") or "",
+            initial_priority=item.get("priority") or "",
         )
         await interaction.response.send_modal(modal)
 
@@ -1297,7 +1344,8 @@ def _format_testcase_message(item: Dict[str, Any], testcases: List[Dict[str, Any
         lines.append(f"**{env}**")
         for case in by_env[env]:
             box = "☑" if case["passed"] else "☐"
-            lines.append(f"{box} {case['seq']}. {case['description']}")
+            priority = _normalize_priority(case.get("priority"))
+            lines.append(f"{box} {PRIORITY_EMOJI[priority]} {case['seq']}. {case['description']}")
         lines.append("")
     lines.append(t('ui_components.tracker.testcase_signoff_hint', guild_id=guild_id))
     return "\n".join(lines)
@@ -1313,7 +1361,7 @@ def build_tracker_testcase_view(item_number: int, testcases: List[Dict[str, Any]
 
 
 async def post_test_cases(item_number: int, cases: List[Dict[str, str]], actor_id: Optional[str] = None) -> Dict[str, Any]:
-    """Persist *cases* ({environment, description}) and (re)post the test-case message to
+    """Persist *cases* ({environment, description, priority?}) and (re)post the test-case message to
     #qapbot-test, transitioning the item to 'testing' the moment it posts (plan §2.4 point 4)
     unless it's already testing/done. Shared by the Discord flow and the bridge/MCP
     `tracker_add_testcases` tool — there is no native Discord UI for *composing* test cases,
