@@ -815,33 +815,48 @@ class CoCClanCache:
     def get_memory_usage_mb(self) -> float:
         """
         Calculate approximate memory usage of the clan cache in MB.
-        
-        Estimates memory by calculating the size of all cached clan objects
-        and their associated metadata.
-        
-        Returns:
-            Memory usage in MB (float)
+
+        Recurses into each cached coc.Clan object's own attributes (2026-08-21, tracker #0009).
+        The previous version only added sys.getsizeof(member) per member — shallow, and
+        invisible to everything a ClanMember actually points to (its League, that League's
+        Icon, badge URLs, role, etc.). A live PROD memory profile taken while validating this
+        fix showed ~40,000 live ClanMember/League/Icon/BaseLeague objects for barely 1,195
+        cached clans, almost entirely uncounted by the shallow version — which is also why this
+        method was reporting 0.0 MB in _build_cache_summary()'s report: that caller was never
+        even wired up to THIS method (it read a nonexistent 'estimated_size_mb' key off
+        get_stats() instead, which never set it — a second, separate bug fixed alongside this).
+
+        Deliberately generic — walks __dict__ for arbitrary objects rather than a hand-maintained
+        field list — so it doesn't silently go stale if coc.py's model classes gain attributes.
         """
         if not self.cache:
             return 0.0
-        
+
+        def _deep(value: Any, seen: set, depth: int = 0) -> int:
+            # coc.py's own model nesting is only a few levels deep (Clan -> ClanMember ->
+            # League -> Icon); this cap is a safety net against something unexpectedly
+            # self-referential, not a real limit expected to bite in practice.
+            if depth > 8:
+                return 0
+            obj_id = id(value)
+            if obj_id in seen:
+                return 0  # already counted — cycle guard / shared-reference dedup
+            seen.add(obj_id)
+            size = sys.getsizeof(value)
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    size += _deep(k, seen, depth + 1) + _deep(v, seen, depth + 1)
+            elif isinstance(value, (list, tuple, set, frozenset)):
+                for item in value:
+                    size += _deep(item, seen, depth + 1)
+            elif hasattr(value, "__dict__"):
+                for v in vars(value).values():
+                    size += _deep(v, seen, depth + 1)
+            return size
+
         total_bytes = 0
-        
         for cached in self.cache.values():
-            clan_obj = cached["data"]
-            
-            # Estimate clan object size
-            # Basic fields: tag, name, description, location, badge URLs
-            base_size = sys.getsizeof(clan_obj)
-            
-            # Add member list size
-            members_size = sys.getsizeof(clan_obj.members)
-            for member in clan_obj.members:
-                members_size += sys.getsizeof(member)
-            
-            # Add metadata
-            metadata_size = sys.getsizeof(cached["timestamp"]) + sys.getsizeof(cached)
-            
-            total_bytes += base_size + members_size + metadata_size
-        
+            seen: set = set()
+            total_bytes += _deep(cached["data"], seen) + sys.getsizeof(cached["timestamp"])
+
         return total_bytes / (1024 * 1024)

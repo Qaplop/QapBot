@@ -18,6 +18,28 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   qapbot/translations/{en,de}.json, qapbot/docs/BUG_FEATURE_TRACKER.md,
   tests/discord/test_ui_bot_setup.py, tests/discord/test_ui_tracker_items.py. 2320 tests pass.
 
+2026-08-22 (1)
+- Fixed: two bugs in the tracker #0009 memory-report instrumentation shipped yesterday, found by
+  comparing its first live PROD numbers against reality. (1) _estimate_dict_size_mb() stopped
+  recursing at depth 2, silently undercounting anything nested deeper than "dict of dict of
+  list" -- exactly the shape of a war payload (payload -> clan -> members[] -> attacks[]).
+  Verified against a realistic payload: the depth-capped version reported LESS than a pickle-size
+  lower bound, which is structurally impossible for real heap cost. Replaced with a full
+  recursive walk guarded by an id()-based `seen` set (cycle/shared-reference safe, reset per
+  sampled entry so the per-entry average stays correct). (2) coc_clan_cache's report line was
+  hardcoded to ~0.0 MB: _build_cache_summary() read `get_stats().get("estimated_size_mb", 0)`,
+  a key get_stats() never actually sets. The real (pre-existing but unused) estimator,
+  get_memory_usage_mb(), is now wired up -- and was itself deepened to recurse into each
+  ClanMember's League/Icon/Badge objects via generic __dict__ walking, since a live profile
+  showed ~40,000 such objects for barely 1,195 cached clans, almost entirely invisible to the
+  old sys.getsizeof(member)-only version. Also corrects the record: the first live profile
+  showed clan_name_cache steady at ~477 MB across a 2.9x RSS swing (7.1GB -> 2.5GB) while
+  temp_war_objects/temp_war_stats entry counts dropped 3.4x -- clan_name_cache is confirmed NOT
+  the incident's driver; the war caches remain the leading suspect, now measurable correctly.
+  #0009 stays open pending a re-profile with these fixes during real war/CWL activity. Files:
+  qapbot/coc_cache.py, qapbot/QBdiscocmdshelper_admin_command.py,
+  tests/unit/test_memory_report_instrumentation.py. 2325 tests pass.
+
 2026-08-21 (11)
 - Changed: memory-report instrumentation for tracker item #0009 (huge memory consumption). The
   originally-planned fix — pruning "stale" clan_name_cache entries — was invalidated during

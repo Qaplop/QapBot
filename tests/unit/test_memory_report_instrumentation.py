@@ -62,7 +62,7 @@ class TestBuildCacheSummary:
     def _cache() -> Any:
         cache = MagicMock()
         cache.coc_clan_cache.cache = {"#A": 1}
-        cache.coc_clan_cache.get_stats.return_value = {"estimated_size_mb": 1.5}
+        cache.coc_clan_cache.get_memory_usage_mb.return_value = 1.5
         cache.clan_name_cache = {f"#C{i}": {"name": f"Clan {i}"} for i in range(50)}
         cache.subscriptions = {"g1": {"c1": []}}
         cache.leaderboard_messages = {}
@@ -91,7 +91,114 @@ class TestBuildCacheSummary:
     def test_survives_a_broken_cache_object(self):
         broken = MagicMock()
         broken.coc_clan_cache.cache = {}
-        broken.coc_clan_cache.get_stats.side_effect = RuntimeError("boom")
+        broken.coc_clan_cache.get_memory_usage_mb.side_effect = RuntimeError("boom")
         del broken.clan_name_cache  # attribute access raises
         lines = _build_cache_summary(broken)
         assert any("error reading CACHE sizes" in ln for ln in lines)
+
+
+class TestDeepEstimationFix:
+    """2026-08-22: the original _estimate_dict_size_mb stopped recursing at depth 2, silently
+    undercounting anything nested deeper than "dict of dict of list" -- exactly the shape of a
+    real war payload (payload -> clan -> members[] -> attacks[]). Verified live against a
+    realistic payload: the depth-capped version undercounted a pickle-size lower bound by ~5x.
+    """
+
+    @staticmethod
+    def _war_payload(i: int) -> Dict[str, Any]:
+        def member(j: int) -> Dict[str, Any]:
+            return {
+                "tag": f"#P{i}_{j}", "name": f"Player{j}", "townhallLevel": 15,
+                "attacks": [
+                    {"attackerTag": f"#P{i}_{j}", "defenderTag": f"#D{j}", "stars": 3,
+                     "destructionPercentage": 100, "order": k}
+                    for k in range(2)
+                ],
+            }
+        return {
+            "state": "inWar", "teamSize": 50,
+            "clan": {"tag": f"#C{i}", "members": [member(j) for j in range(50)]},
+        }
+
+    def test_deeply_nested_payload_exceeds_pickle_lower_bound(self):
+        """Real Python heap usage (sys.getsizeof summed over every object) must always be AT
+        LEAST as large as pickle's compact serialized size -- pickle strips almost all per-object
+        overhead. The old depth-capped estimator reported LESS than pickle size, which is
+        structurally impossible for genuine heap cost and proved it was undercounting."""
+        import pickle
+
+        d = {f"#C{i}": self._war_payload(i) for i in range(20)}
+        estimated_mb = _estimate_dict_size_mb(d, sample=20)
+        pickle_mb = len(pickle.dumps(d)) / (1024 * 1024)
+
+        assert estimated_mb >= pickle_mb
+
+    def test_handles_reference_cycles_without_hanging(self):
+        """A cycle guard (id()-based `seen` set) must stop infinite recursion — this test
+        completing at all (not timing out / RecursionError) is the assertion."""
+        cyclical: Dict[str, Any] = {}
+        cyclical["self"] = cyclical
+        result = _estimate_dict_size_mb({"a": cyclical})
+        assert result >= 0.0
+
+
+class TestCocClanCacheMemoryUsage:
+    """2026-08-22: get_memory_usage_mb() was never wired up to _build_cache_summary() (which
+    read a key get_stats() never sets, always defaulting to 0.0) — fixed alongside deepening
+    get_memory_usage_mb() itself, since its own old version only measured
+    sys.getsizeof(member) per member and missed every nested League/Icon/Badge object a real
+    coc.py ClanMember points to."""
+
+    def test_nonzero_for_a_populated_cache(self):
+        from datetime import datetime, timezone
+        from qapbot.coc_cache import CoCClanCache
+
+        class _Icon:
+            def __init__(self):
+                self.small = "http://example/small.png"
+
+        class _League:
+            def __init__(self):
+                self.name = "Master League III"
+                self.icon = _Icon()
+
+        class _Member:
+            def __init__(self, i: int):
+                self.tag = f"#P{i}"
+                self.name = f"Player{i}"
+                self.league = _League()
+
+        class _Clan:
+            def __init__(self):
+                self.tag = "#C1"
+                self.members = [_Member(i) for i in range(30)]
+
+        cache = CoCClanCache()
+        cache.cache["#C1"] = {"data": _Clan(), "timestamp": datetime.now(timezone.utc)}
+
+        assert cache.get_memory_usage_mb() > 0.0
+
+    def test_empty_cache_is_zero(self):
+        from qapbot.coc_cache import CoCClanCache
+        assert CoCClanCache().get_memory_usage_mb() == 0.0
+
+    def test_build_cache_summary_uses_the_real_estimator(self):
+        """_build_cache_summary must call get_memory_usage_mb(), not read a nonexistent key off
+        get_stats() (the original bug — silently always 0.0 MB)."""
+        cache = MagicMock()
+        cache.coc_clan_cache.cache = {"#A": 1}
+        cache.coc_clan_cache.get_memory_usage_mb.return_value = 42.5
+        cache.clan_name_cache = {}
+        cache.subscriptions = {}
+        cache.leaderboard_messages = {}
+        cache.user_accounts = {}
+        cache.notification_state = {}
+        cache.clan_history = {}
+        cache.history_cache = {}
+        cache.temp_war_stats = {}
+        cache.temp_war_objects = {}
+        cache.server_config = {}
+
+        lines = "\n".join(_build_cache_summary(cache))
+        cache.coc_clan_cache.get_memory_usage_mb.assert_called_once()
+        assert "42.5 MB" in lines

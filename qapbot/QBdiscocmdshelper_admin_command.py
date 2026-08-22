@@ -1351,37 +1351,46 @@ def _estimate_dict_size_mb(d: Any, sample: int = 200) -> float:
     """Rough deep size of a {key: value} cache, in MB, from a sample of its entries.
 
     Added 2026-08-21 (tracker #0009): the memory report used to print entry counts only, so
-    there was no way to tell from it which cache actually held the RSS — the 7.1 GB PROD
-    investigation had to measure by hand to discover that temp_war_objects (~61 KB/entry) dwarfs
-    clan_name_cache (a flat metadata dict) despite having ~20x fewer entries.
+    there was no way to tell from it which cache actually held the RSS.
+
+    2026-08-22 fix: the original version stopped recursing at depth 2, which silently
+    undercounted anything nested deeper than "dict of dict of list" — exactly the shape of a war
+    payload (payload -> clan -> members[] -> attacks[]). Verified against a realistic war
+    payload: the depth-capped version undercounted by ~5x versus a pickle-size lower bound.
+    Replaced with a full recursive walk, guarded against cycles/shared references by an
+    id()-based `seen` set (reset per sampled entry, so the estimate stays a true per-entry
+    average rather than crediting a shared substructure to only the first entry that touches it).
 
     Samples rather than walking everything: these dicts run to hundreds of thousands of entries
-    and this is called from an interactive admin command. sys.getsizeof is shallow, so one level
-    of dict/list values is added explicitly — good enough to rank caches against each other,
-    which is the whole point; it is not an exact figure.
+    and this is called from an interactive admin command — good enough to rank caches against
+    each other, which is the whole point; it is not an exact figure.
     """
     import sys
+
+    def _deep(value: Any, seen: set) -> int:
+        obj_id = id(value)
+        if obj_id in seen:
+            return 0  # already counted for this entry — cycle guard / shared-reference dedup
+        seen.add(obj_id)
+        size = sys.getsizeof(value)
+        if isinstance(value, dict):
+            for k, v in value.items():
+                size += _deep(k, seen) + _deep(v, seen)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                size += _deep(item, seen)
+        return size
+
     try:
         total_entries = len(d)
         if not total_entries:
             return 0.0
 
-        def _deep(value: Any, depth: int = 0) -> int:
-            size = sys.getsizeof(value)
-            if depth >= 2:
-                return size
-            if isinstance(value, dict):
-                for k, v in value.items():
-                    size += sys.getsizeof(k) + _deep(v, depth + 1)
-            elif isinstance(value, (list, tuple, set)):
-                for item in value:
-                    size += _deep(item, depth + 1)
-            return size
-
         sampled = 0
         sampled_bytes = 0
         for key, value in d.items():
-            sampled_bytes += sys.getsizeof(key) + _deep(value)
+            seen: set = set()
+            sampled_bytes += _deep(key, seen) + _deep(value, seen)
             sampled += 1
             if sampled >= sample:
                 break
@@ -1398,9 +1407,12 @@ def _build_cache_summary(cache: Any) -> list[str]:
     try:
         coc_cache = cache.coc_clan_cache
         coc_entries = len(coc_cache.cache)
+        # 2026-08-22 fix: this used to call get_stats().get("estimated_size_mb", 0) — a key
+        # get_stats() never actually sets, so this line silently reported 0.0 MB regardless of
+        # cache size. CoCClanCache already has a real (now-fixed-to-be-deep) size estimator,
+        # get_memory_usage_mb() — it just was never wired up here.
         try:
-            coc_stats = coc_cache.get_stats()
-            coc_mb = coc_stats.get("estimated_size_mb", 0)
+            coc_mb = coc_cache.get_memory_usage_mb()
         except Exception:
             coc_mb = 0.0
         lines.append(f"  coc_clan_cache      : {coc_entries} entries, ~{coc_mb:.1f} MB")
