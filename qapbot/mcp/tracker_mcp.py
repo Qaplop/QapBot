@@ -307,13 +307,15 @@ async def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 async def run_stdio_server() -> None:
+    # Deliberately NOT loop.connect_read_pipe(): on Windows the default ProactorEventLoop
+    # registers the pipe with an IOCP, which requires an *overlapped* handle — but anonymous
+    # pipes handed to a child's stdin (VS Code's/Node's child_process.spawn included) aren't
+    # overlapped, so this crashed instantly with "OSError: [WinError 6] Invalid handle" before
+    # ever answering `initialize`. A plain blocking readline() in an executor thread works
+    # identically on every platform/host regardless of pipe type.
     loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
-    protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
-
     while True:
-        line = await reader.readline()
+        line = await loop.run_in_executor(None, sys.stdin.readline)
         if not line:
             break
         line = line.strip()

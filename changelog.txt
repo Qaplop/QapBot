@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (11)
+- Fixed: `qapbot/mcp/tracker_mcp.py`'s stdio transport crashed instantly on Windows
+  (`OSError: [WinError 6] Invalid handle`) before ever answering `initialize`, so the tracker
+  MCP server never worked from VS Code Copilot Chat (`.vscode/mcp.json`) on this machine --
+  only surfaced when testing "get an overview of open bugs/features" via Copilot Chat found no
+  tracker tools available at all. Root cause: `run_stdio_server()` used
+  `loop.connect_read_pipe(...)`, which on Windows requires an IOCP-registerable *overlapped*
+  pipe handle; the anonymous pipe a host gives a child's stdin (VS Code/Node child_process
+  included) isn't overlapped. Replaced with a plain blocking `sys.stdin.readline()` run in an
+  executor thread each iteration -- works identically on every platform/host regardless of pipe
+  type. Verified by spawning the server directly and driving initialize/tools-list/tools-call
+  over its stdio transport by hand (list showed 16 real tracker items). File:
+  qapbot/mcp/tracker_mcp.py. 31/31 tracker_mcp unit tests pass (`.\run_tests.ps1 -k
+  test_tracker_mcp`).
+
 2026-08-22 (10)
 - Changed: renamed `discord_id` -> `dmed_discord_id` on the three CWL snapshot tables
   (cwl_signups, cwl_shared_clan_players, cwl_player_season_status). Addresses the root cause

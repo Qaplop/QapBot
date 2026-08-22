@@ -1621,3 +1621,41 @@ concluding a fix is complete: this one had four (board payload, DM targeting, th
 ownership guard, and the upsert that wrote the stale value straight back). Then grep the *writers*
 too — a defended reader still leaves the bad data spreading, and the next person to add a reader
 starts from a column that looks trustworthy and isn't.
+
+## Pitfall 38: `asyncio.StreamReaderProtocol` + `loop.connect_read_pipe(..., sys.stdin)` crashes instantly on Windows for any host that gives the child a non-overlapped stdin pipe
+
+**Symptom (2026-08-22, live report):** the tracker MCP server (`qapbot/mcp/tracker_mcp.py`,
+`.vscode/mcp.json`) never produced any tools in VS Code Copilot Chat on Windows — no error
+visible from the chat side, it simply looked like the tools didn't exist. Spawning the server
+directly and feeding it an `initialize` request reproduced it: the process died before writing
+any response, with `OSError: [WinError 6] Invalid handle` inside
+`ProactorEventLoop._register_with_iocp` → `CreateIoCompletionPort`.
+
+**Why:** `run_stdio_server()` used `loop.connect_read_pipe(lambda: protocol, sys.stdin)` to get
+an async line reader. On Windows, `asyncio.run()`'s default loop is `ProactorEventLoop`, and
+`connect_read_pipe` registers the pipe handle with an I/O Completion Port — which requires the
+handle to have been created with `FILE_FLAG_OVERLAPPED`. An anonymous pipe a parent process
+hands a child as stdin (Node's `child_process.spawn` on Windows, Python's own `subprocess.Popen`
+via `_winapi.CreatePipe`) is **not** overlapped by default, so the registration fails outright —
+every time, not intermittently. This has nothing to do with the tracker/bridge logic itself
+(`handle_request()` was already correct and fully unit-tested); it's purely a transport-layer
+bug that only manifests on Windows hosts, which is why it could ship unnoticed if the server was
+only ever tested from a non-Windows Claude Code CLI session.
+
+**Fix:** don't use `connect_read_pipe` for stdin at all. Read lines with a plain blocking
+`sys.stdin.readline()` executed in a thread-pool executor each loop iteration
+(`await loop.run_in_executor(None, sys.stdin.readline)`) — this works identically on every
+platform and every kind of stdin handle (overlapped or not, console or pipe or redirected file),
+at the cost of one extra thread instead of native proactor I/O, which is irrelevant for a
+line-at-a-time JSON-RPC server. `_write_message()`'s plain synchronous `sys.stdout.write()` was
+already fine and needed no change — only the *read* side goes through the proactor pipe API.
+
+**How to apply:** any hand-rolled stdio-transport MCP/JSON-RPC server in this repo must avoid
+`loop.connect_read_pipe`/`loop.connect_write_pipe` on `sys.stdin`/`sys.stdout` — use the
+executor-thread `readline()` pattern above instead. If you're debugging "an MCP server produces
+no tools in some client but the tool-call logic unit-tests fine," reproduce it by spawning the
+server directly (`subprocess.Popen([...], stdin=PIPE, stdout=PIPE, stderr=PIPE, text=True)`) and
+sending it a raw `initialize` line by hand — a transport-layer crash shows up immediately in
+`stderr`, whereas the calling host (VS Code, Claude Code) usually just silently shows zero tools
+with no visible error.
+
