@@ -946,7 +946,7 @@
       "button_confirm_notify_new_members": "Ja, DMs senden",
       "notify_new_members_confirm_body": "📋 Soll jedem Pool-Mitglied, das noch keine erhalten hat, die Bestätigen/Absagen-DM für Saison **{season}** gesendet werden?",
       "notify_new_members_processing": "⏳ DMs an neu hinzugekommene Pool-Mitglieder werden gesendet, dies kann einige Sekunden dauern…",
-      "notify_new_members_summary": "✅ Fertig.\nKontaktiert: {contacted}\nÜbersprungen (DM-Schutz): {skipped_dm_guard}\nBereits kontaktiert (anderer Guild): {skipped_already_dm_globally}{dm_issues}",
+      "notify_new_members_summary": "✅ Fertig.\nKontaktiert: {contacted}\nÜbersprungen (DM-Schutz): {skipped_dm_guard}\nBereits kontaktiert (anderer Guild): {skipped_already_dm_globally}\nÜbersprungen (kein verknüpfter Account): {skipped_unlinked}{dm_issues}",
       "notify_new_members_error_no_database": "⚠️ Datenbank nicht bereit — bitte gleich erneut versuchen.",
       "notify_new_members_error_no_event": "⚠️ Für diese Saison wurde kein CWL-Event mehr gefunden — es wurde möglicherweise gelöscht.",
       "notify_new_members_error_not_open": "⚠️ Die Anmeldephase für diese Saison wurde noch nicht gestartet."

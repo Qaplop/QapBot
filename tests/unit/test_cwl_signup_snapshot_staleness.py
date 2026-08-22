@@ -295,6 +295,7 @@ class TestDmBatchSeedsSignupRows:
         import qapbot.QBdiscocmdshelper_cwl as cwl
 
         event_id = await _seed(db, "920", "#CLANI")
+        await _link(db, "owner1", "#NEWGUY")
         CACHE.db_manager = db
         sent = []
 
@@ -324,6 +325,7 @@ class TestDmBatchSeedsSignupRows:
         import qapbot.QBdiscocmdshelper_cwl as cwl
 
         event_id = await _seed(db, "921", "#CLANJ")
+        await _link(db, "owner1", "#ANSWERED2")
         CACHE.db_manager = db
         db.set_cwl_player_response_status_sync(
             "#ANSWERED2", "2026-09", "Answered", "owner1", "confirmed", "2026-09-01T10:00Z", 99, "922",
@@ -374,6 +376,7 @@ class TestDmBatchSeedsSignupRows:
         import qapbot.QBdiscocmdshelper_cwl as cwl
 
         event_id = await _seed(db, "925", "#CLANL")
+        await _link(db, "owner1", "#KEEP2")
         CACHE.db_manager = db
         db.upsert_cwl_signup_sync(
             event_id, "#KEEP2", "Keep2", "owner1", None, "template_confirm", "declined",
@@ -388,6 +391,104 @@ class TestDmBatchSeedsSignupRows:
         )
 
         assert db.get_cwl_signup_sync(event_id, "#KEEP2")["status"] == "declined"
+
+
+class TestDmBatchRechecksLinkBeforeSending:
+    """Live bug report, 2026-08-22: "Daniel", a player with NO linked Discord account at all,
+    was still sent a signup DM (and turned up in the admin's "blocked" report). resolve_cwl_pool_
+    dm_targets_sync() resolves the pool once, up front; a DM batch with many recipients then runs
+    for a while (real Discord API calls, possibly retried) -- long enough for an account already
+    queued to get unlinked before its own turn comes up. _send_cwl_enrollment_dm_batch must
+    re-check user_players immediately before sending, not trust the resolved-pool snapshot."""
+
+    @staticmethod
+    def _target(tag: str, name: str, discord_id: str) -> dict:
+        return {"player_tag": tag, "player_name": name, "discord_id": discord_id}
+
+    @pytest.fixture(autouse=True)
+    def _allow_dms(self, monkeypatch):
+        import dataclasses
+
+        import qapbot.config as config_module
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        relaxed = dataclasses.replace(
+            config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False
+        )
+        monkeypatch.setattr(config_module, "CONFIG", relaxed)
+        monkeypatch.setattr(cwl, "CONFIG", relaxed, raising=False)
+
+    @pytest.mark.asyncio
+    async def test_never_linked_account_is_skipped_not_dmed(self, db, monkeypatch):
+        """No user_players row at all for this tag -- the pool resolver should never have handed
+        this target over with a real discord_id in the first place, but the batch must not trust
+        it blindly regardless of how it got here."""
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "926", "#CLANM")
+        CACHE.db_manager = db
+
+        async def _fake_dm(evt, gid, season, participant):
+            raise AssertionError("must not DM a player with no linked Discord account")
+
+        monkeypatch.setattr(cwl, "send_cwl_signup_template_dm", _fake_dm)
+        result = await cwl._send_cwl_enrollment_dm_batch(
+            event_id, 926, "2026-09", [self._target("#DANIEL", "Daniel", "999")]
+        )
+
+        assert result["contacted"] == 0
+        assert result["skipped_unlinked"] == 1
+        assert db.get_cwl_signup_sync(event_id, "#DANIEL") is None
+
+    @pytest.mark.asyncio
+    async def test_unlinked_after_pool_resolution_is_skipped_not_dmed(self, db, monkeypatch):
+        """The exact race: linked at pool-resolution time, unlinked before the send loop reaches
+        them."""
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "927", "#CLANN")
+        await _link(db, "owner1", "#RACED")
+        CACHE.db_manager = db
+        # Simulates an admin unlinking the account between pool resolution and the send loop.
+        await db.conn.execute("DELETE FROM user_players WHERE player_tag = ?", ("#RACED",))
+        await db.conn.commit()
+
+        async def _fake_dm(evt, gid, season, participant):
+            raise AssertionError("must not DM an account unlinked before the send loop reached it")
+
+        monkeypatch.setattr(cwl, "send_cwl_signup_template_dm", _fake_dm)
+        result = await cwl._send_cwl_enrollment_dm_batch(
+            event_id, 927, "2026-09", [self._target("#RACED", "Raced", "owner1")]
+        )
+
+        assert result["contacted"] == 0
+        assert result["skipped_unlinked"] == 1
+        assert db.get_cwl_signup_sync(event_id, "#RACED") is None
+
+    @pytest.mark.asyncio
+    async def test_relinked_to_a_different_owner_dms_the_new_owner(self, db, monkeypatch):
+        """The live re-check also picks up a re-link to someone ELSE, not just an unlink -- same
+        "live wins over a stale snapshot" rule already applied at pool-build time."""
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "928", "#CLANO")
+        await _link(db, "new_owner", "#RELINKED")
+        CACHE.db_manager = db
+
+        async def _fake_dm(evt, gid, season, participant):
+            assert participant["discord_id"] == "new_owner"
+            return True, "sent", "m", "c"
+
+        monkeypatch.setattr(cwl, "send_cwl_signup_template_dm", _fake_dm)
+        result = await cwl._send_cwl_enrollment_dm_batch(
+            event_id, 928, "2026-09", [self._target("#RELINKED", "Relinked", "old_owner")]
+        )
+
+        assert result["contacted"] == 1
+        assert db.get_cwl_signup_sync(event_id, "#RELINKED")["dmed_discord_id"] == "new_owner"
 
 
 class TestRepairSignupsForSentDms:

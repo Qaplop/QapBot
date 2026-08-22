@@ -2470,6 +2470,10 @@ async def _start_cwl_enrollment_locked(guild_id: int, season: str) -> Dict[str, 
     summary["contacted"] += dm_result["contacted"]
     summary["skipped_dm_guard"] += dm_result["skipped_dm_guard"]
     summary["skipped_already_dm_globally"] += dm_result["skipped_already_dm_globally"]
+    # Same "no linked Discord account" bucket the pool resolution above already reports —
+    # this is just the same condition caught a moment later, right before the send (see
+    # _send_cwl_enrollment_dm_batch's live re-check).
+    summary["skipped_unlinked"] += dm_result["skipped_unlinked"]
     summary["blocked"] = dm_result["blocked"]
     summary["failed"] = dm_result["failed"]
 
@@ -2628,10 +2632,14 @@ async def _send_cwl_enrollment_dm_batch(
     cache_manager.py's send_user_dm_detailed(), which retries a transient error internally and
     never raises — so this loop just needs to keep going and record what happened to who).
 
-    Returns {"contacted", "skipped_dm_guard", "skipped_already_dm_globally", "blocked", "failed"}
-    — the latter two are lists of player_name (or player_tag) strings for the Start Enrollment
-    summary to report back to the admin, since "blocked" (DMs closed/bot blocked) and "failed"
-    (transient error, retries exhausted) call for different admin follow-up.
+    Returns {"contacted", "skipped_dm_guard", "skipped_already_dm_globally", "skipped_unlinked",
+    "blocked", "failed"} — the latter two are lists of player_name (or player_tag) strings for the
+    Start Enrollment summary to report back to the admin, since "blocked" (DMs closed/bot blocked)
+    and "failed" (transient error, retries exhausted) call for different admin follow-up.
+    "skipped_unlinked" is deliberately the same bucket name resolve_cwl_pool_dm_targets_sync()
+    uses for "no linked Discord account at pool-resolution time" — this one just catches the same
+    condition discovered a moment later, right before the send (see the live re-check below), so
+    callers can fold it straight into that same counter without a new i18n line.
 
     Global dm_sent dedup (2026-08-18, rule h, project owner's spec: "we generally need only one
     enrollment DM per player regardless of how many guilds and/or clans invite him") — checked
@@ -2644,7 +2652,8 @@ async def _send_cwl_enrollment_dm_batch(
     from qapbot.config import CONFIG
 
     result: Dict[str, Any] = {
-        "contacted": 0, "skipped_dm_guard": 0, "skipped_already_dm_globally": 0, "blocked": [], "failed": [],
+        "contacted": 0, "skipped_dm_guard": 0, "skipped_already_dm_globally": 0, "skipped_unlinked": 0,
+        "blocked": [], "failed": [],
     }
     db = CACHE.db_manager
     already_dm_by_tag = await asyncio.to_thread(
@@ -2673,6 +2682,28 @@ async def _send_cwl_enrollment_dm_batch(
             result["skipped_dm_guard"] += 1
             continue
         to_dm.append(participant)
+
+    # Re-check live ownership immediately before sending (2026-08-22, live bug report: "Daniel",
+    # a player with NO linked Discord account at all, was still sent a signup DM and turned up in
+    # the "blocked" report). resolve_cwl_pool_dm_targets_sync() resolves the pool once, up front;
+    # everything from here on is real network I/O (row seeding below, then one Discord API round
+    # trip per recipient, each possibly retried by send_user_dm_detailed) — plenty of time for an
+    # admin to unlink the very account already queued to be DMed. Re-reading user_players right
+    # before acting on it closes that window, same "live wins over a stale snapshot" rule already
+    # applied at pool-build time (see _merge's authoritative_discord_id), just applied again here
+    # at send time. Done BEFORE the row-seeding block below so an unlinked player never gets a
+    # cwl_signups row seeded with a dmed_discord_id that was never actually DMed.
+    if db is not None and to_dm:
+        live_links = await asyncio.to_thread(db.get_player_links_sync, [p["player_tag"] for p in to_dm])
+        still_linked: List[Dict[str, Any]] = []
+        for participant in to_dm:
+            live_discord_id = (live_links.get(participant["player_tag"]) or {}).get("discord_id")
+            if live_discord_id is None:
+                result["skipped_unlinked"] += 1
+                continue
+            participant["discord_id"] = live_discord_id
+            still_linked.append(participant)
+        to_dm = still_linked
 
     # Only the players we're actually about to DM — a target skipped by either guard above must
     # not gain a board entry as a side effect of a DM it never received. bulk_create is

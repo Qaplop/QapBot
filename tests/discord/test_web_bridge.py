@@ -2348,6 +2348,52 @@ async def test_enrollment_get_clears_link_for_account_returned_to_unassigned_poo
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_enrollment_get_includes_discord_display_name_for_the_tooltip(db, bridge_config, client, monkeypatch):
+    """2026-08-22 live-testing feedback: "instead of showing 'Linked' the tooltip could as well
+    show the name of the linked discord user" — the board already resolves discord_id live (see
+    test_enrollment_get_resolves_link_live_not_from_signup_snapshot above), it just never carried
+    a human-readable name with it. Sourced from CACHE.user_accounts, the same in-memory gateway
+    cache the @-prefixed guest search already reads (_discord_display_name_player_hits) — no
+    extra DB query. Three shapes: linked + present in the cache, linked but absent from it (left
+    the server — falls back to null, the frontend then shows the older "Linked" text), and not
+    linked at all."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "836", {"#CLAND": "NameClan"})
+    CACHE.db_manager = db
+    CACHE.server_config["836"] = {"member_clans": ["#CLAND"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    CACHE.user_accounts = {
+        "realowner": {"display_name": "Qaplop", "players": []},
+    }
+
+    event_id = db.create_cwl_event_sync("836", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAND", "participating": True}])
+
+    await _seed_current_clan_member(db, "realowner", "#NAMED", "#CLAND")
+    await _seed_current_clan_member(db, "staleowner", "#GHOST", "#CLAND")
+    await _seed_current_clan_member(db, "UNASSIGNED", "#SOLO", "#CLAND")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(836, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "836", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+
+    assert players_by_tag["#NAMED"]["discord_display_name"] == "Qaplop"
+    assert players_by_tag["#GHOST"]["discord_display_name"] is None
+    assert players_by_tag["#SOLO"]["discord_display_name"] is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_enrollment_get_resolves_optout_for_a_clanless_pooled_player(db, bridge_config, client, monkeypatch):
     """optout_by_tag was populated ONLY from get_current_clan_members_sync, which is clan-scoped
     — so a pooled player who is in no member/participating clan silently defaulted to

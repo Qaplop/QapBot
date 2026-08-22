@@ -675,6 +675,15 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
         link = links_by_tag.get(player_tag)
         if link is not None:
             player["discord_id"] = link["discord_id"]
+        # Display name for the tooltip (2026-08-22, live-testing feedback: "instead of showing
+        # 'Linked' the tooltip could as well show the name of the linked discord user" — the board
+        # already resolves discord_id above, it just never carried a human-readable name with it).
+        # CACHE.user_accounts is the same in-memory source _search_cwl_guests_sync's
+        # @-prefixed Discord-name search already reads from — no extra DB query needed.
+        player["discord_display_name"] = (
+            CACHE.user_accounts.get(str(player["discord_id"]), {}).get("display_name")
+            if player["discord_id"] is not None else None
+        )
         # Default False for a player only known via an old cwl_signups row who's since left
         # every guild clan (get_current_clan_members_sync no longer covers them) — same
         # fallback-tolerant shape as the th_level lookup just above. links_by_tag is consulted
@@ -742,6 +751,12 @@ async def notify_new_cwl_pool_members(guild_id: int, season: str) -> Dict[str, A
 
     pool = await asyncio.to_thread(resolve_cwl_pool_dm_targets_sync, guild_id, event["id"], season)
     dm_result = await _send_cwl_enrollment_dm_batch(event["id"], guild_id, season, pool["targets"])
+    # dm_result["skipped_unlinked"] folds in both the pool-resolution-time count (pool's own
+    # "no linked Discord account") and the send-time re-check inside _send_cwl_enrollment_dm_batch
+    # (2026-08-22, live bug report: "Daniel" had no linked account at all yet still received a DM
+    # and turned up "blocked" — that account had been unlinked in the window between this pool
+    # resolution and the actual send).
+    dm_result["skipped_unlinked"] += pool["skipped_unlinked"]
     return {"ok": True, **dm_result}
 
 

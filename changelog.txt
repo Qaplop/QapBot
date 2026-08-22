@@ -1,6 +1,27 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (16)
+- Fixed/Added: two CWL enrollment follow-ups from live-testing feedback on the #0016 fix.
+  (1) "Notify New Pool Members" DMed a player ("Daniel") with NO linked Discord account at all,
+  who then showed up in the admin's "blocked" report -- `resolve_cwl_pool_dm_targets_sync()`
+  resolves the pool once, up front, but `_send_cwl_enrollment_dm_batch()`'s send loop can run for
+  a while afterward (real Discord API calls, some retried), long enough for an account already
+  queued to get unlinked before its own turn. The batch now re-checks `user_players` live,
+  immediately before sending (and before seeding that player's `cwl_signups` row) -- an unlinked
+  target is skipped and counted under the existing "skipped_unlinked" bucket instead of being
+  DMed; a target re-linked to a DIFFERENT owner in that window is redirected to the new owner
+  rather than the stale one, same "live wins" rule already applied at pool-resolution time.
+  "Notify New Pool Members"'s summary now also surfaces this count (previously silently dropped).
+  (2) The Manage Enrollment board's tooltip only ever showed "Linked"/"Not linked" for a player's
+  Discord account -- added `discord_display_name` to the enrollment payload (sourced from
+  CACHE.user_accounts, the same in-memory cache the guest search's @-prefixed Discord-name lookup
+  already reads, no extra DB query) so the tooltip can show WHO it's linked to. Files:
+  qapbot/QBdiscocmdshelper_cwl.py, qapbot/web_bridge.py, qapbot/ui_cwl_roster.py,
+  qapbot/translations/{en,de}.json, activity/client/src/{types,enrollmentBoard}.ts,
+  tests/unit/test_cwl_signup_snapshot_staleness.py, tests/discord/test_web_bridge.py.
+  2446 tests pass.
+
 2026-08-22 (15)
 - Changed: decoupled the bug/feature tracker's item-done and test-case-done archiving, per the
   project owner's explicit spec (each object moves on its own trigger only, no automatic

@@ -1224,6 +1224,7 @@ class CwlNotifyNewMembersConfirmView(discord.ui.View):
                 contacted=result["contacted"],
                 skipped_dm_guard=result["skipped_dm_guard"],
                 skipped_already_dm_globally=result["skipped_already_dm_globally"],
+                skipped_unlinked=result["skipped_unlinked"],
                 dm_issues=dm_issues,
             )
         try:

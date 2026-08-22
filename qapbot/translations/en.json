@@ -946,7 +946,7 @@
       "button_confirm_notify_new_members": "Yes, Send DMs",
       "notify_new_members_confirm_body": "📋 Send the enrollment confirm/opt-out DM to every pool member who hasn't received it yet for season **{season}**?",
       "notify_new_members_processing": "⏳ Sending DMs to newly-added pool members, this can take a few seconds…",
-      "notify_new_members_summary": "✅ Done.\nContacted: {contacted}\nSkipped (DM guard): {skipped_dm_guard}\nAlready contacted (another guild): {skipped_already_dm_globally}{dm_issues}",
+      "notify_new_members_summary": "✅ Done.\nContacted: {contacted}\nSkipped (DM guard): {skipped_dm_guard}\nAlready contacted (another guild): {skipped_already_dm_globally}\nSkipped (no linked account): {skipped_unlinked}{dm_issues}",
       "notify_new_members_error_no_database": "⚠️ Database not ready — try again shortly.",
       "notify_new_members_error_no_event": "⚠️ No CWL event found for this season anymore — it may have been deleted.",
       "notify_new_members_error_not_open": "⚠️ Enrollment hasn't been started yet for this season."

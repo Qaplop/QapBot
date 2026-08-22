@@ -64,6 +64,11 @@ export type EnrollmentPlayer = {
   player_tag: string
   player_name: string | null
   discord_id: string | null
+  // Populated from CACHE.user_accounts (the live gateway member cache), not a DB column — null
+  // whenever discord_id is null, and also whenever discord_id is set but the account isn't in
+  // that cache for any reason (2026-08-22, live-testing feedback: the tooltip showed a bare
+  // "Linked" with no way to tell who — see enrollmentBoard.ts's buildTooltip).
+  discord_display_name: string | null
   // The board only ever displays pending/confirmed/declined — the true statuses a member's own
   // DM response can produce. 'withdrawn' is legacy-only (2026-08-19: its one writer, the board's
   // now-removed 1-click admin confirm/withdraw control and its POST /api/cwl/enrollment/signup

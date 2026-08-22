@@ -141,7 +141,15 @@ function buildTooltipLines(
       player.assigned_clan_tag !== null ? resolveClanName(player.assigned_clan_tag) ?? player.assigned_clan_tag : 'Unassigned'
     }`,
   )
-  pushLine(`Discord: ${player.discord_id != null ? 'Linked' : 'Not linked'}`)
+  // Falls back to "Linked" when the account is linked but isn't in the live gateway member
+  // cache (e.g. left the server) — discord_display_name is only ever null in exactly that case
+  // or when there's genuinely no link at all (2026-08-22, live-testing feedback: show WHO, not
+  // just whether).
+  pushLine(
+    `Discord: ${
+      player.discord_id != null ? player.discord_display_name ?? 'Linked' : 'Not linked'
+    }`,
+  )
   pushLine(
     `Response: ${
       player.discord_id == null
