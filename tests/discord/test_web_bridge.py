@@ -4149,7 +4149,7 @@ async def test_enrollment_guest_never_sends_an_immediate_dm(db, bridge_config, c
     assert body == {"ok": True}
     send_dm_mock.assert_not_awaited()
     signup = db.get_cwl_signup_sync(event_id, "#GUEST2")
-    assert signup["discord_id"] == "999"  # linked and pooled, just not DMed yet
+    assert signup["dmed_discord_id"] == "999"  # linked and pooled, just not DMed yet
 
 
 @pytest.mark.discord

@@ -1,6 +1,29 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (10)
+- Changed: renamed `discord_id` -> `dmed_discord_id` on the three CWL snapshot tables
+  (cwl_signups, cwl_shared_clan_players, cwl_player_season_status). Addresses the root cause
+  behind entries (4)/(7): the column was copied out of user_players and never refreshed, but its
+  name said "ownership", so readers trusted it as ownership -- greying out linked players on the
+  enrollment board and mis-routing enrollment DMs. It only ever recorded who we DMed, which is
+  what it is now called. Renamed rather than dropped: it is the only place the value exists for a
+  never-linked guest tag added via search, and the audit trail is worth keeping. Migration via a
+  new PRAGMA-guarded, idempotent _rename_column_if_present() (companion to
+  _add_column_if_missing); if both names somehow exist it warns and leaves the table alone rather
+  than guessing which holds the data. idx_cwl_signups_discord was DROPPED, not renamed -- nothing
+  ever filtered by that column, so it was pure write cost. Deliberately untouched:
+  users/user_players/notification_state.discord_id, cwl_events.created_by_discord_id and the
+  bridge's discord_user_id params, where the column really does mean ownership or an actor. The
+  Activity board payload keeps the key `discord_id` (it is now live-resolved from user_players,
+  so the name is correct there) -- no frontend change, no redeploy. Verified the migration against
+  a copy of the real PROD DB: all three renamed, row counts and data identical, user_players
+  untouched, old index gone. Files: qapbot/db_manager.py, qapbot/QBdiscocmdshelper_cwl.py,
+  qapbot/web_bridge.py, qapbot/ui_cwl_roster.py, qapbot/docs/DATABASE_ARCHITECTURE.md,
+  qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md, tests/unit/test_db_dmed_discord_id_migration.py
+  (new, incl. idempotency + half-applied-migration cases) and five existing test files.
+  2391 tests pass.
+
 2026-08-22 (9)
 - Fixed: four of the five paths that CREATE a cwl_signups row hardcoded status='pending' instead
   of adopting the player's existing global response from cwl_player_season_status the way

@@ -909,7 +909,7 @@ def _migrate_local_clan_roster_to_shared(db: Any, event_id: int, shared_clan_id:
     # snapshot value straight across into cwl_shared_clan_players (2026-08-22, Pitfall 37).
     live_owners = _live_owners_or_sync(db, [s["player_tag"] for s in migrating])
     for signup in migrating:
-        owner = live_owners.get(signup["player_tag"]) or signup["discord_id"]
+        owner = live_owners.get(signup["player_tag"]) or signup["dmed_discord_id"]
         db.set_cwl_shared_clan_player_assignment_sync(
             shared_clan_id, signup["player_tag"], signup["player_name"], owner,
             True, signup["source"], guild_id_str,
@@ -952,7 +952,7 @@ def sync_cwl_shared_clan_roster_to_local_pools(shared_clan_id: int) -> None:
             if db.get_cwl_signup_sync(event_id, player["player_tag"]) is not None:
                 continue
             db.upsert_cwl_signup_sync(
-                event_id, player["player_tag"], player["player_name"], player["discord_id"], None,
+                event_id, player["player_tag"], player["player_name"], player["dmed_discord_id"], None,
                 source="guest_invite", status=player["status"],
             )
 
@@ -1233,7 +1233,7 @@ def assign_cwl_player_sync(
                         # Live owner, not the other guild's shared-roster snapshot (Pitfall 37).
                         mirrored_owner = (
                             _live_owners_or_sync(db, [player_tag]).get(player_tag)
-                            or other_shared_row["discord_id"]
+                            or other_shared_row["dmed_discord_id"]
                         )
                         db.upsert_cwl_signup_sync(
                             event_id, player_tag, other_shared_row["player_name"],
@@ -1263,7 +1263,7 @@ def assign_cwl_player_sync(
         )
         if shared_row is not None:
             removed_player_name = shared_row["player_name"]
-            removed_discord_id = shared_row["discord_id"]
+            removed_discord_id = shared_row["dmed_discord_id"]
         db.delete_cwl_shared_clan_player_sync(shared_clan_id, player_tag)
         purge_orphaned_shared_clan_guests_sync(shared_clan_id, player_tag)
 
@@ -1275,7 +1275,7 @@ def assign_cwl_player_sync(
         live_owner = _live_owners_or_sync(db, [player_tag]).get(player_tag)
         existing_signup = db.get_cwl_signup_sync(event_id, player_tag)
         if existing_signup is not None:
-            return existing_signup["player_name"], live_owner or existing_signup["discord_id"]
+            return existing_signup["player_name"], live_owner or existing_signup["dmed_discord_id"]
         if removed_player_name is not None:
             return removed_player_name, live_owner or removed_discord_id
         member = next(
@@ -2018,7 +2018,7 @@ def _detach_guild_from_shared_clan_on_deactivation_sync(
         tag = shared_player["player_tag"]
         if shared_player["assigned"] and shared_player["source"] == "admin_override" and tag not in members_by_tag:
             db.mark_cwl_signup_as_shared_clan_guest_sync(
-                event_id, tag, shared_player["player_name"], shared_player["discord_id"], shared["id"]
+                event_id, tag, shared_player["player_name"], shared_player["dmed_discord_id"], shared["id"]
             )
             db.upsert_cwl_assignment_sync(event_id, tag, clan_tag, assignment_source="admin_override", locked=True)
 
@@ -2350,7 +2350,7 @@ async def _start_cwl_enrollment_locked(guild_id: int, season: str) -> Dict[str, 
         signups_to_create.append({
             "player_tag": participant["player_tag"],
             "player_name": participant["player_name"],
-            "discord_id": participant["discord_id"],
+            "dmed_discord_id": participant["discord_id"],
             "preferred_league_rank": participant["preferred_league_rank"],
             "source": "template_confirm",
             "status": existing_global["status"] if existing_global else "pending",
@@ -2577,7 +2577,7 @@ def resolve_cwl_pool_dm_targets_sync(
         _merge(member["player_tag"], member["player_name"], member["discord_id"])
 
     for signup in db.get_cwl_signups_for_event_sync(event_id):
-        _merge(signup["player_tag"], signup["player_name"], signup["discord_id"])
+        _merge(signup["player_tag"], signup["player_name"], signup["dmed_discord_id"])
 
     for clan in all_clans:
         if not clan.get("participating", 1):
@@ -2586,7 +2586,7 @@ def resolve_cwl_pool_dm_targets_sync(
         if shared is None:
             continue
         for shared_player in db.get_cwl_shared_clan_players_sync(shared["id"]):
-            _merge(shared_player["player_tag"], shared_player["player_name"], shared_player["discord_id"])
+            _merge(shared_player["player_tag"], shared_player["player_name"], shared_player["dmed_discord_id"])
 
     # Sources 2/3 carry no opt-out flag and may carry no discord_id at all (the Guests search can
     # add a tag it found no Discord link for) — user_players is the authority for both.
@@ -2761,7 +2761,7 @@ async def cleanup_stale_cwl_enrollment_dms(bot: Any, dm_refs: List[Dict[str, Any
     result = {"deleted": 0, "failed": 0}
     for ref in dm_refs:
         try:
-            user = await bot.fetch_user(int(ref["discord_id"]))
+            user = await bot.fetch_user(int(ref["dmed_discord_id"]))
             dm_channel = user.dm_channel or await user.create_dm()
             message = await dm_channel.fetch_message(int(ref["message_id"]))
             await message.delete()

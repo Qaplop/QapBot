@@ -2118,7 +2118,17 @@ class WarHistoryDB:
                 event_id              INTEGER NOT NULL,
                 player_tag            TEXT    NOT NULL,
                 player_name           TEXT,
-                discord_id            TEXT,
+                -- Who we sent (or would send) THIS event's enrollment DM to — an event-scoped
+                -- historical fact, NOT a statement about who owns the account. Renamed from
+                -- `discord_id` on 2026-08-22 (Pitfall 37) because that name invited exactly the
+                -- wrong reading: it was being copied out of user_players and then trusted as
+                -- ownership long after the account had been re-linked elsewhere, which greyed
+                -- out linked players on the board and mis-routed enrollment DMs. user_players
+                -- is the only authority for current ownership; every reader resolves it live.
+                -- This column stays because it is the one place the value exists for a
+                -- never-linked guest tag added via search, and because "who did we actually
+                -- DM" is worth keeping.
+                dmed_discord_id       TEXT,
                 preferred_league_rank TEXT,
                 source                TEXT    NOT NULL,
                 status                TEXT    NOT NULL DEFAULT 'pending',
@@ -2141,9 +2151,9 @@ class WarHistoryDB:
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cwl_signups_event ON cwl_signups(event_id)"
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_cwl_signups_discord ON cwl_signups(discord_id)"
-        )
+        # NOTE: no index on dmed_discord_id. The old idx_cwl_signups_discord was dropped
+        # 2026-08-22 after verifying nothing ever filtered cwl_signups by that column — it was
+        # pure write cost. Re-add one only if a real by-recipient query appears.
         # idx_cwl_signups_origin_shared_clan is created later, in the ALTER-TABLE migration block
         # below (_add_column_if_missing("cwl_signups", "origin_shared_clan_id", ...)) — NOT here.
         # This CREATE TABLE IF NOT EXISTS is a no-op against a pre-existing table (the common
@@ -2255,7 +2265,9 @@ class WarHistoryDB:
                 shared_clan_id    INTEGER NOT NULL,
                 player_tag        TEXT    NOT NULL,
                 player_name       TEXT,
-                discord_id        TEXT,
+                -- Who we DMed about this shared-clan roster slot; see cwl_signups.
+                -- dmed_discord_id above for why this is NOT an ownership field (Pitfall 37).
+                dmed_discord_id   TEXT,
                 status            TEXT    NOT NULL DEFAULT 'pending',
                 assigned          INTEGER NOT NULL DEFAULT 0,
                 source            TEXT    NOT NULL,
@@ -2305,7 +2317,10 @@ class WarHistoryDB:
                 player_tag             TEXT    NOT NULL,
                 cwl_season             TEXT    NOT NULL,
                 player_name            TEXT,
-                discord_id             TEXT,
+                -- Who we DMed for this player+season; see cwl_signups.dmed_discord_id above for
+                -- why this is NOT an ownership field (Pitfall 37). Pairs naturally with the
+                -- dm_sent_* audit columns right below it.
+                dmed_discord_id        TEXT,
                 dm_sent                INTEGER NOT NULL DEFAULT 0,
                 dm_sent_at             TEXT,
                 dm_sent_via_event_id   INTEGER,
@@ -2489,6 +2504,17 @@ class WarHistoryDB:
         await self._add_column_if_missing("cwl_signups", "origin_shared_clan_id", "INTEGER")
         await self._add_column_if_missing("cwl_player_season_status", "dm_sent_via_message_id", "TEXT")
         await self._add_column_if_missing("cwl_player_season_status", "dm_sent_via_channel_id", "TEXT")
+        # discord_id -> dmed_discord_id across the three CWL snapshot tables (2026-08-22,
+        # Pitfall 37). The old name invited the wrong reading: the column was copied out of
+        # user_players and then trusted as current ownership, which greyed out linked players on
+        # the enrollment board and mis-routed enrollment DMs. It only ever recorded who we DMed.
+        # A rename (not a drop) keeps the one case where the value exists nowhere else — a
+        # never-linked guest tag added via search — and preserves the audit trail.
+        for _cwl_snapshot_table in ("cwl_signups", "cwl_shared_clan_players", "cwl_player_season_status"):
+            await self._rename_column_if_present(_cwl_snapshot_table, "discord_id", "dmed_discord_id")
+        # Dropped rather than renamed: verified 2026-08-22 that nothing ever filtered cwl_signups
+        # by this column, so it was pure write cost on every signup insert/update.
+        await self._conn.execute("DROP INDEX IF EXISTS idx_cwl_signups_discord")
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cwl_signups_origin_shared_clan "
             "ON cwl_signups(origin_shared_clan_id, player_tag) WHERE origin_shared_clan_id IS NOT NULL"
@@ -2522,6 +2548,36 @@ class WarHistoryDB:
             logging.info(f"[DB-MIGRATE] Added column {table}.{column}")
             return True
         return False
+
+    async def _rename_column_if_present(self, table: str, old_column: str, new_column: str) -> bool:
+        """Idempotently ALTER TABLE RENAME COLUMN for pre-existing databases.
+
+        Companion to _add_column_if_missing above, same contract: checks PRAGMA table_info first
+        (re-running the rename would raise), returns True only when the rename actually happened.
+        A no-op on a fresh DB — the CREATE TABLE already uses the new name — and on an
+        already-migrated one, so it is safe on every startup.
+
+        Deliberately renames rather than add-new + copy + drop-old: RENAME COLUMN preserves the
+        data in place with no backfill step to get wrong, and SQLite has supported it since 3.25
+        (2018), well below anything this bot runs on. If BOTH names somehow exist (a half-applied
+        migration), the old column is left alone and a warning is logged rather than guessing
+        which one holds the real data.
+        """
+        cursor = await self._conn.execute(f"PRAGMA table_info({table})")
+        existing_columns = {row[1] async for row in cursor}
+        if old_column not in existing_columns:
+            return False
+        if new_column in existing_columns:
+            logging.warning(
+                f"[DB-MIGRATE] {table} has BOTH {old_column} and {new_column} — leaving as-is; "
+                "resolve manually before relying on either"
+            )
+            return False
+        await self._conn.execute(
+            f"ALTER TABLE {table} RENAME COLUMN {old_column} TO {new_column}"
+        )
+        logging.info(f"[DB-MIGRATE] Renamed column {table}.{old_column} -> {new_column}")
+        return True
 
     async def _create_bot_metadata_schema(self) -> None:
         """Create the bot_metadata key-value table (idempotent)."""
@@ -3995,7 +4051,7 @@ class WarHistoryDB:
         immediately-recreated season silently DMed nobody (every pooled player's dm_sent=1 flag
         from the deleted event was still standing). A row whose response came via a DIFFERENT,
         still-existing event is left untouched — that cross-guild dedup still has to survive.
-        Callers that need the (discord_id, message_id, channel_id) of the DMs this is about to
+        Callers that need the (dmed_discord_id, message_id, channel_id) of the DMs this is about to
         forget — e.g. to retract them — MUST read
         get_cwl_player_season_status_dm_refs_for_event_sync(event_id) first; this call wipes
         exactly the rows that query would return."""
@@ -4025,8 +4081,8 @@ class WarHistoryDB:
                 return False
 
     def get_cwl_player_season_status_dm_refs_for_event_sync(self, event_id: int) -> List[Dict[str, Any]]:
-        """Every (player_tag, discord_id, message_id, channel_id) for a DM this exact event sent
-        that's still eligible to be cleaned up if the event is about to be deleted — same scoping
+        """Every (player_tag, dmed_discord_id, message_id, channel_id) for a DM this exact event
+        sent that's still eligible to be cleaned up if the event is about to be deleted — same scoping
         delete_cwl_event_sync() itself uses (see its own docstring), read BEFORE that call wipes
         the row away. Used by "Delete Season" (CwlDeleteSeasonConfirmView._on_confirm,
         ui_cwl_roster.py) to best-effort retract the now-orphaned DM messages so their dangling
@@ -4040,17 +4096,17 @@ class WarHistoryDB:
             try:
                 rows = conn.execute(
                     """
-                    SELECT player_tag, discord_id, dm_sent_via_message_id, dm_sent_via_channel_id
+                    SELECT player_tag, dmed_discord_id, dm_sent_via_message_id, dm_sent_via_channel_id
                     FROM cwl_player_season_status
                     WHERE dm_sent_via_event_id = ?
                       AND dm_sent_via_message_id IS NOT NULL
-                      AND discord_id IS NOT NULL
+                      AND dmed_discord_id IS NOT NULL
                       AND (responded_via_event_id IS NULL OR responded_via_event_id = ?)
                     """,
                     (event_id, event_id),
                 ).fetchall()
                 return [
-                    {"player_tag": row[0], "discord_id": row[1], "message_id": row[2], "channel_id": row[3]}
+                    {"player_tag": row[0], "dmed_discord_id": row[1], "message_id": row[2], "channel_id": row[3]}
                     for row in rows
                 ]
             except sqlite3.Error as e:
@@ -4665,7 +4721,7 @@ class WarHistoryDB:
                     conn.executemany(
                         """
                         INSERT INTO cwl_signups
-                            (event_id, player_tag, player_name, discord_id, preferred_league_rank, source, status)
+                            (event_id, player_tag, player_name, dmed_discord_id, preferred_league_rank, source, status)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(event_id, player_tag) DO NOTHING
                         """,
@@ -4674,7 +4730,7 @@ class WarHistoryDB:
                                 event_id,
                                 s["player_tag"],
                                 s.get("player_name"),
-                                s.get("discord_id"),
+                                s.get("dmed_discord_id"),
                                 s.get("preferred_league_rank"),
                                 s.get("source", "template_confirm"),
                                 s.get("status", "pending"),
@@ -4695,7 +4751,7 @@ class WarHistoryDB:
         event_id: int,
         player_tag: str,
         player_name: Optional[str],
-        discord_id: Optional[str],
+        dmed_discord_id: Optional[str],
         preferred_league_rank: Optional[str],
         source: str,
         status: str,
@@ -4716,17 +4772,17 @@ class WarHistoryDB:
                     conn.execute(
                         """
                         INSERT INTO cwl_signups
-                            (event_id, player_tag, player_name, discord_id, preferred_league_rank, source, status, responded_at)
+                            (event_id, player_tag, player_name, dmed_discord_id, preferred_league_rank, source, status, responded_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(event_id, player_tag) DO UPDATE SET
                             player_name = excluded.player_name,
-                            discord_id = excluded.discord_id,
+                            dmed_discord_id = excluded.dmed_discord_id,
                             preferred_league_rank = excluded.preferred_league_rank,
                             source = excluded.source,
                             status = excluded.status,
                             responded_at = excluded.responded_at
                         """,
-                        (event_id, player_tag, player_name, discord_id, preferred_league_rank, source, status, responded_at),
+                        (event_id, player_tag, player_name, dmed_discord_id, preferred_league_rank, source, status, responded_at),
                     )
                     if self._should_commit():
                         conn.commit()
@@ -4810,7 +4866,7 @@ class WarHistoryDB:
                 return False
 
     def mark_cwl_signup_as_shared_clan_guest_sync(
-        self, event_id: int, player_tag: str, player_name: Optional[str], discord_id: Optional[str], origin_shared_clan_id: int
+        self, event_id: int, player_tag: str, player_name: Optional[str], dmed_discord_id: Optional[str], origin_shared_clan_id: int
     ) -> bool:
         """Cross-guild foreign-guest conversion (2026-08-15, project owner's spec): creates-or-
         flips a cwl_signups row to source='guest_invite' (the same marker a manually invited
@@ -4838,15 +4894,15 @@ class WarHistoryDB:
                     conn.execute(
                         """
                         INSERT INTO cwl_signups
-                            (event_id, player_tag, player_name, discord_id, source, status, origin_shared_clan_id)
+                            (event_id, player_tag, player_name, dmed_discord_id, source, status, origin_shared_clan_id)
                         VALUES (?, ?, ?, ?, 'guest_invite', 'pending', ?)
                         ON CONFLICT(event_id, player_tag) DO UPDATE SET
                             player_name = excluded.player_name,
-                            discord_id = excluded.discord_id,
+                            dmed_discord_id = excluded.dmed_discord_id,
                             source = excluded.source,
                             origin_shared_clan_id = excluded.origin_shared_clan_id
                         """,
-                        (event_id, player_tag, player_name, discord_id, origin_shared_clan_id),
+                        (event_id, player_tag, player_name, dmed_discord_id, origin_shared_clan_id),
                     )
                     if self._should_commit():
                         conn.commit()
@@ -4997,7 +5053,7 @@ class WarHistoryDB:
                 return result
 
     def mark_cwl_player_dm_sent_sync(
-        self, player_tag: str, cwl_season: str, player_name: Optional[str], discord_id: Optional[str],
+        self, player_tag: str, cwl_season: str, player_name: Optional[str], dmed_discord_id: Optional[str],
         event_id: int, guild_id: int, sent_at: str,
         message_id: Optional[str] = None, channel_id: Optional[str] = None,
     ) -> bool:
@@ -5020,13 +5076,13 @@ class WarHistoryDB:
                     conn.execute(
                         """
                         INSERT INTO cwl_player_season_status
-                            (player_tag, cwl_season, player_name, discord_id, dm_sent, dm_sent_at,
+                            (player_tag, cwl_season, player_name, dmed_discord_id, dm_sent, dm_sent_at,
                              dm_sent_via_event_id, dm_sent_via_guild_id, dm_sent_via_message_id,
                              dm_sent_via_channel_id)
                         VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
                         ON CONFLICT(player_tag, cwl_season) DO UPDATE SET
                             player_name = excluded.player_name,
-                            discord_id = excluded.discord_id,
+                            dmed_discord_id = excluded.dmed_discord_id,
                             dm_sent = 1,
                             dm_sent_at = excluded.dm_sent_at,
                             dm_sent_via_event_id = excluded.dm_sent_via_event_id,
@@ -5036,7 +5092,7 @@ class WarHistoryDB:
                             updated_at = datetime('now')
                         """,
                         (
-                            player_tag, cwl_season, player_name, discord_id, sent_at, event_id, str(guild_id),
+                            player_tag, cwl_season, player_name, dmed_discord_id, sent_at, event_id, str(guild_id),
                             message_id, channel_id,
                         ),
                     )
@@ -5049,7 +5105,7 @@ class WarHistoryDB:
                 return False
 
     def set_cwl_player_response_status_sync(
-        self, player_tag: str, cwl_season: str, player_name: Optional[str], discord_id: Optional[str],
+        self, player_tag: str, cwl_season: str, player_name: Optional[str], dmed_discord_id: Optional[str],
         status: str, responded_at: Optional[str], event_id: int, guild_id: int,
     ) -> bool:
         """Record this player's own genuine confirm/decline response, globally for the season —
@@ -5069,19 +5125,19 @@ class WarHistoryDB:
                     conn.execute(
                         """
                         INSERT INTO cwl_player_season_status
-                            (player_tag, cwl_season, player_name, discord_id, status, responded_at,
+                            (player_tag, cwl_season, player_name, dmed_discord_id, status, responded_at,
                              responded_via_event_id, responded_via_guild_id)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(player_tag, cwl_season) DO UPDATE SET
                             player_name = excluded.player_name,
-                            discord_id = excluded.discord_id,
+                            dmed_discord_id = excluded.dmed_discord_id,
                             status = excluded.status,
                             responded_at = excluded.responded_at,
                             responded_via_event_id = excluded.responded_via_event_id,
                             responded_via_guild_id = excluded.responded_via_guild_id,
                             updated_at = datetime('now')
                         """,
-                        (player_tag, cwl_season, player_name, discord_id, status, responded_at, event_id, str(guild_id)),
+                        (player_tag, cwl_season, player_name, dmed_discord_id, status, responded_at, event_id, str(guild_id)),
                     )
                     if self._should_commit():
                         conn.commit()
@@ -5710,7 +5766,7 @@ class WarHistoryDB:
         shared_clan_id: int,
         player_tag: str,
         player_name: Optional[str],
-        discord_id: Optional[str],
+        dmed_discord_id: Optional[str],
         status: str,
         source: str,
         added_by_guild_id: str,
@@ -5738,19 +5794,19 @@ class WarHistoryDB:
                     conn.execute(
                         """
                         INSERT INTO cwl_shared_clan_players
-                            (shared_clan_id, player_tag, player_name, discord_id, status, source,
+                            (shared_clan_id, player_tag, player_name, dmed_discord_id, status, source,
                              added_by_guild_id, responded_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(shared_clan_id, player_tag) DO UPDATE SET
                             player_name = excluded.player_name,
-                            discord_id = excluded.discord_id,
+                            dmed_discord_id = excluded.dmed_discord_id,
                             status = excluded.status,
                             source = excluded.source,
                             added_by_guild_id = excluded.added_by_guild_id,
                             responded_at = excluded.responded_at,
                             updated_at = datetime('now')
                         """,
-                        (shared_clan_id, player_tag, player_name, discord_id, status, source,
+                        (shared_clan_id, player_tag, player_name, dmed_discord_id, status, source,
                          added_by_guild_id, responded_at),
                     )
                     if self._should_commit():
@@ -5768,7 +5824,7 @@ class WarHistoryDB:
         shared_clan_id: int,
         player_tag: str,
         player_name: Optional[str],
-        discord_id: Optional[str],
+        dmed_discord_id: Optional[str],
         assigned: bool,
         source: str,
         added_by_guild_id: str,
@@ -5793,18 +5849,18 @@ class WarHistoryDB:
                     conn.execute(
                         """
                         INSERT INTO cwl_shared_clan_players
-                            (shared_clan_id, player_tag, player_name, discord_id, assigned, source,
+                            (shared_clan_id, player_tag, player_name, dmed_discord_id, assigned, source,
                              added_by_guild_id)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(shared_clan_id, player_tag) DO UPDATE SET
                             player_name = excluded.player_name,
-                            discord_id = excluded.discord_id,
+                            dmed_discord_id = excluded.dmed_discord_id,
                             assigned = excluded.assigned,
                             source = excluded.source,
                             added_by_guild_id = excluded.added_by_guild_id,
                             updated_at = datetime('now')
                         """,
-                        (shared_clan_id, player_tag, player_name, discord_id, 1 if assigned else 0, source,
+                        (shared_clan_id, player_tag, player_name, dmed_discord_id, 1 if assigned else 0, source,
                          added_by_guild_id),
                     )
                     if self._should_commit():

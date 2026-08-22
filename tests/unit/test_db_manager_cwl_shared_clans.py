@@ -276,13 +276,13 @@ class TestCwlSharedClanPlayersAssignedMigration:
             await manager.conn.execute("ALTER TABLE cwl_shared_clan_players DROP COLUMN assigned")
             await manager.conn.execute(
                 "INSERT INTO cwl_shared_clan_players "
-                "(shared_clan_id, player_tag, player_name, discord_id, status, source, added_by_guild_id) "
+                "(shared_clan_id, player_tag, player_name, dmed_discord_id, status, source, added_by_guild_id) "
                 "VALUES (?, '#PLACED', 'Placed', 'd1', 'confirmed', 'admin_override', '100')",
                 (shared_clan_id,),
             )
             await manager.conn.execute(
                 "INSERT INTO cwl_shared_clan_players "
-                "(shared_clan_id, player_tag, player_name, discord_id, status, source, added_by_guild_id) "
+                "(shared_clan_id, player_tag, player_name, dmed_discord_id, status, source, added_by_guild_id) "
                 "VALUES (?, '#NOT_PLACED', 'NotPlaced', 'd2', 'pending', 'auto_seeded', '100')",
                 (shared_clan_id,),
             )

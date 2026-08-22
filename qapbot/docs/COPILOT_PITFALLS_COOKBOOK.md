@@ -1563,9 +1563,12 @@ that row actually changed.
 
 ## Pitfall 37: `cwl_signups` is an enrollment-time SNAPSHOT — re-resolve its `discord_id` on read
 
-> **Status: fixed 2026-08-22** (`plans/implemented/cwl-board-stale-link-and-whois-timeout.md`).
-> All four read paths now resolve the live owner from `user_players`. The "Why" below describes the
-> original defect; the "How to apply" is the convention to keep following.
+> **Status: fixed 2026-08-22** (`plans/implemented/cwl-board-stale-link-and-whois-timeout.md`,
+> then `plans/implemented/cwl-dmed-discord-id-rename.md`). All four read paths resolve the live
+> owner from `user_players`, the carry-forward writers resolve at the write boundary, and the
+> column itself is now named **`dmed_discord_id`** on all three snapshot tables — so it can only
+> be read as what it is (who we DMed), never mistaken for ownership again. The "Why" below
+> describes the original defect; the "How to apply" is the convention to keep following.
 
 **Symptom (2026-08-22, live report):** a player (`B.A.B.A`, `#2RPLRVUG9`) rendered grey
 "Not Linked" on the CWL enrollment board while `/whois` showed it correctly linked. Sixteen other

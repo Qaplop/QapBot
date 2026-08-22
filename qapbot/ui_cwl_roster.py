@@ -1340,7 +1340,7 @@ class CwlSignupResponseButton(
         event = await asyncio.to_thread(db.get_cwl_event_by_id_sync, self.event_id)
         signup = await asyncio.to_thread(db.get_cwl_signup_sync, self.event_id, self.player_tag)
         # The live owner from user_players, alongside the snapshot's (2026-08-22). cwl_signups is
-        # written once by Start Enrollment and never refreshed, so signup["discord_id"] can name a
+        # written once by Start Enrollment and never refreshed, so its recorded recipient can name a
         # Discord user who no longer owns this account — see Pitfall 37.
         links = await asyncio.to_thread(db.get_player_links_sync, [self.player_tag])
         live_discord_id = (links.get(self.player_tag) or {}).get("discord_id")
@@ -1358,7 +1358,7 @@ class CwlSignupResponseButton(
         # alone, re-linking an account told its real owner "not your signup"). An empty set of
         # known owners means nobody was ever recorded for this tag — unchanged from before, the
         # click is allowed through.
-        known_owner_ids = {oid for oid in (signup.get("discord_id"), live_discord_id) if oid}
+        known_owner_ids = {oid for oid in (signup.get("dmed_discord_id"), live_discord_id) if oid}
         if known_owner_ids and user_id_str not in known_owner_ids:
             await interaction.response.send_message(
                 t('cwl.template.not_your_signup', user_id=user_id_str, guild_id=guild_id), ephemeral=True
@@ -1377,12 +1377,12 @@ class CwlSignupResponseButton(
         # button is on a persistent DM, hit by every member responding to a CWL signup template,
         # so an unwrapped write here is the highest-traffic instance of the whole-bot-freeze risk
         # in this file.
-        # Persist the LIVE owner, not the snapshot's (2026-08-22) — writing signup["discord_id"]
+        # Persist the LIVE owner, not the snapshot's (2026-08-22) — writing the recorded recipient
         # straight back is what made the staleness self-perpetuating, re-stamping the outdated
         # owner on every response. Falls back to the snapshot when user_players has no row for
         # this tag at all (a guest tag added by search that was never linked), so a never-linked
         # signup keeps whatever it had rather than being blanked.
-        owner_discord_id = live_discord_id or signup.get("discord_id")
+        owner_discord_id = live_discord_id or signup.get("dmed_discord_id")
         await asyncio.to_thread(
             db.upsert_cwl_signup_sync,
             self.event_id, self.player_tag, signup.get("player_name"), owner_discord_id,

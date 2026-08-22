@@ -439,7 +439,7 @@ class TestCwlCascadeDelete:
 
         refs = db.get_cwl_player_season_status_dm_refs_for_event_sync(event_id)
 
-        assert refs == [{"player_tag": "#P1", "discord_id": "10", "message_id": "msg1", "channel_id": "chan1"}]
+        assert refs == [{"player_tag": "#P1", "dmed_discord_id": "10", "message_id": "msg1", "channel_id": "chan1"}]
 
 
 class TestGuildConfigCwlColumns:

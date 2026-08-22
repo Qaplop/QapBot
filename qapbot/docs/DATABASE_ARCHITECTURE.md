@@ -522,6 +522,40 @@ Steps 9 & 11):
 
 ---
 
+## Snapshot tables never store ownership (2026-08-22)
+
+**Rule: a snapshot table may record what *happened* — who we DMed, what they answered — but never
+who *currently owns* an account. `user_players` is the single authority for ownership, and every
+reader resolves it live.**
+
+Three CWL tables are enrollment/season-time snapshots: `cwl_signups`,
+`cwl_shared_clan_players`, `cwl_player_season_status`. Each carried a `discord_id` column copied
+out of `user_players` at write time and never refreshed. Because the name said "ownership",
+readers trusted it as ownership — so an account linked *after* Start Enrollment ran rendered grey
+("Not Linked") on the board forever, and an account re-linked to a different Discord user kept
+routing enrollment DMs to the previous owner. See `COPILOT_PITFALLS_COOKBOOK.md` Pitfall 37 for
+the full incident.
+
+The column is now **`dmed_discord_id`** on all three tables, which is the one fact it legitimately
+holds. It was renamed rather than dropped for two reasons: it is the only place the value exists
+for a never-linked guest tag added via search, and "who did we actually DM" is a real audit fact.
+
+`idx_cwl_signups_discord` was **dropped**, not renamed — nothing ever filtered `cwl_signups` by
+that column, so it was pure write cost on every signup insert.
+
+Deliberately **not** renamed, because there the column really does mean ownership or an actor:
+`users.discord_id`, `user_players.discord_id`, `notification_state.discord_id`,
+`cwl_events.created_by_discord_id`, and the bridge's `discord_user_id` request parameters.
+
+The Discord Activity's board payload still exposes the key **`discord_id`** — that field is now
+resolved live from `user_players` on every read, so it genuinely *is* ownership and the name is
+correct there. Only the DB columns changed; no frontend change or redeploy was needed.
+
+Migration: `_rename_column_if_present()` (`db_manager.py`), the companion to
+`_add_column_if_missing()` — PRAGMA-guarded, idempotent, and a no-op on a fresh DB. If both the
+old and new names somehow exist (a half-applied migration) it logs a warning and leaves the table
+alone rather than guessing which column holds the real data.
+
 ## Migration Principles
 
 ### 1. Idempotent Operations

@@ -484,7 +484,7 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
         players_by_tag[signup["player_tag"]] = {
             "player_tag": signup["player_tag"],
             "player_name": signup["player_name"],
-            "discord_id": signup["discord_id"],
+            "discord_id": signup["dmed_discord_id"],
             "signup_status": signup["status"],
             # source='guest_invite' is set by handle_post_cwl_enrollment_guest — the only writer
             # that uses it (every other signup path uses 'template_confirm'/'admin_added'/etc.).
@@ -575,7 +575,7 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
             players_by_tag[tag] = {
                 "player_tag": tag,
                 "player_name": shared_player["player_name"],
-                "discord_id": shared_player["discord_id"],
+                "discord_id": shared_player["dmed_discord_id"],
                 # The RAW status, unconditionally (2026-08-16, live-testing feedback, project
                 # owner's spec, verbatim: "Confirmation status and assignment status should be
                 # treated completely separate... The symbols in the player tile should exclusively

@@ -139,7 +139,7 @@ class TestCarryForwardWritesUseLiveOwner:
         cwl._migrate_local_clan_roster_to_shared(db, event_id, shared_clan_id, "#CLANE", "905")
 
         rows = {p["player_tag"]: p for p in db.get_cwl_shared_clan_players_sync(shared_clan_id)}
-        assert rows["#MIG"]["discord_id"] == "trueowner"
+        assert rows["#MIG"]["dmed_discord_id"] == "trueowner"
 
     @pytest.mark.asyncio
     async def test_migration_keeps_the_snapshot_owner_for_a_never_linked_tag(self, db):
@@ -155,7 +155,7 @@ class TestCarryForwardWritesUseLiveOwner:
         cwl._migrate_local_clan_roster_to_shared(db, event_id, shared_clan_id, "#CLANF", "906")
 
         rows = {p["player_tag"]: p for p in db.get_cwl_shared_clan_players_sync(shared_clan_id)}
-        assert rows["#GUESTX"]["discord_id"] == "guestowner"
+        assert rows["#GUESTX"]["dmed_discord_id"] == "guestowner"
 
     @pytest.mark.asyncio
     async def test_live_owners_helper_omits_never_linked_tags(self, db):

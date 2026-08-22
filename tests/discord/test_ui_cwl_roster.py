@@ -735,7 +735,7 @@ async def test_cwl_delete_season_confirm_view_retracts_stale_enrollment_dms(db, 
     call_args = cleanup_mock.await_args
     assert call_args.args[0] is mock_interaction.client
     assert call_args.args[1] == [
-        {"player_tag": "#P1", "discord_id": "10", "message_id": "msg1", "channel_id": "chan1"}
+        {"player_tag": "#P1", "dmed_discord_id": "10", "message_id": "msg1", "channel_id": "chan1"}
     ]
     # The dm_sent record it referenced is now gone too (delete_cwl_event_sync's own cleanup).
     assert db.get_cwl_player_season_status_sync("#P1", "2026-09") is None
@@ -1865,7 +1865,7 @@ class TestCwlSignupResponseButton:
         signup = db.get_cwl_signup_sync(event_id, "#P1")
         assert signup["status"] == "confirmed"
         # ...and the row self-heals, so it stops re-stamping the outdated owner on every response.
-        assert signup["discord_id"] == "222222222"
+        assert signup["dmed_discord_id"] == "222222222"
 
     @pytest.mark.discord
     @pytest.mark.asyncio

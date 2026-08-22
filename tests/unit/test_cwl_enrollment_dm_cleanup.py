@@ -58,7 +58,7 @@ async def test_deletes_each_referenced_dm_message():
     bot = _make_bot({10: user})
 
     result = await cleanup_stale_cwl_enrollment_dms(
-        bot, [{"player_tag": "#P1", "discord_id": "10", "message_id": "111", "channel_id": "222"}]
+        bot, [{"player_tag": "#P1", "dmed_discord_id": "10", "message_id": "111", "channel_id": "222"}]
     )
 
     message.delete.assert_awaited_once()
@@ -73,7 +73,7 @@ async def test_not_found_is_silently_skipped_not_a_failure():
     bot = _make_bot({10: user})
 
     result = await cleanup_stale_cwl_enrollment_dms(
-        bot, [{"player_tag": "#P1", "discord_id": "10", "message_id": "111", "channel_id": "222"}]
+        bot, [{"player_tag": "#P1", "dmed_discord_id": "10", "message_id": "111", "channel_id": "222"}]
     )
 
     assert result == {"deleted": 0, "failed": 0}
@@ -86,7 +86,7 @@ async def test_forbidden_counts_as_failed():
     bot = _make_bot({10: user})
 
     result = await cleanup_stale_cwl_enrollment_dms(
-        bot, [{"player_tag": "#P1", "discord_id": "10", "message_id": "111", "channel_id": "222"}]
+        bot, [{"player_tag": "#P1", "dmed_discord_id": "10", "message_id": "111", "channel_id": "222"}]
     )
 
     assert result == {"deleted": 0, "failed": 1}
@@ -103,8 +103,8 @@ async def test_one_recipients_failure_does_not_abort_the_rest():
     result = await cleanup_stale_cwl_enrollment_dms(
         bot,
         [
-            {"player_tag": "#P1", "discord_id": "10", "message_id": "111", "channel_id": "1"},
-            {"player_tag": "#P2", "discord_id": "20", "message_id": "222", "channel_id": "2"},
+            {"player_tag": "#P1", "dmed_discord_id": "10", "message_id": "111", "channel_id": "1"},
+            {"player_tag": "#P2", "dmed_discord_id": "20", "message_id": "222", "channel_id": "2"},
         ],
     )
 
