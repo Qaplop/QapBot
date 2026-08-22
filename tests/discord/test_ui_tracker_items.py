@@ -21,6 +21,7 @@ from qapbot.ui_tracker import (
     TRACKER_SETTING_IMPLEMENTED_CHANNEL,
     TRACKER_SETTING_TEST_CHANNEL,
     TrackerDraftView,
+    TrackerItemButton,
     TrackerItemModal,
     _sanitize_attachment_filename,
     apply_status_change,
@@ -1015,3 +1016,158 @@ async def test_upload_window_expired_is_dropped():
     consumed = await handle_tracker_upload_message(_fake_upload_message(attachments=[attachment]))
     assert consumed is False
     assert (1, 2) not in _upload_windows
+
+
+# -- grant/revoke requestor access (plans/tracker-0021-grant-requestor-access.md) ------
+
+async def test_grant_access_denied_for_non_admin(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db, reporter_id="222")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.channel.set_permissions = AsyncMock()
+
+    button = TrackerItemButton("grantaccess", item_number)
+    await button._handle_grant_access(mock_interaction, item)
+
+    mock_interaction.channel.set_permissions.assert_not_awaited()
+    mock_interaction.response.send_message.assert_awaited_once()
+
+
+async def test_grant_access_grants_channel_permission_for_admin(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db, reporter_id="222")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+    member = MagicMock()
+    member.id = 222
+    mock_interaction.guild.get_member = MagicMock(return_value=member)
+    mock_interaction.channel.set_permissions = AsyncMock()
+
+    button = TrackerItemButton("grantaccess", item_number)
+    await button._handle_grant_access(mock_interaction, item)
+
+    mock_interaction.channel.set_permissions.assert_awaited_once()
+    args, kwargs = mock_interaction.channel.set_permissions.call_args
+    assert args[0] is member
+    overwrite = kwargs["overwrite"]
+    assert overwrite.view_channel is True
+    assert overwrite.read_message_history is True
+    assert overwrite.send_messages_in_threads is True
+
+
+async def test_grant_access_response_links_to_the_discussion_thread(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(item_number, channel_id="10", message_id="100", thread_id="777")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+    member = MagicMock()
+    member.id = 222
+    mock_interaction.guild.get_member = MagicMock(return_value=member)
+    mock_interaction.channel.set_permissions = AsyncMock()
+
+    button = TrackerItemButton("grantaccess", item_number)
+    await button._handle_grant_access(mock_interaction, item)
+
+    text = mock_interaction.response.send_message.call_args[0][0]
+    assert "https://discord.com/channels/999/777" in text
+
+
+async def test_grant_access_response_falls_back_to_item_message_link_without_thread(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(item_number, channel_id="10", message_id="100")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+    member = MagicMock()
+    member.id = 222
+    mock_interaction.guild.get_member = MagicMock(return_value=member)
+    mock_interaction.channel.set_permissions = AsyncMock()
+
+    button = TrackerItemButton("grantaccess", item_number)
+    await button._handle_grant_access(mock_interaction, item)
+
+    text = mock_interaction.response.send_message.call_args[0][0]
+    assert "https://discord.com/channels/999/10/100" in text
+
+
+async def test_grant_access_skips_agent_filed_item(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db, reporter_id="agent:tester")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+    mock_interaction.channel.set_permissions = AsyncMock()
+
+    button = TrackerItemButton("grantaccess", item_number)
+    await button._handle_grant_access(mock_interaction, item)
+
+    mock_interaction.channel.set_permissions.assert_not_awaited()
+
+
+async def test_apply_status_change_done_revokes_requestor_access_when_moved(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_IMPLEMENTED_CHANNEL] = "50"
+
+    old_item_message = _fake_message(message_id=100)
+    old_reports_channel = _fake_channel(fetch_message=old_item_message)
+    old_reports_channel.set_permissions = AsyncMock()
+    implemented_channel = _fake_channel(send_message=_fake_message(message_id=555))
+    implemented_channel.id = 50
+    bot = _wire_bot_multi(monkeypatch, {10: old_reports_channel, 50: implemented_channel})
+
+    member = MagicMock()
+    member.id = 222
+    guild = MagicMock()
+    guild.get_member = MagicMock(return_value=member)
+    bot.get_guild = MagicMock(return_value=guild)
+
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(item_number, channel_id="10", message_id="100", status="open")
+
+    await apply_status_change(item_number, "done", actor_id="1")
+
+    old_reports_channel.set_permissions.assert_awaited_once()
+    args, kwargs = old_reports_channel.set_permissions.call_args
+    assert args[0] is member
+    assert kwargs["overwrite"] is None
+
+
+async def test_apply_status_change_done_keeps_access_with_another_open_item_in_same_channel(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_IMPLEMENTED_CHANNEL] = "50"
+
+    old_item_message = _fake_message(message_id=100)
+    old_reports_channel = _fake_channel(fetch_message=old_item_message)
+    old_reports_channel.set_permissions = AsyncMock()
+    implemented_channel = _fake_channel(send_message=_fake_message(message_id=555))
+    implemented_channel.id = 50
+    bot = _wire_bot_multi(monkeypatch, {10: old_reports_channel, 50: implemented_channel})
+
+    member = MagicMock()
+    member.id = 222
+    guild = MagicMock()
+    guild.get_member = MagicMock(return_value=member)
+    bot.get_guild = MagicMock(return_value=guild)
+
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(item_number, channel_id="10", message_id="100", status="open")
+    other_item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(other_item_number, channel_id="10", status="open")
+
+    await apply_status_change(item_number, "done", actor_id="1")
+
+    old_reports_channel.set_permissions.assert_not_awaited()
+
+
+async def test_apply_status_change_done_without_implemented_channel_does_not_revoke(db, monkeypatch):
+    old_item_message = _fake_message(message_id=100)
+    old_reports_channel = _fake_channel(fetch_message=old_item_message)
+    old_reports_channel.set_permissions = AsyncMock()
+    _wire_bot(monkeypatch, channel=old_reports_channel)
+
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(item_number, channel_id="10", message_id="100", status="open")
+
+    await apply_status_change(item_number, "done", actor_id="1")
+
+    old_reports_channel.set_permissions.assert_not_awaited()

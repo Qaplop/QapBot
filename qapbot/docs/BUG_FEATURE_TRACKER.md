@@ -141,13 +141,37 @@ move channels, so the reposted item embed adds a "Discussion thread" jump-link f
 exists (the old thread otherwise becomes unreachable once its parent message is deleted). See
 `_move_item_to_implemented_channel()`.
 
+**Grant/revoke requestor access (2026-08-22, ticket #0021)**: reporters normally can't see the
+reports channel their item was posted in (it isn't open to `@everyone`), so a staff `@mention`
+reply gets no push notification and the reporter can't read the thread. The **"Reply to
+requestor"** button on `TrackerItemButton` (`grantaccess` action, admin-only) gives the reporter
+a member-specific Discord permission overwrite on that channel
+(`view_channel`/`read_message_history`/`send_messages_in_threads`, `_handle_grant_access()`), then
+replies (ephemeral, to the admin who clicked) with a jump link to the item's discussion thread
+(or the item message itself if it has no thread) — the bot never posts the reply/mention itself,
+this only gets the admin's own client to that spot ready to type one, same "no client-navigation
+API, a link is the closest thing" reasoning as the passive-prompt mention above.
+This is deliberately **channel-wide**, not scoped to just their own message/thread — Discord's
+narrower primitive for that would be a standalone **private thread** with `thread.add_user()`
+(membership on a private thread grants access independent of the parent channel's own view
+permission), but that would mean creating the discussion thread separately from the item message
+instead of via `message.create_thread()`. The chosen trade-off accepts that a reporter granted
+access can also see other tickets filed in the same channel, in exchange for keeping the existing
+public-thread-off-the-message flow unchanged. `apply_status_change()` calls
+`_revoke_requestor_access()` to undo the overwrite once the item actually moves to the
+Implemented channel on a terminal status (not merely reaches one — an unconfigured Implemented
+channel leaves the item, and the reporter's access, right where they are) — unless the same
+reporter still has another open item sitting in that same working channel, checked via
+`list_tracker_items(reporter_id=..., guild_id=...)`, in which case the overwrite is left in place
+so it doesn't cut them off from that other item too.
+
 ## Discord surface (`qapbot/ui_tracker.py`)
 
 - `/bug`, `/feature` (`QBdiscordcmds.py`) — thin wrappers around `start_tracker_item()`.
   Registered only when `CONFIG.tracker_enabled`; DM-invokable (no `guild_only()`).
 - `TrackerItemModal` → `TrackerDraftView` (Edit/Add attachments/Submit/Discard, ephemeral,
   session-scoped) → posted item (embed + persistent `TrackerItemButton` row: Edit/Add
-  files/Status/Test cases).
+  files/Status/Test cases/Grant access).
 - Attachments: `attachment1..3` command params are pre-downloaded as a background task
   **immediately after** `send_modal()` — the signed CDN URL on the user's own attachment
   expires while they're still filling in the modal. `Add attachments`/`Add files` instead open

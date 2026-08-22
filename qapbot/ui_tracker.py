@@ -936,6 +936,7 @@ def build_tracker_item_view(item_number: int) -> discord.ui.View:
     view.add_item(TrackerItemButton("addfiles", item_number))
     view.add_item(TrackerItemButton("status", item_number))
     view.add_item(TrackerItemButton("testcases", item_number))
+    view.add_item(TrackerItemButton("grantaccess", item_number))
     return view
 
 
@@ -1108,6 +1109,55 @@ async def _dm_reporter_on_status_change(item: Dict[str, Any]) -> None:
         logging.warning(f"[TRACKER] Failed to DM reporter {user_id} for item #{item['item_number']}: {e}")
 
 
+async def _revoke_requestor_access(item: Dict[str, Any], channel_id: str) -> None:
+    """Undo TrackerItemButton._handle_grant_access()'s channel-wide overwrite once an item
+    archives (moves to the Implemented channel) -- unless the same reporter still has another
+    open item sitting in that same working channel, in which case revoking now would also cut
+    them off from that still-open item. Best-effort: any missing/unresolvable Discord object is
+    logged and skipped, never raised, matching this module's other archive-time side effects
+    (_move_item_to_implemented_channel, _post_tracker_item)."""
+    from qapbot.cache_manager import CACHE
+    import QBcore
+
+    reporter_id = item["reporter_id"]
+    if not reporter_id.isdigit():
+        return
+
+    others = await CACHE.db_manager.list_tracker_items(reporter_id=reporter_id, guild_id=item.get("guild_id"))
+    still_open = any(
+        o["item_number"] != item["item_number"] and o.get("channel_id") == channel_id
+        and o["status"] not in ("done", "rejected", "duplicate")
+        for o in others
+    )
+    if still_open:
+        return
+
+    channel = QBcore.bot.get_channel(int(channel_id))
+    if channel is None:
+        try:
+            channel = await QBcore.bot.fetch_channel(int(channel_id))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            logging.warning(f"[TRACKER] Could not resolve channel {channel_id} to revoke requestor access for item #{item['item_number']}: {e}")
+            return
+
+    guild_id = item.get("guild_id")
+    if not guild_id:
+        return
+    guild = QBcore.bot.get_guild(int(guild_id))
+    if guild is None:
+        return
+    member = guild.get_member(int(reporter_id))
+    if member is None:
+        return
+
+    try:
+        await channel.set_permissions(  # type: ignore[union-attr]
+            member, overwrite=None, reason=f"Tracker #{item['item_number']} closed: revoke requestor access"
+        )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        logging.warning(f"[TRACKER] Failed to revoke requestor access for item #{item['item_number']}: {e}")
+
+
 async def apply_status_change(
     item_number: int, new_status: str, note: Optional[str] = None, actor_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -1145,6 +1195,7 @@ async def apply_status_change(
         # mark_environment_passed_and_refresh(), the 👍-reaction shortcut, or the manual "Move to
         # Done" action) — never as a side effect of the item reaching a terminal status, and vice
         # versa. Each object moves on its own trigger only.
+        original_channel_id = item.get("channel_id")
         moved = await _move_item_to_implemented_channel(item)
         if not moved:
             implemented_channel_id = CACHE.tracker_settings.get(TRACKER_SETTING_IMPLEMENTED_CHANNEL)
@@ -1152,6 +1203,8 @@ async def apply_status_change(
             await _refresh_item_message(item, archived=already_archived)
         item = await db.get_tracker_item(item_number)
         assert item is not None
+        if moved and original_channel_id:
+            await _revoke_requestor_access(item, original_channel_id)
     else:
         await _refresh_item_message(item)
 
@@ -1243,7 +1296,7 @@ def _startup_gate_message(guild_id: Optional[int]) -> str:
     return t('commands.errors.startup_in_progress', guild_id=guild_id)
 
 
-TRACKER_ITEM_BUTTON_TEMPLATE = r'^tracker:(?P<action>edit|addfiles|status|testcases):(?P<item_number>\d+)$'
+TRACKER_ITEM_BUTTON_TEMPLATE = r'^tracker:(?P<action>edit|addfiles|status|testcases|grantaccess):(?P<item_number>\d+)$'
 
 
 class TrackerItemButton(
@@ -1259,12 +1312,14 @@ class TrackerItemButton(
         "addfiles": 'ui_components.tracker.button_add_files',
         "status": 'ui_components.tracker.button_status',
         "testcases": 'ui_components.tracker.button_test_cases',
+        "grantaccess": 'ui_components.tracker.button_grant_access',
     }
     _STYLES = {
         "edit": discord.ButtonStyle.secondary,
         "addfiles": discord.ButtonStyle.secondary,
         "status": discord.ButtonStyle.primary,
         "testcases": discord.ButtonStyle.secondary,
+        "grantaccess": discord.ButtonStyle.secondary,
     }
 
     def __init__(self, action: str, item_number: int):
@@ -1315,6 +1370,8 @@ class TrackerItemButton(
             await self._handle_status(interaction, item)
         elif self.action == "testcases":
             await self._handle_testcases(interaction, item)
+        elif self.action == "grantaccess":
+            await self._handle_grant_access(interaction, item)
 
     async def _handle_edit(self, interaction: discord.Interaction, item: Dict[str, Any]) -> None:
         if not await _check_reporter_or_admin(interaction, item):
@@ -1381,6 +1438,69 @@ class TrackerItemButton(
         jump_link = f"https://discord.com/channels/{item['guild_id'] or '@me'}/{item['test_channel_id']}/{item['test_message_id']}"
         await interaction.response.send_message(
             t('ui_components.tracker.test_cases_jump', user_id=user_id, guild_id=guild_id, jump_link=jump_link), ephemeral=True
+        )
+
+    async def _handle_grant_access(self, interaction: discord.Interaction, item: Dict[str, Any]) -> None:
+        """Admin-only: give the reporter a channel-wide view/read overwrite so they can see this
+        item and its discussion thread, and reply inside threads — the trade-off the user chose
+        over a per-thread-scoped private thread (BUG_FEATURE_TRACKER.md's grant/revoke section).
+        Reverted by _revoke_requestor_access() once the item archives."""
+        from qapbot.config import CONFIG
+        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+
+        user_id = str(interaction.user.id)
+        guild_id = interaction.guild.id if interaction.guild else None
+        if not check_bot_admin_only(interaction, CONFIG.server_admin):
+            await interaction.response.send_message(
+                t('ui_components.tracker.grant_access_denied', user_id=user_id, guild_id=guild_id), ephemeral=True
+            )
+            return
+
+        reporter_id = item["reporter_id"]
+        if not reporter_id.isdigit():
+            await interaction.response.send_message(
+                t('ui_components.tracker.grant_access_no_user', user_id=user_id, guild_id=guild_id), ephemeral=True
+            )
+            return
+
+        member = interaction.guild.get_member(int(reporter_id)) if interaction.guild else None
+        if member is None and interaction.guild is not None:
+            try:
+                member = await interaction.guild.fetch_member(int(reporter_id))
+            except discord.NotFound:
+                member = None
+        if member is None:
+            await interaction.response.send_message(
+                t('ui_components.tracker.grant_access_member_not_found', user_id=user_id, guild_id=guild_id), ephemeral=True
+            )
+            return
+
+        overwrite = discord.PermissionOverwrite(
+            view_channel=True, read_message_history=True, send_messages_in_threads=True,
+        )
+        try:
+            await interaction.channel.set_permissions(  # type: ignore[union-attr]
+                member, overwrite=overwrite, reason=f"Tracker #{self.item_number}: grant requestor access to reply"
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            logging.warning(f"[TRACKER] Failed to grant requestor access for item #{self.item_number}: {e}")
+            await interaction.response.send_message(
+                t('ui_components.tracker.grant_access_failed', user_id=user_id, guild_id=guild_id), ephemeral=True
+            )
+            return
+
+        # Thread if one exists (same target the reply belongs in), else the item message itself
+        # — mirrors _build_archived_item_embed()'s/_handle_testcases()'s jump-link construction.
+        if item.get("thread_id"):
+            jump_link = f"https://discord.com/channels/{item['guild_id'] or '@me'}/{item['thread_id']}"
+        else:
+            jump_link = f"https://discord.com/channels/{item['guild_id'] or '@me'}/{item['channel_id']}/{item['message_id']}"
+        await interaction.response.send_message(
+            t(
+                'ui_components.tracker.grant_access_granted', user_id=user_id, guild_id=guild_id,
+                reporter_id=reporter_id, jump_link=jump_link,
+            ),
+            ephemeral=True,
         )
 
 
