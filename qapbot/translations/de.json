@@ -520,6 +520,12 @@
     },
     "war_notifications_display": {
       "title": "Verwaltung der Kriegsbenachrichtigungen",
+      "channel_notifications_title": "Kanal-Benachrichtigungen:",
+      "channel_notifications_channel": "Kanal: {channel}",
+      "channel_notifications_mentions": "Erwähnungen: {mentions}",
+      "channel_not_configured": "Kein Kanal konfiguriert",
+      "no_custodians": "Keine Betreuer festgelegt",
+      "personal_dm_title": "Persönliche DM-Benachrichtigungen:",
       "players_with_accounts": "Spieler mit Accounts in diesem Clan: {count}",
       "legend_title": "Legende",
       "legend_verified": "Verifiziert",

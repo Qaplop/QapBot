@@ -4296,10 +4296,29 @@ async def _format_clan_management_notifications(clan_tag: str, guild: discord.Gu
     
     guild_id = str(guild.id)
     guild_id_int = int(guild_id)
-    
+
     # Get clan name
     clan_name = CACHE.get_clan_name(clan_tag, "Unknown Clan")
-    
+
+    # Build the "Channel Notifications" summary section (guild-wide channel + per-clan custodians)
+    guild_config = CACHE.server_config.get(guild_id, {})
+    channel_notifications_enabled = guild_config.get("channel_war_notifications_enabled", False)
+    war_notification_channel_id = guild_config.get("war_notification_channel_id")
+    custodian_ids = guild_config.get("clan_custodians", {}).get(clan_tag, [])
+
+    channel_status_emoji = BotEmojis.ENABLED if channel_notifications_enabled else BotEmojis.DISABLED
+    channel_display = f"<#{war_notification_channel_id}>" if war_notification_channel_id else t('ui_components.war_notifications_display.channel_not_configured', guild_id=guild_id_int)
+    if custodian_ids:
+        mentions_display = ", ".join(f"<@{uid}>" for uid in custodian_ids)
+    else:
+        mentions_display = t('ui_components.war_notifications_display.no_custodians', guild_id=guild_id_int)
+
+    channel_section_text = (
+        f"{channel_status_emoji} **{t('ui_components.war_notifications_display.channel_notifications_title', guild_id=guild_id_int)}**\n"
+        f"{t('ui_components.war_notifications_display.channel_notifications_channel', guild_id=guild_id_int, channel=channel_display)}\n"
+        f"{t('ui_components.war_notifications_display.channel_notifications_mentions', guild_id=guild_id_int, mentions=mentions_display)}\n\n"
+    )
+
     # Get current clan members from API (via cache)
     try:
         clan_obj = await CACHE.coc_clan_cache.get_clan(clan_tag)
@@ -4339,7 +4358,7 @@ async def _format_clan_management_notifications(clan_tag: str, guild: discord.Gu
     if not users_with_players_in_clan:
         main_embed = discord.Embed(color=0x2B2D31)
         main_embed.set_author(name=f"{clan_name} ({clan_tag})")
-        main_embed.description = f"**{t('ui_components.war_notifications_display.title', guild_id=guild_id_int)}**\n\n{t('ui_components.war_notifications_display.no_players_found', guild_id=guild_id_int)}"
+        main_embed.description = f"**{t('ui_components.war_notifications_display.title', guild_id=guild_id_int)}**\n\n{channel_section_text}{t('ui_components.war_notifications_display.no_players_found', guild_id=guild_id_int)}"
         return main_embed, None, [], []
     
     # Build output grouped by Discord user
@@ -4428,7 +4447,9 @@ async def _format_clan_management_notifications(clan_tag: str, guild: discord.Gu
         user_sections.append(user_section)
     
     # Build header with count and legend
-    header_text = f"**{t('ui_components.war_notifications_display.title', guild_id=guild_id_int)}**\n"
+    header_text = f"**{t('ui_components.war_notifications_display.title', guild_id=guild_id_int)}**\n\n"
+    header_text += channel_section_text
+    header_text += f"**{t('ui_components.war_notifications_display.personal_dm_title', guild_id=guild_id_int)}**\n"
     header_text += f"{t('ui_components.war_notifications_display.players_with_accounts', guild_id=guild_id_int, count=len(users_with_players_in_clan))}\n\n"
     header_text += f"**{t('ui_components.war_notifications_display.legend_title', guild_id=guild_id_int)}:**\n"
     header_text += f"{BotEmojis.VERIFIED} {t('ui_components.war_notifications_display.legend_verified', guild_id=guild_id_int)}  {BotEmojis.GCHECK} {t('ui_components.war_notifications_display.legend_registered', guild_id=guild_id_int)}  🔹 {t('ui_components.war_notifications_display.legend_player_other_clan', guild_id=guild_id_int)}\n"

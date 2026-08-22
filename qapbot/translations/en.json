@@ -520,6 +520,12 @@
     },
     "war_notifications_display": {
       "title": "War Notification Management",
+      "channel_notifications_title": "Channel Notifications:",
+      "channel_notifications_channel": "Channel: {channel}",
+      "channel_notifications_mentions": "Mentions: {mentions}",
+      "channel_not_configured": "No channel configured",
+      "no_custodians": "No custodians set",
+      "personal_dm_title": "Personal DM notifications:",
       "players_with_accounts": "Players with accounts in this clan: {count}",
       "legend_title": "Legend",
       "legend_verified": "Verified",
