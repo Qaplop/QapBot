@@ -48,6 +48,77 @@ async def _link(db: WarHistoryDB, discord_id: str, player_tag: str, clan_tag=Non
     await db.conn.commit()
 
 
+class TestNewSignupsAdoptTheGlobalResponse:
+    """cwl_player_season_status is the global source of truth for whether a player has already
+    answered (rule h). start_cwl_enrollment seeded new local rows from it; four other creation
+    paths hardcoded 'pending' and would have contradicted a response the player already gave to
+    a different guild. Verified latent at fix time (0 drifted rows live) but fully reachable —
+    31 of 116 global rows already held a real response."""
+
+    @pytest.mark.asyncio
+    async def test_seed_helper_adopts_an_existing_global_response(self, db):
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        db.set_cwl_player_response_status_sync(
+            "#ANSWERED", "2026-09", "Answered", "owner1", "confirmed", "2026-09-01T10:00Z", 1, "900",
+        )
+        assert cwl._seed_status_from_global_sync(db, "#ANSWERED", "2026-09") == "confirmed"
+
+    @pytest.mark.asyncio
+    async def test_seed_helper_defaults_to_pending_without_a_global_row(self, db):
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        assert cwl._seed_status_from_global_sync(db, "#NEVERSEEN", "2026-09") == "pending"
+
+    @pytest.mark.asyncio
+    async def test_seed_helper_is_season_scoped(self, db):
+        """A response belongs to one season — last season's answer must not leak into this one."""
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        db.set_cwl_player_response_status_sync(
+            "#LASTSEASON", "2026-08", "Old", "owner1", "declined", "2026-08-01T10:00Z", 1, "900",
+        )
+        assert cwl._seed_status_from_global_sync(db, "#LASTSEASON", "2026-09") == "pending"
+
+    @pytest.mark.asyncio
+    async def test_placement_creates_a_signup_carrying_the_global_response(self, db, monkeypatch):
+        """assign_cwl_player_sync's placement path — the drag-and-drop route. A player already
+        'declined' globally must not reappear as 'pending' in the guild that just placed them."""
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "907", "#CLANG")
+        CACHE.db_manager = db
+        monkeypatch.setattr(cwl, "resolve_guild_member_clan_tags", lambda *a, **k: ["#CLANG"])
+        db.set_cwl_player_response_status_sync(
+            "#PLACED", "2026-09", "Placed", "owner1", "declined", "2026-09-01T10:00Z", 99, "908",
+        )
+
+        cwl.assign_cwl_player_sync(907, event_id, "2026-09", "#PLACED", "#CLANG", source="admin")
+
+        assert db.get_cwl_signup_sync(event_id, "#PLACED")["status"] == "declined"
+
+    @pytest.mark.asyncio
+    async def test_placement_does_not_overwrite_an_existing_local_row(self, db, monkeypatch):
+        """The seeding is create-only. All four call sites sit inside
+        `if get_cwl_signup_sync(...) is None` and that must stay true, or a placement would
+        silently rewrite a status the local guild had already recorded."""
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "909", "#CLANH")
+        CACHE.db_manager = db
+        monkeypatch.setattr(cwl, "resolve_guild_member_clan_tags", lambda *a, **k: ["#CLANH"])
+        db.upsert_cwl_signup_sync(event_id, "#KEEP", "Keep", "owner1", None, "template_confirm", "confirmed")
+        db.set_cwl_player_response_status_sync(
+            "#KEEP", "2026-09", "Keep", "owner1", "declined", "2026-09-01T10:00Z", 99, "910",
+        )
+
+        cwl.assign_cwl_player_sync(909, event_id, "2026-09", "#KEEP", "#CLANH", source="admin")
+
+        assert db.get_cwl_signup_sync(event_id, "#KEEP")["status"] == "confirmed"
+
+
 class TestCarryForwardWritesUseLiveOwner:
     """Every READ path re-resolves ownership live, so a stale snapshot value can no longer
     mis-route a DM or grey out a tile. But the write paths that COPY one snapshot into the other

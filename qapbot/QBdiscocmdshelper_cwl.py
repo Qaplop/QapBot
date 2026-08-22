@@ -835,6 +835,30 @@ def _create_new_shared_clan_sync(
     }
 
 
+def _seed_status_from_global_sync(db: Any, player_tag: str, cwl_season: str) -> str:
+    """The status a NEW local cwl_signups row must start in, for this player and season.
+
+    cwl_player_season_status is the global source of truth for whether a player has already
+    answered (rule h, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md — project owner's spec: "that
+    status is shown automatically in guild a's and guild B's clan rosters. no need to manage
+    anything manually"). A response is a fact about the *player and season*, not about whichever
+    guild happened to DM them, so a local row created afterwards by a DIFFERENT guild must adopt
+    it rather than starting fresh at 'pending' and contradicting what the player already said.
+
+    start_cwl_enrollment() already does this via the bulk reader; this is the single-player
+    equivalent for the four other paths that create signup rows (2026-08-22 audit: the
+    cross-guild orphan mirror, drag-and-drop placement, the auto_seeded pool seed and the guest
+    invite all hardcoded 'pending'). Verified latent rather than active at the time of the fix —
+    0 live rows had drifted — but 31 of 116 global rows already held a real response, so the
+    precondition was fully in place.
+
+    Callers must still only use this when CREATING a row: an existing local row is never
+    overwritten from here (all four call sites sit inside `if get_cwl_signup_sync(...) is None`).
+    """
+    existing_global = db.get_cwl_player_season_status_sync(player_tag, cwl_season)
+    return existing_global["status"] if existing_global else "pending"
+
+
 def _live_owners_or_sync(db: Any, player_tags: List[str]) -> Dict[str, Optional[str]]:
     """player_tag -> the account's CURRENT owner from user_players, for carry-forward writes.
 
@@ -1213,7 +1237,8 @@ def assign_cwl_player_sync(
                         )
                         db.upsert_cwl_signup_sync(
                             event_id, player_tag, other_shared_row["player_name"],
-                            mirrored_owner, None, signup_source, "pending",
+                            mirrored_owner, None, signup_source,
+                            _seed_status_from_global_sync(db, player_tag, season),
                         )
                     db.upsert_cwl_assignment_sync(
                         event_id, player_tag, chosen[1], assignment_source="orphaned_elsewhere", locked=False,
@@ -1280,7 +1305,8 @@ def assign_cwl_player_sync(
         player_name, discord_id = _resolve_identity(list(set(resolve_guild_member_clan_tags(guild_id)) | {str(target_clan_tag)}))
         if db.get_cwl_signup_sync(event_id, player_tag) is None:
             db.upsert_cwl_signup_sync(
-                event_id, player_tag, player_name, discord_id, None, signup_source, "pending"
+                event_id, player_tag, player_name, discord_id, None, signup_source,
+                _seed_status_from_global_sync(db, player_tag, season),
             )
         db.upsert_cwl_assignment_sync(
             event_id, player_tag, str(target_clan_tag),
@@ -1497,7 +1523,7 @@ def _auto_assign_prior_cwl_members_sync(guild_id: int, event_id: int, season: st
                 continue
             db.upsert_cwl_signup_sync(
                 event_id, tag, member["player_name"], member["discord_id"], member.get("preferred_league_rank"),
-                "auto_seeded", "pending",
+                "auto_seeded", _seed_status_from_global_sync(db, tag, season),
             )
 
     if shared is not None:
