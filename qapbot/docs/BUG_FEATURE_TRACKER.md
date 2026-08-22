@@ -165,6 +165,23 @@ reporter still has another open item sitting in that same working channel, check
 `list_tracker_items(reporter_id=..., guild_id=...)`, in which case the overwrite is left in place
 so it doesn't cut them off from that other item too.
 
+**DM invite for reporters who aren't guild members (2026-08-22, ticket #0021 follow-up)**: most
+reporters file via DM and never join the server, so `_handle_grant_access()`'s member lookup
+usually fails. Instead of stopping there, `_invite_requestor()` resolves the reporter as a plain
+`discord.User` (`get_user`/`fetch_user`, same idiom `_dm_reporter_on_status_change()` already
+uses), creates a 7-day single-use invite to that channel (`channel.create_invite()` — needs the
+bot to hold **Create Invite** on the tracker channel(s), or this step fails with
+`grant_access_invite_failed`), DMs it to them, and sets `tracker_items.access_grant_pending = 1`
+on the item as soon as the invite exists (independent of whether the DM itself lands — a closed-DM
+failure still reports the invite URL back to the admin ephemerally so it can be forwarded by
+hand). `apply_pending_requestor_access()`, called from `QapBot.py`'s `on_member_join`, finishes
+the grant automatically once the reporter actually joins — same overwrite `_handle_grant_access()`
+applies, for every still-open item with `access_grant_pending` set for that member, then clears
+the flag and DMs a jump link. It's gated on `CONFIG.tracker_enabled` as its first line, same
+reasoning as `handle_tracker_test_reaction()` above and Pitfall 39: `on_member_join` is a raw
+gateway event, not a component interaction, so it fires on every bot present in the guild —
+including DEV, whose DB is a routine PROD-backup copy that can contain the exact same pending row.
+
 ## Discord surface (`qapbot/ui_tracker.py`)
 
 - `/bug`, `/feature` (`QBdiscordcmds.py`) — thin wrappers around `start_tracker_item()`.

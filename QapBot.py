@@ -3377,7 +3377,17 @@ async def on_member_join(member: discord.Member) -> None:
     from qapbot.i18n import t  # type: ignore[attr-defined]
     
     logging.info(f"User {member.display_name} (id={member.id}) joined guild {member.guild.name} (id={member.guild.id})")
-    
+
+    # Tracker "Reply to requestor" pending access (ticket #0021 follow-up, 2026-08-22): finish
+    # granting channel access to a reporter who was invited via DM while not yet a guild member.
+    # apply_pending_requestor_access() gates on CONFIG.tracker_enabled itself (see its own
+    # docstring) — this is a raw gateway event, fired on every bot in the guild including DEV.
+    try:
+        from qapbot.ui_tracker import apply_pending_requestor_access
+        await apply_pending_requestor_access(member)
+    except Exception as e:
+        logging.error(f"[TRACKER] Failed to apply pending requestor access for {member.id}: {e}")
+
     # Assign newbie role if configured
     try:
         await assign_newbie_role(member.guild, member.id)

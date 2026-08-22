@@ -24,6 +24,7 @@ from qapbot.ui_tracker import (
     TrackerItemButton,
     TrackerItemModal,
     _sanitize_attachment_filename,
+    apply_pending_requestor_access,
     apply_status_change,
     build_tracker_embed,
     create_tracker_item_for_agent,
@@ -1102,6 +1103,158 @@ async def test_grant_access_skips_agent_filed_item(db, monkeypatch, mock_interac
     await button._handle_grant_access(mock_interaction, item)
 
     mock_interaction.channel.set_permissions.assert_not_awaited()
+
+
+async def test_grant_access_invites_non_member_reporter(db, monkeypatch, mock_interaction):
+    fake_user = AsyncMock()
+    _wire_bot(monkeypatch, channel=None, user=fake_user)
+    item_number = await _make_item(db, reporter_id="222")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+    mock_interaction.guild.get_member = MagicMock(return_value=None)
+    mock_interaction.guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "not found"))
+    mock_interaction.channel.set_permissions = AsyncMock()
+    mock_interaction.channel.create_invite = AsyncMock(return_value=MagicMock(url="https://discord.gg/abc123"))
+
+    button = TrackerItemButton("grantaccess", item_number)
+    await button._handle_grant_access(mock_interaction, item)
+
+    mock_interaction.channel.create_invite.assert_awaited_once()
+    mock_interaction.channel.set_permissions.assert_not_awaited()
+    fake_user.send.assert_awaited_once()
+    dm_text = fake_user.send.call_args[0][0]
+    assert "https://discord.gg/abc123" in dm_text
+
+    updated = await db.get_tracker_item(item_number)
+    assert updated["access_grant_pending"] == 1
+
+    response_text = mock_interaction.response.send_message.call_args[0][0]
+    assert "https://discord.gg/abc123" in response_text
+
+
+async def test_grant_access_invite_dm_failure_still_reports_invite_url(db, monkeypatch, mock_interaction):
+    fake_user = AsyncMock()
+    fake_user.send = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "blocked"))
+    _wire_bot(monkeypatch, channel=None, user=fake_user)
+    item_number = await _make_item(db, reporter_id="222")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+    mock_interaction.guild.get_member = MagicMock(return_value=None)
+    mock_interaction.guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "not found"))
+    mock_interaction.channel.create_invite = AsyncMock(return_value=MagicMock(url="https://discord.gg/abc123"))
+
+    button = TrackerItemButton("grantaccess", item_number)
+    await button._handle_grant_access(mock_interaction, item)
+
+    response_text = mock_interaction.response.send_message.call_args[0][0]
+    assert "https://discord.gg/abc123" in response_text
+    updated = await db.get_tracker_item(item_number)
+    assert updated["access_grant_pending"] == 1
+
+
+async def test_grant_access_invite_creation_failure(db, monkeypatch, mock_interaction):
+    fake_user = AsyncMock()
+    _wire_bot(monkeypatch, channel=None, user=fake_user)
+    item_number = await _make_item(db, reporter_id="222")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+    mock_interaction.guild.get_member = MagicMock(return_value=None)
+    mock_interaction.guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "not found"))
+    mock_interaction.channel.create_invite = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "no perms"))
+
+    button = TrackerItemButton("grantaccess", item_number)
+    await button._handle_grant_access(mock_interaction, item)
+
+    fake_user.send.assert_not_awaited()
+    updated = await db.get_tracker_item(item_number)
+    assert updated["access_grant_pending"] == 0
+
+
+async def test_grant_access_member_not_found_when_reporter_user_unresolvable(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None, user=None)
+    item_number = await _make_item(db, reporter_id="222")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+    mock_interaction.guild.get_member = MagicMock(return_value=None)
+    mock_interaction.guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "not found"))
+    mock_interaction.channel.create_invite = AsyncMock()
+
+    button = TrackerItemButton("grantaccess", item_number)
+    await button._handle_grant_access(mock_interaction, item)
+
+    mock_interaction.channel.create_invite.assert_not_awaited()
+
+
+# -- apply_pending_requestor_access (on_member_join) --------------------
+
+async def test_apply_pending_requestor_access_grants_and_clears_flag(db, monkeypatch):
+    channel = _fake_channel()
+    channel.set_permissions = AsyncMock()
+
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(
+        item_number, channel_id="10", message_id="100", status="open", access_grant_pending=1
+    )
+
+    member = AsyncMock()
+    member.id = 222
+    member.guild = MagicMock()
+    member.guild.id = 999
+    member.guild.get_channel = MagicMock(return_value=channel)
+
+    await apply_pending_requestor_access(member)
+
+    channel.set_permissions.assert_awaited_once()
+    args, kwargs = channel.set_permissions.call_args
+    assert args[0] is member
+    assert kwargs["overwrite"].view_channel is True
+    member.send.assert_awaited_once()
+
+    updated = await db.get_tracker_item(item_number)
+    assert updated["access_grant_pending"] == 0
+
+
+async def test_apply_pending_requestor_access_skips_terminal_item(db, monkeypatch):
+    channel = _fake_channel()
+    channel.set_permissions = AsyncMock()
+
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(
+        item_number, channel_id="10", message_id="100", status="done", access_grant_pending=1
+    )
+
+    member = AsyncMock()
+    member.id = 222
+    member.guild = MagicMock()
+    member.guild.id = 999
+    member.guild.get_channel = MagicMock(return_value=channel)
+
+    await apply_pending_requestor_access(member)
+
+    channel.set_permissions.assert_not_awaited()
+
+
+async def test_apply_pending_requestor_access_noop_when_tracker_disabled(db, monkeypatch):
+    from qapbot.config import CONFIG
+    import dataclasses
+    monkeypatch.setattr("qapbot.config.CONFIG", dataclasses.replace(CONFIG, tracker_enabled=False))
+
+    channel = _fake_channel()
+    channel.set_permissions = AsyncMock()
+
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(
+        item_number, channel_id="10", message_id="100", status="open", access_grant_pending=1
+    )
+
+    member = AsyncMock()
+    member.id = 222
+    member.guild = MagicMock()
+    member.guild.id = 999
+
+    await apply_pending_requestor_access(member)
+
+    channel.set_permissions.assert_not_awaited()
 
 
 async def test_apply_status_change_done_revokes_requestor_access_when_moved(db, monkeypatch):

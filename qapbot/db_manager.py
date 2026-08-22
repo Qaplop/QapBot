@@ -2800,6 +2800,13 @@ class WarHistoryDB:
         await self._add_column_if_missing("tracker_items", "priority", "TEXT NOT NULL DEFAULT 'MEDIUM'")
         await self._add_column_if_missing("tracker_testcases", "priority", "TEXT NOT NULL DEFAULT 'MEDIUM'")
 
+        # Set by _handle_grant_access() (ui_tracker.py) when "Reply to requestor" is clicked for
+        # a reporter who isn't a guild member yet -- they get DM'd an invite instead of failing
+        # outright, and apply_pending_requestor_access() (called from QapBot.py's on_member_join)
+        # finishes the channel-access grant once they actually join. Cleared back to 0 once that
+        # happens (ticket #0021 follow-up, 2026-08-22).
+        await self._add_column_if_missing("tracker_items", "access_grant_pending", "INTEGER NOT NULL DEFAULT 0")
+
         await self._conn.commit()
         logging.debug("[DB-SCHEMA] Bug/feature tracker tables verified")
 
@@ -2911,6 +2918,7 @@ class WarHistoryDB:
         "implemented_note", "implemented_at", "closed_at",
         "last_edited_by", "last_edited_at",
         "test_channel_id", "test_message_id",
+        "access_grant_pending",
     })
 
     async def update_tracker_item(self, item_number: int, **fields: Any) -> None:

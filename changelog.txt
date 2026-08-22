@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (23)
+- Added: DM invite + auto-grant-on-join for tracker reporters who aren't guild members (ticket
+  #0021 follow-up) -- most reporters file via DM and never join the server, so "Reply to
+  requestor" usually hit "member not found" and dead-ended. `_handle_grant_access()`'s
+  `_invite_requestor()` now DMs a 7-day single-use channel invite instead of failing outright,
+  and sets the new `tracker_items.access_grant_pending` flag. `apply_pending_requestor_access()`,
+  wired into `QapBot.py`'s `on_member_join`, finishes the same channel-access grant automatically
+  once the reporter actually joins -- no second click -- then DMs them a jump link, clearing the
+  flag. Gated on `CONFIG.tracker_enabled` as its first line: `on_member_join` is a raw gateway
+  event (fires on every bot in the guild, including DEV, whose DB is a routine PROD-backup copy
+  that can contain the exact same pending row) -- same reasoning already documented for the
+  👍-reaction shortcut (Pitfall 39). Files: qapbot/db_manager.py, qapbot/ui_tracker.py,
+  QapBot.py, qapbot/translations/{en,de}.json, qapbot/docs/BUG_FEATURE_TRACKER.md,
+  tests/discord/test_ui_tracker_items.py, plans/implemented/tracker-0021-dm-invite-auto-grant.md.
+
 2026-08-22 (22)
 - Added: "Reply to requestor" button on posted tracker items (`grantaccess` action,
   `TrackerItemButton._handle_grant_access()`, admin-only) -- reporters can't normally see the

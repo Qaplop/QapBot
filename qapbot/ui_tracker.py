@@ -989,6 +989,15 @@ async def _post_tracker_item(item_number: int, channel_id: int) -> Tuple[Optiona
     return message, thread
 
 
+def _item_jump_link(item: Dict[str, Any]) -> str:
+    """Discussion thread if one exists, else the item message itself — the target a reporter
+    granted access should land on. Used by _handle_grant_access()'s success response and
+    apply_pending_requestor_access()'s post-join DM."""
+    if item.get("thread_id"):
+        return f"https://discord.com/channels/{item['guild_id'] or '@me'}/{item['thread_id']}"
+    return f"https://discord.com/channels/{item['guild_id'] or '@me'}/{item['channel_id']}/{item['message_id']}"
+
+
 def _build_archived_item_embed(item: Dict[str, Any]) -> discord.Embed:
     """The embed used once an item is sitting in the Implemented channel: the normal embed plus
     a "Discussion thread" jump-link field, since threads can't move channels — once the item's
@@ -1156,6 +1165,61 @@ async def _revoke_requestor_access(item: Dict[str, Any], channel_id: str) -> Non
         )
     except (discord.Forbidden, discord.HTTPException) as e:
         logging.warning(f"[TRACKER] Failed to revoke requestor access for item #{item['item_number']}: {e}")
+
+
+async def apply_pending_requestor_access(member: discord.Member) -> None:
+    """Called from QapBot.py's on_member_join: finishes what _handle_grant_access()'s
+    _invite_requestor() started for a reporter who wasn't a guild member yet — applies the same
+    channel overwrite now that they've actually joined, for every still-open item where an admin
+    already clicked "Reply to requestor" (access_grant_pending), no second click needed.
+
+    Explicitly gated on CONFIG.tracker_enabled, same reasoning as handle_tracker_test_reaction()
+    (BUG_FEATURE_TRACKER.md's architecture section / Pitfall 39): on_member_join is a raw gateway
+    event, not a component interaction, so it fires on every bot present in the guild — including
+    DEV, whose DB is a routine PROD-backup copy that can contain the exact same pending row."""
+    from qapbot.config import CONFIG
+    if not CONFIG.tracker_enabled:
+        return
+    from qapbot.cache_manager import CACHE
+
+    items = await CACHE.db_manager.list_tracker_items(reporter_id=str(member.id), guild_id=str(member.guild.id))
+    pending = [
+        i for i in items
+        if i.get("access_grant_pending") and i["status"] not in ("done", "rejected", "duplicate") and i.get("channel_id")
+    ]
+    if not pending:
+        return
+
+    overwrite = discord.PermissionOverwrite(
+        view_channel=True, read_message_history=True, send_messages_in_threads=True,
+    )
+    for item in pending:
+        channel = member.guild.get_channel(int(item["channel_id"]))
+        if channel is None:
+            try:
+                channel = await member.guild.fetch_channel(int(item["channel_id"]))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                logging.warning(f"[TRACKER] Could not resolve channel to finish pending access grant for item #{item['item_number']}: {e}")
+                continue
+        try:
+            await channel.set_permissions(  # type: ignore[union-attr]
+                member, overwrite=overwrite,
+                reason=f"Tracker #{item['item_number']}: requestor joined, applying pending access",
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            logging.warning(f"[TRACKER] Failed to apply pending requestor access for item #{item['item_number']}: {e}")
+            continue
+
+        await CACHE.db_manager.update_tracker_item(item["item_number"], access_grant_pending=0)
+        try:
+            await member.send(
+                t(
+                    'ui_components.tracker.grant_access_pending_applied', user_id=str(member.id), guild_id=member.guild.id,
+                    item_number=f"{item['item_number']:04d}", jump_link=_item_jump_link(item),
+                )
+            )
+        except discord.Forbidden:
+            logging.info(f"[TRACKER] Could not DM {member.id} that pending access for item #{item['item_number']} was applied (closed DMs)")
 
 
 async def apply_status_change(
@@ -1444,7 +1508,9 @@ class TrackerItemButton(
         """Admin-only: give the reporter a channel-wide view/read overwrite so they can see this
         item and its discussion thread, and reply inside threads — the trade-off the user chose
         over a per-thread-scoped private thread (BUG_FEATURE_TRACKER.md's grant/revoke section).
-        Reverted by _revoke_requestor_access() once the item archives."""
+        Reverted by _revoke_requestor_access() once the item archives. If the reporter isn't a
+        guild member (the common case — most reporters file via DM and never join), falls back
+        to _invite_requestor() instead of failing outright."""
         from qapbot.config import CONFIG
         from qapbot.QBdiscocmdshelper import check_bot_admin_only
 
@@ -1470,9 +1536,7 @@ class TrackerItemButton(
             except discord.NotFound:
                 member = None
         if member is None:
-            await interaction.response.send_message(
-                t('ui_components.tracker.grant_access_member_not_found', user_id=user_id, guild_id=guild_id), ephemeral=True
-            )
+            await self._invite_requestor(interaction, item, reporter_id)
             return
 
         overwrite = discord.PermissionOverwrite(
@@ -1489,17 +1553,69 @@ class TrackerItemButton(
             )
             return
 
-        # Thread if one exists (same target the reply belongs in), else the item message itself
-        # — mirrors _build_archived_item_embed()'s/_handle_testcases()'s jump-link construction.
-        if item.get("thread_id"):
-            jump_link = f"https://discord.com/channels/{item['guild_id'] or '@me'}/{item['thread_id']}"
-        else:
-            jump_link = f"https://discord.com/channels/{item['guild_id'] or '@me'}/{item['channel_id']}/{item['message_id']}"
         await interaction.response.send_message(
             t(
                 'ui_components.tracker.grant_access_granted', user_id=user_id, guild_id=guild_id,
-                reporter_id=reporter_id, jump_link=jump_link,
+                reporter_id=reporter_id, jump_link=_item_jump_link(item),
             ),
+            ephemeral=True,
+        )
+
+    async def _invite_requestor(self, interaction: discord.Interaction, item: Dict[str, Any], reporter_id: str) -> None:
+        """Reporter isn't a guild member — DM them a single-use invite instead of just failing,
+        and mark access_grant_pending so apply_pending_requestor_access() (on_member_join) can
+        finish the grant automatically once they actually join, with no second click needed."""
+        import QBcore
+
+        user_id = str(interaction.user.id)
+        guild_id = interaction.guild.id if interaction.guild else None
+
+        reporter_user = QBcore.bot.get_user(int(reporter_id))
+        if reporter_user is None:
+            try:
+                reporter_user = await QBcore.bot.fetch_user(int(reporter_id))
+            except discord.NotFound:
+                reporter_user = None
+        if reporter_user is None:
+            await interaction.response.send_message(
+                t('ui_components.tracker.grant_access_member_not_found', user_id=user_id, guild_id=guild_id), ephemeral=True
+            )
+            return
+
+        try:
+            invite = await interaction.channel.create_invite(  # type: ignore[union-attr]
+                max_age=604800, max_uses=1, unique=True,
+                reason=f"Tracker #{self.item_number}: invite requestor to reply",
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            logging.warning(f"[TRACKER] Failed to create invite for item #{self.item_number}: {e}")
+            await interaction.response.send_message(
+                t('ui_components.tracker.grant_access_invite_failed', user_id=user_id, guild_id=guild_id), ephemeral=True
+            )
+            return
+
+        from qapbot.cache_manager import CACHE
+        await CACHE.db_manager.update_tracker_item(self.item_number, access_grant_pending=1)
+
+        try:
+            await reporter_user.send(
+                t(
+                    'ui_components.tracker.grant_access_invite_dm', user_id=reporter_id, guild_id=guild_id,
+                    item_number=f"{self.item_number:04d}", invite_url=invite.url,
+                )
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                t(
+                    'ui_components.tracker.grant_access_invite_dm_failed', user_id=user_id, guild_id=guild_id,
+                    invite_url=invite.url,
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            t('ui_components.tracker.grant_access_invited', user_id=user_id, guild_id=guild_id, invite_url=invite.url),
             ephemeral=True,
         )
 
