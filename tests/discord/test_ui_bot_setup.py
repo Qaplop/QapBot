@@ -13,8 +13,10 @@ os.environ.setdefault("DISCORD_TOKEN", "test-token")
 
 from qapbot.ui_tracker import (
     TRACKER_SETTING_BUG_CHANNEL,
+    TRACKER_SETTING_DONE_TESTING_CHANNEL,
     TRACKER_SETTING_ENABLED,
     TRACKER_SETTING_GUILD_ID,
+    TRACKER_SETTING_IMPLEMENTED_CHANNEL,
     TRACKER_SETTING_TEST_CHANNEL,
     BotSetupView,
     start_bot_setup,
@@ -81,12 +83,14 @@ def test_channel_select_prefilled_with_current_channel():
     bug_select = next(item for item in view.children if getattr(item, "custom_id", None) == "tracker_setup_channel_bug")
     assert [dv.id for dv in bug_select.default_values] == [bug_channel.id]
 
-    # Only "bug" (now serving both bugs and features) and "test" slots exist any more.
     slot_custom_ids = {
         item.custom_id for item in view.children
         if isinstance(item, discord.ui.ChannelSelect)
     }
-    assert slot_custom_ids == {"tracker_setup_channel_bug", "tracker_setup_channel_test"}
+    assert slot_custom_ids == {
+        "tracker_setup_channel_bug", "tracker_setup_channel_test",
+        "tracker_setup_channel_implemented", "tracker_setup_channel_done_testing",
+    }
 
 
 @pytest.mark.discord
@@ -135,6 +139,23 @@ def test_format_header_shows_configured_channel_and_enabled_status():
     assert "Enabled" in header
 
 
+@pytest.mark.discord
+def test_format_header_shows_all_four_configured_channels():
+    channels = {}
+    for cid in (111, 222, 333, 444):
+        ch = MagicMock(spec=discord.TextChannel)
+        ch.id = cid
+        ch.mention = f"<#{cid}>"
+        channels[cid] = ch
+    guild = _make_guild(channels)
+    view = _make_view(guild=guild, current_channel_ids={
+        "bug": "111", "test": "222", "implemented": "333", "done_testing": "444",
+    })
+    header = view.format_header()
+    for cid in (111, 222, 333, 444):
+        assert f"<#{cid}>" in header
+
+
 # -- Save --------------------------------------------------------------------
 
 @pytest.mark.discord
@@ -155,7 +176,28 @@ async def test_on_save_persists_every_configured_channel_and_guild_id(mock_inter
     calls = {call.args[0]: call.args[1] for call in set_setting.await_args_list}
     assert calls[TRACKER_SETTING_BUG_CHANNEL] == "111"
     assert TRACKER_SETTING_TEST_CHANNEL not in calls  # never configured, never written
+    assert TRACKER_SETTING_IMPLEMENTED_CHANNEL not in calls
+    assert TRACKER_SETTING_DONE_TESTING_CHANNEL not in calls
     assert calls[TRACKER_SETTING_GUILD_ID] == "555"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_on_save_persists_implemented_and_done_testing_channels(mock_interaction, monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    set_setting = AsyncMock()
+    monkeypatch.setattr(CACHE, "set_tracker_setting", set_setting)
+
+    guild = _make_guild()
+    view = _make_view(guild=guild, current_channel_ids={"implemented": "333", "done_testing": "444"})
+    view.message = AsyncMock()
+
+    await view._on_save(mock_interaction)
+
+    calls = {call.args[0]: call.args[1] for call in set_setting.await_args_list}
+    assert calls[TRACKER_SETTING_IMPLEMENTED_CHANNEL] == "333"
+    assert calls[TRACKER_SETTING_DONE_TESTING_CHANNEL] == "444"
 
 
 # -- Toggle enabled/disabled --------------------------------------------------

@@ -15,7 +15,9 @@ os.environ.setdefault("DISCORD_TOKEN", "test-token")
 from qapbot.db_manager import WarHistoryDB
 from qapbot.ui_tracker import (
     TRACKER_SETTING_BUG_CHANNEL,
+    TRACKER_SETTING_DONE_TESTING_CHANNEL,
     TRACKER_SETTING_ENABLED,
+    TRACKER_SETTING_IMPLEMENTED_CHANNEL,
     TRACKER_SETTING_TEST_CHANNEL,
     TrackerDraftView,
     TrackerItemModal,
@@ -83,6 +85,21 @@ def _wire_bot(monkeypatch, channel=None, user=None):
     bot = MagicMock()
     bot.get_channel = MagicMock(return_value=channel)
     bot.fetch_channel = AsyncMock(return_value=channel)
+    bot.get_user = MagicMock(return_value=user)
+    bot.fetch_user = AsyncMock(return_value=user)
+    monkeypatch.setattr(QBcore, "bot", bot)
+    return bot
+
+
+def _wire_bot_multi(monkeypatch, channels_by_id, user=None):
+    """Like _wire_bot, but resolves a different channel object per channel id — needed to
+    exercise a move (source channel != destination channel)."""
+    import QBcore
+    bot = MagicMock()
+    bot.get_channel = MagicMock(side_effect=lambda cid: channels_by_id.get(int(cid)))
+    async def _fetch_channel(cid):
+        return channels_by_id.get(int(cid))
+    bot.fetch_channel = AsyncMock(side_effect=_fetch_channel)
     bot.get_user = MagicMock(return_value=user)
     bot.fetch_user = AsyncMock(return_value=user)
     monkeypatch.setattr(QBcore, "bot", bot)
@@ -251,6 +268,100 @@ async def test_apply_status_change_refreshes_posted_message(db, monkeypatch):
     await db.set_tracker_item_message(item_number, channel_id="1", message_id="999")
     await apply_status_change(item_number, "triaged", actor_id="1")
     message.edit.assert_awaited_once()
+
+
+# -- move-on-done (Implemented / Done Testing channels) ----------------------
+
+@pytest.mark.asyncio
+async def test_apply_status_change_done_moves_item_and_test_message(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_IMPLEMENTED_CHANNEL] = "50"
+    CACHE.tracker_settings[TRACKER_SETTING_DONE_TESTING_CHANNEL] = "60"
+
+    old_item_message = _fake_message(message_id=100)
+    old_reports_channel = _fake_channel(fetch_message=old_item_message)
+    new_item_message = _fake_message(message_id=555)
+    implemented_channel = _fake_channel(send_message=new_item_message)
+    implemented_channel.id = 50
+
+    old_test_message = _fake_message(message_id=200)
+    old_test_channel = _fake_channel(fetch_message=old_test_message)
+    new_test_message = _fake_message(message_id=600)
+    done_testing_channel = _fake_channel(send_message=new_test_message)
+    done_testing_channel.id = 60
+
+    _wire_bot_multi(monkeypatch, {
+        10: old_reports_channel, 50: implemented_channel,
+        20: old_test_channel, 60: done_testing_channel,
+    })
+
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
+    await db.update_tracker_item(
+        item_number, channel_id="10", message_id="100", thread_id="777",
+        test_channel_id="20", test_message_id="200", status="testing",
+    )
+
+    updated = await apply_status_change(item_number, "done", actor_id="1")
+
+    # Item embed moved to Implemented.
+    implemented_channel.send.assert_awaited_once()
+    old_item_message.delete.assert_awaited_once()
+    assert updated["channel_id"] == "50"
+    assert updated["message_id"] == "555"
+    assert updated["thread_id"] == "777"  # never wiped by the move
+
+    # Test-case message moved to Done Testing with no interactive view (buttons stripped).
+    done_testing_channel.send.assert_awaited_once()
+    _, send_kwargs = done_testing_channel.send.call_args
+    assert "view" not in send_kwargs or send_kwargs["view"] is None
+    old_test_message.delete.assert_awaited_once()
+    assert updated["test_channel_id"] == "60"
+    assert updated["test_message_id"] == "600"
+
+
+@pytest.mark.asyncio
+async def test_apply_status_change_done_without_implemented_channel_falls_back_to_refresh(db, monkeypatch):
+    message = _fake_message()
+    channel = _fake_channel(fetch_message=message)
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+    await db.set_tracker_item_message(item_number, channel_id="10", message_id="100")
+
+    updated = await apply_status_change(item_number, "done", actor_id="1")
+
+    message.edit.assert_awaited_once()  # in-place refresh, unchanged from before this feature
+    assert updated["channel_id"] == "10"
+    assert updated["message_id"] == "100"
+
+
+@pytest.mark.asyncio
+async def test_apply_status_change_done_skips_move_when_already_in_implemented_channel(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_IMPLEMENTED_CHANNEL] = "50"
+    message = _fake_message()
+    channel = _fake_channel(fetch_message=message)
+    _wire_bot_multi(monkeypatch, {50: channel})
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, channel_id="50", message_id="100")
+
+    await apply_status_change(item_number, "done", actor_id="1")
+
+    channel.send.assert_not_awaited()  # no duplicate post
+    message.edit.assert_awaited_once()  # still refreshed in place
+
+
+@pytest.mark.asyncio
+async def test_apply_status_change_done_without_test_message_skips_test_move_cleanly(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_DONE_TESTING_CHANNEL] = "60"
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+
+    updated = await apply_status_change(item_number, "done", actor_id="1")  # must not raise
+
+    assert updated["status"] == "done"
+    assert updated["test_channel_id"] is None
 
 
 # -- test-case posting + sign-off loop ---------------------------------------

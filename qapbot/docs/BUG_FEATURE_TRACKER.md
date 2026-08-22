@@ -64,6 +64,19 @@ automatically once every environment that has at least one test case is fully pa
 item with only DEV cases never waits on PROD. `❌ Failed` reverts `testing → in_progress`,
 keeping already-passed environments' sign-off (never resets them).
 
+**Move-on-`done` (2026-08-22)**: the moment any path sets `status = done` — the status
+dropdown, the bridge/MCP `tracker_set_status` tool, or the automatic transition above —
+`apply_status_change()` reposts the item's embed into the configured **Implemented** channel
+and deletes the old copy from the reports channel, and (if a test-case message exists) reposts
+that message into the configured **Done Testing** channel with its Pass/Fail buttons stripped
+(no `view=` on the repost) and deletes the old copy from the test channel. Both channels are
+optional — unconfigured means the move is skipped and the item/test-message stay where they
+are, so a setup that never configures them behaves exactly as before this feature existed.
+Discord threads can't move channels, so the reposted item embed adds a "Discussion thread"
+jump-link field when one exists (the old thread otherwise becomes unreachable once its parent
+message is deleted). See `_move_item_to_implemented_channel()` /
+`_move_test_message_to_done_testing_channel()`.
+
 ## Discord surface (`qapbot/ui_tracker.py`)
 
 - `/bug`, `/feature` (`QBdiscordcmds.py`) — thin wrappers around `start_tracker_item()`.
@@ -134,10 +147,11 @@ directory.
 
 - **Enable the tracker**: nothing to set — `/bug`/`/feature` are registered automatically on
   PROD startup (`CONFIG.tracker_enabled = not is_dev_mode`). Just run `/admin` → *Bot Setup* on
-  PROD to configure the two channels (bug & feature reports, manual test cases). `/bug` and
-  `/feature` both post to the same reports channel (tracker item #0006, 2026-08-21 — they used
-  to have separate channels; `item_type` still distinguishes them in the embed/emoji, just not
-  in routing any more).
+  PROD to configure the channels: bug & feature reports, manual test cases, and (optional) the
+  Implemented/Done Testing move-on-`done` archive channels above. `/bug` and `/feature` both
+  post to the same reports channel (tracker item #0006, 2026-08-21 — they used to have separate
+  channels; `item_type` still distinguishes them in the embed/emoji, just not in routing any
+  more).
 - **Disable at runtime without restarting**: `/admin` → *Bot Setup* → "Disable tracker" — this
   flips `bot_settings.tracker_enabled` (the *runtime* switch); `/bug`/`/feature` reply
   ephemerally that the tracker is off. There is no way to disable command *registration* itself

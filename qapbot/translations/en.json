@@ -377,9 +377,11 @@
       "placeholder_clan_search": "Enter clan name or tag (e.g., 'Dark' or '#2C9UR9GJY')"
     },
     "bot_setup": {
-      "header": "🛠️ **Bot Setup — Issue Tracker**\n\n🐞💡 Bug & feature reports  →  {bug_channel}\n🧪 Manual test cases  →  {test_channel}\n\nTracker status: {status}",
+      "header": "🛠️ **Bot Setup — Issue Tracker**\n\n🐞💡 Bug & feature reports  →  {bug_channel}\n🧪 Manual test cases  →  {test_channel}\n✅ Implemented (done)  →  {implemented_channel}\n🏁 Done testing  →  {done_testing_channel}\n\nTracker status: {status}",
       "bug_label": "bug & feature reports",
       "test_label": "manual test cases",
+      "implemented_label": "implemented (done) archive",
+      "done_testing_label": "done testing archive",
       "select_placeholder": "Select {label} channel...",
       "channel_not_set": "❌ Not set",
       "status_enabled": "🟢 Enabled",
@@ -439,6 +441,7 @@
       "testcase_signoff_denied": "🔒 Only a bot admin can sign off test cases.",
       "no_test_cases_yet": "🧪 No test cases posted yet.",
       "test_cases_jump": "🧪 Test cases: {jump_link}",
+      "discussion_thread_field": "Discussion thread",
       "dm_status_implemented": "✅ Your {type} **#{item_number} · {title}** was marked **implemented**!",
       "dm_status_done": "🎉 Your {type} **#{item_number} · {title}** passed verification and is now **done**!",
       "dm_status_rejected": "❌ Your {type} **#{item_number} · {title}** was marked **rejected**.",

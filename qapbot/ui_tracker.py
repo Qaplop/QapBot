@@ -41,6 +41,10 @@ from qapbot.i18n import t
 TRACKER_SETTING_GUILD_ID = "tracker_guild_id"
 TRACKER_SETTING_BUG_CHANNEL = "tracker_bug_channel_id"
 TRACKER_SETTING_TEST_CHANNEL = "tracker_test_channel_id"
+# Items move out of the working channels once closed, so the reports/test channels don't
+# accumulate closed work forever (see apply_status_change()'s move-on-`done` logic).
+TRACKER_SETTING_IMPLEMENTED_CHANNEL = "tracker_implemented_channel_id"
+TRACKER_SETTING_DONE_TESTING_CHANNEL = "tracker_done_testing_channel_id"
 TRACKER_SETTING_ENABLED = "tracker_enabled"
 # tracker_feature_channel_id (tracker item #0006, 2026-08-21) is retired — bugs and features now
 # share TRACKER_SETTING_BUG_CHANNEL. A pre-existing bot_settings row under that old key, if any,
@@ -121,13 +125,25 @@ class BotSetupView(discord.ui.View):
     channels (a "bug" slot and a "feature" slot); the project owner asked to unify them — both
     `/bug` and `/feature` now post to the single "bug" slot's channel below (the old
     tracker_feature_channel_id bot_settings key is retired, see the comment near the setting
-    constants above). Only "bug" (now serving both item types) and "test" remain as slots.
+    constants above).
+
+    "implemented" and "done_testing" (2026-08-22) are the move-on-`done` destinations: once an
+    item's status becomes `done`, apply_status_change() reposts its embed into "implemented"
+    and (if a test-case message exists) its test-case message into "done_testing", deleting the
+    old copies — keeps the "bug"/"test" working channels from accumulating closed items. Both
+    are optional: unconfigured means the move is skipped and the item stays where it is (a
+    setup that never configures them behaves exactly like before this feature existed).
+
+    Row budget: 4 ChannelSelects (rows 0-3) + the Save/Toggle/Close button row (row 4) is
+    Discord's 5-action-row cap exactly — no headroom for a 5th slot without restructuring.
     """
 
     # (slot_key, bot_settings key, i18n label key) — one ChannelSelect row per slot.
     _SLOTS: Tuple[Tuple[str, str, str], ...] = (
         ("bug", TRACKER_SETTING_BUG_CHANNEL, "ui_components.bot_setup.bug_label"),
         ("test", TRACKER_SETTING_TEST_CHANNEL, "ui_components.bot_setup.test_label"),
+        ("implemented", TRACKER_SETTING_IMPLEMENTED_CHANNEL, "ui_components.bot_setup.implemented_label"),
+        ("done_testing", TRACKER_SETTING_DONE_TESTING_CHANNEL, "ui_components.bot_setup.done_testing_label"),
     )
 
     def __init__(
@@ -241,6 +257,8 @@ class BotSetupView(discord.ui.View):
             user_id=self.user_id, guild_id=self.guild.id,
             bug_channel=channel_text("bug"),
             test_channel=channel_text("test"),
+            implemented_channel=channel_text("implemented"),
+            done_testing_channel=channel_text("done_testing"),
             status=t(status_key, user_id=self.user_id, guild_id=self.guild.id),
         )
 
@@ -299,6 +317,8 @@ async def start_bot_setup(interaction: discord.Interaction) -> None:
     current_channel_ids = {
         "bug": CACHE.tracker_settings.get(TRACKER_SETTING_BUG_CHANNEL),
         "test": CACHE.tracker_settings.get(TRACKER_SETTING_TEST_CHANNEL),
+        "implemented": CACHE.tracker_settings.get(TRACKER_SETTING_IMPLEMENTED_CHANNEL),
+        "done_testing": CACHE.tracker_settings.get(TRACKER_SETTING_DONE_TESTING_CHANNEL),
     }
     tracker_enabled = CACHE.tracker_settings.get(TRACKER_SETTING_ENABLED) != "0"
 
@@ -905,6 +925,61 @@ async def _refresh_item_message(item: Dict[str, Any]) -> None:
         logging.warning(f"[TRACKER] Failed to update item #{item['item_number']} message: {e}")
 
 
+async def _move_item_to_implemented_channel(item: Dict[str, Any]) -> bool:
+    """Once an item reaches `done`, repost its embed into the configured Implemented channel
+    and delete the old copy — keeps the working reports channel from accumulating closed items.
+    Returns False (no-op, caller should fall back to an in-place refresh) if the Implemented
+    channel isn't configured or the item is already posted there; never raises (a failed
+    move must not lose the item's DB row, matching _post_tracker_item's convention)."""
+    from qapbot.cache_manager import CACHE
+    import QBcore
+
+    item_number = item["item_number"]
+    channel_id_str = CACHE.tracker_settings.get(TRACKER_SETTING_IMPLEMENTED_CHANNEL)
+    if not channel_id_str or item.get("channel_id") == channel_id_str:
+        return False
+
+    new_channel = QBcore.bot.get_channel(int(channel_id_str))
+    if new_channel is None:
+        try:
+            new_channel = await QBcore.bot.fetch_channel(int(channel_id_str))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            logging.error(f"[TRACKER] Could not resolve Implemented channel for item #{item_number}: {e}")
+            return False
+
+    embed = build_tracker_embed(item)
+    if item.get("thread_id"):
+        # Threads can't move channels — once the old message is deleted below, the thread
+        # becomes an orphan with no visible parent in its own (old) channel, so keep it
+        # reachable via a jump link (same URL scheme as the "Test cases" jump link).
+        jump_link = f"https://discord.com/channels/{item['guild_id'] or '@me'}/{item['thread_id']}"
+        embed.add_field(
+            name=t('ui_components.tracker.discussion_thread_field', guild_id=_lang_guild_id(item)),
+            value=f"[Jump to thread]({jump_link})", inline=False,
+        )
+    view = build_tracker_item_view(item_number)
+    files = await _build_discord_files(item_number)
+    try:
+        new_message = await new_channel.send(embed=embed, view=view, files=files)  # type: ignore[union-attr]
+    except Exception as e:
+        logging.error(f"[TRACKER] Failed to post item #{item_number} to Implemented channel: {e}")
+        return False
+
+    old_channel_id, old_message_id = item.get("channel_id"), item.get("message_id")
+    if old_channel_id and old_message_id:
+        try:
+            old_channel = QBcore.bot.get_channel(int(old_channel_id)) or await QBcore.bot.fetch_channel(int(old_channel_id))
+            old_message = await old_channel.fetch_message(int(old_message_id))  # type: ignore[union-attr]
+            await old_message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            logging.warning(f"[TRACKER] Failed to delete original item #{item_number} message after move: {e}")
+
+    # update_tracker_item(), not set_tracker_item_message() — the latter always overwrites
+    # thread_id (defaulting to None) and would wipe the jump link above's target.
+    await CACHE.db_manager.update_tracker_item(item_number, channel_id=str(new_channel.id), message_id=str(new_message.id))
+    return True
+
+
 async def _dm_reporter_on_status_change(item: Dict[str, Any]) -> None:
     import QBcore
 
@@ -958,7 +1033,21 @@ async def apply_status_change(
     item = await db.get_tracker_item(item_number)
     assert item is not None
 
-    await _refresh_item_message(item)
+    if new_status == "done":
+        # Move-on-done: repost the item into the Implemented channel, and (if a test-case
+        # message exists) the test-case message into Done Testing — both are single-choke-point
+        # here so this covers the status dropdown, the bridge/MCP tool, AND the automatic
+        # done-transition in mark_environment_passed_and_refresh() (the 👍 sign-off flow calls
+        # this same function), with no changes needed anywhere else.
+        moved = await _move_item_to_implemented_channel(item)
+        if not moved:
+            await _refresh_item_message(item)
+        await _move_test_message_to_done_testing_channel(item)
+        item = await db.get_tracker_item(item_number)
+        assert item is not None
+    else:
+        await _refresh_item_message(item)
+
     if new_status in DM_NOTIFY_STATUSES:
         await _dm_reporter_on_status_change(item)
     return item
@@ -1259,6 +1348,51 @@ async def post_test_cases(item_number: int, cases: List[Dict[str, str]], actor_i
     assert item is not None
     await _refresh_item_message(item)
     return item
+
+
+async def _move_test_message_to_done_testing_channel(item: Dict[str, Any]) -> bool:
+    """Once an item reaches `done`, repost its test-case message into the configured Done
+    Testing channel with no Pass/Fail buttons (nothing left to sign off) and delete the old
+    copy. Returns False (no-op) if no test-case message exists yet, the Done Testing channel
+    isn't configured, or it's already posted there; never raises."""
+    from qapbot.cache_manager import CACHE
+    import QBcore
+
+    if not item.get("test_channel_id") or not item.get("test_message_id"):
+        return False
+    item_number = item["item_number"]
+    channel_id_str = CACHE.tracker_settings.get(TRACKER_SETTING_DONE_TESTING_CHANNEL)
+    if not channel_id_str or item.get("test_channel_id") == channel_id_str:
+        return False
+
+    new_channel = QBcore.bot.get_channel(int(channel_id_str))
+    if new_channel is None:
+        try:
+            new_channel = await QBcore.bot.fetch_channel(int(channel_id_str))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            logging.error(f"[TRACKER] Could not resolve Done Testing channel for item #{item_number}: {e}")
+            return False
+
+    testcases = await CACHE.db_manager.get_tracker_testcases(item_number)
+    content = _format_testcase_message(item, testcases)
+    try:
+        new_message = await new_channel.send(content)  # type: ignore[union-attr]  # no view= -> no buttons
+    except Exception as e:
+        logging.error(f"[TRACKER] Failed to post test cases for item #{item_number} to Done Testing channel: {e}")
+        return False
+
+    old_channel_id, old_message_id = item.get("test_channel_id"), item.get("test_message_id")
+    try:
+        old_channel = QBcore.bot.get_channel(int(old_channel_id)) or await QBcore.bot.fetch_channel(int(old_channel_id))
+        old_message = await old_channel.fetch_message(int(old_message_id))  # type: ignore[union-attr]
+        await old_message.delete()
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+        logging.warning(f"[TRACKER] Failed to delete original test-case message for item #{item_number} after move: {e}")
+
+    await CACHE.db_manager.update_tracker_item(
+        item_number, test_channel_id=str(new_channel.id), test_message_id=str(new_message.id)
+    )
+    return True
 
 
 async def _refresh_testcase_message(item_number: int) -> None:

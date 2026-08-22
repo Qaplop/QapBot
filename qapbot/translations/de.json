@@ -377,9 +377,11 @@
       "placeholder_clan_search": "Gib Clan-Namen oder Tag ein (z.B. 'Dark' oder '#2C9UR9GJY')"
     },
     "bot_setup": {
-      "header": "🛠️ **Bot-Einrichtung — Fehler-/Feature-Tracker**\n\n🐞💡 Fehlermeldungen & Feature-Wünsche  →  {bug_channel}\n🧪 Manuelle Testfälle   →  {test_channel}\n\nTracker-Status: {status}",
+      "header": "🛠️ **Bot-Einrichtung — Fehler-/Feature-Tracker**\n\n🐞💡 Fehlermeldungen & Feature-Wünsche  →  {bug_channel}\n🧪 Manuelle Testfälle   →  {test_channel}\n✅ Implementiert (erledigt)  →  {implemented_channel}\n🏁 Testen abgeschlossen  →  {done_testing_channel}\n\nTracker-Status: {status}",
       "bug_label": "Fehlermeldungen & Feature-Wünsche",
       "test_label": "manuelle Testfälle",
+      "implemented_label": "Archiv „Implementiert (erledigt)“",
+      "done_testing_label": "Archiv „Testen abgeschlossen“",
       "select_placeholder": "Wähle den Kanal für {label}...",
       "channel_not_set": "❌ Nicht festgelegt",
       "status_enabled": "🟢 Aktiviert",
@@ -439,6 +441,7 @@
       "testcase_signoff_denied": "🔒 Nur ein Bot-Administrator kann Testfälle abzeichnen.",
       "no_test_cases_yet": "🧪 Noch keine Testfälle gepostet.",
       "test_cases_jump": "🧪 Testfälle: {jump_link}",
+      "discussion_thread_field": "Diskussions-Thread",
       "dm_status_implemented": "✅ Dein {type} **#{item_number} · {title}** wurde als **umgesetzt** markiert!",
       "dm_status_done": "🎉 Dein {type} **#{item_number} · {title}** hat die Verifizierung bestanden und ist jetzt **erledigt**!",
       "dm_status_rejected": "❌ Dein {type} **#{item_number} · {title}** wurde **abgelehnt**.",

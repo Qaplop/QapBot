@@ -1,6 +1,23 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (1)
+- Added: two new `/admin` -> Bot Setup channel slots, "Implemented" and "Done Testing", so
+  closed tracker items stop accumulating in the working reports/test channels. The moment any
+  path sets an item's status to `done` (status dropdown, bridge/MCP tracker_set_status, or the
+  automatic transition once every environment's test cases pass), apply_status_change() now
+  reposts the item's embed into the Implemented channel and deletes the old copy from the
+  reports channel, and (if a test-case message exists) reposts it into Done Testing with its
+  Pass/Fail buttons stripped and deletes the old copy from the test channel. Both channels are
+  optional -- unconfigured means the move is skipped, so existing single-channel setups are
+  unaffected. Since Discord threads can't move channels, the reposted item embed adds a
+  "Discussion thread" jump-link field when one exists, so the old discussion stays reachable
+  once its parent message is deleted. Files: qapbot/ui_tracker.py (new
+  TRACKER_SETTING_IMPLEMENTED_CHANNEL/TRACKER_SETTING_DONE_TESTING_CHANNEL settings, BotSetupView
+  slots, _move_item_to_implemented_channel(), _move_test_message_to_done_testing_channel()),
+  qapbot/translations/{en,de}.json, qapbot/docs/BUG_FEATURE_TRACKER.md,
+  tests/discord/test_ui_bot_setup.py, tests/discord/test_ui_tracker_items.py. 2320 tests pass.
+
 2026-08-21 (11)
 - Changed: memory-report instrumentation for tracker item #0009 (huge memory consumption). The
   originally-planned fix — pruning "stale" clan_name_cache entries — was invalidated during
