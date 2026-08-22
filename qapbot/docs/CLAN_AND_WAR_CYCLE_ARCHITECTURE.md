@@ -87,6 +87,58 @@ at L543; parallel fetch loop/semaphore at L850-L949)
 
 **Returns**: `{"clan_tag": str, "war_obj": coc.War, "opponent_tag": str, "state": str}` or None
 
+### The `cwl_ended` guard and why CWL wars get re-fetched mid-month (2026-08-22, tracker #0017)
+
+`fetch_clan_war_data()`'s CWL fallback (`_find_active_cwl_war_for_clan()`, `QBhelperfunctions.py`,
+label `CWL-NOTINWAR-FALLBACK`) fires whenever `/currentwar` reports `notInWar`, which for most
+clans is most of the time. It exists because a public-warlog clan genuinely reports `notInWar`
+during CWL — only `/clanwarleagues/wars/{tag}` returns the real state — and because CoC runs a
+genuine **mid-month bonus CWL** (see `normalize_cwl_season`, day 7-24 of a month), so it cannot
+simply be gated on the calendar.
+
+What it does: walks the clan's league group rounds newest-first, calling `get_league_war()` on
+every war tag in each round until it finds one whose participants include this clan AND whose
+state is `preparation`/`inWar`. For a season that is **over**, no tag ever matches, so it walks
+the entire group's tag list (up to 7 rounds x 4 wars in an 8-clan group) and returns `None`. That
+negative outcome is not recorded anywhere, so the walk repeats every time the caches lapse
+(`get_league_group` max_age 7200s for subscribed clans / 300s otherwise; `get_league_war`
+max_age 600s).
+
+The guard meant to stop this is `is_latest_cwl_season_ended_sync(clan_tag)` reading
+`cwl_league_groups.cwl_ended`. **That flag is almost never set.** `cwl_ended=1` has exactly one
+writer, `update_cwl_group_stats()` -> `update_cwl_group_stats_batch(..., set_cwl_ended=all_ended)`,
+and that function only runs on demand:
+
+- `QBdiscordcmds.py` `/cwlinfo` rendering for that clan, and
+- `QapBot.py`'s subscription loop, only for clans with a `cwlgroup` PNG subscription.
+
+There is **no periodic sweep** — `nightly_db_maintenance()` has no CWL step at all. So the flag is
+set only for the handful of groups somebody actually looks at, and every other group stays
+`cwl_ended=0` forever. Measured on the 2026-08-22 DB snapshot:
+
+| | 2026-07 | 2026-08 |
+|---|---|---|
+| distinct league groups | 26,478 | 25,049 |
+| groups with `cwl_ended=1` | 40 rows | 8 rows |
+| clans whose latest season row is still `cwl_ended=0` | 52,869 | 200,292 |
+
+136,707 of those are `track_war_updates=1` clans, i.e. genuinely in the poll rotation. The
+2026-08 CWL's last real war ended `2026-08-11T06:06` (`war_summary`), so every such walk from
+2026-08-12 onward is re-fetching wars that finished days earlier. The previous month's groups are
+still unmarked too, so this never self-corrects — it simply persists until the next season's rows
+push the old ones out of `ORDER BY cwl_season DESC LIMIT 1`.
+
+**The same flag also gates two other things**, which is why "just set it" is not a purely local
+change: `get_active_cwl_group_member_tags()` (the CWL-GROUP-EXPAND per-cycle fetch-list
+expansion) and `update_cwl_group_stats()`'s own short-circuit, which **freezes** a group's
+standings and league_rank once `cwl_ended=1`. Setting the flag too early would freeze a season's
+standings mid-play.
+
+Note for anyone reading a log like tracker #0017's screenshot: `get_league_war()` lines appearing
+between `[PHASE-1] Starting parallel API fetches` and `[PHASE-1] All API fetches completed` are
+always this fallback (or the private-warlog one next to it) — they are inside `fetch_clan_war_data`,
+not a separate CWL job.
+
 ## Error Handling
 
 ### Exception Hierarchy

@@ -1,6 +1,17 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (25)
+- Investigated: mid-month CWL war fetches (ticket #0017). They are the notInWar CWL fallback
+  (_find_active_cwl_war_for_clan) re-walking a FINISHED league group: for a season that is over
+  no war tag ever matches, the negative result is never recorded, and the guard meant to stop it
+  (cwl_league_groups.cwl_ended) is almost never set -- its only writer is update_cwl_group_stats(),
+  which runs on demand from /cwlinfo or a cwlgroup subscription, never on a sweep. Measured on the
+  2026-08-22 DB: 8 of 25049 August groups marked ended; 136707 track_war_updates=1 clans stuck at
+  cwl_ended=0. Analysis documented, no behaviour change -- the fix needs a decision because
+  cwl_ended=1 also freezes group standings. Files: qapbot/docs/CLAN_AND_WAR_CYCLE_ARCHITECTURE.md,
+  plans/tracker-0017-mid-month-cwl-war-fetches.md.
+
 2026-08-22 (24)
 - Added: Guild admins/leads can now set any pooled player's CWL enrollment status from the
   Manage Enrollment board (ticket #0014). The player card's right-click menu grew a
