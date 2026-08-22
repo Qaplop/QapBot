@@ -2258,6 +2258,96 @@ async def test_enrollment_get_uses_cached_th_level_for_clanless_pooled_player(db
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_enrollment_get_resolves_link_live_not_from_signup_snapshot(db, bridge_config, client, monkeypatch):
+    """2026-08-22 live bug report: "B.A.B.A is still shown as unlinked in the teams management
+    view while it is clearly linked to user odin". cwl_signups is an enrollment-time SNAPSHOT
+    written once by Start Enrollment and never refreshed, and _build_enrollment_payload seeds
+    players_by_tag from it BEFORE the live get_current_clan_members_sync pass (which then skips
+    any tag it already has). So an account linked AFTER enrollment ran kept the snapshot's NULL
+    discord_id forever and rendered grey/"Not Linked" (17 players on one live board), while an
+    account re-linked to a different Discord user kept the OLD owner forever (8 more).
+
+    Covers all three shapes in one payload:
+      #LATE   — signup snapshot has NULL, user_players has a real owner  (the B.A.B.A case)
+      #MOVED  — signup snapshot names an owner who no longer owns it     (the re-link case)
+      #NEVER  — signup snapshot names an owner, no user_players row at all (guest tag added by
+                search, never linked) — must keep the snapshot value rather than being blanked.
+    """
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "834", {"#CLANL": "LinkClan"})
+    CACHE.db_manager = db
+    CACHE.server_config["834"] = {"member_clans": ["#CLANL"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("834", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLANL", "participating": True}])
+
+    # The snapshot, as Start Enrollment left it.
+    db.upsert_cwl_signup_sync(event_id, "#LATE", "Late", None, None, "template_confirm", "pending")
+    db.upsert_cwl_signup_sync(event_id, "#MOVED", "Moved", "oldowner", None, "template_confirm", "pending")
+    db.upsert_cwl_signup_sync(event_id, "#NEVER", "Never", "guestowner", None, "guest_invite", "pending")
+
+    # Reality now, per user_players.
+    await _seed_current_clan_member(db, "realowner", "#LATE", "#CLANL")
+    await _seed_current_clan_member(db, "newowner", "#MOVED", "#CLANL")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(834, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "834", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+
+    assert players_by_tag["#LATE"]["discord_id"] == "realowner"
+    assert players_by_tag["#MOVED"]["discord_id"] == "newowner"
+    assert players_by_tag["#NEVER"]["discord_id"] == "guestowner"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_clears_link_for_account_returned_to_unassigned_pool(db, bridge_config, client, monkeypatch):
+    """The other direction of the same staleness (2026-08-22): a signup snapshot naming an owner
+    for an account that has since been unlinked (its only user_players row is the UNASSIGNED
+    sentinel). user_players is the authority for "who owns this now", and the answer is nobody —
+    the board must render it unlinked rather than keeping the old owner. get_player_links_sync
+    maps 'UNASSIGNED' to None, so the live override has to apply that None rather than treating
+    it as "no information"."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "835", {"#CLANU": "UnlinkClan"})
+    CACHE.db_manager = db
+    CACHE.server_config["835"] = {"member_clans": ["#CLANU"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("835", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLANU", "participating": True}])
+    db.upsert_cwl_signup_sync(event_id, "#GONE", "Gone", "exowner", None, "template_confirm", "pending")
+    await _seed_current_clan_member(db, "UNASSIGNED", "#GONE", "#CLANU")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(835, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "835", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    gone = next(p for p in body["players"] if p["player_tag"] == "#GONE")
+    assert gone["discord_id"] is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_enrollment_get_no_event_returns_empty(db, bridge_config, client, monkeypatch):
     from qapbot.cache_manager import CACHE
 

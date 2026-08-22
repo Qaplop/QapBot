@@ -15,6 +15,12 @@ Immediate next steps:
   Discord's role-edit rate limit — 4 gaps of 34s/17.9s/17.8s/11.1s in a single ~5min cycle.
   Deliberately not fixed yet. Fix: bounded concurrency, same pattern as Phase 1's fetch
   semaphore in QapBot.py.
+- Short-TTL player cache in `CACHE.get_player()` (cache_manager.py). Despite living in
+  cache_manager.py it is completely uncached today -- every call is a live API round-trip via
+  coc_retry. Ten call sites would benefit; /whois was the worst (82 serial calls for one user,
+  fixed 2026-08-22 by parallelizing, but the calls themselves remain). Deliberately not done
+  with that fix: the registration/verification flows depend on get_player() being live, so this
+  needs its own invalidation design (probably an explicit `force_fresh=True` for those paths).
 - Handling of DMs that can't be sent: e.g. notify the admin
 - Block players from CWL participation (just show an icon not a real technical blocking!) e.g. when players miss attack and are punished for that
 - After testing on PROD for the new CWL managaemnet features is complete we need to remove the feature toggle for the DM send guard on PROD. The DM send guard should only be effective on DEV after testing on PROD is finished.

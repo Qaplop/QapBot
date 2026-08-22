@@ -4717,22 +4717,85 @@ async def _whois_logic(interaction: discord.Interaction, user: Union[discord.Use
     # highest TH first before embedding. That way if the embed size cap is hit,
     # the most relevant accounts are shown rather than the most recently added ones.
     player_tuples: List[Tuple[int, int, str]] = []  # (th_level: int, hero_sum: int, text: str)
-    
-    for player in players:
-        if not isinstance(player, dict):
-            continue
-        
+
+    # Fetch every account's live data up front, in BOUNDED PARALLEL (2026-08-22 bug report:
+    # /whois timing out). This used to be one `await asyncio.wait_for(CACHE.get_player(tag),
+    # timeout=8.0)` per account INSIDE the formatting loop below — i.e. fully serial. CACHE.
+    # get_player() is uncached (every call is a live API round-trip via coc_retry), so a user with
+    # 82 linked accounts issued 82 serialised calls: 30s wall clock live, with individual calls
+    # logged at 2.18s and 4.46s because the background clan-poll cycle saturates the API at the
+    # same time — which is also what blew the old 8s per-account budget. Mirrors the parallel
+    # pattern already used by AccountManagementView._on_refresh_click (ui_registration.py).
+    # Semaphore-bounded rather than a bare gather: the CoC rate limiter is shared with the poll
+    # cycle, so 82 simultaneous calls would spike it (same bound as the other batch call sites,
+    # e.g. QBdiscocmdshelper_admin_command.py's _cleanup_sem).
+    valid_players: List[Dict[str, Any]] = [p for p in players if isinstance(p, dict)]
+    _whois_sem = asyncio.Semaphore(10)
+
+    async def _fetch_one(tag: str) -> Any:
+        async with _whois_sem:
+            return await CACHE.get_player(tag)  # type: ignore[arg-type]
+
+    fetch_tags: List[str] = [p.get("player_tag", "") for p in valid_players]  # type: ignore[misc]
+    try:
+        # ONE budget for the whole batch, not one per account. Generous because it now covers all
+        # accounts at once and the API is demonstrably slow under concurrent cycle load.
+        fetched: List[Any] = await asyncio.wait_for(
+            asyncio.gather(*[_fetch_one(tag) for tag in fetch_tags], return_exceptions=True),
+            timeout=45.0,
+        )
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # Degrade to the cached per-account data the clan-poll cycle already keeps fresh
+        # (player_name/th_level/current_clan_tag) rather than failing the whole command — a
+        # degraded row beats an error row, and that data is already in memory.
+        logging.warning(
+            f"[WHOIS] Live fetch for {len(fetch_tags)} account(s) of {user_id_str} exceeded the "
+            "batch timeout — rendering from cached account data"
+        )
+        fetched = [None] * len(fetch_tags)
+
+    def _cached_row(
+        player: Dict[str, Any], player_name: str, player_tag: str, verified: bool, is_primary: bool
+    ) -> Tuple[int, int, str]:
+        """Render one account from CACHE.user_accounts data when the live fetch didn't land.
+
+        The clan-poll cycle keeps player_name/th_level/current_clan_tag fresh for every tracked
+        account (see coc_cache.py's update_player_info_in_user_accounts), so a row built from it
+        is genuinely useful — only hero levels are missing. Sorts by its cached TH like any other
+        row rather than being dumped at the bottom.
+        """
+        from qapbot.emojis import BotEmojis
+
+        cached_th = player.get("th_level")
+        status_icon = BotEmojis.VERIFIED if verified else BotEmojis.GCHECK
+        default_text = " ✓ (Default)" if is_primary else ""
+        profile_url = coc_player_profile_url(player_tag)  # type: ignore[union-attr]
+        if isinstance(cached_th, int):
+            th_emoji = getattr(BotEmojis, f'TH{cached_th:02d}', f'TH{cached_th}')
+            head = f"{th_emoji} {cached_th} • "
+        else:
+            cached_th = 0
+            head = ""
+        line1 = f"{head}**[{player_name}]({profile_url})** ({player_tag}) {status_icon}{default_text}"
+        return (cached_th, 0, f"{line1}\n*Live data unavailable — showing last known info*")
+
+    for player, fetch_result in zip(valid_players, fetched):
         player_tag = player.get("player_tag", "")  # type: ignore[misc]
         player_name = player.get("player_name", "Unknown")  # type: ignore[misc]
         verified = player.get("verified", False)  # type: ignore[misc]
         is_primary = player.get("is_primary", False)  # type: ignore[misc]
-        
-        # Fetch live player data from CoC API
+
         try:
-            player_obj = await asyncio.wait_for(CACHE.get_player(player_tag), timeout=8.0)  # type: ignore[arg-type]
+            if isinstance(fetch_result, BaseException):
+                raise fetch_result
+            player_obj = fetch_result
             if not player_obj:
+                # get_player() returned None (fetch failed and was swallowed there), or the batch
+                # timeout above degraded every row. Previously `continue` — which silently dropped
+                # the account from the output entirely; show what's cached instead.
+                player_tuples.append(_cached_row(player, player_name, player_tag, verified, is_primary))
                 continue
-            
+
             # Get TH level
             th_level = player_obj.town_hall
             
@@ -4804,6 +4867,12 @@ async def _whois_logic(interaction: discord.Interaction, user: Union[discord.Use
             # Combine lines for this player (swap line 2 and 3)
             player_tuples.append((th_level, hero_sum, f"{line1}\n{line3}\n{line2}"))
             
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+            # Routine under API load, not a defect — WARNING without a traceback (2026-08-22).
+            # ERROR + exc_info here meant a user with many accounts could emit one stack trace per
+            # account during a busy cycle; that is the log-flooding pattern Pitfall 24 documents.
+            logging.warning(f"[WHOIS] Timed out fetching player data for {player_tag}: {e}")
+            player_tuples.append(_cached_row(player, player_name, player_tag, verified, is_primary))
         except Exception as e:
             logging.error(f"Error fetching player data for {player_tag}: {e}", exc_info=True)
             # Add minimal error info (TH 0, hero_sum 0 → sorts to bottom)

@@ -2470,12 +2470,41 @@ def resolve_cwl_pool_dm_targets_sync(
     pool: Dict[str, Dict[str, Any]] = {}
     optout_by_tag: Dict[str, bool] = {}
 
-    def _merge(player_tag: str, player_name: Optional[str], discord_id: Optional[str]) -> None:
+    def _merge(
+        player_tag: str,
+        player_name: Optional[str],
+        discord_id: Optional[str],
+        authoritative_discord_id: bool = False,
+    ) -> None:
+        """Merge one source's view of a player into the pool.
+
+        Args:
+            player_tag: The player this row is about.
+            player_name: Name to record if none has been merged yet (always first-wins — the
+                signup's recorded name is the one the DM text should use).
+            discord_id: DM recipient for this player, or None if this source doesn't know one.
+            authoritative_discord_id: When True, `discord_id` REPLACES any previously merged
+                value instead of only filling a None — including replacing it with None, which is
+                what user_players returns for an account that is now in the UNASSIGNED pool
+                (nobody owns it, so nobody should be DMed about it; it correctly falls through to
+                `skipped_unlinked` below). Set by the live user_players source
+                (2026-08-22): with plain first-non-None-wins, a source that runs last can add a
+                missing link but can never CORRECT a stale one, so an enrollment-time
+                cwl_signups snapshot silently kept ownership forever. Verified live: #29JQV2YCL
+                has no current_clan_tag (so the clan-scoped `members` source below never returns
+                it) and its signup row named a Discord user who no longer owns the account — a
+                "Notify New Pool Members" run would have DMed the wrong person about it.
+                Deliberately NOT fixed by reordering the sources: `members` is also live and must
+                keep winning over the snapshot.
+        """
         entry = pool.setdefault(
             player_tag, {"player_tag": player_tag, "player_name": None, "discord_id": None}
         )
         entry["player_name"] = entry["player_name"] or player_name
-        entry["discord_id"] = entry["discord_id"] or discord_id
+        if authoritative_discord_id:
+            entry["discord_id"] = discord_id
+        else:
+            entry["discord_id"] = entry["discord_id"] or discord_id
 
     for member in members:
         optout_by_tag[member["player_tag"]] = bool(member["cwl_permanent_optout"])
@@ -2495,10 +2524,15 @@ def resolve_cwl_pool_dm_targets_sync(
 
     # Sources 2/3 carry no opt-out flag and may carry no discord_id at all (the Guests search can
     # add a tag it found no Discord link for) — user_players is the authority for both.
+    # authoritative_discord_id=True (2026-08-22): sources 2/3 are enrollment-time snapshots, so
+    # whatever they supplied here may name a Discord user who no longer owns the account; this
+    # live source must be able to overwrite it, not merely fill a gap. Query scope is unchanged —
+    # optout_by_tag is populated only from `members` (source 1, also live), so `unknown_tags` is
+    # precisely the set whose discord_id could have come from a snapshot.
     unknown_tags = [tag for tag in pool if tag not in optout_by_tag]
     for tag, link in (db.get_player_links_sync(unknown_tags) if unknown_tags else {}).items():
         optout_by_tag[tag] = link["cwl_permanent_optout"]
-        _merge(tag, link["player_name"], link["discord_id"])
+        _merge(tag, link["player_name"], link["discord_id"], authoritative_discord_id=True)
 
     for entry in pool.values():
         if optout_by_tag.get(entry["player_tag"]):

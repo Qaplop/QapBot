@@ -1833,6 +1833,102 @@ class TestCwlSignupResponseButton:
 
     @pytest.mark.discord
     @pytest.mark.asyncio
+    async def test_click_by_current_owner_is_accepted_when_snapshot_names_a_former_owner(
+        self, db, mock_interaction
+    ):
+        """2026-08-22 (Pitfall 37): cwl_signups is an enrollment-time snapshot, so its discord_id
+        can name a Discord user who no longer owns the account. Guarding on the snapshot alone
+        told the account's REAL current owner "not your signup" and refused their response."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlSignupResponseButton
+
+        await _seed_guild_and_clans(db, "9110", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9110", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "111111111", None, "template_confirm", "pending")
+        # Reality now: the account was re-linked to someone else after enrollment ran.
+        await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('222222222', 'New')")
+        await db.conn.execute(
+            "INSERT INTO user_players (discord_id, player_tag, player_name, verified) "
+            "VALUES ('222222222', '#P1', 'Alpha', 0)"
+        )
+        await db.conn.commit()
+
+        mock_interaction.user.id = 222222222  # the CURRENT owner
+        mock_interaction.response.edit_message = AsyncMock()
+
+        button = CwlSignupResponseButton("confirm", event_id, "#P1")
+        await button.callback(mock_interaction)
+
+        signup = db.get_cwl_signup_sync(event_id, "#P1")
+        assert signup["status"] == "confirmed"
+        # ...and the row self-heals, so it stops re-stamping the outdated owner on every response.
+        assert signup["discord_id"] == "222222222"
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
+    async def test_click_by_snapshot_owner_still_accepted_after_relink(self, db, mock_interaction):
+        """The DM was genuinely delivered to the snapshot owner, so their button must keep
+        working even once the account has been re-linked elsewhere — accepting BOTH owners is
+        deliberate, not an oversight."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlSignupResponseButton
+
+        await _seed_guild_and_clans(db, "9111", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9111", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "111111111", None, "template_confirm", "pending")
+        await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('222222222', 'New')")
+        await db.conn.execute(
+            "INSERT INTO user_players (discord_id, player_tag, player_name, verified) "
+            "VALUES ('222222222', '#P1', 'Alpha', 0)"
+        )
+        await db.conn.commit()
+
+        mock_interaction.user.id = 111111111  # the SNAPSHOT owner, who actually received the DM
+        mock_interaction.response.edit_message = AsyncMock()
+
+        button = CwlSignupResponseButton("confirm", event_id, "#P1")
+        await button.callback(mock_interaction)
+
+        assert db.get_cwl_signup_sync(event_id, "#P1")["status"] == "confirmed"
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
+    async def test_click_by_third_party_still_rejected_when_owners_disagree(self, db, mock_interaction):
+        """Account protection (Cardinal Rule 2) must survive the widening above: someone who is
+        neither the snapshot owner nor the live owner is still refused."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlSignupResponseButton
+
+        await _seed_guild_and_clans(db, "9112", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9112", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "111111111", None, "template_confirm", "pending")
+        await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('222222222', 'New')")
+        await db.conn.execute(
+            "INSERT INTO user_players (discord_id, player_tag, player_name, verified) "
+            "VALUES ('222222222', '#P1', 'Alpha', 0)"
+        )
+        await db.conn.commit()
+
+        mock_interaction.user.id = 999999999  # neither owner
+        mock_interaction.response.send_message = AsyncMock()
+
+        button = CwlSignupResponseButton("confirm", event_id, "#P1")
+        await button.callback(mock_interaction)
+
+        mock_interaction.response.send_message.assert_awaited_once()
+        assert db.get_cwl_signup_sync(event_id, "#P1")["status"] == "pending"  # unchanged
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
     async def test_click_after_event_no_longer_signup_open_is_rejected(self, db, mock_interaction):
         from qapbot.cache_manager import CACHE
         from qapbot.ui_cwl_roster import CwlSignupResponseButton

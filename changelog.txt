@@ -1,6 +1,39 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (5)
+- Fixed: /whois fetched every linked account from the CoC API serially, with an 8s timeout per
+  account -- 82 accounts for one live user meant 82 serialised round-trips, 30s wall clock, and
+  an ERROR-level stack trace for each call that blew the budget (the API runs 2-5s/call while
+  the clan-poll cycle saturates it). Now fetches all accounts in bounded parallel
+  (asyncio.Semaphore(10), mirroring ui_registration.py's refresh path) under ONE 45s batch
+  budget instead of one per account; a timeout degrades to the cached CACHE.user_accounts data
+  the poll cycle already keeps fresh rather than dropping the account from the output, and
+  routine timeouts log at WARNING without a traceback (Pitfall 24). Files: QBdiscordcmds.py,
+  qapbot/docs/RATE_LIMITING_IMPLEMENTATION.md, backlog.txt,
+  tests/discord/test_whois_parallel_fetch.py. 2339 tests pass.
+
+2026-08-22 (4)
+- Fixed: players linked to a Discord account AFTER Start Enrollment ran rendered grey
+  ("Not Linked") on the CWL enrollment board -- reported live for B.A.B.A, 17 such players on
+  that one board. cwl_signups is an enrollment-time snapshot that nothing ever refreshes, and
+  _build_enrollment_payload seeded its player map from it before the live user_players pass
+  (which then skips any tag it already has), so discord_id was the one field left frozen while
+  th_level/current_clan_tag/is_guest all had live re-resolution. Same staleness had two further
+  effects: resolve_cwl_pool_dm_targets_sync merged sources first-non-None-wins with the live
+  source LAST, so it could fill a missing link but never correct a stale one -- verified live,
+  a "Notify New Pool Members" run would have DMed the wrong Discord user about #29JQV2YCL --
+  and the signup DM button guarded ownership on the snapshot alone, telling an account's real
+  current owner "not your signup" and then writing the outdated owner straight back. All four
+  read paths now resolve the live owner via get_player_links_sync (which already applies the
+  verified-wins + UNASSIGNED tiebreak); the button accepts both the snapshot and live owner (the
+  DM really was delivered to the former) while still rejecting any third party, and self-heals
+  the row. No data migration -- once every reader resolves live, the stale column stops
+  mattering. Files: qapbot/web_bridge.py, qapbot/QBdiscocmdshelper_cwl.py,
+  qapbot/ui_cwl_roster.py, qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md (Pitfalls 36+37),
+  tests/discord/test_web_bridge.py, tests/discord/test_ui_cwl_roster.py,
+  tests/unit/test_cwl_signup_snapshot_staleness.py. 2339 tests pass.
+
 2026-08-22 (3)
 - Fixed: the item embed reposted into the Implemented channel on move-on-done (previous entry
   below) still carried its Edit/Add files/Status/Test cases buttons -- nothing left to do on a

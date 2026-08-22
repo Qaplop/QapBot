@@ -1563,10 +1563,9 @@ that row actually changed.
 
 ## Pitfall 37: `cwl_signups` is an enrollment-time SNAPSHOT — re-resolve its `discord_id` on read
 
-> **Status: fix not yet implemented** (as of 2026-08-22). The analysis and the step-by-step fix live
-> in `plans/cwl-board-stale-link-and-whois-timeout.md`. Until that lands, the code described below
-> is still the current behaviour — read this as "what is wrong and what the fix must do," not as a
-> convention the codebase already follows.
+> **Status: fixed 2026-08-22** (`plans/implemented/cwl-board-stale-link-and-whois-timeout.md`).
+> All four read paths now resolve the live owner from `user_players`. The "Why" below describes the
+> original defect; the "How to apply" is the convention to keep following.
 
 **Symptom (2026-08-22, live report):** a player (`B.A.B.A`, `#2RPLRVUG9`) rendered grey
 "Not Linked" on the CWL enrollment board while `/whois` showed it correctly linked. Sixteen other

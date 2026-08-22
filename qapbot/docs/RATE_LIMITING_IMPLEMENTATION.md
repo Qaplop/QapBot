@@ -127,6 +127,27 @@ A: It manages multiple API keys automatically, uses true parallelization (not se
 **Q: How does BatchThrottler differ from the default throttler?**
 A: The default throttler processes requests sequentially per key. BatchThrottler dispatches requests across keys in parallel, allowing higher concurrency up to the configured `throttle_limit` (bounded by the per-key limit).
 
+**Q: `CACHE.get_player()` lives in `cache_manager.py` — is it cached?**
+A: **No.** Despite the module it sits in, every `get_player()` call is a live API round-trip
+through `coc_retry()`. There is no player-level cache (only `coc_clan_cache` for clans and
+`temp_war_objects` for wars). Consequences for any code that calls it:
+
+- **Never loop over `get_player()` serially.** A per-account loop costs one full API round-trip per
+  account, and those calls are slow (2–5s each is normal) whenever the background clan-poll cycle
+  is saturating the API. `/whois` did exactly this and took 30s for a user with 82 linked accounts
+  (2026-08-22) before being changed to a bounded-parallel `asyncio.gather`.
+- **Bound the parallelism.** Use an `asyncio.Semaphore` (10 is the convention here — see
+  `_whois_logic` in `QBdiscordcmds.py` and `_cleanup_sem` in
+  `QBdiscocmdshelper_admin_command.py`) rather than a bare `gather` over an unbounded list: the
+  rate limiter is shared with the poll cycle, so a large fan-out starves it.
+- **Prefer cached data when it is good enough.** `CACHE.user_accounts[uid]["players"]` already
+  carries `player_name`, `th_level`, `current_clan_tag` and `coc_role`, kept fresh for every
+  tracked account by the clan-poll cycle (`coc_cache.py`'s `update_player_info_in_user_accounts`).
+  Only hero levels and live league data actually require a `get_player()` call.
+- **Timeouts belong on the batch, not each call.** A per-call `wait_for` budget that is fine when
+  the API is idle will fire repeatedly under cycle load; one budget for the whole gather, with a
+  cached-data fallback, degrades far more gracefully.
+
 ## Future Enhancements
 
 ### Monitoring & Metrics

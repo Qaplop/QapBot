@@ -641,6 +641,25 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
     # clan-scoped) fallback picks them up regardless of which clan they're actually in.
     clan_fallback_tags = [tag for tag in players_by_tag if tag not in current_clan_by_tag]
     current_clan_fallback_by_tag = db.get_current_clan_tags_for_players_sync(clan_fallback_tags)
+    # Live link + opt-out resolution for EVERY tag in the payload (2026-08-22, live bug report:
+    # "B.A.B.A is still shown as unlinked in the teams management view while it is clearly linked
+    # to user odin"). cwl_signups is an enrollment-time SNAPSHOT, written once by Start Enrollment
+    # and never refreshed — but players_by_tag is seeded from it FIRST (above), and the live
+    # get_current_clan_members_sync pass then deliberately skips any tag it already has. So an
+    # account linked AFTER enrollment ran kept the snapshot's NULL discord_id forever (verified
+    # live: #2RPLRVUG9 was linked 6h after the 2026-08-18 07:57 snapshot; 17 players on that one
+    # board rendered grey), and an account re-linked to a different Discord user kept the OLD owner
+    # forever (8 more on the same board). user_players is the only authority for "who owns this
+    # account now", so this OVERRIDES rather than falls back — exactly as the is_guest rule below
+    # overrides its write-path guess whenever a live current clan is known. A tag with no
+    # user_players row at all (a guest tag added by search that was never linked) keeps whatever
+    # the snapshot had, same fallback-tolerant shape as the th_level lookup above.
+    # get_player_links_sync is the right helper: chunked (SQLite's ~999 host-parameter limit), and
+    # it already applies the verified-wins + UNASSIGNED tiebreak and maps 'UNASSIGNED' -> None.
+    # It also returns cwl_permanent_optout, which closes the identical clan-scoped blind spot in
+    # optout_by_tag (populated above from get_current_clan_members_sync only, so a pooled player
+    # who is in no member clan silently defaulted to False).
+    links_by_tag = db.get_player_links_sync(list(players_by_tag.keys()))
     skill_scores_by_tag = compute_league_adjusted_skill_scores(list(players_by_tag.keys()))
     avg_stars_by_tag = compute_avg_stars_per_attack(list(players_by_tag.keys()))
     for player_tag, player in players_by_tag.items():
@@ -652,10 +671,17 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
         player["th_icon_url"] = th_icon_url(th_level) if th_level is not None else None
         player["skill_score"] = skill_scores_by_tag.get(player_tag)
         player["avg_stars"] = avg_stars_by_tag.get(player_tag)
+        # Live link overrides the enrollment-time snapshot (see links_by_tag above).
+        link = links_by_tag.get(player_tag)
+        if link is not None:
+            player["discord_id"] = link["discord_id"]
         # Default False for a player only known via an old cwl_signups row who's since left
         # every guild clan (get_current_clan_members_sync no longer covers them) — same
-        # fallback-tolerant shape as the th_level lookup just above.
-        player["cwl_permanent_optout"] = optout_by_tag.get(player_tag, False)
+        # fallback-tolerant shape as the th_level lookup just above. links_by_tag is consulted
+        # second (2026-08-22): it covers player-scoped rows the clan-scoped optout_by_tag misses.
+        player["cwl_permanent_optout"] = optout_by_tag.get(
+            player_tag, bool(link["cwl_permanent_optout"]) if link is not None else False
+        )
         # None only when truly unknown (no current_clan_tag on record anywhere) — lets the board
         # tell that apart from "currently in a different clan than their assignment"
         # (same-clan/different-clan highlighting, 2026-08-14).
