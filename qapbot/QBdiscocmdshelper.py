@@ -1228,7 +1228,9 @@ async def _link_player_to_user(
         # Without this, the instant sync_roles_for_user() right after restore has nothing
         # to assign the CoC/clan role from. Best-effort: keep stale values on API failure.
         try:
-            restored_player_obj = await CACHE.get_player(normalized_tag)
+            # force_fresh: this value is persisted as account state and drives the role sync
+            # immediately below — a cached read could restore a stale clan/TH.
+            restored_player_obj = await CACHE.get_player(normalized_tag, force_fresh=True)
             if restored_player_obj:
                 if hasattr(restored_player_obj, "town_hall"):
                     unassigned_player["th_level"] = restored_player_obj.town_hall
@@ -1270,7 +1272,8 @@ async def _link_player_to_user(
     
     # Fetch from CoC API
     try:
-        player_obj = await CACHE.get_player(normalized_tag)
+        # force_fresh: registration path — name/th_level captured here become persisted state.
+        player_obj = await CACHE.get_player(normalized_tag, force_fresh=True)
         if not player_obj:
             from qapbot.i18n import t
             return False, t('playerregistration.player_not_found_coc', player_tag=normalized_tag)
@@ -3235,7 +3238,8 @@ async def process_player_registration(
     if not resolved_name or resolved_name == "Unknown":
         try:
             logging.debug(f"process_player_registration: Fetching player data from CoC API for {normalized_tag}")
-            player_obj = await CACHE.get_player(normalized_tag)
+            # force_fresh: registration path — the resolved name becomes persisted state.
+            player_obj = await CACHE.get_player(normalized_tag, force_fresh=True)
             if not player_obj:
                 from qapbot.i18n import t
                 guild_id = interaction.guild.id if interaction.guild else None

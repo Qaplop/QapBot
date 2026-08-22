@@ -1,9 +1,11 @@
 """/whois fetches every linked account in bounded parallel (2026-08-22 bug report).
 
 It used to await one `asyncio.wait_for(CACHE.get_player(tag), timeout=8.0)` per account INSIDE
-the formatting loop — fully serial. CACHE.get_player() is uncached (every call is a live API
-round-trip), so a user with 82 linked accounts issued 82 serialised calls: 30s wall clock live,
-and one call exceeding the 8s per-account budget produced an ERROR-level traceback per account.
+the formatting loop — fully serial. CACHE.get_player() was also entirely uncached at the time
+(every call a live API round-trip), so a user with 82 linked accounts issued 82 serialised
+calls: 30s wall clock live, and one call exceeding the 8s per-account budget produced an
+ERROR-level traceback per account. get_player() gained a short-TTL cache later the same day,
+which helps repeat invocations; the parallelism this file covers is what bounds a single one.
 """
 from __future__ import annotations
 

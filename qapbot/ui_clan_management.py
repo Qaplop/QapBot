@@ -68,10 +68,12 @@ class ManualPlayerTagModal(discord.ui.Modal, title="Enter Player Tag"):
         
         await interaction.response.defer()
         
-        # Fetch player from CoC API through cache
+        # Fetch player from CoC API through cache.
+        # force_fresh: feeds the admin link-account flow — the th_level/name captured here get
+        # persisted onto the link that follows.
         try:
-            player = await CACHE.get_player(normalized_tag)
-            
+            player = await CACHE.get_player(normalized_tag, force_fresh=True)
+
             if not player:
                 from qapbot.i18n import t
                 user_id = str(interaction.user.id)

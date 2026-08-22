@@ -1,6 +1,27 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (6)
+- Added: short-TTL read-through cache in `CACHE.get_player()`. Despite living in
+  cache_manager.py it was completely uncached -- every call across its ~10 call sites was a live
+  API round-trip via coc_retry. Now caches successful fetches for 60s, keyed on the normalized
+  tag, with a hard 1000-entry cap enforced on insert (not just in the per-cycle
+  evict_stale_player_cache() sweep, which is far too coarse to bound a single burst) -- kept
+  modest because tracker #0009 (memory) is still open. Failures are deliberately NOT cached, so a
+  transient API error can't become a minute of sticky failure; there is deliberately no stampede
+  lock either (a redundant idempotent GET is cheaper than an unbounded per-tag lock dict).
+  Registration/link paths and the My Accounts refresh button pass the new `force_fresh=True`,
+  since the name/th_level/clan they capture become persisted account state and drive the role
+  sync right after -- a regression test asserts linking never reads from the cache. Verification
+  is unaffected (verify_api_token() calls the API directly, never through get_player()).
+  Hardened one adjacent trap while here: get_player()'s broad `except Exception` turned a missing
+  instance attribute into a silent None, so one construction gap would have quietly made EVERY
+  player lookup return "not found" -- the cache dict is now resolved through a helper that
+  degrades to uncached instead. Files: qapbot/cache_manager.py, QapBot.py,
+  qapbot/QBdiscocmdshelper.py, qapbot/ui_registration.py, qapbot/ui_clan_management.py,
+  qapbot/docs/RATE_LIMITING_IMPLEMENTATION.md, backlog.txt, tests/unit/test_player_cache.py,
+  tests/integration/test_account_protection.py. 2353 tests pass.
+
 2026-08-22 (5)
 - Fixed: /whois fetched every linked account from the CoC API serially, with an 8s timeout per
   account -- 82 accounts for one live user meant 82 serialised round-trips, 30s wall clock, and

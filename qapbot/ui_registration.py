@@ -1331,9 +1331,11 @@ class AccountManagementView(discord.ui.View):
         tags = [p.get("player_tag") for p in user_players
                 if p.get("player_tag")]
 
-        # Parallel-fetch all player tags from the CoC API
+        # Parallel-fetch all player tags from the CoC API.
+        # force_fresh: this IS the refresh button — serving it from the short-TTL player cache
+        # would make a second click within the TTL silently do nothing.
         results = await asyncio.gather(
-            *[CACHE.get_player(tag) for tag in tags],  # type: ignore[arg-type]
+            *[CACHE.get_player(tag, force_fresh=True) for tag in tags],  # type: ignore[arg-type]
             return_exceptions=True
         )
 

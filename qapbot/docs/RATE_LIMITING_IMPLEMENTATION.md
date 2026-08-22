@@ -128,25 +128,42 @@ A: It manages multiple API keys automatically, uses true parallelization (not se
 A: The default throttler processes requests sequentially per key. BatchThrottler dispatches requests across keys in parallel, allowing higher concurrency up to the configured `throttle_limit` (bounded by the per-key limit).
 
 **Q: `CACHE.get_player()` lives in `cache_manager.py` — is it cached?**
-A: **No.** Despite the module it sits in, every `get_player()` call is a live API round-trip
-through `coc_retry()`. There is no player-level cache (only `coc_clan_cache` for clans and
-`temp_war_objects` for wars). Consequences for any code that calls it:
+A: **Yes, but only briefly** (since 2026-08-22; before that it was completely uncached and every
+call was a live API round-trip). It is a read-through cache keyed on the *normalized* tag with a
+`_PLAYER_CACHE_TTL` of 60s and a hard `_PLAYER_CACHE_MAX_ENTRIES` cap of 1000, enforced on insert
+and swept once per update cycle via `evict_stale_player_cache()`. It exists to collapse bursts and
+repeated commands — it is **not** a source of durable state. Consequences for any code that calls
+it:
 
-- **Never loop over `get_player()` serially.** A per-account loop costs one full API round-trip per
-  account, and those calls are slow (2–5s each is normal) whenever the background clan-poll cycle
-  is saturating the API. `/whois` did exactly this and took 30s for a user with 82 linked accounts
-  (2026-08-22) before being changed to a bounded-parallel `asyncio.gather`.
+- **Pass `force_fresh=True` when the value becomes persisted state or freshness *is* the feature.**
+  Currently: the registration/link paths (`_link_player_to_user`, `process_player_registration`,
+  the UNASSIGNED-restore refresh, `ManualPlayerTagModal`) and the "My Accounts" refresh button.
+  A link records `player_name`/`th_level`/`current_clan_tag`/`coc_role` and the role sync runs off
+  that same data immediately afterwards, so a cached read could persist a clan the player already
+  left and assign the wrong in-game role. `tests/integration/test_account_protection.py` asserts
+  the linking path never reads from the cache. Verification itself is unaffected either way —
+  `verify_api_token()` calls the CoC API directly and never goes through `get_player()`.
+- **Never loop over `get_player()` serially.** The cache does not help a single command over many
+  *distinct* tags — each is still one round-trip, and those calls are slow (2–5s each is normal)
+  whenever the background clan-poll cycle is saturating the API. `/whois` did exactly this and took
+  30s for a user with 82 linked accounts (2026-08-22) before being changed to a bounded-parallel
+  `asyncio.gather`.
 - **Bound the parallelism.** Use an `asyncio.Semaphore` (10 is the convention here — see
   `_whois_logic` in `QBdiscordcmds.py` and `_cleanup_sem` in
   `QBdiscocmdshelper_admin_command.py`) rather than a bare `gather` over an unbounded list: the
   rate limiter is shared with the poll cycle, so a large fan-out starves it.
-- **Prefer cached data when it is good enough.** `CACHE.user_accounts[uid]["players"]` already
-  carries `player_name`, `th_level`, `current_clan_tag` and `coc_role`, kept fresh for every
-  tracked account by the clan-poll cycle (`coc_cache.py`'s `update_player_info_in_user_accounts`).
-  Only hero levels and live league data actually require a `get_player()` call.
+- **Prefer the account cache when it is good enough.** `CACHE.user_accounts[uid]["players"]`
+  already carries `player_name`, `th_level`, `current_clan_tag` and `coc_role`, kept fresh for
+  every tracked account by the clan-poll cycle (`coc_cache.py`'s
+  `update_player_info_in_user_accounts`). Only hero levels and live league data actually require a
+  `get_player()` call.
 - **Timeouts belong on the batch, not each call.** A per-call `wait_for` budget that is fine when
   the API is idle will fire repeatedly under cycle load; one budget for the whole gather, with a
   cached-data fallback, degrades far more gracefully.
+- **Failures are never cached**, so an immediate retry after a transient API error can still
+  succeed. There is also deliberately **no stampede lock**: two concurrent misses for the same tag
+  both hit the API, which costs one redundant idempotent GET — cheaper than a per-tag lock dict
+  that would itself need bounding.
 
 ## Future Enhancements
 

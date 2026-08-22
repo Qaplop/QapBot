@@ -216,6 +216,9 @@ class CacheManager:
         # League group cache: clan_tag → (league_group_obj, fetch_unix_timestamp, active_round_count)
         # Invalidated when active_round_count increases (new round started).
         self._league_group_cache: Dict[str, Tuple[Any, float, int]] = {}
+        # Player cache: normalized_player_tag → (player_obj, fetch_unix_timestamp).
+        # Read-through with a short TTL; see _PLAYER_CACHE_TTL above and get_player() below.
+        self._player_cache: Dict[str, Tuple[Any, float]] = {}
         # Per-clan shortcut: clan_tag → war_tag of the last known active CWL war.
         # Allows 1-call refresh instead of iterating all round war tags.
         self.clan_active_cwl_war: Dict[str, str] = {}
@@ -593,6 +596,20 @@ class CacheManager:
     # At ~200 KB per coc.ClanWar object: 1000 entries ≈ 200 MB max.
     _LEAGUE_WAR_CACHE_MAX_ENTRIES: int = 1000
     _LEAGUE_GROUP_CACHE_MAX_ENTRIES: int = 200
+
+    # Player cache (2026-08-22). get_player() was completely uncached despite living here, so
+    # every one of its ~10 call sites paid a full API round-trip per call — /whois was the worst
+    # (one round-trip per linked account; 82 for one live user). Deliberately SHORT: this exists
+    # to collapse bursts and repeated commands, not to serve durable state. Anything that must
+    # observe a change the user just made in-game (registration, the My Accounts refresh button)
+    # passes force_fresh=True — see get_player()'s docstring.
+    _PLAYER_CACHE_TTL: float = 60.0
+    # A coc.Player carries heroes/troops/spells/achievements lists, so it is not small —
+    # estimated tens of KB each; 1000 entries is on the order of 30 MB. Kept deliberately modest
+    # because tracker #0009 (memory) is still open: the realistic working set is user-facing
+    # commands only (the clan-poll cycle never calls get_player), so this is far above what a
+    # normal hour actually touches.
+    _PLAYER_CACHE_MAX_ENTRIES: int = 1000
 
     @staticmethod
     def _calculate_track_war_updates(clan_data: Dict[str, Any], is_tracked: bool) -> bool:
@@ -1421,19 +1438,41 @@ class CacheManager:
         )
         return False, "failed"
 
-    async def get_player(self, player_tag: str) -> Optional['coc.Player']:
+    async def get_player(self, player_tag: str, force_fresh: bool = False) -> Optional['coc.Player']:
         """
-        Fetch player data from CoC API.
-        
+        Fetch player data from the CoC API, through a short-TTL read-through cache.
+
         Centralized method for all player data fetching. Provides consistent
         error handling and logging.
-        
+
+        Caching (added 2026-08-22 — this was a live API round-trip on every call before, despite
+        the method living in cache_manager.py). Entries live for ``_PLAYER_CACHE_TTL`` seconds,
+        long enough to collapse a burst (``/whois`` over one user's linked accounts, a command
+        re-run, two views resolving the same tag) and short enough that nothing user-visible
+        goes meaningfully stale. Three deliberate properties:
+
+        - **Only successful fetches are cached.** A failed lookup returns None and caches
+          nothing, so a transient API error can't turn into a minute of sticky failure for a
+          registration attempt.
+        - **No stampede lock.** Two concurrent misses for the same tag both hit the API. That
+          costs one redundant idempotent GET, which is cheaper than carrying a per-tag lock dict
+          that would itself need bounding/eviction (contrast CoCClanCache._update_locks, which
+          exists to protect a shared MUTATION, not a read).
+        - **Bounded on insert**, not only by the periodic sweep, so the memory ceiling holds
+          even within a single burst.
+
         Args:
             player_tag: Player tag (will be normalized automatically)
-        
+            force_fresh: Bypass the cache and re-fetch from the API, replacing any cached entry.
+                Required for anything that must observe a change the user just made in-game, or
+                whose whole purpose is freshness: the registration/link paths (the captured
+                th_level/name/clan role become persisted account state) and the "My Accounts"
+                refresh button. Verification itself is unaffected either way — verify_api_token()
+                calls the CoC API directly and never goes through here.
+
         Returns:
             coc.Player object or None if fetch fails
-        
+
         Example:
             player = await CACHE.get_player("#ABC123")
             if player:
@@ -1441,28 +1480,86 @@ class CacheManager:
         """
         # import QBcore  # Not used in this function
         from qapbot.QBdiscocmdshelper import normalize_clan_tag
-        
+
         try:
             normalized_tag = normalize_clan_tag(player_tag)
             if not normalized_tag:
                 logging.warning(f"Invalid player tag format: {player_tag}")
                 return None
-            
+
+            player_cache = self._player_cache_store()
+
+            if not force_fresh:
+                cached = player_cache.get(normalized_tag)
+                if cached is not None and (time.time() - cached[1]) <= self._PLAYER_CACHE_TTL:
+                    return cached[0]
+
             if not self.coc_client:
                 raise RuntimeError("CoC API client not initialized. Call startup_login() first.")
-            
+
             async def _fetch_player() -> coc.Player:
                 return await self.coc_client.get_player(normalized_tag)  # type: ignore[union-attr]
-            
+
             player: coc.Player = await coc_retry(  # type: ignore[assignment]
                 _fetch_player,
                 operation_name=f"get_player({normalized_tag})"
             )
+            if player is not None:
+                player_cache[normalized_tag] = (player, time.time())
+                self._enforce_player_cache_cap()
             return player
-            
+
         except Exception as e:
             logging.warning(f"Failed to fetch player {player_tag} from CoC API: {e}")
             return None
+
+    def _player_cache_store(self) -> Dict[str, Tuple[Any, float]]:
+        """The player cache dict, creating it if this instance somehow lacks one.
+
+        Resolved through __dict__ rather than plain attribute access on purpose: an instance
+        built without __init__ (``CacheManager.__new__``, which test helpers do use) would
+        otherwise raise AttributeError inside get_player, whose broad ``except Exception``
+        would swallow it into a silent None — one missing attribute quietly turning EVERY
+        player lookup in the bot into "player not found". Degrading to an empty cache is the
+        far safer failure mode.
+        """
+        return self.__dict__.setdefault("_player_cache", {})
+
+    def _enforce_player_cache_cap(self) -> None:
+        """Drop the oldest entries when _player_cache exceeds its hard size cap.
+
+        Runs on insert (not only in the periodic sweep) so the ceiling holds even inside a
+        single burst — evict_stale_player_cache() only runs once per update cycle, which is far
+        too coarse to bound a command that fetches dozens of tags back to back.
+        """
+        store = self._player_cache_store()
+        over = len(store) - self._PLAYER_CACHE_MAX_ENTRIES
+        if over <= 0:
+            return
+        oldest = sorted(store.items(), key=lambda kv: kv[1][1])[:over]
+        for tag, _ in oldest:
+            del store[tag]
+        logging.debug(
+            f"[PLAYER-CACHE-EVICT] Size cap: evicted {over} entries "
+            f"(limit={self._PLAYER_CACHE_MAX_ENTRIES})"
+        )
+
+    def evict_stale_player_cache(self) -> None:
+        """Purge _player_cache entries past their TTL. Called once per update cycle (QapBot.py),
+        alongside evict_stale_cwl_caches().
+
+        The size cap already guarantees the hard memory ceiling; this is what stops a bounded
+        set of long-dead entries from sitting on heavy coc.Player objects between bursts.
+        """
+        now = time.time()
+        expired = [
+            tag for tag, (_, ts) in self._player_cache.items()
+            if now - ts > self._PLAYER_CACHE_TTL
+        ]
+        for tag in expired:
+            del self._player_cache[tag]
+        if expired:
+            logging.debug(f"[PLAYER-CACHE-EVICT] Purged {len(expired)} stale player entries")
 
     async def verify_api_token(self, player_tag: str, api_token: str) -> tuple[bool, str]:
         """

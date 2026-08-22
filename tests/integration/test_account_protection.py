@@ -26,6 +26,7 @@ class _FakeCache:
         self.server_config: dict[str, dict[str, Any]] = {}
         self.clan_name_cache: dict[str, Any] = {}
         self._persisted: list[str] = []
+        self.force_fresh_calls: list[tuple[str, bool]] = []
 
     async def persist_user(self, discord_id: str) -> None:
         self._persisted.append(str(discord_id))
@@ -39,7 +40,11 @@ class _FakeCache:
     async def persist_clan(self, clan_tag: str) -> None:
         return None
 
-    async def get_player(self, player_tag: str) -> _FakePlayer:
+    async def get_player(self, player_tag: str, force_fresh: bool = False) -> _FakePlayer:
+        # force_fresh mirrors the real CacheManager.get_player signature (2026-08-22): the
+        # linking paths under test pass it explicitly, since the name/th_level captured there
+        # become persisted account state and must never come from the short-TTL cache.
+        self.force_fresh_calls.append((player_tag, force_fresh))
         return _FakePlayer(tag=player_tag, name="PlayerName", clan=_FakeClan(tag="#CLAN", name="ClanName"))
 
 
@@ -133,3 +138,25 @@ class TestLinkingSecurity:
         assert moved.get("verified") is False
         assert "111" in fake_cache._persisted
         assert "222" in fake_cache._persisted
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_linking_never_reads_player_data_from_the_short_ttl_cache(self, fake_cache):
+        """2026-08-22: CACHE.get_player() gained a 60s read-through cache. The linking path
+        captures player_name/th_level/current_clan_tag/coc_role and PERSISTS them as account
+        state — and the role sync runs off that same data immediately afterwards — so it must
+        always read live. A cached read here would let a link record a clan the player has
+        already left, and hand them the wrong in-game role."""
+        from qapbot.QBdiscocmdshelper import _link_player_to_user
+
+        ok, _msg = await _link_player_to_user(
+            target_user_id=222,
+            player_tag_raw="#ABC123",
+            display_name="NewUser",
+        )
+        assert ok is True
+
+        assert fake_cache.force_fresh_calls, "linking made no get_player call at all"
+        assert all(
+            forced for _tag, forced in fake_cache.force_fresh_calls
+        ), f"linking read player data from the cache: {fake_cache.force_fresh_calls}"

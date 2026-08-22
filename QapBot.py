@@ -1836,6 +1836,9 @@ async def main() -> None:
 
     # Evict expired CWL cache entries to prevent unbounded growth.
     CACHE.evict_stale_cwl_caches()
+    # Same, for the short-TTL player cache (2026-08-22). Its hard size cap is enforced on
+    # insert; this releases entries that simply aged out between bursts.
+    CACHE.evict_stale_player_cache()
 
     # Update throttle_backlog to the post-cycle remaining count.
     # _overdue_total was snapshotted before the cap; inactive_count clans were
