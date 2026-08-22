@@ -1984,11 +1984,26 @@ async def handle_tracker_test_reaction(payload: discord.RawReactionActionEvent) 
     §2.4 point 3) — a new on_raw_reaction_add listener (the bot had none before this, plan
     §5.4). Raw (not cached) so it works after restarts. Bot-admin only (plan §8.2); anyone
     else's reaction is silently skipped (never removed — that would need an extra permission
-    the bot may not have, and isn't worth the noise)."""
+    the bot may not have, and isn't worth the noise).
+
+    Explicitly gated on CONFIG.tracker_enabled (2026-08-22 live bug report: DEV reacted to a 👍
+    on a PROD-authored test-case message — raw reaction events fire for every bot present in a
+    channel, regardless of which bot's message was reacted to, unlike component interactions
+    which Discord routes only to the owning application. QapBot.py's own `on_raw_reaction_add`
+    registers this listener unconditionally on the wrong assumption that DEV's tracker DB has no
+    matching rows to find; in practice DEV's DB is periodically seeded from a PROD backup and
+    does have them, so DEV proceeded to mark environments passed in its own DB, fail with a 403
+    ("Cannot edit a message authored by another user") refreshing PROD's test-case message, and
+    still post its own "mark item done too?" prompt to the thread. tracker_enabled is already
+    `not is_dev_mode` (qapbot/config.py) — this is the one function actually reachable from that
+    listener, so the guard belongs here rather than relying on the registration site alone."""
+    from qapbot.config import CONFIG
+
+    if not CONFIG.tracker_enabled:
+        return
     if payload.emoji.name != "👍" or payload.user_id is None:
         return
     from qapbot.cache_manager import CACHE
-    from qapbot.config import CONFIG
 
     if not CONFIG.server_admin or str(payload.user_id) != CONFIG.server_admin:
         return

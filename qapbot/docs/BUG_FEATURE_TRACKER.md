@@ -30,6 +30,23 @@ an independently-configurable toggle would let DEV post real-looking items into 
 channels. There is currently no way to live-test the Discord-side tracker commands on DEV —
 use the unit/discord/integration test suites instead.
 
+**This invariant has to be enforced at every entry point individually — slash-command
+registration alone doesn't cover everything** (2026-08-22 live bug report: DEV reacted to a 👍
+on a PROD-authored test-case message, marked environments passed in its own PROD-backup-seeded
+copy of that tracker item, then failed with a 403 editing a message it doesn't own, and still
+posted its own "mark item done too?" prompt into the thread). The reason slash-command gating
+alone isn't enough: a raw gateway event like `on_raw_reaction_add` fires for **every bot present
+in a channel**, regardless of which bot's message was reacted to — unlike a component
+interaction (button click), which Discord delivers only to the application that owns the
+message. So "DEV's copy of a DynamicItem button is safe because DEV never receives the
+interaction" does NOT generalize to reaction listeners, where DEV very much does receive the
+event and, since its DB is a PROD copy, finds a real matching row to act on.
+`handle_tracker_test_reaction()` now checks `CONFIG.tracker_enabled` explicitly as its first
+line for exactly this reason — any *future* raw event listener (reactions, message edits, etc.)
+touching tracker state needs the same explicit check; do not rely on "DEV won't have a matching
+row" or "DEV won't receive this event" without verifying which kind of Discord event it actually
+is.
+
 ## Data model
 
 Four tables, all created in `WarHistoryDB._create_tracker_schema()` (called from

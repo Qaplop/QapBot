@@ -1716,3 +1716,43 @@ sending it a raw `initialize` line by hand — a transport-layer crash shows up 
 `stderr`, whereas the calling host (VS Code, Claude Code) usually just silently shows zero tools
 with no visible error.
 
+## Pitfall 39: a raw Discord gateway event fires for every bot in the channel, not just the one whose message it's about — "DEV never sees a matching row" doesn't generalize from button clicks to reactions
+
+**Symptom (2026-08-22, live report):** DEV reacted to an admin's 👍 on a test-case message that
+PROD had posted, in a channel/guild both bots share for testing. DEV proceeded to mark that
+tracker item's environments passed in its own DB, then logged `[TRACKER] Failed to refresh
+test-case message for item #11: 403 Forbidden (error code: 50005): Cannot edit a message
+authored by another user`, and still posted its own "mark item done too?" prompt into the
+thread — visibly, since the mention fix landed in the same deploy (see the changelog).
+
+**Why:** `qapbot/ui_tracker.py`'s bug/feature tracker is meant to be PROD-only —
+`CONFIG.tracker_enabled` is hard-coded `not is_dev_mode` specifically so DEV never registers
+`/bug`/`/feature` (see `BUG_FEATURE_TRACKER.md`'s "Architecture at a glance"). The 👍-reaction
+sign-off shortcut is wired as `on_raw_reaction_add` in `QapBot.py`, registered unconditionally
+under the assumption that it'd be a harmless no-op on DEV — reasoning copied from the adjacent
+`DynamicItem` button registration, which really is safe on DEV: a component **interaction**
+(button click) is delivered by Discord only to the bot application that owns the message, so
+DEV's own copy of a `TrackerTestPassButton` etc. is simply never invoked for a PROD-authored
+message. A **raw reaction add event is not scoped that way** — it fires for every bot present in
+the channel/guild regardless of which bot's message got the reaction, because it's a statement
+about the channel's state, not an interaction routed to a specific application. Combined with
+DEV's tracker DB being a routine copy of a PROD backup (a project-standard workflow, not a
+misconfiguration), DEV's `get_tracker_item_by_test_message_id()` lookup found a real row and
+proceeded to act on it — the "no tracker message ever exists there" assumption was true for
+`/bug`/`/feature`-created items but false the moment ANY raw gateway event touches tracker state.
+
+**Fix:** `handle_tracker_test_reaction()` now checks `CONFIG.tracker_enabled` as its very first
+line, before even checking the emoji — the gate belongs in the one function actually reachable
+from the listener, not only (or instead of) the registration site, so it holds regardless of
+future callers.
+
+**How to apply:** before assuming a Discord listener is "safe" on DEV because an analogous one
+is, check WHICH KIND of event it is. Component interactions (buttons, select menus, modals) and
+slash commands are scoped by Discord to the owning bot application — safe by construction.
+Anything based on raw gateway events over shared channel state — `on_raw_reaction_add`/`_remove`,
+`on_message`, `on_raw_message_edit`/`_delete`, presence/typing events — fires for every bot
+present, regardless of which bot the content belongs to, and must carry its own explicit
+`CONFIG.tracker_enabled` (or equivalent PROD-only) check if it touches tracker (or any other
+PROD-only) state. Don't reuse "DEV never receives this" reasoning across event types without
+verifying it actually applies to the specific event you're adding.
+

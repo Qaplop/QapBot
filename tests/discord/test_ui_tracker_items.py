@@ -64,7 +64,14 @@ def _wire_cache_db(db, monkeypatch):
 def _configure_admin(monkeypatch):
     from qapbot.config import CONFIG
     import dataclasses
-    monkeypatch.setattr("qapbot.config.CONFIG", dataclasses.replace(CONFIG, server_admin=ADMIN_ID))
+    # tracker_enabled=True: the ambient test CONFIG defaults to DEV-like settings (is_dev_mode
+    # True, tracker_enabled False) absent real PROD env vars -- this whole file exercises tracker
+    # behavior, so it needs the same override test_cwl_signup_snapshot_staleness.py's _allow_dms
+    # fixture makes for cwl_dm_restrict_to_admin. Needed since 2026-08-22's live bug report fix:
+    # handle_tracker_test_reaction() now gates on tracker_enabled (see its own docstring).
+    monkeypatch.setattr(
+        "qapbot.config.CONFIG", dataclasses.replace(CONFIG, server_admin=ADMIN_ID, tracker_enabled=True)
+    )
     # ui_tracker imports CONFIG inside its functions (`from qapbot.config import CONFIG`),
     # which re-reads the module attribute each call, so the patch above is picked up live.
 
@@ -695,6 +702,31 @@ async def test_reaction_marks_all_pending_environments_passed(db, monkeypatch):
     assert all(c["passed"] for c in testcases)
     item = await db.get_tracker_item(item_number)
     assert item["status"] == "testing"  # decoupled (tracker item #0015 follow-up) — unaffected
+
+
+@pytest.mark.asyncio
+async def test_reaction_is_a_noop_when_tracker_disabled(db, monkeypatch):
+    """2026-08-22 live bug report: DEV reacted to a 👍 on a PROD-authored test-case message and
+    tried to mark environments passed in its own (PROD-backup-seeded) copy of the same tracker
+    item, then failed with a 403 editing a message it doesn't own. Raw reaction events fire for
+    every bot present in a channel regardless of which bot's message was reacted to -- unlike
+    component interactions, which Discord routes only to the owning application -- so this can't
+    rely on "DEV just never sees a matching row" the way the DynamicItem buttons safely can.
+    tracker_enabled=False (DEV's real setting: `not is_dev_mode`, qapbot/config.py) must make
+    this a true no-op even when a matching item genuinely exists in this bot's own DB."""
+    import dataclasses
+    from qapbot.config import CONFIG as _cfg
+
+    monkeypatch.setattr("qapbot.config.CONFIG", dataclasses.replace(_cfg, tracker_enabled=False))
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "x"}])
+    await db.update_tracker_item(item_number, test_channel_id="1", test_message_id="999", status="testing")
+
+    await handle_tracker_test_reaction(_fake_payload())
+
+    cases = await db.get_tracker_testcases(item_number)
+    assert cases[0]["passed"] == 0
 
 
 @pytest.mark.asyncio

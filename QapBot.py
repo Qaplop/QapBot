@@ -2824,8 +2824,11 @@ async def _setup_hook():
 
     # Bug/feature tracker item buttons (BUG_FEATURE_TRACKER_PLAN.md Phase 3/5) — DynamicItems so
     # a bot restart between posting an item/test-case message and a click still resolves
-    # correctly. Registered unconditionally (harmless no-op on DEV, where tracker_enabled is
-    # always False — no tracker message ever exists there to carry these custom_ids).
+    # correctly. Registered unconditionally: genuinely harmless on DEV here, unlike the
+    # on_raw_reaction_add listener below (2026-08-22 live bug report) — a button click is a
+    # component INTERACTION, which Discord delivers only to the bot application that actually
+    # owns the message, so DEV's own copy of these DynamicItems is simply never invoked for a
+    # PROD-authored message no matter what DEV's own tracker DB contains.
     from qapbot.ui_tracker import TrackerItemButton, TrackerTestPassButton, TrackerTestFailButton, TrackerTestMoveDoneButton
     QBcore.bot.add_dynamic_items(TrackerItemButton, TrackerTestPassButton, TrackerTestFailButton, TrackerTestMoveDoneButton)
     logging.info("[SETUP_HOOK] Registered persistent tracker item/test-case dynamic items for restart-surviving buttons")
@@ -3571,7 +3574,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     """Bug/feature tracker's 👍 test-case sign-off shortcut (BUG_FEATURE_TRACKER_PLAN.md §2.4,
     §5.4) — the bot had no on_raw_reaction_add listener before this. Raw (not cached) so it
     keeps working after a restart. Delegates entirely to handle_tracker_test_reaction(), which
-    no-ops for anything that isn't 👍 on a known test-case message from the bot admin.
+    no-ops for anything that isn't 👍 on a known test-case message from the bot admin —
+    including, as of 2026-08-22, on DEV: a raw reaction event fires for every bot present in a
+    channel regardless of which bot's message was reacted to (unlike component interactions,
+    which Discord routes only to the owning application), and DEV's tracker DB is periodically
+    seeded from a PROD backup, so it isn't the harmless no-op it looks like without that gate —
+    see handle_tracker_test_reaction()'s own docstring for the live incident this fixed.
     """
     from qapbot.ui_tracker import handle_tracker_test_reaction
     try:

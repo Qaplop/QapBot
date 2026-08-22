@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (20)
+- Fixed: DEV reacted to a 👍 on a PROD-authored tracker test-case message -- marked that item's
+  environments passed in its own (PROD-backup-seeded) copy of the same row, then failed with a
+  403 ("Cannot edit a message authored by another user") refreshing PROD's message, and still
+  posted its own "mark item done too?" prompt into the thread (live bug report against item
+  #0011). Root cause: `on_raw_reaction_add` (QapBot.py) was registered unconditionally on the
+  assumption it'd be a harmless DEV no-op, copying the reasoning from the adjacent tracker
+  DynamicItem buttons -- which really IS safe on DEV, since Discord routes a component
+  interaction only to the owning bot application. A raw reaction-add event has no such routing:
+  it fires for every bot present in the channel regardless of which bot's message got the
+  reaction, so "DEV never sees a matching row" doesn't hold once DEV's DB (a routine PROD-backup
+  copy) actually has one. `handle_tracker_test_reaction()` now checks `CONFIG.tracker_enabled`
+  (already hard-coded `not is_dev_mode`) as its very first line. Documented as Pitfall 39
+  (COPILOT_PITFALLS_COOKBOOK.md) and in BUG_FEATURE_TRACKER.md's architecture section, since the
+  same reasoning gap applies to any future raw-gateway-event listener touching tracker state.
+  Files: qapbot/ui_tracker.py, QapBot.py, qapbot/docs/{BUG_FEATURE_TRACKER,
+  COPILOT_PITFALLS_COOKBOOK}.md, tests/discord/test_ui_tracker_items.py. 2459 tests pass.
+
 2026-08-22 (19)
 - Fixed: the passive "mark item done too?" prompt (posted to a tracker item's discussion thread
   when the 👍-reaction shortcut fully passes its test cases, since there's no live interaction to
