@@ -1600,8 +1600,21 @@ at whatever Discord account owned them at snapshot time.
   added at the end to "fill gaps" silently cannot fix wrong values — if it is the authority, it must
   assign, not `or`.
 
+**Also fix the WRITE boundary, not just the readers.** Defending every reader stops the
+user-visible symptom, but the paths that *copy one snapshot into another* — a clan becoming
+shared (`_migrate_local_clan_roster_to_shared`), a drag-and-drop placement (`_resolve_identity`),
+the cross-guild mirror — were still laundering an outdated owner into `cwl_shared_clan_players`,
+where the next feature to read that column would naturally trust it. Those now resolve through
+`_live_owners_or_sync()` (`QBdiscocmdshelper_cwl.py`), which batches the lookup and falls back to
+the recorded value only for a tag with no `user_players` row at all. Note the asymmetry, which is
+deliberate: a *reader* treats a live None as authoritative (nobody owns this, don't DM anyone),
+while a *carry-forward writer* falls back instead — so it can only ever correct an owner, never
+erase the record of who was originally DMed.
+
 General lesson: when a snapshot table and a live table both carry the same field, every read path
 has to make an explicit, documented choice about which wins — and "whichever source the merge loop
 happened to visit first" is not that choice. Grep for *all* readers of the snapshot field before
 concluding a fix is complete: this one had four (board payload, DM targeting, the DM button's
-ownership guard, and the upsert that wrote the stale value straight back).
+ownership guard, and the upsert that wrote the stale value straight back). Then grep the *writers*
+too — a defended reader still leaves the bad data spreading, and the next person to add a reader
+starts from a column that looks trustworthy and isn't.

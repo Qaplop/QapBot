@@ -48,6 +48,60 @@ async def _link(db: WarHistoryDB, discord_id: str, player_tag: str, clan_tag=Non
     await db.conn.commit()
 
 
+class TestCarryForwardWritesUseLiveOwner:
+    """Every READ path re-resolves ownership live, so a stale snapshot value can no longer
+    mis-route a DM or grey out a tile. But the write paths that COPY one snapshot into the other
+    (a clan becoming shared, a placement) were still laundering an outdated owner into a second
+    table, where the next feature to read that column would naturally trust it. Resolving at the
+    write boundary stops the stale value spreading — the same self-healing the DM button does."""
+
+    @pytest.mark.asyncio
+    async def test_migrating_a_local_roster_to_shared_writes_the_live_owner(self, db):
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "905", "#CLANE")
+        db.upsert_cwl_signup_sync(event_id, "#MIG", "Mig", "staleowner", None, "template_confirm", "confirmed")
+        db.upsert_cwl_assignment_sync(event_id, "#MIG", "#CLANE")
+        await _link(db, "trueowner", "#MIG", clan_tag="#CLANE")
+
+        shared_clan_id = db.create_cwl_shared_clan_sync("#CLANE", "2026-09", "905", event_id, "test")
+        cwl._migrate_local_clan_roster_to_shared(db, event_id, shared_clan_id, "#CLANE", "905")
+
+        rows = {p["player_tag"]: p for p in db.get_cwl_shared_clan_players_sync(shared_clan_id)}
+        assert rows["#MIG"]["discord_id"] == "trueowner"
+
+    @pytest.mark.asyncio
+    async def test_migration_keeps_the_snapshot_owner_for_a_never_linked_tag(self, db):
+        """A guest tag added by search has no user_players row at all — there is nothing live to
+        resolve, so the recorded owner (who really was DMed) must survive rather than be blanked."""
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "906", "#CLANF")
+        db.upsert_cwl_signup_sync(event_id, "#GUESTX", "GuestX", "guestowner", None, "guest_invite", "pending")
+        db.upsert_cwl_assignment_sync(event_id, "#GUESTX", "#CLANF")
+
+        shared_clan_id = db.create_cwl_shared_clan_sync("#CLANF", "2026-09", "906", event_id, "test")
+        cwl._migrate_local_clan_roster_to_shared(db, event_id, shared_clan_id, "#CLANF", "906")
+
+        rows = {p["player_tag"]: p for p in db.get_cwl_shared_clan_players_sync(shared_clan_id)}
+        assert rows["#GUESTX"]["discord_id"] == "guestowner"
+
+    @pytest.mark.asyncio
+    async def test_live_owners_helper_omits_never_linked_tags(self, db):
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        await _link(db, "someone", "#KNOWN1", clan_tag=None)
+        result = cwl._live_owners_or_sync(db, ["#KNOWN1", "#UNKN0WN"])
+
+        assert result == {"#KNOWN1": "someone"}
+
+    @pytest.mark.asyncio
+    async def test_live_owners_helper_is_empty_for_no_tags(self, db):
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        assert cwl._live_owners_or_sync(db, []) == {}
+
+
 class TestDmTargetingUsesLiveOwner:
     """resolve_cwl_pool_dm_targets_sync merged its four sources with first-non-None-wins
     (`entry["discord_id"] = entry["discord_id"] or discord_id`), and the live user_players

@@ -1,6 +1,23 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (7)
+- Fixed: follow-up audit of the (4) snapshot-staleness fix found three WRITE paths still copying
+  an outdated owner from one snapshot table into another -- _migrate_local_clan_roster_to_shared()
+  (clan becomes shared), the cross-guild "orphaned elsewhere" mirror, and _resolve_identity()
+  (drag-and-drop placement) all carried cwl_signups.discord_id straight into
+  cwl_shared_clan_players / a fresh signup row. No user-visible bug (every reader now re-resolves
+  live, verified by re-auditing all of them plus every CWL DM path), but it kept spreading stale
+  data into a column the next feature to read it would trust. All three now go through a new
+  batched _live_owners_or_sync() helper. Deliberate asymmetry, documented: a reader treats a live
+  None as authoritative (nobody owns it, DM nobody) while a carry-forward writer falls back to the
+  recorded value, so it can only correct an owner and never erase who was originally DMed.
+  Also added the test that (4) was missing for its own opt-out change: cwl_permanent_optout for a
+  pooled player who is in no member clan (the clan-scoped source silently defaulted it to False).
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md (Pitfall 37),
+  tests/unit/test_cwl_signup_snapshot_staleness.py, tests/discord/test_web_bridge.py.
+  2359 tests pass.
+
 2026-08-22 (6)
 - Added: short-TTL read-through cache in `CACHE.get_player()`. Despite living in
   cache_manager.py it was completely uncached -- every call across its ~10 call sites was a live

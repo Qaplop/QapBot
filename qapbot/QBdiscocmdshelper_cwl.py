@@ -835,6 +835,30 @@ def _create_new_shared_clan_sync(
     }
 
 
+def _live_owners_or_sync(db: Any, player_tags: List[str]) -> Dict[str, Optional[str]]:
+    """player_tag -> the account's CURRENT owner from user_players, for carry-forward writes.
+
+    cwl_signups and cwl_shared_clan_players are enrollment-time SNAPSHOTS (Pitfall 37). Every
+    READ path now re-resolves ownership live, so a stale value in either column can no longer
+    mis-route a DM or grey out a board tile — but the write paths that COPY one snapshot into
+    the other (a clan becoming shared, a drag-and-drop placement) were still laundering an
+    outdated owner into a second table, where the next feature to read that column would
+    naturally trust it. Resolving at the write boundary keeps the stale value from spreading in
+    the first place, the same way CwlSignupResponseButton self-heals the row it touches.
+
+    A tag with no user_players row at all (a guest tag added by search that was never linked)
+    is absent from the result — callers keep their own fallback for that. A tag whose only row
+    is the UNASSIGNED sentinel maps to None; callers deliberately fall back rather than blanking,
+    so this can only ever CORRECT an owner, never erase a record of who was originally DMed.
+
+    Batched (one query for the whole set) — the migrate-to-shared path below runs over a whole
+    clan roster, and a per-player query there would be one round-trip per assigned member.
+    """
+    if not player_tags:
+        return {}
+    return {tag: link["discord_id"] for tag, link in db.get_player_links_sync(player_tags).items()}
+
+
 def _migrate_local_clan_roster_to_shared(db: Any, event_id: int, shared_clan_id: int, clan_tag: str, guild_id_str: str) -> None:
     """Folds a guild's pre-existing LOCAL cwl_assignments+cwl_signups rows for clan_tag into the
     shared roster (cwl_shared_clan_players) the moment that guild attaches to a shared clan —
@@ -850,18 +874,24 @@ def _migrate_local_clan_roster_to_shared(db: Any, event_id: int, shared_clan_id:
     split rationale) — this is the one legitimate place that needs to set both at once, since it's
     carrying forward two genuinely real, independent prior facts (they WERE locally assigned here,
     AND they had this exact real response), not deriving one from the other."""
-    for assignment in db.get_cwl_assignments_sync(event_id):
-        if assignment["assigned_clan_tag"] != clan_tag:
-            continue
-        signup = db.get_cwl_signup_sync(event_id, assignment["player_tag"])
-        if signup is None:
-            continue
+    migrating = [
+        signup
+        for assignment in db.get_cwl_assignments_sync(event_id)
+        if assignment["assigned_clan_tag"] == clan_tag
+        for signup in [db.get_cwl_signup_sync(event_id, assignment["player_tag"])]
+        if signup is not None
+    ]
+    # Resolve current ownership once for the whole roster rather than carrying each signup's
+    # snapshot value straight across into cwl_shared_clan_players (2026-08-22, Pitfall 37).
+    live_owners = _live_owners_or_sync(db, [s["player_tag"] for s in migrating])
+    for signup in migrating:
+        owner = live_owners.get(signup["player_tag"]) or signup["discord_id"]
         db.set_cwl_shared_clan_player_assignment_sync(
-            shared_clan_id, signup["player_tag"], signup["player_name"], signup["discord_id"],
+            shared_clan_id, signup["player_tag"], signup["player_name"], owner,
             True, signup["source"], guild_id_str,
         )
         db.set_cwl_shared_clan_player_status_sync(
-            shared_clan_id, signup["player_tag"], signup["player_name"], signup["discord_id"],
+            shared_clan_id, signup["player_tag"], signup["player_name"], owner,
             signup["status"], signup["source"], guild_id_str, signup.get("responded_at"),
         )
 
@@ -1176,9 +1206,14 @@ def assign_cwl_player_sync(
                     # recognized and instead of putting QManiac to the unassigned pool he should
                     # have been assigned to the 'Assigned to other clan' pool").
                     if db.get_cwl_signup_sync(event_id, player_tag) is None:
+                        # Live owner, not the other guild's shared-roster snapshot (Pitfall 37).
+                        mirrored_owner = (
+                            _live_owners_or_sync(db, [player_tag]).get(player_tag)
+                            or other_shared_row["discord_id"]
+                        )
                         db.upsert_cwl_signup_sync(
                             event_id, player_tag, other_shared_row["player_name"],
-                            other_shared_row["discord_id"], None, signup_source, "pending",
+                            mirrored_owner, None, signup_source, "pending",
                         )
                     db.upsert_cwl_assignment_sync(
                         event_id, player_tag, chosen[1], assignment_source="orphaned_elsewhere", locked=False,
@@ -1208,18 +1243,23 @@ def assign_cwl_player_sync(
         purge_orphaned_shared_clan_guests_sync(shared_clan_id, player_tag)
 
     def _resolve_identity(candidate_tags: List[str]) -> Tuple[str, Optional[str]]:
+        # The NAME keeps its existing snapshot-first precedence (the recorded name is the one
+        # any DM text already used); only the OWNER is re-resolved live, since that value gets
+        # persisted into cwl_shared_clan_players / a fresh cwl_signups row below and would
+        # otherwise carry an outdated owner into a second table (2026-08-22, Pitfall 37).
+        live_owner = _live_owners_or_sync(db, [player_tag]).get(player_tag)
         existing_signup = db.get_cwl_signup_sync(event_id, player_tag)
         if existing_signup is not None:
-            return existing_signup["player_name"], existing_signup["discord_id"]
+            return existing_signup["player_name"], live_owner or existing_signup["discord_id"]
         if removed_player_name is not None:
-            return removed_player_name, removed_discord_id
+            return removed_player_name, live_owner or removed_discord_id
         member = next(
             (m for m in db.get_current_clan_members_sync(candidate_tags) if m["player_tag"] == player_tag),
             None,
         )
         if member is not None:
-            return member["player_name"], member["discord_id"]
-        return player_tag, None
+            return member["player_name"], live_owner or member["discord_id"]
+        return player_tag, live_owner
 
     if target_clan_tag is not None and target_clan_tag in shared_clans_by_tag:
         player_name, discord_id = _resolve_identity(list(set(resolve_guild_member_clan_tags(guild_id)) | {target_clan_tag}))

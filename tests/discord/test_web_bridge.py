@@ -2348,6 +2348,47 @@ async def test_enrollment_get_clears_link_for_account_returned_to_unassigned_poo
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_enrollment_get_resolves_optout_for_a_clanless_pooled_player(db, bridge_config, client, monkeypatch):
+    """optout_by_tag was populated ONLY from get_current_clan_members_sync, which is clan-scoped
+    — so a pooled player who is in no member/participating clan silently defaulted to
+    cwl_permanent_optout=False no matter what user_players actually said, hiding a real opt-out
+    from the board. The same get_player_links_sync call that fixes discord_id (2026-08-22) also
+    carries cwl_permanent_optout, so it closes this identical blind spot."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "836", {"#CLANO": "OptClan"})
+    CACHE.db_manager = db
+    CACHE.server_config["836"] = {"member_clans": ["#CLANO"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("836", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLANO", "participating": True}])
+    db.upsert_cwl_signup_sync(event_id, "#OPTED", "Opted", "owner1", None, "template_confirm", "pending")
+    # Linked and opted out, but in NO clan — the clan-scoped source can't see them.
+    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('owner1', 'Owner')")
+    await db.conn.execute(
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag, "
+        "cwl_permanent_optout) VALUES ('owner1', '#OPTED', 'Opted', 0, NULL, 1)"
+    )
+    await db.conn.commit()
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(836, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "836", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    opted = next(p for p in body["players"] if p["player_tag"] == "#OPTED")
+    assert opted["cwl_permanent_optout"] is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_enrollment_get_no_event_returns_empty(db, bridge_config, client, monkeypatch):
     from qapbot.cache_manager import CACHE
 
