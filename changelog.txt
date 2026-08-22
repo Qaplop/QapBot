@@ -1,7 +1,20 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
-2026-08-22 (1)
+2026-08-22 (3)
+- Fixed: the item embed reposted into the Implemented channel on move-on-done (previous entry
+  below) still carried its Edit/Add files/Status/Test cases buttons -- nothing left to do on a
+  closed item, flagged from a live screenshot. _move_item_to_implemented_channel() now sends the
+  repost with no `view=`, matching how the Done Testing test-case repost already strips its
+  Pass/Fail buttons. Also handles the "already archived" edge case: if `done` is re-entered while
+  the item is already sitting in the Implemented channel (no new move happens),
+  _refresh_item_message() gained an `archived` flag so the in-place refresh also renders with no
+  buttons and keeps the "Discussion thread" jump-link field (factored into a new
+  _build_archived_item_embed() shared by both paths, so a later status change doesn't silently
+  drop that field). Files: qapbot/ui_tracker.py, qapbot/docs/BUG_FEATURE_TRACKER.md,
+  tests/discord/test_ui_tracker_items.py. 2325 tests pass.
+
+2026-08-22 (2)
 - Added: two new `/admin` -> Bot Setup channel slots, "Implemented" and "Done Testing", so
   closed tracker items stop accumulating in the working reports/test channels. The moment any
   path sets an item's status to `done` (status dropdown, bridge/MCP tracker_set_status, or the
