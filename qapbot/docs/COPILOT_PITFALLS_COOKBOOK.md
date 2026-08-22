@@ -1518,3 +1518,91 @@ fails, ask not just "is the on-disk data still correct" (it was — the transact
 "is the in-memory state I'm about to reuse next time still correct" — an object mutated *before*
 the failing write, then never repaired after, silently becomes permanent poison for every future
 caller that shares it, which is a much larger blast radius than the single failed call suggests.
+
+---
+
+## Pitfall 36: `user_players.added_at` is "last persisted", NOT "when this account was linked"
+
+**Symptom (2026-08-22 investigation):** a forensic query grouped `user_players` by `added_at` and
+found all 82 of one Discord user's accounts sharing the exact same second
+(`2026-08-21 22:41:49`), several of them tags that a `cwl_signups` snapshot showed belonging to
+three *other* Discord users days earlier. That reads unmistakably as a bulk ownership hijack, and a
+whole hypothesis was built on it. It was nothing of the sort.
+
+**Why:** `save_user()` → `_replace_user_players_rows()` (`db_manager.py`) persists a user by
+
+```sql
+DELETE FROM user_players WHERE discord_id = ?
+```
+
+followed by a full re-insert of every player from the in-memory list. `added_at` has
+`DEFAULT (datetime('now'))` and is never carried over, so **every** persist of a user rewrites the
+timestamp on **all** of that user's rows. The routine clan-poll cycle persists users constantly
+(`_update_player_info_in_user_accounts_locked` → `persist_user(uid)` for every user whose TH, name,
+role or current clan changed), so a shared `added_at` across a user's whole account list means only
+"this user was last written at that moment" — the single most common state for an active user.
+
+**How to apply:**
+- Never use `added_at` to date a link, order links, or infer that ownership moved. It cannot
+  distinguish "linked just now" from "linked in February and touched by a poll just now."
+- The real link/unlink audit trail is the **log**, not the DB:
+  `USER ACTION: <user> skipped verification for player <name> (<tag>)`, the `/link` and unlink
+  paths' own log lines, and `[USER-ACCOUNTS-UPDATE] <tag>: newly tracked from clan <clan>`.
+  Grep the rotated `data/logs/qapbot.log*` for the player tag.
+- Watch the timezone when correlating the two: log lines are **local** (UTC+2 on PROD) while
+  `added_at` / `datetime('now')` are **UTC**. A DB timestamp of `2026-08-21 22:41:49` is
+  `00:41:49` on 2026-08-22 in the log — a different file once the log has rotated.
+
+General lesson: a column whose value is a side effect of *how* a row is persisted carries no
+information about the fact the row represents. Before treating any timestamp as domain evidence,
+check whether the write path is an UPDATE of changed fields or a DELETE + full re-insert — the
+latter resets every defaulted column on every save, for every row, whether or not anything about
+that row actually changed.
+
+---
+
+## Pitfall 37: `cwl_signups` is an enrollment-time SNAPSHOT — re-resolve its `discord_id` on read
+
+> **Status: fix not yet implemented** (as of 2026-08-22). The analysis and the step-by-step fix live
+> in `plans/cwl-board-stale-link-and-whois-timeout.md`. Until that lands, the code described below
+> is still the current behaviour — read this as "what is wrong and what the fix must do," not as a
+> convention the codebase already follows.
+
+**Symptom (2026-08-22, live report):** a player (`B.A.B.A`, `#2RPLRVUG9`) rendered grey
+"Not Linked" on the CWL enrollment board while `/whois` showed it correctly linked. Sixteen other
+players on the same board had the same problem, and eight more showed a *different* owner than
+`user_players` held.
+
+**Why:** `cwl_signups` rows are written once, by Start Enrollment, and never refreshed.
+`_build_enrollment_payload` (`web_bridge.py`) seeds `players_by_tag` from `cwl_signups` **first**
+and then skips any tag it already has when merging the live `get_current_clan_members_sync()`
+source — so the snapshot's `discord_id` wins permanently. Any account linked *after* Start
+Enrollment ran keeps the snapshot's `NULL` forever; any account re-linked to a different user keeps
+the old owner forever.
+
+The same staleness reaches DM routing: `resolve_cwl_pool_dm_targets_sync()`
+(`QBdiscocmdshelper_cwl.py`) merges its four sources with first-non-`None`-wins
+(`entry["discord_id"] = entry["discord_id"] or discord_id`), and the live `get_player_links_sync()`
+source runs **last** — so it can add a missing link but can never correct a stale one. A pooled
+player with no `current_clan_tag` (not returned by the clan-scoped live source) therefore gets DMed
+at whatever Discord account owned them at snapshot time.
+
+**How to apply:**
+- Treat `cwl_signups` (and `cwl_shared_clan_players`) as a historical record of what was true at
+  Start Enrollment. `user_players` is the only authority for "who owns this account *now*."
+- Any field on those tables that can change afterwards — `discord_id` above all, also
+  `player_name`, `cwl_permanent_optout` — must be re-resolved from `user_players` on read.
+  `get_player_links_sync(tags)` is the batched, chunked helper for exactly this; it already applies
+  the verified-wins + UNASSIGNED tiebreak and maps `'UNASSIGNED'` → `None`.
+- `_build_enrollment_payload` already does this correctly for `th_level` (three-step fallback
+  chain), `current_clan_tag` (player-scoped fallback) and `is_guest` (overridden outright whenever a
+  live current clan is known). Copy that pattern; `discord_id` was simply never given it.
+- In a first-non-`None`-wins merge, source order **is** the precedence rule. A live-data source
+  added at the end to "fill gaps" silently cannot fix wrong values — if it is the authority, it must
+  assign, not `or`.
+
+General lesson: when a snapshot table and a live table both carry the same field, every read path
+has to make an explicit, documented choice about which wins — and "whichever source the merge loop
+happened to visit first" is not that choice. Grep for *all* readers of the snapshot field before
+concluding a fix is complete: this one had four (board payload, DM targeting, the DM button's
+ownership guard, and the upsert that wrote the stale value straight back).
