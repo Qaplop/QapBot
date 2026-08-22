@@ -101,6 +101,13 @@ independent objects that only ever move on their OWN trigger:
   no thread. The bridge/MCP surface never blocks on this — `tracker_mark_testcase_passed`/
   `tracker_move_testcases_done`'s response just names the linked item and status and suggests
   calling `tracker_set_status(..., "done")` if the agent wants to.
+- The passive (thread/DM) prompt opens with an `<@actor_id>` mention (`item_done_confirm_prompt_
+  passive`, 2026-08-22 live bug report: item #0015's prompt sat unnoticed in the thread because a
+  plain, unmentioned message doesn't highlight or notify anyone in Discord). The ephemeral variant
+  (`item_done_confirm_prompt`) has no mention — it's already private to the person who just
+  clicked the button. There is no Discord API for a bot to move a user's client view to a
+  channel/thread directly; a mention is the closest equivalent, since its notification is
+  clickable and jumps straight to that exact message.
 
 **Move-on-`done` (2026-08-22, item side only since the follow-up above)**: the moment any path
 sets `status = done` — the status dropdown, the bridge/MCP `tracker_set_status` tool, or

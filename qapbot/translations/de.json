@@ -461,6 +461,7 @@
       "testcase_moved_done_confirmed": "📦 Testfälle in den Erledigt-Testkanal verschoben.",
       "testcase_moved_done_no_channel": "✅ Alle Testfälle bestehen jetzt (kein Erledigt-Testkanal konfiguriert — unverändert belassen).",
       "item_done_confirm_prompt": "Der verknüpfte Eintrag **#{item_number} · {title}** ist noch **{status}** — soll er auch als **erledigt** markiert werden?",
+      "item_done_confirm_prompt_passive": "<@{actor_id}> — der verknüpfte Eintrag **#{item_number} · {title}** ist noch **{status}** — soll er auch als **erledigt** markiert werden?",
       "item_done_confirm_yes": "Ja, als erledigt markieren",
       "item_done_confirm_no": "Nein",
       "item_done_confirm_applied": "✅ #{item_number} als erledigt markiert.",

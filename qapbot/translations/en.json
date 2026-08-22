@@ -461,6 +461,7 @@
       "testcase_moved_done_confirmed": "📦 Test cases moved to the Done Testing channel.",
       "testcase_moved_done_no_channel": "✅ All test cases now pass (no Done Testing channel configured — left in place).",
       "item_done_confirm_prompt": "Linked item **#{item_number} · {title}** is still **{status}** — mark it **done** too?",
+      "item_done_confirm_prompt_passive": "<@{actor_id}> — linked item **#{item_number} · {title}** is still **{status}** — mark it **done** too?",
       "item_done_confirm_yes": "Yes, mark done",
       "item_done_confirm_no": "No",
       "item_done_confirm_applied": "✅ #{item_number} marked done.",

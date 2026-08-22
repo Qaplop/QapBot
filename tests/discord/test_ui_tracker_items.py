@@ -698,6 +698,30 @@ async def test_reaction_marks_all_pending_environments_passed(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reaction_completion_posts_mentioned_done_confirm_prompt_to_thread(db, monkeypatch):
+    """2026-08-22 live bug report: item #0015's "mark done too?" prompt sat unnoticed in the
+    discussion thread after a full pass via the reaction shortcut -- a plain, unmentioned message
+    doesn't highlight/notify anyone in Discord, so the reactor had no way to know a decision was
+    waiting on them. The passive path (no live interaction to attach an ephemeral followup to)
+    must @mention the reactor so Discord actually surfaces it."""
+    message = _fake_message()
+    channel = _fake_channel(fetch_message=message)
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "x"}])
+    await db.update_tracker_item(
+        item_number, test_channel_id="1", test_message_id="999", thread_id="777", status="testing",
+    )
+
+    await handle_tracker_test_reaction(_fake_payload())
+
+    # channel.send is used for the passive done-confirm prompt (there's no Done Testing channel
+    # configured here, so the test-case archive move is a no-op and never calls it).
+    sent_texts = [call.args[0] for call in channel.send.await_args_list if call.args]
+    assert any(f"<@{ADMIN_ID}>" in text for text in sent_texts)
+
+
+@pytest.mark.asyncio
 async def test_reaction_on_already_passed_archived_item_is_a_true_noop(db, monkeypatch):
     """2026-08-22 live bug report: reacting with a redundant second 👍 on a message that was
     already fully passed AND already archived to the Done Testing channel resurrected its

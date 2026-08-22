@@ -1,6 +1,20 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (19)
+- Fixed: the passive "mark item done too?" prompt (posted to a tracker item's discussion thread
+  when the 👍-reaction shortcut fully passes its test cases, since there's no live interaction to
+  attach an ephemeral followup to) never @mentioned anyone -- a plain, unmentioned message doesn't
+  highlight or notify anyone in Discord, so item #0015's prompt sat unnoticed after a full pass
+  (live bug report; audited against the project owner's full decoupling spec -- points 1/2/4 were
+  already correctly implemented by e361dd4, point 3's logic was correct too, just silent). New
+  `item_done_confirm_prompt_passive` i18n key opens with `<@{actor_id}>`; the ephemeral variant
+  used by the Pass/Move-to-Done buttons is unchanged (already private to the clicker). There is no
+  Discord API for a bot to move a user's client view directly -- the mention's clickable
+  notification, which jumps straight to that exact message, is the closest equivalent. Files:
+  qapbot/ui_tracker.py, qapbot/translations/{en,de}.json, qapbot/docs/BUG_FEATURE_TRACKER.md,
+  tests/discord/test_ui_tracker_items.py. 2458 tests pass.
+
 2026-08-22 (18)
 - Added: `tracker_get_thread` MCP tool + `GET /api/tracker/items/{n}/thread?limit=` bridge
   endpoint, closing a one-way gap -- `tracker_comment` could only ever WRITE into a tracker

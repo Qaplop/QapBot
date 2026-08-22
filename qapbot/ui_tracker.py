@@ -1662,14 +1662,23 @@ async def mark_testing_failed(item_number: int, actor_id: str) -> None:
 async def _post_item_done_confirmation_passive(item: Dict[str, Any], actor_id: str) -> None:
     """Non-interactive equivalent of the ephemeral "mark item done too?" prompt, for triggers
     with no live interaction to attach a followup to (the 👍-reaction shortcut). Posts to the
-    item's discussion thread if one exists, else DMs the actor — never raises."""
+    item's discussion thread if one exists, else DMs the actor — never raises.
+
+    Uses the `_passive` prompt variant, which opens with an `<@actor_id>` mention (2026-08-22,
+    live bug report: a plain, unmentioned thread message doesn't highlight/notify anyone in
+    Discord — the reactor had no way to know a decision was waiting on them, and the prompt for
+    #0015 sat unnoticed). A mention also has the side effect of pulling a non-member actor into
+    the thread, and Discord's own mention notification already jumps straight to this exact
+    message when clicked — the closest a bot can get to "move the user's view there" since there
+    is no API to steer a user's client directly."""
     import QBcore
 
     guild_id = _lang_guild_id(item)
     text = t(
-        'ui_components.tracker.item_done_confirm_prompt', guild_id=guild_id,
+        'ui_components.tracker.item_done_confirm_prompt_passive', guild_id=guild_id,
         item_number=f"{item['item_number']:04d}", title=item['title'],
         status=t(f'ui_components.tracker.status_{item["status"]}', guild_id=guild_id),
+        actor_id=actor_id,
     )
     view = ConfirmItemDoneView(item['item_number'], guild_id)
     if item.get("thread_id"):
