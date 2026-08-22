@@ -206,6 +206,24 @@ restriction (1699-1732) and the cross-guild sharing check (1643-1646) — only t
 candidate set changes. The existing `cwl_enrollment_include_all_linked_accounts` expansion
 (1656-1667) is untouched — confirmed working as intended and orthogonal to this change.
 
+#### Confirmed intentional: family members are DMed even when their own clan isn't participating
+
+**This is the designed behaviour, not a bug — do not "fix" it.** (Re-confirmed by the project
+owner 2026-08-22, after the tracker #0016 investigation noticed that all 27 affected players sat
+in clans with `participating=0` and raised it as a possible defect.)
+
+Because the pool is the family-wide union above, a player whose *own* clan is unchecked for this
+season is still a pool member, still receives the enrollment DM, and still shows on the board
+(normally in Unassigned). That is the point: a lead must be able to pull any family member into
+any participating clan's roster, so the question the DM asks — *"do you want to play CWL this
+season?"* — is about the **player**, not about whether their current clan happens to be checked
+in. Restricting the DM to participating clans would silently exclude exactly the bench the lead
+needs.
+
+Practical consequence to expect, so it doesn't get re-reported: on a guild whose family is much
+larger than its participating set, a Start Enrollment or "Notify New Pool Members" run legitimately
+DMs far more people than there are roster slots.
+
 ### 3. Rules c/d/e/f/g — guest pool management
 
 - **Rule e**: delete the "Send enrollment DM immediately" checkbox entirely — backend

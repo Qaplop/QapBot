@@ -2505,7 +2505,16 @@ def resolve_cwl_pool_dm_targets_sync(
     The pool is the union of three sources, deduped by player_tag, first non-empty discord_id
     winning:
       1. current members of the guild's whole clan family unioned with every clan configured for
-         this event — participating or not (rule b/f, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md);
+         this event — participating or not (rule b/f, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md).
+         "Participating or not" is INTENTIONAL and re-confirmed by the project owner 2026-08-22:
+         a family member whose own clan is unchecked this season is still DMed and still shows on
+         the board (usually in Unassigned), because a lead must be able to pull any family member
+         into any participating clan's roster — the DM asks "do you want to play CWL this
+         season?" about the PLAYER, not about whether their clan happens to be checked in.
+         Expect a large family to legitimately produce far more DMs than there are roster slots;
+         that is not a bug, and narrowing this to participating clans would silently drop exactly
+         the bench a lead needs. (Raised as a suspected defect during the tracker #0016
+         investigation — all 27 affected players had participating=0 clans — and rejected.);
       2. this event's existing cwl_signups rows — the only way an individually-invited guest
          player is reachable at all, since their real current clan is by definition none of the
          above (deliberately not filtered by `source`: every row here is in the pool, see

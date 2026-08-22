@@ -118,13 +118,25 @@ Log the repaired count; a no-op on every subsequent start once Part 1 is in.
   ```
 - Ask `.zuurn` / Lucas to click a previously-dead button and confirm it now records a response.
 
-## Open question for the project owner (not fixed here)
+## Raised question — ANSWERED: intentional, no change
 
-All 27 affected players sit in clans with `participating=0` for event 18 (their clans are in the
-guild's family but not checked in for this season). They were DMed anyway, because the pool is
-deliberately `family_clan_tags | participating_clan_tags`. That may well be intended — a lead can
-drag any family member into a roster — but "we DM everyone in the family even when their own clan
-isn't playing this season" is worth an explicit decision. Out of scope for #0016.
+All 27 affected players sit in clans with `participating=0` for event 18, so they were DMed even
+though their own clan isn't checked in this season. Flagged as a possible defect; **the project
+owner confirmed 2026-08-22 that this is the intended design.** The DM asks whether the *player*
+wants to play, not whether their clan is checked in, because a lead must be able to pull any
+family member into any participating clan's roster.
+
+Documented so it doesn't get re-reported: `CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md` rule b
+("Confirmed intentional" subsection) and `resolve_cwl_pool_dm_targets_sync`'s docstring.
+
+## Follow-up filed separately: ownership change should re-route an unanswered DM
+
+`#LLV0Y9PQ` (JERRY) was DMed to `.zuurn` and has since been unlinked. Per the owner's decision
+the repair keeps that button working for `.zuurn` (he did receive the DM, and the ownership guard
+deliberately accepts the recorded recipient). The better long-term behaviour — when an account
+changes owner, delete an **unanswered** DM and re-send it to the new owner, while leaving any
+already confirmed/declined DM untouched — is filed as its own tracker item rather than folded in
+here.
 
 ## Tracker
 
