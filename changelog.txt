@@ -1,6 +1,16 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (21)
+- Fixed: rejected/duplicate tracker items never moved to the configured Implemented channel --
+  `apply_status_change()` (ui_tracker.py) only triggered `_move_item_to_implemented_channel()` for
+  `status == "done"`, so rejecting or duplicate-closing an item fell into the plain in-place-
+  refresh branch and left it sitting in the working reports channel indefinitely, cluttering it
+  with items that will never move again (live bug found while closing tracker #0010 as a
+  duplicate of #0016; filed and fixed as #0022). Now `done`/`rejected`/`duplicate` are all treated
+  as equally terminal. Files: qapbot/ui_tracker.py, qapbot/docs/BUG_FEATURE_TRACKER.md,
+  tests/discord/test_ui_tracker_items.py. 2461 tests pass.
+
 2026-08-22 (20)
 - Fixed: DEV reacted to a 👍 on a PROD-authored tracker test-case message -- marked that item's
   environments passed in its own (PROD-backup-seeded) copy of the same row, then failed with a

@@ -1036,11 +1036,12 @@ async def _refresh_item_message(item: Dict[str, Any], archived: bool = False) ->
 
 
 async def _move_item_to_implemented_channel(item: Dict[str, Any]) -> bool:
-    """Once an item reaches `done`, repost its embed (no buttons — nothing left to do on a
-    closed item) into the configured Implemented channel and delete the old copy — keeps the
-    working reports channel from accumulating closed items. Returns False (no-op, caller should
-    fall back to an in-place refresh) if the Implemented channel isn't configured or the item is
-    already posted there; never raises (a failed move must not lose the item's DB row, matching
+    """Once an item reaches a terminal status (`done`, `rejected`, or `duplicate`), repost its
+    embed (no buttons — nothing left to do on a closed item) into the configured Implemented
+    channel and delete the old copy — keeps the working reports channel from accumulating closed
+    items regardless of how they closed. Returns False (no-op, caller should fall back to an
+    in-place refresh) if the Implemented channel isn't configured or the item is already posted
+    there; never raises (a failed move must not lose the item's DB row, matching
     _post_tracker_item's convention)."""
     from qapbot.cache_manager import CACHE
     import QBcore
@@ -1134,12 +1135,16 @@ async def apply_status_change(
     item = await db.get_tracker_item(item_number)
     assert item is not None
 
-    if new_status == "done":
-        # Move-on-done, item side only (tracker item #0015 follow-up, 2026-08-22): the
-        # test-case message is now archived independently, via its OWN completion event
-        # (finalize_testcases_move(), called from mark_environment_passed_and_refresh(), the
-        # 👍-reaction shortcut, or the manual "Move to Done" action) — never as a side effect
-        # of the item reaching done, and vice versa. Each object moves on its own trigger only.
+    if new_status in ("done", "rejected", "duplicate"):
+        # Move on any terminal status, item side only (tracker item #0015 follow-up, 2026-08-22,
+        # widened 2026-08-22 to also cover rejected/duplicate — spec gap found live: those two
+        # are just as terminal as done, but were falling into the plain _refresh_item_message()
+        # branch below and lingering in the working reports channel forever instead of being
+        # archived like everything else that's finished). The test-case message is archived
+        # independently, via its OWN completion event (finalize_testcases_move(), called from
+        # mark_environment_passed_and_refresh(), the 👍-reaction shortcut, or the manual "Move to
+        # Done" action) — never as a side effect of the item reaching a terminal status, and vice
+        # versa. Each object moves on its own trigger only.
         moved = await _move_item_to_implemented_channel(item)
         if not moved:
             implemented_channel_id = CACHE.tracker_settings.get(TRACKER_SETTING_IMPLEMENTED_CHANNEL)

@@ -467,6 +467,40 @@ async def test_apply_status_change_done_moves_item_only_not_test_message(db, mon
     assert updated["test_message_id"] == "200"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["rejected", "duplicate"])
+async def test_apply_status_change_rejected_and_duplicate_also_move_to_implemented_channel(
+    db, monkeypatch, terminal_status,
+):
+    """Spec gap found live (2026-08-22, tracker #0010's own closure): rejected/duplicate are
+    just as terminal as done, but apply_status_change() only moved `done` items to the
+    Implemented channel — rejected/duplicate fell into the plain in-place-refresh branch and
+    lingered in the working reports channel forever instead of being archived like everything
+    else that's finished."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_IMPLEMENTED_CHANNEL] = "50"
+
+    old_item_message = _fake_message(message_id=100)
+    old_reports_channel = _fake_channel(fetch_message=old_item_message)
+    new_item_message = _fake_message(message_id=555)
+    implemented_channel = _fake_channel(send_message=new_item_message)
+    implemented_channel.id = 50
+    _wire_bot_multi(monkeypatch, {10: old_reports_channel, 50: implemented_channel})
+
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, channel_id="10", message_id="100", status="open")
+
+    updated = await apply_status_change(item_number, terminal_status, actor_id="1")
+
+    implemented_channel.send.assert_awaited_once()
+    _, item_send_kwargs = implemented_channel.send.call_args
+    assert "view" not in item_send_kwargs or item_send_kwargs["view"] is None
+    old_item_message.delete.assert_awaited_once()
+    assert updated["channel_id"] == "50"
+    assert updated["message_id"] == "555"
+    assert updated["status"] == terminal_status
+
+
 async def test_finalize_testcases_move_moves_test_message_independent_of_item_status(db, monkeypatch):
     """The other half of the decoupling: moving the test-case message must never touch the
     item's own status/channel fields."""

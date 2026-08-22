@@ -126,15 +126,19 @@ independent objects that only ever move on their OWN trigger:
   channel/thread directly; a mention is the closest equivalent, since its notification is
   clickable and jumps straight to that exact message.
 
-**Move-on-`done` (2026-08-22, item side only since the follow-up above)**: the moment any path
-sets `status = done` — the status dropdown, the bridge/MCP `tracker_set_status` tool, or
-accepting the "mark done too?" prompt — `apply_status_change()` reposts the item's embed into
-the configured **Implemented** channel, with its Edit/Add files/Status/Test cases buttons
-stripped (no `view=` on the repost — nothing left to do on a closed item), and deletes the old
-copy from the reports channel. The Implemented channel is optional — unconfigured means the
-move is skipped and the item stays where it is. Discord threads can't move channels, so the
-reposted item embed adds a "Discussion thread" jump-link field when one exists (the old thread
-otherwise becomes unreachable once its parent message is deleted). See
+**Move-on-terminal-status (2026-08-22, item side only since the follow-up above; widened same
+day to `rejected`/`duplicate`)**: the moment any path sets `status` to `done`, `rejected`, or
+`duplicate` — the status dropdown, the bridge/MCP `tracker_set_status` tool, or accepting the
+"mark done too?" prompt — `apply_status_change()` reposts the item's embed into the configured
+**Implemented** channel, with its Edit/Add files/Status/Test cases buttons stripped (no `view=`
+on the repost — nothing left to do on a closed item), and deletes the old copy from the reports
+channel. All three are equally terminal: `rejected`/`duplicate` originally fell into the plain
+in-place-refresh branch and lingered in the working reports channel indefinitely (live bug found
+via tracker #0010's own closure) — an item that will never move again needs to leave the
+unfinished-workload channel regardless of *why* it closed. The Implemented channel is optional —
+unconfigured means the move is skipped and the item stays where it is. Discord threads can't
+move channels, so the reposted item embed adds a "Discussion thread" jump-link field when one
+exists (the old thread otherwise becomes unreachable once its parent message is deleted). See
 `_move_item_to_implemented_channel()`.
 
 ## Discord surface (`qapbot/ui_tracker.py`)
