@@ -119,5 +119,12 @@ Updated `qapbot/docs/BUG_FEATURE_TRACKER.md`'s "Discord surface" (move-on-`done`
 
 ## Status
 
-Implemented, tests passing. Not yet committed (only commit when the user asks) — `git mv` this
-file into `plans/implemented/` in the same turn as that commit.
+Implemented, tests passing, committed:
+
+- `2ec8430` — Add Implemented/Done Testing tracker channels to archive done items.
+- `381312c` — Strip buttons from tracker items moved to the Implemented channel (follow-up fix:
+  the initial repost kept its Edit/Add files/Status/Test cases buttons, flagged from a live
+  screenshot).
+- `d78167b` — changelog entry for the button-strip fix.
+
+Archived to `plans/implemented/`.
