@@ -261,3 +261,219 @@ class TestDmTargetingUsesLiveOwner:
 
         targets = {t["player_tag"]: t["discord_id"] for t in result["targets"]}
         assert targets["#GUEST"] == "guestowner"
+
+
+class TestDmBatchSeedsSignupRows:
+    """Tracker #0016: CwlSignupResponseButton resolves a click by (event_id, player_tag) and
+    returns `no_longer_valid` when no cwl_signups row exists, so a DM sent without one carries a
+    permanently dead button. start_cwl_enrollment seeded its rows before DMing; "Notify New Pool
+    Members" did not -- and its whole job is reaching pool members added AFTER Start Enrollment,
+    i.e. exactly the players with no row. 27 live DMs across 4 users were dead on arrival."""
+
+    @staticmethod
+    def _target(tag: str, name: str, discord_id: str) -> dict:
+        return {"player_tag": tag, "player_name": name, "discord_id": discord_id}
+
+    @pytest.fixture(autouse=True)
+    def _allow_dms(self, monkeypatch):
+        """CONFIG.cwl_dm_restrict_to_admin defaults to True on DEV (the PROD-testing guard), which
+        would skip every target here before the seeding path is even reached."""
+        import dataclasses
+
+        import qapbot.config as config_module
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        relaxed = dataclasses.replace(
+            config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False
+        )
+        monkeypatch.setattr(config_module, "CONFIG", relaxed)
+        monkeypatch.setattr(cwl, "CONFIG", relaxed, raising=False)
+
+    @pytest.mark.asyncio
+    async def test_missing_signup_row_is_created_before_the_dm_goes_out(self, db, monkeypatch):
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "920", "#CLANI")
+        CACHE.db_manager = db
+        sent = []
+
+        async def _fake_dm(evt, gid, season, participant):
+            # The row its button needs must already exist at send time, not after.
+            assert db.get_cwl_signup_sync(evt, participant["player_tag"]) is not None
+            sent.append(participant["player_tag"])
+            return True, "sent", "msg1", "chan1"
+
+        monkeypatch.setattr(cwl, "send_cwl_signup_template_dm", _fake_dm)
+
+        result = await cwl._send_cwl_enrollment_dm_batch(
+            event_id, 920, "2026-09", [self._target("#NEWGUY", "NewGuy", "owner1")]
+        )
+
+        assert result["contacted"] == 1
+        assert sent == ["#NEWGUY"]
+        row = db.get_cwl_signup_sync(event_id, "#NEWGUY")
+        assert row is not None
+        assert row["dmed_discord_id"] == "owner1"
+
+    @pytest.mark.asyncio
+    async def test_seeded_row_adopts_the_global_response(self, db, monkeypatch):
+        """Not a hardcoded 'pending' -- a player who already answered another guild's DM must
+        not be contradicted (rule h)."""
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "921", "#CLANJ")
+        CACHE.db_manager = db
+        db.set_cwl_player_response_status_sync(
+            "#ANSWERED2", "2026-09", "Answered", "owner1", "confirmed", "2026-09-01T10:00Z", 99, "922",
+        )
+
+        async def _fake_dm(evt, gid, season, participant):
+            return True, "sent", "m", "c"
+
+        monkeypatch.setattr(cwl, "send_cwl_signup_template_dm", _fake_dm)
+        await cwl._send_cwl_enrollment_dm_batch(
+            event_id, 921, "2026-09", [self._target("#ANSWERED2", "Answered", "owner1")]
+        )
+
+        assert db.get_cwl_signup_sync(event_id, "#ANSWERED2")["status"] == "confirmed"
+
+    @pytest.mark.asyncio
+    async def test_skipped_target_gets_no_row(self, db, monkeypatch):
+        """A player skipped by the global dm_sent dedup never received this DM, so they must not
+        gain a board entry as a side effect of it."""
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "923", "#CLANK")
+        other_event_id = await _seed(db, "924", "#CLANK2")
+        CACHE.db_manager = db
+        # Already DMed by ANOTHER guild's event -> the batch's dedup skips them. The event must
+        # really exist: get_cwl_player_season_dm_status_bulk_sync deliberately distrusts a
+        # dm_sent row whose dm_sent_via_event_id has been deleted (2026-08-19 orphan self-heal).
+        db.mark_cwl_player_dm_sent_sync(
+            "#ALREADY", "2026-09", "Already", "owner1", other_event_id, 924,
+            "2026-09-01T10:00Z", "m", "c",
+        )
+
+        async def _fake_dm(evt, gid, season, participant):
+            raise AssertionError("should not have DMed a skipped target")
+
+        monkeypatch.setattr(cwl, "send_cwl_signup_template_dm", _fake_dm)
+        result = await cwl._send_cwl_enrollment_dm_batch(
+            event_id, 923, "2026-09", [self._target("#ALREADY", "Already", "owner1")]
+        )
+
+        assert result["skipped_already_dm_globally"] == 1
+        assert db.get_cwl_signup_sync(event_id, "#ALREADY") is None
+
+    @pytest.mark.asyncio
+    async def test_existing_row_is_never_clobbered(self, db, monkeypatch):
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "925", "#CLANL")
+        CACHE.db_manager = db
+        db.upsert_cwl_signup_sync(
+            event_id, "#KEEP2", "Keep2", "owner1", None, "template_confirm", "declined",
+        )
+
+        async def _fake_dm(evt, gid, season, participant):
+            return True, "sent", "m", "c"
+
+        monkeypatch.setattr(cwl, "send_cwl_signup_template_dm", _fake_dm)
+        await cwl._send_cwl_enrollment_dm_batch(
+            event_id, 925, "2026-09", [self._target("#KEEP2", "Keep2", "owner1")]
+        )
+
+        assert db.get_cwl_signup_sync(event_id, "#KEEP2")["status"] == "declined"
+
+
+class TestRepairSignupsForSentDms:
+    """Tracker #0016, part 2: the forward fix can't help the 27 DMs already sitting in inboxes --
+    the batch's global dm_sent dedup skips anyone already contacted, so they'd never be revisited.
+    But the button resolves (event_id, player_tag) at CLICK time, so creating the missing row
+    repairs the delivered DM in place: no re-send, the existing button just starts working."""
+
+    @staticmethod
+    async def _dmed_without_signup(db, guild_id: str, clan: str, tag: str, status: str = "pending"):
+        event_id = await _seed(db, guild_id, clan)
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.mark_cwl_player_dm_sent_sync(
+            tag, "2026-09", "Dangler", "owner1", event_id, int(guild_id),
+            "2026-09-01T10:00Z", "msg1", "chan1",
+        )
+        if status != "pending":
+            db.set_cwl_player_response_status_sync(
+                tag, "2026-09", "Dangler", "owner1", status, "2026-09-01T11:00Z", event_id, guild_id,
+            )
+        assert db.get_cwl_signup_sync(event_id, tag) is None  # the dead-button state
+        return event_id
+
+    @pytest.mark.asyncio
+    async def test_repair_creates_the_missing_row(self, db):
+        event_id = await self._dmed_without_signup(db, "930", "#CLANM", "#DEAD1")
+
+        await db._repair_cwl_signups_for_sent_dms()
+
+        row = db.get_cwl_signup_sync(event_id, "#DEAD1")
+        assert row is not None
+        assert row["dmed_discord_id"] == "owner1"
+
+    @pytest.mark.asyncio
+    async def test_repair_carries_the_global_response(self, db):
+        event_id = await self._dmed_without_signup(db, "931", "#CLANN", "#DEAD2", status="declined")
+
+        await db._repair_cwl_signups_for_sent_dms()
+
+        assert db.get_cwl_signup_sync(event_id, "#DEAD2")["status"] == "declined"
+
+    @pytest.mark.asyncio
+    async def test_repair_is_idempotent(self, db):
+        event_id = await self._dmed_without_signup(db, "932", "#CLANO2", "#DEAD3")
+
+        for _ in range(3):
+            await db._repair_cwl_signups_for_sent_dms()
+
+        rows = [s for s in db.get_cwl_signups_for_event_sync(event_id) if s["player_tag"] == "#DEAD3"]
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_repair_never_clobbers_an_existing_row(self, db):
+        event_id = await _seed(db, "933", "#CLANP")
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(
+            event_id, "#LIVE1", "Live", "owner1", None, "template_confirm", "confirmed",
+        )
+        db.mark_cwl_player_dm_sent_sync(
+            "#LIVE1", "2026-09", "Live", "owner1", event_id, 933, "2026-09-01T10:00Z", "m", "c",
+        )
+
+        await db._repair_cwl_signups_for_sent_dms()
+
+        assert db.get_cwl_signup_sync(event_id, "#LIVE1")["status"] == "confirmed"
+
+    @pytest.mark.asyncio
+    async def test_repair_skips_events_that_are_no_longer_signup_open(self, db):
+        """Only 'signup_open' events have an actionable button, so that's the whole broken-link
+        population -- and skipping the rest avoids retroactively adding players to a finalized
+        event's historical board."""
+        event_id = await self._dmed_without_signup(db, "934", "#CLANQ", "#DEAD4")
+        db.update_cwl_event_status_sync(event_id, "finalized")
+
+        await db._repair_cwl_signups_for_sent_dms()
+
+        assert db.get_cwl_signup_sync(event_id, "#DEAD4") is None
+
+    @pytest.mark.asyncio
+    async def test_repair_ignores_players_never_dmed(self, db):
+        event_id = await _seed(db, "935", "#CLANR")
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.set_cwl_player_response_status_sync(
+            "#NEVERDM", "2026-09", "NeverDM", "owner1", "pending", None, event_id, "935",
+        )
+
+        await db._repair_cwl_signups_for_sent_dms()
+
+        assert db.get_cwl_signup_sync(event_id, "#NEVERDM") is None

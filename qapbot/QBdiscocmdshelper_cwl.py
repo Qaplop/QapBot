@@ -2642,6 +2642,17 @@ async def _send_cwl_enrollment_dm_batch(
         db.get_cwl_player_season_dm_status_bulk_sync, [p["player_tag"] for p in dm_targets], season,
     ) if db is not None else {}
 
+    # Decide who we will actually DM BEFORE sending, so the signup rows their buttons need can be
+    # seeded in one batch (2026-08-22, tracker #0016). CwlSignupResponseButton resolves a click by
+    # (event_id, player_tag) and returns `no_longer_valid` when no cwl_signups row exists, so a DM
+    # sent without one carries a permanently dead button. start_cwl_enrollment seeds its rows
+    # before calling this; "Notify New Pool Members" (web_bridge.notify_new_cwl_pool_members) did
+    # not — and since its whole job is reaching pool members added AFTER Start Enrollment ran,
+    # i.e. exactly the players with no row yet, every DM it sent to a new member was dead on
+    # arrival. Confirmed live: 27 such DMs across 4 users, all stuck 'pending' because nobody
+    # could respond. Putting the invariant here rather than in that one caller means any future
+    # caller of this batch helper inherits it.
+    to_dm: List[Dict[str, Any]] = []
     for participant in dm_targets:
         if already_dm_by_tag.get(participant["player_tag"]):
             result["skipped_already_dm_globally"] += 1
@@ -2652,6 +2663,49 @@ async def _send_cwl_enrollment_dm_batch(
         if CONFIG.cwl_dm_restrict_to_admin and not (is_admin or is_prod_tester):
             result["skipped_dm_guard"] += 1
             continue
+        to_dm.append(participant)
+
+    # Only the players we're actually about to DM — a target skipped by either guard above must
+    # not gain a board entry as a side effect of a DM it never received. bulk_create is
+    # ON CONFLICT(event_id, player_tag) DO NOTHING, so this is a no-op for Start Enrollment's
+    # already-seeded rows and never clobbers a response a player has already given.
+    if db is not None and to_dm:
+        # Both reads go through asyncio.to_thread (Pitfall 26) and are BULK — this runs on the
+        # DM-blast path, where a per-player query would be one blocking round trip per recipient.
+        existing_rows = await asyncio.to_thread(db.get_cwl_signups_for_event_sync, event_id)
+        existing_tags = {s["player_tag"] for s in existing_rows}
+        missing = [p for p in to_dm if p["player_tag"] not in existing_tags]
+        if missing:
+            global_status_by_tag = await asyncio.to_thread(
+                db.get_cwl_player_season_status_bulk_sync, [p["player_tag"] for p in missing], season,
+            )
+            await asyncio.to_thread(
+                db.bulk_create_cwl_signups_sync,
+                event_id,
+                [
+                    {
+                        "player_tag": p["player_tag"],
+                        "player_name": p["player_name"],
+                        "dmed_discord_id": p["discord_id"],
+                        "preferred_league_rank": None,
+                        "source": "template_confirm",
+                        # Never a hardcoded 'pending' — a player who already answered another
+                        # guild's DM must not be contradicted here (rule h). Same seeding
+                        # start_cwl_enrollment does, just from the bulk reader.
+                        "status": (
+                            global_status_by_tag[p["player_tag"]]["status"]
+                            if p["player_tag"] in global_status_by_tag else "pending"
+                        ),
+                    }
+                    for p in missing
+                ],
+            )
+            logging.info(
+                f"[CWL-ENROLLMENT] Seeded {len(missing)} missing cwl_signups row(s) for event "
+                f"{event_id} before DMing — their buttons would otherwise have been dead (#0016)"
+            )
+
+    for participant in to_dm:
         sent, outcome, dm_message_id, dm_channel_id = await send_cwl_signup_template_dm(
             event_id, guild_id, season, participant
         )

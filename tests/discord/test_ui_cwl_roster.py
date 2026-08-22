@@ -2458,3 +2458,45 @@ def test_compute_avg_stars_per_attack_returns_empty_without_db_manager():
 # tests/unit/test_check_admin_or_leader_permission.py — this file's module-level autouse
 # _bypass_cwl_admin_check fixture forces check_admin_permissions() to always return True for
 # every test here, which would silently defeat any test of the leader-role-holder path.
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_repaired_signup_row_revives_a_dead_dm_button(db, mock_interaction):
+    """Tracker #0016, end-to-end. The button resolves (event_id, player_tag) at CLICK time, so a
+    DM sent without a cwl_signups row shows "this sign-up is no longer valid" forever -- and
+    creating the row afterwards repairs the DM already sitting in the user's inbox, no re-send.
+    Asserts the actual user-visible symptom flips, not just that a row appeared."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlSignupResponseButton
+
+    await _seed_guild_and_clans(db, "9120", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    event_id = db.create_cwl_event_sync("9120", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+    db.update_cwl_event_status_sync(event_id, "signup_open")
+    # DM went out, but nothing seeded the row its button needs -> dead on arrival.
+    db.mark_cwl_player_dm_sent_sync(
+        "#DEADBTN", "2026-09", "DeadBtn", "123456789", event_id, 9120,
+        "2026-09-01T10:00Z", "msg1", "chan1",
+    )
+
+    mock_interaction.user.id = 123456789
+    mock_interaction.response.send_message = AsyncMock()
+    mock_interaction.response.edit_message = AsyncMock()
+
+    button = CwlSignupResponseButton("optout", event_id, "#DEADBTN")
+    await button.callback(mock_interaction)
+
+    # Before the repair: rejected outright, nothing recorded.
+    mock_interaction.response.send_message.assert_awaited_once()
+    assert db.get_cwl_signup_sync(event_id, "#DEADBTN") is None
+
+    await db._repair_cwl_signups_for_sent_dms()
+
+    mock_interaction.response.send_message.reset_mock()
+    await button.callback(mock_interaction)
+
+    # After: the same click on the same untouched DM now records the response.
+    mock_interaction.response.send_message.assert_not_awaited()
+    assert db.get_cwl_signup_sync(event_id, "#DEADBTN")["status"] == "declined"

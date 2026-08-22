@@ -1,6 +1,30 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (13)
+- Fixed: tracker #0016, second defect -- CWL sign-up DM buttons that were dead on arrival. The
+  button resolves (event_id, player_tag) at click time and returns "this sign-up is no longer
+  valid (the season may have been deleted)" when no cwl_signups row exists. start_cwl_enrollment
+  seeds those rows before DMing; the "Notify New Pool Members" button did not -- and since its
+  whole job is reaching pool members added AFTER Start Enrollment, i.e. exactly the players with
+  no row yet, every DM it sent to a new member was permanently dead. Confirmed live: 27 sent DMs
+  across 4 Discord users, all still 'pending' because nobody could respond. Two parts: (1)
+  _send_cwl_enrollment_dm_batch now bulk-seeds any missing row before sending, so the invariant
+  sits with the sending rather than one caller -- only for targets that pass its own dedup/DM
+  guards, so a skipped player never gains a board entry, and status comes from the global table
+  rather than a hardcoded 'pending'; (2) a new idempotent startup repair
+  _repair_cwl_signups_for_sent_dms() (Cardinal Rule 12, same pattern as tracker #0013's cleanup)
+  creates the missing rows for DMs already delivered -- because the button resolves its row at
+  click time, this revives the message already sitting in the user's inbox with no re-send.
+  Scoped to events still in 'signup_open' (the only status where the button is actionable) so a
+  finalized event's historical board is never retroactively changed. Dry-run against a copy of
+  the real PROD DB: 27 -> 0 broken links, +27 rows on event 18, re-run added 0, no existing row
+  altered. Note #0016 covered TWO distinct defects -- the ownership guard (fixed in ddc602e /
+  7e8ef2f) and this one. Files: qapbot/db_manager.py, qapbot/QBdiscocmdshelper_cwl.py,
+  tests/unit/test_cwl_signup_snapshot_staleness.py, tests/discord/test_ui_cwl_roster.py
+  (end-to-end: the same click on the same untouched DM flips from rejected to recorded).
+  2415 tests pass.
+
 2026-08-22 (12)
 - Added: tracker item #0015 ("Create path for agent") -- agents can now file bugs/features
   directly instead of asking a human to run /bug or /feature. New `create_tracker_item_for_agent()`

@@ -1594,6 +1594,55 @@ class WarHistoryDB:
 
         await self._backfill_player_name_search_if_needed()
         await self._cleanup_stray_unassigned_duplicates()
+        await self._repair_cwl_signups_for_sent_dms()
+
+    async def _repair_cwl_signups_for_sent_dms(self) -> None:
+        """Idempotent repair of enrollment DMs whose button has no cwl_signups row to land on
+        (2026-08-22, tracker #0016; Cardinal Rule 12 — safe every startup, a no-op once none
+        remain).
+
+        CwlSignupResponseButton resolves a click by (event_id, player_tag) from its custom_id and
+        bails out with `cwl.template.no_longer_valid` ("this sign-up is no longer valid — the
+        season may have been deleted") when no matching cwl_signups row exists. Start Enrollment
+        seeds those rows before it DMs; the "Notify New Pool Members" button did not, so every DM
+        it sent to a genuinely-new pool member produced a permanently dead button. Confirmed live:
+        27 sent DMs across 4 Discord users, all still 'pending' because nobody could respond.
+
+        The forward fix (_send_cwl_enrollment_dm_batch now seeds before sending) cannot help those
+        27 — the batch's global dm_sent dedup skips anyone already contacted, so they would never
+        be revisited. But the button resolves its row at CLICK time, so simply creating the row
+        repairs the DM already sitting in the recipient's inbox: no re-send, no new message, the
+        existing button just starts working.
+
+        Scoped to events still in 'signup_open' on purpose: that is the only status where the
+        button is actionable (any other status returns `signup_closed` regardless), so it is
+        exactly the broken-link population — and it avoids retroactively adding players to a
+        finalized event's historical board. Never overwrites an existing row.
+        """
+        cursor = await self._conn.execute(
+            """
+            INSERT INTO cwl_signups
+                (event_id, player_tag, player_name, dmed_discord_id, source, status)
+            SELECT g.dm_sent_via_event_id, g.player_tag, g.player_name, g.dmed_discord_id,
+                   'template_confirm', g.status
+            FROM cwl_player_season_status g
+            JOIN cwl_events e ON e.id = g.dm_sent_via_event_id AND e.status = 'signup_open'
+            WHERE g.dm_sent = 1
+              AND g.dm_sent_via_event_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM cwl_signups s
+                  WHERE s.event_id = g.dm_sent_via_event_id AND s.player_tag = g.player_tag
+              )
+            ON CONFLICT(event_id, player_tag) DO NOTHING
+            """
+        )
+        repaired = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+        await self._conn.commit()
+        if repaired:
+            logging.info(
+                f"[DB-REPAIR] Created {repaired} missing cwl_signups row(s) for already-sent "
+                f"enrollment DMs — their buttons were dead until now (tracker #0016)"
+            )
 
     async def _cleanup_stray_unassigned_duplicates(self) -> None:
         """Idempotent cleanup of UNASSIGNED-pool rows for player_tags that already have a real

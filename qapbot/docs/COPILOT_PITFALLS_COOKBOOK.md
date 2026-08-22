@@ -1561,6 +1561,63 @@ that row actually changed.
 
 ---
 
+## Pitfall 38: a persistent Discord button is a FOREIGN KEY into the DB — the row must outlive the message
+
+> **Status: fixed 2026-08-22** (`plans/implemented/tracker-0016-dead-signup-dm-buttons.md`).
+
+**Symptom (tracker #0016, live):** users clicking the Confirm/Opt-Out buttons on their CWL
+sign-up DM got *"⚠️ This sign-up is no longer valid (the season may have been deleted)"* — for
+most of their accounts, while a few worked. No season had been deleted. 27 delivered DMs across
+4 Discord users were affected, and all 27 were still `status='pending'` — nobody had responded
+because nobody *could*.
+
+**Why:** `CwlSignupResponseButton` is a `DynamicItem` whose `custom_id` encodes only
+`(action, event_id, player_tag)`. The callback re-reads the row at click time — correctly, since
+the message outlives any in-memory view — and bails when it finds nothing:
+
+```python
+signup = await asyncio.to_thread(db.get_cwl_signup_sync, self.event_id, self.player_tag)
+if event is None or signup is None:
+    ... t('cwl.template.no_longer_valid'); return
+```
+
+So the button is effectively a foreign key into `cwl_signups`. Two paths sent that DM, and only
+one of them created the row:
+
+| path | seeds `cwl_signups`? | sends DM? |
+|---|---|---|
+| `start_cwl_enrollment` | yes (`bulk_create_cwl_signups_sync`) | yes |
+| `notify_new_cwl_pool_members` ("Notify New Pool Members") | **no** | yes |
+
+They shared the *pool resolution* (`resolve_cwl_pool_dm_targets_sync`) and the *sending*
+(`_send_cwl_enrollment_dm_batch`) — which is exactly why nobody noticed the seeding wasn't
+shared too. Worse, the notify button's purpose is to reach members added *after* Start
+Enrollment, i.e. precisely the players with no row: it was ~100% broken for its intended
+population, not an edge case.
+
+**How to apply:**
+- **Before sending any message with a persistent button, make sure the row that button resolves
+  already exists** — and put that guarantee next to the *send*, not in one caller. It now lives
+  in `_send_cwl_enrollment_dm_batch`, so any future caller inherits it.
+- **Seed only for recipients who actually get the message.** A target skipped by a dedup or guard
+  must not gain a DB row (and hence a board entry) for a message it never received.
+- **A delivered message can be repaired in place.** Because the callback resolves at click time,
+  back-filling the missing row revives buttons already sitting in users' inboxes — no re-send, no
+  new message. `_repair_cwl_signups_for_sent_dms()` does this idempotently at startup, scoped to
+  events still `signup_open` (the only status where the button is actionable, and so the exact
+  broken population — while leaving a finalized event's historical board untouched).
+- **Watch for the misleading error text.** `no_longer_valid` says "the season may have been
+  deleted", which sent the first look at this straight down the wrong path. When a persistent
+  component reports a missing parent, check whether the parent was ever *created* before assuming
+  it was deleted.
+
+General lesson: when two code paths share "who to contact" but not "what state to write", they
+will drift, and the symptom shows up much later at the point of interaction. If a message
+outlives the process that sent it, everything its buttons dereference is now a persistence
+contract — enumerate every sender and make the write an invariant of sending.
+
+---
+
 ## Pitfall 37: `cwl_signups` is an enrollment-time SNAPSHOT — re-resolve its `discord_id` on read
 
 > **Status: fixed 2026-08-22** (`plans/implemented/cwl-board-stale-link-and-whois-timeout.md`,
