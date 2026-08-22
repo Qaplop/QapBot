@@ -4162,8 +4162,32 @@ class WarHistoryDB:
                     """,
                     (event_id, event_id),
                 ).fetchall()
+                # Named access, never row[N] (Cardinal Rule 14). Fixed 2026-08-23.
+                #
+                # Be precise about the risk this removes, because the obvious guess is wrong: an
+                # explicit SELECT list like the one above makes row[N] index the PROJECTION, not
+                # physical storage, so an ALTER TABLE reorder genuinely cannot break it — verified
+                # by reverting this and watching the reorder test still pass. Rule 14's headline
+                # incident (`bool(row[12])` reading `created_at`) was a SELECT * case, which this
+                # is not.
+                #
+                # The real exposure is a code edit: add or reorder one column in that SELECT and
+                # every index below silently shifts onto the wrong field, with no error and no
+                # type mismatch to trip over — dmed_discord_id, message_id and channel_id are all
+                # TEXT ids of similar shape. And the blast radius is real: the only consumer,
+                # cleanup_stale_cwl_enrollment_dms(), feeds these straight into
+                # bot.fetch_user(...) and channel.fetch_message(...) to DELETE a Discord message.
+                # Named access makes that class of edit-time mistake impossible rather than
+                # merely unlikely, which is the whole point of the rule being absolute.
+                #
+                # See tests/unit/test_cwl_dm_refs_column_order_immunity.py.
                 return [
-                    {"player_tag": row[0], "dmed_discord_id": row[1], "message_id": row[2], "channel_id": row[3]}
+                    {
+                        "player_tag": row["player_tag"],
+                        "dmed_discord_id": row["dmed_discord_id"],
+                        "message_id": row["dm_sent_via_message_id"],
+                        "channel_id": row["dm_sent_via_channel_id"],
+                    }
                     for row in rows
                 ]
             except sqlite3.Error as e:
@@ -9105,7 +9129,11 @@ class WarHistoryDB:
             "SELECT clan_tag, role_id FROM guild_clan_roles WHERE guild_id = ?",
             (guild_id,)
         )
-        clan_roles: Dict[str, str] = {r[0]: r[1] for r in await clan_roles_cursor.fetchall()}
+        # Named access, never r[N] (Cardinal Rule 14) — found alongside the 2026-08-23 fix in
+        # get_cwl_player_season_status_dm_refs_for_event_sync(); identical violation, same file.
+        clan_roles: Dict[str, str] = {
+            r["clan_tag"]: r["role_id"] for r in await clan_roles_cursor.fetchall()
+        }
 
         # Load per-clan war-notification custodians (multiple Discord users per clan_tag)
         custodians_cursor = await self._conn.execute(

@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (1)
+- Fixed: positional DB row access (Cardinal Rule 14) in
+  get_cwl_player_season_status_dm_refs_for_event_sync() and in get_guild_config()'s
+  guild_clan_roles load -- both now read by column name. Neither was producing wrong results
+  today: with an explicit SELECT list row[N] indexes the projection, not physical storage, so a
+  migration reorder cannot break it (verified by reverting and watching a reorder test still
+  pass). The real exposure is edit time -- adding or reordering one column in that SELECT shifts
+  every index onto the wrong same-typed id, silently, and the only consumer feeds those values
+  to bot.fetch_user()/channel.fetch_message() to DELETE a Discord message. Since the code is
+  correct until such an edit, the regression guard is structural rather than behavioural.
+  Rule 14 in .github/copilot-instructions.md gained a note on this distinction, since its stated
+  WHY only covers the SELECT * case. Files: qapbot/db_manager.py,
+  .github/copilot-instructions.md, tests/unit/test_cwl_dm_refs_column_order_immunity.py,
+  plans/implemented/tracker-0017-mid-month-cwl-war-fetches.md. 2527 tests pass.
+
 2026-08-22 (27)
 - Fixed: CWL league groups are now marked cwl_ended=1 by a periodic sweep, ending the redundant
   mid-month get_league_war() re-walks of finished groups (ticket #0017, option A). The flag

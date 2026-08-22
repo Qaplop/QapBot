@@ -158,9 +158,23 @@ Also verified in passing that `main` vs `history` `war_summary` have the same co
 a different physical order (diverging at position 14, `result` vs `war_tag`) — the harmless
 Cardinal Rule 1 case, harmless precisely because these queries name columns explicitly.
 
-### Follow-up noted, not done
+### Follow-up — done 2026-08-23
 
-`get_cwl_player_season_status_dm_refs_for_event_sync()` (`db_manager.py`) reads its rows with
-positional indices (`row[0]`, `row[1]`, ...), which Cardinal Rule 14 forbids. It is safe today
-because its SELECT names columns explicitly, and it is outside this change's blast radius — worth
-folding into the next edit that lands in that function.
+`get_cwl_player_season_status_dm_refs_for_event_sync()` (`db_manager.py`) read its rows with
+positional indices (`row[0]`, `row[1]`, ...), against Cardinal Rule 14. Fixed on the project
+owner's instruction, along with the identical `{r[0]: r[1]}` in `get_guild_config()`'s
+`guild_clan_roles` load, found in the same audit.
+
+Worth recording what the audit actually established, since the intuitive answer was wrong: with an
+**explicit** SELECT list, `row[N]` indexes the projection, not physical storage, so an
+`ALTER TABLE` reorder cannot break it — confirmed empirically by reverting the fix and watching a
+reorder test still pass. Rule 14's headline incident was a `SELECT *` case. The real exposure here
+is *edit* time: adding or reordering one column in that SELECT shifts every index onto the wrong
+same-typed id, silently, and the only consumer feeds those values straight to
+`bot.fetch_user()` / `channel.fetch_message()` to delete a Discord message.
+
+Because the code is correct until the edit, no behavioural test can catch it in advance — so the
+guard that earns its place is structural: `test_no_positional_row_access_remains_in_the_reader`,
+which is the one test that fails against the old code. `tests/unit/
+test_cwl_dm_refs_column_order_immunity.py` (5 tests). Rule 14 in
+`.github/copilot-instructions.md` gained a note covering this distinction.
