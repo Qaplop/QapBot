@@ -898,9 +898,27 @@ async def _post_tracker_item(item_number: int, channel_id: int) -> Tuple[Optiona
     return message, thread
 
 
-async def _refresh_item_message(item: Dict[str, Any]) -> None:
+def _build_archived_item_embed(item: Dict[str, Any]) -> discord.Embed:
+    """The embed used once an item is sitting in the Implemented channel: the normal embed plus
+    a "Discussion thread" jump-link field, since threads can't move channels — once the item's
+    original message is deleted the thread becomes an orphan with no visible parent, so this
+    keeps it reachable (same URL scheme as the "Test cases" jump link)."""
+    embed = build_tracker_embed(item)
+    if item.get("thread_id"):
+        jump_link = f"https://discord.com/channels/{item['guild_id'] or '@me'}/{item['thread_id']}"
+        embed.add_field(
+            name=t('ui_components.tracker.discussion_thread_field', guild_id=_lang_guild_id(item)),
+            value=f"[Jump to thread]({jump_link})", inline=False,
+        )
+    return embed
+
+
+async def _refresh_item_message(item: Dict[str, Any], archived: bool = False) -> None:
     """Re-render the posted item embed/view in place. Never passes `attachments=` — doing so
-    would replace (not preserve) the existing file set (plan §5.5)."""
+    would replace (not preserve) the existing file set (plan §5.5). *archived* renders the item
+    as it looks once it has moved to the Implemented channel — the thread jump-link field, and
+    no buttons (`view=None`, nothing left to do on a closed item) — for the case where the item
+    is already posted there and apply_status_change() re-enters `done` without moving it again."""
     if not item.get("channel_id") or not item.get("message_id"):
         return
     import QBcore
@@ -919,18 +937,21 @@ async def _refresh_item_message(item: Dict[str, Any]) -> None:
         logging.warning(f"[TRACKER] Failed to fetch item #{item['item_number']} message: {e}")
         return
 
+    embed = _build_archived_item_embed(item) if archived else build_tracker_embed(item)
+    view = None if archived else build_tracker_item_view(item["item_number"])
     try:
-        await message.edit(embed=build_tracker_embed(item), view=build_tracker_item_view(item["item_number"]))
+        await message.edit(embed=embed, view=view)
     except Exception as e:
         logging.warning(f"[TRACKER] Failed to update item #{item['item_number']} message: {e}")
 
 
 async def _move_item_to_implemented_channel(item: Dict[str, Any]) -> bool:
-    """Once an item reaches `done`, repost its embed into the configured Implemented channel
-    and delete the old copy — keeps the working reports channel from accumulating closed items.
-    Returns False (no-op, caller should fall back to an in-place refresh) if the Implemented
-    channel isn't configured or the item is already posted there; never raises (a failed
-    move must not lose the item's DB row, matching _post_tracker_item's convention)."""
+    """Once an item reaches `done`, repost its embed (no buttons — nothing left to do on a
+    closed item) into the configured Implemented channel and delete the old copy — keeps the
+    working reports channel from accumulating closed items. Returns False (no-op, caller should
+    fall back to an in-place refresh) if the Implemented channel isn't configured or the item is
+    already posted there; never raises (a failed move must not lose the item's DB row, matching
+    _post_tracker_item's convention)."""
     from qapbot.cache_manager import CACHE
     import QBcore
 
@@ -947,20 +968,10 @@ async def _move_item_to_implemented_channel(item: Dict[str, Any]) -> bool:
             logging.error(f"[TRACKER] Could not resolve Implemented channel for item #{item_number}: {e}")
             return False
 
-    embed = build_tracker_embed(item)
-    if item.get("thread_id"):
-        # Threads can't move channels — once the old message is deleted below, the thread
-        # becomes an orphan with no visible parent in its own (old) channel, so keep it
-        # reachable via a jump link (same URL scheme as the "Test cases" jump link).
-        jump_link = f"https://discord.com/channels/{item['guild_id'] or '@me'}/{item['thread_id']}"
-        embed.add_field(
-            name=t('ui_components.tracker.discussion_thread_field', guild_id=_lang_guild_id(item)),
-            value=f"[Jump to thread]({jump_link})", inline=False,
-        )
-    view = build_tracker_item_view(item_number)
+    embed = _build_archived_item_embed(item)
     files = await _build_discord_files(item_number)
     try:
-        new_message = await new_channel.send(embed=embed, view=view, files=files)  # type: ignore[union-attr]
+        new_message = await new_channel.send(embed=embed, files=files)  # type: ignore[union-attr]  # no view= -> no buttons
     except Exception as e:
         logging.error(f"[TRACKER] Failed to post item #{item_number} to Implemented channel: {e}")
         return False
@@ -1041,7 +1052,9 @@ async def apply_status_change(
         # this same function), with no changes needed anywhere else.
         moved = await _move_item_to_implemented_channel(item)
         if not moved:
-            await _refresh_item_message(item)
+            implemented_channel_id = CACHE.tracker_settings.get(TRACKER_SETTING_IMPLEMENTED_CHANNEL)
+            already_archived = bool(implemented_channel_id) and item.get("channel_id") == implemented_channel_id
+            await _refresh_item_message(item, archived=already_archived)
         await _move_test_message_to_done_testing_channel(item)
         item = await db.get_tracker_item(item_number)
         assert item is not None

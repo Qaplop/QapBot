@@ -304,8 +304,10 @@ async def test_apply_status_change_done_moves_item_and_test_message(db, monkeypa
 
     updated = await apply_status_change(item_number, "done", actor_id="1")
 
-    # Item embed moved to Implemented.
+    # Item embed moved to Implemented, buttons stripped (nothing left to do on a closed item).
     implemented_channel.send.assert_awaited_once()
+    _, item_send_kwargs = implemented_channel.send.call_args
+    assert "view" not in item_send_kwargs or item_send_kwargs["view"] is None
     old_item_message.delete.assert_awaited_once()
     assert updated["channel_id"] == "50"
     assert updated["message_id"] == "555"
@@ -348,7 +350,9 @@ async def test_apply_status_change_done_skips_move_when_already_in_implemented_c
     await apply_status_change(item_number, "done", actor_id="1")
 
     channel.send.assert_not_awaited()  # no duplicate post
-    message.edit.assert_awaited_once()  # still refreshed in place
+    message.edit.assert_awaited_once()  # still refreshed in place, buttons stay stripped
+    _, edit_kwargs = message.edit.call_args
+    assert edit_kwargs["view"] is None
 
 
 @pytest.mark.asyncio

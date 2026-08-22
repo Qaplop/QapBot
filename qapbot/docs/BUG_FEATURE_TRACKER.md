@@ -66,10 +66,11 @@ keeping already-passed environments' sign-off (never resets them).
 
 **Move-on-`done` (2026-08-22)**: the moment any path sets `status = done` — the status
 dropdown, the bridge/MCP `tracker_set_status` tool, or the automatic transition above —
-`apply_status_change()` reposts the item's embed into the configured **Implemented** channel
-and deletes the old copy from the reports channel, and (if a test-case message exists) reposts
-that message into the configured **Done Testing** channel with its Pass/Fail buttons stripped
-(no `view=` on the repost) and deletes the old copy from the test channel. Both channels are
+`apply_status_change()` reposts the item's embed into the configured **Implemented** channel,
+with its Edit/Add files/Status/Test cases buttons stripped (no `view=` on the repost — nothing
+left to do on a closed item), and deletes the old copy from the reports channel. If a test-case
+message exists, it's likewise reposted into the configured **Done Testing** channel with its
+Pass/Fail buttons stripped and the old copy deleted from the test channel. Both channels are
 optional — unconfigured means the move is skipped and the item/test-message stay where they
 are, so a setup that never configures them behaves exactly as before this feature existed.
 Discord threads can't move channels, so the reposted item embed adds a "Discussion thread"
