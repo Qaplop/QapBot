@@ -66,24 +66,47 @@ open ──▶ triaged ──▶ in_progress ──▶ implemented ──▶ tes
 
 `implemented → testing` happens automatically the moment `post_test_cases()` runs (Discord
 button has no "compose test cases" UI — only the bridge/MCP `tracker_add_testcases` does that;
-the Discord-side "Test cases" button is a jump link once one exists). `testing → done` happens
-automatically once every environment that has at least one test case is fully passed — an
-item with only DEV cases never waits on PROD. `❌ Failed` reverts `testing → in_progress`,
-keeping already-passed environments' sign-off (never resets them).
+the Discord-side "Test cases" button is a jump link once one exists). `❌ Failed` reverts
+`testing → in_progress`, keeping already-passed environments' sign-off (never resets them).
 
-**Move-on-`done` (2026-08-22)**: the moment any path sets `status = done` — the status
-dropdown, the bridge/MCP `tracker_set_status` tool, or the automatic transition above —
-`apply_status_change()` reposts the item's embed into the configured **Implemented** channel,
-with its Edit/Add files/Status/Test cases buttons stripped (no `view=` on the repost — nothing
-left to do on a closed item), and deletes the old copy from the reports channel. If a test-case
-message exists, it's likewise reposted into the configured **Done Testing** channel with its
-Pass/Fail buttons stripped and the old copy deleted from the test channel. Both channels are
-optional — unconfigured means the move is skipped and the item/test-message stay where they
-are, so a setup that never configures them behaves exactly as before this feature existed.
-Discord threads can't move channels, so the reposted item embed adds a "Discussion thread"
-jump-link field when one exists (the old thread otherwise becomes unreachable once its parent
-message is deleted). See `_move_item_to_implemented_channel()` /
-`_move_test_message_to_done_testing_channel()`.
+**`testing → done` is NOT automatic any more (decoupled 2026-08-22, tracker item #0015
+follow-up).** Completing every environment's test cases used to force the item straight to
+`done` as a side effect — by design now, the item and its test-case message are two
+independent objects that only ever move on their OWN trigger:
+
+- **The item** only reaches `done` via an explicit `apply_status_change(item_number, "done", ...)`
+  call — the status dropdown, `tracker_set_status`, or someone accepting the "mark done too?"
+  prompt described below. Reaching `done` never touches the test-case message.
+- **The test-case message** only archives to the Done Testing channel via
+  `move_testcases_to_done_channel()`/`finalize_testcases_move()` — triggered by its own
+  completion (every environment with cases fully passed, detected as an edge-trigger in
+  `mark_environment_passed_and_refresh()`/the 👍-reaction shortcut so it only fires once, not on
+  every call against an already-fully-passed item) or by the manual `[ 📦 Move to Done ]`
+  button/`tracker_move_testcases_done` MCP tool. The manual path works even with cases still
+  unchecked — it asks for confirmation first (`ConfirmForceMoveView` / the bridge's
+  `needs_confirmation`/`unchecked_count` response, force-able with `{"force": true}`) — and
+  never silently marks the remaining cases passed; they stay visibly unchecked in the archived
+  message.
+- Whenever a test-case set just finished (naturally or via the forced manual move),
+  `get_linked_item_if_eligible_for_done()` checks whether the linked item is still open (not
+  already `done`/`rejected`/`duplicate`) and, if so, offers a "mark item done too?" prompt:
+  `ConfirmItemDoneView` as an ephemeral followup (Pass button, Move-to-Done button) or, for the
+  👍-reaction shortcut (no interaction to attach an ephemeral to), a message with the same Yes/No
+  buttons posted to the item's discussion thread, falling back to a DM to the reactor if there's
+  no thread. The bridge/MCP surface never blocks on this — `tracker_mark_testcase_passed`/
+  `tracker_move_testcases_done`'s response just names the linked item and status and suggests
+  calling `tracker_set_status(..., "done")` if the agent wants to.
+
+**Move-on-`done` (2026-08-22, item side only since the follow-up above)**: the moment any path
+sets `status = done` — the status dropdown, the bridge/MCP `tracker_set_status` tool, or
+accepting the "mark done too?" prompt — `apply_status_change()` reposts the item's embed into
+the configured **Implemented** channel, with its Edit/Add files/Status/Test cases buttons
+stripped (no `view=` on the repost — nothing left to do on a closed item), and deletes the old
+copy from the reports channel. The Implemented channel is optional — unconfigured means the
+move is skipped and the item stays where it is. Discord threads can't move channels, so the
+reposted item embed adds a "Discussion thread" jump-link field when one exists (the old thread
+otherwise becomes unreachable once its parent message is deleted). See
+`_move_item_to_implemented_channel()`.
 
 ## Discord surface (`qapbot/ui_tracker.py`)
 
@@ -98,11 +121,14 @@ message is deleted). See `_move_item_to_implemented_channel()` /
   a 5-minute **upload window** (`_upload_windows`, consumed by `handle_tracker_upload_message()`,
   wired into `QapBot.py`'s existing `on_message` handler *before* its DM-fallback branch) —
   the only way to accept a pasted screenshot, since Discord modals can't contain file inputs.
-- `TrackerItemButton` / `TrackerTestPassButton` / `TrackerTestFailButton` are restart-safe
-  `discord.ui.DynamicItem`s (custom_id scheme: `tracker:<action>:<item_number>`,
-  `tracker:test:pass:<item_number>:<DEV|PROD>`, `tracker:test:fail:<item_number>`), registered
-  once via `QBcore.bot.add_dynamic_items(...)` in `QapBot.py`'s `_setup_hook()`. Each
-  implements `interaction_check()` gating on `QBcore.bot.fully_initialized` (Pitfall 20).
+- `TrackerItemButton` / `TrackerTestPassButton` / `TrackerTestFailButton` / `TrackerTestMoveDoneButton`
+  are restart-safe `discord.ui.DynamicItem`s (custom_id scheme: `tracker:<action>:<item_number>`,
+  `tracker:test:pass:<item_number>:<DEV|PROD>`, `tracker:test:fail:<item_number>`,
+  `tracker:test:movedone:<item_number>`), registered once via `QBcore.bot.add_dynamic_items(...)`
+  in `QapBot.py`'s `_setup_hook()`. Each implements `interaction_check()` gating on
+  `QBcore.bot.fully_initialized` (Pitfall 20). `ConfirmItemDoneView`/`ConfirmForceMoveView` are
+  short-lived, session-scoped Yes/No prompts (not restart-safe by design, same convention as
+  `TrackerDraftView`) used by the decoupled done-linkage flow above.
 - The 👍-reaction sign-off shortcut is a **new** `on_raw_reaction_add` listener in `QapBot.py`
   (the bot had none before) — bot-admin only, raw (not cached) so it survives restarts.
 
@@ -123,11 +149,15 @@ GET  /api/tracker/items/{n}/attachments/{aid}
 POST /api/tracker/items/{n}/status     {status, note}
 POST /api/tracker/items/{n}/comment    {text}
 POST /api/tracker/items/{n}/testcases  {cases: [{environment, description, priority?}]}
+POST /api/tracker/items/{n}/testcases/pass  {environment}
+POST /api/tracker/items/{n}/testcases/fail  {}
+POST /api/tracker/items/{n}/testcases/move-done  {force?}
 ```
 
 All handlers delegate the actual DB+Discord work to `qapbot/ui_tracker.py`
 (`create_tracker_item_for_agent()` / `apply_status_change()` / `post_comment()` /
-`post_test_cases()`) — there is exactly one place each of those things happens, whether
+`post_test_cases()` / `mark_environment_passed_and_refresh()` / `mark_testing_failed()` /
+`finalize_testcases_move()`) — there is exactly one place each of those things happens, whether
 triggered from Discord or from an agent.
 
 ### MCP server (`qapbot/mcp/tracker_mcp.py`)
@@ -137,9 +167,10 @@ and `.vscode/mcp.json` (VS Code Copilot Chat). Hand-rolled JSON-RPC 2.0 — the 
 package is **not** a project dependency; the wire surface needed (`initialize`, `tools/list`,
 `tools/call`) is small enough that adding a new dependency wasn't worth it.
 
-Six tools: `tracker_list_items`, `tracker_get_item`, `tracker_create_item`, `tracker_set_status`,
-`tracker_comment`, `tracker_add_testcases`. All but the first two write something — no
-filesystem/shell/git/deploy tool is exposed here (plan §6.6).
+Eight tools: `tracker_list_items`, `tracker_get_item`, `tracker_create_item`, `tracker_set_status`,
+`tracker_comment`, `tracker_add_testcases`, `tracker_mark_testcase_passed`,
+`tracker_mark_testcase_failed`, `tracker_move_testcases_done`. All but the first two write
+something — no filesystem/shell/git/deploy tool is exposed here (plan §6.6).
 
 `tracker_create_item` (tracker item #0015, 2026-08-22) lets an agent file a new bug/feature
 directly instead of asking a human to run `/bug`/`/feature` — it posts to the same reports
@@ -148,6 +179,25 @@ channel with the same embed/buttons a human-filed item gets. Its `reporter_id` i
 collide with a real Discord snowflake; this means the reporter-DM-on-status-change step silently
 no-ops (nobody to DM) and only a bot admin — not "the reporter" — can Edit it from Discord. Both
 are acceptable: there is no Discord user to notify or to grant reporter-only edit rights to.
+
+`tracker_mark_testcase_passed`/`tracker_mark_testcase_failed` (2026-08-22) are the agent-drivable
+equivalent of the Discord "✅ passed"/"❌ Failed" test-case buttons — previously the only way to
+sign off a testing round. `mark_environment_passed_and_refresh()`/`mark_testing_failed()` never
+actually depended on a Discord interaction (only on `QBcore.bot` for posting/refreshing
+messages), so this was pure wiring: no new tracker-state logic, just a bridge
+endpoint + MCP tool pointing at the same functions Discord's buttons already call. Marking an
+environment passed no longer touches the item's status at all (decoupled in a follow-up the same
+day, tracker item #0015 follow-up) — see the status-lifecycle section above for what happens
+instead once every environment with cases is fully passed. Marking failed still reverts the item
+to `in_progress`, keeping any already-passed environments' sign-off (that direction of coupling
+was deliberately left alone).
+
+`tracker_move_testcases_done` (2026-08-22 follow-up, point 4) is the agent-drivable equivalent of
+the new `[ 📦 Move to Done ]` Discord button — archives the test-case message regardless of
+whether every case is checked off. Without `force: true`, an incomplete set isn't moved; the
+response's `needs_confirmation`/`unchecked_count` fields tell the caller how many cases remain so
+it can decide whether to finish them first or retry with `force: true`. Never auto-marks the
+remaining cases passed — they stay visibly unchecked in the archived message either way.
 
 **Untrusted input (`qapbot/mcp/tracker_envelope.py`)**: bug/feature reports are arbitrary text
 from arbitrary Discord users, fed straight into an agent's context — a textbook

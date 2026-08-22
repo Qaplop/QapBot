@@ -26,6 +26,7 @@ from qapbot.ui_tracker import (
     apply_status_change,
     build_tracker_embed,
     create_tracker_item_for_agent,
+    finalize_testcases_move,
     handle_tracker_test_reaction,
     handle_tracker_upload_message,
     mark_environment_passed_and_refresh,
@@ -411,7 +412,10 @@ async def test_apply_status_change_refreshes_posted_message(db, monkeypatch):
 # -- move-on-done (Implemented / Done Testing channels) ----------------------
 
 @pytest.mark.asyncio
-async def test_apply_status_change_done_moves_item_and_test_message(db, monkeypatch):
+async def test_apply_status_change_done_moves_item_only_not_test_message(db, monkeypatch):
+    """Decoupled (tracker item #0015 follow-up, 2026-08-22): the item's own `done` transition
+    must never touch the test-case message — that only moves on its own trigger
+    (move_testcases_to_done_channel / finalize_testcases_move)."""
     from qapbot.cache_manager import CACHE
     CACHE.tracker_settings[TRACKER_SETTING_IMPLEMENTED_CHANNEL] = "50"
     CACHE.tracker_settings[TRACKER_SETTING_DONE_TESTING_CHANNEL] = "60"
@@ -422,10 +426,8 @@ async def test_apply_status_change_done_moves_item_and_test_message(db, monkeypa
     implemented_channel = _fake_channel(send_message=new_item_message)
     implemented_channel.id = 50
 
-    old_test_message = _fake_message(message_id=200)
-    old_test_channel = _fake_channel(fetch_message=old_test_message)
-    new_test_message = _fake_message(message_id=600)
-    done_testing_channel = _fake_channel(send_message=new_test_message)
+    old_test_channel = _fake_channel()
+    done_testing_channel = _fake_channel()
     done_testing_channel.id = 60
 
     _wire_bot_multi(monkeypatch, {
@@ -451,13 +453,42 @@ async def test_apply_status_change_done_moves_item_and_test_message(db, monkeypa
     assert updated["message_id"] == "555"
     assert updated["thread_id"] == "777"  # never wiped by the move
 
-    # Test-case message moved to Done Testing with no interactive view (buttons stripped).
+    # Test-case message untouched — no automatic linkage any more.
+    done_testing_channel.send.assert_not_awaited()
+    assert updated["test_channel_id"] == "20"
+    assert updated["test_message_id"] == "200"
+
+
+async def test_finalize_testcases_move_moves_test_message_independent_of_item_status(db, monkeypatch):
+    """The other half of the decoupling: moving the test-case message must never touch the
+    item's own status/channel fields."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_DONE_TESTING_CHANNEL] = "60"
+
+    old_test_message = _fake_message(message_id=200)
+    old_test_channel = _fake_channel(fetch_message=old_test_message)
+    new_test_message = _fake_message(message_id=600)
+    done_testing_channel = _fake_channel(send_message=new_test_message)
+    done_testing_channel.id = 60
+    _wire_bot_multi(monkeypatch, {20: old_test_channel, 60: done_testing_channel})
+
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
+    await db.mark_tracker_environment_passed(item_number, "DEV", "1")
+    await db.update_tracker_item(
+        item_number, test_channel_id="20", test_message_id="200", status="testing",
+    )
+
+    result = await finalize_testcases_move(item_number)
+
+    assert result["moved"] is True
     done_testing_channel.send.assert_awaited_once()
-    _, send_kwargs = done_testing_channel.send.call_args
-    assert "view" not in send_kwargs or send_kwargs["view"] is None
     old_test_message.delete.assert_awaited_once()
-    assert updated["test_channel_id"] == "60"
-    assert updated["test_message_id"] == "600"
+    item = await db.get_tracker_item(item_number)
+    assert item["status"] == "testing"  # unaffected
+    assert item["test_channel_id"] == "60"
+    assert item["test_message_id"] == "600"
+    assert result["linked_item"]["item_number"] == item_number  # still testing -> eligible
 
 
 @pytest.mark.asyncio
@@ -554,7 +585,9 @@ async def test_post_test_cases_does_not_downgrade_done(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_mark_environment_passed_transitions_to_done_when_all_envs_pass(db, monkeypatch):
+async def test_mark_environment_passed_no_longer_touches_item_status(db, monkeypatch):
+    """Decoupled (tracker item #0015 follow-up, 2026-08-22): completing every test case must
+    never change the item's own status any more — it only reports that completion happened."""
     message = _fake_message()
     channel = _fake_channel(fetch_message=message)
     _wire_bot(monkeypatch, channel=channel)
@@ -562,10 +595,28 @@ async def test_mark_environment_passed_transitions_to_done_when_all_envs_pass(db
     await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
     await db.update_tracker_item(item_number, test_channel_id="1", test_message_id="999", status="testing")
 
-    await mark_environment_passed_and_refresh(item_number, "DEV", "1")
+    result = await mark_environment_passed_and_refresh(item_number, "DEV", "1")
 
     item = await db.get_tracker_item(item_number)
-    assert item["status"] == "done"
+    assert item["status"] == "testing"  # unchanged
+    assert result["just_completed"] is True
+    assert result["moved"] is False  # no Done Testing channel configured in this test
+    assert result["linked_item"]["item_number"] == item_number  # still testing -> eligible for the prompt
+
+
+@pytest.mark.asyncio
+async def test_mark_environment_passed_skips_prompt_for_already_terminal_item(db, monkeypatch):
+    message = _fake_message()
+    channel = _fake_channel(fetch_message=message)
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
+    await db.update_tracker_item(item_number, test_channel_id="1", test_message_id="999", status="rejected")
+
+    result = await mark_environment_passed_and_refresh(item_number, "DEV", "1")
+
+    assert result["just_completed"] is True
+    assert result["linked_item"] is None  # terminal status -> never offered
 
 
 @pytest.mark.asyncio
@@ -639,8 +690,10 @@ async def test_reaction_marks_all_pending_environments_passed(db, monkeypatch):
 
     await handle_tracker_test_reaction(_fake_payload())
 
+    testcases = await db.get_tracker_testcases(item_number)
+    assert all(c["passed"] for c in testcases)
     item = await db.get_tracker_item(item_number)
-    assert item["status"] == "done"
+    assert item["status"] == "testing"  # decoupled (tracker item #0015 follow-up) — unaffected
 
 
 @pytest.mark.asyncio

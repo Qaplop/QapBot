@@ -1,6 +1,47 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (15)
+- Changed: decoupled the bug/feature tracker's item-done and test-case-done archiving, per the
+  project owner's explicit spec (each object moves on its own trigger only, no automatic
+  cross-linking either direction). `apply_status_change()`'s `done` branch no longer calls
+  `_move_test_message_to_done_testing_channel()` -- an item reaching done now only ever moves
+  its own embed to the Implemented channel. `mark_environment_passed_and_refresh()` and the
+  `\U0001F44D`-reaction shortcut no longer force the item to `done` when every environment's
+  cases pass; instead they edge-trigger (only on the transition into fully-passed, not on every
+  call against an already-complete item) a new `finalize_testcases_move()` that archives the
+  test-case message to the Done Testing channel independently, then -- if the linked item isn't
+  already done/rejected/duplicate -- offers a "mark item done too?" prompt (`ConfirmItemDoneView`:
+  ephemeral followup for the Pass button, a thread message/DM fallback for the reaction
+  shortcut, since it has no interaction to attach an ephemeral to). Added a new manual
+  `[ \U0001F4E6 Move to Done ]` button/`tracker_move_testcases_done` MCP tool + bridge endpoint
+  (`POST /api/tracker/items/{n}/testcases/move-done {force?}`) to archive the test-case message
+  even with cases still unchecked -- guarded by a `ConfirmForceMoveView`/`needs_confirmation`
+  response unless `force: true`; forcing never silently marks the remaining cases passed. Kept
+  as-is per explicit confirmation: the reporter DM-on-done notification, and Failed reverting the
+  item to in_progress (a different, intentionally-untouched coupling). MCP surface now 9 tools
+  (7 write). Docs: qapbot/docs/BUG_FEATURE_TRACKER.md status-lifecycle/bridge/MCP sections
+  rewritten. Files: qapbot/ui_tracker.py, qapbot/web_bridge.py, qapbot/mcp/tracker_mcp.py,
+  qapbot/mcp/tracker_bridge_client.py, QapBot.py (registered TrackerTestMoveDoneButton),
+  qapbot/translations/{en,de}.json. 2440/2440 tests pass.
+
+2026-08-22 (14)
+- Added: `tracker_mark_testcase_passed`/`tracker_mark_testcase_failed` MCP tools -- the
+  agent-drivable equivalent of the Discord "[OK] passed"/"[X] Failed" test-case buttons, which
+  were previously the only way to sign off a tracker item's testing round. No new ui_tracker.py
+  logic needed -- `mark_environment_passed_and_refresh()`/`mark_testing_failed()` already didn't
+  depend on a Discord interaction, just wiring: new `POST /api/tracker/items/{n}/testcases/pass`
+  {environment} and `POST /api/tracker/items/{n}/testcases/fail` bridge endpoints
+  (qapbot/web_bridge.py, 404 for a missing item, 400 for an invalid/empty environment), matching
+  client methods (qapbot/mcp/tracker_bridge_client.py), and the two new tools
+  (qapbot/mcp/tracker_mcp.py) -- 8 tools total now, 6 of them write tools. Verified live against
+  the deployed bridge with a real disposable feature item (#0018): create -> implemented ->
+  add_testcases (auto -> testing) -> set_status(done) roundtrip all worked end-to-end before this
+  change landed; this change closes the one remaining gap (per-environment pass/fail) that
+  previously required a human clicking Discord buttons. Docs: qapbot/docs/BUG_FEATURE_TRACKER.md
+  tool count/table updated. Files: qapbot/web_bridge.py, qapbot/mcp/tracker_mcp.py,
+  qapbot/mcp/tracker_bridge_client.py. 2426/2426 tests pass.
+
 2026-08-22 (13)
 - Fixed: tracker #0016, second defect -- CWL sign-up DM buttons that were dead on arrival. The
   button resolves (event_id, player_tag) at click time and returns "this sign-up is no longer

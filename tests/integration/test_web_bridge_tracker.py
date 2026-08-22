@@ -406,3 +406,224 @@ async def test_post_create_item_requires_configured_channel(client, db, monkeypa
         headers={"X-Bridge-Secret": SECRET},
     )
     assert resp.status == 400
+
+
+# -- test case pass/fail (agent-drivable sign-off loop) --------------------
+
+async def test_post_testcase_pass_requires_secret(client):
+    resp = await client.post("/api/tracker/items/1/testcases/pass", json={"environment": "PROD"})
+    assert resp.status == 403
+
+
+async def test_post_testcase_pass_marks_environment_passed(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "x"}])
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/pass",
+        json={"environment": "PROD"},
+        headers={"X-Bridge-Secret": SECRET, "X-Tracker-Admin": "claude"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["testcases"][0]["passed"] == 1
+    assert body["testcases"][0]["passed_by"] == "claude"
+
+
+async def test_post_testcase_pass_reports_completion_without_touching_item_status(client, db, monkeypatch):
+    """Decoupled (tracker item #0015 follow-up, 2026-08-22): the pass endpoint reports
+    completion/linked-item info but never changes the item's own status any more."""
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, status="testing")
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "x"}])
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/pass",
+        json={"environment": "PROD"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "testing"
+    assert body["testcases_just_completed"] is True
+    assert body["moved"] is False  # no Done Testing channel configured
+    assert body["linked_item"]["item_number"] == item_number
+
+
+async def test_post_testcase_pass_skips_linked_item_when_already_terminal(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, status="rejected")
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "x"}])
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/pass",
+        json={"environment": "PROD"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["testcases_just_completed"] is True
+    assert body["linked_item"] is None
+
+
+async def test_post_testcase_pass_rejects_invalid_environment(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/pass",
+        json={"environment": "QA"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 400
+
+
+async def test_post_testcase_pass_404_for_missing_item(client, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    resp = await client.post(
+        "/api/tracker/items/99999/testcases/pass", json={"environment": "PROD"}, headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 404
+
+
+async def test_post_testcase_pass_400_for_environment_with_no_cases(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/pass",
+        json={"environment": "PROD"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 400
+
+
+async def test_post_testcase_fail_requires_secret(client):
+    resp = await client.post("/api/tracker/items/1/testcases/fail", json={})
+    assert resp.status == 403
+
+
+async def test_post_testcase_fail_reverts_to_in_progress(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, status="testing")
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/fail", json={}, headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["item"]["status"] == "in_progress"
+
+
+async def test_post_testcase_fail_404_for_missing_item(client, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    resp = await client.post(
+        "/api/tracker/items/99999/testcases/fail", json={}, headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 404
+
+
+# -- move-done (manual archive, decoupled from item status) ----------------
+
+async def test_post_testcase_move_done_requires_secret(client):
+    resp = await client.post("/api/tracker/items/1/testcases/move-done", json={})
+    assert resp.status == 403
+
+
+async def test_post_testcase_move_done_404_for_missing_item(client, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    resp = await client.post(
+        "/api/tracker/items/99999/testcases/move-done", json={}, headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 404
+
+
+async def test_post_testcase_move_done_requires_testcases(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/move-done", json={}, headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 400
+
+
+async def test_post_testcase_move_done_needs_confirmation_when_incomplete(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [
+        {"environment": "DEV", "description": "x"}, {"environment": "PROD", "description": "y"},
+    ])
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/move-done", json={}, headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["moved"] is False
+    assert body["needs_confirmation"] is True
+    assert body["unchecked_count"] == 2
+
+
+async def test_post_testcase_move_done_force_moves_despite_incomplete(client, db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_tracker import TRACKER_SETTING_DONE_TESTING_CHANNEL
+    CACHE.tracker_settings[TRACKER_SETTING_DONE_TESTING_CHANNEL] = "1"
+    channel = _fake_channel()
+    channel.fetch_message = AsyncMock(return_value=AsyncMock())
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
+    await db.update_tracker_item(item_number, test_channel_id="2", test_message_id="999")
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/move-done",
+        json={"force": True}, headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["moved"] is True
+    assert body["needs_confirmation"] is False
+    channel.send.assert_awaited_once()
+    # forcing a move must not silently mark the still-unchecked case passed
+    cases = await db.get_tracker_testcases(item_number)
+    assert cases[0]["passed"] == 0
+
+
+async def test_post_testcase_move_done_moves_directly_when_already_complete(client, db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_tracker import TRACKER_SETTING_DONE_TESTING_CHANNEL
+    CACHE.tracker_settings[TRACKER_SETTING_DONE_TESTING_CHANNEL] = "1"
+    channel = _fake_channel()
+    channel.fetch_message = AsyncMock(return_value=AsyncMock())
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
+    await db.mark_tracker_environment_passed(item_number, "DEV", "1")
+    await db.update_tracker_item(item_number, test_channel_id="2", test_message_id="999", status="testing")
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/move-done", json={}, headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["moved"] is True
+    assert body["needs_confirmation"] is False
+    assert body["linked_item"]["item_number"] == item_number  # still testing -> eligible
+
+
+async def test_post_testcase_move_done_no_linked_item_when_item_terminal(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
+    await db.mark_tracker_environment_passed(item_number, "DEV", "1")
+    await db.update_tracker_item(item_number, status="done")
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/move-done", json={}, headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["linked_item"] is None
+

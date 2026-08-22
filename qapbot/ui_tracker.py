@@ -1135,17 +1135,16 @@ async def apply_status_change(
     assert item is not None
 
     if new_status == "done":
-        # Move-on-done: repost the item into the Implemented channel, and (if a test-case
-        # message exists) the test-case message into Done Testing — both are single-choke-point
-        # here so this covers the status dropdown, the bridge/MCP tool, AND the automatic
-        # done-transition in mark_environment_passed_and_refresh() (the 👍 sign-off flow calls
-        # this same function), with no changes needed anywhere else.
+        # Move-on-done, item side only (tracker item #0015 follow-up, 2026-08-22): the
+        # test-case message is now archived independently, via its OWN completion event
+        # (finalize_testcases_move(), called from mark_environment_passed_and_refresh(), the
+        # 👍-reaction shortcut, or the manual "Move to Done" action) — never as a side effect
+        # of the item reaching done, and vice versa. Each object moves on its own trigger only.
         moved = await _move_item_to_implemented_channel(item)
         if not moved:
             implemented_channel_id = CACHE.tracker_settings.get(TRACKER_SETTING_IMPLEMENTED_CHANNEL)
             already_archived = bool(implemented_channel_id) and item.get("channel_id") == implemented_channel_id
             await _refresh_item_message(item, archived=already_archived)
-        await _move_test_message_to_done_testing_channel(item)
         item = await db.get_tracker_item(item_number)
         assert item is not None
     else:
@@ -1401,6 +1400,7 @@ def build_tracker_testcase_view(item_number: int, testcases: List[Dict[str, Any]
     for env in environments:
         view.add_item(TrackerTestPassButton(item_number, env))
     view.add_item(TrackerTestFailButton(item_number))
+    view.add_item(TrackerTestMoveDoneButton(item_number))
     return view
 
 
@@ -1525,22 +1525,65 @@ async def _refresh_testcase_message(item_number: int) -> None:
         logging.warning(f"[TRACKER] Failed to refresh test-case message for item #{item_number}: {e}")
 
 
-async def mark_environment_passed_and_refresh(item_number: int, environment: str, actor_id: str) -> None:
-    """Sign off every pending test case for one environment; auto-transitions to 'done' the
-    moment every environment that HAS test cases is fully passed (plan §2.4 point 4 — "required"
-    = every environment with at least one row, so an item with only DEV cases never waits on
-    PROD)."""
+async def move_testcases_to_done_channel(item_number: int) -> bool:
+    """Best-effort archive of one item's test-case message to the Done Testing channel —
+    entirely independent of the linked item's own status (tracker item #0015 follow-up,
+    2026-08-22: each object moves on its own trigger only). Thin wrapper so bridge/MCP callers
+    don't need to fetch the item themselves first."""
+    from qapbot.cache_manager import CACHE
+
+    item = await CACHE.db_manager.get_tracker_item(item_number)
+    if item is None:
+        return False
+    return await _move_test_message_to_done_testing_channel(item)
+
+
+async def get_linked_item_if_eligible_for_done(item_number: int) -> Optional[Dict[str, Any]]:
+    """The item linked to a test-case set, or None if it no longer exists or is already in a
+    terminal status (done/rejected/duplicate) — the "should we even offer to mark it done too?"
+    check shared by every completion path (tracker item #0015 follow-up, 2026-08-22)."""
+    from qapbot.cache_manager import CACHE
+
+    item = await CACHE.db_manager.get_tracker_item(item_number)
+    if item is None or item["status"] in ("done", "rejected", "duplicate"):
+        return None
+    return item
+
+
+async def finalize_testcases_move(item_number: int) -> Dict[str, Any]:
+    """Archive the test-case message (independent of the item) and report whether the linked
+    item is eligible for a "mark done too?" follow-up. Shared by natural full-completion
+    (mark_environment_passed_and_refresh, the 👍-reaction shortcut) and the manual "Move to
+    Done" action (TrackerTestMoveDoneButton, the bridge/MCP tool) — one place either path
+    actually performs the move."""
+    moved = await move_testcases_to_done_channel(item_number)
+    linked_item = await get_linked_item_if_eligible_for_done(item_number)
+    return {"moved": moved, "linked_item": linked_item}
+
+
+async def mark_environment_passed_and_refresh(item_number: int, environment: str, actor_id: str) -> Dict[str, Any]:
+    """Sign off every pending test case for one environment. No longer touches the linked
+    item's status at all (tracker item #0015 follow-up, 2026-08-22 — the two objects are
+    archived independently now). Returns {"just_completed", "moved", "linked_item"} — "just_
+    completed" is edge-triggered (only True the call that flips the LAST pending row, not on
+    every call against an already-fully-passed item) so callers can decide whether to offer
+    moving the test-case message and/or prompting to mark the linked item done."""
     from qapbot.cache_manager import CACHE
 
     db = CACHE.db_manager
+    before = await db.get_tracker_testcases(item_number)
+    was_fully_passed = bool(before) and all(c["passed"] for c in before)
+
     await db.mark_tracker_environment_passed(item_number, environment, actor_id)
     await _refresh_testcase_message(item_number)
 
-    testcases = await db.get_tracker_testcases(item_number)
-    if testcases and all(c["passed"] for c in testcases):
-        item = await db.get_tracker_item(item_number)
-        if item is not None and item["status"] != "done":
-            await apply_status_change(item_number, "done", actor_id=actor_id)
+    after = await db.get_tracker_testcases(item_number)
+    now_fully_passed = bool(after) and all(c["passed"] for c in after)
+
+    if now_fully_passed and not was_fully_passed:
+        result = await finalize_testcases_move(item_number)
+        return {"just_completed": True, **result}
+    return {"just_completed": False, "moved": False, "linked_item": None}
 
 
 async def mark_testing_failed(item_number: int, actor_id: str) -> None:
@@ -1558,8 +1601,93 @@ async def mark_testing_failed(item_number: int, actor_id: str) -> None:
             logging.warning(f"[TRACKER] Failed to post fail-note into thread for item #{item_number}: {e}")
 
 
+async def _post_item_done_confirmation_passive(item: Dict[str, Any], actor_id: str) -> None:
+    """Non-interactive equivalent of the ephemeral "mark item done too?" prompt, for triggers
+    with no live interaction to attach a followup to (the 👍-reaction shortcut). Posts to the
+    item's discussion thread if one exists, else DMs the actor — never raises."""
+    import QBcore
+
+    guild_id = _lang_guild_id(item)
+    text = t(
+        'ui_components.tracker.item_done_confirm_prompt', guild_id=guild_id,
+        item_number=f"{item['item_number']:04d}", title=item['title'],
+        status=t(f'ui_components.tracker.status_{item["status"]}', guild_id=guild_id),
+    )
+    view = ConfirmItemDoneView(item['item_number'], guild_id)
+    if item.get("thread_id"):
+        try:
+            thread = QBcore.bot.get_channel(int(item["thread_id"])) or await QBcore.bot.fetch_channel(int(item["thread_id"]))
+            await thread.send(text, view=view)  # type: ignore[union-attr]
+            return
+        except Exception as e:
+            logging.warning(f"[TRACKER] Failed to post item-done prompt into thread for item #{item['item_number']}: {e}")
+    try:
+        user = QBcore.bot.get_user(int(actor_id)) or await QBcore.bot.fetch_user(int(actor_id))
+        await user.send(text, view=view)  # type: ignore[union-attr]
+    except Exception as e:
+        logging.warning(f"[TRACKER] Failed to DM item-done prompt to {actor_id} for item #{item['item_number']}: {e}")
+
+
+class ConfirmItemDoneView(discord.ui.View):
+    """Short-lived, session-scoped Yes/No prompt offered once a test-case set's message has
+    been archived (naturally or via the manual "Move to Done" action) and the linked item isn't
+    already terminal (tracker item #0015 follow-up, 2026-08-22). Not restart-safe by design —
+    same convention as TrackerDraftView; a bot restart before anyone answers just lets it
+    expire. Works both as an ephemeral followup (Pass button / Move-to-Done button) and as a
+    regular channel/thread/DM message (the 👍-reaction shortcut has no interaction to attach an
+    ephemeral message to)."""
+
+    def __init__(self, item_number: int, guild_id: Optional[int], timeout: int = 600):
+        super().__init__(timeout=timeout)
+        self.item_number = item_number
+        self.guild_id = guild_id
+        yes_btn = discord.ui.Button(
+            label=t('ui_components.tracker.item_done_confirm_yes', guild_id=guild_id), style=discord.ButtonStyle.success
+        )
+        yes_btn.callback = self._on_yes  # type: ignore[assignment]
+        self.add_item(yes_btn)
+        no_btn = discord.ui.Button(
+            label=t('ui_components.tracker.item_done_confirm_no', guild_id=guild_id), style=discord.ButtonStyle.secondary
+        )
+        no_btn.callback = self._on_no  # type: ignore[assignment]
+        self.add_item(no_btn)
+
+    async def _on_yes(self, interaction: discord.Interaction) -> None:
+        from qapbot.config import CONFIG
+        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+
+        user_id = str(interaction.user.id)
+        if not check_bot_admin_only(interaction, CONFIG.server_admin):
+            await interaction.response.send_message(
+                t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=self.guild_id), ephemeral=True
+            )
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        try:
+            await apply_status_change(self.item_number, "done", actor_id=user_id)
+            await interaction.followup.send(
+                t(
+                    'ui_components.tracker.item_done_confirm_applied', guild_id=self.guild_id,
+                    item_number=f"{self.item_number:04d}",
+                ),
+                ephemeral=True,
+            )
+        except ValueError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+        self.stop()
+
+    async def _on_no(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        await interaction.followup.send(
+            t('ui_components.tracker.item_done_confirm_cancelled', guild_id=self.guild_id), ephemeral=True
+        )
+        self.stop()
+
+
 TRACKER_TEST_PASS_TEMPLATE = r'^tracker:test:pass:(?P<item_number>\d+):(?P<environment>DEV|PROD)$'
 TRACKER_TEST_FAIL_TEMPLATE = r'^tracker:test:fail:(?P<item_number>\d+)$'
+TRACKER_TEST_MOVEDONE_TEMPLATE = r'^tracker:test:movedone:(?P<item_number>\d+)$'
+
 
 
 class TrackerTestPassButton(
@@ -1605,7 +1733,9 @@ class TrackerTestPassButton(
             )
             return
         await interaction.response.defer(thinking=False, ephemeral=True)
-        await mark_environment_passed_and_refresh(self.item_number, self.environment, user_id)
+        result = await mark_environment_passed_and_refresh(self.item_number, self.environment, user_id)
+        if result["just_completed"]:
+            await _send_testcases_moved_followup(interaction, self.item_number, result, guild_id)
 
 
 class TrackerTestFailButton(
@@ -1653,6 +1783,135 @@ class TrackerTestFailButton(
         await mark_testing_failed(self.item_number, user_id)
 
 
+async def _send_testcases_moved_followup(
+    interaction: discord.Interaction, item_number: int, result: Dict[str, Any], guild_id: Optional[int]
+) -> None:
+    """Shared ephemeral followup for both the natural-completion path (Pass button) and the
+    manual Move-to-Done action, once a test-case message has just been archived — reports the
+    move and, if the linked item isn't already terminal, offers the ConfirmItemDoneView
+    (tracker item #0015 follow-up, 2026-08-22)."""
+    text = t(
+        'ui_components.tracker.testcase_moved_done_confirmed' if result["moved"] else 'ui_components.tracker.testcase_moved_done_no_channel',
+        guild_id=guild_id,
+    )
+    linked_item = result.get("linked_item")
+    if linked_item is not None:
+        text += "\n" + t(
+            'ui_components.tracker.item_done_confirm_prompt', guild_id=guild_id,
+            item_number=f"{linked_item['item_number']:04d}", title=linked_item['title'],
+            status=t(f'ui_components.tracker.status_{linked_item["status"]}', guild_id=guild_id),
+        )
+        await interaction.followup.send(text, view=ConfirmItemDoneView(item_number, guild_id), ephemeral=True)
+    else:
+        await interaction.followup.send(text, ephemeral=True)
+
+
+class ConfirmForceMoveView(discord.ui.View):
+    """Yes/No guard shown by TrackerTestMoveDoneButton when cases are still unchecked (tracker
+    item #0015 follow-up, point 4, 2026-08-22). Not restart-safe by design, same as
+    ConfirmItemDoneView."""
+
+    def __init__(self, item_number: int, guild_id: Optional[int], timeout: int = 300):
+        super().__init__(timeout=timeout)
+        self.item_number = item_number
+        self.guild_id = guild_id
+        yes_btn = discord.ui.Button(
+            label=t('ui_components.tracker.testcase_movedone_confirm_yes', guild_id=guild_id), style=discord.ButtonStyle.danger
+        )
+        yes_btn.callback = self._on_yes  # type: ignore[assignment]
+        self.add_item(yes_btn)
+        no_btn = discord.ui.Button(
+            label=t('ui_components.tracker.testcase_movedone_confirm_no', guild_id=guild_id), style=discord.ButtonStyle.secondary
+        )
+        no_btn.callback = self._on_no  # type: ignore[assignment]
+        self.add_item(no_btn)
+
+    async def _on_yes(self, interaction: discord.Interaction) -> None:
+        from qapbot.config import CONFIG
+        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+
+        user_id = str(interaction.user.id)
+        if not check_bot_admin_only(interaction, CONFIG.server_admin):
+            await interaction.response.send_message(
+                t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=self.guild_id), ephemeral=True
+            )
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        result = await finalize_testcases_move(self.item_number)
+        await _send_testcases_moved_followup(interaction, self.item_number, result, self.guild_id)
+        self.stop()
+
+    async def _on_no(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        await interaction.followup.send(
+            t('ui_components.tracker.testcase_movedone_confirm_cancelled', guild_id=self.guild_id), ephemeral=True
+        )
+        self.stop()
+
+
+class TrackerTestMoveDoneButton(
+    discord.ui.DynamicItem[discord.ui.Button],  # type: ignore[type-arg]
+    template=TRACKER_TEST_MOVEDONE_TEMPLATE,
+):
+    """`[ 📦 Move to Done ]` — manually archive the test-case message to the Done Testing
+    channel, independent of whether every case is checked off or of the linked item's status
+    (tracker item #0015 follow-up, point 4, 2026-08-22). Bot-admin only."""
+
+    def __init__(self, item_number: int):
+        self.item_number = item_number
+        super().__init__(
+            discord.ui.Button(
+                label=t('ui_components.tracker.testcase_button_movedone'),
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"tracker:test:movedone:{item_number}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls, interaction: discord.Interaction, item: discord.ui.Item[Any], match: 're.Match[str]', /
+    ) -> 'TrackerTestMoveDoneButton':
+        return cls(item_number=int(match["item_number"]))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        import QBcore
+        if not getattr(QBcore.bot, 'fully_initialized', False):
+            guild_id = interaction.guild.id if interaction.guild else None
+            await interaction.response.send_message(_startup_gate_message(guild_id), ephemeral=True)
+            return False
+        return True
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        from qapbot.cache_manager import CACHE
+        from qapbot.config import CONFIG
+        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+
+        user_id = str(interaction.user.id)
+        guild_id = interaction.guild.id if interaction.guild else None
+        if not check_bot_admin_only(interaction, CONFIG.server_admin):
+            await interaction.response.send_message(
+                t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=guild_id), ephemeral=True
+            )
+            return
+
+        testcases = await CACHE.db_manager.get_tracker_testcases(self.item_number)
+        unchecked = [c for c in testcases if not c["passed"]]
+        if unchecked:
+            await interaction.response.send_message(
+                t(
+                    'ui_components.tracker.testcase_movedone_confirm_incomplete', guild_id=guild_id,
+                    count=len(unchecked),
+                ),
+                view=ConfirmForceMoveView(self.item_number, guild_id),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        result = await finalize_testcases_move(self.item_number)
+        await _send_testcases_moved_followup(interaction, self.item_number, result, guild_id)
+
+
 async def handle_tracker_test_reaction(payload: discord.RawReactionActionEvent) -> None:
     """👍 on a test-case message marks every still-pending environment passed at once (plan
     §2.4 point 3) — a new on_raw_reaction_add listener (the bot had none before this, plan
@@ -1673,16 +1932,20 @@ async def handle_tracker_test_reaction(payload: discord.RawReactionActionEvent) 
     item = await db.get_tracker_item_by_test_message_id(str(payload.message_id))
     if item is None:
         return
+    item_number = item["item_number"]
 
-    testcases = await db.get_tracker_testcases(item["item_number"])
-    pending_envs = sorted({c["environment"] for c in testcases if not c["passed"]})
+    before = await db.get_tracker_testcases(item_number)
+    was_fully_passed = bool(before) and all(c["passed"] for c in before)
+    pending_envs = sorted({c["environment"] for c in before if not c["passed"]})
     actor_id = str(payload.user_id)
     for env in pending_envs:
-        await db.mark_tracker_environment_passed(item["item_number"], env, actor_id)
-    await _refresh_testcase_message(item["item_number"])
+        await db.mark_tracker_environment_passed(item_number, env, actor_id)
+    await _refresh_testcase_message(item_number)
 
-    testcases = await db.get_tracker_testcases(item["item_number"])
-    if testcases and all(c["passed"] for c in testcases):
-        refreshed = await db.get_tracker_item(item["item_number"])
-        if refreshed is not None and refreshed["status"] != "done":
-            await apply_status_change(item["item_number"], "done", actor_id=actor_id)
+    after = await db.get_tracker_testcases(item_number)
+    now_fully_passed = bool(after) and all(c["passed"] for c in after)
+    if now_fully_passed and not was_fully_passed:
+        result = await finalize_testcases_move(item_number)
+        linked_item = result.get("linked_item")
+        if linked_item is not None:
+            await _post_item_done_confirmation_passive(linked_item, actor_id)

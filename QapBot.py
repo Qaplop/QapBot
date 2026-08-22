@@ -2826,8 +2826,8 @@ async def _setup_hook():
     # a bot restart between posting an item/test-case message and a click still resolves
     # correctly. Registered unconditionally (harmless no-op on DEV, where tracker_enabled is
     # always False — no tracker message ever exists there to carry these custom_ids).
-    from qapbot.ui_tracker import TrackerItemButton, TrackerTestPassButton, TrackerTestFailButton
-    QBcore.bot.add_dynamic_items(TrackerItemButton, TrackerTestPassButton, TrackerTestFailButton)
+    from qapbot.ui_tracker import TrackerItemButton, TrackerTestPassButton, TrackerTestFailButton, TrackerTestMoveDoneButton
+    QBcore.bot.add_dynamic_items(TrackerItemButton, TrackerTestPassButton, TrackerTestFailButton, TrackerTestMoveDoneButton)
     logging.info("[SETUP_HOOK] Registered persistent tracker item/test-case dynamic items for restart-surviving buttons")
 
     # CWL clan-config web bridge (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase B) — no-ops unless

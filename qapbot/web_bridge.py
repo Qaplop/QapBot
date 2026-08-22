@@ -2325,6 +2325,92 @@ async def handle_post_tracker_testcases(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "item": dict(item)})
 
 
+async def handle_post_tracker_testcase_pass(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from qapbot.ui_tracker import mark_environment_passed_and_refresh
+
+    try:
+        item_number = int(request.match_info["item_number"])
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid body"}, status=400)
+    environment = body.get("environment")
+    if environment not in ("DEV", "PROD"):
+        return web.json_response({"error": "environment must be DEV or PROD"}, status=400)
+
+    item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
+    if item is None:
+        return web.json_response({"error": "not found"}, status=404)
+    testcases = await CACHE.db_manager.get_tracker_testcases(item_number)  # type: ignore[union-attr]
+    if not any(c["environment"] == environment for c in testcases):
+        return web.json_response({"error": f"no test cases for environment {environment}"}, status=400)
+
+    result = await mark_environment_passed_and_refresh(item_number, environment, _tracker_admin_label(request))
+    item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
+    testcases = await CACHE.db_manager.get_tracker_testcases(item_number)  # type: ignore[union-attr]
+    linked_item = result.get("linked_item")
+    return web.json_response({
+        "ok": True, "item": dict(item), "testcases": [dict(c) for c in testcases],
+        "testcases_just_completed": result["just_completed"],
+        "moved": result["moved"],
+        "linked_item": dict(linked_item) if linked_item is not None else None,
+    })
+
+
+async def handle_post_tracker_testcase_fail(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from qapbot.ui_tracker import mark_testing_failed
+
+    try:
+        item_number = int(request.match_info["item_number"])
+    except ValueError:
+        return web.json_response({"error": "invalid item_number"}, status=400)
+
+    item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
+    if item is None:
+        return web.json_response({"error": "not found"}, status=404)
+
+    await mark_testing_failed(item_number, _tracker_admin_label(request))
+    item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
+    return web.json_response({"ok": True, "item": dict(item)})
+
+
+async def handle_post_tracker_testcase_move_done(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from qapbot.ui_tracker import finalize_testcases_move
+
+    try:
+        item_number = int(request.match_info["item_number"])
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid body"}, status=400)
+    force = bool(body.get("force", False))
+
+    item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
+    if item is None:
+        return web.json_response({"error": "not found"}, status=404)
+    testcases = await CACHE.db_manager.get_tracker_testcases(item_number)  # type: ignore[union-attr]
+    if not testcases:
+        return web.json_response({"error": "no test cases posted for this item"}, status=400)
+    unchecked = [c for c in testcases if not c["passed"]]
+    if unchecked and not force:
+        return web.json_response({
+            "ok": True, "moved": False, "needs_confirmation": True,
+            "unchecked_count": len(unchecked),
+            "unchecked": [{"environment": c["environment"], "description": c["description"]} for c in unchecked],
+        })
+
+    result = await finalize_testcases_move(item_number)
+    linked_item = result.get("linked_item")
+    return web.json_response({
+        "ok": True, "moved": result["moved"], "needs_confirmation": False,
+        "linked_item": dict(linked_item) if linked_item is not None else None,
+    })
+
+
 def create_app() -> web.Application:
     app = web.Application(middlewares=[_access_log_middleware])
     app.router.add_get("/api/health", handle_health)
@@ -2350,6 +2436,9 @@ def create_app() -> web.Application:
     app.router.add_post("/api/tracker/items/{item_number}/status", handle_post_tracker_status)
     app.router.add_post("/api/tracker/items/{item_number}/comment", handle_post_tracker_comment)
     app.router.add_post("/api/tracker/items/{item_number}/testcases", handle_post_tracker_testcases)
+    app.router.add_post("/api/tracker/items/{item_number}/testcases/pass", handle_post_tracker_testcase_pass)
+    app.router.add_post("/api/tracker/items/{item_number}/testcases/fail", handle_post_tracker_testcase_fail)
+    app.router.add_post("/api/tracker/items/{item_number}/testcases/move-done", handle_post_tracker_testcase_move_done)
     return app
 
 

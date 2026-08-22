@@ -15,9 +15,14 @@ guaranteed to see the user's shell environment):
     TRACKER_ADMIN_ID       attribution label sent as X-Tracker-Admin (self-asserted, never
                            authentication — see plan §6.4).
 
-Four write tools now (tracker item #0015 added `tracker_create_item`): create / status /
-comment / testcases. Still no filesystem, shell, git, or deployment tool exposed here — only
-tracker state changes (plan §6.6's original read-mostly posture, extended to cover creation).
+Seven write tools now (tracker item #0015 added `tracker_create_item`; a follow-up added
+`tracker_mark_testcase_passed`/`tracker_mark_testcase_failed` so the pass/fail sign-off loop,
+previously Discord-button-only, is agent-drivable too; a second follow-up decoupled the item's
+own `done` transition from the test-case message's archive move — each object now moves on its
+own trigger only — and added `tracker_move_testcases_done` for the manual/forced archive):
+create / status / comment / testcases / mark-passed / mark-failed / move-testcases-done. Still
+no filesystem, shell, git, or deployment tool exposed here — only tracker state changes (plan
+§6.6's original read-mostly posture, extended to cover all of the above).
 """
 from __future__ import annotations
 
@@ -157,6 +162,57 @@ TOOLS: List[Dict[str, Any]] = [
             "required": ["item_number", "cases"],
         },
     },
+    {
+        "name": "tracker_mark_testcase_passed",
+        "description": (
+            "Sign off every not-yet-passed test case for one environment (DEV/PROD) of a "
+            "tracker item — the agent-drivable equivalent of clicking the Discord '✅ passed' "
+            "button. The moment every environment with test cases is fully passed, the "
+            "test-case message is archived to the Done Testing channel on its own (independent "
+            "of the item's status — tracker item #0015 follow-up). The item itself is never "
+            "changed automatically any more; the tool's response tells you if the linked item "
+            "is still open and eligible for tracker_set_status(..., 'done')."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_number": {"type": "integer"},
+                "environment": {"type": "string", "enum": ["DEV", "PROD"]},
+            },
+            "required": ["item_number", "environment"],
+        },
+    },
+    {
+        "name": "tracker_mark_testcase_failed",
+        "description": (
+            "Mark a tracker item's testing round as failed — the agent-drivable equivalent of "
+            "the Discord '❌ Failed' button. Reverts the item to 'in_progress'; already-passed "
+            "environments keep their sign-off (never reset)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"item_number": {"type": "integer"}},
+            "required": ["item_number"],
+        },
+    },
+    {
+        "name": "tracker_move_testcases_done",
+        "description": (
+            "Manually archive a tracker item's test-case message to the Done Testing channel, "
+            "independent of whether every case is checked off and of the linked item's status "
+            "(tracker item #0015 follow-up, point 4). If any cases are still unchecked and "
+            "`force` isn't set, nothing is moved — the response reports how many are unchecked so "
+            "you can decide whether to finish them first or retry with force=true."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_number": {"type": "integer"},
+                "force": {"type": "boolean", "description": "Move anyway even if cases are still unchecked. Defaults to false."},
+            },
+            "required": ["item_number"],
+        },
+    },
 ]
 
 
@@ -284,7 +340,45 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> str:
             f"— status is now {result['item']['status']}."
         )
 
+    if name == "tracker_mark_testcase_passed":
+        result = await client.mark_testcase_passed(int(arguments["item_number"]), arguments["environment"])
+        lines = [f"Marked {arguments['environment']} passed for #{int(arguments['item_number']):04d}."]
+        if result.get("testcases_just_completed"):
+            lines.append(_testcases_moved_summary(result))
+            lines.append(_linked_item_hint(result.get("linked_item")))
+        return "\n".join(line for line in lines if line)
+
+    if name == "tracker_mark_testcase_failed":
+        result = await client.mark_testcase_failed(int(arguments["item_number"]))
+        return f"Marked #{int(arguments['item_number']):04d} testing failed — status is now {result['item']['status']}."
+
+    if name == "tracker_move_testcases_done":
+        result = await client.move_testcases_done(int(arguments["item_number"]), arguments.get("force", False))
+        if result.get("needs_confirmation"):
+            return (
+                f"#{int(arguments['item_number']):04d} has {result['unchecked_count']} unchecked test case(s) — "
+                f"not moved. Call again with force=true to move anyway, or finish the remaining cases first."
+            )
+        lines = [_testcases_moved_summary(result), _linked_item_hint(result.get("linked_item"))]
+        return "\n".join(line for line in lines if line)
+
     raise ValueError(f"unknown tool: {name}")
+
+
+def _testcases_moved_summary(result: Dict[str, Any]) -> str:
+    return (
+        "Test cases moved to the Done Testing channel." if result.get("moved")
+        else "Test cases left in place (no Done Testing channel configured)."
+    )
+
+
+def _linked_item_hint(linked_item: Optional[Dict[str, Any]]) -> str:
+    if linked_item is None:
+        return ""
+    return (
+        f"Linked item #{linked_item['item_number']:04d} is still '{linked_item['status']}' — "
+        f"call tracker_set_status({linked_item['item_number']}, 'done') if you want to mark it done too."
+    )
 
 
 # ---------------------------------------------------------------------------
