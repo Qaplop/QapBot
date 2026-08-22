@@ -139,6 +139,68 @@ between `[PHASE-1] Starting parallel API fetches` and `[PHASE-1] All API fetches
 always this fallback (or the private-warlog one next to it) — they are inside `fetch_clan_war_data`,
 not a separate CWL job.
 
+### The `cwl_ended` sweep — fixed 2026-08-22 (tracker #0017)
+
+`sweep_cwl_ended_flags()` (`QBhelperfunctions.py`) now runs once per update cycle from `main()`,
+giving the flag the periodic writer it never had. It is placed **before** the Discord-health
+early-return: it is pure DB work with no Discord I/O, so it must keep running during an outage.
+
+**Two conditions, either one marks a group ended:**
+
+1. `cwl_group_all_rounds_ended()` — every clan in the group has played its `n-1` rounds. Extracted
+   from `update_cwl_group_stats()` so the sweep and the on-demand path can never disagree about
+   what "finished" means (Cardinal Rule 4).
+2. `cwl_season_window_closed()` (`qapbot/constants.py`) — the season's war window is definitively
+   over, i.e. `now >= season_start + CWL_SEASON_WINDOW_DAYS` (14). Handles both season-key shapes
+   `normalize_cwl_season()` can produce, since both mean "start of the CWL": `YYYY-MM` starts at
+   the 1st, `YYYY-MM-DD` starts on that date. An empty or unparseable key is never treated as
+   closed — marking a season ended suppresses live CWL detection for every clan in it.
+
+Condition 2 is **not** redundant. Measured on real 2026-08-22 data (1,500-group samples), only
+~55% of groups can EVER satisfy condition 1: the other ~45% contain clans — typically 6 to 8 of 8
+— with no recorded wars at all, because they are group-mates harvested from a subscribed clan's
+group whose own wars nobody fetches. Those are precisely the groups still driving redundant
+`get_league_war()` walks, and no amount of waiting completes their data. Condition 1 alone would
+have fixed a bit over half the problem.
+
+Grounding for the 14-day figure, from `war_summary`: regular CWL ran day 2 → day 10-11 of the
+month across 2026-05..2026-08; the one bonus season present (`2026-06-15`) ran key+2 → key+11. The
+only later rows in ~1M CWL war rows were 5 stragglers tagged `2026-07` landing 2026-08-04..06 —
+noise, not a tail.
+
+**It does not freeze any standings.** The sweep writes the flag ONLY, through
+`mark_cwl_groups_ended_sync()`, never `group_rank`/`total_stars`/`total_destruction`. That matters
+because `update_cwl_group_stats()`'s freeze short-circuit requires `cwl_ended` **AND** non-NULL
+stored stats — so a group the sweep marks with no stats still recomputes its standings live on the
+next render. The flag suppresses the redundant walks (the point) without freezing numbers that
+were not already frozen. This is structural, not incidental; `test_sweep_never_writes_standings`
+pins it down.
+
+**Batching and the rotating cursor.** 5 sequential batches of 500 groups per cycle
+(`CWL_ENDED_SWEEP_BATCHES_PER_CYCLE` / `CWL_ENDED_SWEEP_BATCH_SIZE`), each its own
+`asyncio.to_thread()` hop (Pitfall 26) with an await between them so the gateway heartbeat
+breathes — deliberately **not** concurrent, which would put several sqlite writers on one file for
+work that is index-seek bound anyway.
+
+`find_unended_cwl_groups_page_sync()` uses a **keyset** cursor ordered by
+`(league_group_id, cwl_season)` — matching `idx_cwl_league_groups_id`'s own column order. Ordering
+by `(cwl_season, league_group_id)` instead, the more natural-looking choice, degrades the page
+query to a full SCAN plus a TEMP B-TREE: measured 1.28 s vs 0.036 s for five 500-group pages, a
+35x difference. Keyset also keeps a deep cursor as cheap as a shallow one, which OFFSET would not.
+
+The cursor **must** rotate, and wraps to the start on a short page. Because ~45% of groups can
+never satisfy condition 1, a query that always returned "the first N unended groups" would
+re-check that same stuck residue every cycle and never reach the rest. (Once condition 2 has swept
+the historical backlog the residue mostly clears, but the rotation is still needed for the
+transition and for genuinely-incomplete current groups.)
+
+Cost, measured against the real PROD-sized DB: the per-group `war_summary` aggregate is ~0.8 ms,
+and it is **skipped entirely** when condition 2 already decides the outcome — so burning down a
+historical backlog is nearly free (~0.04 s/cycle, dominated by paging). `get_cwl_group_war_stats()`
+was also collapsed from two queries to one (they differed only in the aggregate over an identical
+WHERE/GROUP BY), with `get_cwl_group_war_stats_sync()` as its deliberately-identical sync twin for
+the sweep's to_thread batches.
+
 ## Error Handling
 
 ### Exception Hierarchy

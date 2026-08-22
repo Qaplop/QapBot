@@ -1,6 +1,26 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (27)
+- Fixed: CWL league groups are now marked cwl_ended=1 by a periodic sweep, ending the redundant
+  mid-month get_league_war() re-walks of finished groups (ticket #0017, option A). The flag
+  previously had exactly one writer (update_cwl_group_stats, reached only from /cwlinfo or a
+  cwlgroup subscription) and no periodic pass, so 8 of 25049 August groups were marked while
+  136707 polled clans kept re-downloading long-finished wars. New sweep_cwl_ended_flags() runs
+  5 sequential asyncio.to_thread batches of 500 groups per update cycle and marks a group on
+  EITHER "every clan played all rounds" OR "the season window is definitively over"
+  (cwl_season_window_closed, start + 14 days). The time-based condition is load-bearing: measured
+  on real data only ~55% of groups can ever satisfy the completeness test, since the rest contain
+  clans whose wars are never fetched. It does NOT freeze standings -- the sweep writes the flag
+  only, and update_cwl_group_stats's freeze needs cwl_ended AND non-null stats, so a swept group
+  still recomputes live. Keyset cursor ordered to match idx_cwl_league_groups_id (35x faster than
+  the natural ordering: 0.036s vs 1.28s per 5 pages) and rotates, since ~45% of groups can never
+  complete and would otherwise be re-checked forever. get_cwl_group_war_stats collapsed from two
+  queries to one. Files: QBhelperfunctions.py, qapbot/db_manager.py, qapbot/constants.py,
+  QapBot.py, qapbot/docs/CLAN_AND_WAR_CYCLE_ARCHITECTURE.md,
+  tests/integration/test_cwl_ended_sweep.py,
+  plans/implemented/tracker-0017-mid-month-cwl-war-fetches.md. 2522 tests pass.
+
 2026-08-22 (26)
 - Fixed: an unanswered CWL enrollment DM is now re-routed when the account changes Discord owner
   (ticket #0019). Previously the old owner could still answer for an account they no longer owned

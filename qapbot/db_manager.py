@@ -8273,38 +8273,209 @@ class WarHistoryDB:
         params: Tuple[Any, ...] = (cwl_season, *clan_tags)
         ws_cols = await self._explicit_column_list("war_summary")
 
+        # One pass, not two (2026-08-22, tracker #0017). This used to run the SUM query and the
+        # COUNT query separately over an identical WHERE/GROUP BY, doubling the work for no
+        # reason. Measured on the real PROD-sized DB: ~1.0 ms/group before, ~0.8 ms/group after.
+        # Kept byte-identical in shape to get_cwl_group_war_stats_sync() below — the two must
+        # never drift, since the sweep and the on-demand path have to agree on completion.
         cursor = await self._conn.execute(
             f"WITH ws AS ("
             f"SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary"
             f") "
             f"SELECT clan_tag, "
             f"  SUM(clan_stars) + SUM(CASE WHEN result = 'win' THEN 10 ELSE 0 END) AS tot_stars, "
-            f"  SUM(clan_destruction * team_size) AS tot_destr "
+            f"  SUM(clan_destruction * team_size) AS tot_destr, "
+            f"  COUNT(*) AS ended_wars "
             f"FROM ws "
             f"WHERE cwl_season = ? AND is_cwl = 1 AND state = 'war_ended' AND clan_tag IN ({placeholders}) "
             f"GROUP BY clan_tag",
             params,
         )
-        stars_map: Dict[str, Tuple[int, float]] = {
-            row["clan_tag"]: (int(row["tot_stars"] or 0), float(row["tot_destr"] or 0.0))
-            for row in await cursor.fetchall()
-        }
-
-        cursor2 = await self._conn.execute(
-            f"WITH ws AS ("
-            f"SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary"
-            f") "
-            f"SELECT clan_tag, COUNT(*) AS ended_wars "
-            f"FROM ws "
-            f"WHERE cwl_season = ? AND is_cwl = 1 AND state = 'war_ended' AND clan_tag IN ({placeholders}) "
-            f"GROUP BY clan_tag",
-            params,
-        )
-        ended_map: Dict[str, int] = {
-            row["clan_tag"]: int(row["ended_wars"] or 0)
-            for row in await cursor2.fetchall()
-        }
+        stars_map: Dict[str, Tuple[int, float]] = {}
+        ended_map: Dict[str, int] = {}
+        for row in await cursor.fetchall():
+            stars_map[row["clan_tag"]] = (int(row["tot_stars"] or 0), float(row["tot_destr"] or 0.0))
+            ended_map[row["clan_tag"]] = int(row["ended_wars"] or 0)
         return stars_map, ended_map
+
+    def get_cwl_group_war_stats_sync(
+        self, cwl_season: str, clan_tags: List[str]
+    ) -> Tuple[Dict[str, Tuple[int, float]], Dict[str, int]]:
+        """Synchronous twin of get_cwl_group_war_stats() above, for tracker #0017's `cwl_ended`
+        sweep — which runs a whole batch of groups inside ONE asyncio.to_thread() hop (Pitfall 26)
+        and so cannot await the aiosqlite version per group.
+
+        Deliberately the same single merged query, not a re-derivation: the sweep and the
+        on-demand path must reach the identical completion verdict for a given group, so if one
+        aggregate ever changes the other has to change with it. Keep the two SQL bodies in step.
+
+        Args:
+            cwl_season: Season key to aggregate over.
+            clan_tags: Every clan in the league group.
+
+        Returns:
+            (stars_map, ended_map) — same shape as the async version. Empty dicts on error, which
+            the sweep reads as "no completed rounds", i.e. it will not mark the group ended on the
+            all_ended test (the time-based test is unaffected).
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not clan_tags:
+            return {}, {}
+
+        with self._sync_conn() as conn:
+            try:
+                ws_cols = self.explicit_column_list_sync(conn, "war_summary")
+                placeholders = ",".join("?" * len(clan_tags))
+                rows = conn.execute(
+                    f"WITH ws AS ("
+                    f"SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary"
+                    f") "
+                    f"SELECT clan_tag, "
+                    f"  SUM(clan_stars) + SUM(CASE WHEN result = 'win' THEN 10 ELSE 0 END) AS tot_stars, "
+                    f"  SUM(clan_destruction * team_size) AS tot_destr, "
+                    f"  COUNT(*) AS ended_wars "
+                    f"FROM ws "
+                    f"WHERE cwl_season = ? AND is_cwl = 1 AND state = 'war_ended' "
+                    f"AND clan_tag IN ({placeholders}) "
+                    f"GROUP BY clan_tag",
+                    (cwl_season, *clan_tags),
+                ).fetchall()
+                stars_map: Dict[str, Tuple[int, float]] = {}
+                ended_map: Dict[str, int] = {}
+                for row in rows:
+                    stars_map[row["clan_tag"]] = (int(row["tot_stars"] or 0), float(row["tot_destr"] or 0.0))
+                    ended_map[row["clan_tag"]] = int(row["ended_wars"] or 0)
+                return stars_map, ended_map
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_cwl_group_war_stats_sync failed for {cwl_season}: {e}")
+                return {}, {}
+
+    def find_unended_cwl_groups_page_sync(
+        self, after_group_id: str, after_season: str, limit: int,
+    ) -> List[Dict[str, Any]]:
+        """One keyset-paginated page of CWL league groups still carrying cwl_ended=0, for tracker
+        #0017's sweep. Returns each group with its full member-clan list, ready for the
+        completion test.
+
+        Keyset (not LIMIT/OFFSET) and ordered by (league_group_id, cwl_season) specifically to
+        match the existing idx_cwl_league_groups_id index's own column order. That turns the page
+        query into a plain index SEARCH; ordering by (cwl_season, league_group_id) instead — the
+        more natural-looking choice — degrades it to a full SCAN plus a TEMP B-TREE and measured
+        35x slower on the real PROD-sized table (1.28s vs 0.036s for five 500-group pages). Keyset
+        paging also keeps a deep cursor as cheap as a shallow one, which OFFSET would not.
+
+        The caller passes the last row of the previous page back in and wraps to ("", "") when a
+        short page comes back. A rotating cursor is required, not optional: ~45% of groups can
+        never satisfy the all_ended test (their members' wars are simply not tracked), so a query
+        that always returned "the first N unended groups" would re-check that same stuck residue
+        forever and never reach the rest.
+
+        Args:
+            after_group_id: Cursor — last league_group_id of the previous page ("" to start).
+            after_season: Cursor — last cwl_season of the previous page ("" to start).
+            limit: Page size.
+
+        Returns:
+            [{league_group_id, cwl_season, clan_tags: [...]}, ...], at most `limit` entries, in
+            cursor order. Empty list on error or at the end of the rotation.
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                page = conn.execute(
+                    """
+                    SELECT DISTINCT league_group_id, cwl_season
+                    FROM cwl_league_groups
+                    WHERE cwl_ended = 0
+                      AND (league_group_id, cwl_season) > (?, ?)
+                    ORDER BY league_group_id, cwl_season
+                    LIMIT ?
+                    """,
+                    (after_group_id, after_season, limit),
+                ).fetchall()
+                if not page:
+                    return []
+
+                wanted = {(r["league_group_id"], r["cwl_season"]) for r in page}
+                placeholders = ",".join("?" * len(page))
+                members = conn.execute(
+                    f"SELECT league_group_id, cwl_season, clan_tag FROM cwl_league_groups "
+                    f"WHERE cwl_ended = 0 AND league_group_id IN ({placeholders})",
+                    [r["league_group_id"] for r in page],
+                ).fetchall()
+
+                by_group: Dict[Tuple[str, str], List[str]] = {}
+                for row in members:
+                    key = (row["league_group_id"], row["cwl_season"])
+                    # The IN() above is keyed on league_group_id alone (that is what the index
+                    # covers); a group id reused across seasons would drag in the wrong season's
+                    # rows, so re-check the full pair here.
+                    if key in wanted:
+                        by_group.setdefault(key, []).append(row["clan_tag"])
+
+                return [
+                    {
+                        "league_group_id": r["league_group_id"],
+                        "cwl_season": r["cwl_season"],
+                        "clan_tags": by_group.get((r["league_group_id"], r["cwl_season"]), []),
+                    }
+                    for r in page
+                ]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] find_unended_cwl_groups_page_sync failed: {e}")
+                return []
+
+    def mark_cwl_groups_ended_sync(self, groups: List[Tuple[str, str]]) -> int:
+        """Set cwl_ended=1 for whole league groups — and touch NOTHING else (2026-08-22, tracker
+        #0017).
+
+        Deliberately separate from update_cwl_group_stats_batch(), which writes the flag together
+        with group_rank/total_stars/total_destruction. The sweep must not write standings: for the
+        ~45% of groups whose members' wars are not tracked, the computed standings are all zeros,
+        and persisting those as final numbers would be worse than leaving them NULL.
+
+        Leaving them NULL is in fact load-bearing. update_cwl_group_stats()'s freeze short-circuit
+        is `if cwl_ended and all(total_stars is not None)` — so a group this sweep marks ended
+        without stored stats still gets its standings recomputed live on the next /cwlinfo render.
+        Setting the flag alone therefore suppresses the redundant get_league_war() walks (which is
+        the whole point) WITHOUT freezing any standings that were not already frozen.
+
+        Args:
+            groups: (league_group_id, cwl_season) pairs to mark.
+
+        Returns:
+            Number of rows updated (clans, not groups), 0 on error or empty input.
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not groups:
+            return 0
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    cursor = conn.executemany(
+                        "UPDATE cwl_league_groups SET cwl_ended = 1 "
+                        "WHERE league_group_id = ? AND cwl_season = ? AND cwl_ended = 0",
+                        groups,
+                    )
+                    updated = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+                    if self._should_commit():
+                        conn.commit()
+                return updated
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] mark_cwl_groups_ended_sync failed: {e}")
+                conn.rollback()
+                return 0
 
     async def update_cwl_group_stats_batch(
         self,

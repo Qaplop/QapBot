@@ -1866,6 +1866,24 @@ async def main() -> None:
             f"CoC API calls: {coc_stats['cycle_total_calls']}"
         )
     
+    # Mark finished CWL league groups as cwl_ended=1 (2026-08-22, tracker #0017). That flag is
+    # what stops _find_active_cwl_war_for_clan() re-walking a finished group's war tags on every
+    # notInWar clan; before this it had no periodic writer at all, so 136,707 polled clans sat at
+    # cwl_ended=0 re-downloading long-finished CWL wars. Deliberately BEFORE the Discord-health
+    # return below — this is pure DB work with no Discord I/O, so it must keep running during an
+    # outage. 5 sequential to_thread batches of 500; see the function's docstring.
+    try:
+        from QBhelperfunctions import sweep_cwl_ended_flags
+        _sweep = await sweep_cwl_ended_flags()
+        if _sweep["marked"]:
+            logging.info(
+                f"[CWL-ENDED-SWEEP] Marked {_sweep['marked']} league group(s) as ended "
+                f"({_sweep['checked']} checked across {_sweep['batches_run']} batch(es)"
+                f"{', rotation wrapped' if _sweep['wrapped'] else ''})"
+            )
+    except Exception as e:
+        logging.error(f"Error in CWL ended-flag sweep: {e}")
+
     # Check for war notifications (send DM reminders to players)
     try:
         from qapbot.war_notifications import check_wars_for_notifications

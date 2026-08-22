@@ -331,3 +331,58 @@ def normalize_cwl_season(raw: str) -> str:
         monday = dt - timedelta(days=dt.weekday())  # weekday(): Mon=0 … Sun=6
         return monday.isoformat()
     return raw
+
+
+# Days after a CWL season's start key beyond which that season's war window is definitively
+# over (2026-08-22, tracker #0017). Measured against real war_summary data:
+#   regular CWL "YYYY-MM"   → wars ran day 2 .. day 10-11 of the month
+#   bonus  CWL "YYYY-MM-DD" → wars ran key+2 .. key+11 (observed: 2026-06-15 → 06-17..06-26)
+# so 14 days clears the last real war of both shapes by 3-4 days. The only later rows found in
+# ~1M CWL war_summary rows were 5 stragglers tagged 2026-07 that landed 2026-08-04..06 — noise,
+# not a tail.
+CWL_SEASON_WINDOW_DAYS = 14
+
+
+def cwl_season_window_closed(cwl_season: str, now: object = None) -> bool:
+    """True when *cwl_season*'s CWL war window is definitively over, so no clan in that season
+    can still have an active league war.
+
+    Added for tracker #0017's `cwl_ended` sweep. The sweep's other test — "every clan in the
+    group has played all its rounds" — can only ever be satisfied for a group whose members we
+    actually track: measured on real data, ~45% of groups have 6-8 of their 8 clans with no
+    recorded wars at all (they are group-mates harvested from a subscribed clan's group, whose
+    own wars nobody ever fetches). Those groups would stay unended forever, which is exactly the
+    population still doing redundant get_league_war() walks. This is the time-based answer to the
+    same question, and it resolves 100% of groups rather than ~55%.
+
+    Both season-key shapes normalize_cwl_season() can produce are handled, and both mean "start
+    of the CWL", so one rule covers them:
+      - "YYYY-MM"     → regular monthly CWL, window starts at the 1st of that month
+      - "YYYY-MM-DD"  → mid-month bonus CWL, window starts on that date
+
+    Args:
+        cwl_season: A season key as stored in cwl_league_groups.cwl_season.
+        now: Optional datetime to evaluate against (tests); defaults to the current UTC time.
+
+    Returns:
+        True if the window closed at least CWL_SEASON_WINDOW_DAYS ago. False for an empty or
+        unparseable key — never guess a season is over on a value we don't understand, since
+        marking it ended suppresses live CWL detection for every clan in it.
+    """
+    from datetime import date, datetime, timedelta, timezone
+
+    if not cwl_season:
+        return False
+    parts = cwl_season.split("-")
+    try:
+        if len(parts) == 2:
+            start = date(int(parts[0]), int(parts[1]), 1)
+        elif len(parts) == 3:
+            start = date.fromisoformat(cwl_season)
+        else:
+            return False
+    except ValueError:
+        return False
+
+    reference = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    return reference.date() >= start + timedelta(days=CWL_SEASON_WINDOW_DAYS)

@@ -2825,6 +2825,181 @@ async def _apply_cwl_self_heal(
     return healed
 
 
+def cwl_group_all_rounds_ended(clan_tags: List[str], ended_wars: Dict[str, int]) -> bool:
+    """Has every clan in this league group played out all of its CWL rounds?
+
+    Standard CWL formula: n clans → n-1 rounds (works for short groups too). Extracted from
+    update_cwl_group_stats() on 2026-08-22 (tracker #0017) so the on-demand path and the
+    `cwl_ended` sweep can never disagree about what "the season finished" means — the sweep marks
+    a group ended for real, and a second, subtly-different copy of this test is exactly the kind
+    of near-duplicate Cardinal Rule 4 exists to prevent.
+
+    Args:
+        clan_tags: Every clan in the league group.
+        ended_wars: {clan_tag: count of that clan's war_ended CWL wars this season}, as returned
+            by get_cwl_group_war_stats()/get_cwl_group_war_stats_sync(). A clan absent from the
+            dict has played zero.
+
+    Returns:
+        True only when every clan has reached the expected round count. False for an empty group.
+
+    Note:
+        Measured on real PROD data (2026-08-22), only ~55% of groups can EVER satisfy this: the
+        rest contain clans whose wars are not tracked at all (group-mates harvested from a
+        subscribed clan's group), so their counts stay at zero permanently. That is why the sweep
+        pairs this with a time-based test — see constants.cwl_season_window_closed().
+    """
+    if not clan_tags:
+        return False
+    expected_rounds = max(len(clan_tags) - 1, 1)
+    return all(ended_wars.get(ct, 0) >= expected_rounds for ct in clan_tags)
+
+
+
+# ---------------------------------------------------------------------------
+# cwl_ended sweep (2026-08-22, tracker #0017)
+# ---------------------------------------------------------------------------
+
+# Rotating keyset cursor over cwl_league_groups, carried between cycles. Module-level rather than
+# persisted: the candidate query only ever returns groups still at cwl_ended=0, so a restart
+# simply resumes from the top of whatever is still unended — no work is lost or repeated
+# meaningfully, and the sweep is idempotent either way (Cardinal Rule 12).
+_cwl_ended_sweep_cursor: Tuple[str, str] = ("", "")
+
+# One asyncio.to_thread() hop per batch, this many batches per update cycle (project owner's
+# spec, 2026-08-22). Sequential with an await between batches, NOT concurrent — see
+# sweep_cwl_ended_flags()'s docstring.
+CWL_ENDED_SWEEP_BATCH_SIZE = 500
+CWL_ENDED_SWEEP_BATCHES_PER_CYCLE = 5
+
+
+def _sweep_cwl_ended_batch_sync(after_group_id: str, after_season: str, limit: int) -> Dict[str, Any]:
+    """One batch of the cwl_ended sweep, start to finish, with no await anywhere inside — the
+    whole thing is one asyncio.to_thread() hop (Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md). Doing
+    it call-by-call instead would open an interleaving window per group on a path that touches
+    thousands of them per cycle.
+
+    Returns {"marked", "checked", "cursor", "exhausted"}.
+    """
+    from qapbot.constants import cwl_season_window_closed
+
+    db = CACHE.db_manager
+    result: Dict[str, Any] = {
+        "marked": 0, "checked": 0, "cursor": (after_group_id, after_season), "exhausted": True,
+    }
+    if db is None:
+        return result
+
+    page = db.find_unended_cwl_groups_page_sync(after_group_id, after_season, limit)
+    if not page:
+        return result
+
+    result["checked"] = len(page)
+    result["cursor"] = (page[-1]["league_group_id"], page[-1]["cwl_season"])
+    # A short page means the rotation reached the end — the caller wraps back to ("", "").
+    result["exhausted"] = len(page) < limit
+
+    to_mark: List[Tuple[str, str]] = []
+    for group in page:
+        season = group["cwl_season"]
+        clan_tags = group["clan_tags"]
+        if not clan_tags:
+            continue
+        # Time test first, and short-circuit: once the window is closed the answer is already
+        # decided, so the per-group war_summary aggregate (~0.8 ms) is pure waste. This is what
+        # makes burning down the historical backlog nearly free — every season older than
+        # CWL_SEASON_WINDOW_DAYS skips the query entirely.
+        if cwl_season_window_closed(season):
+            to_mark.append((group["league_group_id"], season))
+            continue
+        # Still inside the window: the group can only be marked if it genuinely finished every
+        # round. Same test the on-demand path uses (shared helper), so the two cannot disagree.
+        _stars, ended_wars = db.get_cwl_group_war_stats_sync(season, clan_tags)
+        if cwl_group_all_rounds_ended(clan_tags, ended_wars):
+            to_mark.append((group["league_group_id"], season))
+
+    if to_mark:
+        db.mark_cwl_groups_ended_sync(to_mark)
+        result["marked"] = len(to_mark)
+    return result
+
+
+async def sweep_cwl_ended_flags(
+    batches: int = CWL_ENDED_SWEEP_BATCHES_PER_CYCLE,
+    batch_size: int = CWL_ENDED_SWEEP_BATCH_SIZE,
+) -> Dict[str, int]:
+    """Mark finished CWL league groups as `cwl_ended=1` (2026-08-22, tracker #0017).
+
+    THE BUG THIS FIXES. `cwl_ended` gates `is_latest_cwl_season_ended_sync()`, which is what stops
+    `_find_active_cwl_war_for_clan()` re-walking a finished league group's war tags on every
+    notInWar clan, forever. But the flag had exactly one writer — `update_cwl_group_stats()`,
+    reached only from a `/cwlinfo` render or a `cwlgroup` subscription — and no periodic pass at
+    all. Measured on the 2026-08-22 PROD data: 8 of 25,049 August groups were marked ended, and
+    136,707 polled clans were sitting at cwl_ended=0, each one re-downloading long-finished CWL
+    wars whenever the caches lapsed.
+
+    TWO CONDITIONS, EITHER ONE MARKS THE GROUP:
+      1. every clan played all its rounds (`cwl_group_all_rounds_ended`) — the pre-existing test,
+         which fires as soon as a tracked group genuinely completes; and
+      2. the season's war window is definitively over (`cwl_season_window_closed`).
+    (2) is not redundant with (1): measured on real data, only ~55% of groups can EVER satisfy
+    (1), because the other ~45% contain clans (6-8 of 8, typically) whose wars nobody fetches —
+    they are group-mates harvested from a subscribed clan's group. Those are precisely the groups
+    still doing redundant walks, and no amount of waiting completes their data.
+
+    WHY THIS DOES NOT FREEZE ANY STANDINGS. The sweep writes the flag ONLY, via
+    `mark_cwl_groups_ended_sync()` — never group_rank/total_stars/total_destruction.
+    `update_cwl_group_stats()`'s freeze short-circuit requires `cwl_ended` AND non-NULL stored
+    stats, so a group marked here with no stats still recomputes its standings live on the next
+    render. That was the project owner's stated concern about option A, and it is structurally
+    avoided rather than merely unlikely.
+
+    BATCHES ARE SEQUENTIAL, NOT CONCURRENT. `batches` separate to_thread hops run one after
+    another with an await between them, so the event loop (and the Discord gateway heartbeat)
+    breathes between chunks instead of being handed one long blocking call. Firing them
+    concurrently would put several sqlite writers on the same file and invite `database is
+    locked`; the work is index-seek bound, so there is little to win from it anyway.
+
+    Args:
+        batches: How many pages to process this cycle.
+        batch_size: Groups per page.
+
+    Returns:
+        {"checked", "marked", "batches_run", "wrapped"} for the cycle log. Never raises — this
+        runs inside the main update cycle and must never break it.
+    """
+    global _cwl_ended_sweep_cursor
+
+    totals = {"checked": 0, "marked": 0, "batches_run": 0, "wrapped": 0}
+    if CACHE.db_manager is None:
+        return totals
+
+    for _ in range(max(1, batches)):
+        after_group_id, after_season = _cwl_ended_sweep_cursor
+        try:
+            batch = await asyncio.to_thread(
+                _sweep_cwl_ended_batch_sync, after_group_id, after_season, batch_size
+            )
+        except Exception as e:
+            logging.error(f"[CWL-ENDED-SWEEP] Batch failed at cursor {after_group_id!r}: {e}")
+            break
+
+        totals["checked"] += batch["checked"]
+        totals["marked"] += batch["marked"]
+        totals["batches_run"] += 1
+
+        if batch["exhausted"]:
+            # End of the rotation — wrap so the next cycle re-walks whatever is still unended
+            # (the ~45% that can never complete, plus anything new). Stop here rather than
+            # immediately re-walking from the top within the same cycle.
+            _cwl_ended_sweep_cursor = ("", "")
+            totals["wrapped"] = 1
+            break
+        _cwl_ended_sweep_cursor = batch["cursor"]
+
+    return totals
+
+
 async def update_cwl_group_stats(
     clan_tag: str,
     cwl_season: Optional[str] = None,
@@ -2935,9 +3110,7 @@ async def update_cwl_group_stats(
         })
 
     # ── 7. Check season completion (all clans × their group's round count ended) ─
-    # Standard CWL formula: n clans → n-1 rounds (works for short groups too).
-    expected_rounds = max(len(clan_tags) - 1, 1)
-    all_ended = len(clan_tags) > 0 and all(ended_wars.get(ct, 0) >= expected_rounds for ct in clan_tags)
+    all_ended = cwl_group_all_rounds_ended(clan_tags, ended_wars)
 
     # ── 8. Persist to DB (only changed rows) ─────────────────────────────────
     n_updated = await db.update_cwl_group_stats_batch(cwl_season, group_id, clan_stats, all_ended)
