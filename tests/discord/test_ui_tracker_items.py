@@ -27,6 +27,7 @@ from qapbot.ui_tracker import (
     build_tracker_embed,
     create_tracker_item_for_agent,
     finalize_testcases_move,
+    get_thread_messages,
     handle_tracker_test_reaction,
     handle_tracker_upload_message,
     mark_environment_passed_and_refresh,
@@ -697,6 +698,52 @@ async def test_reaction_marks_all_pending_environments_passed(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reaction_on_already_passed_archived_item_is_a_true_noop(db, monkeypatch):
+    """2026-08-22 live bug report: reacting with a redundant second 👍 on a message that was
+    already fully passed AND already archived to the Done Testing channel resurrected its
+    Pass/Fail/Move-to-Done buttons. Nothing is pending, so this must not touch the message at
+    all -- not even a content-only edit."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_DONE_TESTING_CHANNEL] = "60"
+    message = _fake_message(message_id=600)
+    channel = _fake_channel(fetch_message=message)
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "x"}])
+    await db.mark_tracker_environment_passed(item_number, "PROD", "1")
+    await db.update_tracker_item(item_number, test_channel_id="60", test_message_id="600", status="testing")
+
+    await handle_tracker_test_reaction(_fake_payload(message_id=600))
+
+    message.edit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_testcase_message_strips_view_once_archived(db, monkeypatch):
+    """_move_test_message_to_done_testing_channel() reposts the archived message with no view=
+    for a reason (nothing left to sign off) -- any LATER refresh of that same message (e.g. one
+    triggered by a redundant 👍, or by mark_testing_failed on a different item entirely) must not
+    undo that by reattaching a fresh interactive view. Exercises _refresh_testcase_message
+    directly so the assertion holds regardless of which caller invokes it."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_tracker import _refresh_testcase_message
+
+    CACHE.tracker_settings[TRACKER_SETTING_DONE_TESTING_CHANNEL] = "60"
+    message = _fake_message(message_id=600)
+    channel = _fake_channel(fetch_message=message)
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "x"}])
+    await db.mark_tracker_environment_passed(item_number, "PROD", "1")
+    await db.update_tracker_item(item_number, test_channel_id="60", test_message_id="600", status="testing")
+
+    await _refresh_testcase_message(item_number)
+
+    message.edit.assert_awaited_once()
+    assert message.edit.call_args.kwargs["view"] is None
+
+
+@pytest.mark.asyncio
 async def test_reaction_from_non_admin_is_ignored(db, monkeypatch):
     _wire_bot(monkeypatch, channel=None)
     item_number = await _make_item(db)
@@ -727,6 +774,80 @@ async def test_reaction_on_unknown_message_is_a_noop(db, monkeypatch):
     _wire_bot(monkeypatch, channel=None)
     # No item has test_message_id=999 — should not raise.
     await handle_tracker_test_reaction(_fake_payload(message_id=42424242))
+
+
+# -- get_thread_messages (2026-08-22: tracker_comment could only WRITE into the discussion ------
+# -- thread; this is the read side, previously missing entirely) --------------------------------
+
+def _fake_thread_message(author_id, author_name, content, is_bot=False):
+    import datetime
+
+    message = MagicMock()
+    message.author = MagicMock(id=author_id, display_name=author_name, bot=is_bot)
+    message.content = content
+    message.created_at = datetime.datetime(2026, 8, 22, 10, 0, 0, tzinfo=datetime.timezone.utc)
+    return message
+
+
+def _fake_thread_with_history(messages):
+    """AsyncMock's default mocking of `.history` would make it an awaitable returning a plain
+    value, not an async iterator `async for` can consume -- Discord's real history() is the
+    latter. Wired explicitly as a plain callable returning an async generator."""
+    async def _history(limit=50):
+        for m in messages:
+            yield m
+
+    thread = AsyncMock()
+    thread.history = _history
+    return thread
+
+
+@pytest.mark.asyncio
+async def test_get_thread_messages_reverses_to_chronological_order(db, monkeypatch):
+    # Discord's history() yields newest-first; get_thread_messages must reverse it.
+    newest = _fake_thread_message("1", "Qaplop", "any update?")
+    oldest = _fake_thread_message("2", "QapBot", "filed as #0016", is_bot=True)
+    thread = _fake_thread_with_history([newest, oldest])
+    _wire_bot(monkeypatch, channel=thread)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, thread_id="777")
+
+    messages = await get_thread_messages(item_number)
+
+    assert [m["content"] for m in messages] == ["filed as #0016", "any update?"]
+    assert messages[0]["is_bot"] is True
+    assert messages[1]["author_name"] == "Qaplop"
+    assert messages[1]["author_id"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_get_thread_messages_on_item_with_no_thread_returns_empty(db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)  # no thread_id set
+
+    assert await get_thread_messages(item_number) == []
+
+
+@pytest.mark.asyncio
+async def test_get_thread_messages_on_unresolvable_channel_returns_empty(db, monkeypatch):
+    """Deleted/inaccessible thread -- must degrade to empty, not raise (matches post_comment's
+    sibling tolerance for other "missing optional Discord object" cases in this module)."""
+    import QBcore
+    bot = MagicMock()
+    bot.get_channel = MagicMock(return_value=None)
+    bot.fetch_channel = AsyncMock(side_effect=discord.NotFound(MagicMock(status=404), "unknown channel"))
+    monkeypatch.setattr(QBcore, "bot", bot)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, thread_id="777")
+
+    assert await get_thread_messages(item_number) == []
+
+
+@pytest.mark.asyncio
+async def test_get_thread_messages_on_unknown_item_raises(db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    with pytest.raises(ValueError):
+        await get_thread_messages(99999)
 
 
 # -- upload window ---------------------------------------------------------

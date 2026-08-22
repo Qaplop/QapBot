@@ -82,6 +82,10 @@ class TrackerBridgeClient:
     async def comment(self, item_number: int, text: str) -> Dict[str, Any]:
         return await self._post(f"/api/tracker/items/{item_number}/comment", {"text": text})
 
+    async def get_thread(self, item_number: int, limit: int = 50) -> List[Dict[str, Any]]:
+        body = await self._get(f"/api/tracker/items/{item_number}/thread", params={"limit": str(limit)})
+        return body["messages"]
+
     async def add_testcases(self, item_number: int, cases: List[Dict[str, str]]) -> Dict[str, Any]:
         return await self._post(f"/api/tracker/items/{item_number}/testcases", {"cases": cases})
 

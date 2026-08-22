@@ -86,7 +86,12 @@ independent objects that only ever move on their OWN trigger:
   unchecked — it asks for confirmation first (`ConfirmForceMoveView` / the bridge's
   `needs_confirmation`/`unchecked_count` response, force-able with `{"force": true}`) — and
   never silently marks the remaining cases passed; they stay visibly unchecked in the archived
-  message.
+  message. `_refresh_testcase_message()` (any later in-place refresh of that same message) checks
+  whether `test_channel_id` already equals the configured Done Testing channel and, if so, passes
+  `view=None` instead of rebuilding the interactive Pass/Fail/Move-to-Done view — mirroring
+  `_refresh_item_message()`'s own `archived` handling for the item embed. Without this a later
+  refresh (e.g. a redundant 👍 on an already-fully-passed message) would resurrect the buttons on
+  a message that was deliberately stripped (2026-08-22 live bug report).
 - Whenever a test-case set just finished (naturally or via the forced manual move),
   `get_linked_item_if_eligible_for_done()` checks whether the linked item is still open (not
   already `done`/`rejected`/`duplicate`) and, if so, offers a "mark item done too?" prompt:
@@ -130,7 +135,9 @@ otherwise becomes unreachable once its parent message is deleted). See
   short-lived, session-scoped Yes/No prompts (not restart-safe by design, same convention as
   `TrackerDraftView`) used by the decoupled done-linkage flow above.
 - The 👍-reaction sign-off shortcut is a **new** `on_raw_reaction_add` listener in `QapBot.py`
-  (the bot had none before) — bot-admin only, raw (not cached) so it survives restarts.
+  (the bot had none before) — bot-admin only, raw (not cached) so it survives restarts. A
+  redundant reaction with nothing left pending is a true no-op (returns before touching the
+  message at all — see `_refresh_testcase_message()`'s archived handling above).
 
 ## Agent integration
 
@@ -146,6 +153,7 @@ GET  /api/tracker/items?status=&type=&limit=
 POST /api/tracker/items                {item_type, title, description, details?, environment?, priority?}
 GET  /api/tracker/items/{n}
 GET  /api/tracker/items/{n}/attachments/{aid}
+GET  /api/tracker/items/{n}/thread?limit=
 POST /api/tracker/items/{n}/status     {status, note}
 POST /api/tracker/items/{n}/comment    {text}
 POST /api/tracker/items/{n}/testcases  {cases: [{environment, description, priority?}]}
@@ -156,9 +164,9 @@ POST /api/tracker/items/{n}/testcases/move-done  {force?}
 
 All handlers delegate the actual DB+Discord work to `qapbot/ui_tracker.py`
 (`create_tracker_item_for_agent()` / `apply_status_change()` / `post_comment()` /
-`post_test_cases()` / `mark_environment_passed_and_refresh()` / `mark_testing_failed()` /
-`finalize_testcases_move()`) — there is exactly one place each of those things happens, whether
-triggered from Discord or from an agent.
+`get_thread_messages()` / `post_test_cases()` / `mark_environment_passed_and_refresh()` /
+`mark_testing_failed()` / `finalize_testcases_move()`) — there is exactly one place each of those
+things happens, whether triggered from Discord or from an agent.
 
 ### MCP server (`qapbot/mcp/tracker_mcp.py`)
 
@@ -167,10 +175,25 @@ and `.vscode/mcp.json` (VS Code Copilot Chat). Hand-rolled JSON-RPC 2.0 — the 
 package is **not** a project dependency; the wire surface needed (`initialize`, `tools/list`,
 `tools/call`) is small enough that adding a new dependency wasn't worth it.
 
-Eight tools: `tracker_list_items`, `tracker_get_item`, `tracker_create_item`, `tracker_set_status`,
-`tracker_comment`, `tracker_add_testcases`, `tracker_mark_testcase_passed`,
-`tracker_mark_testcase_failed`, `tracker_move_testcases_done`. All but the first two write
-something — no filesystem/shell/git/deploy tool is exposed here (plan §6.6).
+Ten tools: `tracker_list_items`, `tracker_get_item`, `tracker_get_thread`, `tracker_create_item`,
+`tracker_set_status`, `tracker_comment`, `tracker_add_testcases`, `tracker_mark_testcase_passed`,
+`tracker_mark_testcase_failed`, `tracker_move_testcases_done`. Only the first three are read-only
+— no filesystem/shell/git/deploy tool is exposed here (plan §6.6).
+
+`tracker_get_thread` (2026-08-22) closes a one-way gap: `tracker_comment` could only ever WRITE
+into an item's Discord discussion thread — there was no way for an agent to read a human's
+replies, clarifications, or the automated notes (test-fail notes, other comments) already posted
+there. Backed by a new `get_thread_messages()` in `ui_tracker.py`, which resolves the thread the
+same way `post_comment()` already does and calls `Thread.history()`, reversed into chronological
+(oldest-first) order. Returns `[]` rather than raising when the item simply has no thread yet
+(best-effort thread creation in `_post_tracker_item()` can fail) — only an unknown `item_number`
+raises. Since `_post_tracker_item()` seeds the thread with the item's own untruncated
+title/description/details as its first message(s) (the embed-overflow strategy, §2.3), this tool
+doubles as a way to read a long report that `tracker_get_item`'s embed truncated. Thread content
+goes through the same `sanitize_field()`/`wrap_untrusted()` treatment as every other
+reporter-supplied field — arbitrary Discord-user chat is exactly as untrusted as a report's
+description/details field, just free-form rather than one structured value, so the whole
+transcript is wrapped as a single block instead of per-message.
 
 `tracker_create_item` (tracker item #0015, 2026-08-22) lets an agent file a new bug/feature
 directly instead of asking a human to run `/bug`/`/feature` — it posts to the same reports

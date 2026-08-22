@@ -1,6 +1,36 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (18)
+- Added: `tracker_get_thread` MCP tool + `GET /api/tracker/items/{n}/thread?limit=` bridge
+  endpoint, closing a one-way gap -- `tracker_comment` could only ever WRITE into a tracker
+  item's Discord discussion thread, with no way for an agent to read a human's replies,
+  clarifications, or the automated notes (test-fail notes, other comments) already posted there.
+  New `get_thread_messages()` in qapbot/ui_tracker.py resolves the thread the same way
+  `post_comment()` already does and calls `Thread.history()`, reversed into chronological
+  (oldest-first) order; returns `[]` for an item with no thread yet rather than raising (only an
+  unknown item_number does). Since `_post_tracker_item()` seeds the thread with the item's own
+  untruncated title/description/details as its first message(s), this also doubles as a way to
+  read a long report that `tracker_get_item`'s embed truncated. Thread content goes through the
+  same sanitize_field()/wrap_untrusted() untrusted-data envelope as every other reporter-supplied
+  field. MCP surface now 10 tools (7 write, 3 read). Files: qapbot/ui_tracker.py,
+  qapbot/web_bridge.py, qapbot/mcp/tracker_bridge_client.py, qapbot/mcp/tracker_mcp.py,
+  qapbot/docs/BUG_FEATURE_TRACKER.md, tests/discord/test_ui_tracker_items.py,
+  tests/integration/test_web_bridge_tracker.py, tests/unit/test_tracker_mcp.py. 2457 tests pass.
+
+2026-08-22 (17)
+- Fixed: reacting with a redundant second (thumbs-up) on a CWL tracker test-case message that was
+  already fully passed and already archived to the Done Testing channel resurrected its
+  Pass/Fail/Move-to-Done buttons -- live bug report right after the #0016 button-strip fix shipped.
+  `_refresh_testcase_message()` unconditionally rebuilt a fresh interactive view on every call,
+  never checking whether the message had already been reposted (view-less, on purpose) to the Done
+  Testing channel; the reaction handler also called it even when nothing was actually pending.
+  Now mirrors `_refresh_item_message()`'s existing `archived` handling for the item embed:
+  `view=None` once `test_channel_id` matches the configured Done Testing channel, and the
+  reaction handler returns before touching the message at all when there are no pending
+  environments left to sign off. Files: qapbot/ui_tracker.py,
+  tests/discord/test_ui_tracker_items.py. 2446 tests pass.
+
 2026-08-22 (16)
 - Fixed/Added: two CWL enrollment follow-ups from live-testing feedback on the #0016 fix.
   (1) "Notify New Pool Members" DMed a player ("Daniel") with NO linked Discord account at all,

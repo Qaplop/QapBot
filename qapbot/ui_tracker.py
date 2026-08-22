@@ -1171,6 +1171,54 @@ async def post_comment(item_number: int, text: str, author_id: str) -> None:
     await thread.send(message)  # type: ignore[union-attr]
 
 
+async def get_thread_messages(item_number: int, limit: int = 50) -> List[Dict[str, Any]]:
+    """Fetch an item's discussion thread history, oldest first (2026-08-22 — until now
+    `post_comment`/`tracker_comment` could only WRITE into the thread; nothing ever read it back,
+    so an agent had no way to see a human's replies, clarifications, or the fail-note the testing
+    loop posts there). `_post_tracker_item` seeds the thread with the item's own untruncated
+    title/description/details as its very first message(s) (plan §2.3's embed-overflow strategy),
+    so this also doubles as a way to read a long report the item embed itself truncated.
+
+    Returns [] rather than raising when the item simply has no thread yet -- best-effort thread
+    creation in _post_tracker_item can fail, or the item predates the thread feature -- matching
+    the rest of this module's "missing optional Discord object" tolerance. Raises ValueError only
+    when item_number itself doesn't exist, mirroring post_comment/apply_status_change.
+    """
+    from qapbot.cache_manager import CACHE
+    import QBcore
+
+    item = await CACHE.db_manager.get_tracker_item(item_number)
+    if item is None:
+        raise ValueError(f"tracker item #{item_number} not found")
+    if not item.get("thread_id"):
+        return []
+
+    thread = QBcore.bot.get_channel(int(item["thread_id"]))
+    if thread is None:
+        try:
+            thread = await QBcore.bot.fetch_channel(int(item["thread_id"]))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            logging.warning(f"[TRACKER] Could not resolve discussion thread for item #{item_number}: {e}")
+            return []
+
+    try:
+        history = [msg async for msg in thread.history(limit=limit)]  # type: ignore[union-attr]
+    except (discord.Forbidden, discord.HTTPException) as e:
+        logging.warning(f"[TRACKER] Could not read discussion thread history for item #{item_number}: {e}")
+        return []
+    history.reverse()  # Discord's history() is newest-first; a conversation reads oldest-first.
+    return [
+        {
+            "author_id": str(msg.author.id),
+            "author_name": msg.author.display_name,
+            "is_bot": bool(msg.author.bot),
+            "content": msg.content,
+            "created_at": msg.created_at.isoformat(),
+        }
+        for msg in history
+    ]
+
+
 async def _check_reporter_or_admin(interaction: discord.Interaction, item: Dict[str, Any]) -> bool:
     """Edit/Add files gate: the reporter themself, or a bot admin (plan §2.3)."""
     from qapbot.config import CONFIG
@@ -1501,6 +1549,14 @@ async def _move_test_message_to_done_testing_channel(item: Dict[str, Any]) -> bo
 
 
 async def _refresh_testcase_message(item_number: int) -> None:
+    """Re-render the posted test-case message in place. Skips rebuilding the Pass/Fail/Move-to-
+    Done view once the message has been archived to the Done Testing channel (2026-08-22, live
+    bug report: reacting 👍 a second time on an already-fully-passed, already-archived message
+    resurrected its buttons) — _move_test_message_to_done_testing_channel() reposts with no view=
+    specifically because there's nothing left to sign off, and updates test_channel_id to that
+    channel when it does; unconditionally reattaching a fresh interactive view here on any later
+    refresh (the 👍-reaction handler calls this even when nothing was actually pending) undid
+    that. Mirrors _refresh_item_message's own `archived` handling for the item embed."""
     from qapbot.cache_manager import CACHE
     import QBcore
 
@@ -1519,8 +1575,10 @@ async def _refresh_testcase_message(item_number: int) -> None:
     except discord.NotFound:
         return
     testcases = await db.get_tracker_testcases(item_number)
+    archived = item["test_channel_id"] == CACHE.tracker_settings.get(TRACKER_SETTING_DONE_TESTING_CHANNEL)
+    view = None if archived else build_tracker_testcase_view(item_number, testcases)
     try:
-        await message.edit(content=_format_testcase_message(item, testcases), view=build_tracker_testcase_view(item_number, testcases))
+        await message.edit(content=_format_testcase_message(item, testcases), view=view)
     except Exception as e:
         logging.warning(f"[TRACKER] Failed to refresh test-case message for item #{item_number}: {e}")
 
@@ -1937,6 +1995,11 @@ async def handle_tracker_test_reaction(payload: discord.RawReactionActionEvent) 
     before = await db.get_tracker_testcases(item_number)
     was_fully_passed = bool(before) and all(c["passed"] for c in before)
     pending_envs = sorted({c["environment"] for c in before if not c["passed"]})
+    if not pending_envs:
+        # Nothing left to sign off (already fully passed, e.g. a redundant second 👍 on an
+        # already-archived message) — a genuine no-op must not touch the message at all. Also
+        # belt-and-suspenders alongside _refresh_testcase_message's own archived check below.
+        return
     actor_id = str(payload.user_id)
     for env in pending_envs:
         await db.mark_tracker_environment_passed(item_number, env, actor_id)

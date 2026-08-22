@@ -2314,6 +2314,27 @@ async def handle_post_tracker_comment(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def handle_get_tracker_thread(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from qapbot.ui_tracker import get_thread_messages
+
+    try:
+        item_number = int(request.match_info["item_number"])
+    except ValueError:
+        return web.json_response({"error": "invalid item_number"}, status=400)
+    try:
+        limit = max(1, min(int(request.query.get("limit", "50")), 200))
+    except ValueError:
+        return web.json_response({"error": "invalid limit"}, status=400)
+
+    try:
+        messages = await get_thread_messages(item_number, limit=limit)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=404)
+    return web.json_response({"messages": messages})
+
+
 async def handle_post_tracker_testcases(request: web.Request) -> web.Response:
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
@@ -2450,6 +2471,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/tracker/items/{item_number}/attachments/{attachment_id}", handle_get_tracker_attachment)
     app.router.add_post("/api/tracker/items/{item_number}/status", handle_post_tracker_status)
     app.router.add_post("/api/tracker/items/{item_number}/comment", handle_post_tracker_comment)
+    app.router.add_get("/api/tracker/items/{item_number}/thread", handle_get_tracker_thread)
     app.router.add_post("/api/tracker/items/{item_number}/testcases", handle_post_tracker_testcases)
     app.router.add_post("/api/tracker/items/{item_number}/testcases/pass", handle_post_tracker_testcase_pass)
     app.router.add_post("/api/tracker/items/{item_number}/testcases/fail", handle_post_tracker_testcase_fail)

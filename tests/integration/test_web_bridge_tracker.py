@@ -266,6 +266,77 @@ async def test_post_comment_requires_text(client, db, monkeypatch):
     assert resp.status == 400
 
 
+# -- thread history (2026-08-22: tracker_comment could only WRITE into the discussion thread; ---
+# -- this is the read side, previously missing entirely) ----------------------------------------
+
+def _fake_thread_message(author_id, author_name, content, is_bot=False):
+    import datetime
+
+    message = MagicMock()
+    message.author = MagicMock(id=author_id, display_name=author_name, bot=is_bot)
+    message.content = content
+    message.created_at = datetime.datetime(2026, 8, 22, 10, 0, 0, tzinfo=datetime.timezone.utc)
+    return message
+
+
+def _fake_thread_with_history(messages):
+    """Discord's history() is an async iterator, not a coroutine -- AsyncMock's default mocking
+    of `.history` would make it an awaitable returning a plain value, not something `async for`
+    can iterate. Wire it explicitly as a plain callable returning an async generator."""
+    async def _history(limit=50):
+        for m in messages:
+            yield m
+
+    thread = AsyncMock()
+    thread.history = _history
+    return thread
+
+
+async def test_get_thread_returns_messages_oldest_first(client, db, monkeypatch):
+    # Discord's history() yields newest-first; the endpoint must reverse it.
+    newest = _fake_thread_message("1", "Qaplop", "any update?")
+    oldest = _fake_thread_message("2", "QapBot", "filed as #0016", is_bot=True)
+    thread = _fake_thread_with_history([newest, oldest])
+    _wire_bot(monkeypatch, channel=thread)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, thread_id="777")
+
+    resp = await client.get(
+        f"/api/tracker/items/{item_number}/thread", headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert [m["content"] for m in body["messages"]] == ["filed as #0016", "any update?"]
+    assert body["messages"][0]["is_bot"] is True
+    assert body["messages"][1]["author_name"] == "Qaplop"
+
+
+async def test_get_thread_on_item_with_no_thread_returns_empty(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)  # no thread_id set
+
+    resp = await client.get(
+        f"/api/tracker/items/{item_number}/thread", headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["messages"] == []
+
+
+async def test_get_thread_on_unknown_item_is_404(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    resp = await client.get(
+        "/api/tracker/items/99999/thread", headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 404
+
+
+async def test_get_thread_requires_secret(client, db):
+    item_number = await _make_item(db)
+    resp = await client.get(f"/api/tracker/items/{item_number}/thread")
+    assert resp.status == 403
+
+
 # -- testcases ---------------------------------------------------------
 
 async def test_post_testcases_creates_and_posts(client, db, monkeypatch):
