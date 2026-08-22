@@ -117,6 +117,7 @@ authentication — it's self-asserted.
 
 ```
 GET  /api/tracker/items?status=&type=&limit=
+POST /api/tracker/items                {item_type, title, description, details?, environment?, priority?}
 GET  /api/tracker/items/{n}
 GET  /api/tracker/items/{n}/attachments/{aid}
 POST /api/tracker/items/{n}/status     {status, note}
@@ -125,8 +126,9 @@ POST /api/tracker/items/{n}/testcases  {cases: [{environment, description, prior
 ```
 
 All handlers delegate the actual DB+Discord work to `qapbot/ui_tracker.py`
-(`apply_status_change()` / `post_comment()` / `post_test_cases()`) — there is exactly one
-place each of those things happens, whether triggered from Discord or from an agent.
+(`create_tracker_item_for_agent()` / `apply_status_change()` / `post_comment()` /
+`post_test_cases()`) — there is exactly one place each of those things happens, whether
+triggered from Discord or from an agent.
 
 ### MCP server (`qapbot/mcp/tracker_mcp.py`)
 
@@ -135,9 +137,17 @@ and `.vscode/mcp.json` (VS Code Copilot Chat). Hand-rolled JSON-RPC 2.0 — the 
 package is **not** a project dependency; the wire surface needed (`initialize`, `tools/list`,
 `tools/call`) is small enough that adding a new dependency wasn't worth it.
 
-Five tools: `tracker_list_items`, `tracker_get_item`, `tracker_set_status`, `tracker_comment`,
-`tracker_add_testcases`. Only the last three write anything — no filesystem/shell/git/deploy
-tool is exposed here (plan §6.6).
+Six tools: `tracker_list_items`, `tracker_get_item`, `tracker_create_item`, `tracker_set_status`,
+`tracker_comment`, `tracker_add_testcases`. All but the first two write something — no
+filesystem/shell/git/deploy tool is exposed here (plan §6.6).
+
+`tracker_create_item` (tracker item #0015, 2026-08-22) lets an agent file a new bug/feature
+directly instead of asking a human to run `/bug`/`/feature` — it posts to the same reports
+channel with the same embed/buttons a human-filed item gets. Its `reporter_id` is
+`agent:<X-Tracker-Admin label>` (e.g. `agent:claude`), deliberately non-numeric so it can never
+collide with a real Discord snowflake; this means the reporter-DM-on-status-change step silently
+no-ops (nobody to DM) and only a bot admin — not "the reporter" — can Edit it from Discord. Both
+are acceptable: there is no Discord user to notify or to grant reporter-only edit rights to.
 
 **Untrusted input (`qapbot/mcp/tracker_envelope.py`)**: bug/feature reports are arbitrary text
 from arbitrary Discord users, fed straight into an agent's context — a textbook

@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (12)
+- Added: tracker item #0015 ("Create path for agent") -- agents can now file bugs/features
+  directly instead of asking a human to run /bug or /feature. New `create_tracker_item_for_agent()`
+  (qapbot/ui_tracker.py) mirrors TrackerDraftView._on_submit()'s DB-insert + Discord-post flow
+  with no interaction/modal involved; new `POST /api/tracker/items` bridge endpoint
+  (qapbot/web_bridge.py); new `tracker_create_item` MCP tool (qapbot/mcp/tracker_mcp.py,
+  qapbot/mcp/tracker_bridge_client.py) -- now 6 tools total, 4 of them write tools. Agent-created
+  items get a deliberately non-numeric `reporter_id` (`agent:<label>`) so they can never collide
+  with a real Discord snowflake; the reporter-DM-on-status-change step silently no-ops for them
+  and only a bot admin can Edit them from Discord (both acceptable -- there's no Discord user to
+  notify or grant reporter rights to). Docs: qapbot/docs/BUG_FEATURE_TRACKER.md updated (tool
+  count, new endpoint, reporter_id convention). Files: qapbot/ui_tracker.py, qapbot/web_bridge.py,
+  qapbot/mcp/tracker_mcp.py, qapbot/mcp/tracker_bridge_client.py. 2404/2404 tests pass. Marked
+  #0015 implemented + posted 2 PROD manual test cases via the tracker MCP tool itself.
+
 2026-08-22 (11)
 - Fixed: `qapbot/mcp/tracker_mcp.py`'s stdio transport crashed instantly on Windows
   (`OSError: [WinError 6] Invalid handle`) before ever answering `initialize`, so the tracker

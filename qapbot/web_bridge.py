@@ -2174,6 +2174,38 @@ async def handle_get_tracker_items(request: web.Request) -> web.Response:
     return web.json_response({"items": payload})
 
 
+async def handle_post_tracker_create_item(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from qapbot.ui_tracker import create_tracker_item_for_agent
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid body"}, status=400)
+    item_type = body.get("item_type")
+    title = (body.get("title") or "").strip()
+    description = (body.get("description") or "").strip()
+    if item_type not in ("bug", "feature"):
+        return web.json_response({"error": "item_type must be 'bug' or 'feature'"}, status=400)
+    if not title or not description:
+        return web.json_response({"error": "title and description are required"}, status=400)
+    if "priority" in body and body["priority"] not in ("HIGH", "MEDIUM", "LOW"):
+        return web.json_response({"error": "priority must be one of HIGH/MEDIUM/LOW"}, status=400)
+
+    try:
+        result = await create_tracker_item_for_agent(
+            item_type=item_type, title=title, description=description,
+            details=body.get("details"), environment=body.get("environment"),
+            priority=body.get("priority", "MEDIUM"), reporter_name=_tracker_admin_label(request),
+        )
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    return web.json_response({
+        "ok": True, "item_number": result["item"]["item_number"], "jump_url": result["jump_url"],
+    })
+
+
 async def handle_get_tracker_item(request: web.Request) -> web.Response:
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
@@ -2312,6 +2344,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/cwl/shared-clan/evict", handle_post_cwl_shared_clan_evict)
     app.router.add_post("/api/cwl/activity-closed", handle_post_cwl_activity_closed)
     app.router.add_get("/api/tracker/items", handle_get_tracker_items)
+    app.router.add_post("/api/tracker/items", handle_post_tracker_create_item)
     app.router.add_get("/api/tracker/items/{item_number}", handle_get_tracker_item)
     app.router.add_get("/api/tracker/items/{item_number}/attachments/{attachment_id}", handle_get_tracker_attachment)
     app.router.add_post("/api/tracker/items/{item_number}/status", handle_post_tracker_status)

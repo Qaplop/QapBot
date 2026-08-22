@@ -846,6 +846,50 @@ async def start_tracker_item(
         modal.predownload_task = asyncio.create_task(_predownload_attachments(attachments))
 
 
+async def create_tracker_item_for_agent(
+    item_type: str,
+    title: str,
+    description: str,
+    details: Optional[str] = None,
+    environment: Optional[str] = None,
+    priority: str = "MEDIUM",
+    reporter_name: str = "agent",
+) -> Dict[str, Any]:
+    """Agent-facing equivalent of `TrackerDraftView._on_submit()` — no Discord interaction/modal
+    involved, since the caller is the bridge (`/api/tracker/items` POST) or the MCP server's
+    `tracker_create_item` tool, not a human in Discord (tracker item #0015). Creates the DB row
+    and posts it to the configured reports channel exactly like a human-filed `/bug`/`/feature`
+    would, just with no attachments and a non-numeric `reporter_id` (`agent:<label>` — never a
+    real Discord snowflake, so it can't collide with one; `_dm_reporter_on_status_change()`'s
+    `int(reporter_id)` already tolerates any non-numeric value by design, and Edit/status-DM
+    features degrade gracefully — a human bot admin can still Edit the posted item in Discord).
+    Raises ValueError if the tracker is disabled, unconfigured, or item_type is invalid."""
+    from qapbot.cache_manager import CACHE
+
+    if item_type not in ("bug", "feature"):
+        raise ValueError(f"item_type must be 'bug' or 'feature', got {item_type!r}")
+    if CACHE.tracker_settings.get(TRACKER_SETTING_ENABLED) == "0":
+        raise ValueError("tracker is disabled")
+    channel_id_str = CACHE.tracker_settings.get(TRACKER_SETTING_BUG_CHANNEL)
+    if not channel_id_str:
+        raise ValueError("tracker reports channel is not configured")
+
+    normalized_priority = _normalize_priority(priority)
+    normalized_environment = _normalize_environment(environment) if item_type == "bug" and environment else None
+
+    db = CACHE.db_manager
+    item_number = await db.create_tracker_item(
+        item_type=item_type, title=title, description=description,
+        reporter_id=f"agent:{reporter_name}", reporter_name=reporter_name,
+        details=details or None, environment=normalized_environment, priority=normalized_priority,
+    )
+
+    message, _thread = await _post_tracker_item(item_number, int(channel_id_str))
+    item = await db.get_tracker_item(item_number)
+    assert item is not None
+    return {"item": item, "jump_url": message.jump_url if message else None}
+
+
 # ===========================================================================
 # Posted item: embed, view, posting, refresh (plan §2.3)
 # ===========================================================================

@@ -52,6 +52,19 @@ class TrackerBridgeClient:
     async def get_item(self, item_number: int) -> Dict[str, Any]:
         return await self._get(f"/api/tracker/items/{item_number}")
 
+    async def create_item(
+        self, item_type: str, title: str, description: str,
+        details: Optional[str] = None, environment: Optional[str] = None, priority: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"item_type": item_type, "title": title, "description": description}
+        if details:
+            payload["details"] = details
+        if environment:
+            payload["environment"] = environment
+        if priority:
+            payload["priority"] = priority
+        return await self._post("/api/tracker/items", payload)
+
     async def get_attachment_bytes(self, item_number: int, attachment_id: int) -> bytes:
         async with aiohttp.ClientSession() as session:
             url = f"{self.base_url}/api/tracker/items/{item_number}/attachments/{attachment_id}"

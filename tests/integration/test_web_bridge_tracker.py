@@ -67,6 +67,7 @@ def _fake_channel():
     channel = AsyncMock()
     message = AsyncMock()
     message.id = 999
+    message.jump_url = "https://discord.com/channels/1/2/999"
     channel.send = AsyncMock(return_value=message)
     channel.fetch_message = AsyncMock(return_value=None)
     return channel
@@ -331,5 +332,77 @@ async def test_post_testcases_requires_non_empty_list(client, db, monkeypatch):
     item_number = await _make_item(db)
     resp = await client.post(
         f"/api/tracker/items/{item_number}/testcases", json={"cases": []}, headers={"X-Bridge-Secret": SECRET}
+    )
+    assert resp.status == 400
+
+
+# -- create item (tracker item #0015) --------------------------------------
+
+async def test_post_create_item_requires_secret(client):
+    resp = await client.post("/api/tracker/items", json={"item_type": "bug", "title": "t", "description": "d"})
+    assert resp.status == 403
+
+
+async def test_post_create_item_persists_and_posts(client, db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_tracker import TRACKER_SETTING_BUG_CHANNEL
+    CACHE.tracker_settings[TRACKER_SETTING_BUG_CHANNEL] = "1"
+    channel = _fake_channel()
+    _wire_bot(monkeypatch, channel=channel)
+
+    resp = await client.post(
+        "/api/tracker/items",
+        json={"item_type": "bug", "title": "Odd fetch", "description": "desc"},
+        headers={"X-Bridge-Secret": SECRET, "X-Tracker-Admin": "claude"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["item_number"]
+    assert body["jump_url"]
+    channel.send.assert_awaited_once()
+    stored = await db.get_tracker_item(body["item_number"])
+    assert stored["reporter_id"] == "agent:claude"
+    assert stored["reporter_name"] == "claude"
+
+
+async def test_post_create_item_rejects_invalid_item_type(client, db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_tracker import TRACKER_SETTING_BUG_CHANNEL
+    CACHE.tracker_settings[TRACKER_SETTING_BUG_CHANNEL] = "1"
+    resp = await client.post(
+        "/api/tracker/items", json={"item_type": "epic", "title": "t", "description": "d"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 400
+
+
+async def test_post_create_item_requires_title_and_description(client, db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_tracker import TRACKER_SETTING_BUG_CHANNEL
+    CACHE.tracker_settings[TRACKER_SETTING_BUG_CHANNEL] = "1"
+    resp = await client.post(
+        "/api/tracker/items", json={"item_type": "bug", "title": "", "description": "d"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 400
+
+
+async def test_post_create_item_rejects_invalid_priority(client, db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_tracker import TRACKER_SETTING_BUG_CHANNEL
+    CACHE.tracker_settings[TRACKER_SETTING_BUG_CHANNEL] = "1"
+    resp = await client.post(
+        "/api/tracker/items",
+        json={"item_type": "bug", "title": "t", "description": "d", "priority": "URGENT"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 400
+
+
+async def test_post_create_item_requires_configured_channel(client, db, monkeypatch):
+    resp = await client.post(
+        "/api/tracker/items", json={"item_type": "bug", "title": "t", "description": "d"},
+        headers={"X-Bridge-Secret": SECRET},
     )
     assert resp.status == 400

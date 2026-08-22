@@ -25,6 +25,7 @@ from qapbot.ui_tracker import (
     _sanitize_attachment_filename,
     apply_status_change,
     build_tracker_embed,
+    create_tracker_item_for_agent,
     handle_tracker_test_reaction,
     handle_tracker_upload_message,
     mark_environment_passed_and_refresh,
@@ -113,6 +114,56 @@ async def _make_item(db, item_type="bug", **overrides):
     kwargs.update(overrides)
     item_number = await db.create_tracker_item(**kwargs)
     return item_number
+
+
+# -- create_tracker_item_for_agent (tracker item #0015) --------------------
+
+async def test_create_tracker_item_for_agent_persists_and_posts(monkeypatch, db):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_BUG_CHANNEL] = "1"
+    channel = _fake_channel()
+    _wire_bot(monkeypatch, channel=channel)
+
+    result = await create_tracker_item_for_agent(
+        item_type="bug", title="Odd fetch", description="desc", reporter_name="claude"
+    )
+
+    assert result["item"]["title"] == "Odd fetch"
+    assert result["item"]["reporter_id"] == "agent:claude"
+    assert result["item"]["reporter_name"] == "claude"
+    assert result["jump_url"]
+    channel.send.assert_awaited_once()
+
+
+async def test_create_tracker_item_for_agent_feature_ignores_environment(monkeypatch, db):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_BUG_CHANNEL] = "1"
+    _wire_bot(monkeypatch, channel=_fake_channel())
+
+    result = await create_tracker_item_for_agent(
+        item_type="feature", title="T", description="D", environment="PROD"
+    )
+    assert result["item"]["environment"] is None
+
+
+async def test_create_tracker_item_for_agent_rejects_bad_item_type(monkeypatch, db):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_BUG_CHANNEL] = "1"
+    with pytest.raises(ValueError):
+        await create_tracker_item_for_agent(item_type="epic", title="T", description="D")
+
+
+async def test_create_tracker_item_for_agent_requires_configured_channel(monkeypatch, db):
+    with pytest.raises(ValueError):
+        await create_tracker_item_for_agent(item_type="bug", title="T", description="D")
+
+
+async def test_create_tracker_item_for_agent_respects_disabled_flag(monkeypatch, db):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_BUG_CHANNEL] = "1"
+    CACHE.tracker_settings[TRACKER_SETTING_ENABLED] = "0"
+    with pytest.raises(ValueError):
+        await create_tracker_item_for_agent(item_type="bug", title="T", description="D")
 
 
 # -- attachment filename sanitizing -----------------------------------------

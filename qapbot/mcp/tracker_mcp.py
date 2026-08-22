@@ -15,8 +15,9 @@ guaranteed to see the user's shell environment):
     TRACKER_ADMIN_ID       attribution label sent as X-Tracker-Admin (self-asserted, never
                            authentication — see plan §6.4).
 
-Read-mostly by design (plan §6.6): the three write tools only ever change tracker state
-(status / comment / testcases). No filesystem, shell, git, or deployment tool is exposed here.
+Four write tools now (tracker item #0015 added `tracker_create_item`): create / status /
+comment / testcases. Still no filesystem, shell, git, or deployment tool exposed here — only
+tracker state changes (plan §6.6's original read-mostly posture, extended to cover creation).
 """
 from __future__ import annotations
 
@@ -56,6 +57,30 @@ TOOLS: List[Dict[str, Any]] = [
                 "type": {"type": "string", "enum": ["bug", "feature"]},
                 "limit": {"type": "integer", "default": 50},
             },
+        },
+    },
+    {
+        "name": "tracker_create_item",
+        "description": (
+            "File a new bug or feature request into the tracker, posting it to the configured "
+            "Discord reports channel exactly like a human-filed /bug or /feature. Attributed "
+            "to this MCP session's TRACKER_ADMIN_ID, not a Discord user — use this instead of "
+            "asking the project owner to file it manually."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_type": {"type": "string", "enum": ["bug", "feature"]},
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "details": {"type": "string", "description": "Optional longer write-up (repro steps, rationale, etc.)."},
+                "environment": {
+                    "type": "string", "enum": ["PROD", "DEV", "BOTH"],
+                    "description": "Bug items only; ignored for features.",
+                },
+                "priority": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"], "description": "Defaults to MEDIUM if omitted."},
+            },
+            "required": ["item_type", "title", "description"],
         },
     },
     {
@@ -236,6 +261,13 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> str:
 
     if name == "tracker_get_item":
         return await render_item_markdown(client, int(arguments["item_number"]))
+
+    if name == "tracker_create_item":
+        result = await client.create_item(
+            item_type=arguments["item_type"], title=arguments["title"], description=arguments["description"],
+            details=arguments.get("details"), environment=arguments.get("environment"), priority=arguments.get("priority"),
+        )
+        return f"Created #{result['item_number']:04d}. {result['jump_url'] or '(no jump link — reports channel unreachable)'}"
 
     if name == "tracker_set_status":
         result = await client.set_status(int(arguments["item_number"]), arguments["status"], arguments.get("note"))

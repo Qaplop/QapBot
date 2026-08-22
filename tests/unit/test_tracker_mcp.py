@@ -81,10 +81,10 @@ def test_tool_names_are_unique():
     assert len(names) == len(set(names))
 
 
-def test_write_tools_are_exactly_three():
-    """Plan §6.6: "the three write tools only ever change tracker state" — set_status,
-    comment, add_testcases. Everything else is read-only."""
-    write_tools = {"tracker_set_status", "tracker_comment", "tracker_add_testcases"}
+def test_write_tools_are_exactly_four():
+    """Plan §6.6, extended by tracker item #0015: create_item / set_status / comment /
+    add_testcases are the only tools that change tracker state. Everything else is read-only."""
+    write_tools = {"tracker_create_item", "tracker_set_status", "tracker_comment", "tracker_add_testcases"}
     read_tools = {"tracker_list_items", "tracker_get_item"}
     names = {t["name"] for t in tracker_mcp.TOOLS}
     assert names == write_tools | read_tools
@@ -255,6 +255,29 @@ async def test_call_tool_get_item_survives_attachment_download_failure(fake_clie
 
     markdown = await tracker_mcp.call_tool("tracker_get_item", {"item_number": 8})
     assert "download failed" in markdown
+
+
+@pytest.mark.asyncio
+async def test_call_tool_create_item(fake_client):
+    fake_client.create_item = AsyncMock(return_value={"item_number": 18, "jump_url": "https://discord.com/x"})
+    result = await tracker_mcp.call_tool(
+        "tracker_create_item", {"item_type": "bug", "title": "T", "description": "D"}
+    )
+    assert "#0018" in result
+    assert "https://discord.com/x" in result
+    fake_client.create_item.assert_awaited_once_with(
+        item_type="bug", title="T", description="D", details=None, environment=None, priority=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_call_tool_create_item_handles_missing_jump_url(fake_client):
+    fake_client.create_item = AsyncMock(return_value={"item_number": 19, "jump_url": None})
+    result = await tracker_mcp.call_tool(
+        "tracker_create_item", {"item_type": "feature", "title": "T", "description": "D"}
+    )
+    assert "#0019" in result
+    assert "no jump link" in result
 
 
 @pytest.mark.asyncio
