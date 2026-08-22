@@ -892,3 +892,76 @@ class attributes, set before any translation context is available).
 - `CACHE.persist_user(user_id)` must be called after any player data modification (write-through to database)
 - Verification status updates persist immediately via write-through
 - Notification settings updates persist immediately via write-through
+
+---
+
+## CWL Enrollment DM Re-Route on Ownership Change (2026-08-22, tracker #0019)
+
+An enrollment DM records **who it was sent to**, not who owns the account. When a CoC account
+changes its Discord owner, a DM already sitting in the OLD owner's inbox keeps pointing at that
+account — and its sign-up button still works for them, deliberately (tracker #0016 widened
+`CwlSignupResponseButton`'s guard to accept the recorded recipient, because rejecting them would
+have broken DMs that were legitimately delivered). The result was that the previous owner could
+answer for an account they no longer owned, while the new owner was never asked at all.
+
+### The rule
+
+| DM state (`cwl_player_season_status.status`) | Action |
+|---|---|
+| `pending` (unanswered) | delete the old owner's DM, re-send to the new owner |
+| `confirmed` / `declined` | **completely untouched** — a response is a real historical fact and must never be retracted or re-asked |
+| account **unlinked** or in the **UNASSIGNED pool** | **completely untouched** — that is ownership *removal*, not a change; there is nobody to re-route to, and the old recipient's button keeps working (project owner's explicit call for the live `#LLV0Y9PQ` / `.zuurn` case) |
+
+### The trigger is a periodic sweep, deliberately
+
+`reroute_cwl_enrollment_dms_after_ownership_change()` (`QBdiscocmdshelper_cwl.py`) runs once per
+update cycle from `main()` (`QapBot.py`), after the `is_discord_available()` guard because it does
+DM I/O. Two alternatives were considered and rejected:
+
+- **Hooking the link/unlink path**: that is account-protection code (Cardinal Rule 2), and a
+  re-route means two Discord round trips (a delete and a send, each internally retryable) — neither
+  belongs inside the synchronous user-facing linking flow.
+- **A startup-only idempotent pass**: the bot runs for weeks while an enrollment window lasts days,
+  so it would routinely miss the window. The sweep subsumes startup anyway (the first cycle runs
+  shortly after boot), so there is no separate startup call site.
+
+Idempotent by construction (Cardinal Rule 12): once re-routed, `dmed_discord_id` matches the live
+owner and the row stops matching the detection query.
+
+### Order of operations, and why
+
+1. **Retract the old DM first** (`cleanup_stale_cwl_enrollment_dms()`) — the old owner must lose
+   the ability to answer even if the re-send below fails. Best-effort; never fatal.
+2. **Clear the global dm_sent record** (`clear_cwl_player_dm_sent_sync()`). Load-bearing:
+   `_send_cwl_enrollment_dm_batch()`'s global dedup would otherwise count the player as already
+   contacted this season and send nothing at all.
+3. **Re-point `cwl_signups.dmed_discord_id`** (`set_cwl_signup_dmed_discord_id_sync()`). This is
+   what closes the hole for a legacy row whose `dm_sent_via_message_id` is NULL (predating
+   2026-08-19) and whose message therefore cannot be deleted — the button's guard is
+   `{signup.dmed_discord_id, live_discord_id}`, so once both name the new owner, the old owner's
+   surviving DM correctly rejects them with `not_your_signup`.
+4. **Re-send** via `_send_cwl_enrollment_dm_batch()` — never a hand-rolled send (Pitfall 38: the
+   batch seeds the `cwl_signups` row the button needs). It also re-stamps the global row's
+   `dmed_discord_id` on success.
+
+A failed re-send leaves the row `status='pending'` with `dm_sent=0` — exactly the state "Notify
+New Pool Members" already picks up, so it recovers on its own instead of stranding the player.
+
+### Two deliberate limits
+
+- **The old owner is not told their DM was withdrawn.** Precedent: `cleanup_stale_cwl_enrollment_dms()`
+  (Delete Season) already retracts enrollment DMs silently, recorded in its docstring as the
+  project owner's stated preference. A notice would also be odd on its face — it would tell someone
+  about an account they no longer own.
+- **`_MAX_DM_REROUTES_PER_CYCLE = 25`** bounds the blast radius, so a mass re-link (or a bug in the
+  detection query) can never become an unbounded DM burst in one cycle. The remainder is picked up
+  by the next cycle, and hitting the cap is logged.
+
+### Ownership is resolved in Python, not SQL
+
+`find_cwl_enrollment_dms_needing_reroute_sync()` returns candidates only (pending + `dm_sent=1` +
+event still `signup_open`). The old-vs-new comparison uses `get_player_links_sync()`, which already
+owns the verified-wins / UNASSIGNED-last dedup that decides which `user_players` row is the real
+owner. Re-deriving that in SQL would be a near-duplicate (Cardinal Rule 4) and would silently pick
+the wrong owner for a tag holding both a real and a stray row (see
+`_cleanup_stray_unassigned_duplicates`).

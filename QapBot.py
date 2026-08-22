@@ -1882,6 +1882,24 @@ async def main() -> None:
         )
         return
 
+    # Re-route CWL enrollment DMs whose account changed Discord owner while the DM was still
+    # unanswered (2026-08-22, tracker #0019). Placed after the Discord-health guard above because
+    # it deletes and sends DMs; a no-op (one cheap query, scoped to signup_open events) on every
+    # cycle where nothing changed hands. See the function's own docstring for why this is a sweep
+    # rather than a hook on the link/unlink path.
+    try:
+        from qapbot.QBdiscocmdshelper_cwl import reroute_cwl_enrollment_dms_after_ownership_change
+        _reroute = await reroute_cwl_enrollment_dms_after_ownership_change()
+        if _reroute["rerouted"] or _reroute["send_failed"]:
+            logging.info(
+                f"[CWL-DM-REROUTE] {_reroute['rerouted']} DM(s) re-routed to a new owner "
+                f"({_reroute['retracted']} old message(s) retracted, "
+                f"{_reroute['send_failed']} could not be re-sent) out of "
+                f"{_reroute['checked']} unanswered DM(s) checked"
+            )
+    except Exception as e:
+        logging.error(f"Error in CWL enrollment DM re-route sweep: {e}")
+
     # Sync Discord roles for guilds with CoC/clan role features enabled
     try:
         from qapbot.guild_role_manager import sync_all_roles_for_guild

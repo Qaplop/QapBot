@@ -5343,6 +5343,117 @@ class WarHistoryDB:
                 conn.rollback()
                 return False
 
+    def set_cwl_signup_dmed_discord_id_sync(
+        self, event_id: int, player_tag: str, dmed_discord_id: Optional[str],
+    ) -> bool:
+        """Narrow UPDATE of an EXISTING cwl_signups row's dmed_discord_id — same "never creates a
+        row" contract as update_cwl_signup_status_sync above, and deliberately touches nothing
+        else (status, source and responded_at are none of this write's business).
+
+        Added 2026-08-22 for tracker #0019's enrollment-DM re-route. When an account changes
+        Discord owner while its sign-up DM is still unanswered, the DM is re-sent to the new owner
+        and this column has to follow: `dmed_discord_id` means "who we actually DMed for this
+        event" (see the table's own CREATE TABLE comment), and after a re-route that is the new
+        owner. Re-pointing it is also what closes the hole for a legacy row whose
+        dm_sent_via_message_id is NULL and whose old message therefore cannot be deleted —
+        CwlSignupResponseButton.callback accepts `{signup.dmed_discord_id, live_discord_id}`
+        (widened by tracker #0016), so once this names the new owner the old owner's surviving DM
+        correctly rejects them.
+
+        Args:
+            event_id: The CWL event the signup row belongs to.
+            player_tag: The player whose row should be re-pointed.
+            dmed_discord_id: The Discord user the DM was (re-)sent to.
+
+        Returns:
+            True on success (including a no-op when no such row exists), False if the write failed.
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "UPDATE cwl_signups SET dmed_discord_id = ? WHERE event_id = ? AND player_tag = ?",
+                        (dmed_discord_id, event_id, player_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] set_cwl_signup_dmed_discord_id_sync failed for event "
+                    f"{event_id} player {player_tag}: {e}"
+                )
+                conn.rollback()
+                return False
+
+    def find_cwl_enrollment_dms_needing_reroute_sync(self) -> List[Dict[str, Any]]:
+        """Every still-UNANSWERED enrollment DM that might need re-routing to a new account owner
+        (2026-08-22, tracker #0019). Returns the candidate rows only — this deliberately does NOT
+        decide which of them actually changed hands.
+
+        Ownership is resolved by the caller through get_player_links_sync(), not joined in here:
+        `user_players` can hold several rows per player_tag, and the verified-wins /
+        UNASSIGNED-last dedup that picks the right one already lives in that helper. Re-deriving
+        it in a second query is exactly the near-duplicate Cardinal Rule 4 forbids, and it is what
+        would silently pick the wrong owner for a tag with both a real and a stray row (see
+        _cleanup_stray_unassigned_duplicates). The candidate set is small enough for that to be
+        free — it is scoped to events still in 'signup_open'.
+
+        Filters, each load-bearing:
+          - status = 'pending': the project owner's spec is explicit that an already-answered DM
+            (confirmed/declined) is a real historical fact and must never be retracted or re-asked.
+          - dm_sent = 1 AND dmed_discord_id IS NOT NULL: there has to be a real DM, sent to a real
+            recipient, for "re-route" to mean anything.
+          - event status 'signup_open': the only status where the DM's button is actionable at all
+            (any other status returns `signup_closed` regardless) — same scoping
+            _repair_cwl_signups_for_sent_dms() uses, and it avoids touching a finalized event's
+            historical record.
+
+        dm_sent_via_message_id is deliberately NOT required to be non-NULL. A row predating the
+        2026-08-19 addition of those columns has no message to delete, but re-pointing its
+        recipient and re-sending still fixes the reported bug's more serious half (the new owner
+        never being asked at all) — see set_cwl_signup_dmed_discord_id_sync's docstring for why
+        that alone also stops the old owner answering.
+
+        Returns:
+            One dict per candidate with player_tag, cwl_season, player_name, dmed_discord_id,
+            message_id, event_id and guild_id — everything the re-route needs without a second
+            lookup. Empty list on error (the sweep is best-effort and must never break a cycle).
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT g.player_tag              AS player_tag,
+                           g.cwl_season              AS cwl_season,
+                           g.player_name             AS player_name,
+                           g.dmed_discord_id         AS dmed_discord_id,
+                           g.dm_sent_via_message_id  AS message_id,
+                           g.dm_sent_via_event_id    AS event_id,
+                           e.guild_id                AS guild_id
+                    FROM cwl_player_season_status g
+                    JOIN cwl_events e
+                      ON e.id = g.dm_sent_via_event_id AND e.status = 'signup_open'
+                    WHERE g.status = 'pending'
+                      AND g.dm_sent = 1
+                      AND g.dmed_discord_id IS NOT NULL
+                    """
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] find_cwl_enrollment_dms_needing_reroute_sync failed: {e}")
+                return []
+
     def upsert_cwl_assignment_sync(
         self,
         event_id: int,

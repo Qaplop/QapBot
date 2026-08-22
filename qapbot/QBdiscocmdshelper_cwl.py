@@ -2871,3 +2871,161 @@ async def cleanup_stale_cwl_enrollment_dms(bot: Any, dm_refs: List[Dict[str, Any
             )
             result["failed"] += 1
     return result
+
+
+# Bound on how many enrollment DMs one sweep will re-route (2026-08-22, tracker #0019). A mass
+# re-link — or a bug in the detection query — must never be able to turn into an unbounded DM
+# burst inside a single cycle. Anything over the cap is simply picked up by the next cycle, and
+# the sweep logs when it hits the limit so that is visible rather than silent.
+_MAX_DM_REROUTES_PER_CYCLE = 25
+
+
+async def reroute_cwl_enrollment_dms_after_ownership_change() -> Dict[str, int]:
+    """Re-route still-unanswered CWL enrollment DMs whose account has changed Discord owner
+    (2026-08-22, tracker #0019).
+
+    The reported bug: when a CoC account changes owner, an enrollment DM already sitting in the
+    OLD owner's inbox keeps pointing at that account. The sign-up button still works for whoever
+    received the DM (deliberately — tracker #0016 widened the guard to accept the recorded
+    recipient, because rejecting them would have broken DMs that were legitimately delivered), so
+    the previous owner can answer on behalf of an account they no longer own, and the NEW owner is
+    never asked at all.
+
+    Project owner's spec:
+      - UNANSWERED (cwl_player_season_status.status = 'pending') -> delete the old owner's DM and
+        re-send it to the new owner.
+      - ANSWERED (confirmed/declined) -> leave it completely untouched. The response is a real
+        historical fact and must not be retracted or re-asked. Enforced by the detection query's
+        own `status = 'pending'` filter, not by anything here.
+
+    Why a periodic sweep rather than hooking the link/unlink path: that path is account-protection
+    code (Cardinal Rule 2), and a re-route means two Discord round trips (a delete and a send,
+    each internally retryable) — neither belongs inside the synchronous user-facing linking flow.
+    A startup-only pass was the other option and is not enough on its own: the bot runs for weeks
+    while an enrollment window lasts days, so it would routinely miss the window entirely. This
+    sweep subsumes startup anyway, since the first cycle runs shortly after boot.
+
+    Idempotent by construction (Cardinal Rule 12): a re-routed row's dmed_discord_id then matches
+    the live owner, so it stops matching the detection on every subsequent pass.
+
+    An account that has simply been UNLINKED is deliberately NOT re-routed. Unlinking is ownership
+    *removal*, not an ownership *change* — there is nobody to re-send to, and the project owner
+    explicitly confirmed for the live #LLV0Y9PQ / .zuurn case that the old recipient's button
+    should keep working. get_player_links_sync() reports an UNASSIGNED-pool account as
+    discord_id=None, so both "no row at all" and "in the UNASSIGNED pool" fall through untouched.
+
+    Returns:
+        {"checked", "rerouted", "retracted", "send_failed", "capped"} — counts for the cycle log.
+        Best-effort throughout: every failure is logged and skipped, never raised, since this runs
+        inside the main update cycle and must never break it.
+    """
+    import QBcore
+
+    result: Dict[str, int] = {"checked": 0, "rerouted": 0, "retracted": 0, "send_failed": 0, "capped": 0}
+    db = CACHE.db_manager
+    bot = getattr(QBcore, "bot", None)
+    if db is None or bot is None:
+        return result
+
+    candidates = await asyncio.to_thread(db.find_cwl_enrollment_dms_needing_reroute_sync)
+    if not candidates:
+        return result
+    result["checked"] = len(candidates)
+
+    # One bulk ownership lookup for the whole candidate set, not one per row — this runs every
+    # cycle, and the helper already does the verified-wins / UNASSIGNED-last dedup that decides
+    # which user_players row is the real owner (see the detection query's own docstring).
+    live_links = await asyncio.to_thread(
+        db.get_player_links_sync, [c["player_tag"] for c in candidates]
+    )
+
+    stale: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        live_owner = (live_links.get(candidate["player_tag"]) or {}).get("discord_id")
+        # None covers both "never linked" and "sitting in the UNASSIGNED pool" — see the docstring
+        # on why neither is a re-route.
+        if not live_owner or live_owner == candidate["dmed_discord_id"]:
+            continue
+        candidate["new_owner_id"] = live_owner
+        stale.append(candidate)
+
+    if not stale:
+        return result
+
+    if len(stale) > _MAX_DM_REROUTES_PER_CYCLE:
+        result["capped"] = len(stale) - _MAX_DM_REROUTES_PER_CYCLE
+        stale = stale[:_MAX_DM_REROUTES_PER_CYCLE]
+
+    for entry in stale:
+        player_tag = entry["player_tag"]
+        season = entry["cwl_season"]
+        event_id = entry["event_id"]
+        guild_id = int(entry["guild_id"])
+
+        # 1. Retract the old owner's DM FIRST, so they lose the ability to answer even if the
+        #    re-send below fails. Best-effort — a row predating the 2026-08-19 dm_sent_via_*
+        #    columns has no message id at all, and step 3 covers that case on its own.
+        if entry.get("message_id"):
+            try:
+                retract = await cleanup_stale_cwl_enrollment_dms(
+                    bot,
+                    [{
+                        "player_tag": player_tag,
+                        "dmed_discord_id": entry["dmed_discord_id"],
+                        "message_id": entry["message_id"],
+                    }],
+                )
+                result["retracted"] += retract["deleted"]
+            except Exception as e:
+                logging.warning(
+                    f"[CWL-DM-REROUTE] Could not retract the old enrollment DM for {player_tag}: {e}"
+                )
+
+        # 2. Clear the global dm_sent record. Load-bearing: _send_cwl_enrollment_dm_batch()'s
+        #    global dedup would otherwise count this player as already contacted this season and
+        #    send nothing at all.
+        await asyncio.to_thread(db.clear_cwl_player_dm_sent_sync, player_tag, season)
+
+        # 3. Re-point the local signup row's recorded recipient. This is what closes the hole for
+        #    a legacy row whose message could not be deleted above — the button's guard is
+        #    {signup.dmed_discord_id, live_discord_id}, so once both name the new owner the old
+        #    owner's surviving DM correctly rejects them.
+        await asyncio.to_thread(
+            db.set_cwl_signup_dmed_discord_id_sync, event_id, player_tag, entry["new_owner_id"]
+        )
+
+        # 4. Re-send to the new owner. Through the batch helper, never a hand-rolled send — it
+        #    seeds the cwl_signups row the button needs (Pitfall 38) and re-stamps the global
+        #    row's dmed_discord_id via mark_cwl_player_dm_sent_sync on success.
+        batch = await _send_cwl_enrollment_dm_batch(
+            event_id, guild_id, season,
+            [{
+                "player_tag": player_tag,
+                "player_name": entry.get("player_name") or player_tag,
+                "discord_id": entry["new_owner_id"],
+            }],
+        )
+        if batch["contacted"]:
+            result["rerouted"] += 1
+            logging.info(
+                f"[CWL-DM-REROUTE] {player_tag} ({season}): enrollment DM moved from "
+                f"{entry['dmed_discord_id']} to {entry['new_owner_id']} (event {event_id})"
+            )
+        else:
+            # Left at status='pending' with dm_sent=0 — exactly the state "Notify New Pool
+            # Members" already picks up, so this recovers on its own rather than stranding
+            # the player with no DM at all.
+            result["send_failed"] += 1
+            logging.warning(
+                f"[CWL-DM-REROUTE] {player_tag} ({season}): retracted the old DM but could not "
+                f"reach the new owner {entry['new_owner_id']} — left pending for a later "
+                f"\"Notify New Pool Members\" run"
+            )
+
+    if result["capped"]:
+        logging.info(
+            f"[CWL-DM-REROUTE] Hit the per-cycle cap of {_MAX_DM_REROUTES_PER_CYCLE} — "
+            f"{result['capped']} more will be re-routed next cycle"
+        )
+    return result
+

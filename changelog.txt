@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-22 (26)
+- Fixed: an unanswered CWL enrollment DM is now re-routed when the account changes Discord owner
+  (ticket #0019). Previously the old owner could still answer for an account they no longer owned
+  (the sign-up button deliberately accepts the recorded recipient since #0016) and the new owner
+  was never asked at all. New per-cycle sweep reroute_cwl_enrollment_dms_after_ownership_change()
+  retracts the old DM, clears the global dm_sent record, re-points cwl_signups.dmed_discord_id and
+  re-sends via _send_cwl_enrollment_dm_batch. An ANSWERED DM (confirmed/declined) is never touched
+  -- a response is a historical fact. An UNLINKED account is never touched either: that is
+  ownership removal, not a change, so the old recipient keeps their working button (the #LLV0Y9PQ
+  / .zuurn case). A sweep, not a link/unlink hook, to keep DM I/O out of account-protection code;
+  capped at 25 re-routes per cycle. Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/db_manager.py,
+  QapBot.py, qapbot/docs/REGISTRATION_MESSAGE_WORKFLOWS.md,
+  tests/integration/test_cwl_dm_reroute_on_ownership_change.py,
+  plans/implemented/tracker-0019-reroute-enrollment-dm-on-ownership-change.md. 2496 tests pass.
+
 2026-08-22 (25)
 - Investigated: mid-month CWL war fetches (ticket #0017). They are the notInWar CWL fallback
   (_find_active_cwl_war_for_clan) re-walking a FINISHED league group: for a season that is over
