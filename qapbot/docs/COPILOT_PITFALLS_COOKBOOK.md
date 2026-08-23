@@ -1888,3 +1888,38 @@ call, either guard it into `discord.utils.MISSING` or branch the call entirely. 
 `edit_original_response`, where it's true and deliberate) to a send-style call (where it isn't)
 just because the same variable is reused between the two.
 
+
+## Pitfall 43: assuming a renamed persistent view's `custom_id`s need a dedicated repair pass — check whether the STARTUP repost is already unconditional first
+
+**Symptom (2026-08-23, found while implementing plans/cwl-personal-hub.md's Phase 2d):**
+renaming `CwlManagementHubView`'s three `custom_id`s (`cwl_hub_mode_settings` etc. →
+`cwl_admin_hub_mode_settings` etc., to retire a prefix collision with an unrelated feature's own
+config columns) looked like it needed a one-time forced-repost repair with a persisted per-guild
+"have I migrated this guild yet" marker — reasoning by analogy from the *periodic* maintenance
+repost call (`QapBot.py`'s `main()`, `only_if_not_bottom=True`), which genuinely does skip a
+message that's already the newest one in its channel and could in principle leave a stale
+`custom_id` unfixed indefinitely.
+
+**Why the analogy was wrong:** `repost_anchored_message()`'s `only_if_not_bottom` parameter
+defaults to `False`. The *startup* repost call — `on_ready()`'s numbered `INIT-STEP-8b` (and
+now `8c`) — calls e.g. `repost_cwl_management_messages()` with **no** `only_if_not_bottom`
+argument at all, i.e. an **unconditional** repost, once per bot process start. Since a bot
+restart is exactly what a real deploy already is for this project, any custom_id (or other
+anchored-message content) change already self-heals on the very next restart with zero extra
+code — the "could live stale indefinitely" risk only applies to a bot that runs forever without
+ever restarting, which isn't this project's actual deployment model.
+
+**Fix:** none needed for the case that prompted this — verified by reading the exact startup
+call site (not inferred from the periodic call's behavior) and documenting the reasoning inline
+in `CwlManagementHubView`'s own docstring (`qapbot/ui_cwl_roster.py`) so a future reader doesn't
+have to re-derive it.
+
+**How to apply:** before adding a one-time migration/repair mechanism (a persisted "already
+migrated" marker, an extra forced-repost call, etc.) for *any* anchored-message content or
+component change, check whether `on_ready()`'s own startup repost for that message already runs
+unconditionally (no `only_if_not_bottom` argument, or `only_if_not_bottom=False`) — if so, the
+change is already self-healing on the next deploy, and a repair pass would just be redundant
+code with no behavioral benefit (or worse, a second repost racing the startup one in the same
+init sequence). Only build a real repair mechanism when the *periodic* maintenance path is the
+only thing that would ever touch that guild's message again (e.g. a guild that never gets a
+fresh bot restart for a long time in a deployment model where that's actually possible).

@@ -270,6 +270,20 @@ Each `guild_only()` decorator left in place — and each sub-action-level guard 
 - **CWL Management Hub auto-refresh + manual fallback button, added same day after a third live-testing gap.** Changes made via `/clan management` (entry point a) never propagated to the anchored Hub message (entry point b) — the two shells only refresh themselves, not each other, unless the change happened to originate from the Hub itself (whose own `refresh_cwl_view()` already called `refresh_cwl_management_hub_message()`) or from the web bridge (which already called it too, Phase B). Fixed by adding the same call to `ClanManagementView.refresh_cwl_view()` and to `CwlLineupRemovalConfirmView._on_confirm()` (the guild-removal cascade above) — every CWL-data mutation path now pushes a Hub refresh, regardless of which shell (or the bridge) triggered it. Also added a manual "🔄 Refresh" button to the Hub message itself (row 0, alongside Settings/Season Management — Discord's per-row cap of 5, still 2 slots free), explicitly framed as a last resort now that auto-refresh covers the normal cases. 3 new tests in `test_ui_cwl_roster.py`/`test_ui_clan_management_cwl_removal.py`.
 
 ### Personal CWL Hub message
+
+> **Superseded 2026-08-23** — this slice never shipped as designed below (verified independently
+> that session: the `guild_config.cwl_hub_*`/`user_players.cwl_permanent_optout`/
+> `cwl_default_preferred_league_rank` columns existed but nothing wrote them and no UI existed).
+> The project owner redesigned it with a materially different spec (renamed **"Player CWL
+> Settings Hub"**; single **"Your CWL Preferences"** button opening a Discord Activity web UI
+> instead of the two-button ephemeral-view design below; adds a general opt-in preference with a
+> new `auto_confirmed` signup status, and an opt-out "send the DM anyway" override). See
+> `plans/cwl-personal-hub.md` for the current design and implementation status — Phases 0-4
+> (schema, enrollment semantics, admin config, repost wiring) are implemented; the Activity
+> screen itself (Phase 5) and its i18n plumbing (Phase 6) are not yet. The section below is kept
+> for its still-accurate historical context (why the feature was scoped as a Phase 2 slice, the
+> Personal-vs-Management Hub separation rationale) but no longer describes what ships.
+
 A new anchored message, structurally identical to the registration message's lifecycle (own channel, own tracked `message_id`, reposted on the same cycle) but functionally its own thing — this is deliberately **not** a 5th button bolted onto `RegistrationView`, per the confirmed decision to keep account-identity concerns (registration) separate from clan-participation concerns (CWL).
 - **Message tracking**: the new `guild_config.cwl_hub_*` columns, read/written via `CACHE.server_config` + `persist_server_config()` — the exact path `registration_channel_id`/`registration_message_id` already use (verified: registration tracking has no per-column db accessors either; it flows entirely through `save_guild_config()`'s column list). No new db_manager functions beyond the column-list extension from the Data Model section.
 - **`qapbot/ui_cwl_roster.py`**: `CwlHubView(discord.ui.View)` — the persistent, `timeout=None` view attached to the anchored message (parallel to `RegistrationView`). Two buttons: **"My CWL Status"** and **"My Preferences"**, both handled as ephemeral follow-ups scoped to the clicking user (never edits the shared anchored message itself, same as how registration's buttons open per-user ephemeral flows).
