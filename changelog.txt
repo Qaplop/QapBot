@@ -1,6 +1,16 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (13)
+- Fixed: get_user()'s player dict and _replace_user_players_rows()'s INSERT both omitted
+  cwl_permanent_optout/cwl_default_preferred_league_rank, so any save_user() round-trip
+  (set_primary_account(), unlink_player(), a fresh /link, via CACHE.persist_user()) silently
+  reset both columns to their defaults for every OTHER linked account of that discord_id, not
+  just the one the caller meant to change. Phase 0 of plans/cwl-personal-hub.md (Player CWL
+  Settings Hub) -- lands ahead of the rest of that plan, before these columns have real
+  preference data to lose.
+  Files: qapbot/db_manager.py, tests/unit/test_db_manager_cwl_roster.py. 2613 tests pass.
+
 2026-08-23 (12)
 - Added: CWL Management's "Sign-Ups" embed field now shows a "New players without DM invitation:
   n" line, only when n > 0 -- same condition that already gates the "Notify New Pool Members"
