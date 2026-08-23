@@ -94,6 +94,23 @@ confirm/rule this out if a "regression" is reported for something that was suppo
 PROD (`npm run deploy:prod`) still needs explicit user confirmation before every deploy — this
 redeploy-on-edit habit applies to DEV only.
 
+**Cloudflare Pages "Preview" vs "Production" trap (2026-08-23 incident):** `client/`'s
+`deploy:dev`/`deploy:prod` scripts always pass `wrangler pages deploy dist --branch=main`. Do
+not remove that flag or run `wrangler pages deploy` manually without it. Cloudflare Pages only
+publishes a deploy to the bare `*.pages.dev` domain (the one Discord's Activity URL Mapping and
+`wrangler.toml`'s `REDIRECT_URI` actually point at) when the deployed branch equals the
+project's configured production branch (`main`) — `wrangler pages deploy` otherwise
+auto-detects the *locally checked-out git branch* and tags the deploy with that name instead,
+which lands as an inert "Preview" at a branch-scoped URL nobody's Activity ever loads. This repo
+develops CWL Activity work on feature branches (e.g. `cwl-player-hub`) while `main` stays
+untouched until merge, so a plain `deploy:dev` run from a feature branch silently ships to a URL
+Discord never sees — the build succeeds, `npx wrangler pages deploy` reports success, and the
+live Activity keeps serving the previous bundle with no error anywhere. `--branch=main` forces
+the deploy to be tagged as `main`/Production regardless of which branch is actually checked out
+locally, without requiring an actual `git checkout main` (which would swap every tracked file on
+disk and could break a bot currently running off the feature branch — see `git worktree` instead
+if you ever need both checked out at once).
+
 ## Local development
 
 Discord cannot embed `localhost` URLs directly — for local iteration once Phase A's spike is
