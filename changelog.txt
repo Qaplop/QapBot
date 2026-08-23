@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (16)
+- Changed: Phase 4d of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- unified the
+  two CWL DM response buttons' previously-diverged end-of-click rendering.
+  CwlSignupResponseButton (single-account invitation DM) used to always wipe the whole message;
+  CwlReminderResponseButton (tracker #0038's combined multi-account reminder DM) re-derived its
+  remaining pending accounts and re-rendered instead. Both now go through one new
+  rerender_cwl_dm_after_response() (ui_cwl_roster.py), which re-derives scope from a new
+  get_cwl_player_season_status_rows_by_dm_message_sync() query (db_manager.py) keyed by
+  dm_sent_via_message_id -- bookkeeping both DM senders already wrote per-account, so no new
+  column was needed. Also drivable without a discord.Interaction (via message.edit()), which
+  the invitation button's old wipe-in-place couldn't be -- infrastructure a later phase needs.
+  Real behavior refinement alongside the refactor: scope is now message-id-scoped rather than
+  "every pending signup in this event owned by this Discord user" (the reminder button's old
+  scoping), so a user's pending accounts split across multiple reminder DM chunks can no longer
+  bleed into each other's re-render. Both DM custom_id templates stay registered.
+  Files: qapbot/db_manager.py, qapbot/ui_cwl_roster.py, tests/discord/test_ui_cwl_roster.py,
+  tests/unit/test_cwl_remind_pending.py. 2648 tests pass.
+
 2026-08-23 (15)
 - Added: Phase 4a-4c of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- Start
   Enrollment (and every other place that seeds a cwl_signups row) now honors the standing
