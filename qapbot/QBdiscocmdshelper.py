@@ -1988,6 +1988,29 @@ def check_bot_admin_only(interaction: discord.Interaction, server_admin: str) ->
     return _is_configured_admin(interaction.user, server_admin)
 
 
+def check_bot_admin_or_tester(interaction: discord.Interaction, server_admin: str) -> bool:
+    """
+    Check if user is the bot admin OR a configured tester (CACHE.testers — the /admin
+    MANAGE_TESTERS allowlist). Used for tracker actions (status changes, test-case sign-off)
+    that testers are trusted to perform, unlike admin-only actions such as Grant access.
+
+    Deliberately not DEV/PROD-gated: unlike the CWL enrollment DM guard (which ignores
+    CACHE.testers in DEV to avoid double-DMing testers' real accounts), tracker items are
+    tested in DEV first and PROD second by the same testers, so both environments must honor
+    this allowlist.
+
+    Args:
+        interaction: Discord interaction object
+        server_admin: Configured bot admin — numeric Discord user ID (preferred) or username (legacy)
+
+    Returns:
+        bool: True if user is the bot admin or a configured tester, False otherwise
+    """
+    if check_bot_admin_only(interaction, server_admin):
+        return True
+    return str(interaction.user.id) in CACHE.testers
+
+
 def get_dm_caller_matched_guild_ids(discord_id: str) -> List[int]:
     """
     Every guild whose tracked clans include at least one of discord_id's linked accounts'

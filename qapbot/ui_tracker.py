@@ -1485,11 +1485,11 @@ class TrackerItemButton(
 
     async def _handle_status(self, interaction: discord.Interaction, item: Dict[str, Any]) -> None:
         from qapbot.config import CONFIG
-        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+        from qapbot.QBdiscocmdshelper import check_bot_admin_or_tester
 
         user_id = str(interaction.user.id)
         guild_id = interaction.guild.id if interaction.guild else None
-        if not check_bot_admin_only(interaction, CONFIG.server_admin):
+        if not check_bot_admin_or_tester(interaction, CONFIG.server_admin):
             await interaction.response.send_message(
                 t('ui_components.tracker.status_denied', user_id=user_id, guild_id=guild_id), ephemeral=True
             )
@@ -2147,10 +2147,10 @@ class ConfirmItemDoneView(discord.ui.View):
 
     async def _on_yes(self, interaction: discord.Interaction) -> None:
         from qapbot.config import CONFIG
-        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+        from qapbot.QBdiscocmdshelper import check_bot_admin_or_tester
 
         user_id = str(interaction.user.id)
-        if not check_bot_admin_only(interaction, CONFIG.server_admin):
+        if not check_bot_admin_or_tester(interaction, CONFIG.server_admin):
             await interaction.response.send_message(
                 t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=self.guild_id), ephemeral=True
             )
@@ -2216,11 +2216,11 @@ class TrackerTestPassButton(
 
     async def callback(self, interaction: discord.Interaction) -> None:
         from qapbot.config import CONFIG
-        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+        from qapbot.QBdiscocmdshelper import check_bot_admin_or_tester
 
         user_id = str(interaction.user.id)
         guild_id = interaction.guild.id if interaction.guild else None
-        if not check_bot_admin_only(interaction, CONFIG.server_admin):
+        if not check_bot_admin_or_tester(interaction, CONFIG.server_admin):
             await interaction.response.send_message(
                 t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=guild_id), ephemeral=True
             )
@@ -2263,11 +2263,11 @@ class TrackerTestFailButton(
 
     async def callback(self, interaction: discord.Interaction) -> None:
         from qapbot.config import CONFIG
-        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+        from qapbot.QBdiscocmdshelper import check_bot_admin_or_tester
 
         user_id = str(interaction.user.id)
         guild_id = interaction.guild.id if interaction.guild else None
-        if not check_bot_admin_only(interaction, CONFIG.server_admin):
+        if not check_bot_admin_or_tester(interaction, CONFIG.server_admin):
             await interaction.response.send_message(
                 t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=guild_id), ephemeral=True
             )
@@ -2321,10 +2321,10 @@ class ConfirmForceMoveView(discord.ui.View):
 
     async def _on_yes(self, interaction: discord.Interaction) -> None:
         from qapbot.config import CONFIG
-        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+        from qapbot.QBdiscocmdshelper import check_bot_admin_or_tester
 
         user_id = str(interaction.user.id)
-        if not check_bot_admin_only(interaction, CONFIG.server_admin):
+        if not check_bot_admin_or_tester(interaction, CONFIG.server_admin):
             await interaction.response.send_message(
                 t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=self.guild_id), ephemeral=True
             )
@@ -2377,11 +2377,11 @@ class TrackerTestMoveDoneButton(
     async def callback(self, interaction: discord.Interaction) -> None:
         from qapbot.cache_manager import CACHE
         from qapbot.config import CONFIG
-        from qapbot.QBdiscocmdshelper import check_bot_admin_only
+        from qapbot.QBdiscocmdshelper import check_bot_admin_or_tester
 
         user_id = str(interaction.user.id)
         guild_id = interaction.guild.id if interaction.guild else None
-        if not check_bot_admin_only(interaction, CONFIG.server_admin):
+        if not check_bot_admin_or_tester(interaction, CONFIG.server_admin):
             await interaction.response.send_message(
                 t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=guild_id), ephemeral=True
             )
@@ -2408,7 +2408,8 @@ class TrackerTestMoveDoneButton(
 async def handle_tracker_test_reaction(payload: discord.RawReactionActionEvent) -> None:
     """👍 on a test-case message marks every still-pending environment passed at once (plan
     §2.4 point 3) — a new on_raw_reaction_add listener (the bot had none before this, plan
-    §5.4). Raw (not cached) so it works after restarts. Bot-admin only (plan §8.2); anyone
+    §5.4). Raw (not cached) so it works after restarts. Bot-admin or configured tester
+    (CACHE.testers) only (2026-08-23 follow-up to plan §8.2, which was admin-only); anyone
     else's reaction is silently skipped (never removed — that would need an extra permission
     the bot may not have, and isn't worth the noise).
 
@@ -2431,7 +2432,9 @@ async def handle_tracker_test_reaction(payload: discord.RawReactionActionEvent) 
         return
     from qapbot.cache_manager import CACHE
 
-    if not CONFIG.server_admin or str(payload.user_id) != CONFIG.server_admin:
+    actor = str(payload.user_id)
+    is_admin = bool(CONFIG.server_admin) and actor == CONFIG.server_admin
+    if not is_admin and actor not in CACHE.testers:
         return
     db = CACHE.db_manager
     if db is None:
@@ -2450,9 +2453,8 @@ async def handle_tracker_test_reaction(payload: discord.RawReactionActionEvent) 
         # already-archived message) — a genuine no-op must not touch the message at all. Also
         # belt-and-suspenders alongside _refresh_testcase_message's own archived check below.
         return
-    actor_id = str(payload.user_id)
     for env in pending_envs:
-        await db.mark_tracker_environment_passed(item_number, env, actor_id)
+        await db.mark_tracker_environment_passed(item_number, env, actor)
     await _refresh_testcase_message(item_number)
 
     after = await db.get_tracker_testcases(item_number)
@@ -2461,4 +2463,4 @@ async def handle_tracker_test_reaction(payload: discord.RawReactionActionEvent) 
         result = await finalize_testcases_move(item_number)
         linked_item = result.get("linked_item")
         if linked_item is not None:
-            await _post_item_done_confirmation_passive(linked_item, actor_id)
+            await _post_item_done_confirmation_passive(linked_item, actor)

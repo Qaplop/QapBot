@@ -39,6 +39,20 @@ def test_check_bot_admin_only_numeric_id(mock_interaction):
 
 
 @pytest.mark.discord
+def test_check_bot_admin_or_tester(mock_interaction, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper import check_bot_admin_or_tester
+
+    monkeypatch.setattr(CACHE, "testers", {"999999999"})
+    # mock_interaction.user.id == 123456789 (conftest)
+    assert check_bot_admin_or_tester(mock_interaction, "123456789") is True  # admin
+    monkeypatch.setattr(CACHE, "testers", {"123456789"})
+    assert check_bot_admin_or_tester(mock_interaction, "999999999") is True  # tester
+    monkeypatch.setattr(CACHE, "testers", set())
+    assert check_bot_admin_or_tester(mock_interaction, "999999999") is False  # neither
+
+
+@pytest.mark.discord
 @pytest.mark.asyncio
 async def test_check_admin_permissions_numeric_id(mock_interaction):
     from qapbot.QBdiscocmdshelper import check_admin_permissions

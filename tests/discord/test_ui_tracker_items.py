@@ -1124,7 +1124,7 @@ async def test_refresh_testcase_message_strips_view_once_archived(db, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_reaction_from_non_admin_is_ignored(db, monkeypatch):
+async def test_reaction_from_non_admin_non_tester_is_ignored(db, monkeypatch):
     _wire_bot(monkeypatch, channel=None)
     item_number = await _make_item(db)
     await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
@@ -1134,6 +1134,26 @@ async def test_reaction_from_non_admin_is_ignored(db, monkeypatch):
 
     cases = await db.get_tracker_testcases(item_number)
     assert cases[0]["passed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reaction_from_configured_tester_is_honored(db, monkeypatch):
+    """Testers (CACHE.testers, the /admin MANAGE_TESTERS allowlist) can sign off test cases the
+    same as the bot admin -- not just the admin account (2026-08-23 permission change)."""
+    from qapbot.cache_manager import CACHE
+
+    monkeypatch.setattr(CACHE, "testers", {"999999"})
+    message = _fake_message()
+    channel = _fake_channel(fetch_message=message)
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
+    await db.update_tracker_item(item_number, test_channel_id="1", test_message_id="999", status="testing")
+
+    await handle_tracker_test_reaction(_fake_payload(user_id=999999))
+
+    cases = await db.get_tracker_testcases(item_number)
+    assert cases[0]["passed"] == 1
 
 
 @pytest.mark.asyncio

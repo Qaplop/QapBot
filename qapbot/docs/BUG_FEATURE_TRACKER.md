@@ -204,9 +204,21 @@ including DEV, whose DB is a routine PROD-backup copy that can contain the exact
   short-lived, session-scoped Yes/No prompts (not restart-safe by design, same convention as
   `TrackerDraftView`) used by the decoupled done-linkage flow above.
 - The 👍-reaction sign-off shortcut is a **new** `on_raw_reaction_add` listener in `QapBot.py`
-  (the bot had none before) — bot-admin only, raw (not cached) so it survives restarts. A
-  redundant reaction with nothing left pending is a true no-op (returns before touching the
-  message at all — see `_refresh_testcase_message()`'s archived handling above).
+  (the bot had none before) — bot-admin or configured tester only, raw (not cached) so it
+  survives restarts. A redundant reaction with nothing left pending is a true no-op (returns
+  before touching the message at all — see `_refresh_testcase_message()`'s archived handling
+  above).
+
+**Permission model (2026-08-23 revision)**: the Status button, the whole test-case sign-off loop
+(`TrackerTestPassButton`/`TrackerTestFailButton`/`TrackerTestMoveDoneButton`,
+`ConfirmItemDoneView`/`ConfirmForceMoveView`, and the 👍-reaction shortcut) all gate on
+`check_bot_admin_or_tester()` (`qapbot/QBdiscocmdshelper.py`) — the bot admin **or** anyone in
+`CACHE.testers` (the `/admin` → Manage Testers allowlist). This is deliberately *not*
+DEV/PROD-gated, unlike the CWL enrollment DM guard's use of the same allowlist: tracker items are
+tested in DEV first and PROD second by the same testers, so both environments must honor it.
+Grant access (`_handle_grant_access()`) and the reporter/admin edit gate
+(`_check_reporter_or_admin()`) are unchanged — still `check_bot_admin_only()` — since neither is
+part of the test-case/status workflow testers were given.
 
 ### Test-case message chunking (2026-08-23, tracker #0028)
 
