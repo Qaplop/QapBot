@@ -1,6 +1,23 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (19)
+- Added: Phase 5a+5c of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- the
+  player-prefs bridge endpoints. New GET/POST /api/cwl/player-prefs and POST
+  /api/cwl/player-prefs/status (qapbot/web_bridge.py) -- the first CWL bridge endpoints that
+  are not admin-gated; account protection instead derives the whole set of accounts a request
+  may touch solely from the caller's own linked accounts, and a player_tag belonging to someone
+  else 403s the whole request. The status endpoint reuses the existing
+  _apply_cwl_signup_response() so a member changing their status from the Activity is provably
+  identical to answering the DM, then best-effort reconciles that DM so it doesn't sit
+  contradicting what they just did.
+  New shared activity/client/src/timeFormat.ts and signupStatus.ts, extracted out of
+  clanConfigTable.ts/enrollmentBoard.ts so the new player-prefs screen (still to come) can never
+  disagree with the existing boards about time formatting or status icons/labels.
+  Files: qapbot/web_bridge.py, activity/client/src/{types,clanConfigTable,enrollmentBoard,
+  timeFormat,signupStatus}.ts, tests/discord/test_web_bridge.py. 2688 tests pass; activity/client
+  typecheck clean.
+
 2026-08-23 (18)
 - Added: Phase 3 of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- repost wiring.
   New repost_cwl_player_hub_messages() (QapBot.py), wired into all three existing repost call
