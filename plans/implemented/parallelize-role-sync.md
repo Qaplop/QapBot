@@ -5,13 +5,13 @@ first PROD cycle after the 2026-08-14 `has_active_subscriptions` fix — changel
 No tracker item exists for this, so the plan filename carries no `tracker-NNNN-` prefix
 (Cardinal Rule 15).
 
-**Status:** not started. Hand-over target: sonnet-5.
+**Status:** Implemented 2026-08-23. See changelog.txt 2026-08-23 (2).
 
 ---
 
 ## 1. Problem
 
-[qapbot/guild_role_manager.py:960-964](../qapbot/guild_role_manager.py#L960-L964) —
+[qapbot/guild_role_manager.py:960-964](../../qapbot/guild_role_manager.py#L960-L964) —
 `sync_roles_for_clan_members()` ends in a plain serial loop:
 
 ```python
@@ -29,7 +29,7 @@ registered members burns real wall-clock time inside a single update cycle. `log
 measured **4 gaps of 34s / 17.9s / 17.8s / 11.1s in one ~5min PROD cycle**.
 
 This runs on the background task spawned by
-[qapbot/coc_cache.py:434](../qapbot/coc_cache.py#L434) (`_do_role_sync` →
+[qapbot/coc_cache.py:434](../../qapbot/coc_cache.py#L434) (`_do_role_sync` →
 `spawn_tracked("coc-cache-role-sync-<tag>")`), once per clan per real API fetch, and it iterates
 guilds sequentially inside that task too — so the per-clan cost multiplies by the number of
 guilds covering that clan.
@@ -37,8 +37,8 @@ guilds covering that clan.
 ## 2. Fix
 
 Replace the serial loop with **bounded concurrency**, using the same pattern as Phase 1's fetch
-semaphore in [QapBot.py:1137-1142](../QapBot.py#L1137-L1142) and
-[QapBot.py:1161-1166](../QapBot.py#L1161-L1166): a per-call `asyncio.Semaphore` + an inner
+semaphore in [QapBot.py:1137-1142](../../QapBot.py#L1137-L1142) and
+[QapBot.py:1161-1166](../../QapBot.py#L1161-L1166): a per-call `asyncio.Semaphore` + an inner
 `async def` worker + `asyncio.gather(..., return_exceptions=True)`.
 
 ### Why per-call and not a module-level semaphore
@@ -62,7 +62,7 @@ discord.py already serializes behind its own bucket lock — concurrency above a
 queues up behind that lock and holds more coroutines open for no gain. The win we are after is
 overlapping the *non-bucket* parts: `fetch_member()` round-trips, the many calls that turn out
 to be complete no-ops (`assign_role_to_member()` returns early when the role is already present,
-[guild_role_manager.py:530-531](../qapbot/guild_role_manager.py#L530-L531) — no API call at all),
+[guild_role_manager.py:530-531](../../qapbot/guild_role_manager.py#L530-L531) — no API call at all),
 and per-user CACHE work. Start at 5; it is a one-constant change if PROD logs show headroom.
 
 ## 3. Changes
@@ -70,7 +70,7 @@ and per-user CACHE work. Start at 5; it is a one-constant change if PROD logs sh
 ### 3.1 `qapbot/guild_role_manager.py` — constant
 
 Add next to the other module-level constants (near `_users_being_synced`, around
-[line 88](../qapbot/guild_role_manager.py#L88)):
+[line 88](../../qapbot/guild_role_manager.py#L88)):
 
 ```python
 # Max concurrent per-user role syncs inside one sync_roles_for_clan_members() /
@@ -85,7 +85,7 @@ _ROLE_SYNC_CONCURRENCY = 5
 
 ### 3.2 `qapbot/guild_role_manager.py` — replace the serial loop
 
-Replace [lines 960-964](../qapbot/guild_role_manager.py#L960-L964) with:
+Replace [lines 960-964](../../qapbot/guild_role_manager.py#L960-L964) with:
 
 ```python
     if not discord_users_to_sync:
@@ -120,7 +120,7 @@ Notes for the implementer:
 
 - **Keep the warning message text byte-identical** to the current one. It is the same log line
   operators grep for, and `log_time_gaps.py` correlation against past PROD logs depends on it.
-- `asyncio` is already imported ([line 34](../qapbot/guild_role_manager.py#L34)). **`time` is
+- `asyncio` is already imported ([line 34](../../qapbot/guild_role_manager.py#L34)). **`time` is
   not** — add `import time` to the stdlib import block.
 - `return_exceptions=True` is belt-and-braces: `_sync_one` already swallows everything, but this
   matches Phase 1 and guarantees one pathological worker can never abort the batch.
@@ -129,11 +129,11 @@ Notes for the implementer:
 
 ### 3.3 The `_users_being_synced` guard — verify, don't change
 
-[guild_role_manager.py:606-612](../qapbot/guild_role_manager.py#L606-L612) *skips* (does not wait
+[guild_role_manager.py:606-612](../../qapbot/guild_role_manager.py#L606-L612) *skips* (does not wait
 for) a user already being synced. Two things to confirm while implementing:
 
 1. **Within one call there are no duplicates**: the collection loop at
-   [lines 946-958](../qapbot/guild_role_manager.py#L946-L958) `break`s after the first matching
+   [lines 946-958](../../qapbot/guild_role_manager.py#L946-L958) `break`s after the first matching
    player, so each `user_id_str` is appended at most once. Concurrency inside one call therefore
    cannot self-collide. Verify this still holds; do not add a `set()` dedupe on top (it would
    change iteration order for no benefit).
@@ -149,9 +149,9 @@ for) a user already being synced. Two things to confirm while implementing:
 The backlog item names `sync_roles_for_clan_members()` only, but the identical serial pattern
 exists twice more in the same file, in `sync_all_roles_for_guild()`:
 
-- [lines 855-864](../qapbot/guild_role_manager.py#L855-L864) — the `for member in guild.members`
+- [lines 855-864](../../qapbot/guild_role_manager.py#L855-L864) — the `for member in guild.members`
   loop over every registered guild member (**the bigger population of the two functions**).
-- [lines 887-896](../qapbot/guild_role_manager.py#L887-L896) — the capped (≤50) missing-member
+- [lines 887-896](../../qapbot/guild_role_manager.py#L887-L896) — the capped (≤50) missing-member
   verification loop, where every iteration is a guaranteed `fetch_member()` API call.
 
 Same treatment applies cleanly, with three extra constraints:
@@ -160,7 +160,7 @@ Same treatment applies cleanly, with three extra constraints:
   incremented by `+= 1` on a closure variable — that happens to work in asyncio (no preemption
   mid-statement) but is fragile to read. Have the worker **return** a `bool`/sentinel and tally
   the gathered results afterwards, the way Phase 1 tallies `fetch_results` at
-  [QapBot.py:1230-1236](../QapBot.py#L1230-L1236).
+  [QapBot.py:1230-1236](../../QapBot.py#L1230-L1236).
 - The first loop passes `member=member` (fast path, no `fetch_member()`); preserve that.
 - Build `seen_ids` in a plain synchronous pass over `guild.members` **before** launching the
   gather, so `missing_ids` is still computed from a complete set (today it is filled during the
@@ -175,7 +175,7 @@ and leave this section here as the follow-up.
 
 Extend `tests/unit/test_guild_role_manager.py` — it already has async class-based tests and the
 fixture shape to copy from (see `TestCocRoleBootstrap` at
-[line 359](../tests/unit/test_guild_role_manager.py#L359) for the
+[line 359](../../tests/unit/test_guild_role_manager.py#L359) for the
 `patch("qapbot.cache_manager.CACHE", fake_cache)` + fake-guild setup). Add a
 `TestRoleSyncConcurrency` class marked `@pytest.mark.smoke`:
 
@@ -203,7 +203,7 @@ Run with `.\run_tests.ps1` — **never** a raw pytest command. Baseline as of th
 ## 5. Docs (Cardinal Rule 15 — same change, not a follow-up)
 
 - **`qapbot/docs/CODE_STRUCTURE.md`** — the `guild_role_manager.py` tree at
-  [lines 987-996](../qapbot/docs/CODE_STRUCTURE.md#L987-L996) currently says
+  [lines 987-996](../../qapbot/docs/CODE_STRUCTURE.md#L987-L996) currently says
   `"Calls sync_roles_for_user() for every registered guild member"`. Update that line and add a
   `sync_roles_for_clan_members` entry noting the bounded-concurrency (`_ROLE_SYNC_CONCURRENCY`)
   behaviour.
@@ -242,7 +242,7 @@ Run with `.\run_tests.ps1` — **never** a raw pytest command. Baseline as of th
 
 - Changing `_users_being_synced` from skip-semantics to wait-semantics (§3.3).
 - Parallelizing the *guild* loop in `coc_cache.py`'s `_do_role_sync`
-  ([lines 410-441](../qapbot/coc_cache.py#L410-L441)). Guild count is small and each guild is a
+  ([lines 410-441](../../qapbot/coc_cache.py#L410-L441)). Guild count is small and each guild is a
   separate rate-limit bucket, so the per-guild fix above should already cover the measured cost;
   revisit only if PROD logs still show a gap after this lands.
 - Any change to `assign_role_to_member` / `remove_role_from_member` error handling.

@@ -424,3 +424,238 @@ class TestCocRoleBootstrap:
             await sync_all_roles_for_guild(guild, "111")
 
         fake_coc_cache.get_clan.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Bounded-concurrency role sync (sync_roles_for_clan_members / sync_all_roles_for_guild)
+# ---------------------------------------------------------------------------
+
+
+def _make_registered_users(user_ids: list[int], clan_tag: str = "#CLAN1") -> dict[str, Any]:
+    """Build a CACHE.user_accounts-shaped dict where each user has one player in clan_tag."""
+    return {
+        str(uid): {"players": [{"current_clan_tag": clan_tag, "verified": True}]}
+        for uid in user_ids
+    }
+
+
+@pytest.mark.smoke
+class TestSyncRolesForClanMembersConcurrency:
+    """Verify sync_roles_for_clan_members() uses bounded concurrency, not a serial loop."""
+
+    async def test_all_users_synced_exactly_once(self):
+        import qapbot.guild_role_manager as grm
+
+        user_ids = list(range(1, 13))  # 12 users
+        fake_cache = MagicMock()
+        fake_cache.server_config = {"111": {"coc_role_enabled": True, "clan_role_enabled": False}}
+        fake_cache.user_accounts = _make_registered_users(user_ids)
+
+        synced_ids: list[int] = []
+
+        async def _fake_sync(guild, guild_id, discord_user_id, member=None):
+            synced_ids.append(discord_user_id)
+            return True
+
+        guild = _make_guild(roles=[])
+
+        with patch("qapbot.cache_manager.CACHE", fake_cache), \
+             patch.object(grm, "sync_roles_for_user", _fake_sync):
+            await grm.sync_roles_for_clan_members(guild, "111", "#CLAN1", [])
+
+        assert sorted(synced_ids) == user_ids
+        assert len(synced_ids) == len(set(synced_ids))
+
+    async def test_concurrency_is_bounded(self):
+        import asyncio as _asyncio
+
+        import qapbot.guild_role_manager as grm
+
+        user_ids = list(range(1, 21))  # 20 users
+        fake_cache = MagicMock()
+        fake_cache.server_config = {"111": {"coc_role_enabled": True, "clan_role_enabled": False}}
+        fake_cache.user_accounts = _make_registered_users(user_ids)
+
+        in_flight = 0
+        max_in_flight = 0
+
+        async def _fake_sync(guild, guild_id, discord_user_id, member=None):
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await _asyncio.sleep(0.01)
+            in_flight -= 1
+            return True
+
+        guild = _make_guild(roles=[])
+
+        with patch("qapbot.cache_manager.CACHE", fake_cache), \
+             patch.object(grm, "sync_roles_for_user", _fake_sync):
+            await grm.sync_roles_for_clan_members(guild, "111", "#CLAN1", [])
+
+        assert max_in_flight <= grm._ROLE_SYNC_CONCURRENCY
+        assert max_in_flight > 1  # proves it's no longer a serial loop
+
+    async def test_one_failure_does_not_abort_batch(self, caplog):
+        import qapbot.guild_role_manager as grm
+
+        user_ids = list(range(1, 8))  # 7 users
+        fake_cache = MagicMock()
+        fake_cache.server_config = {"111": {"coc_role_enabled": True, "clan_role_enabled": False}}
+        fake_cache.user_accounts = _make_registered_users(user_ids)
+
+        synced_ids: list[int] = []
+
+        async def _fake_sync(guild, guild_id, discord_user_id, member=None):
+            if discord_user_id == 4:
+                raise RuntimeError("boom")
+            synced_ids.append(discord_user_id)
+            return True
+
+        guild = _make_guild(roles=[])
+
+        with patch("qapbot.cache_manager.CACHE", fake_cache), \
+             patch.object(grm, "sync_roles_for_user", _fake_sync), \
+             caplog.at_level("WARNING"):
+            await grm.sync_roles_for_clan_members(guild, "111", "#CLAN1", [])
+
+        assert sorted(synced_ids) == [uid for uid in user_ids if uid != 4]
+        assert any(
+            "Error syncing roles for user 4" in rec.message for rec in caplog.records
+        )
+
+    async def test_empty_user_list_short_circuits(self):
+        import qapbot.guild_role_manager as grm
+
+        fake_cache = MagicMock()
+        fake_cache.server_config = {"111": {"coc_role_enabled": True, "clan_role_enabled": False}}
+        fake_cache.user_accounts = {}  # no registered users in this clan
+
+        guild = _make_guild(roles=[])
+
+        with patch("qapbot.cache_manager.CACHE", fake_cache), \
+             patch.object(grm, "sync_roles_for_user", AsyncMock()) as mock_sync:
+            await grm.sync_roles_for_clan_members(guild, "111", "#CLAN1", [])
+
+        mock_sync.assert_not_called()
+
+
+@pytest.mark.smoke
+class TestSyncAllRolesForGuildConcurrency:
+    """Verify sync_all_roles_for_guild() also uses bounded concurrency for its member loop."""
+
+    def _guild_with_members(self, user_ids: list[int]):
+        guild = _make_guild(roles=[])
+        guild.chunked = True  # skip Discord chunk() API call
+        members = []
+        for uid in user_ids:
+            m = MagicMock()
+            m.id = uid
+            members.append(m)
+        guild.members = members
+        return guild
+
+    async def test_all_users_synced_exactly_once(self):
+        import qapbot.guild_role_manager as grm
+
+        user_ids = list(range(1, 13))  # 12 users
+        fake_cache = MagicMock()
+        fake_cache.server_config = {
+            "111": {
+                "coc_role_enabled": True,
+                "clan_role_enabled": False,
+                "member_clans": ["#CLAN1"],
+                "member_families": [],
+            }
+        }
+        fake_cache.user_accounts = _make_registered_users(user_ids)
+        fake_cache.clan_families = {}
+
+        synced_ids: list[int] = []
+
+        async def _fake_sync(guild, guild_id, discord_user_id, member=None):
+            synced_ids.append(discord_user_id)
+            return True
+
+        guild = self._guild_with_members(user_ids)
+
+        with patch("qapbot.cache_manager.CACHE", fake_cache), \
+             patch.object(grm, "sync_roles_for_user", _fake_sync):
+            await grm.sync_all_roles_for_guild(guild, "111")
+
+        assert sorted(synced_ids) == user_ids
+        assert len(synced_ids) == len(set(synced_ids))
+
+    async def test_concurrency_is_bounded(self):
+        import asyncio as _asyncio
+
+        import qapbot.guild_role_manager as grm
+
+        user_ids = list(range(1, 21))  # 20 users
+        fake_cache = MagicMock()
+        fake_cache.server_config = {
+            "111": {
+                "coc_role_enabled": True,
+                "clan_role_enabled": False,
+                "member_clans": ["#CLAN1"],
+                "member_families": [],
+            }
+        }
+        fake_cache.user_accounts = _make_registered_users(user_ids)
+        fake_cache.clan_families = {}
+
+        in_flight = 0
+        max_in_flight = 0
+
+        async def _fake_sync(guild, guild_id, discord_user_id, member=None):
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await _asyncio.sleep(0.01)
+            in_flight -= 1
+            return True
+
+        guild = self._guild_with_members(user_ids)
+
+        with patch("qapbot.cache_manager.CACHE", fake_cache), \
+             patch.object(grm, "sync_roles_for_user", _fake_sync):
+            await grm.sync_all_roles_for_guild(guild, "111")
+
+        assert max_in_flight <= grm._ROLE_SYNC_CONCURRENCY
+        assert max_in_flight > 1  # proves it's no longer a serial loop
+
+    async def test_counters_match_results(self, caplog):
+        """The final 'N synced, M errors' tally must be correct once counting moves
+        from in-loop increments to post-gather counting (see plan §3.4)."""
+        import qapbot.guild_role_manager as grm
+
+        user_ids = list(range(1, 8))  # 7 users
+        fake_cache = MagicMock()
+        fake_cache.server_config = {
+            "111": {
+                "coc_role_enabled": True,
+                "clan_role_enabled": False,
+                "member_clans": ["#CLAN1"],
+                "member_families": [],
+            }
+        }
+        fake_cache.user_accounts = _make_registered_users(user_ids)
+        fake_cache.clan_families = {}
+
+        async def _fake_sync(guild, guild_id, discord_user_id, member=None):
+            if discord_user_id in (2, 5):
+                raise RuntimeError("boom")
+            return True
+
+        guild = self._guild_with_members(user_ids)
+
+        with patch("qapbot.cache_manager.CACHE", fake_cache), \
+             patch.object(grm, "sync_roles_for_user", _fake_sync), \
+             caplog.at_level("INFO"):
+            await grm.sync_all_roles_for_guild(guild, "111")
+
+        summary_lines = [
+            rec.message for rec in caplog.records if "role sync complete" in rec.message
+        ]
+        assert len(summary_lines) == 1
+        assert "5 synced, 2 errors" in summary_lines[0]

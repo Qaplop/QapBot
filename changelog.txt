@@ -20,7 +20,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   restart to take effect (the tracker MCP tools point at bridge-prod.qapbot.uk) -- once restarted,
   #14/#17/#19's test cases need re-posting since they never actually reached Discord.
 
-2026-08-23 (2)
+2026-08-23 (3)
 - Fixed: role sync now runs with bounded Discord-side concurrency instead of a serial per-user
   loop. `log_time_gaps.py` against the first PROD cycle after the 2026-08-14
   has_active_subscriptions fix (changelog (12)) found 4 gaps of 34s/17.9s/17.8s/11.1s in a single

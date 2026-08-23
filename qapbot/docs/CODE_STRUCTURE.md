@@ -985,13 +985,22 @@ kept here only for functions not narrated elsewhere.
 
 🟩 qapbot/guild_role_manager.py
 ├── _coc_role_refreshed_clans: set[str]  (module-level; one bootstrap per process lifetime)
+├── _ROLE_SYNC_CONCURRENCY = 5  (module-level; caps concurrent sync_roles_for_user() calls
+│   below, per asyncio.Semaphore built fresh inside each sync_all_roles_for_guild()/
+│   sync_roles_for_clan_members() call — see RATE_LIMITING_IMPLEMENTATION.md "Discord
+│   role-edit concurrency")
 ├── sync_all_roles_for_guild(guild, guild_id)
 │   ├── Bootstrap: calls coc_clan_cache.get_clan() for each uncached member clan
 │   │   └── Ensures coc_role is populated after restart (coc_role is memory-only)
-│   └── Calls sync_roles_for_user() for every registered guild member
+│   └── Calls sync_roles_for_user() for every registered guild member, bounded-concurrent
+│       via _ROLE_SYNC_CONCURRENCY (asyncio.gather over a semaphore-guarded worker, both
+│       for the chunked-member pass and the capped missing-member verification pass)
 ├── sync_roles_for_user(guild, guild_id, discord_user_id)
 │   ├── CoC role sync: _get_highest_coc_role_for_user() → assign/remove 4 CoC roles
 │   └── Clan role sync: _get_clan_tags_for_user() → assign/remove per-clan roles
+├── sync_roles_for_clan_members(guild, guild_id, clan_tag, coc_members)
+│   └── Fast path from coc_cache.py's per-clan fetch trigger — calls sync_roles_for_user()
+│       for just this clan's registered members, bounded-concurrent via _ROLE_SYNC_CONCURRENCY
 ├── create_coc_ingame_roles / delete_all_coc_ingame_roles
 ├── create_clan_role / create_all_clan_roles / delete_clan_role_from_guild
 └── get_or_create_discord_role / normalize_discord_role_name

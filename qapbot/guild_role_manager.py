@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import discord
@@ -88,6 +89,15 @@ _coc_role_refreshed_clans: set[str] = set()
 # Prevents duplicate work when sync_all_roles_for_guild and sync_roles_for_clan_members
 # run concurrently and both try to sync the same user at the same moment.
 _users_being_synced: set[tuple[str, int]] = set()
+
+# Max concurrent per-user role syncs inside one sync_roles_for_clan_members() /
+# sync_all_roles_for_guild() call.  Bounds how many Discord member-edit chains are in
+# flight at once: discord.py already serializes the actual role-edit calls behind its
+# per-guild rate-limit bucket, so this exists to overlap the *other* work (fetch_member()
+# round-trips, no-op role checks, CACHE lookups) without opening an unbounded number of
+# coroutines.  Same pattern as Phase 1's _FETCH_CONCURRENCY in QapBot.py, lower value
+# because the binding constraint here is a Discord per-guild bucket, not connection count.
+_ROLE_SYNC_CONCURRENCY = 5
 
 
 # ---------------------------------------------------------------------------
@@ -855,19 +865,34 @@ async def sync_all_roles_for_guild(
     if not guild.chunked:
         await guild.chunk(cache=True)
 
-    synced = 0
-    errors = 0
+    _sem = asyncio.Semaphore(_ROLE_SYNC_CONCURRENCY)
+
+    async def _sync_one_member(member: discord.Member) -> bool:
+        """Sync one already-fetched guild member.  Lets exceptions propagate to the
+        gather() below, which correlates them back to the member for logging/counting."""
+        async with _sem:
+            return await sync_roles_for_user(guild, guild_id, member.id, member=member)
+
     seen_ids: set[int] = set()
+    members_to_sync: List[discord.Member] = []
     for member in guild.members:
         if member.id not in registered_ids:
             continue
         seen_ids.add(member.id)
-        try:
-            if await sync_roles_for_user(guild, guild_id, member.id, member=member):
-                synced += 1
-        except Exception as e:
+        members_to_sync.append(member)
+
+    _results = await asyncio.gather(
+        *(_sync_one_member(m) for m in members_to_sync),
+        return_exceptions=True,
+    )
+    synced = 0
+    errors = 0
+    for _member, _r in zip(members_to_sync, _results):
+        if isinstance(_r, Exception):
             errors += 1
-            logging.warning(f"[ROLE-SYNC] Error syncing roles for user {member.id} in guild {guild.name} ({guild_id}): {e}")
+            logging.warning(f"[ROLE-SYNC] Error syncing roles for user {_member.id} in guild {guild.name} ({guild_id}): {_r}")
+        elif _r is True:
+            synced += 1
 
     # An EXPECTED member (registered with a player currently in a clan this guild covers)
     # not found in guild.members after chunk() is ambiguous from the cache alone: guild.chunked
@@ -894,15 +919,26 @@ async def sync_all_roles_for_guild(
                 f"[ROLE-SYNC] Guild {guild.name} ({guild_id}): verifying only {len(_to_verify)} of "
                 f"{len(missing_ids)} expected-but-uncached member(s) this run; rest deferred to next cycle"
             )
-        for _uid in _to_verify:
-            try:
-                if await sync_roles_for_user(guild, guild_id, _uid):
-                    synced += 1
-                # else: confirmed not a member (or otherwise skipped) — already logged
-                # at DEBUG (or WARNING, if genuinely inconclusive) inside sync_roles_for_user.
-            except Exception as e:
+        async def _verify_one(_uid: int) -> bool:
+            """Verify+sync one uncached-but-expected user.
+
+            A False return means confirmed not a member (or otherwise skipped) — already
+            logged at DEBUG (or WARNING, if genuinely inconclusive) inside sync_roles_for_user.
+            Exceptions propagate to the gather() below for correlation/logging there.
+            """
+            async with _sem:
+                return await sync_roles_for_user(guild, guild_id, _uid)
+
+        _verify_results = await asyncio.gather(
+            *(_verify_one(_uid) for _uid in _to_verify),
+            return_exceptions=True,
+        )
+        for _uid, _r in zip(_to_verify, _verify_results):
+            if isinstance(_r, Exception):
                 errors += 1
-                logging.warning(f"[ROLE-SYNC] Error syncing roles for user {_uid} in guild {guild.name} ({guild_id}): {e}")
+                logging.warning(f"[ROLE-SYNC] Error syncing roles for user {_uid} in guild {guild.name} ({guild_id}): {_r}")
+            elif _r is True:
+                synced += 1
 
     logging.info(f"[ROLE-SYNC] Guild {guild.name} ({guild_id}) role sync complete: {synced} synced, {errors} errors")
 
@@ -957,11 +993,32 @@ async def sync_roles_for_clan_members(
                     pass
                 break
 
-    for discord_user_id in discord_users_to_sync:
-        try:
-            await sync_roles_for_user(guild, guild_id, discord_user_id)
-        except Exception as e:
-            logging.warning(f"[ROLE-SYNC] Error syncing roles for user {discord_user_id} in guild {guild.name} ({guild_id}) (clan {clan_tag}): {e}")
+    if not discord_users_to_sync:
+        return
+
+    _sem = asyncio.Semaphore(_ROLE_SYNC_CONCURRENCY)
+
+    async def _sync_one(discord_user_id: int) -> None:
+        """Sync one user's roles, semaphore-bounded.  Never raises."""
+        async with _sem:
+            try:
+                await sync_roles_for_user(guild, guild_id, discord_user_id)
+            except Exception as e:
+                logging.warning(
+                    f"[ROLE-SYNC] Error syncing roles for user {discord_user_id} in guild "
+                    f"{guild.name} ({guild_id}) (clan {clan_tag}): {e}"
+                )
+
+    _t0 = time.monotonic()
+    await asyncio.gather(
+        *(_sync_one(uid) for uid in discord_users_to_sync),
+        return_exceptions=True,
+    )
+    logging.info(
+        "[ROLE-SYNC] Clan %s in guild %s (%s): synced %d user(s) in %.2fs (max %d concurrent)",
+        clan_tag, guild.name, guild_id, len(discord_users_to_sync),
+        time.monotonic() - _t0, _ROLE_SYNC_CONCURRENCY,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -165,6 +165,35 @@ it:
   both hit the API, which costs one redundant idempotent GET — cheaper than a per-tag lock dict
   that would itself need bounding.
 
+## Discord role-edit concurrency
+
+Everything above bounds *outbound CoC API* calls. `qapbot/guild_role_manager.py` has a separate,
+smaller bound for *Discord* role-edit calls, added 2026-08-23 after `log_time_gaps.py` found 4
+gaps of 34s/17.9s/17.8s/11.1s inside one ~5min PROD update cycle, all attributable to
+`sync_roles_for_clan_members()` awaiting `sync_roles_for_user()` one Discord user at a time in a
+plain serial loop.
+
+- **`_ROLE_SYNC_CONCURRENCY = 5`** (module constant in `guild_role_manager.py`), used by both
+  `sync_roles_for_clan_members()` and `sync_all_roles_for_guild()`: each call builds its own
+  `asyncio.Semaphore(_ROLE_SYNC_CONCURRENCY)` and fans out `sync_roles_for_user()` calls through
+  it via `asyncio.gather(..., return_exceptions=True)` — the same shape as Phase 1's fetch
+  semaphore above, just a separate instance per call rather than a shared module-level one.
+- **Why per-call, not shared module-level**: Discord's role-edit rate limit is per-guild.
+  Sharing one semaphore across all guilds/clans would couple unrelated guilds' syncs for no
+  benefit.
+- **Why 5, not Phase 1's 20**: Phase 1's ceiling is outbound connection/SSL pressure against the
+  CoC API. Here, discord.py already serializes the actual role-edit HTTP calls behind its own
+  per-guild rate-limit bucket lock — so concurrency above a handful mostly just queues up behind
+  that lock. The actual win is overlapping the *non-bucket* work: `fetch_member()` round-trips on
+  a local-cache miss, and the large fraction of calls that are pure no-ops (`assign_role_to_member`
+  / `remove_role_from_member` return immediately when the role is already in the desired state,
+  no Discord call at all). 5 was a starting value, not a measured optimum — revisit if PROD logs
+  still show a meaningful gap after this landed.
+- **Exceptions are correlated back to the user/member after `gather()`**, not swallowed inside
+  the per-user worker — `sync_all_roles_for_guild()`'s `synced`/`errors` tally depends on being
+  able to tell "confirmed not a guild member" (`sync_roles_for_user()` returning `False`) apart
+  from "the call itself blew up" (an `Exception` in the gathered results).
+
 ## Future Enhancements
 
 ### Monitoring & Metrics
