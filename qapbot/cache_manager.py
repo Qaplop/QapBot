@@ -1415,11 +1415,17 @@ class CacheManager:
                 logging.info(f"[DM-SENT] to user_id={user_id} ({user.name}): {preview!r}")
                 return True, "sent"
 
-            except discord.Forbidden:
-                logging.info(f"Cannot send DM to user {user_id}: DMs disabled or bot blocked")
+            except discord.Forbidden as e:
+                logging.info(
+                    f"Cannot send DM to user {user_id}: DMs disabled or bot blocked "
+                    f"(HTTP {e.status}, discord code {e.code}: {e.text})"
+                )
                 return False, "blocked"
-            except discord.NotFound:
-                logging.info(f"Cannot send DM to user {user_id}: User not found")
+            except discord.NotFound as e:
+                logging.info(
+                    f"Cannot send DM to user {user_id}: User not found "
+                    f"(HTTP {e.status}, discord code {e.code}: {e.text})"
+                )
                 return False, "blocked"
             except discord.DiscordServerError as e:
                 last_error = e
