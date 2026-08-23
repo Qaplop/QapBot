@@ -109,7 +109,7 @@ else:
     await interaction.response.send_message("OK", ephemeral=True)
 ```
 
-See also: ../qapbot/docs/CODE_STRUCTURE.md § Discord Interaction Pitfall
+See also: ../qapbot/docs/CODE_STRUCTURE.md § Discord.py Patterns (Single-Message Flow, Double-Click Guard)
 
 ---
 

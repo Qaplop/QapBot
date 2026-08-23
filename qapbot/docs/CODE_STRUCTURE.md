@@ -255,6 +255,69 @@ async def on_select(self, interaction):
     await interaction.edit_original_response(...)  # NOT response.edit_message
 ```
 
+### Single-Message Flow Pattern (avoid clutter)
+Multi-step/confirm flows must edit ONE message end-to-end, not spawn a new message per step:
+```python
+# First response IS the only message for the whole flow
+await interaction.response.send_message(text, view=view, ephemeral=True)
+
+# ...later, from a component callback on the SAME view (not a defer()'d one)...
+await interaction.response.edit_message(content=new_text, view=new_view_or_None)
+
+# ...or, if an earlier step deferred (thinking=False) instead of responding directly...
+await interaction.edit_original_response(content=new_text, view=None)
+```
+Never `followup.send()` a fresh confirmation next to a prompt that's still visible — that leaves
+the stale prompt behind as clutter (Pitfall 2). The one deliberate exception is a genuinely
+append-only log (a tracker item's discussion thread) — that's accumulation by design, not
+message clutter.
+
+### Double-Click Guard Pattern
+Any View/DynamicItem callback with a side effect (a DB write, a DM, a status change) must not
+run twice for one logical click. discord.py dispatches each interaction as its own task, so a
+re-click landing while the first click's `defer()`/`await` is still in flight starts a second,
+concurrent run of the same callback before the first click's "done" state (or its disabled
+buttons) is even visible yet — and most side-effecting functions in this codebase aren't written
+to tolerate being called twice for the same logical action.
+
+**Session-scoped View** (a Yes/No confirm, a draft preview — held in memory across its own
+clicks until `.stop()`): guard with a flag set as the literal first statement, before any
+`await`, so the check-and-set is atomic against a second click's callback starting mid-way
+through the first:
+```python
+async def _on_yes(self, interaction: discord.Interaction) -> None:
+    if getattr(self, "_consumed", False):
+        await interaction.response.defer(thinking=False)
+        return
+    self._consumed = True
+    for child in self.children:
+        child.disabled = True
+    await interaction.response.edit_message(view=self)  # NOT defer()-then-edit-separately
+    # ... perform the side effect, then interaction.edit_original_response(...) for final content
+```
+`qapbot/ui_tracker.py`'s `_consume_once(view, interaction)` is the shared helper implementing
+exactly this shape — reuse it for any new session-scoped confirm/select view rather than
+reinventing the flag.
+
+**Persistent `DynamicItem`** (a fresh Python object reconstructed from its `custom_id` on every
+single click — no `self` state survives between clicks, so the flag trick above doesn't apply):
+guard by re-checking persisted state instead, right before the side effect:
+```python
+async def callback(self, interaction: discord.Interaction) -> None:
+    item = await CACHE.db_manager.get_tracker_item(self.item_number)  # fresh read, every click
+    if item.get("some_pending_flag"):
+        await interaction.response.send_message("Already in progress.", ephemeral=True)
+        return
+    # ... perform the side effect, which itself sets some_pending_flag
+```
+This narrows the race to the (much smaller) window where two clicks' reads both land before
+either click's write — good enough for the realistic "user re-clicked because nothing visibly
+happened yet" case, as opposed to requiring a real lock for genuinely simultaneous clicks.
+`TrackerItemButton._invite_requestor`'s `access_grant_pending` check is a real example.
+
+See Pitfall 41 (`COPILOT_PITFALLS_COOKBOOK.md`) for the full incident writeup (tracker items
+#0026 and #0036 both shipped without this guard).
+
 ### Ephemeral View Delete-on-Timeout Pattern
 All ephemeral views that the bot sends (and whose messages it tracks) MUST implement
 delete-on-timeout so stale Discord messages are cleaned up automatically.
