@@ -446,8 +446,8 @@ class TestGuildConfigCwlColumns:
     @pytest.mark.integration
     async def test_save_and_get_cwl_guild_config_columns(self, db):
         await db.save_guild_config("111", {
-            "cwl_hub_channel_id": "555",
-            "cwl_hub_message_enabled": True,
+            "cwl_player_hub_channel_id": "555",
+            "cwl_player_hub_message_enabled": True,
             "cwl_management_channel_id": "666",
             "cwl_management_message_enabled": True,
             "cwl_retention_months": 12,
@@ -456,22 +456,22 @@ class TestGuildConfigCwlColumns:
         })
 
         cfg = await db.get_guild_config("111")
-        assert cfg["cwl_hub_channel_id"] == "555"
-        assert cfg["cwl_hub_message_enabled"] is True
+        assert cfg["cwl_player_hub_channel_id"] == "555"
+        assert cfg["cwl_player_hub_message_enabled"] is True
         assert cfg["cwl_management_channel_id"] == "666"
         assert cfg["cwl_management_message_enabled"] is True
         assert cfg["cwl_retention_months"] == 12
         assert cfg["cwl_selected_season"] == "2026-09"
         assert cfg["timezone_name"] == "Europe/Berlin"
         # Untouched fields default sanely
-        assert cfg["cwl_hub_message_id"] is None
+        assert cfg["cwl_player_hub_message_id"] is None
         assert cfg["cwl_management_message_id"] is None
 
     @pytest.mark.integration
     async def test_cwl_guild_config_defaults_for_fresh_guild(self, db):
         await db.save_guild_config("222", {})
         cfg = await db.get_guild_config("222")
-        assert cfg["cwl_hub_message_enabled"] is False
+        assert cfg["cwl_player_hub_message_enabled"] is False
         assert cfg["cwl_management_message_enabled"] is False
         assert cfg["cwl_retention_months"] == 0
         assert cfg["cwl_selected_season"] is None
@@ -1040,6 +1040,7 @@ class TestGetAllPlayersForDiscordIds:
             "player_tag": "#P1", "player_name": "Player", "clan_tag": "#OUT_OF_FAMILY_CLAN",
             "discord_id": "d1", "verified": True, "cwl_permanent_optout": False,
             "preferred_league_rank": None, "th_level": None,
+            "cwl_permanent_optin": False, "cwl_optout_send_dm_anyway": False,
         }]
 
     @pytest.mark.integration
@@ -1101,6 +1102,7 @@ class TestGetPlayerLinks:
         assert links["#P1"] == {
             "player_name": "Player", "discord_id": "d1", "verified": True,
             "cwl_permanent_optout": False,
+            "cwl_permanent_optin": False, "cwl_optout_send_dm_anyway": False,
         }
 
     @pytest.mark.integration
@@ -1199,6 +1201,7 @@ class TestChunkedInQuery:
         assert links[tags[0]] == {
         "player_name": "Player0", "discord_id": "d0", "verified": True,
         "cwl_permanent_optout": False,
+        "cwl_permanent_optin": False, "cwl_optout_send_dm_anyway": False,
     }
         assert tags[1] not in links
 
@@ -1443,3 +1446,133 @@ class TestUserPlayersCwlPreferenceSurvival:
         kept = reread["players"][0]
         assert kept["cwl_permanent_optout"] is True
         assert kept["cwl_default_preferred_league_rank"] == "Crystal League I"
+
+
+async def _read_prefs(db: "WarHistoryDB", discord_id: str, player_tag: str) -> dict:
+    """Raw read of the four preference columns for one row, bypassing the higher-level read
+    methods under test elsewhere in this file — used so set_cwl_preferences_sync's own tests
+    don't depend on get_player_links_sync also being correct."""
+    cursor = await db.conn.execute(
+        "SELECT cwl_permanent_optout, cwl_permanent_optin, cwl_optout_send_dm_anyway, "
+        "cwl_default_preferred_league_rank FROM user_players WHERE discord_id = ? AND player_tag = ?",
+        (discord_id, player_tag),
+    )
+    row = await cursor.fetchone()
+    return {
+        "cwl_permanent_optout": bool(row["cwl_permanent_optout"]),
+        "cwl_permanent_optin": bool(row["cwl_permanent_optin"]),
+        "cwl_optout_send_dm_anyway": bool(row["cwl_optout_send_dm_anyway"]),
+        "cwl_default_preferred_league_rank": row["cwl_default_preferred_league_rank"],
+    }
+
+
+class TestSetCwlPreferencesSync:
+    """Phase 1c (plans/cwl-personal-hub.md) — set_cwl_preferences_sync()'s write path."""
+
+    async def test_mode_optout_sets_both_booleans(self, db):
+        await _seed_user_player(db, "701", "#A1")
+        rowcount = db.set_cwl_preferences_sync("701", "#A1", mode="optout")
+        assert rowcount == 1
+        prefs = await _read_prefs(db, "701", "#A1")
+        assert prefs["cwl_permanent_optout"] is True
+        assert prefs["cwl_permanent_optin"] is False
+
+    async def test_mode_optin_sets_both_booleans(self, db):
+        await _seed_user_player(db, "701", "#A1")
+        db.set_cwl_preferences_sync("701", "#A1", mode="optin")
+        prefs = await _read_prefs(db, "701", "#A1")
+        assert prefs["cwl_permanent_optout"] is False
+        assert prefs["cwl_permanent_optin"] is True
+
+    async def test_mode_none_clears_both_booleans(self, db):
+        await _seed_user_player(db, "701", "#A1", cwl_permanent_optout=True)
+        db.set_cwl_preferences_sync("701", "#A1", mode="none")
+        prefs = await _read_prefs(db, "701", "#A1")
+        assert prefs["cwl_permanent_optout"] is False
+        assert prefs["cwl_permanent_optin"] is False
+
+    async def test_switching_away_from_optout_clears_send_dm_anyway(self, db):
+        await _seed_user_player(db, "701", "#A1")
+        db.set_cwl_preferences_sync("701", "#A1", mode="optout", send_dm_anyway=True)
+        assert (await _read_prefs(db, "701", "#A1"))["cwl_optout_send_dm_anyway"] is True
+
+        db.set_cwl_preferences_sync("701", "#A1", mode="optin")
+        prefs = await _read_prefs(db, "701", "#A1")
+        assert prefs["cwl_permanent_optin"] is True
+        assert prefs["cwl_optout_send_dm_anyway"] is False  # force-cleared, not left stale
+
+    async def test_send_dm_anyway_standalone_toggle_without_mode_change(self, db):
+        await _seed_user_player(db, "701", "#A1", cwl_permanent_optout=True)
+        rowcount = db.set_cwl_preferences_sync("701", "#A1", send_dm_anyway=True)
+        assert rowcount == 1
+        prefs = await _read_prefs(db, "701", "#A1")
+        assert prefs["cwl_permanent_optout"] is True  # untouched — mode was None
+        assert prefs["cwl_optout_send_dm_anyway"] is True
+
+    async def test_rank_provided_true_with_none_clears_to_null(self, db):
+        await _seed_user_player(db, "701", "#A1", cwl_default_preferred_league_rank="Gold League I")
+        db.set_cwl_preferences_sync("701", "#A1", league_rank=None, rank_provided=True)
+        assert (await _read_prefs(db, "701", "#A1"))["cwl_default_preferred_league_rank"] is None
+
+    async def test_rank_provided_false_leaves_existing_rank_untouched(self, db):
+        await _seed_user_player(db, "701", "#A1", cwl_default_preferred_league_rank="Gold League I")
+        db.set_cwl_preferences_sync("701", "#A1", mode="optout")  # rank_provided defaults False
+        assert (await _read_prefs(db, "701", "#A1"))["cwl_default_preferred_league_rank"] == "Gold League I"
+
+    async def test_rank_provided_true_sets_a_new_value(self, db):
+        await _seed_user_player(db, "701", "#A1")
+        db.set_cwl_preferences_sync("701", "#A1", league_rank="Champion League III", rank_provided=True)
+        assert (await _read_prefs(db, "701", "#A1"))["cwl_default_preferred_league_rank"] == "Champion League III"
+
+    async def test_player_tag_none_applies_to_every_linked_account_of_that_discord_id_only(self, db):
+        await _seed_user_player(db, "701", "#A1")
+        await _seed_user_player(db, "701", "#A2")
+        await _seed_user_player(db, "702", "#B1")  # different discord_id — must NOT be touched
+
+        rowcount = db.set_cwl_preferences_sync("701", None, mode="optout")
+        assert rowcount == 2
+        assert (await _read_prefs(db, "701", "#A1"))["cwl_permanent_optout"] is True
+        assert (await _read_prefs(db, "701", "#A2"))["cwl_permanent_optout"] is True
+        assert (await _read_prefs(db, "702", "#B1"))["cwl_permanent_optout"] is False
+
+    async def test_nonexistent_pair_returns_zero_without_raising(self, db):
+        rowcount = db.set_cwl_preferences_sync("999999", "#NOPE", mode="optout")
+        assert rowcount == 0
+
+    async def test_no_arguments_is_a_pure_noop_returning_zero(self, db):
+        await _seed_user_player(db, "701", "#A1", cwl_permanent_optout=True)
+        rowcount = db.set_cwl_preferences_sync("701", "#A1")
+        assert rowcount == 0
+        # Confirm it genuinely touched nothing.
+        assert (await _read_prefs(db, "701", "#A1"))["cwl_permanent_optout"] is True
+
+    async def test_invalid_mode_raises_value_error(self, db):
+        await _seed_user_player(db, "701", "#A1")
+        with pytest.raises(ValueError):
+            db.set_cwl_preferences_sync("701", "#A1", mode="bogus")
+
+    async def test_write_immediately_visible_to_get_player_links_sync(self, db):
+        await _seed_user_player(db, "701", "#A1")
+        db.set_cwl_preferences_sync("701", "#A1", mode="optin", league_rank="Silver League II", rank_provided=True)
+        links = db.get_player_links_sync(["#A1"])
+        assert links["#A1"]["cwl_permanent_optin"] is True
+        assert links["#A1"]["cwl_permanent_optout"] is False
+
+    async def test_write_immediately_visible_to_get_current_clan_members_sync(self, db):
+        await _seed_clan(db, "#CLANX")
+        await _seed_user_player(db, "701", "#A1", current_clan_tag="#CLANX")
+        db.set_cwl_preferences_sync("701", "#A1", mode="optout", send_dm_anyway=True)
+
+        members = db.get_current_clan_members_sync(["#CLANX"])
+        assert len(members) == 1
+        assert members[0]["cwl_permanent_optout"] is True
+        assert members[0]["cwl_optout_send_dm_anyway"] is True
+        assert members[0]["cwl_permanent_optin"] is False
+
+    async def test_write_immediately_visible_to_get_all_players_for_discord_ids_sync(self, db):
+        await _seed_user_player(db, "701", "#A1")
+        db.set_cwl_preferences_sync("701", "#A1", mode="optin")
+
+        players = db.get_all_players_for_discord_ids_sync(["701"])
+        assert len(players) == 1
+        assert players[0]["cwl_permanent_optin"] is True

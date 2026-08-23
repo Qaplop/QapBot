@@ -2005,6 +2005,8 @@ class WarHistoryDB:
                 added_at TEXT NOT NULL DEFAULT (datetime('now')),
                 cwl_permanent_optout INTEGER NOT NULL DEFAULT 0,
                 cwl_default_preferred_league_rank TEXT,
+                cwl_permanent_optin INTEGER NOT NULL DEFAULT 0,
+                cwl_optout_send_dm_anyway INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (discord_id) REFERENCES users(discord_id) ON DELETE CASCADE,
                 FOREIGN KEY (current_clan_tag) REFERENCES clans(clan_tag) ON DELETE SET NULL,
                 UNIQUE (discord_id, player_tag)
@@ -2064,10 +2066,10 @@ class WarHistoryDB:
                 welcome_message_mode TEXT NOT NULL DEFAULT 'clan_link',
                 welcome_apply_channel_id TEXT,
                 welcome_clan_tag TEXT,
-                cwl_hub_channel_id TEXT,
-                cwl_hub_message_id TEXT,
-                cwl_hub_message_enabled BOOLEAN NOT NULL DEFAULT 0,
-                cwl_hub_message_last_bump_iso TEXT,
+                cwl_player_hub_channel_id TEXT,
+                cwl_player_hub_message_id TEXT,
+                cwl_player_hub_message_enabled BOOLEAN NOT NULL DEFAULT 0,
+                cwl_player_hub_message_last_bump_iso TEXT,
                 cwl_management_channel_id TEXT,
                 cwl_management_message_id TEXT,
                 cwl_management_message_enabled BOOLEAN NOT NULL DEFAULT 0,
@@ -2538,10 +2540,25 @@ class WarHistoryDB:
         # changelog "Removed all one-time migration code from db_manager.py startup routines").
         await self._add_column_if_missing("user_players", "cwl_permanent_optout", "INTEGER NOT NULL DEFAULT 0")
         await self._add_column_if_missing("user_players", "cwl_default_preferred_league_rank", "TEXT")
-        await self._add_column_if_missing("guild_config", "cwl_hub_channel_id", "TEXT")
-        await self._add_column_if_missing("guild_config", "cwl_hub_message_id", "TEXT")
-        await self._add_column_if_missing("guild_config", "cwl_hub_message_enabled", "BOOLEAN NOT NULL DEFAULT 0")
-        await self._add_column_if_missing("guild_config", "cwl_hub_message_last_bump_iso", "TEXT")
+        # plans/cwl-personal-hub.md Phase 1 — two new standing preferences alongside the existing
+        # pair above ("always play" and "send the invitation DM anyway despite opting out").
+        await self._add_column_if_missing("user_players", "cwl_permanent_optin", "INTEGER NOT NULL DEFAULT 0")
+        await self._add_column_if_missing("user_players", "cwl_optout_send_dm_anyway", "INTEGER NOT NULL DEFAULT 0")
+        # cwl_hub_* -> cwl_player_hub_* (2026-08-23, plans/cwl-personal-hub.md "Naming convention"
+        # — these four columns were unused since the day they were added, under a name that
+        # collided with the ADMIN hub's custom_ids; retired in favor of a name that says which
+        # feature owns it). Rename first (converts an already-migrated DB that still has the old
+        # name), then add-if-missing under the new name as a safety net for a guild_config table
+        # that predates BOTH names ever existing — a fresh DB's CREATE TABLE already has the new
+        # name, so both calls are no-ops there.
+        for _old_name, _new_name, _ddl_type in (
+            ("cwl_hub_channel_id", "cwl_player_hub_channel_id", "TEXT"),
+            ("cwl_hub_message_id", "cwl_player_hub_message_id", "TEXT"),
+            ("cwl_hub_message_enabled", "cwl_player_hub_message_enabled", "BOOLEAN NOT NULL DEFAULT 0"),
+            ("cwl_hub_message_last_bump_iso", "cwl_player_hub_message_last_bump_iso", "TEXT"),
+        ):
+            await self._rename_column_if_present("guild_config", _old_name, _new_name)
+            await self._add_column_if_missing("guild_config", _new_name, _ddl_type)
         await self._add_column_if_missing("guild_config", "cwl_management_channel_id", "TEXT")
         await self._add_column_if_missing("guild_config", "cwl_management_message_id", "TEXT")
         await self._add_column_if_missing("guild_config", "cwl_management_message_enabled", "BOOLEAN NOT NULL DEFAULT 0")
@@ -4473,7 +4490,8 @@ class WarHistoryDB:
                     conn,
                     """
                     SELECT player_tag, player_name, current_clan_tag, discord_id, verified,
-                           cwl_permanent_optout, cwl_default_preferred_league_rank, th_level
+                           cwl_permanent_optout, cwl_default_preferred_league_rank, th_level,
+                           cwl_permanent_optin, cwl_optout_send_dm_anyway
                     FROM user_players
                     WHERE current_clan_tag IN ({placeholders})
                     ORDER BY verified DESC, (discord_id = 'UNASSIGNED') ASC
@@ -4509,6 +4527,8 @@ class WarHistoryDB:
                 "cwl_permanent_optout": bool(row["cwl_permanent_optout"]),
                 "preferred_league_rank": row["cwl_default_preferred_league_rank"],
                 "th_level": row["th_level"],
+                "cwl_permanent_optin": bool(row["cwl_permanent_optin"]),
+                "cwl_optout_send_dm_anyway": bool(row["cwl_optout_send_dm_anyway"]),
             })
         return members
 
@@ -4541,7 +4561,8 @@ class WarHistoryDB:
                 rows = conn.execute(
                     f"""
                     SELECT player_tag, player_name, current_clan_tag, discord_id, verified,
-                           cwl_permanent_optout, cwl_default_preferred_league_rank, th_level
+                           cwl_permanent_optout, cwl_default_preferred_league_rank, th_level,
+                           cwl_permanent_optin, cwl_optout_send_dm_anyway
                     FROM user_players
                     WHERE discord_id IN ({placeholders})
                     ORDER BY verified DESC, (discord_id = 'UNASSIGNED') ASC
@@ -4569,17 +4590,23 @@ class WarHistoryDB:
                 "cwl_permanent_optout": bool(row["cwl_permanent_optout"]),
                 "preferred_league_rank": row["cwl_default_preferred_league_rank"],
                 "th_level": row["th_level"],
+                "cwl_permanent_optin": bool(row["cwl_permanent_optin"]),
+                "cwl_optout_send_dm_anyway": bool(row["cwl_optout_send_dm_anyway"]),
             })
         return players
 
     def get_player_links_sync(self, player_tags: List[str]) -> Dict[str, Dict[str, Any]]:
-        """player_tag -> {discord_id, player_name, verified, cwl_permanent_optout} for whichever of
+        """player_tag -> {discord_id, player_name, verified, cwl_permanent_optout,
+        cwl_permanent_optin, cwl_optout_send_dm_anyway} for whichever of
         player_tags are linked to a Discord account (user_players), regardless of current clan — a
         player_tag with no linked account simply isn't a key in the returned dict. Used by the CWL
         guest search (web_bridge.py's _search_cwl_guests_sync) to show whether a found player can
         actually be DMed, without needing clan context the way get_current_clan_members_sync does,
         and by start_cwl_enrollment() to resolve exactly that for an already-pooled guest player
-        no clan-scoped query can reach."""
+        no clan-scoped query can reach. The three cwl_* preference fields (plans/cwl-personal-hub.md
+        Phase 1) are what let resolve_cwl_pool_dm_targets_sync() apply a guest/shared-clan player's
+        standing preference — sources it can only ever resolve through this method, never through
+        the clan-scoped get_current_clan_members_sync."""
         import sqlite3
 
         if not self.db_path:
@@ -4592,7 +4619,8 @@ class WarHistoryDB:
                 rows = self._chunked_in_query_sync(
                     conn,
                     """
-                    SELECT player_tag, player_name, discord_id, verified, cwl_permanent_optout
+                    SELECT player_tag, player_name, discord_id, verified, cwl_permanent_optout,
+                           cwl_permanent_optin, cwl_optout_send_dm_anyway
                     FROM user_players
                     WHERE player_tag IN ({placeholders})
                     ORDER BY verified DESC, (discord_id = 'UNASSIGNED') ASC
@@ -4618,8 +4646,124 @@ class WarHistoryDB:
                 "discord_id": discord_id if discord_id and discord_id != "UNASSIGNED" else None,
                 "verified": bool(row["verified"]),
                 "cwl_permanent_optout": bool(row["cwl_permanent_optout"]),
+                "cwl_permanent_optin": bool(row["cwl_permanent_optin"]),
+                "cwl_optout_send_dm_anyway": bool(row["cwl_optout_send_dm_anyway"]),
             }
         return links
+
+    def set_cwl_preferences_sync(
+        self,
+        discord_id: str,
+        player_tag: Optional[str],
+        *,
+        mode: Optional[str] = None,
+        send_dm_anyway: Optional[bool] = None,
+        league_rank: Optional[str] = None,
+        rank_provided: bool = False,
+    ) -> int:
+        """Write one or more of a member's standing CWL preferences (plans/cwl-personal-hub.md
+        Phase 1c) — the write half of the three read methods above (get_current_clan_members_sync/
+        get_all_players_for_discord_ids_sync/get_player_links_sync), which is what makes a write
+        here immediately visible to all three with no cache warm-up (same self._sync_conn()
+        direct-SQL pool every sync read/write in this class uses).
+
+        Direct SQL against user_players, NOT routed through CACHE.user_accounts/save_user() —
+        that pipeline is Phase 0's landmine fix, not what these preference writes should use.
+
+        Args:
+            discord_id: whose preferences to change.
+            player_tag: a single linked account, or None to apply to EVERY account currently
+                linked to this discord_id (the "apply to all my accounts" bulk control).
+            mode: 'optin' | 'optout' | 'none' (clear both), or None to leave the two boolean
+                columns untouched. Writes cwl_permanent_optout AND cwl_permanent_optin in the
+                SAME UPDATE statement, which is what makes the two structurally unable to both
+                read 1 afterward — there is no intermediate state a concurrent reader could ever
+                observe where both are set:
+                    'optin'  -> cwl_permanent_optout=0, cwl_permanent_optin=1
+                    'optout' -> cwl_permanent_optout=1, cwl_permanent_optin=0
+                    'none'   -> cwl_permanent_optout=0, cwl_permanent_optin=0
+                Any mode OTHER than 'optout' also forces cwl_optout_send_dm_anyway=0 in the same
+                statement — that flag is only meaningful while opted out, so it can never survive
+                as a stale leftover on an account that no longer is, regardless of what the caller
+                passed for send_dm_anyway.
+            send_dm_anyway: explicit value for cwl_optout_send_dm_anyway. Ignored (forced to 0
+                instead) when mode resolves the account out of opt-out this same call; applied as
+                given when mode == 'optout'; applied standalone (mode is None this call, e.g. a
+                pure DM-anyway toggle on an account already opted out) otherwise. None means
+                leave the column untouched.
+            league_rank / rank_provided: league_rank=None is ambiguous on its own — "don't touch
+                this field" vs. "clear it to no preference" — so rank_provided=True is what makes
+                league_rank=None an explicit clear-to-NULL rather than a no-op. rank_provided=False
+                (the default) never touches cwl_default_preferred_league_rank regardless of what
+                league_rank holds.
+
+        Returns the number of user_players rows actually updated — 0 both when nothing matched
+        (a nonexistent discord_id/player_tag pair) and when every argument was left at its
+        no-op default (mode=None, send_dm_anyway=None, rank_provided=False); callers cannot
+        distinguish those two from the return value alone, which is fine since both mean "no
+        preference data changed."
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if mode is not None and mode not in ("optin", "optout", "none"):
+            raise ValueError(f"set_cwl_preferences_sync: invalid mode {mode!r}")
+
+        set_clauses: List[str] = []
+        params: List[Any] = []
+
+        if mode is not None:
+            optout_val, optin_val = {
+                "optin": (0, 1),
+                "optout": (1, 0),
+                "none": (0, 0),
+            }[mode]
+            set_clauses += ["cwl_permanent_optout = ?", "cwl_permanent_optin = ?"]
+            params += [optout_val, optin_val]
+            if mode != "optout":
+                # Leaving opt-out (or clearing to no preference) — the DM-anyway flag has no
+                # meaning without it, so it is force-cleared here rather than left stale.
+                set_clauses.append("cwl_optout_send_dm_anyway = ?")
+                params.append(0)
+            elif send_dm_anyway is not None:
+                set_clauses.append("cwl_optout_send_dm_anyway = ?")
+                params.append(1 if send_dm_anyway else 0)
+        elif send_dm_anyway is not None:
+            # Standalone DM-anyway change with no mode change this call (e.g. toggling the
+            # checkbox on an account that is already opted out).
+            set_clauses.append("cwl_optout_send_dm_anyway = ?")
+            params.append(1 if send_dm_anyway else 0)
+
+        if rank_provided:
+            set_clauses.append("cwl_default_preferred_league_rank = ?")
+            params.append(league_rank)
+
+        if not set_clauses:
+            return 0
+
+        where_clause = "discord_id = ?"
+        params.append(discord_id)
+        if player_tag is not None:
+            where_clause += " AND player_tag = ?"
+            params.append(player_tag)
+
+        sql = f"UPDATE user_players SET {', '.join(set_clauses)} WHERE {where_clause}"
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    cursor = conn.execute(sql, params)
+                    if self._should_commit():
+                        conn.commit()
+                return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] set_cwl_preferences_sync failed for discord_id={discord_id} "
+                    f"player_tag={player_tag}: {e}"
+                )
+                conn.rollback()
+                return 0
 
     def get_current_clan_tags_for_players_sync(self, player_tags: List[str]) -> Dict[str, str]:
         """player_tag -> current_clan_tag for ANY player_tag, regardless of whether that clan is
@@ -9197,10 +9341,10 @@ class WarHistoryDB:
             "member_clans": clans,
             "clan_roles": clan_roles,
             "clan_custodians": clan_custodians,
-            "cwl_hub_channel_id": row["cwl_hub_channel_id"],
-            "cwl_hub_message_id": row["cwl_hub_message_id"],
-            "cwl_hub_message_enabled": bool(row["cwl_hub_message_enabled"]) if row["cwl_hub_message_enabled"] is not None else False,
-            "cwl_hub_message_last_bump_iso": row["cwl_hub_message_last_bump_iso"],
+            "cwl_player_hub_channel_id": row["cwl_player_hub_channel_id"],
+            "cwl_player_hub_message_id": row["cwl_player_hub_message_id"],
+            "cwl_player_hub_message_enabled": bool(row["cwl_player_hub_message_enabled"]) if row["cwl_player_hub_message_enabled"] is not None else False,
+            "cwl_player_hub_message_last_bump_iso": row["cwl_player_hub_message_last_bump_iso"],
             "cwl_management_channel_id": row["cwl_management_channel_id"],
             "cwl_management_message_id": row["cwl_management_message_id"],
             "cwl_management_message_enabled": bool(row["cwl_management_message_enabled"]) if row["cwl_management_message_enabled"] is not None else False,
@@ -9249,7 +9393,7 @@ class WarHistoryDB:
                  coc_role_enabled, clan_role_enabled,
                  coc_role_member_id, coc_role_elder_id, coc_role_coleader_id, coc_role_leader_id,
                  welcome_message_enabled, welcome_message_mode, welcome_apply_channel_id, welcome_clan_tag,
-                 cwl_hub_channel_id, cwl_hub_message_id, cwl_hub_message_enabled, cwl_hub_message_last_bump_iso,
+                 cwl_player_hub_channel_id, cwl_player_hub_message_id, cwl_player_hub_message_enabled, cwl_player_hub_message_last_bump_iso,
                  cwl_management_channel_id, cwl_management_message_id, cwl_management_message_enabled,
                  cwl_management_message_last_bump_iso, cwl_retention_months, cwl_selected_season,
                  cwl_enrollment_include_all_linked_accounts, timezone_name)
@@ -9276,10 +9420,10 @@ class WarHistoryDB:
                     welcome_message_mode = excluded.welcome_message_mode,
                     welcome_apply_channel_id = excluded.welcome_apply_channel_id,
                     welcome_clan_tag = excluded.welcome_clan_tag,
-                    cwl_hub_channel_id = excluded.cwl_hub_channel_id,
-                    cwl_hub_message_id = excluded.cwl_hub_message_id,
-                    cwl_hub_message_enabled = excluded.cwl_hub_message_enabled,
-                    cwl_hub_message_last_bump_iso = excluded.cwl_hub_message_last_bump_iso,
+                    cwl_player_hub_channel_id = excluded.cwl_player_hub_channel_id,
+                    cwl_player_hub_message_id = excluded.cwl_player_hub_message_id,
+                    cwl_player_hub_message_enabled = excluded.cwl_player_hub_message_enabled,
+                    cwl_player_hub_message_last_bump_iso = excluded.cwl_player_hub_message_last_bump_iso,
                     cwl_management_channel_id = excluded.cwl_management_channel_id,
                     cwl_management_message_id = excluded.cwl_management_message_id,
                     cwl_management_message_enabled = excluded.cwl_management_message_enabled,
@@ -9311,10 +9455,10 @@ class WarHistoryDB:
                 config.get("welcome_message_mode", "clan_link"),
                 config.get("welcome_apply_channel_id"),
                 config.get("welcome_clan_tag"),
-                config.get("cwl_hub_channel_id"),
-                config.get("cwl_hub_message_id"),
-                1 if config.get("cwl_hub_message_enabled", False) else 0,
-                config.get("cwl_hub_message_last_bump_iso"),
+                config.get("cwl_player_hub_channel_id"),
+                config.get("cwl_player_hub_message_id"),
+                1 if config.get("cwl_player_hub_message_enabled", False) else 0,
+                config.get("cwl_player_hub_message_last_bump_iso"),
                 config.get("cwl_management_channel_id"),
                 config.get("cwl_management_message_id"),
                 1 if config.get("cwl_management_message_enabled", False) else 0,
