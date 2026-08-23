@@ -166,6 +166,102 @@ async def test_health_does_not_require_secret(client):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/i18n — plans/cwl-personal-hub.md Phase 6c
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_i18n_requires_secret(bridge_config, client):
+    resp = await client.get("/api/i18n", params={"guild_id": "1", "discord_user_id": "2", "ns": "cwl.player_hub"})
+    assert resp.status == 403
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_i18n_missing_params_returns_400(bridge_config, client):
+    headers = {"X-Bridge-Secret": "test-secret"}
+    resp = await client.get("/api/i18n", params={"discord_user_id": "2", "ns": "cwl.player_hub"}, headers=headers)
+    assert resp.status == 400
+    resp2 = await client.get("/api/i18n", params={"guild_id": "1", "discord_user_id": "2"}, headers=headers)
+    assert resp2.status == 400
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_i18n_defaults_to_english_with_no_preference_set(bridge_config, client):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.server_config["901"] = {}
+    CACHE.user_accounts.pop("902", None)
+
+    resp = await client.get(
+        "/api/i18n",
+        params={"guild_id": "901", "discord_user_id": "902", "ns": "cwl.player_hub"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["lang"] == "en"
+    assert body["strings"]["title"] == "🛡️ Your CWL Preferences"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_i18n_honours_guild_language_over_default(bridge_config, client):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.server_config["903"] = {"language": "de"}
+    CACHE.user_accounts.pop("904", None)
+
+    resp = await client.get(
+        "/api/i18n",
+        params={"guild_id": "903", "discord_user_id": "904", "ns": "cwl.player_hub"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    body = await resp.json()
+    assert body["lang"] == "de"
+    assert body["strings"]["title"] == "🛡️ Deine CWL-Einstellungen"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_i18n_user_language_wins_over_guild_language(bridge_config, client):
+    """The exact chain t() itself uses — a member's own preference beats the guild's, matching
+    what a DM to the same member would show them."""
+    from qapbot.cache_manager import CACHE
+
+    CACHE.server_config["905"] = {"language": "en"}
+    CACHE.user_accounts["906"] = {"user_language": "de"}
+
+    resp = await client.get(
+        "/api/i18n",
+        params={"guild_id": "905", "discord_user_id": "906", "ns": "cwl.player_hub"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    body = await resp.json()
+    assert body["lang"] == "de"
+    assert body["strings"]["title"] == "🛡️ Deine CWL-Einstellungen"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_i18n_unknown_namespace_returns_empty_strings_not_an_error(bridge_config, client):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.server_config["907"] = {}
+    CACHE.user_accounts.pop("908", None)
+
+    resp = await client.get(
+        "/api/i18n",
+        params={"guild_id": "907", "discord_user_id": "908", "ns": "this.does.not.exist"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["strings"] == {}
+
+
+# ---------------------------------------------------------------------------
 # _access_log_middleware — replaces aiohttp's default access log with one naming the
 # guild/user instead of raw IDs (2026-08-14, live-testing feedback)
 # ---------------------------------------------------------------------------

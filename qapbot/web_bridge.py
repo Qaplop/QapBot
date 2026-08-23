@@ -1264,6 +1264,10 @@ async def handle_get_cwl_screen(request: web.Request) -> web.Response:
     Reading non-destructively fixes that — the value now simply persists until the NEXT distinct
     button click overwrites it, which is exactly the "which screen was most recently requested"
     semantics this was always meant to have.
+
+    Three screens as of plans/cwl-personal-hub.md Phase 5a ('clan_config' / 'enrollment' /
+    'player_prefs') — this handler needed no code change for the third; it already returns
+    whatever CwlPlayerHubView's button (or /cwl preferences) recorded.
     """
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
@@ -1275,6 +1279,40 @@ async def handle_get_cwl_screen(request: web.Request) -> web.Response:
 
     screen = CACHE.pending_cwl_activity_screen.get((guild_id_str, discord_user_id_str), "clan_config")
     return web.json_response({"screen": screen})
+
+
+async def handle_get_i18n(request: web.Request) -> web.Response:
+    """GET /api/i18n?guild_id=&discord_user_id=&ns=cwl.activity — plans/cwl-personal-hub.md
+    Phase 6c. Bulk-fetch translation endpoint for the Discord Activity, which has no server-side
+    rendering of its own and so cannot call `t()` directly; this is the one HTTP round-trip that
+    lets it render every string in the caller's own language on launch.
+
+    Language resolution is the EXACT chain `t()` itself uses
+    (`get_user_language(discord_user_id) or get_guild_language(guild_id) or default`) — never
+    re-derived independently — so the Activity can never disagree with a DM the same member
+    receives from the bot.
+
+    No permission gate beyond the bridge secret: a translation catalog reveals nothing
+    guild/account-specific, unlike every other CWL bridge endpoint."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        guild_id_int = int(request.query["guild_id"])
+        discord_user_id_str = str(int(request.query["discord_user_id"]))
+    except (KeyError, ValueError):
+        return web.json_response({"error": "missing/invalid guild_id or discord_user_id"}, status=400)
+    namespace = request.query.get("ns")
+    if not namespace:
+        return web.json_response({"error": "missing ns"}, status=400)
+
+    from qapbot.i18n import get_guild_language, get_namespace, get_user_language
+
+    # Not to_thread-wrapped (unlike every DB-backed handler here, Pitfall 26) — this is a pure
+    # in-memory dict traversal over the already-loaded translation catalog, the same cost class
+    # as calling t() directly, which every handler in this file already does unwrapped.
+    language = get_user_language(discord_user_id_str) or get_guild_language(guild_id_int)
+    strings = get_namespace(namespace, language)
+    return web.json_response({"lang": language, "strings": strings})
 
 
 async def handle_get_cwl_enrollment(request: web.Request) -> web.Response:
@@ -2775,6 +2813,7 @@ async def handle_post_tracker_testcase_move_done(request: web.Request) -> web.Re
 def create_app() -> web.Application:
     app = web.Application(middlewares=[_access_log_middleware])
     app.router.add_get("/api/health", handle_health)
+    app.router.add_get("/api/i18n", handle_get_i18n)
     app.router.add_get("/api/cwl/clan-config", handle_get_clan_config)
     app.router.add_post("/api/cwl/clan-config", handle_post_clan_config)
     app.router.add_get("/api/cwl/screen", handle_get_cwl_screen)

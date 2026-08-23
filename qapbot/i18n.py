@@ -286,6 +286,52 @@ def t(key: str, guild_id: Optional[int] = None, user_id: Optional[str] = None, *
     return _translation_manager.get_translation(key, language, **kwargs)
 
 
+def get_namespace(namespace: str, language: Optional[str] = None) -> Dict[str, str]:
+    """Flattened {dotted_key: raw_template} for one namespace subtree, for bulk delivery to a
+    non-Python client (plans/cwl-personal-hub.md Phase 6b — the Discord Activity's `/api/i18n`
+    endpoint fetches `cwl.activity` this way once at launch, rather than round-tripping `t()`
+    per string). Placeholders are left UNINTERPOLATED (`{name}` intact) — the caller substitutes.
+
+    Falls back to `en` PER KEY, not per namespace, matching `get_translation()`'s own chain: a
+    `de.json` missing one key under this namespace must yield English for that key only, never
+    silently drop every sibling key just because one is missing. Keys nested more than one level
+    below the namespace (none exist yet, but a future one might) are flattened with the same
+    dot-notation the rest of this module uses.
+
+    Returns `{}` for a namespace that doesn't exist in either language — never raises.
+    """
+    if not _translation_manager._loaded:
+        _translation_manager.load_translations()
+    if language is None:
+        language = _translation_manager.default_language
+
+    def _resolve_subtree(lang: str) -> Dict[str, Any]:
+        current: Any = _translation_manager.translations.get(lang, {})
+        for part in namespace.split('.'):
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                return {}
+        return current if isinstance(current, dict) else {}
+
+    def _flatten(data: Dict[str, Any], prefix: str = "") -> Dict[str, str]:
+        flat: Dict[str, str] = {}
+        for k, v in data.items():
+            dotted_key = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                flat.update(_flatten(v, dotted_key))
+            elif isinstance(v, str):
+                flat[dotted_key] = v
+        return flat
+
+    # Per-key fallback: start from the English subtree (guarantees every key that exists in
+    # English is present), then overlay whatever the target language actually has — a key the
+    # target is missing simply keeps its English value instead of vanishing.
+    merged = _flatten(_resolve_subtree(_translation_manager.default_language))
+    merged.update(_flatten(_resolve_subtree(language)))
+    return merged
+
+
 def get_guild_language(guild_id: Optional[int]) -> str:
     """
     Get language preference for a guild.

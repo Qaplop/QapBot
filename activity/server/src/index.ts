@@ -163,6 +163,27 @@ api.get('/cwl/screen', async (c) => {
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
 })
 
+// Bulk-fetch translation strings (2026-08-23, plans/cwl-personal-hub.md Phase 6c) — same
+// verify-identity-then-proxy shape as /cwl/screen above. No CWL-specific logic at all; kept
+// outside the /cwl/* namespace since it isn't one.
+api.get('/i18n', async (c) => {
+  const guildId = c.req.query('guild_id')
+  const ns = c.req.query('ns')
+  if (!guildId) return c.json({ error: 'missing guild_id' }, 400)
+  if (!ns) return c.json({ error: 'missing ns' }, 400)
+
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  const upstream = await fetch(
+    `${c.env.BRIDGE_URL}/api/i18n?guild_id=${encodeURIComponent(guildId)}&discord_user_id=${encodeURIComponent(discordUserId)}&ns=${encodeURIComponent(ns)}`,
+    { headers: { 'X-Bridge-Secret': c.env.BRIDGE_SECRET } },
+  )
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 500)
+})
+
 api.get('/cwl/enrollment', async (c) => {
   const guildId = c.req.query('guild_id')
   if (!guildId) return c.json({ error: 'missing guild_id' }, 400)
