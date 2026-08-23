@@ -208,6 +208,42 @@ including DEV, whose DB is a routine PROD-backup copy that can contain the exact
   redundant reaction with nothing left pending is a true no-op (returns before touching the
   message at all — see `_refresh_testcase_message()`'s archived handling above).
 
+### Test-case message chunking (2026-08-23, tracker #0028)
+
+`post_test_cases()`, `_refresh_testcase_message()` and `_move_test_message_to_done_testing_channel()`
+all render their content through `_format_testcase_lines()` → `_chunk_lines_for_discord()` rather
+than one unguarded `channel.send(content)`. Fixed a live incident: the old single-message send
+raised `discord.HTTPException` (Discord's 2000-char cap) for any moderately detailed case list —
+confirmed as low as 2 verbose cases (1221 chars) and routinely for a typical 8-case set (~2.4x
+over) — which propagated uncaught all the way to the bridge as a bare `text/plain` 500, even
+though `set_tracker_testcases()` (the DB write, earlier in the same function) had already
+committed. The caller saw a failure; the cases were never actually posted. `post_comment()` had
+the identical defect and the identical fix (chunking on `text.split("\n")` first, since a comment
+has no test-case-style line structure of its own).
+
+Behavior once content needs more than one message:
+
+- The interactive view (Pass/Fail/Move-to-Done) lives on the **last** chunk only — that is also
+  the id persisted as `test_message_id`, the one `get_tracker_item_by_test_message_id()` resolves
+  for the 👍-reaction shortcut, regardless of which channel it's in.
+- A new `test_overflow_message_ids` column (comma-joined) tracks any leading chunks.
+- Edit-in-place is used **only** when the content still fits in exactly one message and there's
+  no previously-tracked overflow — the common case, unchanged from before this fix (same message
+  id, position, and reactions preserved). The moment a repost needs — or previously needed — more
+  than one message, every previously-tracked message is deleted and the full set is reposted
+  fresh, in order. This is deliberate: a newly-created overflow message would land
+  chronologically *after* an existing message being edited in place, which would put the reader-
+  order chunks out of sequence in the channel.
+- `_move_test_message_to_done_testing_channel()` can't reuse that same delete-then-post helper
+  directly, since its old and new messages live in **different channels** — it deletes the old
+  ones from the source channel itself and posts fresh (view-less) chunks to the Done channel.
+
+`web_bridge.py`'s `handle_post_tracker_comment`/`handle_post_tracker_testcases` additionally
+catch `discord.HTTPException` and return a JSON `{"error": ...}` (502) instead of letting it
+propagate — defense in depth for a genuine Discord-side failure (outage, permissions) that
+chunking alone can't prevent, so the caller at least gets a parseable error instead of the
+mimetype-confusion 500 that made the original bug hard to diagnose from the MCP side.
+
 ## Agent integration
 
 ### Bridge (`qapbot/web_bridge.py`, `/api/tracker/*`)

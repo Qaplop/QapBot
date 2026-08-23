@@ -2520,6 +2520,15 @@ async def handle_post_tracker_comment(request: web.Request) -> web.Response:
         await post_comment(item_number, text, _tracker_admin_label(request))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=404)
+    except discord.HTTPException as e:
+        # 2026-08-23, tracker #0028: this used to propagate uncaught, and aiohttp's own default
+        # error handler turned it into a bare text/plain 500 the MCP client couldn't parse as
+        # JSON at all — reported as "500, message='Attempt to decode JSON with unexpected
+        # mimetype'". post_comment() now chunks long comments, so this should be rare; still
+        # caught here so a genuine Discord-side failure (outage, permissions) reports a real
+        # error instead of a mimetype-confusion message that hides what actually went wrong.
+        logging.error(f"[TRACKER] Discord rejected the comment for item #{item_number}: {e}")
+        return web.json_response({"error": f"Discord rejected the comment: {e}"}, status=502)
     return web.json_response({"ok": True})
 
 
@@ -2567,6 +2576,15 @@ async def handle_post_tracker_testcases(request: web.Request) -> web.Response:
         item = await post_test_cases(item_number, cases, actor_id=_tracker_admin_label(request))
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=404)
+    except discord.HTTPException as e:
+        # 2026-08-23, tracker #0028 — same reasoning as handle_post_tracker_comment above.
+        # post_test_cases() itself now chunks (_post_or_refresh_testcase_message), so this is a
+        # genuine Discord-side failure rather than the routine case; note that set_tracker_
+        # testcases() (the DB write) already committed by this point regardless of whether the
+        # Discord post below it succeeds — a caller retrying on this error re-sends the same
+        # cases, which is safe (set_tracker_testcases replaces the full set, not appends).
+        logging.error(f"[TRACKER] Discord rejected the test-case message for item #{item_number}: {e}")
+        return web.json_response({"error": f"Discord rejected the test-case message: {e}"}, status=502)
     return web.json_response({"ok": True, "item": dict(item)})
 
 

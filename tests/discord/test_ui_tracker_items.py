@@ -34,8 +34,10 @@ from qapbot.ui_tracker import (
     handle_tracker_upload_message,
     mark_environment_passed_and_refresh,
     mark_testing_failed,
+    post_comment,
     post_test_cases,
     start_tracker_item,
+    _chunk_lines_for_discord,
     _register_upload_window,
     _upload_windows,
 )
@@ -626,6 +628,292 @@ async def test_post_test_cases_does_not_downgrade_done(db, monkeypatch):
     await db.update_tracker_item(item_number, status="done")
     item = await post_test_cases(item_number, [{"environment": "DEV", "description": "x"}], actor_id="1")
     assert item["status"] == "done"
+
+
+# -- message chunking (2026-08-23, tracker #0028) -----------------------------
+# Live incident: post_test_cases() sent the ENTIRE formatted list as one channel.send() call
+# with no length guard. A typical 8-case set overflowed Discord's 2000-char cap by ~2.4x;
+# channel.send() raised discord.HTTPException, which propagated all the way up as an unhandled
+# exception and surfaced to the MCP/bridge caller as a bare text/plain 500 -- even though
+# set_tracker_testcases() (the DB write) had already committed successfully a few lines earlier.
+# The caller saw a failure; the test cases were silently never actually posted to Discord at all.
+
+def _long_case(n: int, filler_len: int = 220) -> Dict[str, str]:
+    """One test case whose rendered line alone runs to roughly `filler_len` characters -- enough
+    that a handful of them reliably overflows a single 2000-char Discord message, without
+    resorting to an unrealistically huge string that would obscure what's being tested."""
+    return {"environment": "DEV", "description": f"case {n} " + ("x" * filler_len)}
+
+
+class TestChunkLinesForDiscord:
+    """_chunk_lines_for_discord() in isolation -- the pure packing logic every message-sending
+    path above it (post_test_cases, _refresh_testcase_message, the Done-channel move, and
+    post_comment) relies on to never exceed Discord's cap."""
+
+    def test_short_input_produces_one_chunk(self):
+        assert _chunk_lines_for_discord(["a", "b", "c"]) == ["a\nb\nc"]
+
+    def test_empty_input_produces_one_empty_chunk_not_zero(self):
+        # Discord has no concept of "send zero messages" for content that must go out.
+        assert _chunk_lines_for_discord([]) == [""]
+
+    def test_no_chunk_ever_exceeds_the_limit(self):
+        lines = [f"line {i} " + ("y" * 50) for i in range(200)]
+        chunks = _chunk_lines_for_discord(lines, limit=500)
+        assert all(len(c) <= 500 for c in chunks)
+        assert len(chunks) > 1  # the input genuinely needed splitting
+
+    def test_rejoining_all_chunks_reproduces_the_original_lines_exactly(self):
+        """The defining correctness property: chunking must be lossless. Splitting each chunk
+        back on "\\n" and concatenating must recover the exact original line list -- proving no
+        line was ever split mid-content and none was dropped or duplicated."""
+        lines = [f"**ENV{i}**" if i % 5 == 0 else f"case description number {i}" for i in range(80)]
+        chunks = _chunk_lines_for_discord(lines, limit=200)
+        recovered = "\n".join(chunks).split("\n")
+        assert recovered == lines
+
+    def test_a_single_line_never_lands_split_across_two_chunks(self):
+        lines = ["short", "x" * 100, "short again"]
+        chunks = _chunk_lines_for_discord(lines, limit=150)
+        # Each ORIGINAL line must appear whole inside exactly one chunk.
+        for line in lines:
+            assert sum(1 for c in chunks if line in c) == 1
+
+    def test_a_line_longer_than_the_limit_is_hard_sliced_rather_than_raising(self):
+        """The last-resort fallback -- a single test-case description (or one comment paragraph
+        with no newline) that alone exceeds 2000 characters must never crash the caller."""
+        huge_line = "z" * 5000
+        chunks = _chunk_lines_for_discord([huge_line], limit=2000)
+        assert all(len(c) <= 2000 for c in chunks)
+        assert "".join(chunks) == huge_line  # every byte preserved, just split
+
+    def test_an_oversized_line_flushes_pending_content_first(self):
+        """A short line queued before an oversized one must not get swept into the oversized
+        line's hard-sliced chunks -- it belongs in its own, still-readable chunk."""
+        chunks = _chunk_lines_for_discord(["short line", "z" * 3000], limit=2000)
+        assert chunks[0] == "short line"
+        assert "".join(chunks[1:]) == "z" * 3000
+
+
+@pytest.mark.asyncio
+async def test_post_test_cases_small_set_still_edits_in_place_on_repost(db, monkeypatch):
+    """Regression guard for the common case: a test-case list that has always fit in one message
+    must keep today's edit-in-place behavior (same message, no delete+repost) after the chunking
+    refactor -- this is the path every existing tracker item with a short case list takes."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_TEST_CHANNEL] = "1"
+    message = _fake_message(message_id=42)
+    # send_message: what the first, fresh post() returns. fetch_message: what the second call's
+    # edit-in-place fetch_message() resolves to -- both must be the SAME object for the "edited
+    # in place" assertion below to mean anything.
+    channel = _fake_channel(send_message=message, fetch_message=message)
+    channel.id = 1  # must resolve back to a real int -- the second call re-reads test_channel_id
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+
+    first = await post_test_cases(item_number, [{"environment": "DEV", "description": "x"}], actor_id="1")
+    channel.send.assert_awaited_once()
+    channel.send.reset_mock()
+
+    second = await post_test_cases(
+        item_number, [{"environment": "DEV", "description": "x, updated"}], actor_id="1"
+    )
+
+    message.edit.assert_awaited_once()
+    channel.send.assert_not_called()
+    assert first["test_message_id"] == second["test_message_id"] == "42"
+    assert second["test_overflow_message_ids"] is None
+
+
+@pytest.mark.asyncio
+async def test_post_test_cases_overflow_sends_multiple_messages_view_only_on_last(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_TEST_CHANNEL] = "1"
+    # Unique, freshly-minted message per send() call, how many ever turn out to be needed —
+    # the exact chunk count is an internal formatting detail this test deliberately doesn't
+    # hardcode; what it checks is the STRUCTURE (view only on the last one, ids tracked in order).
+    sent_messages = []
+
+    def _next_message(*_args, **_kwargs):
+        msg = _fake_message(message_id=900 + len(sent_messages))
+        sent_messages.append(msg)
+        return msg
+
+    channel = _fake_channel()
+    channel.send = AsyncMock(side_effect=_next_message)
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+
+    cases = [_long_case(i) for i in range(10)]  # comfortably overflows one 2000-char message
+    item = await post_test_cases(item_number, cases, actor_id="1")
+
+    assert channel.send.await_count >= 2  # genuinely needed more than one message
+    assert channel.send.await_count == len(sent_messages)
+    # Every call except the last must carry no interactive view at all.
+    calls = channel.send.call_args_list
+    for call in calls[:-1]:
+        assert call.kwargs.get("view") is None
+    assert calls[-1].kwargs.get("view") is not None
+
+    # The LAST sent message is the tracked, reactable one; the rest are the overflow list, in order.
+    assert item["test_message_id"] == str(sent_messages[-1].id)
+    assert item["test_overflow_message_ids"] == ",".join(str(m.id) for m in sent_messages[:-1])
+
+
+@pytest.mark.asyncio
+async def test_post_test_cases_growing_past_one_message_deletes_the_old_single_message(db, monkeypatch):
+    """Edit-in-place must be abandoned the moment a repost needs more than one message -- a
+    freshly-created overflow message would otherwise land chronologically AFTER the old message
+    being edited in place, breaking top-to-bottom reading order."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_TEST_CHANNEL] = "1"
+    old_message = _fake_message(message_id=200)
+    channel = _fake_channel(send_message=old_message, fetch_message=old_message)
+    channel.id = 1
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+
+    first = await post_test_cases(item_number, [{"environment": "DEV", "description": "x"}], actor_id="1")
+    channel.send.assert_awaited_once()  # nothing existed yet to edit
+    assert first["test_message_id"] == "200"
+    channel.send.reset_mock()
+
+    new_messages = [_fake_message(message_id=301), _fake_message(message_id=302)]
+    channel.send = AsyncMock(side_effect=new_messages)
+    cases = [_long_case(i) for i in range(10)]
+    item = await post_test_cases(item_number, cases, actor_id="1")
+
+    old_message.delete.assert_awaited_once()
+    assert channel.send.await_count == len(new_messages)
+    assert item["test_message_id"] == "302"
+    assert item["test_overflow_message_ids"] == "301"
+
+
+@pytest.mark.asyncio
+async def test_post_test_cases_shrinking_back_to_one_message_deletes_all_old_overflow(db, monkeypatch):
+    """The inverse of the growth case: a case list that shrinks back under the limit must clean
+    up EVERY previously-tracked message (primary and overflow), not just leave the overflow ones
+    orphaned in the channel."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_TEST_CHANNEL] = "1"
+    channel = _fake_channel()
+    channel.id = 1
+    overflow_msg = _fake_message(message_id=301)
+    primary_msg = _fake_message(message_id=302)
+    channel.fetch_message = AsyncMock(side_effect=lambda mid: {301: overflow_msg, 302: primary_msg}[int(mid)])
+    channel.send = AsyncMock(side_effect=[overflow_msg, primary_msg])
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+    await post_test_cases(item_number, [_long_case(i) for i in range(10)], actor_id="1")
+    assert overflow_msg.delete.await_count == 0  # sanity: nothing deleted yet on first post
+
+    fresh_message = _fake_message(message_id=999)
+    channel.send = AsyncMock(return_value=fresh_message)
+    item = await post_test_cases(item_number, [{"environment": "DEV", "description": "small now"}], actor_id="1")
+
+    overflow_msg.delete.assert_awaited_once()
+    primary_msg.delete.assert_awaited_once()
+    channel.send.assert_awaited_once()  # fresh single message, not an edit
+    assert item["test_message_id"] == "999"
+    assert item["test_overflow_message_ids"] is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_testcase_message_persists_new_ids_after_rechunk(db, monkeypatch):
+    """_refresh_testcase_message() (called after every Pass/Fail click) must persist a changed
+    test_message_id/test_overflow_message_ids when a re-chunk changes them -- otherwise the next
+    refresh would keep trying to edit message ids that no longer exist."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_TEST_CHANNEL] = "1"
+    old_message = _fake_message(message_id=500)
+    channel = _fake_channel(send_message=old_message, fetch_message=old_message)
+    channel.id = 1
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+    await post_test_cases(item_number, [{"environment": "DEV", "description": "x"}], actor_id="1")
+
+    # Grow the case list directly in the DB (simulating a second tracker_add_testcases call)
+    # then trigger the same refresh mark_environment_passed_and_refresh() performs internally.
+    await db.set_tracker_testcases(item_number, [_long_case(i) for i in range(10)])
+    new_messages = [_fake_message(message_id=701), _fake_message(message_id=702)]
+    channel.send = AsyncMock(side_effect=new_messages)
+
+    await mark_environment_passed_and_refresh(item_number, "DEV", "1")
+
+    old_message.delete.assert_awaited_once()
+    item = await db.get_tracker_item(item_number)
+    assert item["test_message_id"] == "702"
+    assert item["test_overflow_message_ids"] == "701"
+
+
+@pytest.mark.asyncio
+async def test_finalize_testcases_move_moves_every_overflow_message(db, monkeypatch):
+    """The Done-channel move must delete ALL previously-tracked messages from the SOURCE channel
+    (not just the primary one) and post fresh chunks to the DESTINATION channel — it can't reuse
+    the live-channel edit-in-place path since old and new messages live in different channels."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_DONE_TESTING_CHANNEL] = "60"
+
+    old_overflow = _fake_message(message_id=301)
+    old_primary = _fake_message(message_id=302)
+    old_channel = AsyncMock()
+    old_channel.fetch_message = AsyncMock(
+        side_effect=lambda mid: {301: old_overflow, 302: old_primary}[int(mid)]
+    )
+    new_messages = [_fake_message(message_id=701), _fake_message(message_id=702)]
+    done_channel = AsyncMock()
+    done_channel.id = 60
+    done_channel.send = AsyncMock(side_effect=new_messages)
+    _wire_bot_multi(monkeypatch, {20: old_channel, 60: done_channel})
+
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [_long_case(i) for i in range(10)])
+    await db.update_tracker_item(
+        item_number,
+        test_channel_id="20", test_message_id="302", test_overflow_message_ids="301",
+        status="testing",
+    )
+
+    result = await finalize_testcases_move(item_number)
+
+    assert result["moved"] is True
+    old_overflow.delete.assert_awaited_once()
+    old_primary.delete.assert_awaited_once()
+    assert done_channel.send.await_count == 2
+    # No view= on either chunk in the Done channel — nothing left to sign off there.
+    for call in done_channel.send.call_args_list:
+        assert call.kwargs.get("view") is None
+    item = await db.get_tracker_item(item_number)
+    assert item["test_channel_id"] == "60"
+    assert item["test_message_id"] == "702"
+    assert item["test_overflow_message_ids"] == "701"
+
+
+@pytest.mark.asyncio
+async def test_post_comment_chunks_an_overlong_comment_into_multiple_sends(db, monkeypatch):
+    """Same root cause and fix shape as the test-case overflow above, for the discussion-thread
+    comment path (post_comment / tracker_comment)."""
+    thread = AsyncMock()
+    _wire_bot(monkeypatch, channel=thread)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, thread_id="777")
+
+    # Real paragraph breaks, not one giant unbroken word -- representative of an actual long
+    # comment, and it keeps this test on the ordinary line-packing path rather than the
+    # single-oversized-line hard-slice fallback (already covered on its own terms by
+    # TestChunkLinesForDiscord.test_a_line_longer_than_the_limit_is_hard_sliced_rather_than_
+    # raising, whose pieces get rejoined with "" instead of "\n" for exactly that reason).
+    paragraph = "detail " + ("q" * 60)
+    long_text = "\n".join(f"{paragraph} {i}" for i in range(40))  # well over 2000 chars total
+    await post_comment(item_number, long_text, author_id="1")
+
+    assert thread.send.await_count >= 2
+    for call in thread.send.call_args_list:
+        assert len(call.args[0]) <= 2000
+    # Lossless: every chunk concatenated back together must contain the original text verbatim
+    # (the t() wrapper adds its own surrounding text, so check containment, not exact equality).
+    reconstructed = "\n".join(call.args[0] for call in thread.send.call_args_list)
+    assert long_text in reconstructed
 
 
 @pytest.mark.asyncio

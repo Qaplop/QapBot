@@ -2793,6 +2793,12 @@ class WarHistoryDB:
         # itself is created a few lines above in this same idempotent method, not there.
         await self._add_column_if_missing("tracker_items", "test_channel_id", "TEXT")
         await self._add_column_if_missing("tracker_items", "test_message_id", "TEXT")
+        # Comma-joined ids of any LEADING messages a test-case list needed beyond the first
+        # (2026-08-23, tracker #0028) — test_message_id always stays the LAST chunk, the one
+        # carrying the Pass/Fail/Move-to-Done view and the one get_tracker_item_by_test_message_id
+        # resolves for the 👍-reaction shortcut. NULL/empty means the whole list still fits in one
+        # message, which is the common case and the only one that existed before this column.
+        await self._add_column_if_missing("tracker_items", "test_overflow_message_ids", "TEXT")
 
         # Priority (HIGH/MEDIUM/LOW, tracker item request 2026-08-22) — one per bug/feature item,
         # and separately per individual test case row (an MCP/bridge caller decides each case's
@@ -2917,7 +2923,7 @@ class WarHistoryDB:
         "channel_id", "message_id", "thread_id",
         "implemented_note", "implemented_at", "closed_at",
         "last_edited_by", "last_edited_at",
-        "test_channel_id", "test_message_id",
+        "test_channel_id", "test_message_id", "test_overflow_message_ids",
         "access_grant_pending",
     })
 

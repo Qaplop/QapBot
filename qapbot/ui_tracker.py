@@ -1290,7 +1290,13 @@ async def post_comment(item_number: int, text: str, author_id: str) -> None:
     if thread is None:
         thread = await QBcore.bot.fetch_channel(int(item["thread_id"]))
     message = t('ui_components.tracker.comment_posted', guild_id=_lang_guild_id(item), author_id=author_id, text=text)
-    await thread.send(message)  # type: ignore[union-attr]
+    # Chunked, not one unguarded send() (2026-08-23, tracker #0028 — same root cause as the
+    # test-case message: an over-2000-char comment raised discord.HTTPException, which propagated
+    # as an unhandled exception and surfaced to the caller as a bare 500). Reuses
+    # _chunk_lines_for_discord() by splitting on "\n" first — a comment has no test-case-style
+    # line structure of its own, so the newline is the only safe split point available.
+    for chunk in _chunk_lines_for_discord(message.split("\n")):
+        await thread.send(chunk)  # type: ignore[union-attr]
 
 
 async def get_thread_messages(item_number: int, limit: int = 50) -> List[Dict[str, Any]]:
@@ -1658,7 +1664,10 @@ class TrackerStatusSelectView(discord.ui.View):
 # Test-case loop (plan §2.4)
 # ===========================================================================
 
-def _format_testcase_message(item: Dict[str, Any], testcases: List[Dict[str, Any]]) -> str:
+def _format_testcase_lines(item: Dict[str, Any], testcases: List[Dict[str, Any]]) -> List[str]:
+    """The test-case message's content, as individual lines rather than one joined string —
+    _chunk_lines_for_discord() below needs line boundaries to split on safely. Split out from
+    _format_testcase_message() 2026-08-23 (tracker #0028) for exactly that reason."""
     guild_id = _lang_guild_id(item)
     # Same status badge (emoji + text) as build_tracker_embed()'s item title, so the test-case
     # message shows the same visible "done" indicator once the item is actually done — not just
@@ -1680,7 +1689,163 @@ def _format_testcase_message(item: Dict[str, Any], testcases: List[Dict[str, Any
             lines.append(f"{box} {PRIORITY_EMOJI[priority]} {case['seq']}. {case['description']}")
         lines.append("")
     lines.append(t('ui_components.tracker.testcase_signoff_hint', guild_id=guild_id))
-    return "\n".join(lines)
+    return lines
+
+
+def _format_testcase_message(item: Dict[str, Any], testcases: List[Dict[str, Any]]) -> str:
+    return "\n".join(_format_testcase_lines(item, testcases))
+
+
+# Discord's hard per-message content cap (not configurable, not a guess).
+DISCORD_MESSAGE_CHAR_LIMIT = 2000
+
+
+def _chunk_lines_for_discord(lines: List[str], limit: int = DISCORD_MESSAGE_CHAR_LIMIT) -> List[str]:
+    """Pack `lines` into the fewest possible Discord messages, each <= `limit` chars when the
+    lines inside it are joined by "\\n" — never splitting a single line's content across two
+    messages, since that would break a sentence or a test case mid-word.
+
+    A lone line that itself exceeds `limit` (a single test case description longer than 2000
+    characters, or a comment with one very long paragraph) is hard-sliced as a last resort so
+    this can never raise — better a slightly awkward mid-word break in the rare oversized case
+    than an unhandled exception.
+
+    Added 2026-08-23 (tracker #0028, live incident): post_test_cases() used to send the ENTIRE
+    formatted list as one `channel.send()` call with no length guard at all. Two moderately
+    detailed test cases already ran to 1221 characters; a typical 8-case set for one feature
+    overflowed the 2000-char cap by roughly 2.4x. `channel.send()` raised `discord.HTTPException`
+    (error 50035, message too long), which propagated all the way up through post_test_cases()
+    and handle_post_tracker_testcases() as an unhandled exception — surfacing to the MCP/bridge
+    caller as a bare `text/plain` HTTP 500, even though `set_tracker_testcases()` (the DB write)
+    had already run and committed successfully a few lines earlier. The caller saw a failure; the
+    test cases were silently never actually posted to Discord at all.
+
+    Shared, not test-case-specific despite the name origin — post_comment() reuses this for plain
+    text by splitting on "\\n" first, since a comment has no pre-existing "test case" line
+    structure of its own to preserve.
+
+    Args:
+        lines: Content to pack, in order. Joining ALL of them with "\\n" must reproduce the
+            original text exactly (i.e. splitting on "\\n" is how a caller should get here from a
+            plain string).
+        limit: Discord's message content cap, overridable for tests.
+
+    Returns:
+        At least one chunk (never an empty list — an empty `lines` input returns `[""]`, since
+        Discord has no concept of "zero messages" for content that must be sent).
+    """
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    def flush() -> None:
+        if current:
+            chunks.append("\n".join(current))
+            current.clear()
+
+    for line in lines:
+        if len(line) > limit:
+            flush()
+            current_len = 0
+            for i in range(0, len(line), limit):
+                chunks.append(line[i:i + limit])
+            continue
+        separator_len = 1 if current else 0  # the "\n" this line would need to join on
+        if current and current_len + separator_len + len(line) > limit:
+            flush()
+            current_len = 0
+            separator_len = 0
+        current.append(line)
+        current_len += separator_len + len(line)
+    flush()
+    return chunks or [""]
+
+
+def _parse_testcase_overflow_ids(raw: Optional[str]) -> List[str]:
+    """Inverse of the comma-join used to persist test_overflow_message_ids — tolerates None and
+    the empty string (the common case: no overflow messages tracked)."""
+    if not raw:
+        return []
+    return [mid for mid in raw.split(",") if mid]
+
+
+async def _send_testcase_chunks(
+    channel: Any, chunks: List[str], view: Optional[discord.ui.View],
+) -> List[str]:
+    """Send `chunks` to `channel` in order, attaching `view` only to the LAST message — that is
+    always the one users click Pass/Fail/Move-to-Done on, or 👍-react to for the sign-off
+    shortcut (get_tracker_item_by_test_message_id resolves by that single id). Returns the sent
+    message ids in the same order, for the caller to persist as
+    (test_message_id, test_overflow_message_ids)."""
+    sent_ids: List[str] = []
+    for i, content in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+        message = await channel.send(content, view=view) if (is_last and view) else await channel.send(content)
+        sent_ids.append(str(message.id))
+    return sent_ids
+
+
+async def _delete_testcase_messages(channel: Any, message_ids: List[str]) -> None:
+    """Best-effort delete of previously-tracked test-case messages from `channel` — tolerates a
+    message already gone, permissions lost, or any other Discord hiccup, since there is nothing
+    to roll back to and the caller is about to post fresh replacements regardless."""
+    for mid in message_ids:
+        if not mid:
+            continue
+        try:
+            old_message = await channel.fetch_message(int(mid))
+            await old_message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
+            pass
+
+
+async def _post_or_refresh_testcase_message(
+    channel: Any, item: Dict[str, Any], testcases: List[Dict[str, Any]], *, view: Optional[discord.ui.View],
+) -> Tuple[str, List[str]]:
+    """Render `testcases` into `channel`, reusing the previously-tracked message(s) when the
+    content still fits in exactly one and there is no overflow to clean up, or replacing them
+    wholesale when it doesn't. Shared by post_test_cases() and _refresh_testcase_message() so the
+    two can never chunk differently (Cardinal Rule 4) — NOT used by
+    _move_test_message_to_done_testing_channel(), which posts to a DIFFERENT channel than the one
+    holding the old messages and so must delete those itself, in the source channel.
+
+    Edit-in-place is deliberately abandoned the moment more than one message is needed, now OR
+    previously: a newly-created overflow message would land chronologically AFTER whatever
+    existing message is being edited in place, breaking top-to-bottom reading order. Deleting
+    everything tracked so far and reposting fresh keeps the chunks in order with the
+    interactive/reactable one always last. The common case — a test-case list that has always
+    fit in one message — is completely unaffected and keeps today's edit-in-place behavior
+    (same message id, position, and any reactions on it preserved).
+
+    Args:
+        channel: Where to post/edit.
+        item: The tracker item (for `_format_testcase_lines`' header/status and for reading the
+            previously-tracked `test_message_id`/`test_overflow_message_ids`).
+        testcases: This item's current test-case rows.
+        view: The interactive view for the last chunk, or None (an archived item's refresh, or
+            any other case with nothing left to sign off).
+
+    Returns:
+        (new_test_message_id, new_overflow_message_ids) for the caller to persist.
+    """
+    lines = _format_testcase_lines(item, testcases)
+    chunks = _chunk_lines_for_discord(lines)
+    old_test_message_id = item.get("test_message_id")
+    old_overflow_ids = _parse_testcase_overflow_ids(item.get("test_overflow_message_ids"))
+
+    if len(chunks) == 1 and not old_overflow_ids and old_test_message_id:
+        try:
+            message = await channel.fetch_message(int(old_test_message_id))
+            await message.edit(content=chunks[0], view=view)
+            return str(message.id), []
+        except discord.NotFound:
+            pass  # fall through to the delete-and-repost path below
+
+    await _delete_testcase_messages(
+        channel, [*old_overflow_ids, *([old_test_message_id] if old_test_message_id else [])]
+    )
+    sent_ids = await _send_testcase_chunks(channel, chunks, view)
+    return sent_ids[-1], sent_ids[:-1]
 
 
 def build_tracker_testcase_view(item_number: int, testcases: List[Dict[str, Any]]) -> discord.ui.View:
@@ -1718,20 +1883,16 @@ async def post_test_cases(item_number: int, cases: List[Dict[str, str]], actor_i
     if channel is None:
         channel = await QBcore.bot.fetch_channel(int(channel_id_str))
 
-    content = _format_testcase_message(item, testcases)
     view = build_tracker_testcase_view(item_number, testcases)
+    new_test_message_id, new_overflow_ids = await _post_or_refresh_testcase_message(
+        channel, item, testcases, view=view
+    )
 
-    message = None
-    if item.get("test_message_id"):
-        try:
-            message = await channel.fetch_message(int(item["test_message_id"]))  # type: ignore[union-attr]
-            await message.edit(content=content, view=view)
-        except discord.NotFound:
-            message = None
-    if message is None:
-        message = await channel.send(content, view=view)  # type: ignore[union-attr]
-
-    fields: Dict[str, Any] = {"test_channel_id": str(channel.id), "test_message_id": str(message.id)}
+    fields: Dict[str, Any] = {
+        "test_channel_id": str(channel.id),
+        "test_message_id": new_test_message_id,
+        "test_overflow_message_ids": ",".join(new_overflow_ids) if new_overflow_ids else None,
+    }
     if item["status"] not in ("testing", "done"):
         fields["status"] = "testing"
     if actor_id:
@@ -1768,23 +1929,38 @@ async def _move_test_message_to_done_testing_channel(item: Dict[str, Any]) -> bo
             return False
 
     testcases = await CACHE.db_manager.get_tracker_testcases(item_number)
-    content = _format_testcase_message(item, testcases)
+    # Chunked the same way as the live channel (2026-08-23, tracker #0028) — no view= on any
+    # chunk here, matching the pre-existing "nothing left to sign off" contract. Posts to
+    # new_channel while the OLD tracked message(s) live in the source channel, so this can't
+    # reuse _post_or_refresh_testcase_message() (which assumes deleting old messages and posting
+    # new ones happen in the SAME channel) — it deletes the old ones itself, below.
+    chunks = _chunk_lines_for_discord(_format_testcase_lines(item, testcases))
     try:
-        new_message = await new_channel.send(content)  # type: ignore[union-attr]  # no view= -> no buttons
+        sent_ids = await _send_testcase_chunks(new_channel, chunks, view=None)
     except Exception as e:
         logging.error(f"[TRACKER] Failed to post test cases for item #{item_number} to Done Testing channel: {e}")
         return False
 
-    old_channel_id, old_message_id = item.get("test_channel_id"), item.get("test_message_id")
+    old_channel_id = item.get("test_channel_id")
+    old_message_ids = [
+        *_parse_testcase_overflow_ids(item.get("test_overflow_message_ids")),
+        *([item["test_message_id"]] if item.get("test_message_id") else []),
+    ]
     try:
+        # This try/except is for resolving old_channel itself (fetch_channel can raise); per-
+        # message delete failures are already swallowed inside _delete_testcase_messages, since
+        # a message already gone is exactly what "moving after a previous partial failure" looks
+        # like and must not block the rest of the move.
         old_channel = QBcore.bot.get_channel(int(old_channel_id)) or await QBcore.bot.fetch_channel(int(old_channel_id))
-        old_message = await old_channel.fetch_message(int(old_message_id))  # type: ignore[union-attr]
-        await old_message.delete()
+        await _delete_testcase_messages(old_channel, old_message_ids)  # type: ignore[arg-type]
     except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-        logging.warning(f"[TRACKER] Failed to delete original test-case message for item #{item_number} after move: {e}")
+        logging.warning(f"[TRACKER] Failed to delete original test-case message(s) for item #{item_number} after move: {e}")
 
     await CACHE.db_manager.update_tracker_item(
-        item_number, test_channel_id=str(new_channel.id), test_message_id=str(new_message.id)
+        item_number,
+        test_channel_id=str(new_channel.id),
+        test_message_id=sent_ids[-1],
+        test_overflow_message_ids=",".join(sent_ids[:-1]) if len(sent_ids) > 1 else None,
     )
     return True
 
@@ -1811,17 +1987,26 @@ async def _refresh_testcase_message(item_number: int) -> None:
             channel = await QBcore.bot.fetch_channel(int(item["test_channel_id"]))
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return
-    try:
-        message = await channel.fetch_message(int(item["test_message_id"]))  # type: ignore[union-attr]
-    except discord.NotFound:
-        return
     testcases = await db.get_tracker_testcases(item_number)
     archived = item["test_channel_id"] == CACHE.tracker_settings.get(TRACKER_SETTING_DONE_TESTING_CHANNEL)
     view = None if archived else build_tracker_testcase_view(item_number, testcases)
     try:
-        await message.edit(content=_format_testcase_message(item, testcases), view=view)
+        new_test_message_id, new_overflow_ids = await _post_or_refresh_testcase_message(
+            channel, item, testcases, view=view
+        )
     except Exception as e:
         logging.warning(f"[TRACKER] Failed to refresh test-case message for item #{item_number}: {e}")
+        return
+    # Usually a no-op write (edit-in-place keeps the same id) — but a re-chunk (case list grew or
+    # shrank past the 2000-char boundary since the last refresh) genuinely changes the tracked
+    # id(s), and the next refresh/repost must see the new ones rather than retrying deleted
+    # message ids forever (2026-08-23, tracker #0028).
+    await db.update_tracker_item(
+        item_number,
+        test_channel_id=str(channel.id),
+        test_message_id=new_test_message_id,
+        test_overflow_message_ids=",".join(new_overflow_ids) if new_overflow_ids else None,
+    )
 
 
 async def move_testcases_to_done_channel(item_number: int) -> bool:

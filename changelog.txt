@@ -1,6 +1,41 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (2)
+- Fixed: post_test_cases() and post_comment() (qapbot/ui_tracker.py) sent their entire content as
+  ONE Discord message with no length guard (ticket #0028) -- found live when test cases posted
+  for tickets #14/#17/#19 hit the 2000-char cap, raised discord.HTTPException, and surfaced as a
+  bare text/plain 500 even though the DB write (set_tracker_testcases) had already committed --
+  the messages silently never reached #qapbot-testing at all. New _chunk_lines_for_discord() packs
+  content into as few messages as needed without ever splitting a line; a new
+  test_overflow_message_ids column tracks any leading chunks while test_message_id stays the last
+  one (the interactive/reactable message). Edit-in-place is preserved for the common single-
+  message case; a repost that newly needs multiple messages deletes everything tracked and
+  reposts fresh, in order, since a new overflow message would otherwise land chronologically after
+  an in-place edit. web_bridge.py's comment/testcases handlers now also catch
+  discord.HTTPException and return JSON instead of an unguarded 500. Files: qapbot/ui_tracker.py,
+  qapbot/db_manager.py, qapbot/web_bridge.py, qapbot/docs/BUG_FEATURE_TRACKER.md,
+  tests/discord/test_ui_tracker_items.py, tests/integration/test_web_bridge_tracker.py,
+  plans/tracker-0028-testcase-comment-message-chunking.md. 2550 tests pass. Needs a PROD bot
+  restart to take effect (the tracker MCP tools point at bridge-prod.qapbot.uk) -- once restarted,
+  #14/#17/#19's test cases need re-posting since they never actually reached Discord.
+
+2026-08-23 (2)
+- Fixed: role sync now runs with bounded Discord-side concurrency instead of a serial per-user
+  loop. `log_time_gaps.py` against the first PROD cycle after the 2026-08-14
+  has_active_subscriptions fix (changelog (12)) found 4 gaps of 34s/17.9s/17.8s/11.1s in a single
+  ~5min cycle, all from sync_roles_for_clan_members() awaiting sync_roles_for_user() one Discord
+  user at a time. Both sync_roles_for_clan_members() and sync_all_roles_for_guild() (same
+  pattern, larger member population) now fan out through a per-call asyncio.Semaphore(5) via
+  asyncio.gather(), same shape as Phase 1's fetch semaphore in QapBot.py but a lower, per-call
+  (not shared) limit, since the actual bottleneck is Discord's per-guild role-edit rate-limit
+  bucket rather than outbound connection pressure. sync_all_roles_for_guild()'s synced/errors
+  tally moved from in-loop increments to post-gather correlation against the gathered results, so
+  it can still tell "confirmed not a guild member" apart from "the call raised". Files:
+  qapbot/guild_role_manager.py, qapbot/docs/CODE_STRUCTURE.md,
+  qapbot/docs/RATE_LIMITING_IMPLEMENTATION.md, tests/unit/test_guild_role_manager.py,
+  backlog.txt, plans/implemented/parallelize-role-sync.md. 2534 tests pass.
+
 2026-08-23 (1)
 - Fixed: positional DB row access (Cardinal Rule 14) in
   get_cwl_player_season_status_dm_refs_for_event_sync() and in get_guild_config()'s

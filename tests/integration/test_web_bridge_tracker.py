@@ -9,6 +9,7 @@ import dataclasses
 import os
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -266,6 +267,30 @@ async def test_post_comment_requires_text(client, db, monkeypatch):
     assert resp.status == 400
 
 
+async def test_post_comment_reports_discord_failure_as_json_not_a_bare_500(client, db, monkeypatch):
+    """Tracker #0028, live incident: post_comment() used to let discord.HTTPException propagate
+    all the way to aiohttp's default handler, which produced a bare text/plain 500 the MCP client
+    could not even parse as JSON ("Attempt to decode JSON with unexpected mimetype"). Chunking
+    (see test_ui_tracker_items.py) fixes the routine over-length case; this covers what's left --
+    a genuine Discord-side failure (outage, permissions) even after chunking -- and asserts it
+    comes back as a real JSON error instead."""
+    thread = AsyncMock()
+    thread.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(status=503), "service unavailable"))
+    _wire_bot(monkeypatch, channel=thread)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, thread_id="777")
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/comment",
+        json={"text": "hello"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+
+    assert resp.status == 502
+    body = await resp.json()  # must be parseable JSON, not the raw exception text
+    assert "error" in body
+
+
 # -- thread history (2026-08-22: tracker_comment could only WRITE into the discussion thread; ---
 # -- this is the read side, previously missing entirely) ----------------------------------------
 
@@ -405,6 +430,35 @@ async def test_post_testcases_requires_non_empty_list(client, db, monkeypatch):
         f"/api/tracker/items/{item_number}/testcases", json={"cases": []}, headers={"X-Bridge-Secret": SECRET}
     )
     assert resp.status == 400
+
+
+async def test_post_testcases_reports_discord_failure_as_json_and_keeps_the_db_write(client, db, monkeypatch):
+    """Tracker #0028, live incident: a Discord-side failure posting the test-case message used to
+    surface as a bare text/plain 500 the caller couldn't parse as JSON -- and worse, masked that
+    set_tracker_testcases() (the DB write, which runs BEFORE the Discord post) had already
+    committed successfully. Confirms both halves of the fix: a real JSON error comes back, AND
+    the rows are there regardless -- a caller retrying the same cases after this error is safe
+    (set_tracker_testcases replaces the full set, it doesn't append)."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_tracker import TRACKER_SETTING_TEST_CHANNEL
+    CACHE.tracker_settings[TRACKER_SETTING_TEST_CHANNEL] = "1"
+    channel = _fake_channel()
+    channel.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(status=503), "service unavailable"))
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases",
+        json={"cases": [{"environment": "DEV", "description": "run it"}]},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+
+    assert resp.status == 502
+    body = await resp.json()
+    assert "error" in body
+    cases = await db.get_tracker_testcases(item_number)
+    assert len(cases) == 1
+    assert cases[0]["description"] == "run it"
 
 
 # -- create item (tracker item #0015) --------------------------------------
