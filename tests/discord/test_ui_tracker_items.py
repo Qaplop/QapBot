@@ -20,9 +20,12 @@ from qapbot.ui_tracker import (
     TRACKER_SETTING_ENABLED,
     TRACKER_SETTING_IMPLEMENTED_CHANNEL,
     TRACKER_SETTING_TEST_CHANNEL,
+    ConfirmForceMoveView,
+    ConfirmItemDoneView,
     TrackerDraftView,
     TrackerItemButton,
     TrackerItemModal,
+    TrackerStatusSelectView,
     _sanitize_attachment_filename,
     apply_pending_requestor_access,
     apply_status_change,
@@ -381,6 +384,89 @@ async def test_apply_status_change_updates_db(db, monkeypatch):
     item_number = await _make_item(db)
     updated = await apply_status_change(item_number, "triaged", actor_id="1")
     assert updated["status"] == "triaged"
+
+
+@pytest.mark.asyncio
+async def test_status_select_edits_dropdown_message_in_place(db, monkeypatch, mock_interaction):
+    """The status dropdown is a single-use picker (like ConfirmItemDoneView/ConfirmForceMoveView)
+    -- picking a value must replace its own message via edit_original_response(), not leave the
+    stale dropdown behind while a separate confirmation message is sent (message-clutter Pitfall
+    2, qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md; 2026-08-23 fix)."""
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    view = TrackerStatusSelectView(item_number, "new", str(mock_interaction.user.id), mock_interaction.guild.id)
+    mock_interaction.data = {"values": ["triaged"]}
+
+    await view._on_select(mock_interaction)
+
+    mock_interaction.edit_original_response.assert_awaited_once()
+    assert mock_interaction.edit_original_response.call_args.kwargs["view"] is None
+    mock_interaction.followup.send.assert_not_awaited()
+    item = await db.get_tracker_item(item_number)
+    assert item["status"] == "triaged"
+
+
+@pytest.mark.asyncio
+async def test_confirm_item_done_yes_edits_message_in_place(db, monkeypatch, mock_interaction):
+    """Same message-clutter fix as the status dropdown: clicking Yes must replace the Yes/No
+    prompt itself, not leave it behind alongside a separate confirmation message."""
+    _wire_bot(monkeypatch, channel=None)
+    mock_interaction.user.id = int(ADMIN_ID)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, status="testing")
+    view = ConfirmItemDoneView(item_number, mock_interaction.guild.id)
+
+    await view._on_yes(mock_interaction)
+
+    mock_interaction.edit_original_response.assert_awaited_once()
+    assert mock_interaction.edit_original_response.call_args.kwargs["view"] is None
+    mock_interaction.followup.send.assert_not_awaited()
+    item = await db.get_tracker_item(item_number)
+    assert item["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_confirm_item_done_no_edits_message_in_place(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, status="testing")
+    view = ConfirmItemDoneView(item_number, mock_interaction.guild.id)
+
+    await view._on_no(mock_interaction)
+
+    mock_interaction.edit_original_response.assert_awaited_once()
+    assert mock_interaction.edit_original_response.call_args.kwargs["view"] is None
+    mock_interaction.followup.send.assert_not_awaited()
+    item = await db.get_tracker_item(item_number)
+    assert item["status"] == "testing"  # untouched
+
+
+@pytest.mark.asyncio
+async def test_confirm_force_move_yes_edits_message_in_place(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    mock_interaction.user.id = int(ADMIN_ID)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, status="testing")
+    view = ConfirmForceMoveView(item_number, mock_interaction.guild.id)
+
+    await view._on_yes(mock_interaction)
+
+    mock_interaction.edit_original_response.assert_awaited_once()
+    mock_interaction.followup.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_force_move_no_edits_message_in_place(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, status="testing")
+    view = ConfirmForceMoveView(item_number, mock_interaction.guild.id)
+
+    await view._on_no(mock_interaction)
+
+    mock_interaction.edit_original_response.assert_awaited_once()
+    assert mock_interaction.edit_original_response.call_args.kwargs["view"] is None
+    mock_interaction.followup.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

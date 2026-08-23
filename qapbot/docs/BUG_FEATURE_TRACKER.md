@@ -220,6 +220,26 @@ Grant access (`_handle_grant_access()`) and the reporter/admin edit gate
 (`_check_reporter_or_admin()`) are unchanged — still `check_bot_admin_only()` — since neither is
 part of the test-case/status workflow testers were given.
 
+**Single-use ephemeral prompts must edit themselves, not spawn a sibling (2026-08-23, live bug
+report)**: `TrackerStatusSelectView._on_select`, `ConfirmItemDoneView`, and
+`ConfirmForceMoveView` are one-shot dialogs — a dropdown pick or a Yes/No click is the dialog's
+entire purpose, so the click must replace that same message (`interaction.response.defer()` +
+`interaction.edit_original_response(..., view=None)`), never `interaction.followup.send(...)`,
+which leaves the original prompt behind with its now-stale controls still visibly clickable while
+a second, disconnected message appears below it (Pitfall 2,
+`qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md`). `ConfirmForceMoveView._on_yes` shares its result text
+with the ordinary Pass-button/Move-to-Done completion path via `_build_testcases_moved_message()`
+(pure text/view builder) — `_send_testcases_moved_followup()` (new message) is for those two,
+which are layered on top of the *permanent* test-case list message and correctly stay a separate
+toast, while `_edit_to_testcases_moved_message()` (in-place edit) is for the confirm-dialog case.
+Not every "send a followup after defer" site is this bug: a followup layered on a persistent,
+non-ephemeral message (the item card, the test-case checklist) is intentional and correct — only
+a dialog whose sole content *is* the control being clicked must be edited away.
+`CwlCarryOverPromptView._finish()` (`qapbot/ui_cwl_roster.py`) is a known, unfixable exception to
+this rule: it must give `_launch_cwl_activity()` the interaction's one and only initial-response
+slot, so its own ephemeral Yes/No prompt can't be edited or deleted first — documented in-place at
+that call site.
+
 ### Test-case message chunking (2026-08-23, tracker #0028)
 
 `post_test_cases()`, `_refresh_testcase_message()` and `_move_test_message_to_done_testing_channel()`

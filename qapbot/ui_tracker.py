@@ -1646,17 +1646,17 @@ class TrackerStatusSelectView(discord.ui.View):
         self.add_item(select)  # type: ignore[arg-type]
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(thinking=False, ephemeral=True)
+        await interaction.response.defer(thinking=False)
         new_status = interaction.data['values'][0]  # type: ignore[index]
         actor_id = str(interaction.user.id)
         await apply_status_change(self.item_number, new_status, actor_id=actor_id)
-        await interaction.followup.send(
-            t(
+        await interaction.edit_original_response(
+            content=t(
                 'ui_components.tracker.status_changed_note', user_id=self.user_id, guild_id=self.guild_id,
                 status=t(f'ui_components.tracker.status_{new_status}', user_id=self.user_id, guild_id=self.guild_id),
                 actor_id=actor_id,
             ),
-            ephemeral=True,
+            view=None,
         )
 
 
@@ -2155,24 +2155,24 @@ class ConfirmItemDoneView(discord.ui.View):
                 t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=self.guild_id), ephemeral=True
             )
             return
-        await interaction.response.defer(thinking=False, ephemeral=True)
+        await interaction.response.defer(thinking=False)
         try:
             await apply_status_change(self.item_number, "done", actor_id=user_id)
-            await interaction.followup.send(
-                t(
+            await interaction.edit_original_response(
+                content=t(
                     'ui_components.tracker.item_done_confirm_applied', guild_id=self.guild_id,
                     item_number=f"{self.item_number:04d}",
                 ),
-                ephemeral=True,
+                view=None,
             )
         except ValueError as e:
-            await interaction.followup.send(str(e), ephemeral=True)
+            await interaction.edit_original_response(content=str(e), view=None)
         self.stop()
 
     async def _on_no(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(thinking=False, ephemeral=True)
-        await interaction.followup.send(
-            t('ui_components.tracker.item_done_confirm_cancelled', guild_id=self.guild_id), ephemeral=True
+        await interaction.response.defer(thinking=False)
+        await interaction.edit_original_response(
+            content=t('ui_components.tracker.item_done_confirm_cancelled', guild_id=self.guild_id), view=None
         )
         self.stop()
 
@@ -2276,27 +2276,48 @@ class TrackerTestFailButton(
         await mark_testing_failed(self.item_number, user_id)
 
 
-async def _send_testcases_moved_followup(
-    interaction: discord.Interaction, item_number: int, result: Dict[str, Any], guild_id: Optional[int]
-) -> None:
-    """Shared ephemeral followup for both the natural-completion path (Pass button) and the
-    manual Move-to-Done action, once a test-case message has just been archived — reports the
-    move and, if the linked item isn't already terminal, offers the ConfirmItemDoneView
-    (tracker item #0015 follow-up, 2026-08-22)."""
+def _build_testcases_moved_message(
+    item_number: int, result: Dict[str, Any], guild_id: Optional[int]
+) -> Tuple[str, Optional[discord.ui.View]]:
+    """Builds the archived-test-cases report text and, if the linked item isn't already
+    terminal, the ConfirmItemDoneView prompt to pair with it (tracker item #0015 follow-up,
+    2026-08-22). Shared by both the send (_send_testcases_moved_followup) and edit-in-place
+    (_edit_to_testcases_moved_message) presentations below."""
     text = t(
         'ui_components.tracker.testcase_moved_done_confirmed' if result["moved"] else 'ui_components.tracker.testcase_moved_done_no_channel',
         guild_id=guild_id,
     )
     linked_item = result.get("linked_item")
+    view: Optional[discord.ui.View] = None
     if linked_item is not None:
         text += "\n" + t(
             'ui_components.tracker.item_done_confirm_prompt', guild_id=guild_id,
             item_number=f"{linked_item['item_number']:04d}", title=linked_item['title'],
             status=t(f'ui_components.tracker.status_{linked_item["status"]}', guild_id=guild_id),
         )
-        await interaction.followup.send(text, view=ConfirmItemDoneView(item_number, guild_id), ephemeral=True)
-    else:
-        await interaction.followup.send(text, ephemeral=True)
+        view = ConfirmItemDoneView(item_number, guild_id)
+    return text, view
+
+
+async def _send_testcases_moved_followup(
+    interaction: discord.Interaction, item_number: int, result: Dict[str, Any], guild_id: Optional[int]
+) -> None:
+    """Shared ephemeral followup for the natural-completion path (Pass button) and the direct
+    Move-to-Done action — layered on top of the permanent (non-ephemeral) test-case message that
+    triggered it, so a new message (rather than an edit) is correct here."""
+    text, view = _build_testcases_moved_message(item_number, result, guild_id)
+    await interaction.followup.send(text, view=view, ephemeral=True)
+
+
+async def _edit_to_testcases_moved_message(
+    interaction: discord.Interaction, item_number: int, result: Dict[str, Any], guild_id: Optional[int]
+) -> None:
+    """Same content as _send_testcases_moved_followup, but edits the interaction's own message in
+    place instead — for confirm dialogs (ConfirmForceMoveView) whose Yes/No prompt should be
+    replaced once acted on, not left behind as clutter alongside a brand-new message (Pitfall 2,
+    qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md)."""
+    text, view = _build_testcases_moved_message(item_number, result, guild_id)
+    await interaction.edit_original_response(content=text, view=view)
 
 
 class ConfirmForceMoveView(discord.ui.View):
@@ -2329,15 +2350,15 @@ class ConfirmForceMoveView(discord.ui.View):
                 t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=self.guild_id), ephemeral=True
             )
             return
-        await interaction.response.defer(thinking=False, ephemeral=True)
+        await interaction.response.defer(thinking=False)
         result = await finalize_testcases_move(self.item_number)
-        await _send_testcases_moved_followup(interaction, self.item_number, result, self.guild_id)
+        await _edit_to_testcases_moved_message(interaction, self.item_number, result, self.guild_id)
         self.stop()
 
     async def _on_no(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(thinking=False, ephemeral=True)
-        await interaction.followup.send(
-            t('ui_components.tracker.testcase_movedone_confirm_cancelled', guild_id=self.guild_id), ephemeral=True
+        await interaction.response.defer(thinking=False)
+        await interaction.edit_original_response(
+            content=t('ui_components.tracker.testcase_movedone_confirm_cancelled', guild_id=self.guild_id), view=None
         )
         self.stop()
 

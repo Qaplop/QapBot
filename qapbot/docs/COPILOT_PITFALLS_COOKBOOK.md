@@ -35,10 +35,21 @@ Symptom: users get multiple ephemeral messages for one workflow.
 Fix: prefer in-place updates via `edit_message()`; if you must send a new message, delete the old one best-effort.
 
 ```python
-# Preferred: single-message flow
+# Preferred: single-message flow, work finishes within Discord's 3s response window
 await interaction.response.edit_message(content="Step 2", view=StepTwoView())
 
-# If you need a new ephemeral message, clean up old response when possible
+# Work takes longer than 3s: defer, THEN edit the original message via the webhook token —
+# NOT interaction.followup.send(), which creates a brand-new message and leaves this one
+# (buttons/select and all) behind, stale and still clickable (live bug report, 2026-08-23: a
+# Yes/No confirm dialog and a status-select dropdown in qapbot/ui_tracker.py both did exactly
+# this — see BUG_FEATURE_TRACKER.md's "Single-use ephemeral prompts must edit themselves" note).
+await interaction.response.defer(thinking=False)
+# ... slow work ...
+await interaction.edit_original_response(content="Step 2", view=None)
+
+# If you genuinely need a NEW message (the message being clicked is a permanent/persistent one
+# that should stay, e.g. a toast layered on top of an item card), clean up any PRIOR throwaway
+# response first when one exists:
 try:
     await interaction.delete_original_response()
 except Exception:
