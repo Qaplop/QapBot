@@ -459,7 +459,7 @@
       "grant_access_pending_applied": "✅ You now have access to reply to your report **#{item_number}**: {jump_link}",
       "discussion_thread_field": "Discussion thread",
       "dm_status_implemented": "🧪 Your {type} **#{item_number} · {title}** is ready and now being tested — it'll be finished soon!",
-      "dm_status_done": "🎉 Your {type} **#{item_number} · {title}** passed verification and is now **done**!",
+      "dm_status_done": "🎉 Your {type} **#{item_number} · {title}** passed verification and is now **ready for you to use**! Many thanks for your support!",
       "dm_status_rejected": "❌ Your {type} **#{item_number} · {title}** was marked **rejected**.",
       "testcase_message_header": "🧪 **#{item_number} · {title}**",
       "testcase_signoff_hint": "React 👍 to sign the whole set off, or use the buttons for per-environment sign-off.",
