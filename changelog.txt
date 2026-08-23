@@ -1,6 +1,17 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-24 (1)
+- Added: Phase 5d+5e of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- the Activity
+  screen itself. Three Worker routes (activity/server/src/index.ts) proxying the already-built
+  bridge endpoints, and a new activity/client/src/playerPrefs.ts rendering block I (standing
+  preferences per linked account plus an immediate-apply "apply to all" row) and block II (this
+  season's invitation status, with interactive I'm in/I'm out buttons mirroring the DM's own
+  two buttons). Fully localized via the two i18n namespaces (cwl.activity, cwl.template)
+  main.ts now fetches in parallel at launch and merges into one translator.
+  Files: activity/client/src/{playerPrefs.ts,main.ts,index.html}, activity/server/src/index.ts,
+  qapbot/ui_cwl_roster.py. 2690 tests pass; both Activity projects typecheck and build clean.
+
 2026-08-23 (20)
 - Added: Phase 5a-bis of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- a
   new /cwl preferences slash command (QBdiscordcmds.py), a second entry point into the same
