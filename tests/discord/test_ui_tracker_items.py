@@ -26,6 +26,7 @@ from qapbot.ui_tracker import (
     TrackerItemButton,
     TrackerItemModal,
     TrackerStatusSelectView,
+    TrackerTestMoveDoneButton,
     TrackerTestPassButton,
     _sanitize_attachment_filename,
     apply_pending_requestor_access,
@@ -43,6 +44,7 @@ from qapbot.ui_tracker import (
     start_tracker_item,
     _chunk_lines_for_discord,
     _register_upload_window,
+    _send_testcases_moved_followup,
     _upload_windows,
 )
 
@@ -884,6 +886,46 @@ async def test_finalize_testcases_move_moves_test_message_independent_of_item_st
     assert item["test_channel_id"] == "60"
     assert item["test_message_id"] == "600"
     assert result["linked_item"]["item_number"] == item_number  # still testing -> eligible
+
+
+@pytest.mark.asyncio
+async def test_send_testcases_moved_followup_omits_view_when_no_linked_item(mock_interaction):
+    """Live crash (2026-08-23): discord.py's followup.send() only accepts an actual View/
+    LayoutView for its `view` kwarg, or having it omitted entirely (default MISSING) -- passing
+    `None` explicitly raises TypeError. _build_testcases_moved_message() returns view=None
+    whenever there's no linked item eligible for the "mark done too?" prompt (e.g. Move to Done
+    on an item whose linked tracker item is already done/rejected/duplicate, or has no linked
+    item at all), so the followup must translate that None into MISSING, not pass it through."""
+    result = {"moved": True, "linked_item": None}
+
+    await _send_testcases_moved_followup(mock_interaction, 1, result, None)
+
+    mock_interaction.followup.send.assert_awaited_once()
+    assert mock_interaction.followup.send.call_args.kwargs["view"] is discord.utils.MISSING
+
+
+@pytest.mark.asyncio
+async def test_movedone_button_does_not_crash_when_linked_item_already_done(db, monkeypatch, mock_interaction):
+    """End-to-end reproduction of the reported crash: click Move to Done (no unchecked cases,
+    straight to completion) on a test-case set whose linked tracker item is already 'done' --
+    get_linked_item_if_eligible_for_done() returns None, which used to blow up the followup."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_DONE_TESTING_CHANNEL] = "60"
+    old_test_channel = _fake_channel(fetch_message=_fake_message(message_id=200))
+    done_testing_channel = _fake_channel(send_message=_fake_message(message_id=600))
+    _wire_bot_multi(monkeypatch, {20: old_test_channel, 60: done_testing_channel})
+    mock_interaction.user.id = int(ADMIN_ID)
+
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
+    await db.mark_tracker_environment_passed(item_number, "DEV", "1")
+    await db.update_tracker_item(item_number, test_channel_id="20", test_message_id="200", status="done")
+
+    button = TrackerTestMoveDoneButton(item_number)
+    await button.callback(mock_interaction)  # must not raise
+
+    mock_interaction.followup.send.assert_awaited_once()
+    assert mock_interaction.followup.send.call_args.kwargs["view"] is discord.utils.MISSING
 
 
 @pytest.mark.asyncio

@@ -2473,7 +2473,14 @@ async def _send_testcases_moved_followup(
     Move-to-Done action — layered on top of the permanent (non-ephemeral) test-case message that
     triggered it, so a new message (rather than an edit) is correct here."""
     text, view = _build_testcases_moved_message(item_number, result, guild_id)
-    await interaction.followup.send(text, view=view, ephemeral=True)
+    # _build_testcases_moved_message() returns view=None whenever the linked item isn't eligible
+    # for a "mark done too?" prompt (already terminal, or there's no linked item at all) -- but
+    # unlike edit_message()/edit_original_response() (where `view=None` validly means "clear the
+    # view"), followup.send()'s `view` parameter only accepts an actual View/LayoutView or being
+    # omitted entirely (default MISSING); passing `None` explicitly raises TypeError (confirmed
+    # live, 2026-08-23: crashed the "Move to Done" button whenever the linked item was already
+    # done/rejected/duplicate). MISSING is the correct "no view" value here.
+    await interaction.followup.send(text, view=view if view is not None else discord.utils.MISSING, ephemeral=True)
 
 
 async def _edit_to_testcases_moved_message(

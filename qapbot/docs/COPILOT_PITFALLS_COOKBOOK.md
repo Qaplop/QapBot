@@ -1850,3 +1850,41 @@ component is session-scoped (`self`-state flag via `_consume_once()`) or a persi
 `DynamicItem` (persisted-state re-check). A bare `check permission → defer() → act` shape with
 neither is the exact pattern that shipped both #0026 and #0036.
 
+## Pitfall 42: `interaction.followup.send(view=...)` rejects an explicit `None` — only `edit_message()`/`edit_original_response()` treat `None` as "no view"
+
+**Symptom (2026-08-23, live report, found while re-testing #0036's fix):** clicking "Move to
+Done" on a test-case set whose linked tracker item was already `done` crashed with
+`TypeError: expected view parameter to be of type View or LayoutView, not NoneType` inside
+`discord/webhook/async_.py`'s `send()`, surfacing as "Ignoring exception in dynamic item
+callback for TrackerTestMoveDoneButton" in the logs — the button appeared to do nothing from the
+user's side, no error visible in Discord.
+
+**Why:** `_build_testcases_moved_message()` (`qapbot/ui_tracker.py`) returns `view=None`
+whenever the linked item isn't eligible for a "mark it done too?" prompt (already terminal, or
+no linked item at all) — a legitimate, common case, not an error state.
+`_send_testcases_moved_followup()` passed that straight through:
+`interaction.followup.send(text, view=view, ephemeral=True)`. discord.py's `Webhook.send()`
+(and `Interaction.followup.send()`, which wraps it) types `view` as `View = MISSING` — a bare
+type, not `Optional[View]` — so `None` is simply not an accepted value; only a real
+`View`/`LayoutView` instance or omitting the parameter entirely (the `MISSING` sentinel) works.
+This is *inconsistent* with `interaction.edit_original_response()` / `response.edit_message()`,
+which type the same parameter as `Optional[Union[View, LayoutView]] = MISSING` specifically so
+`None` can mean "clear the existing view" — an easy trap when a function like
+`_build_testcases_moved_message()` is shared between a `.send()` call site
+(`_send_testcases_moved_followup`) and an `.edit_original_response()` call site
+(`_edit_to_testcases_moved_message`), since only one of the two call sites is actually broken by
+the same `view=None` return value.
+
+**Fix:** translate `None` into `discord.utils.MISSING` at any `.send()`/`followup.send()` call
+site whose `view` can be `None`: `view=view if view is not None else discord.utils.MISSING`. An
+equally valid alternative already used elsewhere in this file (`_send_testcase_chunks()`) is a
+ternary on the whole call: `await x.send(content, view=view) if view else await x.send(content)`.
+
+**How to apply:** before passing a `view=` (or `embed=`, `embeds=`, `file=`, etc. — the same
+`MISSING`-not-`None` convention applies to most discord.py webhook/interaction kwargs) that
+might be `None` into any `channel.send()` / `interaction.followup.send()` / `webhook.send()`
+call, either guard it into `discord.utils.MISSING` or branch the call entirely. Don't assume
+"`None` means omitted" carries over from an edit-style call (`edit_message`/
+`edit_original_response`, where it's true and deliberate) to a send-style call (where it isn't)
+just because the same variable is reused between the two.
+
