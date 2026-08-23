@@ -23,6 +23,10 @@ from qapbot.cache_manager import CACHE
 
 # CoC's real league ladder, used for target_league_rank / preferred_league_rank pickers
 # throughout this feature (Phase 1's per-clan target tier, Phase 2's sign-up preference).
+# Duplicated verbatim as a TS constant in activity/client/src/playerPrefs.ts (plans/
+# cwl-personal-hub.md Phase 5e, its own picker) rather than fetched — a static, CoC-defined
+# ladder that hasn't changed since this list was written. If this list ever changes, update
+# that file's copy too.
 CWL_LEAGUE_RANKS: List[str] = [
     "Champion League I", "Champion League II", "Champion League III",
     "Master League I", "Master League II", "Master League III",

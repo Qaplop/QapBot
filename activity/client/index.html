@@ -553,6 +553,28 @@
       }
       .skill-score { flex-shrink: 0; font-size: 0.75rem; color: #f2f3f5; }
       .status-icon { width: 16px; height: 16px; flex-shrink: 0; display: block; }
+
+      /* Player CWL Settings Hub (2026-08-24, plans/cwl-personal-hub.md Phase 5e) — the
+         player_prefs screen's own bits, layered on top of everything above (table/header/
+         footer/select styling is all already shared, see playerPrefs.ts's own comment). */
+      .prefs-description { margin-bottom: 12px; font-size: 0.8rem; color: #f2f3f5; }
+      .prefs-block { margin-top: 24px; }
+      .prefs-block:first-of-type { margin-top: 0; }
+      tr.apply-row { background: #3f4147; }
+      .status-cell-inner { display: flex; align-items: center; gap: 8px; }
+      .status-action-button {
+        background: #3f4147;
+        color: #f2f3f5;
+        border: none;
+        border-radius: 4px;
+        padding: 2px 8px;
+        font-size: 0.7rem;
+        cursor: pointer;
+      }
+      .status-action-button:hover:not(:disabled) { background: #4a4d54; }
+      .status-action-button:disabled { opacity: 0.5; cursor: default; }
+      .block-status { font-size: 0.8rem; margin-top: 8px; min-height: 1em; }
+      .block-status.error { color: #f23f42; }
     </style>
   </head>
   <body>

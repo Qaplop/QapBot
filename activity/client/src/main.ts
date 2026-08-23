@@ -7,6 +7,8 @@
 import { DiscordSDK, RPCCloseCodes } from '@discord/embedded-app-sdk'
 import { renderClanConfigTable } from './clanConfigTable'
 import { renderEnrollmentBoard } from './enrollmentBoard'
+import { renderPlayerPrefs } from './playerPrefs'
+import { createTranslator } from './i18n'
 import type {
   AdminSettableStatus,
   ClanConfig,
@@ -14,6 +16,9 @@ import type {
   EnrollmentPayload,
   GuestPlayerPoolEntry,
   GuestSearchResponse,
+  PlayerPrefsChange,
+  PlayerPrefsPayload,
+  PlayerPrefsStatusAction,
   ScreenPayload,
   SetStatusResult,
   WaitResponse,
@@ -365,6 +370,73 @@ async function setup(): Promise<void> {
           }
         }
       })()
+      return
+    }
+
+    if (screen === 'player_prefs') {
+      root.textContent = 'Loading…'
+
+      // Two i18n namespaces (2026-08-24, plans/cwl-personal-hub.md Phase 5e/6): cwl.activity for
+      // this screen's own strings, cwl.template for the status-change endpoint's failure codes
+      // (reused as-is from the DM template, Phase 6f) — fetched in parallel and merged into one
+      // flat lookup, since GET /api/i18n only accepts a single `ns` per call and the two
+      // namespaces' key sets don't overlap.
+      const [prefsResponse, activityI18n, templateI18n] = await Promise.all([
+        fetch(`/api/cwl/player-prefs?guild_id=${encodeURIComponent(guildId)}`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }),
+        fetch(`/api/i18n?guild_id=${encodeURIComponent(guildId)}&ns=cwl.activity`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }),
+        fetch(`/api/i18n?guild_id=${encodeURIComponent(guildId)}&ns=cwl.template`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }),
+      ])
+      if (!prefsResponse.ok) {
+        const body = await prefsResponse.text()
+        throw new Error(`failed to load CWL preferences (${prefsResponse.status}): ${body}`)
+      }
+      if (!activityI18n.ok || !templateI18n.ok) {
+        throw new Error('failed to load translations for the CWL preferences screen')
+      }
+      const prefsPayload = (await prefsResponse.json()) as PlayerPrefsPayload
+      const { strings: activityStrings } = (await activityI18n.json()) as { strings: Record<string, string> }
+      const { strings: templateStrings } = (await templateI18n.json()) as { strings: Record<string, string> }
+      const t = createTranslator({ ...activityStrings, ...templateStrings })
+
+      renderPlayerPrefs(
+        root,
+        prefsPayload,
+        t,
+        async (changes: PlayerPrefsChange[]) => {
+          const response = await fetch('/api/cwl/player-prefs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+            body: JSON.stringify({ guild_id: guildId, changes }),
+          })
+          if (!response.ok) {
+            const body = await response.text()
+            throw errorFromResponse(response.status, body)
+          }
+          return (await response.json()) as PlayerPrefsPayload
+        },
+        async (playerTag: string, action: PlayerPrefsStatusAction) => {
+          const response = await fetch('/api/cwl/player-prefs/status', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+            body: JSON.stringify({ guild_id: guildId, player_tag: playerTag, action }),
+          })
+          const body = (await response.json()) as PlayerPrefsPayload & { error?: string }
+          if (!response.ok) {
+            // Unlike every other endpoint, the error field here is a cwl.template.* KEY, not a
+            // human-readable message — playerPrefs.ts's own translator turns it into text (see
+            // its STATUS_ERROR_CODES set), so the raw code is what must survive as .message.
+            throw new Error(body.error ?? `${response.status}`)
+          }
+          return body
+        },
+        closeActivity,
+      )
       return
     }
 
