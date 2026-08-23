@@ -4220,6 +4220,50 @@ class WarHistoryDB:
                 )
                 return []
 
+    def get_cwl_player_season_status_rows_by_dm_message_sync(
+        self, message_id: str, cwl_season: str
+    ) -> List[Dict[str, Any]]:
+        """Every cwl_player_season_status row whose invitation/reminder DM currently lives in
+        message_id, for this season — the live "which accounts does this Discord message cover"
+        resolution plans/cwl-personal-hub.md Phase 4d's rerender_cwl_dm_after_response() needs to
+        re-render either DM shape (single-account invitation or multi-account reminder) from
+        current state rather than a stored/assumed scope. mark_cwl_player_dm_sent_sync() already
+        writes dm_sent_via_message_id per player_tag for both DM-sending paths
+        (_send_cwl_enrollment_dm_batch, send_cwl_reminder_dm_group), so no new write path is
+        needed — this is purely the read side. Season-scoped in addition to message_id (globally
+        unique per real Discord message on its own) as defense-in-depth, matching this table's own
+        UNIQUE(player_tag, cwl_season)."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT player_tag, player_name, status, dmed_discord_id
+                    FROM cwl_player_season_status
+                    WHERE dm_sent_via_message_id = ? AND cwl_season = ?
+                    """,
+                    (message_id, cwl_season),
+                ).fetchall()
+                return [
+                    {
+                        "player_tag": row["player_tag"],
+                        "player_name": row["player_name"],
+                        "status": row["status"],
+                        "dmed_discord_id": row["dmed_discord_id"],
+                    }
+                    for row in rows
+                ]
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-QUERY-SYNC] get_cwl_player_season_status_rows_by_dm_message_sync failed "
+                    f"for message_id={message_id}: {e}"
+                )
+                return []
+
     def set_cwl_event_clans_sync(self, event_id: int, clan_configs: List[Dict[str, Any]]) -> bool:
         """Replace an event's full cwl_event_clans set in one atomic DELETE + INSERT (matches
         the pattern used elsewhere for whole-collection replacement, e.g. war_attacks updates).

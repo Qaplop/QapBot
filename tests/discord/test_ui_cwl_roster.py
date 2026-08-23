@@ -2044,6 +2044,12 @@ class TestCwlReminderResponseButton:
         db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
         db.update_cwl_event_status_sync(event_id, "signup_open")
         db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "123456789", None, "template_confirm", "pending")
+        # Scope is re-derived from cwl_player_season_status.dm_sent_via_message_id (Phase 4d),
+        # not just from the cwl_signups snapshot — this message covers exactly #P1.
+        mock_interaction.message.id = 555001
+        db.mark_cwl_player_dm_sent_sync(
+            "#P1", "2026-08", "Alpha", "123456789", event_id, 9201, "2026-08-17T09:00Z", "555001",
+        )
 
         mock_interaction.user.id = 123456789
         mock_interaction.response.edit_message = AsyncMock()
@@ -2083,6 +2089,15 @@ class TestCwlReminderResponseButton:
             "('123456789', '#ALT1', 'AltOne', 0), ('123456789', '#ALT2', 'AltTwo', 0)"
         )
         await db.conn.commit()
+        # Scope is re-derived from cwl_player_season_status.dm_sent_via_message_id (Phase 4d) —
+        # both accounts share this one combined reminder message.
+        mock_interaction.message.id = 555002
+        db.mark_cwl_player_dm_sent_sync(
+            "#ALT1", "2026-08", "AltOne", "123456789", event_id, 9202, "2026-08-17T09:00Z", "555002",
+        )
+        db.mark_cwl_player_dm_sent_sync(
+            "#ALT2", "2026-08", "AltTwo", "123456789", event_id, 9202, "2026-08-17T09:00Z", "555002",
+        )
 
         mock_interaction.user.id = 123456789
         mock_interaction.response.edit_message = AsyncMock()

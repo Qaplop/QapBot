@@ -1523,7 +1523,98 @@ async def _apply_cwl_signup_response(
     for other_guild_id in affected_guild_ids:
         await bump_enrollment_version(other_guild_id)
 
-    return {"code": "ok", "guild_id": guild_id, "player_name": signup.get("player_name") or player_tag}
+    return {
+        "code": "ok", "guild_id": guild_id, "player_name": signup.get("player_name") or player_tag,
+        # Phase 4d (plans/cwl-personal-hub.md) — rerender_cwl_dm_after_response() needs the
+        # season for its DB query and its multi-account intro text; event is already fetched
+        # here, so this avoids either caller re-fetching it just for this one field.
+        "season": event["cwl_season"],
+    }
+
+
+async def rerender_cwl_dm_after_response(
+    message: Any, event_id: int, season: str, discord_id: str,
+    *, action: str, player_name: str, interaction: Optional[discord.Interaction] = None,
+) -> None:
+    """Re-render one enrollment/reminder DM from live state after its owner answered — from a
+    button click, from the Activity (Phase 5c, a later session), or from anywhere else.
+
+    Unifies CwlSignupResponseButton's and CwlReminderResponseButton's previously-diverged
+    end-of-click rendering (plans/cwl-personal-hub.md Phase 4d "Design note" — the split was
+    deliberate at the time: an invitation DM covers exactly one account and can simply be wiped,
+    while a reminder DM can cover up to 5 and wiping the whole message on one click would destroy
+    the still-pending siblings' buttons). This function makes both shapes go through the SAME
+    "re-derive scope from the DB, then render" path — Pitfall 24's "live wins over a stored
+    snapshot" convention, generalized to cover N=1 as a degenerate case of N=many rather than a
+    separate code path.
+
+    Scope (which accounts this message covers) is re-derived, never assumed: every
+    cwl_player_season_status row whose dm_sent_via_message_id equals this message's id, for this
+    season (get_cwl_player_season_status_rows_by_dm_message_sync — the same bookkeeping both DM
+    senders already write per-account, so no new column or custom_id snapshot is needed). Of
+    those, the ones still 'pending' get re-rendered with their own confirm/decline buttons; when
+    none remain, the message finalizes with the existing single-account
+    cwl.template.confirmed_msg/declined_msg, naming `player_name` — the exact text both button
+    classes already showed before this unification, preserved byte-for-byte regardless of how
+    many accounts the message originally covered (there was never a distinct "group finalized"
+    wording in the pre-unification code to reuse; inventing one now would be a real wording
+    change, not a refactor). `player_name` is a required caller-supplied parameter rather than
+    re-derived from `covered`+`discord_id` here, because one Discord user can own MULTIPLE
+    accounts covered by the same reminder DM — looking it up by discord_id alone would be
+    ambiguous about which of their several accounts was actually just answered; the caller already
+    knows this unambiguously (it's the account whose button was clicked, or whose status the
+    caller just changed) and _apply_cwl_signup_response()'s own return already names it.
+
+    Applies the edit through `interaction.response.edit_message()` when an interaction is
+    available (keeping the click's own response slot, exactly as before) and through
+    `message.edit()` otherwise — deliberately tolerant of failure there (discord.HTTPException,
+    caught and logged) since a non-interaction caller (Phase 5c) has already committed the
+    underlying status write by the time this runs; a DM that can't be edited must never undo it.
+    """
+    from qapbot.i18n import t
+
+    db = CACHE.db_manager
+    covered = (
+        await asyncio.to_thread(db.get_cwl_player_season_status_rows_by_dm_message_sync, str(message.id), season)
+        if db is not None else []
+    )
+    remaining = [
+        {"player_tag": row["player_tag"], "player_name": row["player_name"]}
+        for row in covered if row["status"] == "pending"
+    ]
+
+    guild_id: Optional[int] = None
+    if db is not None:
+        event = await asyncio.to_thread(db.get_cwl_event_by_id_sync, event_id)
+        guild_id = int(event["guild_id"]) if event is not None else None
+
+    if remaining:
+        content = t('cwl.reminder.dm_buttons_intro', user_id=discord_id, guild_id=guild_id, season=season)
+        view: Optional[discord.ui.View] = build_cwl_reminder_response_view(event_id, remaining, guild_id)
+    else:
+        response_key = 'cwl.template.confirmed_msg' if action == "confirm" else 'cwl.template.declined_msg'
+        content = t(response_key, user_id=discord_id, guild_id=guild_id, player_name=player_name)
+        view = None
+
+    if interaction is not None:
+        try:
+            await interaction.response.edit_message(content=content, view=view)
+        except discord.NotFound as e:
+            if getattr(e, "code", None) == 10062:
+                logging.warning(
+                    f"[rerender_cwl_dm_after_response] Interaction expired before bot could respond "
+                    f"(10062): event={event_id} discord_id={discord_id}"
+                )
+            else:
+                raise
+    else:
+        try:
+            await message.edit(content=content, view=view)
+        except discord.HTTPException as e:
+            logging.warning(
+                f"[rerender_cwl_dm_after_response] Could not edit DM message {message.id} for "
+                f"event={event_id} discord_id={discord_id}: {e}"
+            )
 
 
 class CwlSignupResponseButton(
@@ -1572,22 +1663,15 @@ class CwlSignupResponseButton(
             )
             return
 
-        response_key = 'cwl.template.confirmed_msg' if self.action == "confirm" else 'cwl.template.declined_msg'
-        try:
-            await interaction.response.edit_message(
-                content=t(
-                    response_key, user_id=user_id_str, guild_id=guild_id, player_name=result["player_name"]
-                ),
-                view=None,
-            )
-        except discord.NotFound as e:
-            if getattr(e, "code", None) == 10062:
-                logging.warning(
-                    f"[CwlSignupResponseButton] Interaction expired before bot could respond (10062): "
-                    f"event={self.event_id} player={self.player_tag}"
-                )
-            else:
-                raise
+        # Phase 4d (plans/cwl-personal-hub.md) — the render half now goes through the same
+        # shared re-derive-from-DB path CwlReminderResponseButton uses below, rather than this
+        # class's own hardcoded "always wipe the whole message" behavior. For a genuine
+        # single-account invitation DM the re-derived scope is always exactly one account, so the
+        # rendered result is unchanged — this is a pure refactor of HOW that result is reached.
+        await rerender_cwl_dm_after_response(
+            interaction.message, self.event_id, result["season"], user_id_str,
+            action=self.action, player_name=result["player_name"], interaction=interaction,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1680,52 +1764,19 @@ class CwlReminderResponseButton(
             )
             return
 
-        db = CACHE.db_manager
-        event = await asyncio.to_thread(db.get_cwl_event_by_id_sync, self.event_id)
-        pending = [
-            s for s in await asyncio.to_thread(db.get_cwl_signups_for_event_sync, self.event_id)
-            if s["status"] == "pending"
-        ]
-        links = (
-            await asyncio.to_thread(db.get_player_links_sync, [s["player_tag"] for s in pending])
-            if pending else {}
+        # Phase 4d (plans/cwl-personal-hub.md) — same shared re-derive-from-DB rendering
+        # CwlSignupResponseButton now uses above, replacing this class's own hand-rolled
+        # "re-derive this user's remaining pending accounts and rebuild" logic. Scope is now
+        # message-id-scoped (get_cwl_player_season_status_rows_by_dm_message_sync) rather than
+        # "every pending signup in this event owned by this discord_id" — a real behavior
+        # refinement, not just a refactor: the old scoping could pull in accounts from a
+        # DIFFERENT reminder DM chunk (send_cwl_reminder_dm_group splits a user's pending
+        # accounts into multiple ≤5-account messages when they exceed Discord's 5-action-row
+        # cap), which message-id scoping can no longer do.
+        await rerender_cwl_dm_after_response(
+            interaction.message, self.event_id, result["season"], user_id_str,
+            action=self.action, player_name=result["player_name"], interaction=interaction,
         )
-        remaining = [
-            {
-                "player_tag": s["player_tag"],
-                "player_name": s["player_name"] or (links.get(s["player_tag"]) or {}).get("player_name"),
-            }
-            for s in pending
-            if (links.get(s["player_tag"]) or {}).get("discord_id") == user_id_str
-        ]
-
-        try:
-            if remaining:
-                content = t(
-                    'cwl.reminder.dm_buttons_intro', user_id=user_id_str, guild_id=guild_id,
-                    season=event["cwl_season"] if event is not None else "",
-                )
-                await interaction.response.edit_message(
-                    content=content, view=build_cwl_reminder_response_view(self.event_id, remaining, guild_id)
-                )
-            else:
-                response_key = (
-                    'cwl.template.confirmed_msg' if self.action == "confirm" else 'cwl.template.declined_msg'
-                )
-                await interaction.response.edit_message(
-                    content=t(
-                        response_key, user_id=user_id_str, guild_id=guild_id, player_name=result["player_name"]
-                    ),
-                    view=None,
-                )
-        except discord.NotFound as e:
-            if getattr(e, "code", None) == 10062:
-                logging.warning(
-                    f"[CwlReminderResponseButton] Interaction expired before bot could respond (10062): "
-                    f"event={self.event_id} player={self.player_tag}"
-                )
-            else:
-                raise
 
 
 # ---------------------------------------------------------------------------

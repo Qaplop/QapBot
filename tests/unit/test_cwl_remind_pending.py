@@ -7,6 +7,8 @@ DB joins/filters that a mocked db_manager would just re-assert back at itself.
 """
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from qapbot.db_manager import WarHistoryDB
@@ -318,3 +320,169 @@ class TestCountCwlPoolMembersMissingDm:
         db.upsert_cwl_signup_sync(event_id, "#NEW1", "New1", "owner1", None, "guest_invite", "pending")
 
         assert has_cwl_pool_members_missing_dm(818, "2026-09") is True
+
+
+# ---------------------------------------------------------------------------
+# rerender_cwl_dm_after_response — Phase 4d (plans/cwl-personal-hub.md) unification of
+# CwlSignupResponseButton's and CwlReminderResponseButton's previously-diverged rendering
+# ---------------------------------------------------------------------------
+
+class TestRerenderCwlDmAfterResponse:
+    @pytest.mark.asyncio
+    async def test_single_account_scope_finalizes_with_view_none(self, db):
+        """Byte-identical to the pre-unification single-account invitation behavior."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import rerender_cwl_dm_after_response
+
+        event_id = await _seed(db, "820", "#CLANQ")
+        CACHE.db_manager = db
+        db.mark_cwl_player_dm_sent_sync(
+            "#P1", "2026-09", "PlayerOne", "d1", event_id, 820, "2026-09-01T09:00Z", "700001",
+        )
+        db.set_cwl_player_response_status_sync(
+            "#P1", "2026-09", "PlayerOne", "d1", "confirmed", "2026-09-01T09:05Z", event_id, 820,
+        )
+
+        message = MagicMock()
+        message.id = 700001
+        interaction = AsyncMock()
+        interaction.response.edit_message = AsyncMock()
+
+        await rerender_cwl_dm_after_response(
+            message, event_id, "2026-09", "d1",
+            action="confirm", player_name="PlayerOne", interaction=interaction,
+        )
+
+        interaction.response.edit_message.assert_awaited_once()
+        _, kwargs = interaction.response.edit_message.call_args
+        assert kwargs["view"] is None
+        assert "PlayerOne" in kwargs["content"]
+
+    @pytest.mark.asyncio
+    async def test_two_of_three_still_pending_rerenders_with_their_buttons(self, db):
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlReminderResponseButton, rerender_cwl_dm_after_response
+
+        event_id = await _seed(db, "821", "#CLANR")
+        CACHE.db_manager = db
+        for tag, name in (("#P1", "One"), ("#P2", "Two"), ("#P3", "Three")):
+            db.mark_cwl_player_dm_sent_sync(
+                tag, "2026-09", name, "d1", event_id, 821, "2026-09-01T09:00Z", "700002",
+            )
+        # #P1 just answered (the account whose button was clicked); #P2/#P3 remain pending.
+        db.set_cwl_player_response_status_sync(
+            "#P1", "2026-09", "One", "d1", "confirmed", "2026-09-01T09:05Z", event_id, 821,
+        )
+
+        message = MagicMock()
+        message.id = 700002
+        interaction = AsyncMock()
+        interaction.response.edit_message = AsyncMock()
+
+        await rerender_cwl_dm_after_response(
+            message, event_id, "2026-09", "d1",
+            action="confirm", player_name="One", interaction=interaction,
+        )
+
+        interaction.response.edit_message.assert_awaited_once()
+        _, kwargs = interaction.response.edit_message.call_args
+        assert kwargs["view"] is not None
+        buttons = [item for item in kwargs["view"].children if isinstance(item, CwlReminderResponseButton)]
+        assert {b.player_tag for b in buttons} == {"#P2", "#P3"}
+
+    @pytest.mark.asyncio
+    async def test_last_of_three_finalizes_with_view_none(self, db):
+        """Once the third and final account is answered, the message finalizes exactly like the
+        single-account case — there is no distinct "group finalized" wording in the
+        pre-unification code, so none is invented here either."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import rerender_cwl_dm_after_response
+
+        event_id = await _seed(db, "822", "#CLANS")
+        CACHE.db_manager = db
+        for tag, name, status in (("#P1", "One", "confirmed"), ("#P2", "Two", "declined"), ("#P3", "Three", "pending")):
+            db.mark_cwl_player_dm_sent_sync(
+                tag, "2026-09", name, "d1", event_id, 822, "2026-09-01T09:00Z", "700003",
+            )
+            if status != "pending":
+                db.set_cwl_player_response_status_sync(
+                    tag, "2026-09", name, "d1", status, "2026-09-01T09:05Z", event_id, 822,
+                )
+        # #P3 is the last one to answer now.
+        db.set_cwl_player_response_status_sync(
+            "#P3", "2026-09", "Three", "d1", "declined", "2026-09-01T09:10Z", event_id, 822,
+        )
+
+        message = MagicMock()
+        message.id = 700003
+        interaction = AsyncMock()
+        interaction.response.edit_message = AsyncMock()
+
+        await rerender_cwl_dm_after_response(
+            message, event_id, "2026-09", "d1",
+            action="optout", player_name="Three", interaction=interaction,
+        )
+
+        _, kwargs = interaction.response.edit_message.call_args
+        assert kwargs["view"] is None
+        assert "Three" in kwargs["content"]
+
+    @pytest.mark.asyncio
+    async def test_scope_ignores_accounts_pointing_at_a_different_message_id(self, db):
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlReminderResponseButton, rerender_cwl_dm_after_response
+
+        event_id = await _seed(db, "823", "#CLANT")
+        CACHE.db_manager = db
+        db.mark_cwl_player_dm_sent_sync(
+            "#SAME", "2026-09", "Same", "d1", event_id, 823, "2026-09-01T09:00Z", "700004a",
+        )
+        db.mark_cwl_player_dm_sent_sync(
+            "#OTHER", "2026-09", "Other", "d1", event_id, 823, "2026-09-01T09:00Z", "700004b",
+        )
+
+        message = MagicMock()
+        message.id = "700004a"  # matches only #SAME's dm_sent_via_message_id
+        interaction = AsyncMock()
+        interaction.response.edit_message = AsyncMock()
+
+        await rerender_cwl_dm_after_response(
+            message, event_id, "2026-09", "d1",
+            action="confirm", player_name="Same", interaction=interaction,
+        )
+
+        _, kwargs = interaction.response.edit_message.call_args
+        # #SAME is still 'pending' (never answered in this test) and alone in scope, so it
+        # re-renders with just its own buttons — #OTHER (a different message) must never appear.
+        assert kwargs["view"] is not None
+        buttons = [item for item in kwargs["view"].children if isinstance(item, CwlReminderResponseButton)]
+        assert {b.player_tag for b in buttons} == {"#SAME"}
+
+    @pytest.mark.asyncio
+    async def test_no_interaction_path_edits_the_message_directly(self, db):
+        """The whole point of this function: it must be drivable WITHOUT an Interaction, for a
+        future non-Discord caller (e.g. the Activity's own DM reconciliation)."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import rerender_cwl_dm_after_response
+
+        event_id = await _seed(db, "824", "#CLANU")
+        CACHE.db_manager = db
+        db.mark_cwl_player_dm_sent_sync(
+            "#P1", "2026-09", "PlayerOne", "d1", event_id, 824, "2026-09-01T09:00Z", "700005",
+        )
+        db.set_cwl_player_response_status_sync(
+            "#P1", "2026-09", "PlayerOne", "d1", "declined", "2026-09-01T09:05Z", event_id, 824,
+        )
+
+        message = AsyncMock()
+        message.id = 700005
+
+        await rerender_cwl_dm_after_response(
+            message, event_id, "2026-09", "d1",
+            action="optout", player_name="PlayerOne", interaction=None,
+        )
+
+        message.edit.assert_awaited_once()
+        _, kwargs = message.edit.call_args
+        assert kwargs["view"] is None
+        assert "PlayerOne" in kwargs["content"]
