@@ -461,16 +461,19 @@ async def format_clan_management_cwl_management(
         inline=False,
     )
 
+    # 'withdrawn' is legacy-only (its one writer, the board's old 1-click admin confirm/withdraw
+    # control, was removed 2026-08-19 — see ADMIN_SETTABLE_ENROLLMENT_STATUSES's comment,
+    # web_bridge.py) — omitted here rather than shown as a permanent "0" line.
     signup_counts = db.get_cwl_signup_status_counts_sync(event["id"]) if db is not None else {}
     pending_linked, pending_unlinked = await asyncio.to_thread(
         split_cwl_pending_signups_by_link_sync, event["id"]
     )
     signup_lines = [
-        f"{t('cwl.management.signup_status_pending', guild_id=guild_id_int)}: {pending_linked}",
         f"{t('cwl.management.signup_status_unlinked', guild_id=guild_id_int)}: {pending_unlinked}",
+        f"{t('cwl.management.signup_status_pending', guild_id=guild_id_int)}: {pending_linked}",
     ] + [
         f"{t(f'cwl.management.signup_status_{status}', guild_id=guild_id_int)}: {signup_counts.get(status, 0)}"
-        for status in ("confirmed", "declined", "withdrawn")
+        for status in ("confirmed", "declined")
     ]
     embed.add_field(
         name=t('cwl.management.signups_block_title', guild_id=guild_id_int),

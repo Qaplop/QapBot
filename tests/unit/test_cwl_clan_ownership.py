@@ -1015,7 +1015,7 @@ async def test_detach_mirrors_confirmed_shared_roster_into_local_orphaned_assign
 @pytest.mark.discord
 @pytest.mark.asyncio
 async def test_detach_does_not_mirror_a_non_confirmed_shared_roster_player(db, monkeypatch):
-    """A pending/withdrawn/declined shared-roster row was never actually "assigned" to the clan
+    """A pending/declined shared-roster row was never actually "assigned" to the clan
     (only status='confirmed' counts as an assignment for a shared clan — see
     _build_enrollment_payload's merge) — must not be mirrored as an orphaned assignment."""
     from qapbot.cache_manager import CACHE

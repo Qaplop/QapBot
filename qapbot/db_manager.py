@@ -2295,8 +2295,9 @@ class WarHistoryDB:
         # different meaning logically than the other! ... The symbols in the player tile should
         # exclusively reflect confirmation status. The assignment status is obvious to the user
         # from the column the player tile appears in."):
-        #   - `status` (pending/confirmed/declined/withdrawn) is PURELY the player's own genuine
-        #     response — set ONLY by set_cwl_shared_clan_player_status_sync (db_manager.py), which
+        #   - `status` (pending/confirmed/declined — 'withdrawn' is legacy-only, no longer written
+        #     anywhere) is PURELY the player's own genuine response — set ONLY by
+        #     set_cwl_shared_clan_player_status_sync (db_manager.py), which
         #     never touches `assigned`. Nothing an assignment/placement decision does may ever
         #     alter it, for the same reason auto-assigning a player into a clan on the "Manage
         #     Enrollment" board never flips their `cwl_signups.status` to 'confirmed' either.
@@ -4332,8 +4333,10 @@ class WarHistoryDB:
                 return []
 
     def get_cwl_signup_status_counts_sync(self, event_id: int) -> Dict[str, int]:
-        """Return {status: count} for an event's cwl_signups (pending/confirmed/declined/
-        withdrawn) — statuses with zero rows are simply absent from the dict, not zero-filled."""
+        """Return {status: count} for an event's cwl_signups (pending/confirmed/declined —
+        'withdrawn' is legacy-only, no longer written anywhere, see
+        ADMIN_SETTABLE_ENROLLMENT_STATUSES's comment in web_bridge.py) — statuses with zero rows
+        are simply absent from the dict, not zero-filled."""
         import sqlite3
 
         if not self.db_path:
@@ -5592,8 +5595,7 @@ class WarHistoryDB:
 
     def delete_cwl_assignment_sync(self, event_id: int, player_tag: str) -> bool:
         """Remove one player's assignment — the "drag to Unassigned" action on the Manage
-        Enrollment board, and the cascade a signup withdrawal triggers (a withdrawn player
-        shouldn't linger in a clan column)."""
+        Enrollment board."""
         import sqlite3
 
         if not self.db_path:
@@ -6023,7 +6025,8 @@ class WarHistoryDB:
         added_by_guild_id: str,
         responded_at: Optional[str] = None,
     ) -> bool:
-        """Record a player's genuine RESPONSE (pending/confirmed/declined/withdrawn) — and ONLY
+        """Record a player's genuine RESPONSE (pending/confirmed/declined — 'withdrawn' is
+        legacy-only, no longer written anywhere) — and ONLY
         that (2026-08-16, live-testing feedback, project owner's spec, verbatim: "Confirmation
         status and assignment status should be treated completely separate. the one has a totally
         different meaning logically than the other!"). Deliberately never touches `assigned` —

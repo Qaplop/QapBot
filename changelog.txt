@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (11)
+- Changed: CWL Management's "Sign-Ups" embed field now leads with "Unlinked accounts" (the
+  unreachable half) before "Pending" (the reachable half, matching Teams-verwalten's icon count),
+  and no longer shows a permanent "Withdrawn: 0" line. The 'withdrawn' cwl_signups status has been
+  dead since its one writer (the board's old 1-click admin confirm/withdraw control) was removed
+  2026-08-19 (tracker #0014) -- nothing has written it since. Audited and updated every remaining
+  docstring/comment in db_manager.py that still listed it as an active status
+  (get_cwl_signup_status_counts_sync, the cwl_shared_clan_players CREATE TABLE comment,
+  set_cwl_shared_clan_player_status_sync, delete_cwl_assignment_sync's stale "withdrawal cascade"
+  mention) to call it out as legacy-only, matching the wording ADMIN_SETTABLE_ENROLLMENT_STATUSES
+  (web_bridge.py) and the frontend's EnrollmentPlayer.signup_status comment (activity/client/src/
+  types.ts) already used. Removed the now-fully-unused signup_status_withdrawn i18n key.
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/db_manager.py, qapbot/translations/en.json,
+  qapbot/translations/de.json, tests/unit/test_cwl_clan_ownership.py. 2605 tests pass.
+
 2026-08-23 (10)
 - Added: tracker #0038 "Remind Pending" -- a new CWL Management button that re-DMs everyone whose
   CWL sign-up is still pending and has a live Discord link. Grouped by Discord user, not by
