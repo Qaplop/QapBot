@@ -3029,3 +3029,46 @@ async def reroute_cwl_enrollment_dms_after_ownership_change() -> Dict[str, int]:
         )
     return result
 
+
+def fire_cwl_dm_reroute_after_ownership_change() -> None:
+    """Fire-and-forget trigger for reroute_cwl_enrollment_dms_after_ownership_change(), called
+    right after a player-linking flow finishes displacing a previous owner (API token override,
+    admin override, or the unverified-duplicate replace — see the three call sites in
+    _link_player_to_user(), QBdiscocmdshelper.py) — 2026-08-23 follow-up to tracker #0019.
+
+    Deliberately NOT awaited by the caller: the linking flow is account-protection code (Cardinal
+    Rule 2), and the periodic sweep's own docstring already explains why a delete-plus-send DM
+    round trip (each internally retryable) doesn't belong inside that synchronous, user-facing
+    path. Scheduling this as a background task gets the near-real-time reroute without adding any
+    latency or failure surface to that path — the linking flow just schedules it and moves on. The
+    per-cycle sweep in QapBot.py's main() keeps running unconditionally regardless, as the safety
+    net for whenever this task loses the race against a slower DB write, fails outright, or the
+    bot restarts before it runs.
+
+    Must be called only after the caller's own persistence of BOTH sides of the ownership change
+    has completed (old owner removed AND new owner's row written) — calling it any earlier risks
+    the task's DB read landing in the gap where the tag is briefly unowned, which the sweep's own
+    logic (correctly) treats as "unlinked, nobody to route to" and skips. That would just cost one
+    missed instant reroute (the next periodic cycle still catches it), never a wrong result, but
+    there's no reason to take the race."""
+    asyncio.create_task(_run_cwl_dm_reroute_and_log(prefix="instant"))
+
+
+async def _run_cwl_dm_reroute_and_log(prefix: str) -> None:
+    """Runs the sweep and logs with `prefix` distinguishing an instant (post-link) run from the
+    regular per-cycle one in QapBot.py — reroute_cwl_enrollment_dms_after_ownership_change()
+    itself is already best-effort/never-raises, but a fire-and-forget asyncio task with no
+    handler at all would otherwise surface any future regression only as asyncio's generic
+    "Task exception was never retrieved" warning."""
+    try:
+        result = await reroute_cwl_enrollment_dms_after_ownership_change()
+        if result["rerouted"] or result["send_failed"]:
+            logging.info(
+                f"[CWL-DM-REROUTE] ({prefix}) {result['rerouted']} DM(s) re-routed to a new owner "
+                f"({result['retracted']} old message(s) retracted, "
+                f"{result['send_failed']} could not be re-sent) out of "
+                f"{result['checked']} unanswered DM(s) checked"
+            )
+    except Exception as e:
+        logging.warning(f"[CWL-DM-REROUTE] ({prefix}) sweep raised unexpectedly: {e}")
+

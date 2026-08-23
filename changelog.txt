@@ -1,6 +1,47 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (6)
+- Added: an ownership flip (API token override, admin override, or the unverified-duplicate
+  replace, in _link_player_to_user()) now schedules the CWL enrollment-DM reroute
+  (reroute_cwl_enrollment_dms_after_ownership_change(), tracker #0019) immediately via
+  fire_cwl_dm_reroute_after_ownership_change() -- asyncio.create_task(), not awaited, so the
+  account-protection linking path (Cardinal Rule 2) gains no extra latency or failure surface.
+  The per-cycle sweep in QapBot.py's main() remains as the safety net. Discovered along the way:
+  a lazy, function-scoped import of QBdiscocmdshelper_cwl from inside _link_player_to_user() could
+  trigger that module's *first* import while some unrelated test had CACHE monkeypatched,
+  permanently freezing its module-level CACHE binding onto the fake for the rest of the process
+  -- fixed by making the import module-level (deterministic import timing) in QBdiscocmdshelper.py
+  instead of deferred. Files: qapbot/QBdiscocmdshelper.py, qapbot/QBdiscocmdshelper_cwl.py,
+  qapbot/docs/REGISTRATION_MESSAGE_WORKFLOWS.md, tests/integration/test_account_protection.py,
+  tests/integration/test_cwl_dm_reroute_on_ownership_change.py. 2562 tests pass.
+
+2026-08-23 (5)
+- Fixed: three tracker confirm dialogs (ConfirmItemDoneView, ConfirmForceMoveView,
+  TrackerStatusSelectView in qapbot/ui_tracker.py) deferred then sent a NEW followup message
+  instead of editing themselves, leaving the Yes/No/dropdown controls visibly stuck alongside a
+  disconnected new message (live bug report -- message-clutter Pitfall 2,
+  qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md). Switched to defer()+edit_original_response() so each
+  one-shot prompt replaces itself. Split _send_testcases_moved_followup() into a shared text/view
+  builder plus a send variant (for followups layered on the permanent test-case message) and an
+  edit variant (for the confirm-dialog case). Audited the rest of the tracker and the whole CWL
+  management complex for the same pattern -- one further, unfixable case documented in place
+  (CwlCarryOverPromptView._finish() in ui_cwl_roster.py, constrained by LAUNCH_ACTIVITY's
+  single-response rule). Files: qapbot/ui_tracker.py, qapbot/docs/BUG_FEATURE_TRACKER.md,
+  qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md, tests/discord/test_ui_tracker_items.py. 2562 tests
+  pass.
+
+2026-08-23 (4)
+- Changed: configured testers (the /admin Manage Testers allowlist, CACHE.testers) -- not just
+  the bot admin -- can now sign off tracker test cases and change bug/feature item status. New
+  check_bot_admin_or_tester() (qapbot/QBdiscocmdshelper.py) replaces check_bot_admin_only() on the
+  Status button, the Pass/Fail/Move-to-Done buttons, both Yes/No confirm dialogs, and the
+  👍-reaction shortcut in qapbot/ui_tracker.py; deliberately not DEV/PROD-gated since items are
+  tested in DEV before PROD by the same testers. Grant access and the reporter/edit gate stay
+  admin-only. Files: qapbot/QBdiscocmdshelper.py, qapbot/ui_tracker.py,
+  qapbot/translations/en.json, qapbot/translations/de.json, qapbot/docs/BUG_FEATURE_TRACKER.md,
+  tests/discord/test_discord_helper.py, tests/discord/test_ui_tracker_items.py. 2562 tests pass.
+
 2026-08-23 (2)
 - Fixed: post_test_cases() and post_comment() (qapbot/ui_tracker.py) sent their entire content as
   ONE Discord message with no length guard (ticket #0028) -- found live when test cases posted

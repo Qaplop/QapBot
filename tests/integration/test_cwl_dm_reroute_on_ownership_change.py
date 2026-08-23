@@ -16,6 +16,7 @@ Project owner's spec, and the split these tests pin down:
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import os
 from typing import Any, Dict, List
@@ -173,6 +174,33 @@ async def test_pending_dm_is_retracted_and_resent_to_the_new_owner(db, monkeypat
     # their message somehow survived — no longer passes CwlSignupResponseButton's guard.
     assert db.get_cwl_signup_sync(event_id, "#P1")["dmed_discord_id"] == "222"
     assert db.get_cwl_player_season_status_sync("#P1", "2026-09")["dmed_discord_id"] == "222"
+
+
+@pytest.mark.asyncio
+async def test_fire_and_forget_trigger_runs_the_same_sweep(db, monkeypatch):
+    """fire_cwl_dm_reroute_after_ownership_change() (_link_player_to_user()'s near-real-time
+    trigger, 2026-08-23 follow-up) must schedule this exact sweep rather than some parallel
+    hand-rolled version — verified end to end by letting the scheduled background task actually
+    run and checking it produced the same effect as the awaited per-cycle call above."""
+    from qapbot.QBdiscocmdshelper_cwl import fire_cwl_dm_reroute_after_ownership_change
+
+    event_id = await _seed(db)
+    contacted = _capture_dms(monkeypatch)
+    deleted: List[int] = []
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _make_bot(deleted))
+
+    fire_cwl_dm_reroute_after_ownership_change()
+
+    # The trigger only schedules the task (asyncio.create_task) and returns immediately; give the
+    # event loop a turn to actually run it, then wait for it to finish.
+    current = asyncio.current_task()
+    pending = [t for t in asyncio.all_tasks() if t is not current]
+    await asyncio.gather(*pending)
+
+    assert deleted == [77001]
+    assert contacted == ["222"]
+    assert db.get_cwl_signup_sync(event_id, "#P1")["dmed_discord_id"] == "222"
 
 
 @pytest.mark.asyncio

@@ -912,21 +912,35 @@ answer for an account they no longer owned, while the new owner was never asked 
 | `confirmed` / `declined` | **completely untouched** — a response is a real historical fact and must never be retracted or re-asked |
 | account **unlinked** or in the **UNASSIGNED pool** | **completely untouched** — that is ownership *removal*, not a change; there is nobody to re-route to, and the old recipient's button keeps working (project owner's explicit call for the live `#LLV0Y9PQ` / `.zuurn` case) |
 
-### The trigger is a periodic sweep, deliberately
+### The trigger is a periodic sweep, deliberately — plus an instant fire-and-forget nudge
 
 `reroute_cwl_enrollment_dms_after_ownership_change()` (`QBdiscocmdshelper_cwl.py`) runs once per
 update cycle from `main()` (`QapBot.py`), after the `is_discord_available()` guard because it does
-DM I/O. Two alternatives were considered and rejected:
+DM I/O. Two alternatives were considered and rejected for being the *sole* trigger:
 
-- **Hooking the link/unlink path**: that is account-protection code (Cardinal Rule 2), and a
-  re-route means two Discord round trips (a delete and a send, each internally retryable) — neither
-  belongs inside the synchronous user-facing linking flow.
+- **Awaiting the reroute inline from the link/unlink path**: that is account-protection code
+  (Cardinal Rule 2), and a re-route means two Discord round trips (a delete and a send, each
+  internally retryable) — neither belongs inside the synchronous user-facing linking flow.
 - **A startup-only idempotent pass**: the bot runs for weeks while an enrollment window lasts days,
   so it would routinely miss the window. The sweep subsumes startup anyway (the first cycle runs
   shortly after boot), so there is no separate startup call site.
 
 Idempotent by construction (Cardinal Rule 12): once re-routed, `dmed_discord_id` matches the live
-owner and the row stops matching the detection query.
+owner and the row stops matching the detection query. That idempotency is also what makes the
+2026-08-23 addition below safe: nothing needs to coordinate with it.
+
+**`fire_cwl_dm_reroute_after_ownership_change()`** (`QBdiscocmdshelper_cwl.py`, 2026-08-23): called
+from `_link_player_to_user()` (`QBdiscocmdshelper.py`) right after its own persistence of an
+ownership-displacing link completes (API token override, admin override, or the unverified-
+duplicate replace — all three set a local `previous_owner_changed` flag). It does
+`asyncio.create_task(...)` and returns immediately, **without awaiting** — this is the "hook the
+link/unlink path" option from above, but scheduled rather than inline, which sidesteps exactly the
+objection that ruled it out: the linking flow's own latency and failure modes are untouched, since
+it never waits on the DM round trips. The periodic sweep keeps running unconditionally regardless,
+as the safety net for whenever the background task loses a race against a slower DB write (it must
+run after BOTH sides of the ownership change are persisted — see the function's own docstring),
+fails outright, or the bot restarts before it fires. Net effect: an ownership flip is normally
+re-routed within the same second instead of waiting up to one `SLEEP_INTERVAL` (default 300s).
 
 ### Order of operations, and why
 

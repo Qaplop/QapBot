@@ -141,6 +141,97 @@ class TestLinkingSecurity:
 
     @pytest.mark.integration
     @pytest.mark.asyncio
+    async def test_api_token_override_fires_cwl_dm_reroute(self, fake_cache, monkeypatch):
+        """2026-08-23 follow-up: an ownership flip must schedule the near-real-time CWL
+        enrollment-DM reroute (fire_cwl_dm_reroute_after_ownership_change) rather than only
+        relying on the next periodic sweep — fired, not awaited, so it must not block/fail this
+        security-sensitive linking call."""
+        import qapbot.QBdiscocmdshelper as helper
+
+        fired = []
+        monkeypatch.setattr(helper, "fire_cwl_dm_reroute_after_ownership_change", lambda: fired.append(True))
+
+        fake_cache.user_accounts["111"] = {
+            "display_name": "Owner",
+            "players": [{"player_tag": "#ABC123", "player_name": "X", "verified": True}],
+        }
+
+        ok, _msg = await helper._link_player_to_user(
+            target_user_id=222,
+            player_tag_raw="#ABC123",
+            display_name="NewUser",
+            api_token_override=True,
+            api_token_user_id="111",
+        )
+        assert ok is True
+        assert fired == [True]
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_admin_override_fires_cwl_dm_reroute(self, fake_cache, monkeypatch):
+        import qapbot.QBdiscocmdshelper as helper
+
+        fired = []
+        monkeypatch.setattr(helper, "fire_cwl_dm_reroute_after_ownership_change", lambda: fired.append(True))
+
+        fake_cache.user_accounts["111"] = {
+            "display_name": "Owner",
+            "players": [{"player_tag": "#ABC123", "player_name": "X", "verified": True}],
+        }
+
+        ok, _msg = await helper._link_player_to_user(
+            target_user_id=222,
+            player_tag_raw="#ABC123",
+            display_name="NewUser",
+            admin_override=True,
+        )
+        assert ok is True
+        assert fired == [True]
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_unverified_duplicate_replace_fires_cwl_dm_reroute(self, fake_cache, monkeypatch):
+        """The third ownership-displacing branch (stealing an unverified, unclaimed tag from
+        whoever currently holds it) is also a real ownership change and must trigger the same
+        reroute — not just the two explicit "override" branches."""
+        import qapbot.QBdiscocmdshelper as helper
+
+        fired = []
+        monkeypatch.setattr(helper, "fire_cwl_dm_reroute_after_ownership_change", lambda: fired.append(True))
+
+        fake_cache.user_accounts["111"] = {
+            "display_name": "Owner",
+            "players": [{"player_tag": "#ABC123", "player_name": "X", "verified": False}],
+        }
+
+        ok, _msg = await helper._link_player_to_user(
+            target_user_id=222,
+            player_tag_raw="#ABC123",
+            display_name="NewUser",
+        )
+        assert ok is True
+        assert fired == [True]
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_fresh_link_does_not_fire_cwl_dm_reroute(self, fake_cache, monkeypatch):
+        """A first-time link of a never-before-linked tag displaces nobody, so it must not
+        schedule a reroute sweep at all."""
+        import qapbot.QBdiscocmdshelper as helper
+
+        fired = []
+        monkeypatch.setattr(helper, "fire_cwl_dm_reroute_after_ownership_change", lambda: fired.append(True))
+
+        ok, _msg = await helper._link_player_to_user(
+            target_user_id=222,
+            player_tag_raw="#ABC123",
+            display_name="NewUser",
+        )
+        assert ok is True
+        assert fired == []
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
     async def test_linking_never_reads_player_data_from_the_short_ttl_cache(self, fake_cache):
         """2026-08-22: CACHE.get_player() gained a 60s read-through cache. The linking path
         captures player_name/th_level/current_clan_tag/coc_role and PERSISTS them as account

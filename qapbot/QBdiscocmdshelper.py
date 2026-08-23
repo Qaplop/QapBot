@@ -36,6 +36,14 @@ from qapbot.cache_manager import CACHE
 from qapbot.exceptions import ValidationError
 from QBhelperfunctions import (generate_message_key_timestamp)
 from qapbot.discord_health import discord_retry
+# Module-level (not deferred) so this module's first import always happens here, deterministically,
+# rather than being triggered lazily from inside _link_player_to_user() at an arbitrary, possibly
+# test-dependent moment — qapbot.QBdiscocmdshelper_cwl.py reads CACHE via its own module-level
+# import, which freezes onto whatever CACHE object is live at that first-import instant. A lazy
+# import from within a function under active test monkeypatching froze it onto a test's fake CACHE
+# for the rest of the process (2026-08-23, cross-file pollution between test_account_protection.py
+# and test_cwl_dm_reroute_on_ownership_change.py).
+from qapbot.QBdiscocmdshelper_cwl import fire_cwl_dm_reroute_after_ownership_change
 
 async def send_and_track(
     interaction: discord.Interaction, 
@@ -1047,9 +1055,14 @@ async def _link_player_to_user(
     normalized_tag = normalize_clan_tag(player_tag_raw)
     if not normalized_tag:
         return False, "Invalid player tag format. Please use a valid player tag (e.g., #ABC123)."
-    
+
     account_tag = str(target_user_id)
-    
+    # Set by any of the three "steal the tag from its previous owner" branches below (API token
+    # override, admin override, unverified-duplicate replace) — triggers the CWL enrollment-DM
+    # reroute (tracker #0019 follow-up, 2026-08-23) once this function's own persistence finishes,
+    # see the two `if previous_owner_changed:` sites near the end.
+    previous_owner_changed = False
+
     # Read existing user entry without mutating cache yet.
     # Mutation and persistence happen only after all validation passes.
     existing_entry = CACHE.user_accounts.get(account_tag)
@@ -1092,6 +1105,7 @@ async def _link_player_to_user(
                     if current_tag == normalized_tag:
                         removed_player = other_players.pop(idx)
                         await CACHE.persist_user(api_token_user_id)
+                        previous_owner_changed = True
                         logging.info(f"Removed player {normalized_tag} from {other_user_id} via API token override")
                     
                         # Send DM notification to the previous owner
@@ -1134,6 +1148,7 @@ async def _link_player_to_user(
                     if current_tag == normalized_tag:
                         removed_player = other_players.pop(idx)
                         await CACHE.persist_user(other_user_id)
+                        previous_owner_changed = True
                         logging.info(f"Removed player {normalized_tag} from {other_user_id} via admin override")
                     
                         # Send DM notification to the previous verified owner
@@ -1178,7 +1193,8 @@ async def _link_player_to_user(
                 # Found unverified duplicate - remove it from other user
                 other_players.pop(idx)
                 await CACHE.persist_user(other_user_id)
-                
+                previous_owner_changed = True
+
                 other_display_name = other_user_data.get("display_name", "Unknown User")
                 logging.warning(
                     f"SECURITY: Removed unverified player {normalized_tag} from {other_display_name} ({other_user_id}) "
@@ -1265,6 +1281,8 @@ async def _link_player_to_user(
         # Also persist UNASSIGNED changes if the pool was modified
         if "UNASSIGNED" in CACHE.user_accounts:
             await CACHE.persist_user("UNASSIGNED")
+        if previous_owner_changed:
+            fire_cwl_dm_reroute_after_ownership_change()
         from qapbot.i18n import t
         player_name = unassigned_player.get("player_name", "Unknown")
         verification_status = "❌ unverified"  # Always unverified after restoration
@@ -1325,7 +1343,10 @@ async def _link_player_to_user(
                 "last_checked_via_api": None
             }
             await CACHE.persist_clan(current_clan_tag)
-    
+
+    if previous_owner_changed:
+        fire_cwl_dm_reroute_after_ownership_change()
+
     from qapbot.i18n import t
     return True, t('playerregistration.linked_unverified', player_name=player_name, player_tag=normalized_tag, display_name=display_name)
 
