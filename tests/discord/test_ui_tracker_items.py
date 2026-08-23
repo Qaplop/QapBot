@@ -230,6 +230,26 @@ async def test_build_tracker_embed_includes_priority(db):
 
 
 @pytest.mark.asyncio
+async def test_build_tracker_embed_stays_english_regardless_of_guild_language(db, monkeypatch):
+    """The tracker is a developer/triage tool, not end-user-facing -- its text must read the
+    same for everyone, so it must ignore the viewing guild's/reporter's configured language
+    (previously status labels like "Implemented"/"Umgesetzt" showed inconsistently depending
+    on which guild's language setting happened to apply -- confusing for whoever's triaging)."""
+    from qapbot.cache_manager import CACHE
+
+    item_number = await _make_item(db, item_type="bug", guild_id="987654321")
+    await db.update_tracker_item(item_number, status="implemented")
+    item = await db.get_tracker_item(item_number)
+    monkeypatch.setattr(CACHE, "server_config", {"987654321": {"language": "de"}})
+
+    embed = build_tracker_embed(item)
+
+    assert "Implemented" in embed.title
+    assert "Umgesetzt" not in embed.title
+    assert "Gemeldet" not in embed.description  # would be the German "reported_by" phrasing
+
+
+@pytest.mark.asyncio
 async def test_build_tracker_embed_defaults_priority_when_missing(db):
     """A pre-migration row (or a caller that never set priority) falls back to MEDIUM rather
     than raising/blank."""
@@ -299,6 +319,60 @@ def test_modal_priority_honors_initial_value_on_edit():
     assert default_values == ["HIGH"]
 
 
+def _edit_modal(item, new_title=None, new_description=None, new_details=None):
+    """Build a TrackerItemModal for editing *item* and poke the submitted text field values
+    directly. discord.py's TextInput has no public setter for `.value` -- only `.default`,
+    which drives the modal UI's pre-filled text, not what on_submit() reads back -- so a
+    programmatic "user typed this and hit submit" simulation has to set the private `_value`
+    discord.py itself populates from the real Discord submission payload."""
+    modal = TrackerItemModal(
+        item["item_type"], guild_id=None, user_id="1", item_number=item["item_number"],
+        initial_title=item["title"], initial_description=item["description"],
+        initial_details=item.get("details") or "",
+    )
+    modal.title_input._value = new_title if new_title is not None else item["title"]
+    modal.description_input._value = new_description if new_description is not None else item["description"]
+    modal.details_input._value = new_details if new_details is not None else (item.get("details") or "")
+    return modal
+
+
+# -- edit reposts full text to thread when it changed (tracker item #0029) --
+
+@pytest.mark.asyncio
+async def test_edit_reposts_full_text_to_thread_when_description_changed(db, monkeypatch, mock_interaction):
+    thread = AsyncMock()
+    _wire_bot(monkeypatch, channel=thread)
+
+    item_number = await _make_item(db, title="Old title", description="Old description")
+    await db.update_tracker_item(item_number, thread_id="777")
+    item = await db.get_tracker_item(item_number)
+
+    modal = _edit_modal(item, new_description="New, corrected description")
+    await modal.on_submit(mock_interaction)
+
+    thread.send.assert_awaited()
+    sent_texts = [call.args[0] for call in thread.send.await_args_list]
+    assert any("Edited" in text or "Bearbeitet" in text for text in sent_texts)
+    assert any("New, corrected description" in text for text in sent_texts)
+
+
+@pytest.mark.asyncio
+async def test_edit_does_not_repost_thread_when_text_is_unchanged(db, monkeypatch, mock_interaction):
+    """A priority-/environment-only edit (title/description/details untouched) must not spam
+    the thread with a redundant "full text" copy."""
+    thread = AsyncMock()
+    _wire_bot(monkeypatch, channel=thread)
+
+    item_number = await _make_item(db, title="Same title", description="Same description")
+    await db.update_tracker_item(item_number, thread_id="777")
+    item = await db.get_tracker_item(item_number)
+
+    modal = _edit_modal(item)  # no new_* args -> resubmits the same text unchanged
+    await modal.on_submit(mock_interaction)
+
+    thread.send.assert_not_awaited()
+
+
 # -- TrackerDraftView preview ---------------------------------------------
 
 def test_draft_preview_lists_pending_attachments():
@@ -358,6 +432,53 @@ async def test_on_submit_posts_to_the_shared_bug_channel(db, monkeypatch, mock_i
 
     assert draft.submitted is True
     channel.send.assert_awaited_once()
+
+
+# -- double-click submit guard (tracker item #0026) -------------------------
+
+@pytest.mark.asyncio
+async def test_on_submit_second_click_does_not_create_a_second_item(db, monkeypatch, mock_interaction):
+    """A user double-clicking Submit before the first click's response lands (Discord hadn't
+    yet made the button vanish) must not create a second tracker item for the same report."""
+    from qapbot.cache_manager import CACHE
+
+    channel = _fake_channel()
+    _wire_bot(monkeypatch, channel=channel)
+    monkeypatch.setattr(CACHE, "tracker_settings", {TRACKER_SETTING_BUG_CHANNEL: "42"})
+
+    draft = TrackerDraftView(
+        item_type="bug", title="T", description="D", details="", environment="",
+        reporter_id="111", reporter_name="A", guild_id=None, channel_id=1, user_id="1",
+    )
+    draft.message = AsyncMock()
+
+    await draft._on_submit(mock_interaction)
+    await draft._on_submit(mock_interaction)  # simulated re-click
+
+    channel.send.assert_awaited_once()  # only one tracker item ever posted
+    mock_interaction.response.defer.assert_awaited_once()  # the re-click's early-return path
+
+
+@pytest.mark.asyncio
+async def test_on_submit_disables_buttons_via_edit_message_response(db, monkeypatch, mock_interaction):
+    """Buttons must vanish as fast as possible: edit_message() as the interaction response
+    itself (not a separate defer-then-edit round trip), with every button disabled."""
+    from qapbot.cache_manager import CACHE
+
+    channel = _fake_channel()
+    _wire_bot(monkeypatch, channel=channel)
+    monkeypatch.setattr(CACHE, "tracker_settings", {TRACKER_SETTING_BUG_CHANNEL: "42"})
+
+    draft = TrackerDraftView(
+        item_type="bug", title="T", description="D", details="", environment="",
+        reporter_id="111", reporter_name="A", guild_id=None, channel_id=1, user_id="1",
+    )
+    draft.message = AsyncMock()
+
+    await draft._on_submit(mock_interaction)
+
+    mock_interaction.response.edit_message.assert_awaited_once_with(view=draft)
+    assert draft.children and all(child.disabled for child in draft.children)  # type: ignore[attr-defined]
 
 
 # -- no cap on open items (removed 2026-08-22 per project owner request) ----

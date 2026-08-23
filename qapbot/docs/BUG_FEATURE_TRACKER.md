@@ -184,6 +184,20 @@ including DEV, whose DB is a routine PROD-backup copy that can contain the exact
 
 ## Discord surface (`qapbot/ui_tracker.py`)
 
+**Always English, regardless of guild/user language (2026-08-23, live bug report)**: unlike the
+rest of the bot, tracker text is never localized. The module shadows `qapbot.i18n.t` right after
+its import (`t = ` wrapper defined immediately below `from qapbot.i18n import t as _t_localized`)
+with a version that drops any `guild_id`/`user_id` kwargs before delegating — every one of the
+~150 existing `t('ui_components.tracker...', guild_id=..., user_id=...)` call sites in this file
+keeps working unchanged, but `qapbot.i18n.t()` then has nothing to resolve a non-default language
+from and falls back to English every time. Reason: the tracker is a developer/triage tool, not
+end-user-facing — status labels like "Implemented" were rendering as "Umgesetzt" or not depending
+on which guild's (or reporter's) configured language happened to apply, which is confusing rather
+than helpful for whoever's actually triaging tickets. If you add a new tracker UI string, no
+special handling is needed — just call `t(...)` as usual; the module-level shadow covers it
+automatically. This is local to `ui_tracker.py` only — no other module renders
+`ui_components.tracker.*` keys.
+
 - `/bug`, `/feature` (`QBdiscordcmds.py`) — thin wrappers around `start_tracker_item()`.
   Registered only when `CONFIG.tracker_enabled`; DM-invokable (no `guild_only()`).
 - `TrackerItemModal` → `TrackerDraftView` (Edit/Add attachments/Submit/Discard, ephemeral,

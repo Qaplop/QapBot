@@ -60,6 +60,33 @@ def test_cache_path_for_item_rejects_traversal_attempt(monkeypatch, tmp_path):
         tracker_mcp.cache_path_for_item(1, "..", "..", "outside.txt")
 
 
+# -- stdio encoding (tracker item #0027) ---------------------------------
+
+def test_main_forces_utf8_on_stdin_and_stdout(monkeypatch):
+    """On Windows, unconfigured sys.stdin/sys.stdout fall back to the locale codepage (often
+    cp1252) rather than UTF-8 -- silently mangling non-ASCII tool output and raising
+    UnicodeEncodeError (killing the server mid-session) on anything cp1252 can't encode.
+    main() must force UTF-8 on both streams before the read loop starts, independent of the
+    host's locale."""
+    calls: dict = {}
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def reconfigure(self, **kwargs):
+            calls[self.name] = kwargs
+
+    monkeypatch.setattr(tracker_mcp.sys, "stdin", FakeStream("stdin"))
+    monkeypatch.setattr(tracker_mcp.sys, "stdout", FakeStream("stdout"))
+    monkeypatch.setattr(tracker_mcp.asyncio, "run", lambda coro: coro.close())
+
+    tracker_mcp.main()
+
+    assert calls["stdin"] == {"encoding": "utf-8", "errors": "replace"}
+    assert calls["stdout"] == {"encoding": "utf-8"}
+
+
 # -- tool schema validity -------------------------------------------------
 
 def test_all_tools_have_name_description_and_schema():

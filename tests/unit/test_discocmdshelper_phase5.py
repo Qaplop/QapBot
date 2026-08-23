@@ -599,11 +599,117 @@ class TestSplitContentIntoTwoEmbeds:
         assert len(result) == 2
         assert result[0].description is not None
         assert len(result[0].description) <= 4096
+        assert result[1].description is not None
+        assert len(result[1].description) <= 4096
 
     def test_first_embed_has_author(self):
         result = self._fn()("MyClan", "#TAG", "H\n", ["Line"])
         assert result[0].author.name is not None
         assert "MyClan" in result[0].author.name
+
+    def test_second_embed_never_exceeds_4096_with_lopsided_content(self):
+        """tracker item #0032 (live bug): switching /clan management to the war notification
+        tab raised Discord's 400 "embeds.1.description: Must be 4096 or fewer in length".
+        Root cause -- the first embed filled up to ~4096 and then ALL remaining content was
+        dumped into a single unbounded second embed with no length check at all. That's only
+        safe when the leftover happens to be small; a big gap between one content unit's size
+        and the embed's remaining headroom (e.g. one line barely fits, forcing everything after
+        it into embed #2) can leave far more than 4096 chars in the "remainder." Every returned
+        embed must stay within Discord's 4096-char limit regardless of how unevenly
+        `content_lines` sizes are distributed -- even when that means returning more than two."""
+        lines = ["a" * 3500] + ["b" * 1000] * 5  # first line alone nearly fills embed 1;
+        # the old code would then dump all 5000+ remaining chars into embed 2 unbounded.
+        result = self._fn()("Clan", "#TAG", "H\n", lines)
+        assert len(result) >= 2
+        for embed in result:
+            assert embed.description is not None
+            assert len(embed.description) <= 4096
+
+    def test_no_content_loss_with_lopsided_content(self):
+        lines = ["a" * 3500] + [f"b{i}" * 500 for i in range(5)]
+        result = self._fn()("Clan", "#TAG", "H\n", lines)
+        combined = "\n".join(e.description for e in result if e.description)
+        for line in lines:
+            assert line in combined
+
+
+# ===========================================================================
+# _format_clan_management_roles -- orphaned clan_roles pruning (tracker #0030)
+# ===========================================================================
+
+class TestFormatClanManagementRolesPruning:
+    @pytest.mark.asyncio
+    async def test_orphaned_clan_role_entry_is_pruned_and_hidden(self, monkeypatch):
+        """A clan removed from its clan family (the reported "StayUndefeated" case) kept
+        showing up in Server-Rollen verwalten -> Clan-Rollen forever, because config's
+        clan_roles entries were never pruned once a clan stopped being covered by the guild's
+        member_clans/member_families -- even once the underlying Discord role was itself
+        deleted (shown as "deleted" but the clan line stayed). Pruning must key off actual
+        current clan coverage, not just whether the stored role id still resolves."""
+        from qapbot.QBdiscocmdshelper import _format_clan_management_roles
+
+        cache = _make_cache(
+            server_config={
+                "1": {
+                    "clan_role_enabled": True,
+                    "member_clans": [],
+                    "member_families": ["FAM1"],
+                    "clan_roles": {
+                        "#COVERED123": "111",   # still in FAM1 -> kept and displayed
+                        "#ORPHANED12": "222",   # no longer in FAM1 or member_clans -> pruned
+                    },
+                },
+            },
+            clan_families={"FAM1": {"name": "Stay-Family", "clans": ["#COVERED123"]}},
+        )
+        cache.persist_server_config = AsyncMock()
+
+        guild = MagicMock()
+        guild.id = 1
+        covered_role = MagicMock()
+        covered_role.mention = "<@&111>"
+        guild.get_role = MagicMock(side_effect=lambda rid: covered_role if rid == 111 else None)
+
+        with patch("qapbot.cache_manager.CACHE", cache), patch("qapbot.QBdiscocmdshelper.CACHE", cache):
+            embed, _, _, _ = await _format_clan_management_roles(guild)
+
+        clan_roles_field_value = embed.fields[-1].value
+        assert "ORPHANED12" not in clan_roles_field_value
+        assert covered_role.mention in clan_roles_field_value
+        assert "#ORPHANED12" not in cache.server_config["1"]["clan_roles"]
+        assert cache.server_config["1"]["clan_roles"]["#COVERED123"] == "111"
+        cache.persist_server_config.assert_awaited_once_with("1")
+
+    @pytest.mark.asyncio
+    async def test_no_pruning_or_persist_when_all_entries_still_covered(self, monkeypatch):
+        """No orphaned entries -> no unnecessary persist_server_config write."""
+        from qapbot.QBdiscocmdshelper import _format_clan_management_roles
+
+        cache = _make_cache(
+            server_config={
+                "1": {
+                    "clan_role_enabled": True,
+                    "member_clans": ["#COVERED123"],
+                    "member_families": [],
+                    "clan_roles": {"#COVERED123": "111"},
+                },
+            },
+            clan_families={},
+        )
+        cache.persist_server_config = AsyncMock()
+
+        guild = MagicMock()
+        guild.id = 1
+        covered_role = MagicMock()
+        covered_role.mention = "<@&111>"
+        guild.get_role = MagicMock(return_value=covered_role)
+
+        with patch("qapbot.cache_manager.CACHE", cache), patch("qapbot.QBdiscocmdshelper.CACHE", cache):
+            embed, _, _, _ = await _format_clan_management_roles(guild)
+
+        assert covered_role.mention in embed.fields[-1].value
+        assert "#COVERED123" in cache.server_config["1"]["clan_roles"]
+        cache.persist_server_config.assert_not_awaited()
 
 
 # ===========================================================================

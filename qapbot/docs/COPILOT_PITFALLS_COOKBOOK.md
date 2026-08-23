@@ -1715,8 +1715,9 @@ only ever tested from a non-Windows Claude Code CLI session.
 (`await loop.run_in_executor(None, sys.stdin.readline)`) — this works identically on every
 platform and every kind of stdin handle (overlapped or not, console or pipe or redirected file),
 at the cost of one extra thread instead of native proactor I/O, which is irrelevant for a
-line-at-a-time JSON-RPC server. `_write_message()`'s plain synchronous `sys.stdout.write()` was
-already fine and needed no change — only the *read* side goes through the proactor pipe API.
+line-at-a-time JSON-RPC server. `_write_message()`'s plain synchronous `sys.stdout.write()` needed no change *here* — only the
+*read* side goes through the proactor pipe API. (It turned out to have its own, separate bug —
+unconfigured encoding, not transport — fixed later; see Pitfall 40 below.)
 
 **How to apply:** any hand-rolled stdio-transport MCP/JSON-RPC server in this repo must avoid
 `loop.connect_read_pipe`/`loop.connect_write_pipe` on `sys.stdin`/`sys.stdout` — use the
@@ -1766,4 +1767,34 @@ present, regardless of which bot the content belongs to, and must carry its own 
 `CONFIG.tracker_enabled` (or equivalent PROD-only) check if it touches tracker (or any other
 PROD-only) state. Don't reuse "DEV never receives this" reasoning across event types without
 verifying it actually applies to the specific event you're adding.
+
+## Pitfall 40: an unconfigured `sys.stdin`/`sys.stdout` on Windows silently mangles non-ASCII MCP traffic, and can crash the server outright on the write side
+
+**Symptom (2026-08-22, live report):** test cases posted through `tracker_add_testcases` on item
+#0014 came out as mojibake in the DB — an em-dash stored as `Ã¢â‚¬"`, a `▸` as `Ã¢â€“Â¸`. The
+bridge and DB were innocent; the text was already corrupt by the time it left the MCP server
+(`qapbot/mcp/tracker_mcp.py`).
+
+**Why:** `run_stdio_server()` reads with a bare `sys.stdin.readline()` (Pitfall 38's fix) and
+`_write_message()` writes with a bare `sys.stdout.write()`. Neither call sets an encoding, so on
+Windows Python falls back to `locale.getpreferredencoding(False)` — cp1252 on a typical
+dev/PROD host. The MCP client always sends UTF-8. Decoding UTF-8 bytes as cp1252 reproduces the
+mojibake exactly (`"—"` → UTF-8 `e2 80 94` → read as cp1252 → `"Ã¢â‚¬"`). Worse on the write
+side: cp1252 cannot *encode* most of these characters at all, so a tool response containing one
+raises `UnicodeEncodeError` inside `sys.stdout.write()` instead of producing garbage — taking the
+whole server down mid-session. The calling chat client just sees the tools stop working, the same
+silent-failure mode as Pitfall 38.
+
+**Fix:** force UTF-8 on both streams at process startup, independent of locale —
+`sys.stdin.reconfigure(encoding="utf-8", errors="replace")` /
+`sys.stdout.reconfigure(encoding="utf-8")` in `main()`, before `asyncio.run(run_stdio_server())`.
+`errors="replace"` on the read side means a genuinely malformed byte degrades to `�` instead of
+killing the read loop. Setting `PYTHONUTF8=1` in the launch config would also work but is easy to
+lose when the server is spawned from a different host/config, so pinning it in code is safer.
+
+**How to apply:** any hand-rolled stdio-transport server in this repo (MCP or otherwise) must
+explicitly set UTF-8 on `sys.stdin`/`sys.stdout` at startup rather than trusting the platform
+default — Windows' locale-codepage fallback is not UTF-8 by default and this class of bug is
+invisible on Linux/macOS dev machines where the locale usually already is UTF-8, so it can ship
+unnoticed until a Windows host or a non-ASCII payload hits it.
 

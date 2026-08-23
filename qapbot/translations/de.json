@@ -440,6 +440,7 @@
       "status_duplicate": "♻️ Duplikat",
       "edit_denied": "🔒 Nur der Melder oder ein Bot-Administrator kann diesen Eintrag bearbeiten.",
       "edit_saved": "✅ Änderungen gespeichert.",
+      "edited_thread_header": "✏️ **Bearbeitet von <@{author_id}>** — aktualisierter Volltext:",
       "item_not_found": "⚠️ Eintrag #{item_number} existiert nicht mehr.",
       "status_denied": "🔒 Nur ein Bot-Administrator oder Tester kann den Status ändern.",
       "testcase_signoff_denied": "🔒 Nur ein Bot-Administrator oder Tester kann Testfälle abzeichnen.",

@@ -508,6 +508,13 @@ async def run_stdio_server() -> None:
 
 
 def main() -> None:
+    # MCP speaks UTF-8 over stdio, but on Windows Python falls back to the locale codepage
+    # (often cp1252) for these streams unless told otherwise -- silently mangling any non-ASCII
+    # text on the way in, and raising UnicodeEncodeError (killing the server mid-session) on the
+    # way out (tracker item #0027). Force UTF-8 independent of locale/host; errors="replace" on
+    # stdin so one malformed byte degrades instead of taking down the read loop.
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8")
     try:
         asyncio.run(run_stdio_server())
     except KeyboardInterrupt:

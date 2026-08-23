@@ -3963,53 +3963,39 @@ def _split_content_into_two_embeds(
     content_lines: List[str]
 ) -> List[discord.Embed]:
     """
-    Split content into exactly two embeds, making the first embed as close to 4096 chars as possible
-    without splitting midline.
-    
+    Split content into embeds, making the first embed as close to 4096 chars as possible
+    without splitting midline -- normally exactly two embeds ("no pagination" callers'
+    intent), but never fewer than needed to keep every embed's description within Discord's
+    4096-char limit.
+
+    Previously this dumped ALL remaining content into a single unbounded second embed, which
+    is only <=4096 chars if the first embed happened to fill close to the limit. A single large
+    content_lines unit (e.g. one Discord user with many linked player accounts in a big clan
+    family) can make the first embed stop far short of 4096 to avoid splitting mid-line, leaving
+    a second embed well over 4096 and raising Discord's "embeds.1.description: Must be 4096 or
+    fewer" 400 error (tracker item #0032). Delegating to `_split_content_into_embeds` gives every
+    embed the same never-exceeds-4096 guarantee; `repeat_header=False` keeps the header on the
+    first embed only, matching this function's original "two embeds, no pagination" shape for
+    the common case.
+
     Args:
         clan_name: Clan name for embed author (first embed only)
         clan_tag: Clan tag for embed author (first embed only)
         header_text: Header text to include in first embed only
         content_lines: List of content sections (each should be a complete unit)
-        
+
     Returns:
-        List of 1-2 Discord embeds
+        List of Discord embeds, normally 1-2 but occasionally more if no 2-way split keeps
+        both embeds within 4096 chars -- callers must handle that as pagination, not assume 2.
     """
-    # Build first embed with header
-    first_content = header_text
-    split_index = 0
-    
-    # Add lines to first embed until we approach 4096 limit
-    for i, line in enumerate(content_lines):
-        test_content = first_content + "\n" + line if first_content != header_text else header_text + line
-        
-        if len(test_content) > 4096:
-            # Stop before this line - it would exceed limit
-            break
-        else:
-            # Add to first embed
-            if first_content == header_text:
-                first_content = header_text + line
-            else:
-                first_content += "\n" + line
-            split_index = i + 1
-    
-    # Create first embed
-    first_embed = discord.Embed(color=0x2B2D31)
-    first_embed.set_author(name=f"{clan_name} ({clan_tag})")
-    first_embed.description = first_content
-    
-    # Check if we need a second embed
-    if split_index >= len(content_lines):
-        # All content fit in first embed
-        return [first_embed]
-    
-    # Create second embed with remaining content
-    second_content = "\n".join(content_lines[split_index:])
-    second_embed = discord.Embed(color=0x2B2D31)
-    second_embed.description = second_content
-    
-    return [first_embed, second_embed]
+    return _split_content_into_embeds(
+        clan_name=clan_name,
+        clan_tag=clan_tag,
+        header_text=header_text,
+        content_lines=content_lines,
+        max_length=4096,
+        repeat_header=False,
+    )
 
 
 async def format_clan_management_message(clan_tag: str, guild: discord.Guild, mode: str = "registrations") -> Tuple[discord.Embed, Optional[discord.Embed], List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -4296,9 +4282,11 @@ async def _format_clan_management_registrations(clan_tag: str, guild: discord.Gu
         elif len(embeds) == 2:
             return embeds[0], embeds[1], linked_players, unlinked_players
         else:
-            # Fallback if split logic returns more than 2
-            return embeds[0], embeds[1], linked_players, unlinked_players
-    
+            # No 2-way split kept every embed within Discord's 4096-char description
+            # limit (tracker item #0032, e.g. one oversized content section) -- fall back
+            # to full pagination rather than silently dropping embeds[2:]'s content.
+            return None, embeds, linked_players, unlinked_players  # type: ignore[return-value]
+
     else:
         # Rule 3: Pagination mode (>6000 chars)
         embeds = _split_content_into_embeds(
@@ -4524,9 +4512,11 @@ async def _format_clan_management_notifications(clan_tag: str, guild: discord.Gu
         elif len(embeds) == 2:
             return embeds[0], embeds[1], [], []
         else:
-            # Fallback if split logic returns more than 2
-            return embeds[0], embeds[1], [], []
-    
+            # No 2-way split kept every embed within Discord's 4096-char description
+            # limit (tracker item #0032, e.g. one oversized user_section) -- fall back
+            # to full pagination rather than silently dropping embeds[2:]'s content.
+            return None, embeds, [], []  # type: ignore[return-value]
+
     else:
         # Rule 3: Pagination mode (>6000 chars)
         logging.info(f"[NOTIFICATION-VIEW] Total chars {total_chars} > 6000, using pagination")
@@ -4716,10 +4706,28 @@ async def _format_clan_management_roles(guild: discord.Guild) -> Tuple[discord.E
     if clan_role_enabled:
         clan_roles: Dict[str, str] = config.get("clan_roles", {})
         if clan_roles:
-            for ctag, rid_str in clan_roles.items():
-                clan_display = CACHE.get_clan_name(ctag, ctag)
-                role_obj = guild.get_role(int(rid_str))
-                clan_lines.append(f"• {clan_display}: {role_obj.mention if role_obj else '⚠️ deleted'}")
+            # A clan_roles entry outlives the clan being removed from a family/member-clans
+            # list whenever the admin doesn't confirm role deletion in ConfirmDeleteClanRolesView
+            # (or the prompt times out) -- it then shows up here forever, "existing" for a clan
+            # that's no longer part of this guild at all (tracker item #0030). Only display, and
+            # self-heal by pruning, entries for clans still actually covered by this guild's
+            # current member_clans / member_families.
+            covered_clans: set = set(member_clans)
+            for family_id in member_families:
+                covered_clans.update(CACHE.clan_families.get(family_id, {}).get("clans", []))
+            orphaned_tags = [ctag for ctag in clan_roles if ctag not in covered_clans]
+            if orphaned_tags:
+                for ctag in orphaned_tags:
+                    clan_roles.pop(ctag, None)
+                await CACHE.persist_server_config(guild_id)
+                logging.info(f"[ROLES] Pruned {len(orphaned_tags)} clan_roles entr(y/ies) no longer covered by guild {guild_id}: {orphaned_tags}")
+            if clan_roles:
+                for ctag, rid_str in clan_roles.items():
+                    clan_display = CACHE.get_clan_name(ctag, ctag)
+                    role_obj = guild.get_role(int(rid_str))
+                    clan_lines.append(f"• {clan_display}: {role_obj.mention if role_obj else '⚠️ deleted'}")
+            else:
+                clan_lines.append(t('ui_components.role_configuration_buttons.clan_role_no_roles', guild_id=guild_id_int))
         else:
             clan_lines.append(t('ui_components.role_configuration_buttons.clan_role_no_roles', guild_id=guild_id_int))
 

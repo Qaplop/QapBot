@@ -35,7 +35,22 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import discord
 
-from qapbot.i18n import t
+from qapbot.i18n import t as _t_localized
+
+
+def t(key: str, **kwargs: Any) -> str:
+    """Shadows qapbot.i18n.t for this whole module: the bug/feature tracker is a developer/
+    triage tool, not end-user-facing, so its text must read the same for everyone regardless
+    of which guild or reporter it's rendered for -- always English (tracker item #0026 follow-
+    up, project owner: status labels like "Implemented"/"Umgesetzt" showing inconsistently
+    depending on the viewing guild's/user's language setting was confusing). Drops any
+    guild_id/user_id kwargs a call site still passes (every existing call in this file does)
+    rather than editing the ~150 call sites individually -- qapbot.i18n.t() already defaults to
+    English whenever neither is given."""
+    kwargs.pop("guild_id", None)
+    kwargs.pop("user_id", None)
+    return _t_localized(key, **kwargs)
+
 
 # bot_settings keys (plan §4.1) — global scope (guild_id='') only, the sole scope wired up today.
 TRACKER_SETTING_GUILD_ID = "tracker_guild_id"
@@ -552,6 +567,12 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         self.user_id = user_id
         self.draft_view = draft_view
         self.item_number = item_number
+        # Pre-edit values (item_number path only) so on_submit can tell whether title/
+        # description/details actually changed (tracker item #0029 -- only a genuine text
+        # change should re-post the untruncated text into the discussion thread).
+        self.initial_title = initial_title
+        self.initial_description = initial_description
+        self.initial_details = initial_details
         self.predownload_task: Optional['asyncio.Task[List[Dict[str, Any]]]'] = None
         self._localize()
         self.title_input.default = initial_title
@@ -605,6 +626,11 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         if self.item_number is not None:
             # Editing an already-posted item (Edit button, plan §2.3).
             await interaction.response.defer(thinking=False, ephemeral=True)
+            text_changed = (
+                title_val != self.initial_title
+                or description_val != self.initial_description
+                or details_val != self.initial_details
+            )
             await CACHE.db_manager.update_tracker_item(
                 self.item_number,
                 title=title_val, description=description_val,
@@ -616,6 +642,10 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
             item = await CACHE.db_manager.get_tracker_item(self.item_number)
             if item is not None:
                 await _refresh_item_message(item)
+                # Only a title/description/details change re-posts the thread's "full text"
+                # copy -- a priority- or environment-only edit shouldn't spam it (#0029).
+                if text_changed and item.get("thread_id"):
+                    await _repost_full_text_to_thread(item, editor_id=str(interaction.user.id))
             await interaction.followup.send(
                 t('ui_components.tracker.edit_saved', user_id=self.user_id, guild_id=self.guild_id), ephemeral=True
             )
@@ -760,7 +790,20 @@ class TrackerDraftView(discord.ui.View):
         _register_upload_window(interaction.user.id, self.channel_id, _on_files)
 
     async def _on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(thinking=False, ephemeral=True)
+        if self.submitted:
+            # Re-click while the first submission is still in flight (or after it
+            # finished) -- swallow it instead of creating a second tracker item.
+            await interaction.response.defer(thinking=False, ephemeral=True)
+            return
+        # Set before any await so a near-simultaneous second click (which reaches this
+        # callback before the first click's edit_message below lands) sees it too --
+        # this check-and-set is atomic within the event loop since nothing yields first.
+        self.submitted = True
+        for child in self.children:
+            child.disabled = True
+        # Editing the message AS the interaction response (not defer-then-edit) is the
+        # fastest way to make the buttons visibly vanish (tracker item #0026).
+        await interaction.response.edit_message(view=self)
         from qapbot.cache_manager import CACHE
 
         db = CACHE.db_manager
@@ -783,7 +826,6 @@ class TrackerDraftView(discord.ui.View):
         if channel_id_str:
             message, _thread = await _post_tracker_item(item_number, int(channel_id_str))
 
-        self.submitted = True
         self.stop()
         jump_link = message.jump_url if message else ""
         text = t(
@@ -978,16 +1020,47 @@ async def _post_tracker_item(item_number: int, channel_id: int) -> Tuple[Optiona
         # Untruncated text as the first thread message (plan §2.3's embed-overflow strategy) —
         # posted unconditionally rather than only when the embed actually truncated, since
         # that keeps this simple and is never wrong either way.
-        full_text = f"**{item['title']}**\n\n{item['description']}"
-        if item.get("details"):
-            full_text += f"\n\n{item['details']}"
-        for i in range(0, len(full_text), 2000):
-            await thread.send(full_text[i:i + 2000])
+        await _post_full_text_to_thread(thread, item)
         await CACHE.db_manager.update_tracker_item(item_number, thread_id=str(thread.id))
     except Exception as e:
         logging.warning(f"[TRACKER] Failed to create discussion thread for item #{item_number}: {e}")
 
     return message, thread
+
+
+async def _post_full_text_to_thread(thread: discord.Thread, item: Dict[str, Any], header: str = "") -> None:
+    """Chunk title/description/details at 2000 chars and post them into *thread* -- the same
+    untruncated text the embed's "(full text in thread)" note promises. Shared by item creation
+    (_post_tracker_item) and the edit path (tracker item #0029), which reposts this whenever a
+    text field actually changed so the thread doesn't go stale against the edited embed. *header*,
+    if given, is sent as its own leading message rather than folded into the chunking below."""
+    if header:
+        await thread.send(header)
+    full_text = f"**{item['title']}**\n\n{item['description']}"
+    if item.get("details"):
+        full_text += f"\n\n{item['details']}"
+    for i in range(0, len(full_text), 2000):
+        await thread.send(full_text[i:i + 2000])
+
+
+async def _repost_full_text_to_thread(item: Dict[str, Any], editor_id: str) -> None:
+    """Resolve item's discussion thread and append a fresh untruncated copy after an edit
+    (tracker item #0029) -- appended rather than editing the original seed message, matching
+    the thread's existing append-only discussion-log shape."""
+    import QBcore
+
+    thread = QBcore.bot.get_channel(int(item["thread_id"]))
+    if thread is None:
+        try:
+            thread = await QBcore.bot.fetch_channel(int(item["thread_id"]))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            logging.warning(f"[TRACKER] Could not resolve discussion thread for item #{item['item_number']} edit re-post: {e}")
+            return
+    header = t('ui_components.tracker.edited_thread_header', guild_id=_lang_guild_id(item), author_id=editor_id)
+    try:
+        await _post_full_text_to_thread(thread, item, header=header)  # type: ignore[arg-type]
+    except Exception as e:
+        logging.warning(f"[TRACKER] Failed to re-post edited text to thread for item #{item['item_number']}: {e}")
 
 
 def _item_jump_link(item: Dict[str, Any]) -> str:

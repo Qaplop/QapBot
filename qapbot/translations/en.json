@@ -440,6 +440,7 @@
       "status_duplicate": "♻️ Duplicate",
       "edit_denied": "🔒 Only the reporter or a bot admin can edit this item.",
       "edit_saved": "✅ Changes saved.",
+      "edited_thread_header": "✏️ **Edited by <@{author_id}>** — updated full text:",
       "item_not_found": "⚠️ Item #{item_number} no longer exists.",
       "status_denied": "🔒 Only a bot admin or tester can change status.",
       "testcase_signoff_denied": "🔒 Only a bot admin or tester can sign off test cases.",
