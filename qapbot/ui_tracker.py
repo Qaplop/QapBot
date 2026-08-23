@@ -860,9 +860,10 @@ async def create_tracker_item_for_agent(
     `tracker_create_item` tool, not a human in Discord (tracker item #0015). Creates the DB row
     and posts it to the configured reports channel exactly like a human-filed `/bug`/`/feature`
     would, just with no attachments and a non-numeric `reporter_id` (`agent:<label>` — never a
-    real Discord snowflake, so it can't collide with one; `_dm_reporter_on_status_change()`'s
-    `int(reporter_id)` already tolerates any non-numeric value by design, and Edit/status-DM
-    features degrade gracefully — a human bot admin can still Edit the posted item in Discord).
+    real Discord snowflake, so it can't collide with one; `_dm_reporter_on_status_change()`
+    explicitly no-ops on a non-numeric reporter_id rather than attempting `int()` on it, and
+    Edit/status-DM features degrade gracefully — a human bot admin can still Edit the posted item
+    in Discord).
     Raises ValueError if the tracker is disabled, unconfigured, or item_type is invalid."""
     from qapbot.cache_manager import CACHE
 
@@ -1104,6 +1105,14 @@ async def _dm_reporter_on_status_change(item: Dict[str, Any]) -> None:
         return
 
     user_id = item["reporter_id"]
+    if not user_id.isdigit():
+        # Agent-filed items use a non-numeric "agent:<label>" reporter_id (e.g. "agent:claude") --
+        # deliberately, so it can never resolve to a real Discord user (BUG_FEATURE_TRACKER.md).
+        # There's genuinely nobody to DM; this is a no-op, not a failure, and must not fall through
+        # to the int() conversion below (2026-08-23 live bug report: it did, logging a misleading
+        # "Failed to DM reporter" warning on every status change for every agent-filed item).
+        return
+
     type_key = 'ui_components.tracker.item_type_bug' if item["item_type"] == "bug" else 'ui_components.tracker.item_type_feature'
     message_text = t(
         key, user_id=user_id, type=t(type_key, user_id=user_id),
@@ -2064,6 +2073,17 @@ async def mark_environment_passed_and_refresh(item_number: int, environment: str
     after = await db.get_tracker_testcases(item_number)
     now_fully_passed = bool(after) and all(c["passed"] for c in after)
 
+    # 2026-08-23 live bug report: a tester's Pass click that turned out to be a no-op (every case
+    # in `environment` was already passed by the time this ran) got zero visible feedback -- no
+    # follow-up prompt (correctly, nothing just completed) and no acknowledgment either, which
+    # read as "the button did nothing." Logged at INFO specifically so a *genuine* miscount (the
+    # click should have completed the item but didn't) is diagnosable from before/after state
+    # instead of requiring guesswork after the fact.
+    logging.info(
+        f"[TRACKER] mark_environment_passed_and_refresh item #{item_number} env={environment} "
+        f"actor={actor_id}: was_fully_passed={was_fully_passed} now_fully_passed={now_fully_passed}"
+    )
+
     if now_fully_passed and not was_fully_passed:
         result = await finalize_testcases_move(item_number)
         return {"just_completed": True, **result}
@@ -2229,6 +2249,16 @@ class TrackerTestPassButton(
         result = await mark_environment_passed_and_refresh(self.item_number, self.environment, user_id)
         if result["just_completed"]:
             await _send_testcases_moved_followup(interaction, self.item_number, result, guild_id)
+        else:
+            # A click that didn't just-complete the item previously got zero feedback at all --
+            # the checkbox update in the persistent message was the only visible sign anything
+            # happened, easy to miss and read as "the button did nothing" (2026-08-23 live bug
+            # report). Also covers the genuinely-redundant case (environment was already fully
+            # passed before this click) with an explicit acknowledgment instead of silence.
+            await interaction.followup.send(
+                t('ui_components.tracker.testcase_pass_ack', guild_id=guild_id, environment=self.environment),
+                ephemeral=True,
+            )
 
 
 class TrackerTestFailButton(

@@ -1,6 +1,29 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (8)
+- Fixed: two live bugs found while testers exercised the new sign-off permission (changelog (4)).
+  (1) _dm_reporter_on_status_change() (qapbot/ui_tracker.py) fell straight into int(reporter_id)
+  for every status change, which raised for an agent-filed item's non-numeric "agent:<label>"
+  reporter_id and logged a misleading "Failed to DM reporter" WARNING on every single transition
+  -- now checks reporter_id.isdigit() first and no-ops, matching the guard
+  _handle_grant_access()/_revoke_requestor_access() already use. (2) TrackerTestPassButton's Pass
+  click gave zero feedback whenever it didn't happen to be the exact click that completed every
+  environment (just_completed=False in mark_environment_passed_and_refresh) -- a tester read this
+  as "the button did nothing." Now sends an explicit testcase_pass_ack acknowledgment on that
+  branch, and mark_environment_passed_and_refresh() logs was_fully_passed/now_fully_passed at INFO
+  (previously no logging at all) so a genuine miscount is diagnosable next time instead of only
+  guessable. Files: qapbot/ui_tracker.py, qapbot/translations/en.json, qapbot/translations/de.json,
+  qapbot/docs/BUG_FEATURE_TRACKER.md, tests/discord/test_ui_tracker_items.py. 2565 tests pass.
+
+2026-08-23 (7)
+- Fixed: send_user_dm_detailed()'s discord.Forbidden/discord.NotFound handlers logged only a
+  generic "DMs disabled or bot blocked" / "User not found" message, discarding the actual
+  Discord HTTP status, error code, and text (e.g. code 50007) needed to tell "DMs closed to
+  non-friends" apart from "bot blocked" or other causes. Now logs
+  {e.status}/{e.code}/{e.text} from the caught exception. Tracker #0031. File:
+  qapbot/cache_manager.py. 2562 tests pass.
+
 2026-08-23 (6)
 - Added: an ownership flip (API token override, admin override, or the unverified-duplicate
   replace, in _link_player_to_user()) now schedules the CWL enrollment-DM reroute

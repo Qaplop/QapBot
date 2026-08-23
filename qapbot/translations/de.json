@@ -462,6 +462,7 @@
       "testcase_message_header": "🧪 **#{item_number} · {title}**",
       "testcase_signoff_hint": "Reagiere mit 👍, um alle abzuzeichnen, oder nutze die Schaltflächen für die Abzeichnung je Umgebung.",
       "testcase_button_passed": "✅ {environment} bestanden",
+      "testcase_pass_ack": "✅ {environment} als bestanden markiert.",
       "testcase_button_failed": "❌ Fehlgeschlagen",
       "testcase_fail_note": "❌ Test fehlgeschlagen (markiert von <@{actor_id}>) — zurückgesetzt auf 'In Bearbeitung'.",
       "testcase_button_movedone": "📦 Nach Erledigt verschieben",

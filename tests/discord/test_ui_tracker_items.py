@@ -26,6 +26,7 @@ from qapbot.ui_tracker import (
     TrackerItemButton,
     TrackerItemModal,
     TrackerStatusSelectView,
+    TrackerTestPassButton,
     _sanitize_attachment_filename,
     apply_pending_requestor_access,
     apply_status_change,
@@ -485,6 +486,22 @@ async def test_apply_status_change_does_not_dm_on_triaged(db, monkeypatch):
     item_number = await _make_item(db, reporter_id="222")
     await apply_status_change(item_number, "triaged", actor_id="1")
     fake_user.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_status_change_skips_dm_for_agent_reporter_without_warning(db, monkeypatch, caplog):
+    """2026-08-23 live bug report: agent-filed items use a non-numeric reporter_id
+    ("agent:<label>") by design (create_tracker_item_for_agent) -- a status change that would
+    normally DM the reporter must silently no-op instead of trying int() on it and logging a
+    misleading "Failed to DM reporter" warning."""
+    fake_user = AsyncMock()
+    bot = _wire_bot(monkeypatch, channel=None, user=fake_user)
+    item_number = await _make_item(db, reporter_id="agent:claude")
+    with caplog.at_level("WARNING"):
+        await apply_status_change(item_number, "implemented", note="fixed in commit abc", actor_id="1")
+    fake_user.send.assert_not_awaited()
+    bot.fetch_user.assert_not_awaited()
+    assert not any("Failed to DM reporter" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -1020,6 +1037,52 @@ async def test_mark_environment_passed_no_longer_touches_item_status(db, monkeyp
     assert result["just_completed"] is True
     assert result["moved"] is False  # no Done Testing channel configured in this test
     assert result["linked_item"]["item_number"] == item_number  # still testing -> eligible for the prompt
+
+
+@pytest.mark.asyncio
+async def test_pass_button_acks_instead_of_silence_when_other_environment_still_pending(db, monkeypatch, mock_interaction):
+    """2026-08-23 live bug report: a Pass click that doesn't complete the item (another
+    environment is still pending) previously gave zero feedback at all -- easy to read as "the
+    button did nothing." Must now get an explicit acknowledgment, not the "mark done?" followup
+    (which is only for the genuinely-completing click)."""
+    _wire_bot(monkeypatch, channel=None)
+    mock_interaction.user.id = int(ADMIN_ID)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [
+        {"environment": "DEV", "description": "x"}, {"environment": "PROD", "description": "y"},
+    ])
+    await db.update_tracker_item(item_number, status="testing")
+    button = TrackerTestPassButton(item_number, "DEV")
+
+    await button.callback(mock_interaction)
+
+    mock_interaction.followup.send.assert_awaited_once()
+    args, kwargs = mock_interaction.followup.send.call_args
+    assert "DEV" in args[0]
+    assert kwargs.get("view") is None
+    cases = await db.get_tracker_testcases(item_number)
+    assert next(c for c in cases if c["environment"] == "DEV")["passed"] == 1
+    assert next(c for c in cases if c["environment"] == "PROD")["passed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pass_button_acks_on_redundant_click_after_already_fully_passed(db, monkeypatch, mock_interaction):
+    """A second Pass click on an environment that's already fully passed must also get an
+    acknowledgment instead of silence -- not the "mark done?" followup, since nothing just
+    completed (edge-triggered)."""
+    _wire_bot(monkeypatch, channel=None)
+    mock_interaction.user.id = int(ADMIN_ID)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
+    await db.mark_tracker_environment_passed(item_number, "DEV", "1")
+    await db.update_tracker_item(item_number, status="testing")
+    button = TrackerTestPassButton(item_number, "DEV")
+
+    await button.callback(mock_interaction)
+
+    mock_interaction.followup.send.assert_awaited_once()
+    args, _kwargs = mock_interaction.followup.send.call_args
+    assert "DEV" in args[0]
 
 
 @pytest.mark.asyncio

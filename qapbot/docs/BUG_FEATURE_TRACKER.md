@@ -240,6 +240,29 @@ this rule: it must give `_launch_cwl_activity()` the interaction's one and only 
 slot, so its own ephemeral Yes/No prompt can't be edited or deleted first — documented in-place at
 that call site.
 
+**A Pass click must never be silent, even when it's a no-op (2026-08-23, live bug report)**: a
+tester reported "the button did nothing" after clicking `[ ✅ DEV passed ]` — the checkbox update
+in the persistent test-case message was the only feedback, easy to miss, and if the click didn't
+happen to be the exact one that finished every environment (`just_completed=True` in
+`mark_environment_passed_and_refresh()`), there was previously **no response at all**, not even an
+acknowledgment. `TrackerTestPassButton.callback()` now sends an explicit
+`testcase_pass_ack` ephemeral followup on the `just_completed=False` branch — covering both a
+click that advances one environment while another is still pending, and a genuinely redundant
+click on an environment that was already fully passed. `mark_environment_passed_and_refresh()`
+also now logs `was_fully_passed`/`now_fully_passed` at INFO on every call, since this code path had
+no logging at all before and a *genuine* miscount (a click that should have completed the item but
+didn't) was previously undiagnosable after the fact.
+
+**Agent-filed items never get a status-change DM — must no-op, not warn (2026-08-23, live bug
+report)**: `create_tracker_item_for_agent()` gives an agent-filed item a non-numeric `reporter_id`
+(`agent:<label>`, e.g. `agent:claude` — deliberately, so it can never collide with a real Discord
+snowflake). `_dm_reporter_on_status_change()` used to fall straight into `int(reporter_id)` for
+every status change, which raised on that non-numeric value and got logged as a misleading
+`"Failed to DM reporter"` WARNING on every single status transition of every agent-filed item, even
+though there was never a real reporter to DM in the first place. It now checks
+`reporter_id.isdigit()` first and returns immediately — the same guard `_handle_grant_access()` and
+`_revoke_requestor_access()` already used for the identical reason.
+
 ### Test-case message chunking (2026-08-23, tracker #0028)
 
 `post_test_cases()`, `_refresh_testcase_message()` and `_move_test_message_to_done_testing_channel()`

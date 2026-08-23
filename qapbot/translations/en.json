@@ -462,6 +462,7 @@
       "testcase_message_header": "🧪 **#{item_number} · {title}**",
       "testcase_signoff_hint": "React 👍 to sign the whole set off, or use the buttons for per-environment sign-off.",
       "testcase_button_passed": "✅ {environment} passed",
+      "testcase_pass_ack": "✅ Marked {environment} passed.",
       "testcase_button_failed": "❌ Failed",
       "testcase_fail_note": "❌ Testing failed (marked by <@{actor_id}>) — reverted to in_progress.",
       "testcase_button_movedone": "📦 Move to Done",
