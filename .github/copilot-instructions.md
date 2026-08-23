@@ -151,6 +151,7 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 - CoC war fetch → `await CACHE.get_current_war_from_api(clan_tag)`
 - DB read/write → `await CACHE.db_manager.*` (never raw sqlite)
 - War file lifecycle → see ../qapbot/docs/WAR_FILE_MANAGEMENT_RULES.md
+- Deploy Activity frontend → `cd activity/client && npm run deploy:dev` (DEV — no confirmation needed) / `npm run deploy:prod` (PROD — always confirm with the user first). Full runbook incl. first-time setup: ../activity/README.md
 
 ---
 
