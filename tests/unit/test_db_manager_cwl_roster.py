@@ -1377,3 +1377,69 @@ class TestCwlPlayerSeasonStatus:
 
         remaining = {c["clan_tag"] for c in db.get_cwl_event_clans_sync(event_id)}
         assert remaining == {"#CLAN1"}  # #GUESTCLAN's row is gone entirely, #CLAN1 untouched
+
+
+class TestUserPlayersCwlPreferenceSurvival:
+    """Phase 0 (plans/cwl-personal-hub.md) — get_user()'s player dict and
+    _replace_user_players_rows()'s INSERT both used to omit cwl_permanent_optout/
+    cwl_default_preferred_league_rank, so ANY save_user() round-trip (what
+    set_primary_account()/unlink_player()/a fresh /link ultimately call via
+    CACHE.persist_user()) did a full user_players delete+reinsert that silently reset both
+    columns back to their defaults for every linked account of that discord_id — not just the
+    one account the caller actually meant to change."""
+
+    async def test_preference_survives_a_save_user_roundtrip_for_a_different_account(self, db):
+        discord_id = "601"
+        await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, "Tester"))
+        await _seed_user_player(
+            db, discord_id, "#PREF1", player_name="Preferred One",
+            cwl_permanent_optout=True, cwl_default_preferred_league_rank="Master League II",
+        )
+        await _seed_user_player(db, discord_id, "#PREF2", player_name="Preferred Two")
+
+        user_data = await db.get_user(discord_id)
+        assert user_data is not None
+        by_tag = {p["player_tag"]: p for p in user_data["players"]}
+        assert by_tag["#PREF1"]["cwl_permanent_optout"] is True
+        assert by_tag["#PREF1"]["cwl_default_preferred_league_rank"] == "Master League II"
+        assert by_tag["#PREF2"]["cwl_permanent_optout"] is False
+
+        # Simulate set_primary_account(discord_id, "#PREF2") — swap which player is_primary,
+        # then round-trip the WHOLE players list back through save_user(), exactly as
+        # CACHE.persist_user() does. This is the exact write path that previously wiped every
+        # CWL preference: _replace_user_players_rows() deletes every user_players row for this
+        # discord_id and reinserts from this list.
+        for p in user_data["players"]:
+            p["is_primary"] = (p["player_tag"] == "#PREF2")
+        await db.save_user(discord_id, user_data)
+
+        reread = await db.get_user(discord_id)
+        by_tag_after = {p["player_tag"]: p for p in reread["players"]}
+        assert by_tag_after["#PREF1"]["is_primary"] is False
+        assert by_tag_after["#PREF2"]["is_primary"] is True
+        # The actual regression: #PREF1's preferences must have survived a save_user() call
+        # that only intentionally changed #PREF2's is_primary flag.
+        assert by_tag_after["#PREF1"]["cwl_permanent_optout"] is True
+        assert by_tag_after["#PREF1"]["cwl_default_preferred_league_rank"] == "Master League II"
+
+    async def test_unlink_player_roundtrip_preserves_remaining_accounts_preferences(self, db):
+        """Simulates unlink_player() removing one account: the caller drops it from the
+        players list before calling save_user(), which still triggers the same
+        delete-everything+reinsert-the-rest path for the accounts that remain."""
+        discord_id = "602"
+        await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, "Tester"))
+        await _seed_user_player(
+            db, discord_id, "#KEEP", player_name="Keep Me",
+            cwl_permanent_optout=True, cwl_default_preferred_league_rank="Crystal League I",
+        )
+        await _seed_user_player(db, discord_id, "#DROP", player_name="Drop Me")
+
+        user_data = await db.get_user(discord_id)
+        user_data["players"] = [p for p in user_data["players"] if p["player_tag"] != "#DROP"]
+        await db.save_user(discord_id, user_data)
+
+        reread = await db.get_user(discord_id)
+        assert {p["player_tag"] for p in reread["players"]} == {"#KEEP"}
+        kept = reread["players"][0]
+        assert kept["cwl_permanent_optout"] is True
+        assert kept["cwl_default_preferred_league_rank"] == "Crystal League I"

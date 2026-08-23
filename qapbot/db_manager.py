@@ -8855,7 +8855,15 @@ class WarHistoryDB:
                 "verified": bool(p_row["verified"]),
                 "th_level": int(p_row["th_level"]) if p_row["th_level"] else None,
                 "current_clan_tag": str(p_row["current_clan_tag"]) if p_row["current_clan_tag"] else None,
-                "is_primary": bool(p_row["is_primary"])
+                "is_primary": bool(p_row["is_primary"]),
+                # CWL preferences (plans/cwl-personal-hub.md Phase 0) — omitting these here meant
+                # any CACHE.persist_user() round-trip (set_primary_account(), unlink_player(), a
+                # fresh /link) did a full user_players delete+reinsert via
+                # _replace_user_players_rows() that silently reset every CWL preference on every
+                # OTHER linked account of the same discord_id back to its default, since this dict
+                # is the only source _replace_user_players_rows() writes from.
+                "cwl_permanent_optout": bool(p_row["cwl_permanent_optout"]),
+                "cwl_default_preferred_league_rank": p_row["cwl_default_preferred_league_rank"],
             }
             for p_row in players_rows
         ]
@@ -8962,8 +8970,9 @@ class WarHistoryDB:
         for player in deduped_players:
             await self._conn.execute("""
                 INSERT INTO user_players
-                (discord_id, player_tag, player_name, verified, th_level, current_clan_tag, is_primary)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (discord_id, player_tag, player_name, verified, th_level, current_clan_tag, is_primary,
+                 cwl_permanent_optout, cwl_default_preferred_league_rank)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 discord_id,
                 player["player_tag"],
@@ -8971,7 +8980,13 @@ class WarHistoryDB:
                 1 if player.get("verified", False) else 0,
                 player.get("th_level"),
                 None if null_clan_tags else player.get("current_clan_tag"),
-                1 if player.get("is_primary", False) else 0
+                1 if player.get("is_primary", False) else 0,
+                # CWL preferences (plans/cwl-personal-hub.md Phase 0) — see get_user()'s matching
+                # comment above: this INSERT is the other half of the same round-trip, and must
+                # source these from the incoming player dict rather than defaulting them, or a
+                # save_user() call for one player silently zeroes every OTHER player's preferences.
+                1 if player.get("cwl_permanent_optout", False) else 0,
+                player.get("cwl_default_preferred_league_rank"),
             ))
 
     async def _save_user_impl(self, discord_id: str, user_data: Dict[str, Any]) -> None:
