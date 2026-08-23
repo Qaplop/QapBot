@@ -160,6 +160,7 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 - Prefer minimal diffs and reuse existing patterns.
 - Preserve unknown keys when updating JSON-like dict structures in CACHE (avoid data loss).
 - Multi-step UI flows: prefer editing an existing message; avoid leaving behind many ephemeral messages.
+- Never `git checkout`/`git switch` another branch on the live working directory just to inspect or diff it — that swaps every tracked file on disk out from under any process watching this directory (IDE, a running bot, this repo's own multi-GB `data/*.db`). Use `git diff branch1 branch2`, `git show branch:path`, or `git worktree add` instead; only actually check out a branch when the user wants their working tree switched (2026-08-23 incident: an exploratory checkout of a stale branch briefly deleted several root-level `.bat` scripts that only ever existed on `main`).
 
 ---
 
