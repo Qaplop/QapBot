@@ -1453,6 +1453,55 @@ async def test_notify_new_cwl_pool_members_only_dms_not_yet_contacted(db, monkey
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_notify_new_cwl_pool_members_seeds_declined_for_an_optout_no_dm_new_member(db, monkeypatch):
+    """plans/cwl-personal-hub.md Phase 4b-bis: a permanently-opted-out member who joins the pool
+    AFTER enrollment already started — this button's whole purpose — is skipped from the DM by
+    _send_cwl_enrollment_dm_batch's own seed-before-DM step (that step only ever seeds who it's
+    ABOUT to DM), so without the second seed pass they would never get a cwl_signups row at all,
+    and would be invisible on the board instead of showing as Declined."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.web_bridge import notify_new_cwl_pool_members
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    await _seed_guild_and_clans(db, "832", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha", "war_league": "Master League II"}}
+    CACHE.server_config["832"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("832", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    db.update_cwl_event_status_sync(event_id, "signup_open")
+
+    # Joined the clan (and thus the pool) after Start Enrollment already ran — no cwl_signups
+    # row exists for them yet, and they're permanently opted out with no DM-anyway override.
+    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('30', '30')")
+    await db.conn.execute(
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag, cwl_permanent_optout) "
+        "VALUES ('30', '#P3', 'PlayerThree', 1, '#CLAN1', 1)"
+    )
+    await db.conn.commit()
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
+
+    result = await notify_new_cwl_pool_members(832, "2026-09")
+
+    assert result["ok"] is True
+    assert result["contacted"] == 0
+    signup = db.get_cwl_signup_sync(event_id, "#P3")
+    assert signup is not None
+    assert signup["status"] == "declined"
+    assert signup["source"] == "auto_optout"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_notify_new_cwl_pool_members_rejects_draft_event(db):
     from qapbot.cache_manager import CACHE
     from qapbot.web_bridge import notify_new_cwl_pool_members

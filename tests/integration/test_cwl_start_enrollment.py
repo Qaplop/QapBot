@@ -50,12 +50,18 @@ async def _seed_guild_and_clan(db: WarHistoryDB, guild_id: str, clan_tag: str = 
 async def _seed_current_clan_member(
     db: WarHistoryDB, discord_id: str, player_tag: str, clan_tag: str = "#CLAN1",
     verified: bool = True, cwl_permanent_optout: bool = False,
+    cwl_permanent_optin: bool = False, cwl_optout_send_dm_anyway: bool = False,
 ) -> None:
     await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
     await db.conn.execute(
-        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, cwl_permanent_optout, current_clan_tag) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (discord_id, player_tag, "Player", 1 if verified else 0, 1 if cwl_permanent_optout else 0, clan_tag),
+        "INSERT INTO user_players "
+        "(discord_id, player_tag, player_name, verified, cwl_permanent_optout, current_clan_tag, "
+        " cwl_permanent_optin, cwl_optout_send_dm_anyway) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            discord_id, player_tag, "Player", 1 if verified else 0, 1 if cwl_permanent_optout else 0, clan_tag,
+            1 if cwl_permanent_optin else 0, 1 if cwl_optout_send_dm_anyway else 0,
+        ),
     )
     await db.conn.commit()
 
@@ -553,7 +559,11 @@ async def test_departed_member_is_not_seeded(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_skips_permanently_opted_out_accounts(db, monkeypatch):
+async def test_permanently_opted_out_accounts_are_seeded_declined_with_no_dm(db, monkeypatch):
+    """plans/cwl-personal-hub.md Phase 4b: opted-out participants used to be skipped entirely
+    (no cwl_signups row at all). They now ALWAYS get seeded — as 'declined' — so the row is what
+    makes them show as Declined on the board and in the season overview; only the DM (gated by
+    cwl_optout_send_dm_anyway, tested separately below) is still skipped by default."""
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
 
@@ -566,11 +576,137 @@ async def test_skips_permanently_opted_out_accounts(db, monkeypatch):
 
     summary = await start_cwl_enrollment(1006, "2026-08")
 
-    assert summary["seeded"] == 0
+    assert summary["seeded"] == 1
     assert summary["contacted"] == 0
     assert summary["skipped_optout"] == 1
     event_id = db.get_cwl_event_sync("1006", "2026-08")["id"]
-    assert db.get_cwl_signup_sync(event_id, "#P1") is None  # never even created
+    signup = db.get_cwl_signup_sync(event_id, "#P1")
+    assert signup is not None
+    assert signup["status"] == "declined"
+    assert signup["source"] == "auto_optout"
+
+
+@pytest.mark.asyncio
+async def test_opted_out_with_dm_anyway_is_seeded_declined_and_still_dmed(db, monkeypatch):
+    """The DM-anyway override (plans/cwl-personal-hub.md): the seeded status is UNCHANGED
+    ('declined') — the member's own auto-decline is only overridable by their own DM-button
+    click, never implied by having asked for the DM — but the invitation DM still goes out."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    # Deterministic regardless of this machine's own .env (see test_seeds_signups_and_dms_
+    # linked_confirmed_accounts above for why) — "d1" must not be silently blocked by the
+    # DM-restrict-to-admin guard, which is what this test is actually about.
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    await _seed_guild_and_clan(db, "1007")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(
+        db, "d1", "#P1", cwl_permanent_optout=True, cwl_optout_send_dm_anyway=True,
+    )
+    await _make_event(db, "1007", "2026-08")
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
+
+    summary = await start_cwl_enrollment(1007, "2026-08")
+
+    assert summary["seeded"] == 1
+    assert summary["contacted"] == 1
+    assert summary["skipped_optout"] == 0
+    event_id = db.get_cwl_event_sync("1007", "2026-08")["id"]
+    signup = db.get_cwl_signup_sync(event_id, "#P1")
+    assert signup["status"] == "declined"
+
+
+@pytest.mark.asyncio
+async def test_permanently_opted_in_accounts_are_seeded_auto_confirmed_and_dmed(db, monkeypatch):
+    """plans/cwl-personal-hub.md Phase 4b: a standing opt-in preference seeds 'auto_confirmed'
+    and ALWAYS gets the invitation DM (no send-dm-anyway gate on this branch — the whole point is
+    letting the member switch to confirmed/declined for a specific season)."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    await _seed_guild_and_clan(db, "1008")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(db, "d1", "#P1", cwl_permanent_optin=True)
+    await _make_event(db, "1008", "2026-08")
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
+
+    summary = await start_cwl_enrollment(1008, "2026-08")
+
+    assert summary["seeded"] == 1
+    assert summary["contacted"] == 1
+    assert summary["skipped_optout"] == 0
+    event_id = db.get_cwl_event_sync("1008", "2026-08")["id"]
+    signup = db.get_cwl_signup_sync(event_id, "#P1")
+    assert signup["status"] == "auto_confirmed"
+    assert signup["source"] == "auto_optin"
+
+
+@pytest.mark.asyncio
+async def test_no_preference_is_unchanged_pending(db, monkeypatch):
+    """A participant with neither preference set behaves exactly as before this feature —
+    plain 'pending', DMed normally."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    await _seed_guild_and_clan(db, "1017")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    await _seed_current_clan_member(db, "d1", "#P1")
+    await _make_event(db, "1017", "2026-08")
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
+
+    summary = await start_cwl_enrollment(1017, "2026-08")
+    assert summary["contacted"] == 1
+    event_id = db.get_cwl_event_sync("1017", "2026-08")["id"]
+    signup = db.get_cwl_signup_sync(event_id, "#P1")
+    assert signup["status"] == "pending"
+    assert signup["source"] == "template_confirm"
+
+
+@pytest.mark.asyncio
+async def test_existing_global_response_beats_every_standing_preference(db, monkeypatch):
+    """rule h wins over Phase 4b's own precedence: a real answer the member already gave ANOTHER
+    guild this season is never contradicted by a standing opt-in/opt-out preference — this guild's
+    freshly-seeded row must show that same real answer, not a value derived from the preference."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    await _seed_guild_and_clan(db, "1018")
+    monkeypatch.setattr(CACHE, "db_manager", db)
+    # A real answer already recorded (as if given via another guild's DM) should beat the standing
+    # opt-in preference below — status must come back 'declined' (the real answer), never
+    # 'auto_confirmed' (what the preference alone would seed).
+    await _seed_current_clan_member(db, "d1", "#P1", cwl_permanent_optin=True)
+    db.set_cwl_player_response_status_sync(
+        "#P1", "2026-08", "Player", "d1", "declined", "2026-08-01T00:00Z", 999, 999,
+    )
+    await _make_event(db, "1018", "2026-08")
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", AsyncMock(return_value=(True, "sent")))
+    await start_cwl_enrollment(1018, "2026-08")
+    event_id = db.get_cwl_event_sync("1018", "2026-08")["id"]
+    signup = db.get_cwl_signup_sync(event_id, "#P1")
+    assert signup["status"] == "declined"  # the real answer, NOT auto_confirmed
+    assert signup["source"] == "template_confirm"
 
 
 @pytest.mark.asyncio

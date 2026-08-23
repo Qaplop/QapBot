@@ -2,6 +2,7 @@ import gcheckIconUrl from './assets/gcheck.svg'
 import pendingIconUrl from './assets/pending.svg'
 import redxIconUrl from './assets/redx.svg'
 import unlinkedIconUrl from './assets/unlinked.svg'
+import autoConfirmedIconUrl from './assets/autoconfirmed.svg'
 import type { AdminSettableStatus, EnrollmentPayload, EnrollmentPlayer, SetStatusResult } from './types'
 
 type SortOrder = 'th' | 'skill' | 'alpha'
@@ -20,21 +21,26 @@ function metricLabel(metric: DisplayMetric): string {
   return metric === 'avg_stars' ? 'Average stars/attack (last 3 CWL months)' : 'League-adjusted skill score'
 }
 
-type VisibleStatus = 'pending' | 'confirmed' | 'declined'
+type VisibleStatus = 'pending' | 'confirmed' | 'declined' | 'auto_confirmed'
 
-// Only the three statuses a member's own DM response can actually produce are ever shown — the
-// board never lets the clan lead alter a signup status itself (live-testing feedback,
-// 2026-08-14: assignment is drag-and-drop only, see renderEnrollmentBoard's docstring).
-// Anything else (no signup row yet, or a legacy 'withdrawn' value) shows no icon at all.
+// The statuses a member's own DM response can produce, plus 'auto_confirmed' (2026-08-23, plans/
+// cwl-personal-hub.md Phase 4a) — seeded automatically by a standing opt-in preference at Start
+// Enrollment, never written by an admin action or a member's own click (a real DM response always
+// overwrites it with 'confirmed'/'declined'). The board still never lets the clan lead alter a
+// signup status itself (live-testing feedback, 2026-08-14: assignment is drag-and-drop only, see
+// renderEnrollmentBoard's docstring). Anything else (no signup row yet, or a legacy 'withdrawn'
+// value) shows no icon at all.
 const STATUS_ICON: Record<VisibleStatus, string> = {
   pending: pendingIconUrl,
   confirmed: gcheckIconUrl,
   declined: redxIconUrl,
+  auto_confirmed: autoConfirmedIconUrl,
 }
 const STATUS_LABEL: Record<VisibleStatus, string> = {
   pending: 'Pending',
   confirmed: 'Confirmed',
   declined: 'Declined',
+  auto_confirmed: 'Auto-Confirmed',
 }
 const UNLINKED_LABEL = 'Not Linked'
 
@@ -52,7 +58,7 @@ function formatEventStatus(status: string | null): string {
 }
 
 function isVisibleStatus(status: EnrollmentPlayer['signup_status']): status is VisibleStatus {
-  return status === 'pending' || status === 'confirmed' || status === 'declined'
+  return status === 'pending' || status === 'confirmed' || status === 'declined' || status === 'auto_confirmed'
 }
 
 function displayName(player: EnrollmentPlayer): string {
@@ -707,6 +713,10 @@ export function renderEnrollmentBoard(
     buildLegendItem(pendingIconUrl, STATUS_LABEL.pending, 'Sent the enrollment DM, no response yet.'),
     buildLegendItem(gcheckIconUrl, STATUS_LABEL.confirmed, 'Confirmed participation via the enrollment DM.'),
     buildLegendItem(redxIconUrl, STATUS_LABEL.declined, 'Declined (opted out) via the enrollment DM.'),
+    buildLegendItem(
+      autoConfirmedIconUrl, STATUS_LABEL.auto_confirmed,
+      'Standing opt-in seeded this — the invitation DM was still sent.',
+    ),
     // Trailing comma appended to this item's own label text, not as a separate flex child
     // (2026-08-16, live-testing feedback: the guest swatch below doesn't belong to the "User
     // response:" group — a comma marks that boundary, but as a sibling flex item it'd pick up the

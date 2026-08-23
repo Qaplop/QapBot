@@ -473,7 +473,10 @@ async def format_clan_management_cwl_management(
         f"{t('cwl.management.signup_status_pending', guild_id=guild_id_int)}: {pending_linked}",
     ] + [
         f"{t(f'cwl.management.signup_status_{status}', guild_id=guild_id_int)}: {signup_counts.get(status, 0)}"
-        for status in ("confirmed", "declined")
+        # auto_confirmed before confirmed (plans/cwl-personal-hub.md Phase 4a) — a standing
+        # opt-in preference seeded this row and the invitation DM was still sent, so it reads as
+        # "not yet a real confirmation" and belongs ahead of the genuine confirmed count.
+        for status in ("auto_confirmed", "confirmed", "declined")
     ]
     # Same resolution + gating count_cwl_pool_members_missing_dm() drives for the "Notify New
     # Pool Members" button below — shown here only when that button would actually do something
@@ -575,7 +578,11 @@ def split_cwl_pending_signups_by_link_sync(event_id: int) -> Tuple[int, int]:
     unlinked pending account has nobody to DM.
 
     Plain sync function (Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — caller wraps in one
-    asyncio.to_thread() hop."""
+    asyncio.to_thread() hop.
+
+    Deliberately UNCHANGED by 'auto_confirmed' (plans/cwl-personal-hub.md Phase 4a): the
+    `status == "pending"` filter below correctly excludes it — an auto-confirmed row was seeded
+    by a standing opt-in preference, not left unanswered, and must not inflate this count."""
     db = CACHE.db_manager
     if db is None:
         return (0, 0)
@@ -906,11 +913,24 @@ def _seed_status_from_global_sync(db: Any, player_tag: str, cwl_season: str) -> 
     0 live rows had drifted — but 31 of 116 global rows already held a real response, so the
     precondition was fully in place.
 
+    2026-08-23 (plans/cwl-personal-hub.md Phase 4b-bis, follow-up audit): all four of those same
+    paths ALSO ignored a player's standing CWL opt-out/opt-in preference — a manual drag-and-drop
+    placement or a guest invite for a permanently-opted-out player produced a stray 'pending' row
+    that never became 'declined', silently contradicting the very preference this feature exists
+    to honour. Delegates to resolve_seeded_cwl_signup_status() (the single shared precedence:
+    existing_global > opt-out > opt-in > pending), fetching the preference flags itself via
+    get_player_links_sync() so none of the four call sites need to change — a player_tag absent
+    from that lookup (no user_players row at all) has no preference to honour, same as before.
+
     Callers must still only use this when CREATING a row: an existing local row is never
     overwritten from here (all four call sites sit inside `if get_cwl_signup_sync(...) is None`).
     """
     existing_global = db.get_cwl_player_season_status_sync(player_tag, cwl_season)
-    return existing_global["status"] if existing_global else "pending"
+    link = db.get_player_links_sync([player_tag]).get(player_tag) or {}
+    status, _source = resolve_seeded_cwl_signup_status(
+        existing_global, bool(link.get("cwl_permanent_optout")), bool(link.get("cwl_permanent_optin")),
+    )
+    return status
 
 
 def _live_owners_or_sync(db: Any, player_tags: List[str]) -> Dict[str, Optional[str]]:
@@ -2232,6 +2252,40 @@ def _seed_prior_cwl_assignments_sync(
         )
 
 
+def resolve_seeded_cwl_signup_status(
+    existing_global: Optional[Dict[str, Any]], permanent_optout: bool, permanent_optin: bool,
+) -> Tuple[str, str]:
+    """(status, source) for a freshly-seeded cwl_signups row — the single definition of
+    plans/cwl-personal-hub.md Phase 4b's precedence, so it can never be written twice and drift
+    apart between the two real seed sites (start_cwl_enrollment's own loop, and
+    _send_cwl_enrollment_dm_batch's "seed before DMing" block for players pooled after enrollment
+    already started — see Phase 4b-bis).
+
+    Precedence, highest first:
+      1. existing_global (a real cwl_player_season_status response the member already gave ANY
+         guild this season) always wins over a standing preference — a real answer must never be
+         contradicted by an automatic derivation.
+      2. permanent_optout -> ('declined', 'auto_optout'). The account is automatically marked
+         declined the moment enrollment starts; whether it ALSO gets DMed (so the member can
+         override their own auto-decline) is a separate decision made by the DM-targeting layer
+         (resolve_cwl_pool_dm_targets_sync's cwl_optout_send_dm_anyway check) — this function only
+         ever decides the seeded row's status, never whether to DM.
+      3. permanent_optin -> ('auto_confirmed', 'auto_optin'). Always DMed regardless (no
+         send-DM-anyway gate on this branch), so the member can still switch to confirmed/declined.
+      4. otherwise -> ('pending', 'template_confirm') — unchanged from before this feature.
+
+    'source' is audit-only (Cardinal Rule 24) — nothing may branch on it; both callers write it
+    straight through to cwl_signups.source for a later "why is this row declined?" answer.
+    """
+    if existing_global:
+        return existing_global["status"], "template_confirm"
+    if permanent_optout:
+        return "declined", "auto_optout"
+    if permanent_optin:
+        return "auto_confirmed", "auto_optin"
+    return "pending", "template_confirm"
+
+
 async def start_cwl_enrollment(guild_id: int, season: str) -> Dict[str, Any]:
     """Per-(guild_id, season)-serialized wrapper around the real implementation below — see
     _enrollment_locks' comment at the top of this module for why. Concurrent calls for the SAME
@@ -2400,18 +2454,24 @@ async def _start_cwl_enrollment_locked(guild_id: int, season: str) -> Dict[str, 
         db.get_cwl_player_season_status_bulk_sync, [p["player_tag"] for p in participants], season,
     )
 
+    # Status precedence (plans/cwl-personal-hub.md Phase 4b) — a real cross-guild response beats
+    # a standing preference, opt-out seeds 'declined', opt-in seeds 'auto_confirmed', otherwise
+    # unchanged 'pending'. Opted-out participants used to be skipped entirely (no row at all);
+    # they now always get seeded, since the row itself is what makes them show as Declined on the
+    # board and in the season overview instead of silently vanishing.
     signups_to_create: List[Dict[str, Any]] = []
     for participant in participants:
-        if participant["cwl_permanent_optout"]:
-            continue
         existing_global = global_status_by_tag.get(participant["player_tag"])
+        status, source = resolve_seeded_cwl_signup_status(
+            existing_global, participant["cwl_permanent_optout"], participant["cwl_permanent_optin"],
+        )
         signups_to_create.append({
             "player_tag": participant["player_tag"],
             "player_name": participant["player_name"],
             "dmed_discord_id": participant["discord_id"],
             "preferred_league_rank": participant["preferred_league_rank"],
-            "source": "template_confirm",
-            "status": existing_global["status"] if existing_global else "pending",
+            "source": source,
+            "status": status,
         })
 
     if signups_to_create:
@@ -2432,6 +2492,38 @@ async def _start_cwl_enrollment_locked(guild_id: int, season: str) -> Dict[str, 
     dm_targets = pool["targets"]
     summary["skipped_optout"] = pool["skipped_optout"]
     summary["skipped_unlinked"] = pool["skipped_unlinked"]
+
+    # 4b-bis (plans/cwl-personal-hub.md): the primary seed loop above only ever sees
+    # `participants` (pool source 1 — clan/family members), so an opted-out GUEST or
+    # SHARED-CLAN entry (sources 2/3) is invisible to it entirely. Without this second pass such
+    # an entry would never get a cwl_signups row at all once it's ALSO skipped from the DM
+    # (declined, no DM) — resolve_cwl_pool_dm_targets_sync above is the only place that ever sees
+    # it. Filtered against the primary loop's own tags (not just left to bulk_create's ON
+    # CONFLICT DO NOTHING) so summary["seeded"] below counts each real row exactly once — a
+    # source-1 participant already seeded above must not be double-counted here even though the
+    # resolver correctly reports it in optout_no_dm too (it makes no source distinction).
+    already_seeded_tags = {s["player_tag"] for s in signups_to_create}
+    optout_no_dm = [e for e in pool["optout_no_dm"] if e["player_tag"] not in already_seeded_tags]
+    if optout_no_dm:
+        optout_no_dm_status_by_tag = await asyncio.to_thread(
+            db.get_cwl_player_season_status_bulk_sync,
+            [entry["player_tag"] for entry in optout_no_dm], season,
+        )
+        extra_signups: List[Dict[str, Any]] = []
+        for entry in optout_no_dm:
+            status, source = resolve_seeded_cwl_signup_status(
+                optout_no_dm_status_by_tag.get(entry["player_tag"]), True, False,
+            )
+            extra_signups.append({
+                "player_tag": entry["player_tag"],
+                "player_name": entry["player_name"],
+                "dmed_discord_id": entry["discord_id"],
+                "preferred_league_rank": None,
+                "source": source,
+                "status": status,
+            })
+        await asyncio.to_thread(db.bulk_create_cwl_signups_sync, event["id"], extra_signups)
+        summary["seeded"] += len(extra_signups)
 
     # Auto-assignment seed — the initial "who probably plays where" suggestion, from each
     # player's own last real CWL attack, anywhere (2026-08-14 redesign — see
@@ -2586,18 +2678,27 @@ def resolve_cwl_pool_dm_targets_sync(
       3. cross-guild shared clans' rosters (cwl_shared_clan_players), whose players may have no
          local row of either kind.
 
-    Returns {"targets", "skipped_optout", "skipped_unlinked"} — targets are the
-    {player_tag, player_name, discord_id} dicts _send_cwl_enrollment_dm_batch() consumes, and the
-    two counts are what the Start Enrollment summary reports. cwl_permanent_optout is honoured
-    for every source, not just source 1 (its per-account "never DM me about CWL" semantics don't
-    care how the player got pooled). preloaded_members lets start_cwl_enrollment pass the member
-    list it already fetched (plus its account-wide expansion) rather than re-running that scan.
+    Returns {"targets", "skipped_optout", "skipped_unlinked", "optout_no_dm"} — targets are the
+    {player_tag, player_name, discord_id} dicts _send_cwl_enrollment_dm_batch() consumes, and
+    skipped_optout/skipped_unlinked are the two counts the Start Enrollment summary reports.
+    cwl_permanent_optout is honoured for every source, not just source 1 (its per-account "never
+    DM me about CWL" semantics don't care how the player got pooled) — UNLESS
+    cwl_optout_send_dm_anyway is also set, in which case the invitation DM is still sent so the
+    member can override their own auto-decline (plans/cwl-personal-hub.md Phase 4c). optout_no_dm
+    is the same-shaped list of every entry that WAS skipped for opt-out (with or without the DM
+    override) — Phase 4b-bis's callers seed a 'declined' cwl_signups row for each of these,
+    because this resolver is the only place that ever sees an opted-out guest/shared-clan player
+    (pool sources 2/3) at all; a plain clan-member scan structurally cannot. preloaded_members
+    lets start_cwl_enrollment pass the member list it already fetched (plus its account-wide
+    expansion) rather than re-running that scan.
 
     Plain synchronous function (Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — no `await` anywhere
     inside, so callers wrap the whole thing in one asyncio.to_thread() hop.
     """
     db = CACHE.db_manager
-    result: Dict[str, Any] = {"targets": [], "skipped_optout": 0, "skipped_unlinked": 0}
+    result: Dict[str, Any] = {
+        "targets": [], "skipped_optout": 0, "skipped_unlinked": 0, "optout_no_dm": [],
+    }
     if db is None:
         return result
 
@@ -2608,6 +2709,7 @@ def resolve_cwl_pool_dm_targets_sync(
 
     pool: Dict[str, Dict[str, Any]] = {}
     optout_by_tag: Dict[str, bool] = {}
+    dm_anyway_by_tag: Dict[str, bool] = {}
 
     def _merge(
         player_tag: str,
@@ -2647,6 +2749,7 @@ def resolve_cwl_pool_dm_targets_sync(
 
     for member in members:
         optout_by_tag[member["player_tag"]] = bool(member["cwl_permanent_optout"])
+        dm_anyway_by_tag[member["player_tag"]] = bool(member.get("cwl_optout_send_dm_anyway"))
         _merge(member["player_tag"], member["player_name"], member["discord_id"])
 
     for signup in db.get_cwl_signups_for_event_sync(event_id):
@@ -2671,10 +2774,20 @@ def resolve_cwl_pool_dm_targets_sync(
     unknown_tags = [tag for tag in pool if tag not in optout_by_tag]
     for tag, link in (db.get_player_links_sync(unknown_tags) if unknown_tags else {}).items():
         optout_by_tag[tag] = link["cwl_permanent_optout"]
+        dm_anyway_by_tag[tag] = bool(link.get("cwl_optout_send_dm_anyway"))
         _merge(tag, link["player_name"], link["discord_id"], authoritative_discord_id=True)
 
     for entry in pool.values():
-        if optout_by_tag.get(entry["player_tag"]):
+        tag = entry["player_tag"]
+        if optout_by_tag.get(tag):
+            # Recorded regardless of what happens below — a 'declined' row is owed to EVERY
+            # opted-out pool entry (Phase 4b-bis), whether it goes on to get DMed via
+            # send_dm_anyway or not; harmlessly redundant (ON CONFLICT DO NOTHING) for an entry
+            # some other seed path already covers, and the ONLY source of a row at all for one
+            # that doesn't (a guest/shared-clan entry skipped from DM entirely).
+            result["optout_no_dm"].append(entry)
+        if optout_by_tag.get(tag) and not dm_anyway_by_tag.get(tag):
+            # narrows from "opted out" to "opted out and didn't ask for the DM anyway" (Phase 4c)
             result["skipped_optout"] += 1
         elif entry["discord_id"]:
             result["targets"].append(entry)
@@ -2695,6 +2808,14 @@ def resolve_cwl_pending_reminder_targets_sync(event_id: int) -> Dict[str, Any]:
     "unlinked" half `split_cwl_pending_signups_by_link_sync` reports on the season overview), and
     `cwl_permanent_optout` is honoured the same way (a permanent opt-out must not be re-pinged
     just because their signup row still reads 'pending').
+
+    Deliberately UNCHANGED by plans/cwl-personal-hub.md Phase 4: `status == "pending"` below
+    already excludes 'auto_confirmed' rows — a standing opt-in preference already answered for
+    that account, so "Remind Pending" must not re-ping them. And since Phase 4b's seed now gives
+    an opted-out account a 'declined' row (never 'pending') from the moment enrollment starts,
+    the `cwl_permanent_optout` check just below is belt-and-braces rather than load-bearing —
+    kept rather than removed, since a row can still reach 'pending' with the flag set via an
+    older event that predates Phase 4b's seeding change.
 
     Returns {"groups": {discord_id: [{"player_tag", "player_name"}, ...]}, "skipped_unlinked",
     "skipped_optout"}. Plain sync function (Pitfall 26) — caller wraps in one asyncio.to_thread()
@@ -2831,27 +2952,28 @@ async def _send_cwl_enrollment_dm_batch(
             global_status_by_tag = await asyncio.to_thread(
                 db.get_cwl_player_season_status_bulk_sync, [p["player_tag"] for p in missing], season,
             )
-            await asyncio.to_thread(
-                db.bulk_create_cwl_signups_sync,
-                event_id,
-                [
-                    {
-                        "player_tag": p["player_tag"],
-                        "player_name": p["player_name"],
-                        "dmed_discord_id": p["discord_id"],
-                        "preferred_league_rank": None,
-                        "source": "template_confirm",
-                        # Never a hardcoded 'pending' — a player who already answered another
-                        # guild's DM must not be contradicted here (rule h). Same seeding
-                        # start_cwl_enrollment does, just from the bulk reader.
-                        "status": (
-                            global_status_by_tag[p["player_tag"]]["status"]
-                            if p["player_tag"] in global_status_by_tag else "pending"
-                        ),
-                    }
-                    for p in missing
-                ],
-            )
+            # Same resolve_seeded_cwl_signup_status precedence start_cwl_enrollment's own seed
+            # loop uses (plans/cwl-personal-hub.md Phase 4b-bis) — the flags come from
+            # `live_links` (already fetched above for the live-ownership re-check), which after
+            # Phase 1b carries cwl_permanent_optin/cwl_optout_send_dm_anyway alongside the
+            # existing cwl_permanent_optout. Not a new query.
+            missing_signups: List[Dict[str, Any]] = []
+            for p in missing:
+                link = live_links.get(p["player_tag"]) or {}
+                status, source = resolve_seeded_cwl_signup_status(
+                    global_status_by_tag.get(p["player_tag"]),
+                    bool(link.get("cwl_permanent_optout")),
+                    bool(link.get("cwl_permanent_optin")),
+                )
+                missing_signups.append({
+                    "player_tag": p["player_tag"],
+                    "player_name": p["player_name"],
+                    "dmed_discord_id": p["discord_id"],
+                    "preferred_league_rank": None,
+                    "source": source,
+                    "status": status,
+                })
+            await asyncio.to_thread(db.bulk_create_cwl_signups_sync, event_id, missing_signups)
             logging.info(
                 f"[CWL-ENROLLMENT] Seeded {len(missing)} missing cwl_signups row(s) for event "
                 f"{event_id} before DMing — their buttons would otherwise have been dead (#0016)"

@@ -1687,6 +1687,34 @@ class TestCwlSignupResponseButton:
 
     @pytest.mark.discord
     @pytest.mark.asyncio
+    async def test_confirm_click_overwrites_an_auto_confirmed_row(self, db, mock_interaction):
+        """plans/cwl-personal-hub.md Phase 4c: a row seeded 'auto_confirmed' by a standing
+        opt-in preference must still be fully overridable by the member's own real DM response —
+        _apply_cwl_signup_response() doesn't special-case the row's prior status, so a click
+        (in either direction) always writes the real answer over whatever seeded it."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlSignupResponseButton
+
+        await _seed_guild_and_clans(db, "9109", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9109", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "123456789", None, "auto_optin", "auto_confirmed")
+
+        mock_interaction.user.id = 123456789
+        mock_interaction.response.edit_message = AsyncMock()
+
+        # The member decides NOT to play this season after all — declines their own auto-seeded row.
+        button = CwlSignupResponseButton("optout", event_id, "#P1")
+        await button.callback(mock_interaction)
+
+        signup = db.get_cwl_signup_sync(event_id, "#P1")
+        assert signup["status"] == "declined"
+        assert signup["responded_at"] is not None
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
     async def test_confirm_click_bumps_enrollment_version(self, db, mock_interaction, monkeypatch):
         """2026-08-17 regression guard (CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8, found via
         live-testing): confirming/opting out via this DM button is a real cwl_signups write, but

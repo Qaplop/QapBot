@@ -738,6 +738,7 @@ async def notify_new_cwl_pool_members(guild_id: int, season: str) -> Dict[str, A
     from qapbot.QBdiscocmdshelper_cwl import (
         _send_cwl_enrollment_dm_batch,
         resolve_cwl_pool_dm_targets_sync,
+        resolve_seeded_cwl_signup_status,
     )
 
     db = CACHE.db_manager
@@ -750,6 +751,36 @@ async def notify_new_cwl_pool_members(guild_id: int, season: str) -> Dict[str, A
         return {"ok": False, "error": "not_open"}
 
     pool = await asyncio.to_thread(resolve_cwl_pool_dm_targets_sync, guild_id, event["id"], season)
+
+    # 4b-bis (plans/cwl-personal-hub.md) — same gap this button hit for Start Enrollment's own
+    # primary seed loop: an opted-out member who joined the pool after enrollment started (this
+    # button's whole purpose) gets skipped from the DM by _send_cwl_enrollment_dm_batch's own
+    # seed-before-DM step (that step only ever seeds who it's ABOUT to DM), so without this pass
+    # they would never get a cwl_signups row at all. Uses the SAME resolve_seeded_cwl_signup_status
+    # precedence Start Enrollment does, so the two callers can never disagree about the result for
+    # the same member with the same preferences — harmlessly redundant (ON CONFLICT DO NOTHING)
+    # for an entry some other seed path already covered.
+    optout_no_dm = pool["optout_no_dm"]
+    if optout_no_dm:
+        optout_no_dm_status_by_tag = await asyncio.to_thread(
+            db.get_cwl_player_season_status_bulk_sync,
+            [entry["player_tag"] for entry in optout_no_dm], season,
+        )
+        extra_signups: List[Dict[str, Any]] = []
+        for entry in optout_no_dm:
+            status, source = resolve_seeded_cwl_signup_status(
+                optout_no_dm_status_by_tag.get(entry["player_tag"]), True, False,
+            )
+            extra_signups.append({
+                "player_tag": entry["player_tag"],
+                "player_name": entry["player_name"],
+                "dmed_discord_id": entry["discord_id"],
+                "preferred_league_rank": None,
+                "source": source,
+                "status": status,
+            })
+        await asyncio.to_thread(db.bulk_create_cwl_signups_sync, event["id"], extra_signups)
+
     dm_result = await _send_cwl_enrollment_dm_batch(event["id"], guild_id, season, pool["targets"])
     # dm_result["skipped_unlinked"] folds in both the pool-resolution-time count (pool's own
     # "no linked Discord account") and the send-time re-check inside _send_cwl_enrollment_dm_batch
@@ -1431,7 +1462,10 @@ async def handle_get_cwl_player_stats(request: web.Request) -> web.Response:
 
 # The only statuses an admin may set from the board's right-click menu (2026-08-22, tracker
 # #0014). Deliberately excludes 'withdrawn' — legacy-only, its one writer was deleted 2026-08-19
-# (see activity/client/src/types.ts's EnrollmentPlayer.signup_status comment).
+# (see activity/client/src/types.ts's EnrollmentPlayer.signup_status comment). Also deliberately
+# excludes 'auto_confirmed' (plans/cwl-personal-hub.md Phase 4) — that status means "a standing
+# opt-in preference seeded this", and an admin setting it by hand would assert a preference the
+# member never actually expressed; the three statuses below remain the complete admin-settable set.
 ADMIN_SETTABLE_ENROLLMENT_STATUSES: Tuple[str, ...] = ("confirmed", "declined", "pending")
 
 

@@ -934,6 +934,7 @@
       "signup_status_unlinked": "Unlinked accounts",
       "signup_status_confirmed": "Confirmed",
       "signup_status_declined": "Declined",
+      "signup_status_auto_confirmed": "Auto-Confirmed",
       "signup_status_missing_dm": "New players without DM invitation",
       "signups_block_title": "Sign-Ups",
       "button_configure_clans": "Configure Participating Clans",

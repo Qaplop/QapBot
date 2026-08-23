@@ -4350,10 +4350,12 @@ class WarHistoryDB:
                 return []
 
     def get_cwl_signup_status_counts_sync(self, event_id: int) -> Dict[str, int]:
-        """Return {status: count} for an event's cwl_signups (pending/confirmed/declined —
-        'withdrawn' is legacy-only, no longer written anywhere, see
+        """Return {status: count} for an event's cwl_signups (pending/confirmed/declined/
+        auto_confirmed — 'withdrawn' is legacy-only, no longer written anywhere, see
         ADMIN_SETTABLE_ENROLLMENT_STATUSES's comment in web_bridge.py) — statuses with zero rows
-        are simply absent from the dict, not zero-filled."""
+        are simply absent from the dict, not zero-filled. No code change needed here for
+        'auto_confirmed' (plans/cwl-personal-hub.md Phase 4a) — GROUP BY status already returns
+        whatever distinct values exist."""
         import sqlite3
 
         if not self.db_path:

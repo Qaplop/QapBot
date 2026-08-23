@@ -36,14 +36,22 @@ async def _seed(db: WarHistoryDB, guild_id: str, clan_tag: str) -> int:
     return event_id
 
 
-async def _link(db: WarHistoryDB, discord_id: str, player_tag: str, clan_tag=None) -> None:
+async def _link(
+    db: WarHistoryDB, discord_id: str, player_tag: str, clan_tag=None,
+    cwl_permanent_optout: bool = False, cwl_permanent_optin: bool = False,
+) -> None:
     await db.conn.execute(
         "INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id)
     )
     await db.conn.execute(
-        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
-        "VALUES (?, ?, ?, 0, ?)",
-        (discord_id, player_tag, "Player", clan_tag),
+        "INSERT INTO user_players "
+        "(discord_id, player_tag, player_name, verified, current_clan_tag, "
+        " cwl_permanent_optout, cwl_permanent_optin) "
+        "VALUES (?, ?, ?, 0, ?, ?, ?)",
+        (
+            discord_id, player_tag, "Player", clan_tag,
+            1 if cwl_permanent_optout else 0, 1 if cwl_permanent_optin else 0,
+        ),
     )
     await db.conn.commit()
 
@@ -79,6 +87,62 @@ class TestNewSignupsAdoptTheGlobalResponse:
             "#LASTSEASON", "2026-08", "Old", "owner1", "declined", "2026-08-01T10:00Z", 1, "900",
         )
         assert cwl._seed_status_from_global_sync(db, "#LASTSEASON", "2026-09") == "pending"
+
+    @pytest.mark.asyncio
+    async def test_seed_helper_honours_permanent_optout(self, db):
+        """2026-08-23 follow-up audit (plans/cwl-personal-hub.md Phase 4b-bis): this helper used
+        to ignore the standing CWL opt-out/opt-in preference entirely, so a drag-and-drop
+        placement or guest invite for a permanently-opted-out player produced a stray 'pending'
+        row that never became 'declined' — silently contradicting the very preference this
+        feature exists to honour. No existing_global response here, so opt-out alone decides."""
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        await _link(db, "owner1", "#OPTEDOUT", cwl_permanent_optout=True)
+        assert cwl._seed_status_from_global_sync(db, "#OPTEDOUT", "2026-09") == "declined"
+
+    @pytest.mark.asyncio
+    async def test_seed_helper_honours_permanent_optin(self, db):
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        await _link(db, "owner1", "#OPTEDIN", cwl_permanent_optin=True)
+        assert cwl._seed_status_from_global_sync(db, "#OPTEDIN", "2026-09") == "auto_confirmed"
+
+    @pytest.mark.asyncio
+    async def test_seed_helper_existing_global_response_beats_optin(self, db):
+        """rule h still wins — a real answer already given for this season is never overridden by
+        a standing preference, even via this single-player helper."""
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        await _link(db, "owner1", "#BOTH", cwl_permanent_optin=True)
+        db.set_cwl_player_response_status_sync(
+            "#BOTH", "2026-09", "Both", "owner1", "declined", "2026-09-01T10:00Z", 1, "900",
+        )
+        assert cwl._seed_status_from_global_sync(db, "#BOTH", "2026-09") == "declined"
+
+    @pytest.mark.asyncio
+    async def test_seed_helper_no_user_players_row_defaults_to_pending(self, db):
+        """A player_tag with no linked account at all (never in user_players) has no preference
+        to honour — same 'pending' default as before this feature existed."""
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        assert cwl._seed_status_from_global_sync(db, "#NEVERLINKED", "2026-09") == "pending"
+
+    @pytest.mark.asyncio
+    async def test_placement_of_an_opted_out_player_creates_a_declined_signup(self, db, monkeypatch):
+        """End-to-end through assign_cwl_player_sync's real drag-and-drop path (not just the
+        helper in isolation) — an admin placing a permanently-opted-out player must not leave
+        them showing as 'pending' on the board."""
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "911", "#CLANI")
+        CACHE.db_manager = db
+        monkeypatch.setattr(cwl, "resolve_guild_member_clan_tags", lambda *a, **k: ["#CLANI"])
+        await _link(db, "owner1", "#OPTEDOUTPLACED", cwl_permanent_optout=True)
+
+        cwl.assign_cwl_player_sync(911, event_id, "2026-09", "#OPTEDOUTPLACED", "#CLANI", source="admin")
+
+        assert db.get_cwl_signup_sync(event_id, "#OPTEDOUTPLACED")["status"] == "declined"
 
     @pytest.mark.asyncio
     async def test_placement_creates_a_signup_carrying_the_global_response(self, db, monkeypatch):
@@ -236,6 +300,7 @@ class TestDmTargetingUsesLiveOwner:
             "player_tag": "#BOTH", "player_name": "Both", "clan_tag": "#CLANC",
             "discord_id": "liveowner", "verified": False, "cwl_permanent_optout": False,
             "preferred_league_rank": None, "th_level": 15,
+            "cwl_permanent_optin": False, "cwl_optout_send_dm_anyway": False,
         }]
 
         result = cwl.resolve_cwl_pool_dm_targets_sync(903, event_id, "2026-09", preloaded_members=members)
@@ -261,6 +326,101 @@ class TestDmTargetingUsesLiveOwner:
 
         targets = {t["player_tag"]: t["discord_id"] for t in result["targets"]}
         assert targets["#GUEST"] == "guestowner"
+
+
+class TestDmTargetingHonoursCwlPreferences:
+    """plans/cwl-personal-hub.md Phase 4c: resolve_cwl_pool_dm_targets_sync's opt-out handling
+    gains a second flag (cwl_optout_send_dm_anyway) and a second output list (optout_no_dm), on
+    top of its pre-existing cwl_permanent_optout skip. Covers both pool sources that can carry
+    the flags — the live `members` scan (source 1) and the get_player_links_sync fallback for
+    tags `members` structurally can't see (guest/shared-clan sources 2/3)."""
+
+    @pytest.mark.asyncio
+    async def test_optout_without_dm_anyway_is_skipped_and_recorded_in_optout_no_dm(self, db, monkeypatch):
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "905", "#CLANE")
+        CACHE.db_manager = db
+        monkeypatch.setattr(cwl, "resolve_cwl_pool_clan_tags_sync", lambda *a, **k: ["#CLANE"])
+        members = [{
+            "player_tag": "#OUT", "player_name": "Out", "clan_tag": "#CLANE",
+            "discord_id": "d1", "verified": True, "cwl_permanent_optout": True,
+            "preferred_league_rank": None, "th_level": None,
+            "cwl_permanent_optin": False, "cwl_optout_send_dm_anyway": False,
+        }]
+
+        result = cwl.resolve_cwl_pool_dm_targets_sync(905, event_id, "2026-09", preloaded_members=members)
+
+        assert [t["player_tag"] for t in result["targets"]] == []
+        assert result["skipped_optout"] == 1
+        assert [e["player_tag"] for e in result["optout_no_dm"]] == ["#OUT"]
+
+    @pytest.mark.asyncio
+    async def test_optout_with_dm_anyway_is_still_a_dm_target(self, db, monkeypatch):
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "906", "#CLANF")
+        CACHE.db_manager = db
+        monkeypatch.setattr(cwl, "resolve_cwl_pool_clan_tags_sync", lambda *a, **k: ["#CLANF"])
+        members = [{
+            "player_tag": "#OUTBUTDM", "player_name": "OutButDM", "clan_tag": "#CLANF",
+            "discord_id": "d1", "verified": True, "cwl_permanent_optout": True,
+            "preferred_league_rank": None, "th_level": None,
+            "cwl_permanent_optin": False, "cwl_optout_send_dm_anyway": True,
+        }]
+
+        result = cwl.resolve_cwl_pool_dm_targets_sync(906, event_id, "2026-09", preloaded_members=members)
+
+        assert [t["player_tag"] for t in result["targets"]] == ["#OUTBUTDM"]
+        assert result["skipped_optout"] == 0
+        # Still recorded — a 'declined' row is owed regardless of whether the DM goes out.
+        assert [e["player_tag"] for e in result["optout_no_dm"]] == ["#OUTBUTDM"]
+
+    @pytest.mark.asyncio
+    async def test_optin_member_is_a_plain_dm_target_no_special_handling(self, db, monkeypatch):
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "913", "#CLANK")
+        CACHE.db_manager = db
+        monkeypatch.setattr(cwl, "resolve_cwl_pool_clan_tags_sync", lambda *a, **k: ["#CLANK"])
+        members = [{
+            "player_tag": "#IN", "player_name": "In", "clan_tag": "#CLANK",
+            "discord_id": "d1", "verified": True, "cwl_permanent_optout": False,
+            "preferred_league_rank": None, "th_level": None,
+            "cwl_permanent_optin": True, "cwl_optout_send_dm_anyway": False,
+        }]
+
+        result = cwl.resolve_cwl_pool_dm_targets_sync(913, event_id, "2026-09", preloaded_members=members)
+
+        assert [t["player_tag"] for t in result["targets"]] == ["#IN"]
+        assert result["skipped_optout"] == 0
+        assert result["optout_no_dm"] == []
+
+    @pytest.mark.asyncio
+    async def test_optout_reached_only_via_the_link_fallback_source_is_still_skipped(self, db, monkeypatch):
+        """A guest/shared-clan entry (pool sources 2/3) has no row in `members` at all — its
+        opt-out flag can only ever be resolved via the get_player_links_sync fallback merge. This
+        is the exact gap Phase 4b-bis closes: without it, an opted-out guest player skipped from
+        the DM would never get a cwl_signups row from ANY seed site."""
+        from qapbot.cache_manager import CACHE
+        import qapbot.QBdiscocmdshelper_cwl as cwl
+
+        event_id = await _seed(db, "914", "#CLANL")
+        CACHE.db_manager = db
+        monkeypatch.setattr(cwl, "resolve_cwl_pool_clan_tags_sync", lambda *a, **k: ["#CLANL"])
+        # Individually-invited guest: a cwl_signups row with no clan membership at all, so
+        # `members` (clan-scoped) structurally never sees it — only the link-fallback merge does.
+        db.upsert_cwl_signup_sync(event_id, "#GUESTOUT", "GuestOut", "d1", None, "guest_invite", "pending")
+        await _link(db, "d1", "#GUESTOUT", clan_tag=None, cwl_permanent_optout=True)
+
+        result = cwl.resolve_cwl_pool_dm_targets_sync(914, event_id, "2026-09", preloaded_members=[])
+
+        assert [t["player_tag"] for t in result["targets"]] == []
+        assert result["skipped_optout"] == 1
+        assert [e["player_tag"] for e in result["optout_no_dm"]] == ["#GUESTOUT"]
 
 
 class TestDmBatchSeedsSignupRows:

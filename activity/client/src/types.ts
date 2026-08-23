@@ -69,14 +69,18 @@ export type EnrollmentPlayer = {
   // that cache for any reason (2026-08-22, live-testing feedback: the tooltip showed a bare
   // "Linked" with no way to tell who — see enrollmentBoard.ts's buildTooltip).
   discord_display_name: string | null
-  // The board only ever displays pending/confirmed/declined — the true statuses a member's own
-  // DM response can produce. 'withdrawn' is legacy-only (2026-08-19: its one writer, the board's
-  // now-removed 1-click admin confirm/withdraw control and its POST /api/cwl/enrollment/signup
-  // endpoint, was deleted outright — dead code with no real caller, per CWL_ROSTER_PLANNING_
-  // PLAN.md's own "known cleanup opportunity" note) — kept in the type purely so any pre-existing
-  // DB row still carrying it renders without crashing; the board treats it the same as
-  // null/unknown rather than giving it its own icon — see enrollmentBoard.ts's isVisibleStatus().
-  signup_status: 'pending' | 'confirmed' | 'declined' | 'withdrawn' | null
+  // The board only ever displays pending/confirmed/declined/auto_confirmed — the true statuses a
+  // member's own DM response can produce, plus 'auto_confirmed' (2026-08-23, plans/
+  // cwl-personal-hub.md Phase 4a): seeded automatically by a standing opt-in preference at Start
+  // Enrollment, never written by an admin action or a member's own click — a real DM response
+  // always overwrites it with 'confirmed'/'declined'. 'withdrawn' is legacy-only (2026-08-19: its
+  // one writer, the board's now-removed 1-click admin confirm/withdraw control and its POST
+  // /api/cwl/enrollment/signup endpoint, was deleted outright — dead code with no real caller,
+  // per CWL_ROSTER_PLANNING_PLAN.md's own "known cleanup opportunity" note) — kept in the type
+  // purely so any pre-existing DB row still carrying it renders without crashing; the board
+  // treats it the same as null/unknown rather than giving it its own icon — see
+  // enrollmentBoard.ts's isVisibleStatus().
+  signup_status: 'pending' | 'confirmed' | 'declined' | 'auto_confirmed' | 'withdrawn' | null
   assigned_clan_tag: string | null
   th_level: number | null
   th_icon_url: string | null
