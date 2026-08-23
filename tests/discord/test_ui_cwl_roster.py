@@ -2899,3 +2899,46 @@ async def test_launch_cwl_activity_fallback_uses_player_hub_key_for_player_prefs
     mock_interaction.response.send_message.assert_awaited_once()
     args, _ = mock_interaction.response.send_message.call_args
     assert "CWL preferences" in args[0]
+
+
+# ---------------------------------------------------------------------------
+# /cwl preferences slash command — plans/cwl-personal-hub.md Phase 5a-bis, the second entry
+# point into the same player_prefs Activity screen as CwlPlayerHubView's button (above), for
+# guilds that never posted (or disabled) the anchored hub message.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_preferences_command_launches_activity_with_player_prefs_screen(mock_interaction):
+    """No permission gate and no defer/send_message before the LAUNCH_ACTIVITY call, exactly
+    like the CwlPlayerHubView button — this command is just an alternate way to reach the same
+    screen."""
+    from qapbot.cache_manager import CACHE
+    import QBdiscordcmds
+
+    mock_interaction.id = 987654321
+    mock_interaction.token = "test-token"
+    mock_interaction.guild.id = 333444
+    mock_interaction.user.id = 555666
+
+    await QBdiscordcmds.cwl_preferences.callback(mock_interaction)  # type: ignore[arg-type]
+
+    mock_interaction.client.http.request.assert_awaited_once()
+    _, kwargs = mock_interaction.client.http.request.await_args
+    assert kwargs["json"] == {"type": 12, "data": {}}
+    assert CACHE.pending_cwl_activity_screen[("333444", "555666")] == "player_prefs"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_preferences_command_does_nothing_outside_a_guild(mock_interaction):
+    """Guild-only (declared via @app_commands.guild_only()), but the callback body also guards
+    directly since Discord's guild-only enforcement is client-side only for some invocation
+    paths — matches the same defensive pattern as every other guild-scoped CWL callback."""
+    import QBdiscordcmds
+
+    mock_interaction.guild = None
+
+    await QBdiscordcmds.cwl_preferences.callback(mock_interaction)  # type: ignore[arg-type]
+
+    mock_interaction.client.http.request.assert_not_awaited()

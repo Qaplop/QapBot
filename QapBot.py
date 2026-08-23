@@ -2785,6 +2785,7 @@ async def _setup_hook():
     COMMAND_GROUPS = [
         QBdiscordcmds.clan_group,
         QBdiscordcmds.analyse_group,
+        QBdiscordcmds.cwl_group,
     ]
     
     # Context menu commands

@@ -1060,6 +1060,7 @@ def _get_help_command_dm_status() -> Dict[str, bool]:
         "analyse cwl_league_group": analyse_leaguegroup.guild_only,
         "analyse cwl_opponent": analyse_cwlopponent.guild_only,
         "clan management": clan_management.guild_only,
+        "cwl preferences": cwl_preferences.guild_only,
         "admin": admin.guild_only,
         "list": list.guild_only,
         "whois": whois_slash.guild_only,
@@ -1097,7 +1098,7 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
     # trips static-analysis "constant redefinition" warnings for a completely legal reassignment.
     available_commands = [
         "subscribe", "unsubscribe", "subscriptions", "leaderboard", "highlightme", "analyse cwl_league_group",
-        "analyse cwl_opponent", "clan management", "admin", "list", "whois", "ping", "status", "help"
+        "analyse cwl_opponent", "clan management", "cwl preferences", "admin", "list", "whois", "ping", "status", "help"
     ]
     if CONFIG.tracker_enabled:
         available_commands += ["bug", "feature"]
@@ -1180,7 +1181,7 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
     # Organize commands by category (reorganized per user request)
     categories = {
         t('commands.help.category_leaderboards', user_id=user_id, guild_id=guild_id): ["subscribe", "unsubscribe", "subscriptions", "leaderboard", "highlightme"],
-        t('commands.help.category_clan_player_info', user_id=user_id, guild_id=guild_id): ["analyse cwl_league_group", "analyse cwl_opponent", "whois"],
+        t('commands.help.category_clan_player_info', user_id=user_id, guild_id=guild_id): ["analyse cwl_league_group", "analyse cwl_opponent", "whois", "cwl preferences"],
         t('commands.help.category_administration', user_id=user_id, guild_id=guild_id): ["clan management", "admin", "list"],
         t('commands.help.category_bot_info', user_id=user_id, guild_id=guild_id): ["ping", "status", "help"],
     }
@@ -1207,6 +1208,8 @@ async def help(interaction: discord.Interaction, command: Optional[str] = None):
             cmd_key = cmd
             if cmd == "clan management":
                 cmd_key = "clan"
+            elif cmd == "cwl preferences":
+                cmd_key = "cwl"
             elif cmd in ("analyse cwl_league_group", "analyse cwl_opponent"):
                 cmd_key = "analyse"
             
@@ -1229,7 +1232,7 @@ async def help_command_autocomplete(interaction: discord.Interaction, current: s
     invoked from a DM (see _get_help_command_dm_status())."""
     commands_list = [
         "subscribe", "unsubscribe", "subscriptions", "leaderboard", "highlightme", "analyse cwl_league_group",
-        "analyse cwl_opponent", "clan management", "admin", "list", "whois", "ping", "status", "help"
+        "analyse cwl_opponent", "clan management", "cwl preferences", "admin", "list", "whois", "ping", "status", "help"
     ]
     if interaction.guild is None:
         dm_status = _get_help_command_dm_status()
@@ -3398,6 +3401,39 @@ async def analyse_cwlopponent_clan_autocomplete(interaction: discord.Interaction
     from qapbot.QBdiscocmdshelper import get_dm_caller_matched_guild_ids
     guild_ids = [str(g) for g in get_dm_caller_matched_guild_ids(str(interaction.user.id))]
     return await get_clan_family_autocomplete_choices(current, guild_ids=guild_ids, mode="guild_first")
+
+
+# =============================================================================
+# /cwl command group
+# =============================================================================
+
+cwl_group = app_commands.Group(name="cwl", description=dev_mode+"Personal CWL commands")
+
+
+@cwl_group.command(name="preferences", description=dev_mode+"View and change your personal CWL settings.")
+@app_commands.guild_only()
+async def cwl_preferences(interaction: discord.Interaction) -> None:
+    """Second entry point into the Player CWL Settings Hub's Activity screen
+    (plans/cwl-personal-hub.md Phase 5a-bis) — reachable even when a guild has the anchored hub
+    message (CwlPlayerHubView) disabled or never configured, since that's the entire reason this
+    command exists. A new `/cwl` group rather than a flat command: leaves room for the other
+    member-facing CWL commands CWL_ROSTER_PLANNING_PLAN.md originally sketched (e.g. a future
+    `/cwl signup`) without a second rename later.
+
+    Deliberately NOT gated on cwl_player_hub_message_enabled, and NOT permission-gated at all —
+    this screen is for every member, same as CwlPlayerHubView's own button. @guild_only() is the
+    only gate: the callback needs a real guild_id to resolve the season/language.
+
+    Must NOT defer()/send_message() before _launch_cwl_activity() — LAUNCH_ACTIVITY (type 12)
+    has to be this interaction's very first response, per that function's own hard-constraint
+    docstring (ui_cwl_roster.py) — a slash-command interaction is subject to the exact same rule
+    every component-click caller of it already follows.
+    """
+    from qapbot.ui_cwl_roster import _launch_cwl_activity
+
+    if interaction.guild is None:
+        return
+    await _launch_cwl_activity(interaction, interaction.guild.id, "player_prefs")
 
 
 @app_commands.command(name="subscriptions", description=dev_mode+"Lists clan and family subscriptions for the current channel or entire discord server.")

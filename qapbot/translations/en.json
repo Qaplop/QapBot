@@ -233,6 +233,11 @@
         "title": "👥 Clan Management Command",
         "detailed": "Open the interactive clan management panel. Displays all clan members with their TH level and Discord linking status. A clan selector dropdown lets you switch between all clans subscribed to this server. The view auto-selects the most active clan.\n\n**Usage:**\n`/clan management`\n\n**Modes (selectable via dropdown):**\n• ⚙️ Basic Configuration — Server language, war notification channel, and bot settings\n• 🔗 Manage Registrations — Shows all clan members with verified/registered/unregistered status; Link Accounts button opens a paginated flow to link unlinked players to Discord users\n• ⚔️ Manage War Notifications — Configure per-player war attack notification settings (whole clan or single user)\n• 🎭 Manage Server Roles — Enable/disable auto-role system, configure CoC roles and clan roles\n• 🏰 Manage Clan Families — Create, edit, and delete clan families; manage member clan assignments\n\n**Notes:**\n• Only server administrators can interact with the buttons and dropdowns\n• The view is posted publicly (non-ephemeral) and replaces any previous clan management message in the channel\n• View expires after 30 minutes and the message is automatically deleted"
       },
+      "cwl preferences": {
+        "short": "Set your personal CWL opt-in/opt-out and league preferences",
+        "title": "🛡️ CWL Preferences Command",
+        "detailed": "Opens your personal CWL preferences screen — set whether you want to always play CWL, never play, or decide fresh each season, plus a preferred league tier. Applies to every one of your linked Clash accounts individually, and to every server that invites you, not just this one.\n\n**Usage:**\n`/cwl preferences`\n\n**Notes:**\n• Works even if this server hasn't set up its Player CWL Settings Hub message — this command is always available\n• A standing choice can still be overridden for any single season, either here or from that season's own invitation DM"
+      },
       "admin": {
         "short": "Administrative actions and utilities",
         "title": "⚙️ Admin Command",
