@@ -2811,6 +2811,15 @@ def _track_cwl_management_channel_change(guild_id_str: str, old_channel_id: Opti
         logging.debug(f"CWL Management Hub channel change tracked during apply: old={old_channel_id}, new={new_channel_id}")
 
 
+def _track_cwl_player_hub_channel_change(guild_id_str: str, old_channel_id: Optional[str], new_channel_id: Optional[str]) -> None:
+    """Record the previous Player CWL Settings Hub channel so the next
+    repost_cwl_player_hub_messages() cycle can clean up the old message — same pattern as the
+    admin CWL Management Hub's own tracking (plans/cwl-personal-hub.md Phase 2a)."""
+    if old_channel_id and new_channel_id and old_channel_id != new_channel_id:
+        CACHE.server_config[guild_id_str]["_old_cwl_player_hub_channel_id"] = old_channel_id
+        logging.debug(f"Player CWL Settings Hub channel change tracked during apply: old={old_channel_id}, new={new_channel_id}")
+
+
 DEFAULT_CHANNEL_SLOTS: Tuple[ChannelSlotConfig, ...] = (
     ChannelSlotConfig(
         key="registration",
@@ -2832,6 +2841,13 @@ DEFAULT_CHANNEL_SLOTS: Tuple[ChannelSlotConfig, ...] = (
         disable_flag_keys=("cwl_management_message_enabled",),
         on_apply=_track_cwl_management_channel_change,
     ),
+    ChannelSlotConfig(
+        key="cwl_player_hub",
+        label="Player CWL Settings Hub",
+        config_key="cwl_player_hub_channel_id",
+        disable_flag_keys=("cwl_player_hub_message_enabled",),
+        on_apply=_track_cwl_player_hub_channel_change,
+    ),
 )
 
 # Context-scoped subsets of DEFAULT_CHANNEL_SLOTS: the basic "config" mode's "Configure
@@ -2843,7 +2859,7 @@ BASIC_CONFIG_CHANNEL_SLOTS: Tuple[ChannelSlotConfig, ...] = tuple(
     slot for slot in DEFAULT_CHANNEL_SLOTS if slot.key in ("registration", "war")
 )
 CWL_CONFIG_CHANNEL_SLOTS: Tuple[ChannelSlotConfig, ...] = tuple(
-    slot for slot in DEFAULT_CHANNEL_SLOTS if slot.key in ("cwl_management",)
+    slot for slot in DEFAULT_CHANNEL_SLOTS if slot.key in ("cwl_management", "cwl_player_hub")
 )
 
 

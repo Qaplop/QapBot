@@ -324,6 +324,35 @@ async def format_clan_management_cwl_settings(
         f"{t('cwl.settings.hub_channel', guild_id=guild_id_int, channel=channel_display)}"
     )
 
+    # Player CWL Settings Hub (plans/cwl-personal-hub.md Phase 2c) — same "Status/Channel" shape
+    # as hub_block above, reading the cwl_player_hub_* config keys instead.
+    player_hub_channel_id = guild_config.get("cwl_player_hub_channel_id")
+    player_hub_enabled = guild_config.get("cwl_player_hub_message_enabled", False)
+
+    if player_hub_channel_id:
+        try:
+            player_hub_channel = guild.get_channel(int(player_hub_channel_id))
+            player_hub_channel_display = (
+                f"<#{player_hub_channel_id}>" if player_hub_channel
+                else f"❌ {t('cwl.settings.channel_not_set', guild_id=guild_id_int)}"
+            )
+        except Exception:
+            player_hub_channel_display = f"❌ {t('cwl.settings.channel_not_set', guild_id=guild_id_int)}"
+    else:
+        player_hub_channel_display = f"❌ {t('cwl.settings.channel_not_set', guild_id=guild_id_int)}"
+
+    player_hub_status_emoji = "🟢" if player_hub_enabled else "🔴"
+    player_hub_status_text = (
+        t('cwl.settings.status_enabled', guild_id=guild_id_int)
+        if player_hub_enabled
+        else t('cwl.settings.status_disabled', guild_id=guild_id_int)
+    )
+    player_hub_block = (
+        f"⠀\n**{t('cwl.settings.player_hub_block_title', guild_id=guild_id_int)}**\n"
+        f"{t('cwl.settings.player_hub_status', guild_id=guild_id_int, status=f'{player_hub_status_emoji} {player_hub_status_text}')}\n"
+        f"{t('cwl.settings.player_hub_channel', guild_id=guild_id_int, channel=player_hub_channel_display)}"
+    )
+
     retention_display = (
         t('cwl.settings.retention_never', guild_id=guild_id_int)
         if not retention_months
@@ -358,6 +387,7 @@ async def format_clan_management_cwl_settings(
         color=discord.Color.gold(),
     )
     embed.add_field(name="", value=hub_block, inline=False)
+    embed.add_field(name="", value=player_hub_block, inline=False)
     embed.add_field(name="", value=retention_block, inline=False)
     embed.add_field(name="", value=enrollment_pool_block, inline=False)
 

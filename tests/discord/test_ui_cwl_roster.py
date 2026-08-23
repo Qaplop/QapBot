@@ -228,8 +228,95 @@ def test_clan_management_view_cwl_settings_mode_constructs_without_row_conflict(
         sent_message=sent_message, mode="cwl_settings", timeout=300,
     )
 
-    # mode select + refresh + channel/hub-toggle/retention/include-all-accounts-toggle buttons
-    assert len(view.children) == 6
+    # mode select + refresh + channel/hub-toggle/player-hub-toggle/retention/
+    # include-all-accounts-toggle buttons
+    assert len(view.children) == 7
+
+
+@pytest.mark.discord
+def test_player_hub_toggle_button_present_disabled_state():
+    """plans/cwl-personal-hub.md Phase 2b — presence/label/style when the Player CWL Settings
+    Hub is currently disabled (the default for every guild)."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_settings_components
+
+    CACHE.server_config["557"] = {"cwl_player_hub_message_enabled": False}
+    view = discord.ui.View(timeout=None)
+
+    add_cwl_settings_components(view, 557)
+
+    button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_player_hub")
+    assert button.label == "Activate Player CWL Settings Hub Message"
+    assert button.style == discord.ButtonStyle.secondary
+
+
+@pytest.mark.discord
+def test_player_hub_toggle_button_present_enabled_state():
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_settings_components
+
+    CACHE.server_config["558"] = {"cwl_player_hub_message_enabled": True}
+    view = discord.ui.View(timeout=None)
+
+    add_cwl_settings_components(view, 558)
+
+    button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_player_hub")
+    assert button.label == "Deactivate Player CWL Settings Hub Message"
+    assert button.style == discord.ButtonStyle.success
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_hub_toggle_guards_when_no_channel_set(db, mock_interaction):
+    """Attempting to enable with no channel configured yet must not flip the flag — same guard
+    the admin hub toggle already has."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_settings_components
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {}  # no cwl_player_hub_channel_id
+    mock_interaction.response.defer = AsyncMock()
+    mock_interaction.followup.send = AsyncMock()
+
+    view = discord.ui.View(timeout=None)
+    add_cwl_settings_components(view, mock_interaction.guild.id)
+    button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_player_hub")
+
+    await button.callback(mock_interaction)
+
+    assert CACHE.server_config[guild_id_str].get("cwl_player_hub_message_enabled", False) is False
+    mock_interaction.followup.send.assert_awaited_once()
+    args, kwargs = mock_interaction.followup.send.call_args
+    assert "Player CWL Settings Hub channel" in args[0]
+    assert kwargs.get("ephemeral") is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_hub_toggle_flips_flag_and_persists_when_channel_set(db, mock_interaction, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_settings_components
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {"cwl_player_hub_channel_id": "999888777"}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    mock_interaction.response.defer = AsyncMock()
+
+    # repost_cwl_player_hub_messages doesn't exist until Phase 3 lands later in this same run;
+    # the toggle callback already tolerates that import failing (try/except, logs a warning) —
+    # this test only asserts the flag flip + persistence, not the repost side effect.
+    view = discord.ui.View(timeout=None)
+    add_cwl_settings_components(view, mock_interaction.guild.id)
+    button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_player_hub")
+
+    await button.callback(mock_interaction)
+
+    assert CACHE.server_config[guild_id_str]["cwl_player_hub_message_enabled"] is True
+    persisted = await db.get_guild_config(guild_id_str)
+    assert persisted["cwl_player_hub_message_enabled"] is True
 
 
 @pytest.mark.discord
@@ -290,6 +377,36 @@ def test_cwl_management_channel_slot_registered():
 
 
 @pytest.mark.discord
+def test_cwl_player_hub_channel_slot_registered():
+    """plans/cwl-personal-hub.md Phase 2a — the "Configure Channels" button on the cwl_settings
+    screen needs zero new select/button/handler code for a new slot, per ChannelSlotConfig's own
+    docstring guarantee; this is the data-only change that adds it."""
+    from qapbot.ui_clan_management import CWL_CONFIG_CHANNEL_SLOTS, DEFAULT_CHANNEL_SLOTS
+
+    slot = next((s for s in DEFAULT_CHANNEL_SLOTS if s.key == "cwl_player_hub"), None)
+    assert slot is not None
+    assert slot.config_key == "cwl_player_hub_channel_id"
+    assert slot.disable_flag_keys == ("cwl_player_hub_message_enabled",)
+
+    # Both CWL hub slots must be offered together on the cwl_settings screen's "Configure
+    # Channels" button — this is what makes the second channel-select row appear automatically.
+    assert {s.key for s in CWL_CONFIG_CHANNEL_SLOTS} == {"cwl_management", "cwl_player_hub"}
+
+
+@pytest.mark.discord
+def test_cwl_player_hub_channel_change_is_tracked():
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_clan_management import _track_cwl_player_hub_channel_change
+
+    guild_id_str = "888"
+    CACHE.server_config[guild_id_str] = {}
+
+    _track_cwl_player_hub_channel_change(guild_id_str, "111", "222")
+
+    assert CACHE.server_config[guild_id_str]["_old_cwl_player_hub_channel_id"] == "111"
+
+
+@pytest.mark.discord
 @pytest.mark.asyncio
 async def test_channel_configuration_view_apply_refreshes_hub_and_closes_ephemeral(db, mock_interaction):
     """Regression guard: ChannelConfigurationView opened from the CWL Management Hub (entry
@@ -338,7 +455,7 @@ def test_cwl_management_hub_view_constructs_with_toggle_buttons():
     view = CwlManagementHubView()
     assert len(view.children) == 3
     custom_ids = {c.custom_id for c in view.children}  # type: ignore[attr-defined]
-    assert custom_ids == {"cwl_hub_mode_settings", "cwl_hub_mode_management", "cwl_hub_refresh"}
+    assert custom_ids == {"cwl_admin_hub_mode_settings", "cwl_admin_hub_mode_management", "cwl_admin_hub_refresh"}
 
 
 @pytest.mark.discord
@@ -377,7 +494,7 @@ async def test_cwl_management_hub_view_refresh_button_rerenders_current_mode(mon
 
     view = CwlManagementHubView()
     view._render = AsyncMock()  # type: ignore[method-assign]
-    refresh_button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_hub_refresh")
+    refresh_button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_admin_hub_refresh")
 
     await refresh_button.callback(interaction)  # type: ignore[misc]
 

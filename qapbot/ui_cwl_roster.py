@@ -74,6 +74,22 @@ def add_cwl_settings_components(view: discord.ui.View, guild_id: int) -> None:
     toggle_button.callback = _make_cwl_settings_toggle_callback(view)  # type: ignore[assignment]
     view.add_item(toggle_button)  # type: ignore[arg-type]
 
+    # Player CWL Settings Hub toggle (plans/cwl-personal-hub.md Phase 2b) — same row, same
+    # simple activate/deactivate-button pattern as the admin hub toggle just above.
+    player_hub_enabled = bool(guild_config.get("cwl_player_hub_message_enabled", False))
+    player_hub_toggle_button = discord.ui.Button(
+        label=(
+            t('cwl.settings.button_deactivate_player_hub', guild_id=guild_id)
+            if player_hub_enabled
+            else t('cwl.settings.button_activate_player_hub', guild_id=guild_id)
+        ),
+        style=discord.ButtonStyle.success if player_hub_enabled else discord.ButtonStyle.secondary,
+        custom_id="cwl_settings_toggle_player_hub",
+        row=1,
+    )
+    player_hub_toggle_button.callback = _make_cwl_settings_toggle_player_hub_callback(view)  # type: ignore[assignment]
+    view.add_item(player_hub_toggle_button)  # type: ignore[arg-type]
+
     retention_button: discord.ui.Button[Any] = discord.ui.Button(
         label=t('cwl.settings.button_configure_retention', guild_id=guild_id),
         style=discord.ButtonStyle.secondary,
@@ -173,6 +189,46 @@ def _make_cwl_settings_toggle_callback(view: discord.ui.View):
             QBcore.spawn_tracked("repost-cwl-management-msg", repost_cwl_management_messages(only_if_not_bottom=False))
         except Exception as e:
             logging.warning(f"Could not update CWL Management Hub message immediately: {e}")
+
+        await _refresh_parent(view, interaction, "cwl_settings")
+
+    return callback
+
+
+def _make_cwl_settings_toggle_player_hub_callback(view: discord.ui.View):
+    """Structural copy of _make_cwl_settings_toggle_callback above, for the Player CWL Settings
+    Hub instead of the admin CWL Management Hub (plans/cwl-personal-hub.md Phase 2b)."""
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        if not interaction.guild:
+            return
+        from qapbot.i18n import t
+
+        guild_id_str = str(interaction.guild.id)
+        guild_id_int = interaction.guild.id
+        config = CACHE.server_config.setdefault(guild_id_str, {})
+        currently_enabled = bool(config.get("cwl_player_hub_message_enabled", False))
+
+        if not currently_enabled and not config.get("cwl_player_hub_channel_id"):
+            await interaction.followup.send(
+                t('cwl.settings.no_player_hub_channel_set', guild_id=guild_id_int),
+                ephemeral=True,
+            )
+            return
+
+        config["cwl_player_hub_message_enabled"] = not currently_enabled
+        await CACHE.persist_server_config(guild_id_str)
+
+        # Post/delete the anchored Hub message immediately rather than waiting for the
+        # next periodic cycle or bot restart — mirrors the admin hub toggle just above.
+        try:
+            from QapBot import repost_cwl_player_hub_messages
+            import QBcore
+            QBcore.spawn_tracked("repost-cwl-player-hub-msg", repost_cwl_player_hub_messages(only_if_not_bottom=False))
+        except Exception as e:
+            logging.warning(f"Could not update Player CWL Settings Hub message immediately: {e}")
 
         await _refresh_parent(view, interaction, "cwl_settings")
 
@@ -2016,6 +2072,21 @@ class CwlManagementHubView(discord.ui.View):
     than trusted from shared state — the exact bug class RegistrationView's own generic
     dispatch instance already had to solve (per-click guild resolution instead of a
     constructor-time guild_id).
+
+    2026-08-23 (plans/cwl-personal-hub.md Phase 2d): this view's three custom_ids were renamed
+    cwl_hub_* -> cwl_admin_hub_* to retire the bare `cwl_hub_*` prefix, which collided with
+    guild_config's OWN (separate, unrelated) cwl_hub_* columns — see the plan's "Naming
+    convention" section. The plan called for a one-time forced-repost repair (a persisted
+    per-guild marker) to fix already-posted messages still carrying the old ids, reasoning that
+    the periodic maintenance repost (`only_if_not_bottom=True`, QapBot.py's `main()`) skips a
+    message already at the bottom of its channel and so could leave it stale indefinitely.
+    That reasoning is correct for the PERIODIC repost, but doesn't apply to the STARTUP one:
+    QapBot.py's on_ready() Step 8b calls `repost_cwl_management_messages()` with no
+    `only_if_not_bottom` argument at all — defaulting to `False`, i.e. an UNCONDITIONAL repost —
+    once per bot process start, which is what actually happens on every real deploy. The rename
+    is therefore already self-healing on the very next restart with no extra repair code; adding
+    one on top would only risk a redundant double-repost in the same startup sequence for no
+    benefit. Verified by reading Step 8b directly, not inferred.
     """
 
     def __init__(self) -> None:
@@ -2026,7 +2097,7 @@ class CwlManagementHubView(discord.ui.View):
         settings_button: discord.ui.Button[Any] = discord.ui.Button(
             label="Settings",
             style=discord.ButtonStyle.primary if active_mode == "cwl_settings" else discord.ButtonStyle.secondary,
-            custom_id="cwl_hub_mode_settings",
+            custom_id="cwl_admin_hub_mode_settings",
             row=0,
         )
         settings_button.callback = self._on_select_settings  # type: ignore[assignment]
@@ -2035,7 +2106,7 @@ class CwlManagementHubView(discord.ui.View):
         management_button: discord.ui.Button[Any] = discord.ui.Button(
             label="Season Management",
             style=discord.ButtonStyle.primary if active_mode == "cwl_management" else discord.ButtonStyle.secondary,
-            custom_id="cwl_hub_mode_management",
+            custom_id="cwl_admin_hub_mode_management",
             row=0,
         )
         management_button.callback = self._on_select_management  # type: ignore[assignment]
@@ -2051,7 +2122,7 @@ class CwlManagementHubView(discord.ui.View):
         refresh_button: discord.ui.Button[Any] = discord.ui.Button(
             label=t('ui_components.clan_management.button_refresh', guild_id=None),
             style=discord.ButtonStyle.secondary,
-            custom_id="cwl_hub_refresh",
+            custom_id="cwl_admin_hub_refresh",
             row=0,
         )
         refresh_button.callback = self._make_refresh_callback(active_mode)  # type: ignore[assignment]
