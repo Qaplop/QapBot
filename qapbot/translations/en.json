@@ -989,6 +989,12 @@
       "remind_pending_error_no_event": "⚠️ No CWL event found for this season anymore — it may have been deleted.",
       "remind_pending_error_not_open": "⚠️ Enrollment hasn't been started yet for this season."
     },
+    "player_hub": {
+      "title": "🛡️ Your CWL Preferences",
+      "description": "Set your personal CWL preferences here — a preferred league tier, and whether you want to always play, never play, or decide fresh each season. These apply to every one of your linked Clash accounts individually, and to every server that invites you, not just this one. A standing choice can still be overridden for any single season from that season's own invitation DM.",
+      "button_preferences": "Your CWL Preferences",
+      "open_fallback": "⚠️ Could not open your CWL preferences directly — try the /cwl preferences command instead."
+    },
     "setup": {
       "button_cancel": "Cancel"
     },

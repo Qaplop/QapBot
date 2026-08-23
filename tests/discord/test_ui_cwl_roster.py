@@ -2804,3 +2804,98 @@ async def test_repaired_signup_row_revives_a_dead_dm_button(db, mock_interaction
     # After: the same click on the same untouched DM now records the response.
     mock_interaction.response.send_message.assert_not_awaited()
     assert db.get_cwl_signup_sync(event_id, "#DEADBTN")["status"] == "declined"
+
+
+# ---------------------------------------------------------------------------
+# CwlPlayerHubView / build_cwl_player_hub_content_and_view — plans/cwl-personal-hub.md
+# Phase 5b, pulled forward into Phase 3 because repost_cwl_player_hub_messages() has a hard
+# import dependency on the content builder (see the plan's own scope-box note for why).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+def test_cwl_player_hub_view_constructs_with_exactly_one_button():
+    from qapbot.ui_cwl_roster import CwlPlayerHubView
+
+    view = CwlPlayerHubView()
+
+    assert len(view.children) == 1
+    button = view.children[0]
+    assert button.custom_id == "cwl_player_hub_open_prefs"
+    assert button.label == "Your CWL Preferences"
+    assert button.style == discord.ButtonStyle.primary
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_player_hub_button_launches_activity_with_player_prefs_screen(mock_interaction):
+    """No permission gate (member-facing, unlike CwlManagementHubView's admin-only toggle
+    buttons) and no defer/send_message before the LAUNCH_ACTIVITY call, per
+    _launch_cwl_activity's own hard constraint."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlPlayerHubView
+
+    mock_interaction.id = 123456789
+    mock_interaction.token = "test-token"
+    mock_interaction.guild.id = 222333
+    mock_interaction.user.id = 444555
+
+    view = CwlPlayerHubView()
+    button = view.children[0]
+
+    await button.callback(mock_interaction)
+
+    mock_interaction.client.http.request.assert_awaited_once()
+    _, kwargs = mock_interaction.client.http.request.await_args
+    assert kwargs["json"] == {"type": 12, "data": {}}
+    assert CACHE.pending_cwl_activity_screen[("222333", "444555")] == "player_prefs"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_player_hub_button_does_nothing_outside_a_guild(mock_interaction):
+    """Guarded the same way every other guild-scoped CWL callback is — a DM-context interaction
+    (interaction.guild is None) must not attempt to resolve a guild_id at all."""
+    from qapbot.ui_cwl_roster import CwlPlayerHubView
+
+    mock_interaction.guild = None
+    view = CwlPlayerHubView()
+    button = view.children[0]
+
+    await button.callback(mock_interaction)
+
+    mock_interaction.client.http.request.assert_not_awaited()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_build_cwl_player_hub_content_and_view_returns_embed_and_view():
+    from qapbot.ui_cwl_roster import CwlPlayerHubView, build_cwl_player_hub_content_and_view
+
+    channel = MagicMock()
+    channel.guild = MagicMock()
+
+    content, view, embed = await build_cwl_player_hub_content_and_view(channel, 999888)
+
+    assert content == ""
+    assert isinstance(view, CwlPlayerHubView)
+    assert embed is not None
+    assert embed.title == "🛡️ Your CWL Preferences"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_launch_cwl_activity_fallback_uses_player_hub_key_for_player_prefs_screen(mock_interaction, monkeypatch):
+    """The dict-based fallback lookup (Phase 5a widening) must pick the new, distinct
+    cwl.player_hub.open_fallback text for this screen, not silently fall back to one of the
+    other two screens' wording."""
+    from qapbot.ui_cwl_roster import _launch_cwl_activity
+
+    mock_interaction.response.send_message = AsyncMock()
+    mock_interaction.response.is_done = MagicMock(return_value=False)
+    mock_interaction.client.http.request = AsyncMock(side_effect=Exception("simulated failure"))
+
+    await _launch_cwl_activity(mock_interaction, 555, "player_prefs")
+
+    mock_interaction.response.send_message.assert_awaited_once()
+    args, _ = mock_interaction.response.send_message.call_args
+    assert "CWL preferences" in args[0]

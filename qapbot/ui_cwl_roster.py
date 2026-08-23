@@ -886,7 +886,14 @@ async def _launch_cwl_activity(interaction: discord.Interaction, guild_id: int, 
         logging.warning(f"[CWL] LAUNCH_ACTIVITY callback failed, falling back to a text hint: {e}")
         if not interaction.response.is_done():
             from qapbot.i18n import t
-            fallback_key = 'cwl.management.open_web_fallback' if screen == "clan_config" else 'cwl.management.open_enrollment_fallback'
+            # Dict lookup rather than a two-way ternary (2026-08-23, plans/cwl-personal-hub.md
+            # Phase 5a) — a third screen ('player_prefs', the Player CWL Settings Hub button)
+            # needs its own fallback text distinct from the other two.
+            fallback_key = {
+                "clan_config": 'cwl.management.open_web_fallback',
+                "enrollment": 'cwl.management.open_enrollment_fallback',
+                "player_prefs": 'cwl.player_hub.open_fallback',
+            }.get(screen, 'cwl.management.open_web_fallback')
             try:
                 await interaction.response.send_message(t(fallback_key, guild_id=guild_id), ephemeral=True)
             except Exception:
@@ -2175,3 +2182,65 @@ class CwlManagementHubView(discord.ui.View):
         if not interaction.guild:
             return
         await refresh_cwl_management_hub_message(interaction.guild.id, mode)
+
+
+# ---------------------------------------------------------------------------
+# Player CWL Settings Hub — anchored message + persistent view (plans/cwl-personal-hub.md
+# Phase 5b, pulled forward into Phase 3: repost_cwl_player_hub_messages() (QapBot.py) has a
+# hard import dependency on build_cwl_player_hub_content_and_view, so this piece must exist
+# before Phase 3 can even import without crashing at every startup/maintenance cycle. Pure
+# Python, no Worker/client involvement — the Activity screen this button launches
+# ('player_prefs') isn't implemented until a later session; see _launch_cwl_activity's
+# docstring for what that means for this button in the meantime.
+# ---------------------------------------------------------------------------
+
+async def build_cwl_player_hub_content_and_view(channel: Any, guild_id_int: int) -> Tuple[str, discord.ui.View, Optional[discord.Embed]]:
+    """The (content, view, embed) callback repost_anchored_message() expects — player-facing
+    counterpart to repost_cwl_management_messages()'s own inline builder (QapBot.py). Static
+    per-guild content (no live per-member data baked in, unlike the admin hub's embed), so
+    unlike CwlManagementHubView this needs no refresh_*_on_mutation companion — nothing a member
+    does in the Activity ever changes this message."""
+    from qapbot.i18n import t
+
+    embed = discord.Embed(
+        title=t('cwl.player_hub.title', guild_id=guild_id_int),
+        description=t('cwl.player_hub.description', guild_id=guild_id_int),
+        color=discord.Color.gold(),
+    )
+    view = CwlPlayerHubView()
+    return "", view, embed
+
+
+class CwlPlayerHubView(discord.ui.View):
+    """Persistent per-guild anchored message, player-facing counterpart to
+    CwlManagementHubView — plans/cwl-personal-hub.md Phase 5b. Holds no per-guild instance state
+    (one instance serves every guild concurrently, the same generic-dispatch constraint
+    CwlManagementHubView documents — "which guild" is always resolved per-click from the
+    interaction, never from constructor-time state). Exactly one button, which launches the
+    'player_prefs' Activity screen.
+
+    No interaction_check() override: the `fully_initialized` gate is applied globally to every
+    discord.ui.View by the monkey-patch in QBcore.py — CwlManagementHubView relies on exactly
+    that and has no override; this view mirrors it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+        from qapbot.i18n import t
+
+        button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.player_hub.button_preferences', guild_id=None),
+            style=discord.ButtonStyle.primary,
+            custom_id="cwl_player_hub_open_prefs",
+        )
+        button.callback = self._on_open_preferences  # type: ignore[assignment]
+        self.add_item(button)
+
+    async def _on_open_preferences(self, interaction: discord.Interaction) -> None:
+        # Deliberately NO permission gate (Phase 5a-bis's own rule, applying here too — this
+        # screen is for every member, not just admins/leaders) and NO defer/send_message before
+        # this — LAUNCH_ACTIVITY (type 12) must be the interaction's very first response, see
+        # _launch_cwl_activity's own hard-constraint docstring.
+        if not interaction.guild:
+            return
+        await _launch_cwl_activity(interaction, interaction.guild.id, "player_prefs")

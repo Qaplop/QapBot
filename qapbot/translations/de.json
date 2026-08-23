@@ -989,6 +989,12 @@
       "remind_pending_error_no_event": "⚠️ Für diese Saison wurde kein CWL-Event mehr gefunden — es wurde möglicherweise gelöscht.",
       "remind_pending_error_not_open": "⚠️ Die Anmeldephase für diese Saison wurde noch nicht gestartet."
     },
+    "player_hub": {
+      "title": "🛡️ Deine CWL-Einstellungen",
+      "description": "Lege hier deine persönlichen CWL-Einstellungen fest — eine bevorzugte Liga-Stufe und ob du immer, nie oder von Saison zu Saison neu entscheiden möchtest, ob du mitspielst. Diese Einstellungen gelten für jeden deiner verknüpften Clash-Accounts einzeln und für jeden Server, der dich einlädt, nicht nur für diesen. Eine dauerhafte Entscheidung kann trotzdem für eine einzelne Saison über die Einladungs-DM dieser Saison überstimmt werden.",
+      "button_preferences": "Deine CWL-Einstellungen",
+      "open_fallback": "⚠️ Deine CWL-Einstellungen konnten nicht direkt geöffnet werden — versuche stattdessen den Befehl /cwl preferences."
+    },
     "setup": {
       "button_cancel": "Abbrechen"
     },

@@ -815,6 +815,7 @@ async def main() -> None:
         logging.info("[NO_COC_API] Skipping clan war updates and leaderboard posts (NO_COC_API=true)")
         await repost_playerregistration_messages(only_if_not_bottom=True, bump_cooldown_seconds=PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS)
         await repost_cwl_management_messages(only_if_not_bottom=True, bump_cooldown_seconds=PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS)
+        await repost_cwl_player_hub_messages(only_if_not_bottom=True, bump_cooldown_seconds=PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS)
         return
 
     # Reset CoC API rate limit tracking for this cycle
@@ -1938,6 +1939,7 @@ async def main() -> None:
     logging.info("Discord leaderboard posts complete.")
     await repost_playerregistration_messages(only_if_not_bottom=True, bump_cooldown_seconds=PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS)
     await repost_cwl_management_messages(only_if_not_bottom=True, bump_cooldown_seconds=PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS)
+    await repost_cwl_player_hub_messages(only_if_not_bottom=True, bump_cooldown_seconds=PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS)
 
 def _archive_move_nightly() -> None:
     """
@@ -2849,6 +2851,12 @@ async def _setup_hook():
     QBcore.bot.add_view(CwlManagementHubView())
     logging.info("[SETUP_HOOK] Registered persistent CwlManagementHubView for restart-surviving buttons")
 
+    # Player CWL Settings Hub message (plans/cwl-personal-hub.md Phase 5b) — player-facing
+    # counterpart to CwlManagementHubView above, same restart-survival reasoning.
+    from qapbot.ui_cwl_roster import CwlPlayerHubView
+    QBcore.bot.add_view(CwlPlayerHubView())
+    logging.info("[SETUP_HOOK] Registered persistent CwlPlayerHubView for restart-surviving buttons")
+
     # CWL template-copy DM confirm/opt-out buttons (CWL_ROSTER_PLANNING_PLAN.md Phase 2) — a
     # DynamicItem, not add_view(): the custom_id itself carries the per-DM state (action/
     # event_id/player_tag), so a bot restart between sending the DM and a member clicking it
@@ -3352,6 +3360,20 @@ async def _run_startup_initialization() -> None:
         except Exception as e:
             logging.error(f"❌ Failed to repost CWL Management Hub messages: {e}")
         logging.info("[INIT-STEP-8b] Done")
+
+        # Step 8c: Repost Player CWL Settings Hub messages on startup (plans/cwl-personal-hub.md
+        # Phase 3) — same unconditional (only_if_not_bottom defaults False) startup repost as
+        # Step 8b just above, which is also what makes the cwl_admin_hub_* custom_id rename
+        # (Phase 2d) self-healing on every real deploy with no separate repair step.
+        logging.info("[INIT-STEP-8c] Starting Player CWL Settings Hub message repost...")
+        try:
+            await asyncio.wait_for(repost_cwl_player_hub_messages(), timeout=30.0)
+            logging.info("✅ Player CWL Settings Hub messages reposted successfully")
+        except asyncio.TimeoutError:
+            logging.warning("⚠️ Reposting Player CWL Settings Hub messages timed out after 30 seconds (continuing)")
+        except Exception as e:
+            logging.error(f"❌ Failed to repost Player CWL Settings Hub messages: {e}")
+        logging.info("[INIT-STEP-8c] Done")
 
         # Step 9: Finalize initialization
         QBcore.bot.fully_initialized = True
@@ -4078,6 +4100,43 @@ async def repost_cwl_management_messages(*, only_if_not_bottom: bool = False, bu
             logging.info(f"No CWL Management Hub messages to repost in guild {CONFIG.discord_guild_id} ({filtered_count} guilds filtered)")
         else:
             logging.info("No CWL Management Hub messages to repost")
+
+async def repost_cwl_player_hub_messages(*, only_if_not_bottom: bool = False, bump_cooldown_seconds: int = PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS) -> None:
+    """
+    Repost Player CWL Settings Hub messages for guilds with the hub enabled
+    (plans/cwl-personal-hub.md Phase 3) — the player-facing anchored message, structurally
+    parallel to repost_cwl_management_messages() just above (its admin-facing counterpart).
+
+    Thin wrapper around the generic repost_anchored_message() driver, same discipline as every
+    other anchored-message feature in this file — only the config keys and message
+    content/view differ per feature.
+    """
+    from qapbot.ui_cwl_roster import build_cwl_player_hub_content_and_view
+
+    cwl_player_hub_count, filtered_count = await repost_anchored_message(
+        log_label="Player CWL Settings Hub",
+        enabled_key="cwl_player_hub_message_enabled",
+        channel_key="cwl_player_hub_channel_id",
+        message_id_key="cwl_player_hub_message_id",
+        old_channel_key="_old_cwl_player_hub_channel_id",
+        last_bump_key="cwl_player_hub_message_last_bump_iso",
+        build_content_and_view=build_cwl_player_hub_content_and_view,
+        # Same DEV test-channel reuse as repost_cwl_management_messages() above.
+        dev_mode_allowed_channel_id=CONFIG.dev_playerregistration_channel_id or None,
+        only_if_not_bottom=only_if_not_bottom,
+        bump_cooldown_seconds=bump_cooldown_seconds,
+    )
+
+    if cwl_player_hub_count > 0:
+        if CONFIG.is_dev_mode and filtered_count > 0:
+            logging.info(f"Successfully reposted {cwl_player_hub_count} Player CWL Settings Hub messages ({filtered_count} guilds filtered in DEV mode)")
+        else:
+            logging.info(f"Successfully reposted {cwl_player_hub_count} Player CWL Settings Hub messages")
+    else:
+        if CONFIG.is_dev_mode and filtered_count > 0:
+            logging.info(f"No Player CWL Settings Hub messages to repost in guild {CONFIG.discord_guild_id} ({filtered_count} guilds filtered)")
+        else:
+            logging.info("No Player CWL Settings Hub messages to repost")
 
 def log_lifetime_stats() -> None:
     """Log lifetime stats exactly once.  Safe to call from any shutdown path."""
