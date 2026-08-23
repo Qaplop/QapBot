@@ -454,6 +454,7 @@
       "grant_access_invite_failed": "⚠️ Einladung konnte nicht erstellt werden — prüfe meine „Einladung erstellen“-Berechtigung in diesem Kanal.",
       "grant_access_invite_dm": "👋 Ein Administrator hat auf deine Meldung **#{item_number}** geantwortet — tritt dem Server bei, um sie zu sehen und zu antworten: {invite_url}",
       "grant_access_invited": "✅ Dieser Melder ist noch nicht auf dem Server — ihm wurde eine Einladung per DM geschickt. Sobald er beitritt, erhält er automatisch Zugriff: {invite_url}",
+      "grant_access_already_invited": "ℹ️ Diesem Melder wurde bereits eine Einladung geschickt — sobald er beitritt, erhält er automatisch Zugriff.",
       "grant_access_invite_dm_failed": "⚠️ Einladung erstellt, aber der Melder hat DMs deaktiviert — teile ihm diesen Link selbst mit: {invite_url}",
       "grant_access_pending_applied": "✅ Du hast jetzt Zugriff, um auf deine Meldung **#{item_number}** zu antworten: {jump_link}",
       "discussion_thread_field": "Diskussions-Thread",

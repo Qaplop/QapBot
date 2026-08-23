@@ -1798,3 +1798,55 @@ default — Windows' locale-codepage fallback is not UTF-8 by default and this c
 invisible on Linux/macOS dev machines where the locale usually already is UTF-8, so it can ship
 unnoticed until a Windows host or a non-ASCII payload hits it.
 
+## Pitfall 41: a Discord View callback that `defer()`s (or otherwise awaits) before performing its side effect is re-entrant — a second click landing before the first finishes re-runs the action
+
+**Symptom (2026-08-23, two live reports):** tracker item #0026 — rapid double-clicking a
+"Report an item" draft's Submit button created two identical tracker items. tracker item #0036 —
+double-clicking "Yes, mark done" on the "mark linked item done too?" prompt (`ui_tracker.py`'s
+`ConfirmItemDoneView`) sent the reporter five identical "passed verification and is now done!"
+DMs — one per click that landed before the view's buttons visually disappeared.
+
+**Why:** every affected callback followed the same shape: check permission (sync, no await) →
+`await interaction.response.defer(...)` → perform the state-mutating action (create a DB row,
+call `apply_status_change()`, etc.) → edit the message to show buttons gone. The `defer()` call
+is itself an `await` — it yields control back to the event loop — and discord.py dispatches each
+incoming interaction as its own task, so a second click's callback can start running (and pass
+the same permission check) before the first click's `defer()` even returns, let alone before the
+first click's action or its final "buttons removed" edit completes. The visible "buttons are
+still there" window during that first `await` is exactly the window a rage-click lands in.
+`apply_status_change()` (and most of the tracker's action functions) aren't written to be
+idempotent against being called twice for the same logical action — they unconditionally re-DM,
+re-insert, etc. — so nothing downstream catches the duplicate either.
+
+**Fix:** for a short-lived, session-scoped `discord.ui.View` (held in memory across its own
+clicks until `.stop()` — draft previews, Yes/No confirms, single-use selects), guard with a flag
+set as the literal first synchronous statement of the handler, *before* any `await` — checking
+and setting it is then atomic against a second click's callback starting mid-way through the
+first, since nothing yields the event loop in between. Respond to the interaction by disabling
+every child and calling `interaction.response.edit_message(view=view)` directly (not
+`defer()`-then-edit-separately) — this is both the guard's synchronous side (buttons visibly gone
+in the same response) and the fastest way to make a rage-click's later hits land on a
+already-disabled control. `ui_tracker.py`'s `_consume_once(view, interaction)` helper implements
+exactly this and is shared by `ConfirmItemDoneView`, `ConfirmForceMoveView`, and
+`TrackerStatusSelectView`; `TrackerDraftView._on_submit` predates the helper and inlines the same
+pattern under its own `self.submitted` flag name.
+
+For a **persistent** button (a `discord.ui.DynamicItem`, reconstructed as a fresh Python object
+from its `custom_id` on every single click — Edit/Add files/Status/Test cases/Grant access on a
+posted tracker item, the Pass/Fail/Move-to-Done buttons) there is no `self` state that survives
+between clicks, so the flag-before-await trick doesn't apply. Guard these instead with a
+persisted-state idempotency check — re-fetch the relevant DB state before acting and short-circuit
+if a previous click (even one still in flight) already recorded it, the way
+`TrackerItemButton._invite_requestor` checks `item["access_grant_pending"]` before creating
+another one-time invite. This narrows the race to the (much smaller, rarely hit in practice) window
+where two clicks' DB reads both land before either click's write — good enough for the realistic
+"user re-clicked because nothing visibly happened yet" case #0026/#0036 both were, as opposed to
+requiring a real lock for genuinely simultaneous concurrent clicks.
+
+**How to apply:** any new tracker (or other Discord UI) View callback that performs a
+side-effecting action — anything that writes to the DB, sends a DM, or otherwise isn't safe to
+run twice for one logical user action — needs one of these two guards depending on whether its
+component is session-scoped (`self`-state flag via `_consume_once()`) or a persistent
+`DynamicItem` (persisted-state re-check). A bare `check permission → defer() → act` shape with
+neither is the exact pattern that shipped both #0026 and #0036.
+

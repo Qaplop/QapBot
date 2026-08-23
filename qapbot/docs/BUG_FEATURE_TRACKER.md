@@ -198,6 +198,21 @@ special handling is needed — just call `t(...)` as usual; the module-level sha
 automatically. This is local to `ui_tracker.py` only — no other module renders
 `ui_components.tracker.*` keys.
 
+**Every side-effecting View callback must guard against double-clicks (2026-08-23, tracker
+#0026/#0036)**: a rapid re-click landing while the first click's `defer()` (or any other
+`await`) is still in flight re-runs the whole callback as a second, concurrent task — discord.py
+dispatches each interaction as its own task, and none of the tracker's action functions
+(`apply_status_change()` etc.) are written to tolerate being called twice for one logical click.
+Session-scoped views (`TrackerDraftView`, `ConfirmItemDoneView`, `ConfirmForceMoveView`,
+`TrackerStatusSelectView`) guard with `_consume_once(view, interaction)` — a flag set as the
+literal first statement before any `await`, then `interaction.response.edit_message(view=view)`
+with every child disabled, so the guard-set and the "buttons visibly gone" response are the same
+atomic step. Persistent `DynamicItem` buttons (a fresh Python object per click, no `self` state
+to flag) instead re-check persisted DB state before acting, e.g.
+`TrackerItemButton._invite_requestor` checking `access_grant_pending`. See Pitfall 41,
+`qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md`, for the full writeup — apply the same pattern to any
+new side-effecting callback added here.
+
 - `/bug`, `/feature` (`QBdiscordcmds.py`) — thin wrappers around `start_tracker_item()`.
   Registered only when `CONFIG.tracker_enabled`; DM-invokable (no `guild_only()`).
 - `TrackerItemModal` → `TrackerDraftView` (Edit/Add attachments/Submit/Discard, ephemeral,

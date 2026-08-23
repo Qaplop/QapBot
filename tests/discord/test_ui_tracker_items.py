@@ -592,6 +592,97 @@ async def test_confirm_force_move_no_edits_message_in_place(db, monkeypatch, moc
 
 
 @pytest.mark.asyncio
+async def test_confirm_item_done_yes_second_click_does_not_resend_dm(db, monkeypatch, mock_interaction):
+    """tracker item #0036: a rapid double-click on "Yes, mark done" sent the reporter five
+    identical "now done!" DMs -- apply_status_change() isn't idempotent (it unconditionally
+    re-DMs on every call), so the view itself must refuse to run the action twice."""
+    fake_user = AsyncMock()
+    _wire_bot(monkeypatch, channel=None, user=fake_user)
+    mock_interaction.user.id = int(ADMIN_ID)
+    item_number = await _make_item(db, reporter_id="222")
+    await db.update_tracker_item(item_number, status="testing")
+    view = ConfirmItemDoneView(item_number, mock_interaction.guild.id)
+
+    await view._on_yes(mock_interaction)
+    await view._on_yes(mock_interaction)  # simulated re-click
+
+    fake_user.send.assert_awaited_once()  # only one "now done!" DM, not two
+    mock_interaction.edit_original_response.assert_awaited_once()  # second click never re-ran the handler
+
+
+@pytest.mark.asyncio
+async def test_confirm_item_done_first_click_disables_and_edits_message(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    mock_interaction.user.id = int(ADMIN_ID)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, status="testing")
+    view = ConfirmItemDoneView(item_number, mock_interaction.guild.id)
+
+    await view._on_yes(mock_interaction)
+
+    mock_interaction.response.edit_message.assert_awaited_once_with(view=view)
+    assert view.children and all(child.disabled for child in view.children)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_confirm_force_move_yes_second_click_does_not_rerun(db, monkeypatch, mock_interaction):
+    """Same double-click class as above, on the "Move to Done anyway?" confirm."""
+    _wire_bot(monkeypatch, channel=None)
+    mock_interaction.user.id = int(ADMIN_ID)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, status="testing")
+    view = ConfirmForceMoveView(item_number, mock_interaction.guild.id)
+
+    await view._on_yes(mock_interaction)
+    await view._on_yes(mock_interaction)  # simulated re-click
+
+    mock_interaction.edit_original_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_status_select_second_selection_does_not_reapply(db, monkeypatch, mock_interaction):
+    """Same double-click class, on the admin status dropdown -- a second selection landing
+    before the first is visibly done must not re-run apply_status_change() (which would re-send
+    a reporter DM for any status in DM_NOTIFY_STATUSES)."""
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    view = TrackerStatusSelectView(item_number, "new", str(mock_interaction.user.id), mock_interaction.guild.id)
+    mock_interaction.data = {"values": ["triaged"]}
+
+    await view._on_select(mock_interaction)
+    await view._on_select(mock_interaction)  # simulated re-click
+
+    mock_interaction.edit_original_response.assert_awaited_once()
+    item = await db.get_tracker_item(item_number)
+    assert item["status"] == "triaged"
+
+
+@pytest.mark.asyncio
+async def test_grant_access_second_click_does_not_resend_invite(db, monkeypatch, mock_interaction):
+    """tracker item #0036 follow-up: Grant Access is a persistent DynamicItem button (a fresh
+    Python object per click, no shared view state), so its double-click guard has to be a
+    persisted-state check instead -- a second click must not create a second one-time invite
+    or send the reporter a second DM once access_grant_pending is already set."""
+    fake_user = AsyncMock()
+    _wire_bot(monkeypatch, channel=None, user=fake_user)
+    item_number = await _make_item(db, reporter_id="222")
+    mock_interaction.user.id = int(ADMIN_ID)
+    mock_interaction.guild.get_member = MagicMock(return_value=None)
+    mock_interaction.guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "not found"))
+    mock_interaction.channel.create_invite = AsyncMock(return_value=MagicMock(url="https://discord.gg/abc123"))
+
+    button = TrackerItemButton("grantaccess", item_number)
+    item = await db.get_tracker_item(item_number)
+    await button._handle_grant_access(mock_interaction, item)  # first click: creates the invite
+
+    item_after_first_click = await db.get_tracker_item(item_number)  # a second click re-fetches
+    await button._handle_grant_access(mock_interaction, item_after_first_click)  # simulated re-click
+
+    mock_interaction.channel.create_invite.assert_awaited_once()
+    fake_user.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_apply_status_change_dms_reporter_on_implemented(db, monkeypatch):
     fake_user = AsyncMock()
     _wire_bot(monkeypatch, channel=None, user=fake_user)

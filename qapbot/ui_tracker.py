@@ -1654,9 +1654,20 @@ class TrackerItemButton(
         and mark access_grant_pending so apply_pending_requestor_access() (on_member_join) can
         finish the grant automatically once they actually join, with no second click needed."""
         import QBcore
+        from qapbot.cache_manager import CACHE
 
         user_id = str(interaction.user.id)
         guild_id = interaction.guild.id if interaction.guild else None
+
+        # A double-click on Grant Access re-invokes this from a fresh callback instance each
+        # time (DynamicItem, no shared view state to guard with like #0036's other fixes) --
+        # re-check the persisted flag so a second click doesn't create a second one-time invite
+        # and DM the reporter again.
+        if item.get("access_grant_pending"):
+            await interaction.response.send_message(
+                t('ui_components.tracker.grant_access_already_invited', user_id=user_id, guild_id=guild_id), ephemeral=True
+            )
+            return
 
         reporter_user = QBcore.bot.get_user(int(reporter_id))
         if reporter_user is None:
@@ -1682,7 +1693,6 @@ class TrackerItemButton(
             )
             return
 
-        from qapbot.cache_manager import CACHE
         await CACHE.db_manager.update_tracker_item(self.item_number, access_grant_pending=1)
 
         try:
@@ -1708,6 +1718,35 @@ class TrackerItemButton(
         )
 
 
+async def _consume_once(view: discord.ui.View, interaction: discord.Interaction) -> bool:
+    """Guards a short-lived, session-scoped confirm/select view against a second click/
+    selection re-running its side-effecting action (tracker item #0036 -- the same double-click
+    class as #0026's Submit button, this time on the "mark linked item done?" Yes/No prompt: a
+    rapid double-click sent the reporter five identical "now done!" DMs, one per click that
+    landed before the view's buttons visually disappeared). Returns True the first time a call
+    site should proceed with its action; False on any later call for the same view instance
+    (caller should just return -- the interaction is already handled via a silent defer here).
+
+    The guard flag is set, and every child disabled, before the interaction is responded to at
+    all -- and disabling+responding IS the single synchronous block with no `await` in between
+    the flag check and the flag set, so two near-simultaneous clicks can't both observe
+    "not yet consumed." Responding via `edit_message()` (not `defer()`-then-edit) also makes the
+    buttons visibly disappear as fast as possible, matching #0026's fix. Works whether *view* is
+    attached to an interaction followup or a plain channel/thread/DM message (`response.
+    edit_message()` edits "the message this component lives on" either way)."""
+    if getattr(view, "_tracker_consumed", False):
+        try:
+            await interaction.response.defer(thinking=False)
+        except discord.HTTPException:
+            pass
+        return False
+    view._tracker_consumed = True  # type: ignore[attr-defined]
+    for child in view.children:
+        child.disabled = True  # type: ignore[attr-defined]
+    await interaction.response.edit_message(view=view)
+    return True
+
+
 class TrackerStatusSelectView(discord.ui.View):
     """Admin-only status dropdown opened by the Status button (plan §2.3, §4.2)."""
 
@@ -1728,7 +1767,8 @@ class TrackerStatusSelectView(discord.ui.View):
         self.add_item(select)  # type: ignore[arg-type]
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(thinking=False)
+        if not await _consume_once(self, interaction):
+            return
         new_status = interaction.data['values'][0]  # type: ignore[index]
         actor_id = str(interaction.user.id)
         await apply_status_change(self.item_number, new_status, actor_id=actor_id)
@@ -2248,7 +2288,8 @@ class ConfirmItemDoneView(discord.ui.View):
                 t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=self.guild_id), ephemeral=True
             )
             return
-        await interaction.response.defer(thinking=False)
+        if not await _consume_once(self, interaction):
+            return
         try:
             await apply_status_change(self.item_number, "done", actor_id=user_id)
             await interaction.edit_original_response(
@@ -2263,7 +2304,8 @@ class ConfirmItemDoneView(discord.ui.View):
         self.stop()
 
     async def _on_no(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(thinking=False)
+        if not await _consume_once(self, interaction):
+            return
         await interaction.edit_original_response(
             content=t('ui_components.tracker.item_done_confirm_cancelled', guild_id=self.guild_id), view=None
         )
@@ -2453,13 +2495,15 @@ class ConfirmForceMoveView(discord.ui.View):
                 t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=self.guild_id), ephemeral=True
             )
             return
-        await interaction.response.defer(thinking=False)
+        if not await _consume_once(self, interaction):
+            return
         result = await finalize_testcases_move(self.item_number)
         await _edit_to_testcases_moved_message(interaction, self.item_number, result, self.guild_id)
         self.stop()
 
     async def _on_no(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(thinking=False)
+        if not await _consume_once(self, interaction):
+            return
         await interaction.edit_original_response(
             content=t('ui_components.tracker.testcase_movedone_confirm_cancelled', guild_id=self.guild_id), view=None
         )
