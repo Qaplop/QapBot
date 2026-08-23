@@ -151,7 +151,7 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 - CoC war fetch → `await CACHE.get_current_war_from_api(clan_tag)`
 - DB read/write → `await CACHE.db_manager.*` (never raw sqlite)
 - War file lifecycle → see ../qapbot/docs/WAR_FILE_MANAGEMENT_RULES.md
-- Deploy Activity frontend → `cd activity/client && npm run deploy:dev` (DEV — no confirmation needed) / `npm run deploy:prod` (PROD — always confirm with the user first). Full runbook incl. first-time setup: ../activity/README.md
+- Deploy the Activity → it's TWO separately-deployed pieces that ship as one feature, both under `activity/`: the Pages client (`cd activity/client && npm run deploy:dev` / `deploy:prod`) AND the Worker server (`cd activity/server && npm run deploy:dev` / `deploy:prod`). "Deploy [the Activity] to dev/prod" means both, every time — check whether server-side code (`activity/server/src/*`) changed since its own last deploy even if the request only says "frontend"; a stale Worker missing a recently-added route fails silently in the UI ("Action failed: not found") with no build-time signal. DEV — no confirmation needed for either half. PROD — always confirm with the user first for either half; if a bug's actual fix requires a PROD deploy that hasn't been explicitly authorized yet, say so and ask — don't silently deploy without confirmation, and don't silently leave the bug unfixed either. Full runbook incl. first-time setup: ../activity/README.md
 
 ---
 

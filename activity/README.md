@@ -56,6 +56,24 @@ you just got.
 without manually swapping one shared file before every deploy. Plain `npm run dev`/`npm run
 build` (no mode flag) still fall back to `.env.local`.
 
+## This is two separately-deployed pieces — deploying one doesn't deploy the other
+
+`client/` (Cloudflare Pages) and `server/` (Cloudflare Worker) ship independently via their own
+`deploy:dev`/`deploy:prod` npm scripts. A request to "deploy the Activity" (or just "deploy the
+frontend") means checking both, not whichever half the wording literally names — they're one
+feature to the person using it.
+
+**2026-08-23 incident**: the server's `/cwl/enrollment/status` route (tracker #0014) was committed
+2026-08-22, but the PROD Worker's last deploy was 2026-08-19 — three days stale. A "deploy the
+frontend to prod" request only redeployed `client/`, leaving the Worker still missing that route.
+The right-click "Set enrollment status" admin action then failed live with `Action failed: not
+found` (Hono's own 404 catch-all — the route genuinely didn't exist in the running Worker), with no
+build error anywhere to catch it, since `client/`'s own `npm run build`/`typecheck` know nothing
+about `server/`'s deployed state. **Before calling a deploy done, check `cd activity/server &&
+npx wrangler deployments list --env <dev|prod>` for the last deploy time and compare against
+`git log -1 -- activity/server/src` — if server source changed more recently than its last deploy,
+redeploy it too, even if only the client was asked for.**
+
 ## Editing `client/src/*` does not ship anything by itself
 
 The live Discord Activity iframe loads the built Cloudflare Pages bundle in `client/dist/`, not
