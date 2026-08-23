@@ -727,6 +727,20 @@ async def test_apply_status_change_dms_reporter_on_implemented(db, monkeypatch):
     fake_user.send.assert_awaited_once()
 
 
+async def test_implemented_dm_reads_as_in_progress_not_finished(db, monkeypatch):
+    """tracker item #0039: "was marked implemented!" reads as finished/deployed to a reporter,
+    but 'implemented' really just means the fix is coded and about to enter testing -- not yet
+    verified, not yet in production. The DM must say so instead of sounding like a done signal
+    (word "done"/"finished" reserved for the actual dm_status_done message)."""
+    fake_user = AsyncMock()
+    _wire_bot(monkeypatch, channel=None, user=fake_user)
+    item_number = await _make_item(db, reporter_id="222")
+    await apply_status_change(item_number, "implemented", actor_id="1")
+    dm_text = fake_user.send.call_args[0][0]
+    assert "being tested" in dm_text
+    assert "implemented" not in dm_text.lower()
+
+
 @pytest.mark.asyncio
 async def test_apply_status_change_does_not_dm_on_triaged(db, monkeypatch):
     fake_user = AsyncMock()

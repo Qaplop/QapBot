@@ -458,7 +458,7 @@
       "grant_access_invite_dm_failed": "⚠️ Einladung erstellt, aber der Melder hat DMs deaktiviert — teile ihm diesen Link selbst mit: {invite_url}",
       "grant_access_pending_applied": "✅ Du hast jetzt Zugriff, um auf deine Meldung **#{item_number}** zu antworten: {jump_link}",
       "discussion_thread_field": "Diskussions-Thread",
-      "dm_status_implemented": "✅ Dein {type} **#{item_number} · {title}** wurde als **umgesetzt** markiert!",
+      "dm_status_implemented": "🧪 Dein {type} **#{item_number} · {title}** ist fertig entwickelt und wird jetzt getestet — er wird bald abgeschlossen sein!",
       "dm_status_done": "🎉 Dein {type} **#{item_number} · {title}** hat die Verifizierung bestanden und ist jetzt **erledigt**!",
       "dm_status_rejected": "❌ Dein {type} **#{item_number} · {title}** wurde **abgelehnt**.",
       "testcase_message_header": "🧪 **#{item_number} · {title}**",
