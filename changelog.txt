@@ -1,6 +1,31 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (15)
+- Added: Phase 4a-4c of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- Start
+  Enrollment (and every other place that seeds a cwl_signups row) now honors the standing
+  cwl_permanent_optout/cwl_permanent_optin preferences added in Phase 1. New 'auto_confirmed'
+  signup status (board icon/label/legend, season overview, deliberately NOT admin-settable) for
+  an opt-in-seeded row. Opted-out participants used to be skipped entirely at Start Enrollment
+  (no row at all); they're now always seeded as 'declined', since the row is what makes them
+  show as Declined instead of silently vanishing -- unless cwl_optout_send_dm_anyway is also
+  set, in which case the invitation DM still goes out so the member can override their own
+  auto-decline. All seeding goes through one shared resolve_seeded_cwl_signup_status()
+  precedence (real cross-guild response > opt-out > opt-in > pending), including a second seed
+  site for "Notify New Pool Members" and a new optout_no_dm path so an opted-out guest/
+  shared-clan player skipped from the DM entirely still gets a row.
+  Audit follow-up beyond the immediate scope: _seed_status_from_global_sync -- used by drag-and-
+  drop placement, the cross-guild orphan mirror, the auto_seeded pool seed, and the guest invite
+  endpoint -- was found to ignore the standing preference entirely (it only ever handled rule h's
+  existing-global-response case), so a manual placement or guest invite for an opted-out player
+  produced a stray 'pending' row. Fixed by routing it through the same shared precedence, with no
+  signature changes needed at any of its four call sites.
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/web_bridge.py, qapbot/translations/en.json,
+  qapbot/translations/de.json, activity/client/src/types.ts, activity/client/src/enrollmentBoard.ts,
+  activity/client/src/assets/autoconfirmed.svg, tests/discord/test_ui_cwl_roster.py,
+  tests/discord/test_web_bridge.py, tests/integration/test_cwl_start_enrollment.py,
+  tests/unit/test_cwl_signup_snapshot_staleness.py. 2643 tests pass; activity/client typecheck clean.
+
 2026-08-23 (14)
 - Added: Phase 1 of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- schema and write
   path only, no UI yet. Two new user_players columns, cwl_permanent_optin ("always play CWL")
