@@ -956,6 +956,7 @@
       "start_enrollment_processing": "⏳ Starting enrollment — sending DMs, this can take a few seconds…",
       "start_enrollment_summary": "✅ Enrollment started.\nSeeded: {seeded}\nPre-assigned from last month's CWL: {assigned}\nContacted: {contacted}\nSkipped (opted out): {skipped_optout}\nSkipped (no linked account): {skipped_unlinked}\nSkipped (DM guard): {skipped_dm_guard}{dm_issues}",
       "start_enrollment_dm_blocked_line": "\n⚠️ Blocked (DMs disabled or bot blocked, not retried): {names}",
+      "start_enrollment_dm_no_mutual_guild_line": "\n⚠️ Left the server (no mutual server with the bot, not retried) — consider removing from the pool: {names}",
       "start_enrollment_dm_failed_line": "\n⚠️ Failed after {retries} retries, may be transient — retry manually later: {names}",
       "start_enrollment_error_no_database": "⚠️ Database not ready — try again shortly.",
       "start_enrollment_error_no_event": "⚠️ No CWL event found for this season anymore — it may have been deleted.",

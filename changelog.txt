@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (9)
+- Added: send_user_dm_detailed()'s discord.Forbidden handler (qapbot/cache_manager.py) now
+  distinguishes Discord error code 50278 ("Cannot send messages to this user due to having no
+  mutual guilds" -- recipient left every guild the bot is in) from a generic "blocked" outcome,
+  returning a new "no_mutual_guild" literal instead. Investigating tracker #0031 (changelog (7))
+  found this is what "John"/"LootandLift" actually hit: not DMs-disabled/bot-blocked, but no
+  shared server with the bot at all -- a hard Discord platform restriction with no code-side
+  workaround, most often meaning the recipient left the server while still tracked as a
+  notification target (e.g. a CWL pool member). _send_cwl_enrollment_dm_batch() and
+  _start_cwl_enrollment_locked() (qapbot/QBdiscocmdshelper_cwl.py) now bucket this into its own
+  "no_mutual_guild" list (notify_new_cwl_pool_members in web_bridge.py inherits it via its
+  **dm_result spread), and Start Enrollment / Notify New Pool Members admin summaries
+  (qapbot/ui_cwl_roster.py) render it as its own line, separate from the "blocked" line, so an
+  admin knows to consider pool/roster cleanup rather than waiting on a DM-privacy change that
+  was never the issue. New i18n key start_enrollment_dm_no_mutual_guild_line in en.json/de.json.
+  Files: qapbot/cache_manager.py, qapbot/QBdiscocmdshelper_cwl.py, qapbot/ui_cwl_roster.py,
+  qapbot/translations/en.json, qapbot/translations/de.json. 2565 tests pass.
+
 2026-08-23 (8)
 - Fixed: two live bugs found while testers exercised the new sign-off permission (changelog (4)).
   (1) _dm_reporter_on_status_change() (qapbot/ui_tracker.py) fell straight into int(reporter_id)

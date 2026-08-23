@@ -1351,7 +1351,7 @@ class CacheManager:
         view: Optional['discord.ui.View'] = None,
         embed: Optional['discord.Embed'] = None,
         sent_message_out: Optional[list] = None,
-    ) -> Tuple[bool, Literal["sent", "blocked", "failed"]]:
+    ) -> Tuple[bool, Literal["sent", "blocked", "no_mutual_guild", "failed"]]:
         """
         Send DM to user, handling fetch and metadata update internally, and retrying a
         transient Discord server error up to DM_SEND_MAX_RETRIES times before giving up.
@@ -1377,6 +1377,12 @@ class CacheManager:
                 worth retrying; distinct from "failed" so a caller reporting back to an admin
                 can say "this person blocked the bot" rather than "a retry is worth trying again
                 later."
+            (False, "no_mutual_guild") when Discord rejects the send with error code 50278
+                ("Cannot send messages to this user due to having no mutual guilds") — the
+                recipient has left every guild the bot is in. Split from "blocked" (2026-08-23,
+                tracker #0031) since it calls for different admin follow-up: this isn't a DM
+                privacy setting the recipient could change, it's the bot and the recipient no
+                longer sharing a server at all — most often a pool/roster member who left.
             (False, "failed") for a transient error that didn't recover after
                 DM_SEND_MAX_RETRIES attempts, or any other unexpected exception.
 
@@ -1416,6 +1422,12 @@ class CacheManager:
                 return True, "sent"
 
             except discord.Forbidden as e:
+                if e.code == 50278:
+                    logging.info(
+                        f"Cannot send DM to user {user_id}: no mutual guild (recipient has left "
+                        f"every server the bot is in) (HTTP {e.status}, discord code {e.code}: {e.text})"
+                    )
+                    return False, "no_mutual_guild"
                 logging.info(
                     f"Cannot send DM to user {user_id}: DMs disabled or bot blocked "
                     f"(HTTP {e.status}, discord code {e.code}: {e.text})"

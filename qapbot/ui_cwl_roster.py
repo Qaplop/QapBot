@@ -1051,15 +1051,21 @@ class CwlStartEnrollmentConfirmView(discord.ui.View):
         if not summary["ok"]:
             content = t(f"cwl.management.start_enrollment_error_{summary['error']}", guild_id=self.guild_id)
         else:
-            # Blocked (DMs closed/bot blocked) vs failed-after-retries (transient, cache_manager.py's
-            # DM_SEND_MAX_RETRIES) get separate lines — an admin follows up differently for each
-            # (2026-08-18, item 3 of the enrollment redesign: surface DM problems instead of
-            # letting a batch abort silently).
+            # Blocked (DMs closed/bot blocked) vs no_mutual_guild (recipient left every guild the
+            # bot is in, 2026-08-23, tracker #0031) vs failed-after-retries (transient,
+            # cache_manager.py's DM_SEND_MAX_RETRIES) get separate lines — an admin follows up
+            # differently for each (2026-08-18, item 3 of the enrollment redesign: surface DM
+            # problems instead of letting a batch abort silently).
             dm_issues = ""
             if summary["blocked"]:
                 dm_issues += t(
                     'cwl.management.start_enrollment_dm_blocked_line',
                     guild_id=self.guild_id, names=", ".join(summary["blocked"]),
+                )
+            if summary["no_mutual_guild"]:
+                dm_issues += t(
+                    'cwl.management.start_enrollment_dm_no_mutual_guild_line',
+                    guild_id=self.guild_id, names=", ".join(summary["no_mutual_guild"]),
                 )
             if summary["failed"]:
                 from qapbot.cache_manager import DM_SEND_MAX_RETRIES
@@ -1210,6 +1216,11 @@ class CwlNotifyNewMembersConfirmView(discord.ui.View):
                 dm_issues += t(
                     'cwl.management.start_enrollment_dm_blocked_line',
                     guild_id=self.guild_id, names=", ".join(result["blocked"]),
+                )
+            if result["no_mutual_guild"]:
+                dm_issues += t(
+                    'cwl.management.start_enrollment_dm_no_mutual_guild_line',
+                    guild_id=self.guild_id, names=", ".join(result["no_mutual_guild"]),
                 )
             if result["failed"]:
                 from qapbot.cache_manager import DM_SEND_MAX_RETRIES

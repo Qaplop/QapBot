@@ -2251,11 +2251,15 @@ async def _start_cwl_enrollment_locked(guild_id: int, season: str) -> Dict[str, 
         "shared_clans": [],
         # Per-recipient DM outcomes (2026-08-18, item 3 of the enrollment redesign) — populated
         # by _send_cwl_enrollment_dm_batch(). "blocked": recipient has DMs closed / blocked the
-        # bot / couldn't be fetched — retrying won't help. "failed": a transient Discord error
-        # that didn't recover after DM_SEND_MAX_RETRIES attempts (cache_manager.py). Both are
-        # player_name (or player_tag) strings, rendered back to the admin in the Start
-        # Enrollment summary so they know who to follow up with.
+        # bot / couldn't be fetched — retrying won't help. "no_mutual_guild" (2026-08-23, tracker
+        # #0031): recipient has left every guild the bot is in (discord code 50278) — also not
+        # worth retrying, but a different admin follow-up than "blocked" (pool/roster cleanup,
+        # not "ask them to enable DMs"). "failed": a transient Discord error that didn't recover
+        # after DM_SEND_MAX_RETRIES attempts (cache_manager.py). All three are player_name (or
+        # player_tag) strings, rendered back to the admin in the Start Enrollment summary so they
+        # know who to follow up with.
         "blocked": [],
+        "no_mutual_guild": [],
         "failed": [],
     }
 
@@ -2475,6 +2479,7 @@ async def _start_cwl_enrollment_locked(guild_id: int, season: str) -> Dict[str, 
     # _send_cwl_enrollment_dm_batch's live re-check).
     summary["skipped_unlinked"] += dm_result["skipped_unlinked"]
     summary["blocked"] = dm_result["blocked"]
+    summary["no_mutual_guild"] = dm_result["no_mutual_guild"]
     summary["failed"] = dm_result["failed"]
 
     await asyncio.to_thread(db.update_cwl_event_status_sync, event["id"], "signup_open")
@@ -2489,7 +2494,8 @@ async def _start_cwl_enrollment_locked(guild_id: int, season: str) -> Dict[str, 
         f"skipped_unlinked={summary['skipped_unlinked']} "
         f"skipped_dm_guard={summary['skipped_dm_guard']} "
         f"skipped_already_dm_globally={summary['skipped_already_dm_globally']} "
-        f"blocked={len(summary['blocked'])} failed={len(summary['failed'])}"
+        f"blocked={len(summary['blocked'])} no_mutual_guild={len(summary['no_mutual_guild'])} "
+        f"failed={len(summary['failed'])}"
     )
     return summary
 
@@ -2633,9 +2639,11 @@ async def _send_cwl_enrollment_dm_batch(
     never raises — so this loop just needs to keep going and record what happened to who).
 
     Returns {"contacted", "skipped_dm_guard", "skipped_already_dm_globally", "skipped_unlinked",
-    "blocked", "failed"} — the latter two are lists of player_name (or player_tag) strings for the
-    Start Enrollment summary to report back to the admin, since "blocked" (DMs closed/bot blocked)
-    and "failed" (transient error, retries exhausted) call for different admin follow-up.
+    "blocked", "no_mutual_guild", "failed"} — the latter three are lists of player_name (or
+    player_tag) strings for the Start Enrollment summary to report back to the admin, since
+    "blocked" (DMs closed/bot blocked), "no_mutual_guild" (recipient left every guild the bot is
+    in — discord code 50278, tracker #0031) and "failed" (transient error, retries exhausted) call
+    for different admin follow-up.
     "skipped_unlinked" is deliberately the same bucket name resolve_cwl_pool_dm_targets_sync()
     uses for "no linked Discord account at pool-resolution time" — this one just catches the same
     condition discovered a moment later, right before the send (see the live re-check below), so
@@ -2653,7 +2661,7 @@ async def _send_cwl_enrollment_dm_batch(
 
     result: Dict[str, Any] = {
         "contacted": 0, "skipped_dm_guard": 0, "skipped_already_dm_globally": 0, "skipped_unlinked": 0,
-        "blocked": [], "failed": [],
+        "blocked": [], "no_mutual_guild": [], "failed": [],
     }
     db = CACHE.db_manager
     already_dm_by_tag = await asyncio.to_thread(
@@ -2760,6 +2768,8 @@ async def _send_cwl_enrollment_dm_batch(
                 )
         elif outcome == "blocked":
             result["blocked"].append(participant["player_name"] or participant["player_tag"])
+        elif outcome == "no_mutual_guild":
+            result["no_mutual_guild"].append(participant["player_name"] or participant["player_tag"])
         else:
             result["failed"].append(participant["player_name"] or participant["player_tag"])
     return result
