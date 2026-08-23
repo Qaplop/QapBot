@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (17)
+- Added: Phase 2 of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- admin config
+  entry point. New "Player CWL Settings Hub" channel slot alongside the existing admin "CWL
+  Management Hub" one on /clan management's CWL Settings screen (its "Configure Channels"
+  button now renders both), a new enable/disable toggle button, and a new status/channel block
+  in the settings embed.
+  Renamed CwlManagementHubView's three custom_ids (cwl_hub_mode_settings/cwl_hub_mode_management/
+  cwl_hub_refresh -> cwl_admin_hub_*) -- the bare cwl_hub_* prefix collided with the
+  guild_config columns Phase 1 renamed to cwl_player_hub_*. Verified this self-heals on the next
+  bot restart via the existing unconditional startup repost (on_ready() Step 8b) with no extra
+  repair code needed.
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/ui_clan_management.py, qapbot/ui_cwl_roster.py,
+  qapbot/translations/en.json, qapbot/translations/de.json, tests/discord/test_ui_cwl_roster.py.
+  2654 tests pass.
+
 2026-08-23 (16)
 - Changed: Phase 4d of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- unified the
   two CWL DM response buttons' previously-diverged end-of-click rendering.
