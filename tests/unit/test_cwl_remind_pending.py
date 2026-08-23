@@ -232,3 +232,89 @@ class TestHasCwlPendingSignupsToRemind:
         db.upsert_cwl_signup_sync(event_id, "#GHOST", "Ghost", None, None, "guest_invite", "pending")
 
         assert has_cwl_pending_signups_to_remind(812, "2026-09") is False
+
+
+# ---------------------------------------------------------------------------
+# count_cwl_pool_members_missing_dm — season-overview "New players without DM
+# invitation" line, and its boolean has_cwl_pool_members_missing_dm() sibling
+# ---------------------------------------------------------------------------
+
+class TestCountCwlPoolMembersMissingDm:
+    """Backs both the "Notify New Pool Members" button's gating and the new season-overview
+    count line — one shared resolution so the two can never disagree (2026-08-23)."""
+
+    @pytest.mark.asyncio
+    async def test_zero_when_no_event(self, db):
+        from qapbot.cache_manager import CACHE
+        from qapbot.QBdiscocmdshelper_cwl import count_cwl_pool_members_missing_dm
+
+        CACHE.db_manager = db
+        assert count_cwl_pool_members_missing_dm(813, "2026-09") == 0
+
+    @pytest.mark.asyncio
+    async def test_zero_while_event_is_still_draft(self, db):
+        from qapbot.cache_manager import CACHE
+        from qapbot.QBdiscocmdshelper_cwl import count_cwl_pool_members_missing_dm
+
+        await _seed(db, "814", "#CLANL")
+        CACHE.db_manager = db
+        await _link(db, "owner1", "#P1")
+
+        assert count_cwl_pool_members_missing_dm(814, "2026-09") == 0
+
+    @pytest.mark.asyncio
+    async def test_counts_dmable_pool_members_never_contacted(self, db):
+        from qapbot.cache_manager import CACHE
+        from qapbot.QBdiscocmdshelper_cwl import count_cwl_pool_members_missing_dm
+
+        event_id = await _seed(db, "815", "#CLANM")
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        CACHE.db_manager = db
+        await _link(db, "owner1", "#NEW1")
+        await _link(db, "owner2", "#NEW2")
+        db.upsert_cwl_signup_sync(event_id, "#NEW1", "New1", "owner1", None, "guest_invite", "pending")
+        db.upsert_cwl_signup_sync(event_id, "#NEW2", "New2", "owner2", None, "guest_invite", "pending")
+
+        assert count_cwl_pool_members_missing_dm(815, "2026-09") == 2
+
+    @pytest.mark.asyncio
+    async def test_already_dmed_members_are_not_counted(self, db):
+        from qapbot.cache_manager import CACHE
+        from qapbot.QBdiscocmdshelper_cwl import count_cwl_pool_members_missing_dm
+
+        event_id = await _seed(db, "816", "#CLANN")
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        CACHE.db_manager = db
+        await _link(db, "owner1", "#DMED")
+        db.upsert_cwl_signup_sync(event_id, "#DMED", "Dmed", "owner1", None, "template_confirm", "pending")
+        db.mark_cwl_player_dm_sent_sync(
+            "#DMED", "2026-09", "Dmed", "owner1", event_id, 816, "2026-09-01T10:00Z", "m", "c",
+        )
+
+        assert count_cwl_pool_members_missing_dm(816, "2026-09") == 0
+
+    @pytest.mark.asyncio
+    async def test_unlinked_pool_members_are_not_counted(self, db):
+        """Nobody to DM — mirrors resolve_cwl_pool_dm_targets_sync's own skipped_unlinked bucket."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.QBdiscocmdshelper_cwl import count_cwl_pool_members_missing_dm
+
+        event_id = await _seed(db, "817", "#CLANO")
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        CACHE.db_manager = db
+        db.upsert_cwl_signup_sync(event_id, "#GHOST", "Ghost", None, None, "guest_invite", "pending")
+
+        assert count_cwl_pool_members_missing_dm(817, "2026-09") == 0
+
+    @pytest.mark.asyncio
+    async def test_boolean_sibling_matches_the_count(self, db):
+        from qapbot.cache_manager import CACHE
+        from qapbot.QBdiscocmdshelper_cwl import has_cwl_pool_members_missing_dm
+
+        event_id = await _seed(db, "818", "#CLANP")
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        CACHE.db_manager = db
+        await _link(db, "owner1", "#NEW1")
+        db.upsert_cwl_signup_sync(event_id, "#NEW1", "New1", "owner1", None, "guest_invite", "pending")
+
+        assert has_cwl_pool_members_missing_dm(818, "2026-09") is True

@@ -1,6 +1,17 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (12)
+- Added: CWL Management's "Sign-Ups" embed field now shows a "New players without DM invitation:
+  n" line, only when n > 0 -- same condition that already gates the "Notify New Pool Members"
+  button, so the line only ever appears alongside a button that would actually do something.
+  Extracted the shared count out of has_cwl_pool_members_missing_dm() into a new
+  count_cwl_pool_members_missing_dm() (QBdiscocmdshelper_cwl.py) so the button's gating and the
+  embed's count can never drift apart -- the boolean check now just delegates to `> 0`.
+  New i18n key signup_status_missing_dm in en.json/de.json. 6 new unit tests.
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/translations/en.json,
+  qapbot/translations/de.json, tests/unit/test_cwl_remind_pending.py. 2611 tests pass.
+
 2026-08-23 (11)
 - Changed: CWL Management's "Sign-Ups" embed field now leads with "Unlinked accounts" (the
   unreachable half) before "Pending" (the reachable half, matching Teams-verwalten's icon count),

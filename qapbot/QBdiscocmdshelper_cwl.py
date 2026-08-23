@@ -475,6 +475,16 @@ async def format_clan_management_cwl_management(
         f"{t(f'cwl.management.signup_status_{status}', guild_id=guild_id_int)}: {signup_counts.get(status, 0)}"
         for status in ("confirmed", "declined")
     ]
+    # Same resolution + gating count_cwl_pool_members_missing_dm() drives for the "Notify New
+    # Pool Members" button below — shown here only when that button would actually do something
+    # (>0), same "don't show what's currently pointless" convention the button itself follows.
+    missing_dm_count = await asyncio.to_thread(
+        count_cwl_pool_members_missing_dm, guild_id_int, event["cwl_season"]
+    )
+    if missing_dm_count:
+        signup_lines.append(
+            f"{t('cwl.management.signup_status_missing_dm', guild_id=guild_id_int)}: {missing_dm_count}"
+        )
     embed.add_field(
         name=t('cwl.management.signups_block_title', guild_id=guild_id_int),
         value="\n".join(signup_lines),
@@ -577,35 +587,45 @@ def split_cwl_pending_signups_by_link_sync(event_id: int) -> Tuple[int, int]:
     return (linked, len(pending_tags) - linked)
 
 
-def has_cwl_pool_members_missing_dm(guild_id: int, season: str) -> bool:
-    """Rule h's button-gating check (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md) —
-    true when at least one of this guild's currently-pooled, DM-able players has never been sent
-    the enrollment DM by ANY guild this season. Drives the "Notify New Pool Members" button
-    (add_cwl_management_components, ui_cwl_roster.py).
+def count_cwl_pool_members_missing_dm(guild_id: int, season: str) -> int:
+    """The number of this guild's currently-pooled, DM-able players who have never been sent the
+    enrollment DM by ANY guild this season (2026-08-23) — drives both the season overview's "New
+    players without DM invitation" line (format_clan_management_cwl_management, this file) and,
+    via has_cwl_pool_members_missing_dm() below, the "Notify New Pool Members" button's own
+    gating (add_cwl_management_components, ui_cwl_roster.py). One shared resolution so the
+    overview's count, the button's visibility, and what pressing the button actually does can
+    never drift apart.
 
-    Answers "would pressing that button actually reach anyone?", so it resolves the pool through
-    the very same resolve_cwl_pool_dm_targets_sync() the button itself (and Start Enrollment)
-    uses — anything else risks the button appearing for a pool the action then declines to DM, or
-    vice versa. Safe on this call path despite running straight on the event loop (Pitfall 26,
-    COPILOT_PITFALLS_COOKBOOK.md — add_cwl_management_components() is the synchronous CWL
-    Management screen render): the resolver is a handful of indexed lookups, not the
-    skill-score/avg-stars board payload builder."""
+    Resolves the pool through the same resolve_cwl_pool_dm_targets_sync() the button/Start
+    Enrollment use. Plain sync function (Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — safe to call
+    directly from add_cwl_management_components()'s synchronous render path (the resolver is a
+    handful of indexed lookups, not the skill-score/avg-stars board payload builder); the async
+    embed-render path wraps it in one asyncio.to_thread() hop instead."""
     db = CACHE.db_manager
     if db is None:
-        return False
+        return 0
     event = db.get_cwl_event_sync(str(guild_id), season)
     if event is None or event["status"] in ("draft", "cancelled"):
-        return False
+        return 0
 
     tags_with_discord = [
         target["player_tag"]
         for target in resolve_cwl_pool_dm_targets_sync(guild_id, event["id"], season)["targets"]
     ]
     if not tags_with_discord:
-        return False
+        return 0
 
     dm_status = db.get_cwl_player_season_dm_status_bulk_sync(tags_with_discord, season)
-    return not all(dm_status.get(tag, False) for tag in tags_with_discord)
+    return sum(1 for tag in tags_with_discord if not dm_status.get(tag, False))
+
+
+def has_cwl_pool_members_missing_dm(guild_id: int, season: str) -> bool:
+    """Rule h's button-gating check (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md) —
+    true when at least one of this guild's currently-pooled, DM-able players has never been sent
+    the enrollment DM by ANY guild this season. Drives the "Notify New Pool Members" button
+    (add_cwl_management_components, ui_cwl_roster.py). See count_cwl_pool_members_missing_dm()
+    for the shared resolution both this and the season overview's count line are built on."""
+    return count_cwl_pool_members_missing_dm(guild_id, season) > 0
 
 
 def resolve_prior_cwl_assignments(player_tags: List[str], participating_clan_tags: List[str]) -> Dict[str, str]:
