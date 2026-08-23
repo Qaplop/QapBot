@@ -1,6 +1,15 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (20)
+- Added: Phase 5a-bis of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- a
+  new /cwl preferences slash command (QBdiscordcmds.py), a second entry point into the same
+  player_prefs Activity screen CwlPlayerHubView's button opens, for guilds that never posted or
+  disabled the anchored hub message. No permission gate, guild-only, LAUNCH_ACTIVITY as the very
+  first response. Updated /help with a new "cwl preferences" entry (en/de.json).
+  Files: QBdiscordcmds.py, QapBot.py, qapbot/translations/{en,de}.json,
+  tests/discord/test_ui_cwl_roster.py. 2690 tests pass.
+
 2026-08-23 (19)
 - Added: Phase 5a+5c of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- the
   player-prefs bridge endpoints. New GET/POST /api/cwl/player-prefs and POST
