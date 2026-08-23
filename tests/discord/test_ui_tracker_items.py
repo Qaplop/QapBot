@@ -183,6 +183,23 @@ async def test_create_tracker_item_for_agent_respects_disabled_flag(monkeypatch,
         await create_tracker_item_for_agent(item_type="bug", title="T", description="D")
 
 
+async def test_create_tracker_item_for_agent_caps_overlong_title(monkeypatch, db):
+    """tracker item #0037: title has no client-side cap on this (non-Discord-modal) path, so an
+    over-length title must be truncated at creation -- otherwise the item becomes permanently
+    un-editable (opening Edit fails Discord's own max_length validation on the modal's default)."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_tracker import TRACKER_TITLE_MAX_LENGTH
+    CACHE.tracker_settings[TRACKER_SETTING_BUG_CHANNEL] = "1"
+    _wire_bot(monkeypatch, channel=_fake_channel())
+
+    result = await create_tracker_item_for_agent(
+        item_type="bug", title="x" * (TRACKER_TITLE_MAX_LENGTH + 20), description="D"
+    )
+
+    assert len(result["item"]["title"]) <= TRACKER_TITLE_MAX_LENGTH
+    assert result["item"]["title"].endswith("…")
+
+
 # -- attachment filename sanitizing -----------------------------------------
 
 def test_sanitize_filename_strips_path_traversal():
@@ -287,6 +304,23 @@ def test_modal_title_differs_by_type():
     bug_modal = TrackerItemModal("bug", guild_id=None, user_id="1")
     feature_modal = TrackerItemModal("feature", guild_id=None, user_id="1")
     assert bug_modal.title != feature_modal.title
+
+
+def test_modal_clamps_overlong_initial_title_on_edit():
+    """tracker item #0037: an item created before the creation-time cap existed (or via any
+    other path that skipped it) can still have a >100-char title stored. Opening Edit on it must
+    not construct a modal whose title field default itself exceeds max_length -- Discord rejects
+    that with a 400 before the modal is even shown, permanently blocking Edit on that item."""
+    from qapbot.ui_tracker import TRACKER_TITLE_MAX_LENGTH
+    overlong = "x" * (TRACKER_TITLE_MAX_LENGTH + 20)
+
+    modal = TrackerItemModal(
+        "bug", guild_id=None, user_id="1", item_number=42, initial_title=overlong,
+        initial_description="D",
+    )
+
+    assert len(modal.title_input.default) <= TRACKER_TITLE_MAX_LENGTH
+    assert modal.initial_title == modal.title_input.default  # on_submit's change-check stays consistent
 
 
 def test_modal_environment_and_priority_are_radio_groups_not_dropdowns():

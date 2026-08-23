@@ -122,6 +122,14 @@ def _normalize_priority(value: Optional[str]) -> str:
     key = (value or "").strip().upper()
     return key if key in PRIORITY_VALUES else DEFAULT_PRIORITY
 
+# Title length cap -- matches TrackerItemModal.title_input's max_length (Discord enforces this
+# for a human typing into the modal). A title set by a non-Discord path (create_tracker_item_for_
+# agent -- the MCP tool / bridge POST, neither of which goes through the modal) must be capped
+# to the same value, or the item becomes permanently un-editable: opening the Edit modal sets
+# this field's `default` to the stored title, and Discord rejects a modal whose default exceeds
+# its own max_length just as readily as it rejects one whose typed value does (tracker #0037).
+TRACKER_TITLE_MAX_LENGTH = 100
+
 # Attachment limits (plan §5.5)
 MAX_ATTACHMENTS_PER_ITEM = 5
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
@@ -520,7 +528,7 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
     (draft_view), or editing an already-posted item (item_number)."""
 
     # TextInput/Label MUST be class attributes for discord.py's Modal system (Cardinal Rule 10).
-    title_input = discord.ui.TextInput(label="Title", required=True, max_length=100)
+    title_input = discord.ui.TextInput(label="Title", required=True, max_length=TRACKER_TITLE_MAX_LENGTH)
     description_input = discord.ui.TextInput(
         label="Description", style=discord.TextStyle.paragraph, required=True, max_length=4000
     )
@@ -567,6 +575,15 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         self.user_id = user_id
         self.draft_view = draft_view
         self.item_number = item_number
+        # A title set through a non-Discord path (create_tracker_item_for_agent) is capped at
+        # creation now, but an already-existing item can still carry an over-length title from
+        # before that cap existed -- clamp here too so opening Edit on one of those doesn't 400
+        # (Discord rejects a modal whose pre-filled default exceeds the field's own max_length,
+        # tracker #0037). Clamped before assigning to self.initial_title, not after, so on_submit's
+        # "did the title change" comparison lines up with what the modal actually displays -- an
+        # edit that leaves this field untouched must not look like a change.
+        if len(initial_title) > TRACKER_TITLE_MAX_LENGTH:
+            initial_title = initial_title[:TRACKER_TITLE_MAX_LENGTH - 1].rstrip() + "…"
         # Pre-edit values (item_number path only) so on_submit can tell whether title/
         # description/details actually changed (tracker item #0029 -- only a genuine text
         # change should re-post the untruncated text into the discussion thread).
@@ -919,6 +936,11 @@ async def create_tracker_item_for_agent(
 
     normalized_priority = _normalize_priority(priority)
     normalized_environment = _normalize_environment(environment) if item_type == "bug" and environment else None
+    # No Discord modal here to cap this client-side (tracker #0037) -- title must still fit
+    # TRACKER_TITLE_MAX_LENGTH, or a later Edit-button click can't open the modal at all
+    # (Discord rejects a modal whose pre-filled default exceeds its own field's max_length).
+    if len(title) > TRACKER_TITLE_MAX_LENGTH:
+        title = title[:TRACKER_TITLE_MAX_LENGTH - 1].rstrip() + "…"
 
     db = CACHE.db_manager
     item_number = await db.create_tracker_item(
