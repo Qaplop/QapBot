@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (18)
+- Added: Phase 3 of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- repost wiring.
+  New repost_cwl_player_hub_messages() (QapBot.py), wired into all three existing repost call
+  sites including a new on_ready() Step 8c mirroring the admin hub's unconditional startup
+  repost. Pulled forward the pure-Python slice of the later Activity-screen phase that this
+  needed to avoid a hard import failure at every startup: build_cwl_player_hub_content_and_view()
+  and CwlPlayerHubView (ui_cwl_roster.py), a persistent single-button anchored view registered
+  in _setup_hook() the same way as the admin CWL Management Hub. The button opens the Activity
+  on a screen name ('player_prefs') the client doesn't handle yet -- that lands in a later
+  session; no Worker/client code touched here, no deploy needed. The toggle from Phase 2 that
+  enables this message defaults off for every guild, so nothing changes for real users yet.
+  Files: QapBot.py, qapbot/ui_cwl_roster.py, qapbot/translations/en.json,
+  qapbot/translations/de.json, tests/discord/test_ui_cwl_roster.py,
+  tests/unit/test_repost_cwl_player_hub_messages.py. 2666 tests pass.
+
 2026-08-23 (17)
 - Added: Phase 2 of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- admin config
   entry point. New "Player CWL Settings Hub" channel slot alongside the existing admin "CWL
