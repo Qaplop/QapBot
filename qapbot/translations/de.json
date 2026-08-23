@@ -931,6 +931,7 @@
       "table_header_roster": "Kader",
       "table_header_start": "CWL-Start",
       "signup_status_pending": "Ausstehend",
+      "signup_status_unlinked": "Nicht verknüpft (ausstehend)",
       "signup_status_confirmed": "Bestätigt",
       "signup_status_declined": "Abgelehnt",
       "signup_status_withdrawn": "Zurückgezogen",
@@ -971,7 +972,15 @@
       "notify_new_members_summary": "✅ Fertig.\nKontaktiert: {contacted}\nÜbersprungen (DM-Schutz): {skipped_dm_guard}\nBereits kontaktiert (anderer Guild): {skipped_already_dm_globally}\nÜbersprungen (kein verknüpfter Account): {skipped_unlinked}{dm_issues}",
       "notify_new_members_error_no_database": "⚠️ Datenbank nicht bereit — bitte gleich erneut versuchen.",
       "notify_new_members_error_no_event": "⚠️ Für diese Saison wurde kein CWL-Event mehr gefunden — es wurde möglicherweise gelöscht.",
-      "notify_new_members_error_not_open": "⚠️ Die Anmeldephase für diese Saison wurde noch nicht gestartet."
+      "notify_new_members_error_not_open": "⚠️ Die Anmeldephase für diese Saison wurde noch nicht gestartet.",
+      "button_remind_pending": "Ausstehende erinnern",
+      "button_confirm_remind_pending": "Ja, Erinnerungen senden",
+      "remind_pending_confirm_body": "📋 Sollen alle Mitglieder mit noch ausstehender CWL-Anmeldung für Saison **{season}** per DM an ihre Antwort erinnert werden? Ihre bisherige Anmeldungs-DM wird dabei entfernt und durch eine neue ersetzt.",
+      "remind_pending_processing": "⏳ Erinnerungen werden an ausstehende Mitglieder gesendet, dies kann einige Sekunden dauern…",
+      "remind_pending_summary": "✅ Fertig.\nErinnert (Accounts): {contacted}\nErinnert (Discord-Nutzer): {contacted_users}\nÜbersprungen (DM-Schutz): {skipped_dm_guard}\nÜbersprungen (kein verknüpfter Account): {skipped_unlinked}\nÜbersprungen (dauerhaft abgemeldet): {skipped_optout}{dm_issues}",
+      "remind_pending_error_no_database": "⚠️ Datenbank nicht bereit — bitte gleich erneut versuchen.",
+      "remind_pending_error_no_event": "⚠️ Für diese Saison wurde kein CWL-Event mehr gefunden — es wurde möglicherweise gelöscht.",
+      "remind_pending_error_not_open": "⚠️ Die Anmeldephase für diese Saison wurde noch nicht gestartet."
     },
     "setup": {
       "button_cancel": "Abbrechen"
@@ -986,6 +995,12 @@
       "not_your_signup": "⚠️ Diese Anmeldung gehört zu einem anderen Account.",
       "signup_closed": "⚠️ Die Anmeldung ist für diese Saison nicht mehr offen.",
       "db_unavailable": "⚠️ Datenbank nicht bereit — bitte gleich erneut versuchen."
+    },
+    "reminder": {
+      "dm_intro_body": "👋 Hallo **{display_name}**,\n\nfür die CWL-Saison **{season}** warten wir noch auf deine Rückmeldung — du hast aktuell **{count}** offene Anmeldung(en) im CWL-Kader-Pool, auf die wir bisher keine Antwort von dir erhalten haben.\n\nBitte bestätige oder melde dich in der nächsten Nachricht so schnell wie möglich ab — dort findest du für jeden deiner Accounts eigene Bestätigen-/Abmelden-Buttons. Deine schnelle Rückmeldung hilft uns sehr bei der Kaderplanung dieser Saison.",
+      "dm_buttons_intro": "📋 Bitte beantworte jede deiner noch offenen CWL-Anmeldungen für Saison **{season}** unten:",
+      "confirm_button_labeled": "✅ {player_name}",
+      "optout_button_labeled": "❌ {player_name}"
     }
   }
 }

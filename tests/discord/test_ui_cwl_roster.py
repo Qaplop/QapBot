@@ -1952,6 +1952,150 @@ class TestCwlSignupResponseButton:
 
 
 # ---------------------------------------------------------------------------
+# CwlReminderResponseButton — tracker #0038's combined-message reminder button
+# ---------------------------------------------------------------------------
+
+class TestCwlReminderResponseButton:
+    def test_template_matches_valid_custom_id(self):
+        import re
+        from qapbot.ui_cwl_roster import CWL_REMINDER_RESPONSE_TEMPLATE
+
+        m = re.match(CWL_REMINDER_RESPONSE_TEMPLATE, "cwl:remind:confirm:42:#ABC12")
+        assert m is not None
+        assert m.group("action") == "confirm"
+        assert m.group("event_id") == "42"
+        assert m.group("player_tag") == "#ABC12"
+
+    def test_template_does_not_collide_with_the_original_signup_button(self):
+        """Own custom_id namespace — the two button classes must never both match the same
+        string, or add_dynamic_items() could route a click to the wrong handler."""
+        import re
+        from qapbot.ui_cwl_roster import CWL_REMINDER_RESPONSE_TEMPLATE, CWL_SIGNUP_RESPONSE_TEMPLATE
+
+        assert re.match(CWL_REMINDER_RESPONSE_TEMPLATE, "cwl:signup:confirm:42:#ABC12") is None
+        assert re.match(CWL_SIGNUP_RESPONSE_TEMPLATE, "cwl:remind:confirm:42:#ABC12") is None
+
+    @pytest.mark.asyncio
+    async def test_from_custom_id_reconstructs_state(self):
+        import re
+        from qapbot.ui_cwl_roster import CWL_REMINDER_RESPONSE_TEMPLATE, CwlReminderResponseButton
+
+        match = re.match(CWL_REMINDER_RESPONSE_TEMPLATE, "cwl:remind:optout:7:#ZZZ1")
+        item = await CwlReminderResponseButton.from_custom_id(MagicMock(), MagicMock(), match)
+        assert item.action == "optout"
+        assert item.event_id == 7
+        assert item.player_tag == "#ZZZ1"
+
+    def test_build_view_puts_one_row_per_account(self):
+        from qapbot.ui_cwl_roster import CwlReminderResponseButton, build_cwl_reminder_response_view
+
+        accounts = [
+            {"player_tag": "#A1", "player_name": "Alt One"},
+            {"player_tag": "#A2", "player_name": "Alt Two"},
+        ]
+        view = build_cwl_reminder_response_view(42, accounts, guild_id=None)
+
+        buttons = [item for item in view.children if isinstance(item, CwlReminderResponseButton)]
+        assert len(buttons) == 4  # confirm + decline per account
+        assert {b.player_tag for b in buttons} == {"#A1", "#A2"}
+        assert {b.row for b in buttons} == {0, 1}
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
+    async def test_confirm_click_finalizes_when_it_was_the_users_only_pending_account(
+        self, db, mock_interaction
+    ):
+        """Same end state as the original single-account button: nothing left pending for this
+        user, so the message becomes a plain confirmation with no buttons."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlReminderResponseButton
+
+        await _seed_guild_and_clans(db, "9201", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9201", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "123456789", None, "template_confirm", "pending")
+
+        mock_interaction.user.id = 123456789
+        mock_interaction.response.edit_message = AsyncMock()
+
+        button = CwlReminderResponseButton("confirm", event_id, "#P1")
+        await button.callback(mock_interaction)
+
+        assert db.get_cwl_signup_sync(event_id, "#P1")["status"] == "confirmed"
+        mock_interaction.response.edit_message.assert_awaited_once()
+        _, kwargs = mock_interaction.response.edit_message.call_args
+        assert kwargs["view"] is None
+        assert "Alpha" in kwargs["content"]
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
+    async def test_confirm_click_leaves_siblings_pending_when_more_accounts_remain(
+        self, db, mock_interaction
+    ):
+        """The whole reason this is a separate button class from CwlSignupResponseButton: one
+        account's click must not wipe the other still-pending accounts' buttons out of the same
+        combined message."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlReminderResponseButton
+
+        await _seed_guild_and_clans(db, "9202", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9202", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#ALT1", "AltOne", "123456789", None, "template_confirm", "pending")
+        db.upsert_cwl_signup_sync(event_id, "#ALT2", "AltTwo", "123456789", None, "template_confirm", "pending")
+        # The remaining-group re-derivation reads the LIVE link (user_players), not the
+        # cwl_signups snapshot's dmed_discord_id — both accounts need a real link row here.
+        await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('123456789', 'U')")
+        await db.conn.execute(
+            "INSERT INTO user_players (discord_id, player_tag, player_name, verified) VALUES "
+            "('123456789', '#ALT1', 'AltOne', 0), ('123456789', '#ALT2', 'AltTwo', 0)"
+        )
+        await db.conn.commit()
+
+        mock_interaction.user.id = 123456789
+        mock_interaction.response.edit_message = AsyncMock()
+
+        button = CwlReminderResponseButton("confirm", event_id, "#ALT1")
+        await button.callback(mock_interaction)
+
+        assert db.get_cwl_signup_sync(event_id, "#ALT1")["status"] == "confirmed"
+        assert db.get_cwl_signup_sync(event_id, "#ALT2")["status"] == "pending"  # sibling untouched
+        mock_interaction.response.edit_message.assert_awaited_once()
+        _, kwargs = mock_interaction.response.edit_message.call_args
+        assert kwargs["view"] is not None  # still has AltTwo's buttons — not wiped
+
+    @pytest.mark.discord
+    @pytest.mark.asyncio
+    async def test_click_by_wrong_account_is_rejected_without_touching_the_message(
+        self, db, mock_interaction
+    ):
+        from qapbot.cache_manager import CACHE
+        from qapbot.ui_cwl_roster import CwlReminderResponseButton
+
+        await _seed_guild_and_clans(db, "9203", {"#CLAN1": "Alpha"})
+        CACHE.db_manager = db
+        event_id = db.create_cwl_event_sync("9203", "2026-08", "discordid1")
+        db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "111111111", None, "template_confirm", "pending")
+
+        mock_interaction.user.id = 999999999  # different account
+        mock_interaction.response.send_message = AsyncMock()
+        mock_interaction.response.edit_message = AsyncMock()
+
+        button = CwlReminderResponseButton("confirm", event_id, "#P1")
+        await button.callback(mock_interaction)
+
+        mock_interaction.response.send_message.assert_awaited_once()
+        mock_interaction.response.edit_message.assert_not_awaited()
+        assert db.get_cwl_signup_sync(event_id, "#P1")["status"] == "pending"  # unchanged
+
+
+# ---------------------------------------------------------------------------
 # find_active_cwl_participation — the guild-clan-removal safety check
 # (CWL_ROSTER_PLANNING_PLAN.md, 2026-08-10 fix)
 # ---------------------------------------------------------------------------

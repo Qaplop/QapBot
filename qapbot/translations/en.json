@@ -931,6 +931,7 @@
       "table_header_roster": "Roster",
       "table_header_start": "CWL Start",
       "signup_status_pending": "Pending",
+      "signup_status_unlinked": "Unlinked (pending)",
       "signup_status_confirmed": "Confirmed",
       "signup_status_declined": "Declined",
       "signup_status_withdrawn": "Withdrawn",
@@ -971,7 +972,15 @@
       "notify_new_members_summary": "✅ Done.\nContacted: {contacted}\nSkipped (DM guard): {skipped_dm_guard}\nAlready contacted (another guild): {skipped_already_dm_globally}\nSkipped (no linked account): {skipped_unlinked}{dm_issues}",
       "notify_new_members_error_no_database": "⚠️ Database not ready — try again shortly.",
       "notify_new_members_error_no_event": "⚠️ No CWL event found for this season anymore — it may have been deleted.",
-      "notify_new_members_error_not_open": "⚠️ Enrollment hasn't been started yet for this season."
+      "notify_new_members_error_not_open": "⚠️ Enrollment hasn't been started yet for this season.",
+      "button_remind_pending": "Remind Pending",
+      "button_confirm_remind_pending": "Yes, send reminders",
+      "remind_pending_confirm_body": "📋 Send every member with a still-pending CWL sign-up for season **{season}** a reminder DM? Their existing sign-up DM will be removed and replaced with a new one.",
+      "remind_pending_processing": "⏳ Sending reminders to pending members, this can take a few seconds…",
+      "remind_pending_summary": "✅ Done.\nReminded (accounts): {contacted}\nReminded (Discord users): {contacted_users}\nSkipped (DM guard): {skipped_dm_guard}\nSkipped (no linked account): {skipped_unlinked}\nSkipped (permanently opted out): {skipped_optout}{dm_issues}",
+      "remind_pending_error_no_database": "⚠️ Database not ready — try again shortly.",
+      "remind_pending_error_no_event": "⚠️ No CWL event found for this season anymore — it may have been deleted.",
+      "remind_pending_error_not_open": "⚠️ Enrollment hasn't been started yet for this season."
     },
     "setup": {
       "button_cancel": "Cancel"
@@ -986,6 +995,12 @@
       "not_your_signup": "⚠️ This sign-up belongs to a different account.",
       "signup_closed": "⚠️ Sign-up isn't open for this season anymore.",
       "db_unavailable": "⚠️ Database not ready — try again shortly."
+    },
+    "reminder": {
+      "dm_intro_body": "👋 Hi **{display_name}**,\n\nwe're still waiting on your reply for CWL season **{season}** — you currently have **{count}** pending sign-up(s) in the CWL roster pool that we haven't heard back from you about.\n\nPlease confirm or opt out in the next message as soon as you can — you'll find a separate Confirm/Opt Out button pair for each of your accounts there. A fast reply really helps us with roster planning this season.",
+      "dm_buttons_intro": "📋 Please answer each of your still-pending CWL sign-ups for season **{season}** below:",
+      "confirm_button_labeled": "✅ {player_name}",
+      "optout_button_labeled": "❌ {player_name}"
     }
   }
 }

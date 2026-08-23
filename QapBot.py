@@ -2858,6 +2858,12 @@ async def _setup_hook():
     QBcore.bot.add_dynamic_items(CwlSignupResponseButton)
     logging.info("[SETUP_HOOK] Registered persistent CwlSignupResponseButton dynamic item for restart-surviving DM buttons")
 
+    # "Remind Pending" combined-message confirm/decline buttons (tracker #0038) — own custom_id
+    # namespace (cwl:remind:... vs. cwl:signup:... above), same restart-survival reasoning.
+    from qapbot.ui_cwl_roster import CwlReminderResponseButton
+    QBcore.bot.add_dynamic_items(CwlReminderResponseButton)
+    logging.info("[SETUP_HOOK] Registered persistent CwlReminderResponseButton dynamic item for restart-surviving DM buttons")
+
     # Bug/feature tracker item buttons (BUG_FEATURE_TRACKER_PLAN.md Phase 3/5) — DynamicItems so
     # a bot restart between posting an item/test-case message and a click still resolves
     # correctly. Registered unconditionally: genuinely harmless on DEV here, unlike the

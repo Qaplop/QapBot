@@ -760,6 +760,70 @@ async def notify_new_cwl_pool_members(guild_id: int, season: str) -> Dict[str, A
     return {"ok": True, **dm_result}
 
 
+async def remind_pending_cwl_players(guild_id: int, season: str) -> Dict[str, Any]:
+    """Tracker #0038's "Remind Pending" action: retracts each still-pending, linked player's old
+    invitation DM, clears their global dm_sent dedup (both required BEFORE re-sending, same order
+    _reset_and_resend_enrollment_dm uses for the single-player "reset to pending" action), then
+    sends one combined reminder DM group per Discord user via send_cwl_reminder_dm_group
+    (QBdiscocmdshelper_cwl.py) — grouping by Discord user rather than by account is the whole
+    point of this action (project owner's spec): someone with several pending alt accounts gets
+    one personal intro DM plus one buttons DM covering all of them, not N separate DMs.
+
+    Pool resolution (resolve_cwl_pending_reminder_targets_sync) is deliberately its own function,
+    not a reuse of resolve_cwl_pool_dm_targets_sync — that one's global dm_sent dedup would skip
+    everyone already DMed, which is precisely who this action needs to re-reach."""
+    from qapbot.QBdiscocmdshelper_cwl import (
+        _dm_guard_blocks,
+        _retract_enrollment_dms_for_tags,
+        resolve_cwl_pending_reminder_targets_sync,
+        send_cwl_reminder_dm_group,
+    )
+
+    db = CACHE.db_manager
+    if db is None:
+        return {"ok": False, "error": "no_database"}
+    event = await asyncio.to_thread(db.get_cwl_event_sync, str(guild_id), season)
+    if event is None:
+        return {"ok": False, "error": "no_event"}
+    if event["status"] in ("draft", "cancelled"):
+        return {"ok": False, "error": "not_open"}
+
+    pool = await asyncio.to_thread(resolve_cwl_pending_reminder_targets_sync, event["id"])
+    summary: Dict[str, Any] = {
+        "ok": True, "contacted": 0, "contacted_users": 0,
+        "skipped_dm_guard": 0, "skipped_unlinked": pool["skipped_unlinked"],
+        "skipped_optout": pool["skipped_optout"],
+        "blocked": [], "no_mutual_guild": [], "failed": [],
+    }
+    for discord_id, accounts in pool["groups"].items():
+        if _dm_guard_blocks(discord_id):
+            summary["skipped_dm_guard"] += len(accounts)
+            continue
+
+        tags = [a["player_tag"] for a in accounts]
+        await _retract_enrollment_dms_for_tags(event["id"], tags, "Remind Pending")
+        for tag in tags:
+            await asyncio.to_thread(db.clear_cwl_player_dm_sent_sync, tag, season)
+
+        group_result = await send_cwl_reminder_dm_group(event["id"], guild_id, season, discord_id, accounts)
+        summary["contacted"] += group_result["contacted"]
+        if group_result["contacted"]:
+            summary["contacted_users"] += 1
+        summary["blocked"].extend(group_result["blocked"])
+        summary["no_mutual_guild"].extend(group_result["no_mutual_guild"])
+        summary["failed"].extend(group_result["failed"])
+
+    logging.info(
+        f"[CWL-ENROLLMENT] Remind Pending complete: guild={guild_id} season={season} "
+        f"event={event['id']} contacted_accounts={summary['contacted']} "
+        f"contacted_users={summary['contacted_users']} skipped_dm_guard={summary['skipped_dm_guard']} "
+        f"skipped_unlinked={summary['skipped_unlinked']} skipped_optout={summary['skipped_optout']} "
+        f"blocked={len(summary['blocked'])} no_mutual_guild={len(summary['no_mutual_guild'])} "
+        f"failed={len(summary['failed'])}"
+    )
+    return summary
+
+
 # CWL Guests search (2026-08-17 PROD meltdown fix): the search used to be an uncapped scan
 # over CACHE.clan_name_cache (~430K entries) and, in `#` mode, CACHE.player_name_index
 # (~6.6M entries) — a short prefix like "#2" accumulated millions of hits before the [:12] cap

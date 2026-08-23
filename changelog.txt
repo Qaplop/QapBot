@@ -1,6 +1,28 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (10)
+- Added: tracker #0038 "Remind Pending" -- a new CWL Management button that re-DMs everyone whose
+  CWL sign-up is still pending and has a live Discord link. Grouped by Discord user, not by
+  account (project owner's spec): a verbose, personally-addressed intro DM, followed by one or
+  more combined confirm/decline-button DMs covering every one of that user's pending accounts at
+  once, after retracting their old per-account invitation DM(s) and clearing the dm_sent dedup.
+  Needed a second DynamicItem button class (CwlReminderResponseButton, own cwl:remind:... custom_id
+  namespace) since the original CwlSignupResponseButton wipes its whole message on response --
+  wrong when several accounts share one message; the new button re-derives the clicking user's
+  remaining pending accounts live and re-renders instead. Shares ownership/propagation logic with
+  the original via a new _apply_cwl_signup_response() helper extracted from
+  CwlSignupResponseButton.callback().
+  Fixed alongside: investigating this surfaced a real discrepancy the project owner flagged -- the
+  season overview's "Ausstehend" count included pending signups with no linked Discord account at
+  all (unreachable), while the Teams-verwalten board only shows a pending icon for the linked half.
+  The overview now shows both counts separately (new "Nicht verknuepft (ausstehend)" line), via
+  split_cwl_pending_signups_by_link_sync().
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/web_bridge.py, qapbot/ui_cwl_roster.py,
+  QapBot.py, qapbot/translations/en.json, qapbot/translations/de.json,
+  qapbot/docs/REGISTRATION_MESSAGE_WORKFLOWS.md, plans/tracker-0038-remind-pending-cwl.md,
+  tests/unit/test_cwl_remind_pending.py, tests/discord/test_ui_cwl_roster.py. 2605 tests pass.
+
 2026-08-23 (9)
 - Added: send_user_dm_detailed()'s discord.Forbidden handler (qapbot/cache_manager.py) now
   distinguishes Discord error code 50278 ("Cannot send messages to this user due to having no

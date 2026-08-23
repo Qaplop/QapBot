@@ -401,6 +401,24 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
             notify_new_members_button.callback = _make_cwl_management_notify_new_members_callback(view)  # type: ignore[assignment]
             view.add_item(notify_new_members_button)  # type: ignore[arg-type]
 
+    # "Remind Pending" (tracker #0038, 2026-08-23) — same "omit entirely rather than disable,
+    # row 4" convention as "Notify New Pool Members" directly above, gated by
+    # has_cwl_pending_signups_to_remind (mirrors has_cwl_pool_members_missing_dm's own shape:
+    # event status not draft/cancelled, at least one still-pending signup with a live Discord
+    # link to actually DM).
+    if event is not None and event["status"] not in ("draft", "cancelled"):
+        from qapbot.QBdiscocmdshelper_cwl import has_cwl_pending_signups_to_remind
+
+        if has_cwl_pending_signups_to_remind(guild_id, season):
+            remind_pending_button = discord.ui.Button(
+                label=t('cwl.management.button_remind_pending', guild_id=guild_id),
+                style=discord.ButtonStyle.success,
+                custom_id="cwl_management_remind_pending",
+                row=4,
+            )
+            remind_pending_button.callback = _make_cwl_management_remind_pending_callback(view)  # type: ignore[assignment]
+            view.add_item(remind_pending_button)  # type: ignore[arg-type]
+
     if event is not None:
         # Surfaced so an admin opening this screen can see at a glance whether every
         # participating clan already has a start time set (Finalize, Phase 4, will require it).
@@ -1158,6 +1176,34 @@ def _make_cwl_management_notify_new_members_callback(view: discord.ui.View):
     return callback
 
 
+def _make_cwl_management_remind_pending_callback(view: discord.ui.View):
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        if not interaction.guild:
+            return
+        from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+
+        db = CACHE.db_manager
+        season = resolve_selected_cwl_season(interaction.guild.id)
+        event = db.get_cwl_event_sync(str(interaction.guild.id), season) if db is not None else None
+        if event is None:
+            return
+        confirm_view = CwlRemindPendingConfirmView(
+            parent_view=view,
+            guild_id=interaction.guild.id,
+            season=event["cwl_season"],
+        )
+        await interaction.followup.send(
+            confirm_view._build_content(),  # type: ignore[attr-defined]
+            view=confirm_view,
+            ephemeral=True,
+        )
+
+    return callback
+
+
 class CwlNotifyNewMembersConfirmView(discord.ui.View):
     """Confirm/cancel dialog for rule h's "Notify New Pool Members" (2026-08-18,
     CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md) — sends real DMs, so not a single-click action,
@@ -1255,6 +1301,103 @@ class CwlNotifyNewMembersConfirmView(discord.ui.View):
             pass
 
 
+class CwlRemindPendingConfirmView(discord.ui.View):
+    """Confirm/cancel dialog for tracker #0038's "Remind Pending" action — sends real DMs, so not
+    a single-click action, mirroring CwlNotifyNewMembersConfirmView's own shape exactly (including
+    its double-click guard: buttons disabled + edit_message() before the long-running send)."""
+
+    def __init__(self, parent_view: discord.ui.View, guild_id: int, season: str, timeout: int = 60):
+        super().__init__(timeout=timeout)
+        self.parent_view = parent_view
+        self.guild_id = guild_id
+        self.season = season
+
+        from qapbot.i18n import t
+
+        confirm_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.management.button_confirm_remind_pending', guild_id=guild_id),
+            style=discord.ButtonStyle.success,
+            custom_id="cwl_remind_pending_confirm",
+        )
+        confirm_button.callback = self._on_confirm  # type: ignore[assignment]
+        self.add_item(confirm_button)
+
+        cancel_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.setup.button_cancel', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_remind_pending_cancel",
+        )
+        cancel_button.callback = self._on_cancel  # type: ignore[assignment]
+        self.add_item(cancel_button)
+
+    def _build_content(self) -> str:
+        from qapbot.i18n import t
+
+        return t('cwl.management.remind_pending_confirm_body', guild_id=self.guild_id, season=self.season)
+
+    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        from qapbot.i18n import t
+
+        for item in self.children:
+            item.disabled = True  # type: ignore[union-attr]
+        await interaction.response.edit_message(
+            content=t('cwl.management.remind_pending_processing', guild_id=self.guild_id), view=self
+        )
+        from qapbot.web_bridge import remind_pending_cwl_players
+
+        result = await remind_pending_cwl_players(self.guild_id, self.season)
+        if not result["ok"]:
+            content = t(f"cwl.management.remind_pending_error_{result['error']}", guild_id=self.guild_id)
+        else:
+            # Same blocked/failed reporting shape as Start Enrollment's own summary — reuses
+            # those same i18n lines, generic enough to apply to any DM batch.
+            dm_issues = ""
+            if result["blocked"]:
+                dm_issues += t(
+                    'cwl.management.start_enrollment_dm_blocked_line',
+                    guild_id=self.guild_id, names=", ".join(result["blocked"]),
+                )
+            if result["no_mutual_guild"]:
+                dm_issues += t(
+                    'cwl.management.start_enrollment_dm_no_mutual_guild_line',
+                    guild_id=self.guild_id, names=", ".join(result["no_mutual_guild"]),
+                )
+            if result["failed"]:
+                from qapbot.cache_manager import DM_SEND_MAX_RETRIES
+
+                dm_issues += t(
+                    'cwl.management.start_enrollment_dm_failed_line',
+                    guild_id=self.guild_id, retries=DM_SEND_MAX_RETRIES, names=", ".join(result["failed"]),
+                )
+            content = t(
+                'cwl.management.remind_pending_summary',
+                guild_id=self.guild_id,
+                contacted=result["contacted"],
+                contacted_users=result["contacted_users"],
+                skipped_dm_guard=result["skipped_dm_guard"],
+                skipped_unlinked=result["skipped_unlinked"],
+                skipped_optout=result["skipped_optout"],
+                dm_issues=dm_issues,
+            )
+        try:
+            await interaction.edit_original_response(content=content, view=None)
+        except discord.NotFound:
+            pass
+        if result["ok"]:
+            await _refresh_parent(self.parent_view, interaction, "cwl_management")
+            from qapbot.web_bridge import bump_enrollment_version
+            await bump_enrollment_version(self.guild_id)
+
+    async def _on_cancel(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        try:
+            await interaction.delete_original_response()
+        except discord.NotFound:
+            pass
+
+
 class CwlOpenEnrollmentView(discord.ui.View):
     """One-button follow-up shown on Start Enrollment's completion message (2026-08-16,
     live-testing feedback, project owner's spec: "when starting the enrollment process the 'Teams
@@ -1302,6 +1445,87 @@ def build_cwl_signup_response_view(event_id: int, player_tag: str, guild_id: Opt
     return view
 
 
+async def _apply_cwl_signup_response(
+    event_id: int, player_tag: str, action: str, user_id_str: str,
+) -> Dict[str, Any]:
+    """Shared response-recording logic for CWL sign-up confirm/opt-out buttons — extracted from
+    CwlSignupResponseButton.callback() (2026-08-23, tracker #0038) so CwlReminderResponseButton's
+    combined-message variant applies the exact same ownership/propagation rules rather than
+    duplicating them. Does everything EXCEPT the final interaction response, since the two callers
+    render it differently: the original button replaces its whole single-account DM, while the
+    combined-message button must leave sibling accounts' buttons in the same message untouched.
+
+    Returns {"code": "db_unavailable"|"no_longer_valid"|"not_your_signup"|"signup_closed"|"ok",
+    "guild_id": Optional[int], "player_name": Optional[str]} — every code maps 1:1 onto an
+    existing `cwl.template.*` i18n key of the same name, so callers can format the ephemeral
+    error with `t(f'cwl.template.{code}', ...)` directly. `guild_id`/`player_name` are filled in
+    whenever known (None is a safe, already-established value for `t()`'s optional guild_id)."""
+    db = CACHE.db_manager
+    if db is None:
+        return {"code": "db_unavailable", "guild_id": None, "player_name": None}
+
+    # Never trust a caller's own cached state beyond routing (action/event_id/player_tag) —
+    # always re-read cwl_signups/cwl_events live, since the event may have moved to
+    # finalized/cancelled (or this row may no longer exist) since the DM was sent.
+    event = await asyncio.to_thread(db.get_cwl_event_by_id_sync, event_id)
+    signup = await asyncio.to_thread(db.get_cwl_signup_sync, event_id, player_tag)
+    # The live owner from user_players, alongside the snapshot's (2026-08-22). cwl_signups is
+    # written once by Start Enrollment and never refreshed, so its recorded recipient can name a
+    # Discord user who no longer owns this account — see Pitfall 37.
+    links = await asyncio.to_thread(db.get_player_links_sync, [player_tag])
+    live_discord_id = (links.get(player_tag) or {}).get("discord_id")
+    guild_id = int(event["guild_id"]) if event is not None else None
+
+    if event is None or signup is None:
+        return {"code": "no_longer_valid", "guild_id": guild_id, "player_name": None}
+    # Account protection (Cardinal Rule 2): a third party who is neither owner is still rejected.
+    # Both owners are accepted deliberately — the DM was genuinely delivered to the snapshot
+    # owner, so their button must keep working, while the CURRENT owner must not be locked out of
+    # responding for their own account. An empty set of known owners means nobody was ever
+    # recorded for this tag — the click is allowed through.
+    known_owner_ids = {oid for oid in (signup.get("dmed_discord_id"), live_discord_id) if oid}
+    if known_owner_ids and user_id_str not in known_owner_ids:
+        return {"code": "not_your_signup", "guild_id": guild_id, "player_name": signup.get("player_name")}
+    if event["status"] != "signup_open":
+        return {"code": "signup_closed", "guild_id": guild_id, "player_name": signup.get("player_name")}
+
+    new_status = "confirmed" if action == "confirm" else "declined"
+    source = "template_confirm" if action == "confirm" else "template_optout"
+    responded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    # to_thread()-wrapped (Pitfall 26) — this is hit by every member responding to a CWL signup
+    # template, so an unwrapped write here is a high-traffic instance of the whole-bot-freeze risk.
+    # Persist the LIVE owner, not the snapshot's (2026-08-22) — writing the recorded recipient
+    # straight back is what made the staleness self-perpetuating. Falls back to the snapshot when
+    # user_players has no row for this tag at all (a guest tag added by search that was never
+    # linked), so a never-linked signup keeps whatever it had rather than being blanked.
+    owner_discord_id = live_discord_id or signup.get("dmed_discord_id")
+    await asyncio.to_thread(
+        db.upsert_cwl_signup_sync,
+        event_id, player_tag, signup.get("player_name"), owner_discord_id,
+        signup.get("preferred_league_rank"), source, new_status, responded_at=responded_at,
+    )
+    # rule h (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md) — this DM's custom_id only
+    # ever names ONE event_id, but the SAME real-world player may be pooled by other guilds too
+    # for this same season; propagate_cwl_player_response() writes the global source of truth and
+    # fans this exact response out to every one of those guilds' own local boards.
+    from qapbot.QBdiscocmdshelper_cwl import propagate_cwl_player_response
+
+    affected_guild_ids = await propagate_cwl_player_response(
+        player_tag, event["cwl_season"], new_status, responded_at,
+        signup.get("player_name"), owner_discord_id, event_id, guild_id or 0,
+    )
+    # Step 8 (2026-08-17) — a player confirming/opting out via a DM button never updated an open
+    # Manage Enrollment board on its own; bump every affected guild's board version here.
+    from qapbot.web_bridge import bump_enrollment_version
+
+    if guild_id is not None:
+        await bump_enrollment_version(guild_id)
+    for other_guild_id in affected_guild_ids:
+        await bump_enrollment_version(other_guild_id)
+
+    return {"code": "ok", "guild_id": guild_id, "player_name": signup.get("player_name") or player_tag}
+
+
 class CwlSignupResponseButton(
     discord.ui.DynamicItem[discord.ui.Button],  # type: ignore[type-arg]
     template=CWL_SIGNUP_RESPONSE_TEMPLATE,
@@ -1338,104 +1562,166 @@ class CwlSignupResponseButton(
     async def callback(self, interaction: discord.Interaction) -> None:
         from qapbot.i18n import t
 
-        db = CACHE.db_manager
         user_id_str = str(interaction.user.id)
-        if db is None:
+        result = await _apply_cwl_signup_response(self.event_id, self.player_tag, self.action, user_id_str)
+        guild_id = result["guild_id"]
+
+        if result["code"] != "ok":
             await interaction.response.send_message(
-                t('cwl.template.db_unavailable', user_id=user_id_str), ephemeral=True
+                t(f'cwl.template.{result["code"]}', user_id=user_id_str, guild_id=guild_id), ephemeral=True
             )
             return
-
-        # Never trust the reconstructed item's own state beyond routing (action/event_id/
-        # player_tag) — always re-read cwl_signups/cwl_events live, since the event may have
-        # moved to finalized/cancelled (or this row may no longer exist) since the DM was sent.
-        event = await asyncio.to_thread(db.get_cwl_event_by_id_sync, self.event_id)
-        signup = await asyncio.to_thread(db.get_cwl_signup_sync, self.event_id, self.player_tag)
-        # The live owner from user_players, alongside the snapshot's (2026-08-22). cwl_signups is
-        # written once by Start Enrollment and never refreshed, so its recorded recipient can name a
-        # Discord user who no longer owns this account — see Pitfall 37.
-        links = await asyncio.to_thread(db.get_player_links_sync, [self.player_tag])
-        live_discord_id = (links.get(self.player_tag) or {}).get("discord_id")
-        guild_id = int(event["guild_id"]) if event is not None else None
-
-        if event is None or signup is None:
-            await interaction.response.send_message(
-                t('cwl.template.no_longer_valid', user_id=user_id_str, guild_id=guild_id), ephemeral=True
-            )
-            return
-        # Account protection (Cardinal Rule 2): a third party who is neither owner is still
-        # rejected. Both owners are accepted deliberately — the DM was genuinely delivered to the
-        # snapshot owner, so their button must keep working, while the CURRENT owner must not be
-        # locked out of responding for their own account (the bug this fixes: with the snapshot
-        # alone, re-linking an account told its real owner "not your signup"). An empty set of
-        # known owners means nobody was ever recorded for this tag — unchanged from before, the
-        # click is allowed through.
-        known_owner_ids = {oid for oid in (signup.get("dmed_discord_id"), live_discord_id) if oid}
-        if known_owner_ids and user_id_str not in known_owner_ids:
-            await interaction.response.send_message(
-                t('cwl.template.not_your_signup', user_id=user_id_str, guild_id=guild_id), ephemeral=True
-            )
-            return
-        if event["status"] != "signup_open":
-            await interaction.response.send_message(
-                t('cwl.template.signup_closed', user_id=user_id_str, guild_id=guild_id), ephemeral=True
-            )
-            return
-
-        new_status = "confirmed" if self.action == "confirm" else "declined"
-        source = "template_confirm" if self.action == "confirm" else "template_optout"
-        responded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
-        # to_thread()-wrapped (2026-08-16, Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — this
-        # button is on a persistent DM, hit by every member responding to a CWL signup template,
-        # so an unwrapped write here is the highest-traffic instance of the whole-bot-freeze risk
-        # in this file.
-        # Persist the LIVE owner, not the snapshot's (2026-08-22) — writing the recorded recipient
-        # straight back is what made the staleness self-perpetuating, re-stamping the outdated
-        # owner on every response. Falls back to the snapshot when user_players has no row for
-        # this tag at all (a guest tag added by search that was never linked), so a never-linked
-        # signup keeps whatever it had rather than being blanked.
-        owner_discord_id = live_discord_id or signup.get("dmed_discord_id")
-        await asyncio.to_thread(
-            db.upsert_cwl_signup_sync,
-            self.event_id, self.player_tag, signup.get("player_name"), owner_discord_id,
-            signup.get("preferred_league_rank"), source, new_status, responded_at=responded_at,
-        )
-        # rule h (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_PLAN.md, project owner's spec:
-        # "that status is shown automatically in guild a's and guild B's clan rosters... no need
-        # to manage anything manually") — this DM's custom_id only ever names ONE event_id (the
-        # guild that happened to send it), but the SAME real-world player may be pooled by other
-        # guilds too for this same season; propagate_cwl_player_response() writes the global
-        # source of truth and fans this exact response out to every one of those guilds' own
-        # local boards.
-        from qapbot.QBdiscocmdshelper_cwl import propagate_cwl_player_response
-
-        affected_guild_ids = await propagate_cwl_player_response(
-            self.player_tag, event["cwl_season"], new_status, responded_at,
-            signup.get("player_name"), owner_discord_id, self.event_id, guild_id or 0,
-        )
-        # Step 8 (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md — found via live-testing: a player
-        # confirming/opting out via this DM button never updated an open Manage Enrollment board
-        # at all, since this callback has no refresh_cwl_management_hub_message()/_refresh_parent()
-        # call to piggyback the bump onto — it only edits the DM itself, never any guild message).
-        # guild_id is already resolved above from the event row; affected_guild_ids (rule h) adds
-        # every OTHER guild whose board this same response just updated.
-        from qapbot.web_bridge import bump_enrollment_version
-
-        if guild_id is not None:
-            await bump_enrollment_version(guild_id)
-        for other_guild_id in affected_guild_ids:
-            await bump_enrollment_version(other_guild_id)
 
         response_key = 'cwl.template.confirmed_msg' if self.action == "confirm" else 'cwl.template.declined_msg'
-        player_name = signup.get("player_name") or self.player_tag
         try:
             await interaction.response.edit_message(
-                content=t(response_key, user_id=user_id_str, guild_id=guild_id, player_name=player_name), view=None
+                content=t(
+                    response_key, user_id=user_id_str, guild_id=guild_id, player_name=result["player_name"]
+                ),
+                view=None,
             )
         except discord.NotFound as e:
             if getattr(e, "code", None) == 10062:
                 logging.warning(
                     f"[CwlSignupResponseButton] Interaction expired before bot could respond (10062): "
+                    f"event={self.event_id} player={self.player_tag}"
+                )
+            else:
+                raise
+
+
+# ---------------------------------------------------------------------------
+# "Remind Pending" combined-message confirm/decline buttons (tracker #0038) —
+# DynamicItem, restart-safe, own custom_id namespace (see Design note,
+# plans/tracker-0038-remind-pending-cwl.md, for why this is not a reuse of
+# CwlSignupResponseButton above)
+# ---------------------------------------------------------------------------
+
+CWL_REMINDER_RESPONSE_TEMPLATE = r'^cwl:remind:(?P<action>confirm|optout):(?P<event_id>\d+):(?P<player_tag>#[A-Z0-9]{1,15})$'
+
+
+def build_cwl_reminder_response_view(
+    event_id: int, accounts: List[Dict[str, Any]], guild_id: Optional[int] = None
+) -> discord.ui.View:
+    """Tracker #0038's combined-message reminder view — one row per account (accounts must
+    already be ≤5, Discord's 5-action-row cap; send_cwl_reminder_dm_group, QBdiscocmdshelper_cwl.
+    py, chunks longer groups into multiple DMs before calling this), each holding a confirm+
+    decline button pair labeled with the account name so several accounts in one message stay
+    distinguishable. timeout=None for the same restart-survival reason as
+    build_cwl_signup_response_view — CwlReminderResponseButton is a DynamicItem, registered via
+    add_dynamic_items() in QapBot.py."""
+    view = discord.ui.View(timeout=None)
+    for row, account in enumerate(accounts):
+        view.add_item(CwlReminderResponseButton(
+            "confirm", event_id, account["player_tag"], account.get("player_name"), row, guild_id
+        ))
+        view.add_item(CwlReminderResponseButton(
+            "optout", event_id, account["player_tag"], account.get("player_name"), row, guild_id
+        ))
+    return view
+
+
+class CwlReminderResponseButton(
+    discord.ui.DynamicItem[discord.ui.Button],  # type: ignore[type-arg]
+    template=CWL_REMINDER_RESPONSE_TEMPLATE,
+):
+    """Restart-safe confirm/decline button for tracker #0038's "Remind Pending" combined-message
+    DM — one Discord user's several still-pending CoC accounts, all in a single message. A
+    distinct custom_id namespace (`cwl:remind:...` vs. the original `cwl:signup:...`) from
+    CwlSignupResponseButton, not a reuse of it, because the two need different end-of-click
+    behavior: the original replaces its whole single-account message with `view=None`; this one
+    must leave sibling accounts' buttons in the same message untouched, so instead of trying to
+    surgically remove just this row from the message's existing component tree, it re-derives
+    this Discord user's remaining pending accounts LIVE from the DB and re-renders the message
+    from that fresh query (matches the codebase's established "live wins over a stored snapshot"
+    convention — Pitfall 24, COPILOT_PITFALLS_COOKBOOK.md). Both button classes share their
+    response-recording logic via `_apply_cwl_signup_response()`."""
+
+    def __init__(
+        self, action: str, event_id: int, player_tag: str, player_name: Optional[str] = None,
+        row: Optional[int] = None, guild_id: Optional[int] = None,
+    ):
+        self.action = action
+        self.event_id = event_id
+        self.player_tag = player_tag
+
+        from qapbot.i18n import t
+
+        label_key = (
+            'cwl.reminder.confirm_button_labeled' if action == "confirm"
+            else 'cwl.reminder.optout_button_labeled'
+        )
+        style = discord.ButtonStyle.success if action == "confirm" else discord.ButtonStyle.secondary
+        super().__init__(
+            discord.ui.Button(
+                label=t(label_key, guild_id=guild_id, player_name=player_name or player_tag),
+                style=style,
+                custom_id=f"cwl:remind:{action}:{event_id}:{player_tag}",
+                row=row,
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls, interaction: discord.Interaction, item: discord.ui.Item[Any], match: 're.Match[str]', /
+    ) -> 'CwlReminderResponseButton':
+        return cls(action=match["action"], event_id=int(match["event_id"]), player_tag=match["player_tag"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        from qapbot.i18n import t
+
+        user_id_str = str(interaction.user.id)
+        result = await _apply_cwl_signup_response(self.event_id, self.player_tag, self.action, user_id_str)
+        guild_id = result["guild_id"]
+
+        if result["code"] != "ok":
+            await interaction.response.send_message(
+                t(f'cwl.template.{result["code"]}', user_id=user_id_str, guild_id=guild_id), ephemeral=True
+            )
+            return
+
+        db = CACHE.db_manager
+        event = await asyncio.to_thread(db.get_cwl_event_by_id_sync, self.event_id)
+        pending = [
+            s for s in await asyncio.to_thread(db.get_cwl_signups_for_event_sync, self.event_id)
+            if s["status"] == "pending"
+        ]
+        links = (
+            await asyncio.to_thread(db.get_player_links_sync, [s["player_tag"] for s in pending])
+            if pending else {}
+        )
+        remaining = [
+            {
+                "player_tag": s["player_tag"],
+                "player_name": s["player_name"] or (links.get(s["player_tag"]) or {}).get("player_name"),
+            }
+            for s in pending
+            if (links.get(s["player_tag"]) or {}).get("discord_id") == user_id_str
+        ]
+
+        try:
+            if remaining:
+                content = t(
+                    'cwl.reminder.dm_buttons_intro', user_id=user_id_str, guild_id=guild_id,
+                    season=event["cwl_season"] if event is not None else "",
+                )
+                await interaction.response.edit_message(
+                    content=content, view=build_cwl_reminder_response_view(self.event_id, remaining, guild_id)
+                )
+            else:
+                response_key = (
+                    'cwl.template.confirmed_msg' if self.action == "confirm" else 'cwl.template.declined_msg'
+                )
+                await interaction.response.edit_message(
+                    content=t(
+                        response_key, user_id=user_id_str, guild_id=guild_id, player_name=result["player_name"]
+                    ),
+                    view=None,
+                )
+        except discord.NotFound as e:
+            if getattr(e, "code", None) == 10062:
+                logging.warning(
+                    f"[CwlReminderResponseButton] Interaction expired before bot could respond (10062): "
                     f"event={self.event_id} player={self.player_tag}"
                 )
             else:

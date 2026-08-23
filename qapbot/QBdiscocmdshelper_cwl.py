@@ -462,9 +462,15 @@ async def format_clan_management_cwl_management(
     )
 
     signup_counts = db.get_cwl_signup_status_counts_sync(event["id"]) if db is not None else {}
+    pending_linked, pending_unlinked = await asyncio.to_thread(
+        split_cwl_pending_signups_by_link_sync, event["id"]
+    )
     signup_lines = [
+        f"{t('cwl.management.signup_status_pending', guild_id=guild_id_int)}: {pending_linked}",
+        f"{t('cwl.management.signup_status_unlinked', guild_id=guild_id_int)}: {pending_unlinked}",
+    ] + [
         f"{t(f'cwl.management.signup_status_{status}', guild_id=guild_id_int)}: {signup_counts.get(status, 0)}"
-        for status in ("pending", "confirmed", "declined", "withdrawn")
+        for status in ("confirmed", "declined", "withdrawn")
     ]
     embed.add_field(
         name=t('cwl.management.signups_block_title', guild_id=guild_id_int),
@@ -541,6 +547,31 @@ def get_cwl_guest_clan_tags_sync(db: Any, event_id: int, guild_id: int) -> Set[s
     members remain pooled."""
     family_tags = set(resolve_guild_member_clan_tags(guild_id))
     return {c["clan_tag"] for c in db.get_cwl_event_clans_sync(event_id) if c["clan_tag"] not in family_tags}
+
+
+def split_cwl_pending_signups_by_link_sync(event_id: int) -> Tuple[int, int]:
+    """Splits the raw `status='pending'` count from `get_cwl_signup_status_counts_sync()` into
+    (pending_linked, pending_unlinked) — 2026-08-23, tracker #0038 investigation. The season
+    overview's old single "Ausstehend" line counted every pending `cwl_signups` row regardless of
+    whether the account has a live Discord link, while the Teams-verwalten board only shows a ❓
+    icon for a pending player who ALSO has one (an unlinked pending player shows "Not Linked"
+    instead — the two icons are drawn as mutually exclusive by design, see enrollmentBoard.ts).
+    That made the two numbers on screen at the same time (66 vs. a much smaller ❓ tally)
+    genuinely irreconcilable to an admin. Splitting here lets the overview show both, matching
+    what Teams-verwalten actually renders, and matching exactly who a reminder DM can reach — an
+    unlinked pending account has nobody to DM.
+
+    Plain sync function (Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — caller wraps in one
+    asyncio.to_thread() hop."""
+    db = CACHE.db_manager
+    if db is None:
+        return (0, 0)
+    pending_tags = [s["player_tag"] for s in db.get_cwl_signups_for_event_sync(event_id) if s["status"] == "pending"]
+    if not pending_tags:
+        return (0, 0)
+    links = db.get_player_links_sync(pending_tags)
+    linked = sum(1 for tag in pending_tags if (links.get(tag) or {}).get("discord_id"))
+    return (linked, len(pending_tags) - linked)
 
 
 def has_cwl_pool_members_missing_dm(guild_id: int, season: str) -> bool:
@@ -2629,6 +2660,61 @@ def resolve_cwl_pool_dm_targets_sync(
     return result
 
 
+def resolve_cwl_pending_reminder_targets_sync(event_id: int) -> Dict[str, Any]:
+    """Tracker #0038's "Remind Pending" pool resolution — every `cwl_signups` row for this event
+    still `status='pending'`, live-link-resolved (same `get_player_links_sync` source of truth as
+    `resolve_cwl_pool_dm_targets_sync`) and grouped by Discord user, since the reminder DM covers
+    all of one person's pending accounts in a single combined message rather than one DM per
+    account (project owner's spec).
+
+    Unlike `resolve_cwl_pool_dm_targets_sync`, there is no snapshot `dmed_discord_id` fallback
+    here — a pending signup with no CURRENT live link has nobody to remind (this is exactly the
+    "unlinked" half `split_cwl_pending_signups_by_link_sync` reports on the season overview), and
+    `cwl_permanent_optout` is honoured the same way (a permanent opt-out must not be re-pinged
+    just because their signup row still reads 'pending').
+
+    Returns {"groups": {discord_id: [{"player_tag", "player_name"}, ...]}, "skipped_unlinked",
+    "skipped_optout"}. Plain sync function (Pitfall 26) — caller wraps in one asyncio.to_thread()
+    hop."""
+    db = CACHE.db_manager
+    result: Dict[str, Any] = {"groups": {}, "skipped_unlinked": 0, "skipped_optout": 0}
+    if db is None:
+        return result
+
+    pending = [s for s in db.get_cwl_signups_for_event_sync(event_id) if s["status"] == "pending"]
+    if not pending:
+        return result
+
+    links = db.get_player_links_sync([s["player_tag"] for s in pending])
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for signup in pending:
+        link = links.get(signup["player_tag"])
+        if link is None or not link.get("discord_id"):
+            result["skipped_unlinked"] += 1
+            continue
+        if link.get("cwl_permanent_optout"):
+            result["skipped_optout"] += 1
+            continue
+        groups.setdefault(link["discord_id"], []).append({
+            "player_tag": signup["player_tag"],
+            "player_name": signup["player_name"] or link.get("player_name"),
+        })
+    result["groups"] = groups
+    return result
+
+
+def _dm_guard_blocks(discord_id: str) -> bool:
+    """True when CONFIG.cwl_dm_restrict_to_admin is on and this recipient is neither the server
+    admin nor a PROD tester — extracted from _send_cwl_enrollment_dm_batch's inline check
+    (2026-08-23, tracker #0038) so the reminder batch (send_cwl_reminder_dm_group) applies the
+    exact same DM-testing guard rather than duplicating it."""
+    from qapbot.config import CONFIG
+
+    is_admin = discord_id == CONFIG.server_admin
+    is_prod_tester = not CONFIG.is_dev_mode and discord_id in CACHE.testers
+    return bool(CONFIG.cwl_dm_restrict_to_admin and not (is_admin or is_prod_tester))
+
+
 async def _send_cwl_enrollment_dm_batch(
     event_id: int, guild_id: int, season: str, dm_targets: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -2657,8 +2743,6 @@ async def _send_cwl_enrollment_dm_batch(
     (see the bulk status lookup right before signups_to_create is built) — this function only
     ever decides whether to DM, never touches status.
     """
-    from qapbot.config import CONFIG
-
     result: Dict[str, Any] = {
         "contacted": 0, "skipped_dm_guard": 0, "skipped_already_dm_globally": 0, "skipped_unlinked": 0,
         "blocked": [], "no_mutual_guild": [], "failed": [],
@@ -2683,10 +2767,7 @@ async def _send_cwl_enrollment_dm_batch(
         if already_dm_by_tag.get(participant["player_tag"]):
             result["skipped_already_dm_globally"] += 1
             continue
-        participant_discord_id = str(participant["discord_id"])
-        is_admin = participant_discord_id == CONFIG.server_admin
-        is_prod_tester = not CONFIG.is_dev_mode and participant_discord_id in CACHE.testers
-        if CONFIG.cwl_dm_restrict_to_admin and not (is_admin or is_prod_tester):
+        if _dm_guard_blocks(str(participant["discord_id"])):
             result["skipped_dm_guard"] += 1
             continue
         to_dm.append(participant)
@@ -2808,6 +2889,82 @@ async def send_cwl_signup_template_dm(
     message_id = str(dm_message.id) if dm_message is not None else None
     channel_id = str(dm_message.channel.id) if dm_message is not None else None
     return sent, outcome, message_id, channel_id
+
+
+async def send_cwl_reminder_dm_group(
+    event_id: int, guild_id: int, season: str, discord_id: str, accounts: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Tracker #0038's "Remind Pending" send, for one Discord user's whole pending-account group
+    at once: a verbose, personally-addressed intro DM (no buttons — explains what's still pending
+    and why a fast reply matters), followed by one or more combined confirm/decline-button DMs
+    (build_cwl_reminder_response_view, ui_cwl_roster.py), chunked to at most 5 accounts per
+    message (Discord's 5-action-row cap, 2 buttons/account). The caller
+    (remind_pending_cwl_players, web_bridge.py) has already retracted this user's old per-account
+    invitation DM(s) and cleared their dm_sent dedup before calling this.
+
+    Returns {"contacted": int accounts reminded, "blocked"/"no_mutual_guild"/"failed": [player
+    names]} — same vocabulary _send_cwl_enrollment_dm_batch() uses, so the summary UI can reuse
+    its existing i18n lines. An empty return (all buckets zero/empty) other than a guard skip
+    means every send genuinely went out — the caller decides skipped_dm_guard purely from whether
+    it called this function at all for that group."""
+    from qapbot.i18n import t
+    from qapbot.ui_cwl_roster import build_cwl_reminder_response_view
+
+    result: Dict[str, Any] = {"contacted": 0, "blocked": [], "no_mutual_guild": [], "failed": []}
+    names = [a["player_name"] or a["player_tag"] for a in accounts]
+
+    display_name = CACHE.user_accounts.get(discord_id, {}).get("display_name") or discord_id
+    intro = t(
+        'cwl.reminder.dm_intro_body',
+        user_id=discord_id, guild_id=guild_id,
+        display_name=display_name, season=season, count=len(accounts),
+    )
+    sent, outcome = await CACHE.send_user_dm_detailed(discord_id, intro)
+    if not sent:
+        result[outcome].extend(names)
+        return result
+
+    db = CACHE.db_manager
+    sent_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    for start in range(0, len(accounts), 5):
+        chunk = accounts[start:start + 5]
+        chunk_names = [a["player_name"] or a["player_tag"] for a in chunk]
+        content = t('cwl.reminder.dm_buttons_intro', user_id=discord_id, guild_id=guild_id, season=season)
+        view = build_cwl_reminder_response_view(event_id, chunk, guild_id)
+        sent_message_ref: List[Any] = []
+        chunk_sent, chunk_outcome = await CACHE.send_user_dm_detailed(
+            discord_id, content, view=view, sent_message_out=sent_message_ref
+        )
+        if not chunk_sent:
+            result[chunk_outcome].extend(chunk_names)
+            continue
+        message = sent_message_ref[0] if sent_message_ref else None
+        message_id = str(message.id) if message is not None else None
+        channel_id = str(message.channel.id) if message is not None else None
+        result["contacted"] += len(chunk)
+        if db is not None:
+            for account in chunk:
+                await asyncio.to_thread(
+                    db.mark_cwl_player_dm_sent_sync,
+                    account["player_tag"], season, account["player_name"], discord_id,
+                    event_id, guild_id, sent_at, message_id, channel_id,
+                )
+    return result
+
+
+def has_cwl_pending_signups_to_remind(guild_id: int, season: str) -> bool:
+    """Button-gating check for "Remind Pending" (tracker #0038), mirroring
+    has_cwl_pool_members_missing_dm's own shape — true iff resolve_cwl_pending_reminder_targets_
+    sync() finds at least one DM-able group for this event. Safe on the synchronous CWL Management
+    render path for the same reason that function is (Pitfall 26): a handful of indexed lookups,
+    not the board payload builder."""
+    db = CACHE.db_manager
+    if db is None:
+        return False
+    event = db.get_cwl_event_sync(str(guild_id), season)
+    if event is None or event["status"] in ("draft", "cancelled"):
+        return False
+    return bool(resolve_cwl_pending_reminder_targets_sync(event["id"])["groups"])
 
 
 async def _retract_enrollment_dms_for_tags(

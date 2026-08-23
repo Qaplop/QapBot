@@ -979,3 +979,59 @@ owns the verified-wins / UNASSIGNED-last dedup that decides which `user_players`
 owner. Re-deriving that in SQL would be a near-duplicate (Cardinal Rule 4) and would silently pick
 the wrong owner for a tag holding both a real and a stray row (see
 `_cleanup_stray_unassigned_duplicates`).
+
+## Remind Pending CWL Players (2026-08-23, tracker #0038)
+
+"Remind Pending" (`ui_cwl_roster.py`'s row-4 button next to "Notify New Pool Members", gated by
+`has_cwl_pending_signups_to_remind()`) re-DMs everyone whose CWL sign-up for the current event is
+still `status='pending'` **and** currently has a live Discord link. It grew out of investigating a
+reported mismatch: the CWL-Verwaltung season overview's old single "Ausstehend" line counted every
+pending `cwl_signups` row regardless of Discord link, while the Teams-verwalten board only shows a
+❓ icon for a pending player who also has one (an unlinked pending player renders "Not Linked"
+instead — the two icons are mutually exclusive by design in `enrollmentBoard.ts`). The season
+overview now shows both counts separately (`split_cwl_pending_signups_by_link_sync()`,
+`QBdiscocmdshelper_cwl.py`) — "Ausstehend" is the linked/reachable half, a new "Nicht verknüpft
+(ausstehend)" line is the rest. Reminders can only ever reach that same linked half, so the two
+features share one root cause and one fix.
+
+### DM shape: grouped by Discord user, not by account
+
+Every other CWL DM path (the original template invite, "Notify New Pool Members",
+`_reset_and_resend_enrollment_dm`) sends one DM per CoC account. "Remind Pending" deliberately
+does not — project owner's spec was a single, personally-addressed reminder per Discord user
+covering *every* one of their pending accounts, so someone with several alt accounts isn't spammed
+with N near-identical DMs. Concretely, per Discord user:
+
+1. Retract their old per-account invitation DM(s) (`_retract_enrollment_dms_for_tags`, reused
+   unmodified).
+2. Clear each account's global `dm_sent` dedup (`clear_cwl_player_dm_sent_sync`) — same ordering
+   `_reset_and_resend_enrollment_dm` already established: this must happen before the re-send or
+   `_send_cwl_enrollment_dm_batch`-style dedup logic would skip them.
+3. Send a verbose, personally-addressed intro DM (`cwl.reminder.dm_intro_body`, no buttons) —
+   greets by `CACHE.user_accounts[discord_id]["display_name"]`, states the pending count, and asks
+   for a fast reply.
+4. Send one or more combined buttons DMs (`build_cwl_reminder_response_view`), one row per account
+   (confirm + decline, labeled with the account name), chunked to ≤5 accounts per message —
+   Discord's 5-action-row cap.
+
+`resolve_cwl_pending_reminder_targets_sync()` (`QBdiscocmdshelper_cwl.py`) is the pool resolver —
+deliberately **not** a reuse of `resolve_cwl_pool_dm_targets_sync()`, whose whole point is a
+broader pool (family members, guests, cross-guild shared rosters) with a snapshot fallback for an
+unlinked account. This one only cares about existing pending `cwl_signups` rows with a live link,
+honouring `cwl_permanent_optout` the same way.
+
+### Why the combined message needed a second button class
+
+The original `CwlSignupResponseButton.callback()` finishes by replacing its whole message
+(`interaction.response.edit_message(content=..., view=None)`) — correct for a one-account DM, but
+wrong for a message holding several accounts' buttons at once: confirming one account would wipe
+the others' still-live buttons too. `CwlReminderResponseButton` (own custom_id namespace,
+`cwl:remind:...` vs. the original `cwl:signup:...`, so the two can never collide) instead
+**re-derives the clicking Discord user's remaining pending accounts live from the DB** after
+recording the response, and re-renders the message from that fresh query — either a trimmed
+button view if others remain, or a plain "all done" confirmation with `view=None` once none do.
+This matches the codebase's established "live wins over a stored snapshot" convention (Pitfall 24,
+`COPILOT_PITFALLS_COOKBOOK.md`) rather than surgically editing the existing message's component
+tree. Both button classes share their ownership/propagation logic via `_apply_cwl_signup_response()`
+(extracted from `CwlSignupResponseButton.callback()`), so the two can never disagree about who
+owns an account or what a click does to `cwl_signups`/cross-guild propagation.
