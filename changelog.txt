@@ -1,6 +1,22 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-23 (14)
+- Added: Phase 1 of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- schema and write
+  path only, no UI yet. Two new user_players columns, cwl_permanent_optin ("always play CWL")
+  and cwl_optout_send_dm_anyway (only meaningful while opted out), alongside the existing
+  cwl_permanent_optout/cwl_default_preferred_league_rank. New set_cwl_preferences_sync() write
+  method: one UPDATE sets both opt-in/opt-out booleans together so they can never both read
+  true, force-clears the DM-anyway flag whenever an account leaves opt-out, and can target a
+  single linked account or every account of a discord_id at once ("apply to all my accounts").
+  get_current_clan_members_sync/get_all_players_for_discord_ids_sync/get_player_links_sync now
+  all return the two new columns.
+  Renamed the four unused guild_config.cwl_hub_* columns to cwl_player_hub_* (see the plan's
+  "Naming convention" section -- that bare prefix collided with the ADMIN hub's custom_ids) via
+  the existing _rename_column_if_present() helper, with an add-if-missing fallback for a
+  guild_config table that predates either name.
+  Files: qapbot/db_manager.py, tests/unit/test_db_manager_cwl_roster.py. 2628 tests pass.
+
 2026-08-23 (13)
 - Fixed: get_user()'s player dict and _replace_user_players_rows()'s INSERT both omitted
   cwl_permanent_optout/cwl_default_preferred_league_rank, so any save_user() round-trip
