@@ -40,12 +40,14 @@ export type ClanConfigPayload = {
   clans: ClanConfig[]
 }
 
-/** Which of the two screens to render — set by whichever Discord button fired LAUNCH_ACTIVITY
+/** Which of the three screens to render — set by whichever Discord button fired LAUNCH_ACTIVITY
  * (CACHE.pending_cwl_activity_screen), read once via GET /api/cwl/screen. See
  * CWL_ROSTER_PLANNING_PLAN.md's "Manage Enrollment" architectural decision for why this exists
- * instead of routing by fetched event status. */
+ * instead of routing by fetched event status. 'player_prefs' (2026-08-23, plans/
+ * cwl-personal-hub.md Phase 5a) is CwlPlayerHubView's single button / the /cwl preferences
+ * command — member-facing, no admin gate on the bridge side. */
 export type ScreenPayload = {
-  screen: 'clan_config' | 'enrollment'
+  screen: 'clan_config' | 'enrollment' | 'player_prefs'
 }
 
 /** Matches qapbot/web_bridge.py's GET /api/cwl/enrollment payload shape exactly. */
@@ -180,3 +182,71 @@ export type SetStatusResult = {
   status: AdminSettableStatus
   dm: { sent: boolean; reason: 'unlinked' | 'blocked' | 'dm_guard' | 'failed' | null } | null
 }
+
+/** Matches qapbot/web_bridge.py's GET/POST /api/cwl/player-prefs payload shape exactly
+ * (2026-08-23, plans/cwl-personal-hub.md Phase 5c). One account's standing CWL preference —
+ * block I of the player_prefs screen. */
+export type PlayerPrefsAccount = {
+  player_tag: string
+  player_name: string | null
+  verified: boolean
+  /** user_players.cwl_default_preferred_league_rank — null = no preference. */
+  preferred_league_rank: string | null
+  /** 'none' = ask each season (the pre-existing default), 'optin' = always play,
+   * 'optout' = never play. Mutually exclusive by construction — see set_cwl_preferences_sync's
+   * own docstring (db_manager.py) for why a single UPDATE enforces this server-side too. */
+  mode: 'none' | 'optin' | 'optout'
+  /** Only meaningful while mode === 'optout' — whether the invitation DM still goes out despite
+   * the standing decline, so the member can override it for one season. */
+  send_dm_anyway: boolean
+}
+
+/** One account's row in block II ("this season"). Every field is null when the account has no
+ * cwl_signups row for the current event yet (still shown — "no row" reads as Unassigned/no
+ * status, not omitted from the table). */
+export type PlayerPrefsSeasonRow = {
+  player_tag: string
+  player_name: string | null
+  /** Same status vocabulary as EnrollmentPlayer.signup_status, including 'auto_confirmed'. */
+  signup_status: 'pending' | 'confirmed' | 'declined' | 'auto_confirmed' | 'withdrawn' | null
+  assigned_clan_tag: string | null
+  assigned_clan_name: string | null
+  assigned_clan_tier: string | null
+  /** Same UTC ISO-ish format as ClanConfig.cwl_start_at. */
+  assigned_clan_start_at: string | null
+}
+
+/** GET /api/cwl/player-prefs's response shape, and also what POST /api/cwl/player-prefs
+ * returns (the freshly rebuilt payload, so the client always re-renders from server truth —
+ * see playerPrefs.ts's own "no optimistic update" discipline). `season`/`event_status` are both
+ * null when the guild has no CWL event at all; `season_rows` is `[]` in that case too. */
+export type PlayerPrefsPayload = {
+  season: string | null
+  event_status: string | null
+  accounts: PlayerPrefsAccount[]
+  season_rows: PlayerPrefsSeasonRow[]
+}
+
+/** One change in a POST /api/cwl/player-prefs request — player_tag: null means "apply to every
+ * one of my linked accounts" (the bulk control). league_rank/rank_provided mirrors
+ * set_cwl_preferences_sync's own disambiguation: league_rank=null is only a clear-to-no-
+ * preference when rank_provided is true, never an accidental no-op. */
+export type PlayerPrefsChange = {
+  player_tag: string | null
+  mode?: 'none' | 'optin' | 'optout'
+  send_dm_anyway?: boolean
+  league_rank?: string | null
+  rank_provided?: boolean
+}
+
+/** POST /api/cwl/player-prefs/status's request shape — the member changing their own invitation
+ * status from block II. Deliberately the same 'action' vocabulary as the DM button's own
+ * custom_id (cwl:signup:confirm|optout), not 'status', because the whole contract of this
+ * endpoint is "do exactly what that button does". */
+export type PlayerPrefsStatusAction = 'confirm' | 'optout'
+
+/** POST /api/cwl/player-prefs/status's response shape on success — the freshly rebuilt
+ * PlayerPrefsPayload, same "no optimistic update" discipline as the preferences POST. On
+ * failure the bridge returns {"error": "<cwl.template code>"} instead (see errorFromResponse in
+ * main.ts and this screen's own footer-status-line handling). */
+export type PlayerPrefsStatusResult = PlayerPrefsPayload

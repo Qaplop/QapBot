@@ -1,4 +1,5 @@
 import type { ClanConfig, ClanConfigPayload, GuestPlayerPoolEntry, GuestSearchResult } from './types'
+import { utcStringToLocalParts } from './timeFormat'
 
 const ROSTER_SIZES = [5, 15, 30] as const
 
@@ -37,31 +38,9 @@ const TIME_OF_DAY_OPTIONS: string[] = (() => {
   return options
 })()
 
-function pad(n: number): string {
-  return String(n).padStart(2, '0')
-}
-
-function snapToQuarterHour(hhmm: string): string {
-  const [hStr, mStr] = hhmm.split(':')
-  const h = Number(hStr) || 0
-  const m = Number(mStr) || 0
-  const snappedM = Math.round(m / 15) * 15
-  const carry = snappedM === 60
-  const finalH = (h + (carry ? 1 : 0)) % 24
-  return `${pad(finalH)}:${pad(carry ? 0 : snappedM)}`
-}
-
-/** Bridge/DB storage is always UTC ("YYYY-MM-DDTHH:MMZ") — the user sees and sets everything in
- * their own browser timezone (Phase E.5); these two functions are the only place that
- * conversion happens, keeping it invisible everywhere else in this file. */
-function utcStringToLocalParts(utc: string): { date: string; time: string } | null {
-  const parsed = new Date(utc)
-  if (Number.isNaN(parsed.getTime())) return null
-  return {
-    date: `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())}`,
-    time: snapToQuarterHour(`${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`),
-  }
-}
+// utcStringToLocalParts (with pad/snapToQuarterHour) moved to timeFormat.ts (2026-08-23,
+// plans/cwl-personal-hub.md Phase 5e) — playerPrefs.ts needs the exact same UTC->local
+// conversion for its own read-only start-time column, and a copy would drift.
 
 function localPartsToUtcString(date: string, time: string): string {
   const [y, mo, d] = date.split('-').map(Number)

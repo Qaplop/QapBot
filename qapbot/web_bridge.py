@@ -1315,6 +1315,252 @@ async def handle_get_i18n(request: web.Request) -> web.Response:
     return web.json_response({"lang": language, "strings": strings})
 
 
+def _build_player_prefs_payload_sync(guild_id: int, discord_user_id: int) -> Dict[str, Any]:
+    """Build the GET/POST response for the Player CWL Settings Hub's Activity screen
+    (plans/cwl-personal-hub.md Phase 5c) — the ONLY function that resolves which accounts a
+    request may act on, which is what makes this feature's account protection (Cardinal Rule 2)
+    hold: every account in the response comes SOLELY from
+    get_all_players_for_discord_ids_sync([str(discord_user_id)]), never from anything
+    client-supplied.
+
+    Block I ("accounts") is season-independent and always populated when the caller has any
+    linked accounts at all. Block II ("season_rows") additionally needs the guild's CURRENT CWL
+    event — resolved via get_current_cwl_event_sync(), the same "which event is relevant to this
+    member right now" resolver the plan's Phase 5c spec calls for, deliberately NOT the admin's
+    cwl_selected_season UI-selection state. Both season/event_status and season_rows are
+    None/[] when the guild has no CWL event at all; block I still renders (preferences are
+    season-independent).
+
+    Plain synchronous function (Pitfall 26, COPILOT_PITFALLS_COOKBOOK.md) — callers wrap the
+    whole thing in one asyncio.to_thread() hop."""
+    from qapbot.QBdiscocmdshelper_cwl import get_current_cwl_event_sync
+
+    db = CACHE.db_manager
+    if db is None:
+        return {"season": None, "event_status": None, "accounts": [], "season_rows": []}
+
+    players = db.get_all_players_for_discord_ids_sync([str(discord_user_id)])
+    # Ordered by display name (case-insensitive), not "primary account first" — the primary flag
+    # isn't part of get_all_players_for_discord_ids_sync's row shape, which deliberately matches
+    # get_current_clan_members_sync's exactly so Start Enrollment's account-wide expansion can
+    # merge the two uniformly (see that method's own docstring); adding a column here would break
+    # that contract for a purely cosmetic ordering nicety.
+    players.sort(key=lambda p: (p["player_name"] or p["player_tag"]).lower())
+
+    accounts: List[Dict[str, Any]] = []
+    for p in players:
+        # Data model's defensive precedence: if both flags are somehow 1, opt-out wins.
+        if p["cwl_permanent_optout"]:
+            mode = "optout"
+        elif p["cwl_permanent_optin"]:
+            mode = "optin"
+        else:
+            mode = "none"
+        accounts.append({
+            "player_tag": p["player_tag"],
+            "player_name": p["player_name"],
+            "verified": bool(p["verified"]),
+            "preferred_league_rank": p["preferred_league_rank"],
+            "mode": mode,
+            "send_dm_anyway": bool(p["cwl_optout_send_dm_anyway"]),
+        })
+
+    event = get_current_cwl_event_sync(guild_id)
+    if event is None:
+        return {"season": None, "event_status": None, "accounts": accounts, "season_rows": []}
+
+    signups_by_tag = {s["player_tag"]: s for s in db.get_cwl_signups_for_event_sync(event["id"])}
+    assignments_by_tag = {a["player_tag"]: a for a in db.get_cwl_assignments_sync(event["id"])}
+    clans_by_tag = {c["clan_tag"]: c for c in db.get_cwl_event_clans_sync(event["id"])}
+
+    season_rows: List[Dict[str, Any]] = []
+    for p in players:
+        tag = p["player_tag"]
+        signup = signups_by_tag.get(tag)
+        assignment = assignments_by_tag.get(tag)
+        assigned_clan_tag = assignment["assigned_clan_tag"] if assignment else None
+        clan_row = clans_by_tag.get(assigned_clan_tag) if assigned_clan_tag else None
+        # Same tier resolution _build_enrollment_payload_sync's own _tier_for uses: the live
+        # CoC-API-derived war league wins when known, falling back to the admin-set
+        # target_league_rank only when it isn't.
+        tier = None
+        if assigned_clan_tag:
+            tier = CACHE.get_clan_war_league(assigned_clan_tag) or (
+                clan_row.get("target_league_rank") if clan_row else None
+            )
+        season_rows.append({
+            "player_tag": tag,
+            "player_name": p["player_name"],
+            "signup_status": signup["status"] if signup else None,
+            "assigned_clan_tag": assigned_clan_tag,
+            "assigned_clan_name": (
+                CACHE.get_clan_name(assigned_clan_tag, assigned_clan_tag) if assigned_clan_tag else None
+            ),
+            "assigned_clan_tier": tier,
+            "assigned_clan_start_at": clan_row.get("cwl_start_at") if clan_row else None,
+        })
+
+    return {
+        "season": event["cwl_season"],
+        "event_status": event["status"],
+        "accounts": accounts,
+        "season_rows": season_rows,
+    }
+
+
+async def handle_get_cwl_player_prefs(request: web.Request) -> web.Response:
+    """GET /api/cwl/player-prefs?guild_id=&discord_user_id= — plans/cwl-personal-hub.md
+    Phase 5c. No permission gate beyond the bridge secret: unlike every OTHER CWL bridge
+    endpoint (admin/leader-gated), this one's "authorization" IS the payload builder itself —
+    it can only ever return discord_user_id's OWN linked accounts, so there's nothing an
+    unprivileged caller could see here that isn't already their own data."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        guild_id = int(request.query["guild_id"])
+        discord_user_id = int(request.query["discord_user_id"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "missing/invalid guild_id or discord_user_id"}, status=400)
+
+    payload = await asyncio.to_thread(_build_player_prefs_payload_sync, guild_id, discord_user_id)
+    return web.json_response(payload)
+
+
+async def handle_post_cwl_player_prefs(request: web.Request) -> web.Response:
+    """POST /api/cwl/player-prefs — plans/cwl-personal-hub.md Phase 5c. Applies one or more
+    preference changes, each mapping to one set_cwl_preferences_sync() call, then returns the
+    freshly rebuilt GET payload (never an optimistic client-side merge — the client always
+    re-renders from server truth).
+
+    Account protection (Cardinal Rule 2): every change's player_tag must belong to
+    discord_user_id's OWN linked accounts (player_tag: null, "apply to all", needs no check —
+    set_cwl_preferences_sync's own WHERE discord_id = ? already scopes it correctly). A
+    player_tag naming someone else's account is a 403 for the WHOLE request, not a partial
+    apply-the-rest-and-silently-skip-that-one — silently dropping just that one change would be
+    much harder for a caller to notice went wrong than a hard rejection.
+    """
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        guild_id = int(body["guild_id"])
+        discord_user_id = int(body["discord_user_id"])
+        changes = body["changes"]
+        if not isinstance(changes, list):
+            raise TypeError("changes must be a list")
+    except (KeyError, ValueError, TypeError):
+        return web.json_response({"error": "invalid request body"}, status=400)
+
+    db = CACHE.db_manager
+    if db is None:
+        return web.json_response({"error": "database not ready"}, status=503)
+
+    owned_tags = {
+        p["player_tag"]
+        for p in await asyncio.to_thread(db.get_all_players_for_discord_ids_sync, [str(discord_user_id)])
+    }
+    for change in changes:
+        tag = change.get("player_tag")
+        if tag is not None and tag not in owned_tags:
+            return web.json_response({"error": "not your account"}, status=403)
+
+    def _apply_changes_sync() -> None:
+        for change in changes:
+            kwargs: Dict[str, Any] = {}
+            if "mode" in change and change["mode"] is not None:
+                kwargs["mode"] = change["mode"]
+            if "send_dm_anyway" in change and change["send_dm_anyway"] is not None:
+                kwargs["send_dm_anyway"] = bool(change["send_dm_anyway"])
+            if change.get("rank_provided"):
+                kwargs["league_rank"] = change.get("league_rank")
+                kwargs["rank_provided"] = True
+            if kwargs:
+                db.set_cwl_preferences_sync(str(discord_user_id), change.get("player_tag"), **kwargs)
+
+    await asyncio.to_thread(_apply_changes_sync)
+
+    payload = await asyncio.to_thread(_build_player_prefs_payload_sync, guild_id, discord_user_id)
+    return web.json_response(payload)
+
+
+# Maps _apply_cwl_signup_response()'s failure codes onto HTTP statuses, matching the precedent
+# handle_post_cwl_enrollment_status() already sets for the same underlying conditions (403 for
+# an ownership mismatch, 409 for "the thing this needs no longer applies", 503 for no DB).
+_PLAYER_PREFS_STATUS_ERROR_HTTP_STATUS: Dict[str, int] = {
+    "db_unavailable": 503,
+    "no_longer_valid": 409,
+    "not_your_signup": 403,
+    "signup_closed": 409,
+}
+
+
+async def handle_post_cwl_player_prefs_status(request: web.Request) -> web.Response:
+    """POST /api/cwl/player-prefs/status — plans/cwl-personal-hub.md Phase 5c. The member
+    changing their own invitation status from block II. `action`, not `status` — deliberately
+    the same vocabulary as the DM button's own custom_id (cwl:signup:confirm|optout), because
+    this endpoint's entire contract is "do exactly what that button does": it calls
+    _apply_cwl_signup_response() directly, which gets the account-ownership check, the
+    event['status'] != 'signup_open' guard (== the spec's "only after enrollment started"),
+    upsert_cwl_signup_sync, propagate_cwl_player_response, and bump_enrollment_version all for
+    free and provably identical to a real DM click — see that function's own docstring
+    (ui_cwl_roster.py).
+
+    Then reconciles the member's own invitation/reminder DM (best-effort, matching
+    cleanup_stale_cwl_enrollment_dms()'s swallow-everything posture) via
+    rerender_cwl_dm_after_response() with no interaction — so a member who answers here while
+    their DM is still unanswered doesn't leave a live-looking Confirm/Opt Out pair in their inbox
+    contradicting what they just did. The status write has already committed by this point; a DM
+    that can't be edited must never fail the member's action.
+    """
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        guild_id = int(body["guild_id"])
+        discord_user_id = int(body["discord_user_id"])
+        player_tag = str(body["player_tag"]).upper()
+        action = str(body["action"])
+    except (KeyError, ValueError, TypeError):
+        return web.json_response({"error": "invalid request body"}, status=400)
+    if action not in ("confirm", "optout"):
+        return web.json_response({"error": f"unsupported action '{action}'"}, status=400)
+
+    from qapbot.QBdiscocmdshelper_cwl import get_current_cwl_event_sync
+    from qapbot.ui_cwl_roster import _apply_cwl_signup_response, rerender_cwl_dm_after_response
+
+    event = await asyncio.to_thread(get_current_cwl_event_sync, guild_id)
+    if event is None:
+        return web.json_response({"error": "no_longer_valid"}, status=409)
+
+    result = await _apply_cwl_signup_response(event["id"], player_tag, action, str(discord_user_id))
+    if result["code"] != "ok":
+        status = _PLAYER_PREFS_STATUS_ERROR_HTTP_STATUS.get(result["code"], 409)
+        return web.json_response({"error": result["code"]}, status=status)
+
+    db = CACHE.db_manager
+    if db is not None:
+        try:
+            season = event["cwl_season"]
+            global_row = await asyncio.to_thread(db.get_cwl_player_season_status_sync, player_tag, season)
+            if global_row and global_row.get("dm_sent_via_message_id") and global_row.get("dmed_discord_id"):
+                import QBcore
+
+                dm_owner = await QBcore.bot.fetch_user(int(global_row["dmed_discord_id"]))
+                dm_channel = dm_owner.dm_channel or await dm_owner.create_dm()
+                message = await dm_channel.fetch_message(int(global_row["dm_sent_via_message_id"]))
+                await rerender_cwl_dm_after_response(
+                    message, event["id"], season, global_row["dmed_discord_id"],
+                    action=action, player_name=result["player_name"], interaction=None,
+                )
+        except Exception as e:
+            logging.warning(
+                f"[WEB-BRIDGE] player-prefs status change: could not reconcile DM for {player_tag}: {e}"
+            )
+
+    payload = await asyncio.to_thread(_build_player_prefs_payload_sync, guild_id, discord_user_id)
+    return web.json_response(payload)
+
+
 async def handle_get_cwl_enrollment(request: web.Request) -> web.Response:
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
@@ -2814,6 +3060,9 @@ def create_app() -> web.Application:
     app = web.Application(middlewares=[_access_log_middleware])
     app.router.add_get("/api/health", handle_health)
     app.router.add_get("/api/i18n", handle_get_i18n)
+    app.router.add_get("/api/cwl/player-prefs", handle_get_cwl_player_prefs)
+    app.router.add_post("/api/cwl/player-prefs", handle_post_cwl_player_prefs)
+    app.router.add_post("/api/cwl/player-prefs/status", handle_post_cwl_player_prefs_status)
     app.router.add_get("/api/cwl/clan-config", handle_get_clan_config)
     app.router.add_post("/api/cwl/clan-config", handle_post_clan_config)
     app.router.add_get("/api/cwl/screen", handle_get_cwl_screen)

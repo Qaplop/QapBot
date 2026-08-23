@@ -5663,3 +5663,316 @@ async def test_enrollment_status_pending_never_redms_a_stale_owner_of_an_unassig
     signup = db.get_cwl_signup_sync(event_id, "#ORPHAN")
     assert signup["status"] == "pending"
     assert signup["dmed_discord_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# GET/POST /api/cwl/player-prefs, POST /api/cwl/player-prefs/status —
+# plans/cwl-personal-hub.md Phase 5c, the Player CWL Settings Hub's Activity screen.
+# ---------------------------------------------------------------------------
+
+async def _link_player_prefs_account(
+    db, discord_id: str, player_tag: str, player_name: str = "Player",
+    clan_tag=None, cwl_permanent_optout: bool = False, cwl_permanent_optin: bool = False,
+    cwl_optout_send_dm_anyway: bool = False, cwl_default_preferred_league_rank=None,
+) -> None:
+    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
+    await db.conn.execute(
+        "INSERT INTO user_players "
+        "(discord_id, player_tag, player_name, verified, current_clan_tag, cwl_permanent_optout, "
+        " cwl_permanent_optin, cwl_optout_send_dm_anyway, cwl_default_preferred_league_rank) "
+        "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)",
+        (
+            discord_id, player_tag, player_name, clan_tag,
+            1 if cwl_permanent_optout else 0, 1 if cwl_permanent_optin else 0,
+            1 if cwl_optout_send_dm_anyway else 0, cwl_default_preferred_league_rank,
+        ),
+    )
+    await db.conn.commit()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_prefs_get_no_linked_accounts_returns_empty(db, bridge_config, client):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('950')")
+    await db.conn.commit()
+
+    resp = await client.get(
+        "/api/cwl/player-prefs",
+        params={"guild_id": "950", "discord_user_id": "999999"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body == {"season": None, "event_status": None, "accounts": [], "season_rows": []}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_prefs_get_one_account_no_event(db, bridge_config, client):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('951')")
+    await db.conn.commit()
+    await _link_player_prefs_account(
+        db, "60", "#SOLO", player_name="Solo", cwl_permanent_optout=True,
+        cwl_optout_send_dm_anyway=True, cwl_default_preferred_league_rank="Gold League I",
+    )
+
+    resp = await client.get(
+        "/api/cwl/player-prefs",
+        params={"guild_id": "951", "discord_user_id": "60"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    body = await resp.json()
+    assert body["season"] is None
+    assert body["season_rows"] == []
+    assert len(body["accounts"]) == 1
+    account = body["accounts"][0]
+    assert account["player_tag"] == "#SOLO"
+    assert account["mode"] == "optout"
+    assert account["send_dm_anyway"] is True
+    assert account["preferred_league_rank"] == "Gold League I"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_prefs_get_three_accounts_sorted_by_name(db, bridge_config, client):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('952')")
+    await db.conn.commit()
+    await _link_player_prefs_account(db, "61", "#C", player_name="Charlie")
+    await _link_player_prefs_account(db, "61", "#A", player_name="Alpha")
+    await _link_player_prefs_account(db, "61", "#B", player_name="Bravo")
+
+    resp = await client.get(
+        "/api/cwl/player-prefs",
+        params={"guild_id": "952", "discord_user_id": "61"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    body = await resp.json()
+    assert [a["player_tag"] for a in body["accounts"]] == ["#A", "#B", "#C"]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_prefs_get_season_rows_assigned_and_unassigned(db, bridge_config, client):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import assign_cwl_player_sync
+
+    await _seed_guild_and_clans(db, "953", {"#CLANX": "Xylo"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLANX": {"name": "Xylo", "war_league": "Crystal League I"}}
+    CACHE.server_config["953"] = {"member_clans": ["#CLANX"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("953", "2026-09", "admin1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLANX", "participating": True}])
+    db.update_cwl_event_status_sync(event_id, "signup_open")
+
+    await _link_player_prefs_account(db, "62", "#ASSIGNED", player_name="Assigned", clan_tag="#CLANX")
+    await _link_player_prefs_account(db, "62", "#FREE", player_name="Free")
+    db.upsert_cwl_signup_sync(event_id, "#ASSIGNED", "Assigned", "62", None, "template_confirm", "confirmed")
+    db.upsert_cwl_signup_sync(event_id, "#FREE", "Free", "62", None, "template_confirm", "pending")
+    assign_cwl_player_sync(953, event_id, "2026-09", "#ASSIGNED", "#CLANX", source="admin")
+
+    resp = await client.get(
+        "/api/cwl/player-prefs",
+        params={"guild_id": "953", "discord_user_id": "62"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    body = await resp.json()
+    assert body["season"] == "2026-09"
+    assert body["event_status"] == "signup_open"
+    rows = {r["player_tag"]: r for r in body["season_rows"]}
+    assert rows["#ASSIGNED"]["signup_status"] == "confirmed"
+    assert rows["#ASSIGNED"]["assigned_clan_tag"] == "#CLANX"
+    assert rows["#ASSIGNED"]["assigned_clan_name"] == "Xylo"
+    assert rows["#ASSIGNED"]["assigned_clan_tier"] == "Crystal League I"
+    assert rows["#FREE"]["signup_status"] == "pending"
+    assert rows["#FREE"]["assigned_clan_tag"] is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_prefs_post_applies_change_and_returns_rebuilt_payload(db, bridge_config, client):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('954')")
+    await db.conn.commit()
+    await _link_player_prefs_account(db, "63", "#MINE", player_name="Mine")
+
+    resp = await client.post(
+        "/api/cwl/player-prefs",
+        json={
+            "guild_id": "954", "discord_user_id": "63",
+            "changes": [{"player_tag": "#MINE", "mode": "optin"}],
+        },
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["accounts"][0]["mode"] == "optin"
+    links = db.get_player_links_sync(["#MINE"])
+    assert links["#MINE"]["cwl_permanent_optin"] is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_prefs_post_null_player_tag_applies_to_all_owned_accounts(db, bridge_config, client):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('955')")
+    await db.conn.commit()
+    await _link_player_prefs_account(db, "64", "#ONE", player_name="One")
+    await _link_player_prefs_account(db, "64", "#TWO", player_name="Two")
+    await _link_player_prefs_account(db, "65", "#OTHER", player_name="Other")
+
+    resp = await client.post(
+        "/api/cwl/player-prefs",
+        json={"guild_id": "955", "discord_user_id": "64", "changes": [{"player_tag": None, "mode": "optout"}]},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    links = db.get_player_links_sync(["#ONE", "#TWO", "#OTHER"])
+    assert links["#ONE"]["cwl_permanent_optout"] is True
+    assert links["#TWO"]["cwl_permanent_optout"] is True
+    assert links["#OTHER"]["cwl_permanent_optout"] is False
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_prefs_post_rejects_a_player_tag_owned_by_someone_else(db, bridge_config, client):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('956')")
+    await db.conn.commit()
+    await _link_player_prefs_account(db, "66", "#MINE2", player_name="Mine2")
+    await _link_player_prefs_account(db, "67", "#NOTMINE", player_name="NotMine")
+
+    resp = await client.post(
+        "/api/cwl/player-prefs",
+        json={
+            "guild_id": "956", "discord_user_id": "66",
+            "changes": [
+                {"player_tag": "#MINE2", "mode": "optin"},
+                {"player_tag": "#NOTMINE", "mode": "optin"},
+            ],
+        },
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 403
+
+    links = db.get_player_links_sync(["#MINE2", "#NOTMINE"])
+    assert links["#MINE2"]["cwl_permanent_optin"] is False
+    assert links["#NOTMINE"]["cwl_permanent_optin"] is False
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_prefs_status_confirm_updates_signup_and_reconciles_dm(db, bridge_config, client, monkeypatch):
+    event_id = await _seed_status_event(db, "957")
+    db.upsert_cwl_signup_sync(event_id, "#P1", "PlayerOne", "70", None, "template_confirm", "pending")
+    db.mark_cwl_player_dm_sent_sync(
+        "#P1", "2026-09", "PlayerOne", "70", event_id, 957, "2026-09-01T09:00Z", "600001", "700001",
+    )
+
+    import QBcore
+    deleted: list = []
+    edited: list = []
+    bot = _fake_dm_bot(957, 70, deleted)
+
+    async def _capture_edit(**kwargs):
+        edited.append(kwargs)
+
+    async def _fetch_message(mid):
+        msg = MagicMock()
+        msg.id = mid
+        msg.edit = _capture_edit
+        return msg
+
+    bot.fetch_user.return_value.dm_channel.fetch_message = AsyncMock(side_effect=_fetch_message)
+    monkeypatch.setattr(QBcore, "bot", bot)
+
+    resp = await client.post(
+        "/api/cwl/player-prefs/status",
+        json={"guild_id": "957", "discord_user_id": "70", "player_tag": "#P1", "action": "confirm"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    assert db.get_cwl_signup_sync(event_id, "#P1")["status"] == "confirmed"
+    assert len(edited) == 1
+    assert edited[0]["view"] is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_prefs_status_rejects_a_different_accounts_signup(db, bridge_config, client, monkeypatch):
+    event_id = await _seed_status_event(db, "958")
+    db.upsert_cwl_signup_sync(event_id, "#P1", "PlayerOne", "70", None, "template_confirm", "pending")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(958, 999, is_admin=False))
+
+    resp = await client.post(
+        "/api/cwl/player-prefs/status",
+        json={"guild_id": "958", "discord_user_id": "999", "player_tag": "#P1", "action": "confirm"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 403
+    body = await resp.json()
+    assert body["error"] == "not_your_signup"
+    assert db.get_cwl_signup_sync(event_id, "#P1")["status"] == "pending"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_prefs_status_rejects_when_enrollment_not_open(db, bridge_config, client):
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "959", {"#CLANY": "Yankee"})
+    CACHE.db_manager = db
+    CACHE.server_config["959"] = {"member_clans": ["#CLANY"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+    event_id = db.create_cwl_event_sync("959", "2026-09", "admin1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLANY", "participating": True}])
+    db.upsert_cwl_signup_sync(event_id, "#P1", "PlayerOne", "70", None, "template_confirm", "pending")
+    await _link_player_prefs_account(db, "70", "#P1", player_name="PlayerOne")
+
+    resp = await client.post(
+        "/api/cwl/player-prefs/status",
+        json={"guild_id": "959", "discord_user_id": "70", "player_tag": "#P1", "action": "confirm"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "signup_closed"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_prefs_status_no_event_returns_409(db, bridge_config, client):
+    from qapbot.cache_manager import CACHE
+
+    CACHE.db_manager = db
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('960')")
+    await db.conn.commit()
+
+    resp = await client.post(
+        "/api/cwl/player-prefs/status",
+        json={"guild_id": "960", "discord_user_id": "70", "player_tag": "#GHOST", "action": "confirm"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["error"] == "no_longer_valid"
