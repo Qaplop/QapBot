@@ -20,6 +20,7 @@ Targets EASY and MEDIUM functions with highest coverage impact:
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -710,6 +711,83 @@ class TestFormatClanManagementRolesPruning:
         assert covered_role.mention in embed.fields[-1].value
         assert "#COVERED123" in cache.server_config["1"]["clan_roles"]
         cache.persist_server_config.assert_not_awaited()
+
+
+# ===========================================================================
+# _format_clan_management_notifications -- lopsided single user (tracker #0032,
+# reopened: still reproducible after the first #0032 fix)
+# ===========================================================================
+
+class TestFormatClanManagementNotificationsLopsidedUser:
+    @pytest.mark.asyncio
+    async def test_user_with_many_linked_players_never_produces_oversized_embed(self, monkeypatch):
+        """The first #0032 fix made _split_content_into_two_embeds/_split_content_into_embeds
+        guarantee every embed stays <=4096 chars -- but only because each entry it receives in
+        content_lines is assumed small. _format_clan_management_notifications violated that by
+        joining one whole Discord user's header + every one of their linked players into a
+        single content_lines entry. A user linked to many players (routine on a multi-clan
+        family guild, e.g. "Stay") can make that one entry alone exceed 4096 chars, which no
+        general-purpose line splitter can subdivide -- reproducing Discord's 400 "description:
+        Must be 4096 or fewer" (this time as embeds.0, since the oversized unit is now the
+        first user section instead of the old unbounded remainder). Fix: emit each user's
+        header and player lines as separate content_lines entries so the splitter can always
+        break between them."""
+        from qapbot.QBdiscocmdshelper import _format_clan_management_notifications
+
+        clan_tag = "#CLAN00001"
+        num_players = 80  # enough linked players on one user to exceed 4096 chars alone
+        member_tags = [f"#P{i:08d}" for i in range(num_players)]
+
+        cache = _make_cache(
+            server_config={
+                "1": {
+                    "channel_war_notifications_enabled": False,
+                    "war_notification_channel_id": None,
+                    "clan_custodians": {},
+                },
+            },
+            user_accounts={
+                # Sorted first (by user_id) so its oversized section lands as embeds[0].
+                "100000000000000001": {
+                    "display_name": "HeavyLinkedUser",
+                    "notification_settings": {"war_reminders": True, "notification_mode": "repeated", "notification_type": "all_wars"},
+                    "players": [
+                        {
+                            "player_tag": tag,
+                            "player_name": f"Player{i}",
+                            "verified": True,
+                            "th_level": 15,
+                            "current_clan_tag": clan_tag,
+                        }
+                        for i, tag in enumerate(member_tags)
+                    ],
+                },
+            },
+        )
+        cache.coc_clan_cache = MagicMock()
+        cache.coc_clan_cache.get_clan = AsyncMock(
+            return_value=SimpleNamespace(members=[SimpleNamespace(tag=tag) for tag in member_tags])
+        )
+        cache.fetch_and_update_player_info = AsyncMock(return_value=None)
+
+        guild = MagicMock()
+        guild.id = 1
+
+        with patch("qapbot.cache_manager.CACHE", cache), patch("qapbot.QBdiscocmdshelper.CACHE", cache):
+            main_embed, unlinked_embed, _, _ = await _format_clan_management_notifications(clan_tag, guild)
+
+        all_embeds = []
+        if main_embed is not None:
+            all_embeds.append(main_embed)
+        if isinstance(unlinked_embed, list):
+            all_embeds.extend(unlinked_embed)
+        elif unlinked_embed is not None:
+            all_embeds.append(unlinked_embed)
+
+        assert all_embeds, "expected at least one embed"
+        for embed in all_embeds:
+            assert embed.description is not None
+            assert len(embed.description) <= 4096
 
 
 # ===========================================================================

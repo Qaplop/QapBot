@@ -4473,10 +4473,17 @@ async def _format_clan_management_notifications(clan_tag: str, guild: discord.Gu
                 line = f"  {status_icon} `{LRM}{th_str} {LRM}{player_name}{LRM}{RLM}` 🔹"
             
             player_lines.append(line)
-        
-        # Combine user section
-        user_section = user_header + "\n" + "\n".join(player_lines) + "\n"  # Add blank line after user section
-        user_sections.append(user_section)
+
+        # Append header and each player line as separate content_lines entries (rather than
+        # one joined block per user) so _split_content_into_embeds can break a page between
+        # any two lines. A user with many linked players (common on a multi-clan family guild)
+        # can otherwise produce a single atomic block bigger than one embed's 4096-char limit,
+        # which the splitter has no way to divide -- it only ever breaks *between* entries
+        # (tracker item #0032: this was still reproducible after the first fix, now reporting
+        # embeds.0 instead of embeds.1, because the oversized unit was the first user section).
+        user_sections.append(user_header)
+        user_sections.extend(player_lines)
+        user_sections.append("")  # Blank line after user section
     
     # Build header with count and legend
     header_text = f"**{t('ui_components.war_notifications_display.title', guild_id=guild_id_int)}**\n\n"
