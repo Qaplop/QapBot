@@ -117,7 +117,17 @@ CWL_LEAGUE_ORDER: Tuple[str, ...] = (
 """Canonical CWL league ladder, lowest to highest — used to sort clans by tier, highest first,
 in the CWL Management embed and the web Activity's clan-config table (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md
 Phase E). Mirrors chart_clans_per_league.py's own LEAGUE_ORDER (kept separate there — that
-module pulls in matplotlib, too heavy a dependency for this constants module)."""
+module pulls in matplotlib, too heavy a dependency for this constants module).
+
+Also the source qapbot/ui_cwl_roster.py's CWL_LEAGUE_RANKS (the target_league_rank/
+preferred_league_rank picker list, reversed plus an "Unranked" placeholder) is derived from —
+and, one level further out, what activity/client/src/playerPrefs.ts's own hand-duplicated TS
+copy of that picker list must be kept in sync with by hand, since Python constants aren't
+reachable from TypeScript. QBwarsim.py's CWL_LEAGUE_STAR_DISTRIBUTION also mirrors this same key
+set (its own dict, star-percentage data rather than a pure ladder, so not derived from this
+tuple directly). If CoC ever changes the league ladder again (tracker #0047: the Legend/Titan
+tiers above Champion had been added upstream but were missing from the picker list — caught only
+there, not here), update this tuple and its dependents together."""
 
 PASSIVE_CLAN_REFRESH_INTERVAL_DAYS = 30
 """Days between opportunistic get_clan() refreshes for passively-tracked

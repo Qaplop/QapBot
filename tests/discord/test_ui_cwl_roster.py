@@ -50,6 +50,26 @@ async def _seed_guild_and_clans(db: WarHistoryDB, guild_id: str, clan_tags: Dict
 
 
 # ---------------------------------------------------------------------------
+# CWL_LEAGUE_RANKS — tracker #0047 (this picker list had drifted stale and was missing the
+# Legend/Titan tiers CoC added above Champion). Now derived from qapbot/constants.py's
+# CWL_LEAGUE_ORDER (the codebase's actual single source of truth for the ladder) instead of a
+# second hand-maintained copy, so it can't drift the same way again.
+# ---------------------------------------------------------------------------
+
+def test_cwl_league_ranks_includes_current_league_tiers_highest_first():
+    from qapbot.constants import CWL_LEAGUE_ORDER
+    from qapbot.ui_cwl_roster import CWL_LEAGUE_RANKS
+
+    assert CWL_LEAGUE_RANKS[0] == "Legend League"
+    assert CWL_LEAGUE_RANKS[1:4] == ["Titan League I", "Titan League II", "Titan League III"]
+    assert CWL_LEAGUE_RANKS[-1] == "Unranked"
+    # Derived, not a second hardcoded list — every real league tier from CWL_LEAGUE_ORDER must
+    # appear, in the reverse (highest-first) order the picker wants, plus exactly one extra
+    # entry ("Unranked") that CWL_LEAGUE_ORDER itself has no use for.
+    assert CWL_LEAGUE_RANKS == [*reversed(CWL_LEAGUE_ORDER), "Unranked"]
+
+
+# ---------------------------------------------------------------------------
 # notify_cwl_clan_shared — ownership-message honesty (2026-08-18)
 # ---------------------------------------------------------------------------
 

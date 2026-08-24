@@ -38,6 +38,13 @@ from typing import Tuple, List, Dict, Any, Optional
 # ---------------------------------------------------------------------------
 # CWL league star distribution data (source: clashspot.net, 2026-07)
 #
+# This dict's key set mirrors the current CoC league ladder — the actual single source of truth
+# for that ladder is qapbot/constants.py's CWL_LEAGUE_ORDER (used to derive
+# qapbot/ui_cwl_roster.py's CWL_LEAGUE_RANKS picker list, and duplicated as a TS constant in
+# activity/client/src/playerPrefs.ts). If a future CoC league-system change adds/renames a tier,
+# update CWL_LEAGUE_ORDER (and this dict) together — tracker #0047 was exactly this kind of drift,
+# caught only in the picker list, not here.
+#
 # Rows ordered Legend → Bronze III.
 # Columns: [p_0★+missed, p_1★, p_2★, p_3★]
 # "missed" (player skipped attack) is merged into the 0★ bucket because

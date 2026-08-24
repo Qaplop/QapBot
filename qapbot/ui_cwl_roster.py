@@ -20,22 +20,20 @@ from typing import Any, Dict, List, Optional, Tuple
 import discord
 
 from qapbot.cache_manager import CACHE
+from qapbot.constants import CWL_LEAGUE_ORDER
 
 # CoC's real league ladder, used for target_league_rank / preferred_league_rank pickers
 # throughout this feature (Phase 1's per-clan target tier, Phase 2's sign-up preference).
-# Duplicated verbatim as a TS constant in activity/client/src/playerPrefs.ts (plans/
-# cwl-personal-hub.md Phase 5e, its own picker) rather than fetched — a static, CoC-defined
-# ladder that hasn't changed since this list was written. If this list ever changes, update
-# that file's copy too.
-CWL_LEAGUE_RANKS: List[str] = [
-    "Champion League I", "Champion League II", "Champion League III",
-    "Master League I", "Master League II", "Master League III",
-    "Crystal League I", "Crystal League II", "Crystal League III",
-    "Gold League I", "Gold League II", "Gold League III",
-    "Silver League I", "Silver League II", "Silver League III",
-    "Bronze League I", "Bronze League II", "Bronze League III",
-    "Unranked",
-]
+# Derived from CWL_LEAGUE_ORDER (qapbot/constants.py — the codebase's actual single source of
+# truth for the current ladder, already used to sort clans by tier elsewhere) rather than a
+# second hand-maintained copy of it: tracker #0047, this list had drifted stale and was missing
+# the Legend/Titan tiers CoC added above Champion, precisely the kind of drift a second
+# hardcoded copy invites. CWL_LEAGUE_ORDER is lowest-to-highest; this picker wants highest-first,
+# plus the "no clan war league synced yet" placeholder CWL_LEAGUE_ORDER itself has no use for.
+# Still duplicated verbatim as a TS constant in activity/client/src/playerPrefs.ts (plans/
+# cwl-personal-hub.md Phase 5e, its own picker) rather than fetched — Python constants aren't
+# reachable from TypeScript. If CWL_LEAGUE_ORDER ever changes, update that file's copy too.
+CWL_LEAGUE_RANKS: List[str] = [*reversed(CWL_LEAGUE_ORDER), "Unranked"]
 
 
 # ---------------------------------------------------------------------------
