@@ -2020,6 +2020,15 @@ async def post_test_cases(item_number: int, cases: List[Dict[str, str]], actor_i
     testcases = await db.get_tracker_testcases(item_number)
 
     channel_id_str = item.get("test_channel_id") or CACHE.tracker_settings.get(TRACKER_SETTING_TEST_CHANNEL)
+    if channel_id_str and channel_id_str == CACHE.tracker_settings.get(TRACKER_SETTING_DONE_TESTING_CHANNEL):
+        # A previous round of this item's test cases was already fully passed and archived to
+        # Done Testing (_move_test_message_to_done_testing_channel persists test_channel_id
+        # pointing there) — a fresh post_test_cases() call is starting a NEW round and must land
+        # in the live test channel, not silently keep reusing that leftover archive pointer
+        # (2026-08-24 live bug report: tracker #0044's Phase 5-6 test cases landed in Done
+        # Testing instead of the configured qapbot-testing channel). Mirrors the same `archived`
+        # check _refresh_testcase_message() already makes for the opposite direction.
+        channel_id_str = CACHE.tracker_settings.get(TRACKER_SETTING_TEST_CHANNEL)
     if not channel_id_str:
         raise ValueError("no test channel configured — run /admin -> Bot Setup first")
 

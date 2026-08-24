@@ -1035,6 +1035,38 @@ async def test_post_test_cases_does_not_downgrade_done(db, monkeypatch):
     assert item["status"] == "done"
 
 
+@pytest.mark.asyncio
+async def test_post_test_cases_after_archive_reposts_to_live_channel_not_done_testing(db, monkeypatch):
+    """2026-08-24 live bug report: a fully-passed round gets archived to Done Testing, which
+    persists test_channel_id pointing there (_move_test_message_to_done_testing_channel). A
+    later post_test_cases() call for a fresh round used to read that stale test_channel_id
+    first and silently keep posting into the archive channel forever after — the new cases
+    never reached the live channel testers were actually watching, even though the DB write and
+    the item's 'testing' status both looked entirely normal from the caller's side."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_TEST_CHANNEL] = "1"
+    CACHE.tracker_settings[TRACKER_SETTING_DONE_TESTING_CHANNEL] = "60"
+    live_channel = _fake_channel()
+    live_channel.id = 1
+    # The stale test_message_id (below) doesn't exist in the live channel — matches real Discord
+    # behavior (fetch_message on a foreign/unknown id raises NotFound) so the edit-in-place
+    # branch correctly falls through to delete-and-repost instead of crashing on a None message.
+    live_channel.fetch_message = AsyncMock(side_effect=discord.NotFound(MagicMock(), "not found"))
+    done_channel = _fake_channel()
+    done_channel.id = 60
+    _wire_bot_multi(monkeypatch, {1: live_channel, 60: done_channel})
+    item_number = await _make_item(db)
+    # Simulates the state left behind by a prior round's archive move: test_channel_id/
+    # test_message_id both point at the (now archived) Done Testing message.
+    await db.update_tracker_item(item_number, test_channel_id="60", test_message_id="999")
+
+    item = await post_test_cases(item_number, [{"environment": "DEV", "description": "fresh round"}], actor_id="1")
+
+    live_channel.send.assert_awaited_once()
+    done_channel.send.assert_not_awaited()
+    assert item["test_channel_id"] == "1"
+
+
 # -- message chunking (2026-08-23, tracker #0028) -----------------------------
 # Live incident: post_test_cases() sent the ENTIRE formatted list as one channel.send() call
 # with no length guard. A typical 8-case set overflowed Discord's 2000-char cap by ~2.4x;
