@@ -1,6 +1,20 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-24 (3)
+- Fixed: tracker #45, "My Accounts" (and the link/verify chooser) silently truncated the player
+  picker to Discord's 25-option Select limit -- a user with ~60 linked accounts couldn't reach,
+  let alone unlink, anything past the cutoff, since no cap on linked-account count exists or is
+  intended. AccountManagementView and AccountActionView now paginate at 25 accounts/page with
+  Prev/Next buttons (mirroring ClanManagementView's pagination row); AccountActionView's "Link
+  new account" moved from a Select option to its own button so the full page budget goes to
+  unverified players. Added an "Unlink All" bulk action -- new unlink_all_players() in
+  QBdiscocmdshelper.py batches every account's move-to-UNASSIGNED before one persist_user() call
+  per side, O(1) DB writes regardless of account count.
+  Files: qapbot/ui_registration.py, qapbot/QBdiscocmdshelper.py, qapbot/translations/{en,de}.json,
+  qapbot/docs/REGISTRATION_MESSAGE_WORKFLOWS.md, tests/discord/{test_ui_registration_account_
+  pagination,test_ui_registration_unlink_all,test_ui_registration_phase11}.py. 2709 tests pass.
+
 2026-08-24 (2)
 - Fixed: tracker #0047-#0052, live-testing feedback on the Player CWL Settings Hub Activity
   screen and Configure Participating Clans' Guests search.

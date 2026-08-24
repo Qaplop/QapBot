@@ -216,9 +216,10 @@ async def test_account_action_view_link_new_path(monkeypatch: pytest.MonkeyPatch
         interaction.guild.id,
         action_interaction,
     )
-    view.select = AsyncMock(values=["link_new"])  # type: ignore[assignment]
 
-    await view._on_select(interaction)
+    # "Link new account" is its own button (not a select option) so pagination can use the
+    # select's full option budget for unverified players.
+    await view._on_link_new_click(interaction)
 
     show_modal.assert_awaited_once_with(interaction, interaction.guild.id, user_mentioned=True, action_view_interaction=action_interaction)
 

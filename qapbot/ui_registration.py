@@ -22,6 +22,10 @@ _DISCORD_MESSAGE_CHAR_LIMIT = 2000
 # How much of that budget AccountManagementView's per-player list may occupy, leaving room for
 # the title, overview template, an optional status message and the selection prompt.
 _PLAYER_LIST_CHAR_BUDGET = 1400
+# Discord's hard cap on a Select's option count — AccountManagementView and AccountActionView
+# paginate their player pickers at this size so an account count above it (no cap is enforced
+# on how many accounts a user may link) doesn't silently hide accounts from the picker.
+_ACCOUNTS_PAGE_SIZE = 25
 
 
 async def _clan_filter_callback(
@@ -594,47 +598,128 @@ class AccountActionView(TrackedView):
         self.guild_id = guild_id
         self.action_view_interaction = action_view_interaction
         self.message: Optional[discord.Message] = None
-        
-        # Build options: unverified players + "Link new account"
+        self.current_page = 0  # Page of _ACCOUNTS_PAGE_SIZE unverified players shown in the select
+        self.prev_button: Optional[discord.ui.Button] = None
+        self.page_indicator: Optional[discord.ui.Button] = None
+        self.next_button: Optional[discord.ui.Button] = None
+
         from qapbot.i18n import t
+
+        # "Link new account" is its own button (row 1) rather than a select option, so the
+        # select's full _ACCOUNTS_PAGE_SIZE slots are available for paginating unverified
+        # players — a user with many unverified accounts would otherwise lose a slot to it.
+        link_new_button = discord.ui.Button(
+            label=t('playerregistration.button_link_new', guild_id=guild_id),
+            style=discord.ButtonStyle.primary,
+            custom_id="account_action_link_new",
+            row=1
+        )
+        link_new_button.callback = self._on_link_new_click  # type: ignore[assignment]
+        self.add_item(link_new_button)  # type: ignore[arg-type]
+
+        self._build_select()
+
+    def _build_select(self) -> None:
+        """Build the unverified-player select (row 0) for the current page, plus the
+        pagination row (row 2) when there's more than one page."""
+        from qapbot.i18n import t
+
+        total_pages = max(1, (len(self.unverified_players) + _ACCOUNTS_PAGE_SIZE - 1) // _ACCOUNTS_PAGE_SIZE)
+        self.current_page = max(0, min(self.current_page, total_pages - 1))
+        page_start = self.current_page * _ACCOUNTS_PAGE_SIZE
+        page_players = self.unverified_players[page_start:page_start + _ACCOUNTS_PAGE_SIZE]
+
         options = []
-        for player in unverified_players[:24]:  # Leave room for "Link new account" option
+        for player in page_players:
             player_tag = player.get("player_tag", "")
             player_name = player.get("player_name", "Unknown")
-            
+
             # Skip if player_tag is empty
             if not player_tag:
                 continue
-            
-            label = t('playerregistration.verify_player', guild_id=guild_id, player_name=player_name, player_tag=player_tag)
+
+            label = t('playerregistration.verify_player', guild_id=self.guild_id, player_name=player_name, player_tag=player_tag)
             options.append(discord.SelectOption(label=label[:100], value=f"verify:{player_tag}"))  # type: ignore[arg-type]
-        
-        # Add "Link new account" option
-        options.append(discord.SelectOption(
-            label=t('playerregistration.button_link_new', guild_id=guild_id),
-            value="link_new",
-            description=t('playerregistration.button_link_new_desc', guild_id=guild_id)
-        ))
-        
+
         self.select = discord.ui.Select(
-            placeholder=t('playerregistration.choose_action', guild_id=guild_id),
+            placeholder=t('playerregistration.choose_action', guild_id=self.guild_id),
             min_values=1,
             max_values=1,
-            options=options  # type: ignore[arg-type]
+            options=options,  # type: ignore[arg-type]
+            row=0
         )
         self.select.callback = self._on_select  # type: ignore[assignment]
         self.add_item(self.select)  # type: ignore[arg-type]
+
+        self._build_pagination_row(total_pages)
+
+    def _build_pagination_row(self, total_pages: int) -> None:
+        """Add/refresh the Prev/Page-indicator/Next row (row 2), only when needed."""
+        for existing in (self.prev_button, self.page_indicator, self.next_button):
+            if existing is not None and existing in self.children:
+                self.remove_item(existing)  # type: ignore[arg-type]
+        self.prev_button = None
+        self.page_indicator = None
+        self.next_button = None
+
+        if total_pages <= 1:
+            return
+
+        from qapbot.i18n import t
+
+        self.prev_button = discord.ui.Button(
+            label=t('ui_components.clan_management.button_previous', guild_id=self.guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="account_action_page_prev",
+            disabled=(self.current_page == 0),
+            row=2
+        )
+        self.prev_button.callback = self._on_page_prev  # type: ignore[assignment]
+        self.add_item(self.prev_button)  # type: ignore[arg-type]
+
+        self.page_indicator = discord.ui.Button(
+            label=f"Page {self.current_page + 1}/{total_pages}",
+            style=discord.ButtonStyle.secondary,
+            custom_id="account_action_page_indicator",
+            disabled=True,
+            row=2
+        )
+        self.add_item(self.page_indicator)  # type: ignore[arg-type]
+
+        self.next_button = discord.ui.Button(
+            label=t('ui_components.clan_management.button_next', guild_id=self.guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="account_action_page_next",
+            disabled=(self.current_page >= total_pages - 1),
+            row=2
+        )
+        self.next_button.callback = self._on_page_next  # type: ignore[assignment]
+        self.add_item(self.next_button)  # type: ignore[arg-type]
+
+    async def _on_page_prev(self, interaction: discord.Interaction) -> None:
+        """Handle Prev page button."""
+        self.current_page = max(0, self.current_page - 1)
+        self.remove_item(self.select)  # type: ignore[arg-type]
+        self._build_select()
+        await interaction.response.edit_message(view=self)
+
+    async def _on_page_next(self, interaction: discord.Interaction) -> None:
+        """Handle Next page button."""
+        self.current_page += 1
+        self.remove_item(self.select)  # type: ignore[arg-type]
+        self._build_select()
+        await interaction.response.edit_message(view=self)
+
+    async def _on_link_new_click(self, interaction: discord.Interaction) -> None:
+        """Handle "Link new account" button click."""
+        await _show_player_search_modal(interaction, self.guild_id, user_mentioned=True, action_view_interaction=self.action_view_interaction)
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
         """Handle action selection."""
         from qapbot.i18n import t
         selection = self.select.values[0]
-        
-        if selection == "link_new":
-            # Continue with player search modal (user already mentioned, delete action view first)
-            await _show_player_search_modal(interaction, self.guild_id, user_mentioned=True, action_view_interaction=self.action_view_interaction)
-            
-        elif selection.startswith("verify:"):
+
+        if selection.startswith("verify:"):
             # Extract player_tag and show verification modal
             player_tag = selection.split(":", 1)[1]
             
@@ -941,11 +1026,16 @@ class AccountManagementView(discord.ui.View):
         self.display_name = display_name
         self.selected_player_tag = None
         self.original_interaction = None  # Store original interaction for editing
-        
+        self.current_page = 0  # Page of _ACCOUNTS_PAGE_SIZE accounts currently shown in the select
+        self.prev_button: Optional[discord.ui.Button] = None
+        self.page_indicator: Optional[discord.ui.Button] = None
+        self.next_button: Optional[discord.ui.Button] = None
+
         from qapbot.i18n import t
-        
+
         # Build player selection dropdown (row 0 — keeps the "Select a player below to manage:"
-        # prompt attached directly above the dropdown, matching Discord's layout expectations)
+        # prompt attached directly above the dropdown, matching Discord's layout expectations).
+        # Also adds the pagination row (row 3) when there are more accounts than fit one page.
         self._build_player_select()
 
         # Refresh button — row 2, below the action buttons
@@ -957,6 +1047,16 @@ class AccountManagementView(discord.ui.View):
         )
         self.refresh_button.callback = self._on_refresh_click  # type: ignore[assignment]
         self.add_item(self.refresh_button)  # type: ignore[arg-type]
+
+        # Unlink All button — row 2, alongside Refresh
+        self.unlink_all_button = discord.ui.Button(
+            label=t('playerregistration.button_unlink_all', guild_id=guild_id),
+            style=discord.ButtonStyle.danger,
+            custom_id="account_action_unlink_all",
+            row=2
+        )
+        self.unlink_all_button.callback = self._on_unlink_all_click  # type: ignore[assignment]
+        self.add_item(self.unlink_all_button)  # type: ignore[arg-type]
 
         # Add action buttons (initially all disabled, row 1)
         self.verify_button = discord.ui.Button(
@@ -999,9 +1099,14 @@ class AccountManagementView(discord.ui.View):
         
         user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
         user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
-        
+
+        total_pages = max(1, (len(user_players) + _ACCOUNTS_PAGE_SIZE - 1) // _ACCOUNTS_PAGE_SIZE)
+        self.current_page = max(0, min(self.current_page, total_pages - 1))
+        page_start = self.current_page * _ACCOUNTS_PAGE_SIZE
+        page_players = user_players[page_start:page_start + _ACCOUNTS_PAGE_SIZE]
+
         options = []
-        for player in user_players[:25]:  # Discord limit
+        for player in page_players:
             if not isinstance(player, dict):  # type: ignore[misc]
                 continue
             
@@ -1043,7 +1148,77 @@ class AccountManagementView(discord.ui.View):
         )
         self.player_select.callback = self._on_player_select  # type: ignore[assignment]
         self.add_item(self.player_select)  # type: ignore[arg-type]
-    
+
+        self._build_pagination_row(total_pages)
+
+    def _build_pagination_row(self, total_pages: int) -> None:
+        """Add/refresh the Prev/Page-indicator/Next row (row 3), only when there's more than
+        one page of accounts. Mirrors ClanManagementView._add_pagination_buttons()."""
+        for existing in (self.prev_button, self.page_indicator, self.next_button):
+            if existing is not None and existing in self.children:
+                self.remove_item(existing)  # type: ignore[arg-type]
+        self.prev_button = None
+        self.page_indicator = None
+        self.next_button = None
+
+        if total_pages <= 1:
+            return
+
+        from qapbot.i18n import t
+
+        self.prev_button = discord.ui.Button(
+            label=t('ui_components.clan_management.button_previous', guild_id=self.guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="account_management_page_prev",
+            disabled=(self.current_page == 0),
+            row=3
+        )
+        self.prev_button.callback = self._on_page_prev  # type: ignore[assignment]
+        self.add_item(self.prev_button)  # type: ignore[arg-type]
+
+        self.page_indicator = discord.ui.Button(
+            label=f"Page {self.current_page + 1}/{total_pages}",
+            style=discord.ButtonStyle.secondary,
+            custom_id="account_management_page_indicator",
+            disabled=True,
+            row=3
+        )
+        self.add_item(self.page_indicator)  # type: ignore[arg-type]
+
+        self.next_button = discord.ui.Button(
+            label=t('ui_components.clan_management.button_next', guild_id=self.guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="account_management_page_next",
+            disabled=(self.current_page >= total_pages - 1),
+            row=3
+        )
+        self.next_button.callback = self._on_page_next  # type: ignore[assignment]
+        self.add_item(self.next_button)  # type: ignore[arg-type]
+
+    async def _on_page_prev(self, interaction: discord.Interaction) -> None:
+        """Handle Prev page button — move back one page and clear the current selection."""
+        self.current_page = max(0, self.current_page - 1)
+        self.selected_player_tag = None
+        self.verify_button.disabled = True
+        self.primary_button.disabled = True
+        self.unlink_button.disabled = True
+        self.remove_item(self.player_select)  # type: ignore[arg-type]
+        self._build_player_select()
+        overview_text = self._build_message_content()  # type: ignore[attr-defined]
+        await interaction.response.edit_message(content=overview_text, view=self)
+
+    async def _on_page_next(self, interaction: discord.Interaction) -> None:
+        """Handle Next page button — move forward one page and clear the current selection."""
+        self.current_page += 1
+        self.selected_player_tag = None
+        self.verify_button.disabled = True
+        self.primary_button.disabled = True
+        self.unlink_button.disabled = True
+        self.remove_item(self.player_select)  # type: ignore[arg-type]
+        self._build_player_select()
+        overview_text = self._build_message_content()  # type: ignore[attr-defined]
+        await interaction.response.edit_message(content=overview_text, view=self)
+
     def _build_message_content(self, status_message: Optional[str] = None, show_selection_prompt: bool = True) -> str:
         """Build message content with account overview.
         
@@ -1123,6 +1298,18 @@ class AccountManagementView(discord.ui.View):
         # Add status message before selection prompt if provided
         if status_message:
             overview_text += f"\n\n{status_message}"
+
+        # Note the visible slice when the dropdown is paginated — otherwise the picker below
+        # silently shows only accounts _ACCOUNTS_PAGE_SIZE at a time with no other indication.
+        total_pages = max(1, (len(user_players) + _ACCOUNTS_PAGE_SIZE - 1) // _ACCOUNTS_PAGE_SIZE)
+        if total_pages > 1:
+            page_start = self.current_page * _ACCOUNTS_PAGE_SIZE
+            page_end = min(page_start + _ACCOUNTS_PAGE_SIZE, len(user_players))
+            overview_text += "\n\n" + t(
+                'playerregistration.account_management_page_note',
+                guild_id=self.guild_id,
+                start=page_start + 1, end=page_end, total=len(user_players),
+            )
 
         # Add selection prompt only if requested
         if show_selection_prompt:
@@ -1320,6 +1507,34 @@ class AccountManagementView(discord.ui.View):
             view=confirm_view
         )
 
+    async def _on_unlink_all_click(self, interaction: discord.Interaction):
+        """Handle Unlink All button click - show a bulk-unlink confirmation inline."""
+        from qapbot.i18n import t
+
+        user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
+        user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
+        account_count = len(user_players)
+
+        if account_count == 0:
+            return
+
+        confirm_view = UnlinkAllConfirmView(
+            user_id=self.user_id,
+            guild_id=self.guild_id,
+            account_count=account_count,
+            parent_view=self
+        )
+
+        confirm_text = self._build_message_content(  # type: ignore[attr-defined]
+            status_message=f"⚠️ {t('playerregistration.unlink_all_confirm', guild_id=self.guild_id, count=account_count)}",
+            show_selection_prompt=False
+        )
+
+        await interaction.response.edit_message(
+            content=confirm_text,
+            view=confirm_view
+        )
+
     async def _on_refresh_click(self, interaction: discord.Interaction) -> None:
         """Handle Refresh button — fetch fresh player data from CoC API for all linked accounts."""
         # Defer immediately so we can do async API work before responding
@@ -1507,6 +1722,84 @@ class UnlinkConfirmView(discord.ui.View):
     async def _on_cancel(self, interaction: discord.Interaction):
         """Handle Cancel button - restore parent view."""
         # Restore parent view with current selection state preserved
+        overview_text = self.parent_view._build_message_content()  # type: ignore[attr-defined]
+        await interaction.response.edit_message(content=overview_text, view=self.parent_view)
+
+
+class UnlinkAllConfirmView(discord.ui.View):
+    """
+    Confirmation dialog for unlinking every account a user has linked, in one shot.
+    Shows Confirm and Cancel buttons inline, mirroring UnlinkConfirmView.
+    """
+    def __init__(
+        self,
+        user_id: str,
+        guild_id: int,
+        account_count: int,
+        parent_view: 'AccountManagementView'
+    ):
+        """
+        Initialize bulk unlink confirmation view.
+
+        Args:
+            user_id: Discord user ID
+            guild_id: Guild ID for i18n
+            account_count: Number of accounts about to be unlinked (for logging/messages)
+            parent_view: AccountManagementView instance to restore on cancel
+        """
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.account_count = account_count
+        self.parent_view = parent_view
+
+        from qapbot.i18n import t
+
+        # Confirm button
+        confirm_button = discord.ui.Button(
+            label=t('playerregistration.button_confirm_unlink_all', guild_id=guild_id),
+            style=discord.ButtonStyle.danger,
+            custom_id="unlink_all_confirm",
+        )
+        confirm_button.callback = self._on_confirm  # type: ignore[assignment]
+        self.add_item(confirm_button)  # type: ignore[arg-type]
+
+        # Cancel button
+        cancel_button = discord.ui.Button(
+            label=t('playerregistration.button_cancel', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="unlink_all_cancel",
+        )
+        cancel_button.callback = self._on_cancel  # type: ignore[assignment]
+        self.add_item(cancel_button)  # type: ignore[arg-type]
+
+    async def _on_confirm(self, interaction: discord.Interaction):
+        """Handle Confirm button - unlink every account and show the empty-state message."""
+        from qapbot.QBdiscocmdshelper import unlink_all_players
+        from qapbot.i18n import t
+
+        # Defer immediately (mirrors UnlinkConfirmView._on_confirm — 2026-08-21 incident fix):
+        # unlink_all_players() + role sync below can take longer than Discord's 3s ack window.
+        await interaction.response.defer(thinking=False, ephemeral=True)
+
+        count = await unlink_all_players(self.user_id)
+
+        # STEP: ROLE SYNC — one sync covering every unlinked account, not one per account.
+        if interaction.guild:
+            try:
+                from qapbot.guild_role_manager import sync_roles_for_user
+                await sync_roles_for_user(interaction.guild, str(interaction.guild.id), int(self.user_id))
+            except Exception as _role_sync_e:
+                logging.warning(f"[ROLE-SYNC] Post-unlink-all role sync failed for {self.user_id}: {_role_sync_e}")
+
+        message = t('playerregistration.unlink_all_success', guild_id=self.guild_id, count=count)
+        message += "\n\n" + t('playerregistration.account_management_no_accounts', guild_id=self.guild_id)
+        await interaction.edit_original_response(content=message, view=None)
+
+        logging.info(f"USER ACTION: {interaction.user} unlinked ALL {count} accounts")
+
+    async def _on_cancel(self, interaction: discord.Interaction):
+        """Handle Cancel button - restore parent view."""
         overview_text = self.parent_view._build_message_content()  # type: ignore[attr-defined]
         await interaction.response.edit_message(content=overview_text, view=self.parent_view)
 

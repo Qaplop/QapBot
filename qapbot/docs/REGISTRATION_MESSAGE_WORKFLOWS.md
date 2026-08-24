@@ -711,13 +711,45 @@ BUTTON: Change Mode
                               │   VerifyAccountModal)   │
                               │ - Set Primary           │
                               │ - Unlink (confirm flow) │
+                              │ - Unlink All (confirm)  │
                               └─────────────────────────┘
 ```
 
 Both **Verify** (`VerifyAccountModal.on_submit()`) and **Unlink**
 (`UnlinkConfirmView._on_confirm()`) call `sync_roles_for_user()` directly after their
 respective data change, so clan/member/CoC roles are rechecked immediately — see Key Decision
-Point 6 above.
+Point 6 above. **Unlink All** (`UnlinkAllConfirmView._on_confirm()`) does the same, once, after
+`unlink_all_players()` moves every account.
+
+### No cap on linked-account count — pagination instead (tracker #45)
+
+`user_players` (`db_manager.py`) has no CHECK constraint or app-level limit on how many
+accounts one Discord user may link, and `_link_player_to_user()` never checks a count before
+adding one. A reporter with ~60 linked accounts hit this directly: `AccountManagementView`'s
+player `Select` used to hard-slice to the first 25 (`[:25]`, Discord's option ceiling) with no
+indication more existed, so accounts past that point were unreachable — including for
+unlinking. The same shape of bug existed in `AccountActionView`'s unverified-account picker
+(`[:24]`, one slot reserved for a "Link new account" option).
+
+Fix: both `AccountManagementView._build_player_select()` and `AccountActionView._build_select()`
+paginate at `_ACCOUNTS_PAGE_SIZE` (25) accounts per page, with a Prev/Page-indicator/Next button
+row (mirroring `ClanManagementView._add_pagination_buttons()` in `ui_clan_management.py`) shown
+only when there's more than one page. `AccountActionView` also moved "Link new account" out of
+the Select into its own button, so the Select's full 25-option budget is available for paging
+through unverified players instead of losing one slot to it. Paging away from the current page
+clears any in-progress selection in `AccountManagementView` (Verify/Set Primary/Unlink buttons
+re-disable) rather than leaving a stale `selected_player_tag` that no longer matches what's
+visible.
+
+For bulk cleanup, `unlink_all_players()` (`QBdiscocmdshelper.py`) mirrors `unlink_player()`'s
+move-to-UNASSIGNED logic but batches every account's mutation in memory before a single
+`persist_user()` write-through per side (the user and `"UNASSIGNED"`) — O(1) DB writes
+regardless of account count, not O(n).
+
+**Known follow-up, not fixed here**: `ui_notifications.py`'s buddy-watch Select
+(`watched_players[:25]`) has the identical unpaginated-truncation shape. It's a different
+feature (watching other players' war attacks for DM reminders), not reachable from this hub,
+so it was left out of scope for tracker #45.
 
 ---
 
@@ -867,6 +899,11 @@ Point 6 above.
 - [ ] Set Primary button updates primary flag
 - [ ] Unlink button → confirmation → success triggers `sync_roles_for_user()` (e.g. removing
       a user's only account in a clan should immediately drop that clan's role)
+- [ ] User with >25 linked accounts (tracker #45): pagination row appears, Prev/Next walk
+      through every account, paging away clears the current selection
+- [ ] Unlink All button → confirmation shows exact account count → success moves every
+      account to UNASSIGNED, triggers one `sync_roles_for_user()` call, shows the "no
+      accounts" empty state
 
 ---
 

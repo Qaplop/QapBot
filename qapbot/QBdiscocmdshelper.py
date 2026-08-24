@@ -2450,8 +2450,57 @@ async def unlink_player(user_id: str, player_tag: str) -> bool:
     # Save changes (write-through: persist both affected users)
     await CACHE.persist_user(user_id)
     await CACHE.persist_user("UNASSIGNED")
-    
+
     return True
+
+
+async def unlink_all_players(user_id: str) -> int:
+    """
+    Unlink every account linked to a user in one batch.
+
+    Moves all of the user's players to the UNASSIGNED pool, mirroring unlink_player()'s logic
+    (metadata preserved, primary flag cleared, dedupe against an already-unassigned tag), but
+    batches every player's in-memory mutation before a single persist_user() write-through per
+    side — O(1) DB writes regardless of account count, instead of looping unlink_player() which
+    would cost 2 writes per account.
+
+    Args:
+        user_id: Discord user ID
+
+    Returns:
+        int: number of accounts unlinked (0 if the user has none)
+    """
+    user_entry = CACHE.user_accounts.get(user_id)
+    if not user_entry:
+        return 0
+
+    players = user_entry.get("players", [])
+    if not isinstance(players, list) or not players:
+        return 0
+
+    unassigned_entry = CACHE.user_accounts.setdefault("UNASSIGNED", {"display_name": "UNASSIGNED", "players": []})
+    unassigned_tags = {
+        p.get("player_tag", "") for p in unassigned_entry.get("players", []) if isinstance(p, dict)
+    }
+
+    moved = 0
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+        player_tag = player.get("player_tag", "")
+        if player_tag and player_tag not in unassigned_tags:
+            player["is_primary"] = False
+            unassigned_entry["players"].append(player)
+            unassigned_tags.add(player_tag)
+        moved += 1
+
+    user_entry["players"] = []
+
+    # Save changes (write-through: persist both affected users, once, regardless of count)
+    await CACHE.persist_user(user_id)
+    await CACHE.persist_user("UNASSIGNED")
+
+    return moved
 
 
 def get_verified_player_owner(player_tag: str, requesting_user_id: str) -> Optional[str]:
