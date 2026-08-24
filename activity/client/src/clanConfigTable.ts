@@ -307,6 +307,22 @@ export function renderClanConfigTable(
   guestsSearchInput.className = 'guests-search-input'
   guestsSearchInput.placeholder = 'Search name/tag, clan, @discord user, or #tag…'
   guestsSearchRow.appendChild(guestsSearchInput)
+
+  // Clear ("×") button at the end of the search field (2026-08-24, tracker #0049) — a custom
+  // element rather than native `type="search"`'s built-in clear icon, since that icon is
+  // Chromium-only (absent on iOS/iPadOS WebKit, which this codebase already has a documented
+  // history of needing to special-case around — see index.html's own WebKit comments). Only
+  // clears the search box itself; results stay untouched by this button (only by a genuinely new
+  // search or a guest add — see addClan()/onGuestPlayerAdd below for why those no longer wipe it
+  // either).
+  const guestsSearchClearButton = document.createElement('button')
+  guestsSearchClearButton.type = 'button'
+  guestsSearchClearButton.className = 'guests-search-clear-button'
+  guestsSearchClearButton.textContent = '×'
+  guestsSearchClearButton.setAttribute('aria-label', 'Clear search')
+  guestsSearchClearButton.hidden = true
+  guestsSearchRow.appendChild(guestsSearchClearButton)
+
   guestsSection.appendChild(guestsSearchRow)
 
   const guestsResults = document.createElement('div')
@@ -396,8 +412,11 @@ export function renderClanConfigTable(
             ? `Added ${clanResult.clan_name} — shared with ${clanResult.already_shared_with}. Click Save above to persist.`
             : `Added ${clanResult.clan_name} — click Save above to persist.`
           guestsStatus.className = 'guests-status success'
-          guestsSearchInput.value = ''
-          guestsResults.innerHTML = ''
+          // Leaves the search box and every OTHER result in place (2026-08-24, tracker #0049,
+          // live bug report: a multi-result search got wiped after adding just one guest, forcing
+          // the admin to retype the same query to add a second result from it) — only this one
+          // now-added result disappears from the list.
+          row.remove()
         }
 
         addButton.addEventListener('click', () => {
@@ -447,8 +466,9 @@ export function renderClanConfigTable(
             await onGuestPlayerAdd(result)
             guestsStatus.textContent = `Added ${result.player_name} to the enrollment pool.`
             guestsStatus.className = 'guests-status success'
-            guestsSearchInput.value = ''
-            guestsResults.innerHTML = ''
+            // Same "leave the search box and every other result alone" fix as the clan Add
+            // above (tracker #0049) — only this one now-added result disappears.
+            row.remove()
           } catch (err) {
             console.error(err)
             guestsStatus.textContent = `Failed to add ${result.player_name}: ${(err as Error).message}`
@@ -463,6 +483,7 @@ export function renderClanConfigTable(
   }
 
   function handleSearchInput(): void {
+    guestsSearchClearButton.hidden = guestsSearchInput.value.length === 0
     if (searchDebounceHandle !== undefined) clearTimeout(searchDebounceHandle)
     const query = guestsSearchInput.value.trim()
     if (!query) {
@@ -522,6 +543,12 @@ export function renderClanConfigTable(
   // requestId guards already collapse any resulting duplicate call to a no-op).
   guestsSearchInput.addEventListener('paste', () => {
     setTimeout(handleSearchInput, 0)
+  })
+
+  guestsSearchClearButton.addEventListener('click', () => {
+    guestsSearchInput.value = ''
+    guestsSearchInput.focus()
+    handleSearchInput()
   })
 
   // Rule g (2026-08-18) — "Remove Guest Players": a collapsed-by-default multi-select list of

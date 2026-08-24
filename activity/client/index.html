@@ -183,9 +183,33 @@
       .guests-section { margin-top: 20px; padding-top: 16px; }
       .guests-title { font-size: 1rem; font-weight: 600; margin-bottom: 4px; }
       .guests-hint { font-size: 0.8rem; color: #949ba4; margin-bottom: 10px; }
-      .guests-search-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+      /* Capped at a fixed max-width on big screens (2026-08-24, tracker #0050, live bug report:
+         these fields stretched to the full width of the panel — well over 2000px on a wide
+         monitor — which made them awkward to read/scan compared to every other list in this
+         Activity). `max-width` alone (no explicit `width`) is what keeps this responsive: a plain
+         block-level flex container already fills its available width up to that cap, so a
+         narrower viewport (mobile) still shrinks it exactly like before this change — only wide
+         screens are newly constrained. */
+      .guests-search-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; max-width: 420px; }
       .guests-search-input { flex: 1; min-width: 220px; }
-      .guests-results { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; }
+      /* Clear ("×") button at the end of the search field (2026-08-24, tracker #0049) — square,
+         same visual weight as the input's own height so it reads as part of the same control
+         rather than a separate button. */
+      .guests-search-clear-button {
+        flex-shrink: 0;
+        width: 26px;
+        height: 26px;
+        box-sizing: border-box;
+        background: #1e1f22;
+        color: #949ba4;
+        border: 1px solid #3f4147;
+        border-radius: 4px;
+        font-size: 1rem;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .guests-search-clear-button:hover { background: #3f4147; color: #f2f3f5; }
+      .guests-results { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; max-width: 420px; }
       .guest-result {
         display: flex;
         align-items: center;
@@ -232,7 +256,7 @@
          above it. */
       .guest-players-section { margin-top: 14px; }
       .guest-players-panel { margin-top: 8px; }
-      .guest-players-list { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; margin-bottom: 8px; }
+      .guest-players-list { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; margin-bottom: 8px; max-width: 420px; }
       .guest-players-row { display: flex; align-items: center; gap: 8px; padding: 4px 8px; background: #1e1f22; border: 1px solid #3f4147; border-radius: 4px; font-size: 0.85rem; }
       .guest-players-actions { display: flex; align-items: center; gap: 10px; }
 
