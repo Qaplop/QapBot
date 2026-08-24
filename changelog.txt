@@ -1,6 +1,28 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-24 (2)
+- Fixed: tracker #0047-#0052, live-testing feedback on the Player CWL Settings Hub Activity
+  screen and Configure Participating Clans' Guests search.
+  #0047: CWL_LEAGUE_RANKS (the preferred-league picker) was missing the Legend/Titan tiers CoC
+  added above Champion -- now derived from qapbot/constants.py's CWL_LEAGUE_ORDER instead of a
+  second hand-maintained copy, so it can't drift stale the same way again.
+  #0049: adding one guest search result used to reset the whole search box and results list --
+  now only that result's own row disappears, and a clear ("x") button was added to the search
+  field.
+  #0050: the Guests search field/results/removal list are now capped at a fixed max-width on
+  wide screens (still fully responsive on narrow ones).
+  #0051: block II's "I'm in" button is no longer disabled for 'auto_confirmed' (only for a real
+  'confirmed') -- a member can now turn a standing opt-in's automatic confirmation into a real
+  one, with a new tooltip explaining why that's preferable for clan leader clarity.
+  #0052: block I now auto-saves every control the instant it changes, replacing the old
+  Save/Cancel footer that only visually applied to block I -- the whole screen now has exactly
+  one button, a single "Close" at the bottom common to both blocks.
+  Files: qapbot/{constants,ui_cwl_roster}.py, QBwarsim.py, activity/client/src/{playerPrefs,
+  clanConfigTable}.ts, activity/client/index.html, qapbot/translations/{en,de}.json,
+  tests/discord/test_ui_cwl_roster.py. 2683 tests pass (excludes an unrelated file mid-edit in a
+  concurrent session); activity/client typecheck and build clean.
+
 2026-08-24 (1)
 - Added: Phase 5d+5e of the Player CWL Settings Hub (plans/cwl-personal-hub.md) -- the Activity
   screen itself. Three Worker routes (activity/server/src/index.ts) proxying the already-built
