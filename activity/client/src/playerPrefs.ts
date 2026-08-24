@@ -1,5 +1,4 @@
 import type {
-  PlayerPrefsAccount,
   PlayerPrefsChange,
   PlayerPrefsPayload,
   PlayerPrefsSeasonRow,
@@ -9,10 +8,13 @@ import { utcStringToLocalParts } from './timeFormat'
 import { STATUS_ICON, isVisibleStatus, statusLabel } from './signupStatus'
 import type { Translator } from './i18n'
 
-// CoC's real league ladder — duplicated verbatim from qapbot/ui_cwl_roster.py:26-34 (see that
-// list's own comment pointing back here) rather than fetched, since it is static and CoC-defined.
-// If that list ever changes, update this one too.
+// CoC's real league ladder — duplicated verbatim from qapbot/ui_cwl_roster.py's CWL_LEAGUE_RANKS
+// (see that list's own comment pointing back here) rather than fetched, since it is static and
+// CoC-defined. If that list ever changes (it did once already, tracker #0047 — CoC added the
+// Legend/Titan tiers above Champion and this copy went stale), update this one too.
 const CWL_LEAGUE_RANKS: string[] = [
+  'Legend League',
+  'Titan League I', 'Titan League II', 'Titan League III',
   'Champion League I', 'Champion League II', 'Champion League III',
   'Master League I', 'Master League II', 'Master League III',
   'Crystal League I', 'Crystal League II', 'Crystal League III',
@@ -33,10 +35,6 @@ const STATUS_ERROR_CODES = new Set(['db_unavailable', 'no_longer_valid', 'not_yo
 function accountLabel(tag: string, name: string | null): string {
   return name ? `${name} (${tag})` : tag
 }
-
-/** One row's local, unsaved working state for block I — mirrors PlayerPrefsAccount's editable
- * fields (everything except `verified`, which is display-only). */
-type AccountWorkingState = { mode: PrefsMode; sendDmAnyway: boolean; leagueRank: string | null }
 
 function buildLeagueSelect(current: string | null, t: Translator): HTMLSelectElement {
   const select = document.createElement('select')
@@ -75,15 +73,20 @@ function buildModeSelect(current: PrefsMode, t: Translator): HTMLSelectElement {
  * linked account plus a bulk "apply to all" row) and block II (this season's invitation status,
  * with interactive I'm in / I'm out buttons). See plans/cwl-personal-hub.md Phase 5e.
  *
- * Reuses clanConfigTable.ts's table/header/footer CSS and its "hold edits in a working copy,
- * only persist on Save, Save closes the Activity" discipline for block I. Block II's status
- * change is a separate, immediate action (like clanConfigTable's guest actions) — it POSTs the
- * moment a button is clicked, never batched with block I's Save.
+ * Reuses clanConfigTable.ts's table/header CSS. Every control on the screen auto-saves the
+ * instant it changes (tracker #0052, live UX feedback: a separate Save button positioned under
+ * only block I read as "block II auto-saves but block I doesn't," which was confusing — and
+ * wasn't even accurate, since block II's status buttons always were immediate actions). There is
+ * exactly one button on the whole screen, a single "Close" at the very bottom, common to both
+ * blocks — its only job is closing the Activity; every change is already persisted by the time a
+ * viewer could click it.
  *
- * No optimistic updates anywhere: both onSave and onStatusChange return the freshly rebuilt
- * payload, and this function always re-renders itself from that fresh payload rather than
- * guessing what changed — a status click therefore also discards any not-yet-saved block I
- * edits, exactly like a real page reload would (an accepted, minor rough edge, not a bug).
+ * No optimistic updates anywhere: onSave/onStatusChange always return the freshly rebuilt
+ * payload, and this function re-renders the ENTIRE screen from that fresh payload after every
+ * single successful change — never a local DOM patch — so what's on screen always matches the DB,
+ * never a guess about what changed. A change to one row therefore also discards any other
+ * not-yet-resolved edit still in flight elsewhere on the screen, same as a real page reload would
+ * (an accepted, minor rough edge, not a bug).
  */
 export function renderPlayerPrefs(
   container: HTMLElement,
@@ -96,25 +99,31 @@ export function renderPlayerPrefs(
   const render = (current: PlayerPrefsPayload): void => {
     container.innerHTML = ''
 
+    const closeButton = document.createElement('button')
+    closeButton.textContent = t('close')
+    closeButton.className = 'cancel-button'
+    closeButton.addEventListener('click', () => onClose('Closed'))
+
     if (current.accounts.length === 0) {
       const notice = document.createElement('div')
       notice.className = 'header'
       notice.textContent = t('no_linked_accounts')
       container.appendChild(notice)
 
-      const footer = document.createElement('div')
-      footer.className = 'footer sticky-footer'
-      const closeButton = document.createElement('button')
-      closeButton.textContent = t('close')
-      closeButton.className = 'cancel-button'
-      closeButton.addEventListener('click', () => onClose('Closed'))
-      footer.appendChild(closeButton)
-      container.appendChild(footer)
+      const emptyFooter = document.createElement('div')
+      emptyFooter.className = 'footer sticky-footer'
+      emptyFooter.appendChild(closeButton)
+      container.appendChild(emptyFooter)
       return
     }
 
-    renderBlockOne(container, current, t, onSave, onClose, render)
+    renderBlockOne(container, current, t, onSave, render)
     renderBlockTwo(container, current, t, onStatusChange, render)
+
+    const footer = document.createElement('div')
+    footer.className = 'footer sticky-footer'
+    footer.appendChild(closeButton)
+    container.appendChild(footer)
   }
 
   render(payload)
@@ -125,7 +134,6 @@ function renderBlockOne(
   payload: PlayerPrefsPayload,
   t: Translator,
   onSave: (changes: PlayerPrefsChange[]) => Promise<PlayerPrefsPayload>,
-  onClose: (reason: string) => void,
   rerender: (fresh: PlayerPrefsPayload) => void,
 ): void {
   const block = document.createElement('div')
@@ -157,18 +165,10 @@ function renderBlockOne(
 
   const tbody = document.createElement('tbody')
 
-  // Working state per account, edited in place and only sent on Save — same discipline as
-  // clanConfigTable.ts's `working` copy.
-  const working = new Map<string, AccountWorkingState>(
-    payload.accounts.map((a) => [
-      a.player_tag,
-      { mode: a.mode, sendDmAnyway: a.send_dm_anyway, leagueRank: a.preferred_league_rank },
-    ]),
-  )
-
-  // "Apply to all my accounts" — pinned above the per-account rows, its own immediate-action
-  // Apply button (posts a single {player_tag: null} change right away, independent of the
-  // footer's Save button below — see this function's own docstring).
+  // "Apply to all my accounts" — pinned above the per-account rows, its own Apply button (posts
+  // a single {player_tag: null} change). Every other row auto-saves per control below; this one
+  // keeps an explicit button since "apply" is a deliberate bulk overwrite of every account at
+  // once, not a single field on one row — worth a distinct, separate confirmation click.
   const applyRow = document.createElement('tr')
   applyRow.className = 'apply-row'
 
@@ -232,8 +232,10 @@ function renderBlockOne(
     }
   })
 
+  const rowStatus = document.createElement('div')
+  rowStatus.className = 'block-status'
+
   for (const account of payload.accounts) {
-    const state = working.get(account.player_tag)!
     const row = document.createElement('tr')
 
     const nameCell = document.createElement('td')
@@ -241,15 +243,12 @@ function renderBlockOne(
     row.appendChild(nameCell)
 
     const leagueCell = document.createElement('td')
-    const leagueSelect = buildLeagueSelect(state.leagueRank, t)
-    leagueSelect.addEventListener('change', () => {
-      state.leagueRank = leagueSelect.value || null
-    })
+    const leagueSelect = buildLeagueSelect(account.preferred_league_rank, t)
     leagueCell.appendChild(leagueSelect)
     row.appendChild(leagueCell)
 
     const modeCell = document.createElement('td')
-    const modeSelect = buildModeSelect(state.mode, t)
+    const modeSelect = buildModeSelect(account.mode, t)
     modeCell.appendChild(modeSelect)
     row.appendChild(modeCell)
 
@@ -258,22 +257,49 @@ function renderBlockOne(
     dmInner.className = 'checkbox-cell-inner'
     const dmCheckbox = document.createElement('input')
     dmCheckbox.type = 'checkbox'
-    dmCheckbox.checked = state.sendDmAnyway
-    dmCheckbox.disabled = state.mode !== 'optout'
-    dmCheckbox.addEventListener('change', () => {
-      state.sendDmAnyway = dmCheckbox.checked
-    })
-    modeSelect.addEventListener('change', () => {
-      state.mode = modeSelect.value as PrefsMode
-      dmCheckbox.disabled = state.mode !== 'optout'
-      if (dmCheckbox.disabled) {
-        dmCheckbox.checked = false
-        state.sendDmAnyway = false
-      }
-    })
+    dmCheckbox.checked = account.send_dm_anyway
+    dmCheckbox.disabled = account.mode !== 'optout'
     dmInner.appendChild(dmCheckbox)
     dmCell.appendChild(dmInner)
     row.appendChild(dmCell)
+
+    // Auto-save (tracker #0052): every control in this row posts the row's full current state
+    // the instant it changes — no separate Save click anywhere on this screen any more. Reads
+    // straight off the DOM elements' live values rather than a separately-tracked working-state
+    // object, since there's nothing left that needs to survive between two different controls'
+    // changes (each change is independently, immediately persisted).
+    const controls = [leagueSelect, modeSelect, dmCheckbox]
+    const saveThisRow = async (): Promise<void> => {
+      controls.forEach((c) => (c.disabled = true))
+      rowStatus.textContent = t('saving')
+      rowStatus.className = 'block-status'
+      try {
+        const fresh = await onSave([
+          {
+            player_tag: account.player_tag,
+            mode: modeSelect.value as PrefsMode,
+            send_dm_anyway: dmCheckbox.checked,
+            league_rank: leagueSelect.value || null,
+            rank_provided: true,
+          },
+        ])
+        rerender(fresh)
+      } catch (err) {
+        console.error(err)
+        rowStatus.textContent = t('save_failed')
+        rowStatus.className = 'block-status error'
+        controls.forEach((c) => (c.disabled = false))
+        dmCheckbox.disabled = modeSelect.value !== 'optout'
+      }
+    }
+
+    leagueSelect.addEventListener('change', () => void saveThisRow())
+    dmCheckbox.addEventListener('change', () => void saveThisRow())
+    modeSelect.addEventListener('change', () => {
+      dmCheckbox.disabled = modeSelect.value !== 'optout'
+      if (dmCheckbox.disabled) dmCheckbox.checked = false
+      void saveThisRow()
+    })
 
     tbody.appendChild(row)
   }
@@ -282,52 +308,7 @@ function renderBlockOne(
   scroll.appendChild(table)
   block.appendChild(scroll)
   block.appendChild(applyStatus)
-
-  const status = document.createElement('span')
-  status.className = 'save-status'
-
-  const saveButton = document.createElement('button')
-  saveButton.textContent = t('save')
-  saveButton.className = 'save-button'
-
-  const closeButton = document.createElement('button')
-  closeButton.textContent = t('close')
-  closeButton.className = 'cancel-button'
-  closeButton.addEventListener('click', () => onClose('Cancelled'))
-
-  saveButton.addEventListener('click', async () => {
-    saveButton.disabled = true
-    closeButton.disabled = true
-    status.textContent = t('saving')
-    status.className = 'save-status'
-    try {
-      const changes: PlayerPrefsChange[] = payload.accounts.map((a) => {
-        const state = working.get(a.player_tag)!
-        return {
-          player_tag: a.player_tag,
-          mode: state.mode,
-          send_dm_anyway: state.sendDmAnyway,
-          league_rank: state.leagueRank,
-          rank_provided: true,
-        }
-      })
-      await onSave(changes)
-      onClose('Saved')
-    } catch (err) {
-      console.error(err)
-      status.textContent = t('save_failed')
-      status.className = 'save-status error'
-      saveButton.disabled = false
-      closeButton.disabled = false
-    }
-  })
-
-  const footer = document.createElement('div')
-  footer.className = 'footer sticky-footer'
-  footer.appendChild(saveButton)
-  footer.appendChild(closeButton)
-  footer.appendChild(status)
-  block.appendChild(footer)
+  block.appendChild(rowStatus)
 
   container.appendChild(block)
 }
@@ -438,7 +419,14 @@ function buildSeasonRow(
     const imInButton = document.createElement('button')
     imInButton.textContent = t('button_im_in')
     imInButton.className = 'status-action-button'
-    imInButton.disabled = currentStatus === 'confirmed' || currentStatus === 'auto_confirmed'
+    // auto_confirmed is left CLICKABLE, unlike a real 'confirmed' (tracker #0051, live bug
+    // report): it was seeded automatically by a standing opt-in preference, not a genuine click,
+    // so the member can still turn it into a real confirmation — which the tooltip below explains
+    // is preferable, since it gives the clan leader more clarity than an automatic one.
+    imInButton.disabled = currentStatus === 'confirmed'
+    if (currentStatus === 'auto_confirmed') {
+      imInButton.title = t('confirm_tooltip_auto_confirmed')
+    }
 
     const imOutButton = document.createElement('button')
     imOutButton.textContent = t('button_im_out')
@@ -458,7 +446,7 @@ function buildSeasonRow(
         const code = (err as Error).message
         blockStatus.textContent = STATUS_ERROR_CODES.has(code) ? t(code) : code
         blockStatus.className = 'block-status error'
-        imInButton.disabled = currentStatus === 'confirmed' || currentStatus === 'auto_confirmed'
+        imInButton.disabled = currentStatus === 'confirmed'
         imOutButton.disabled = currentStatus === 'declined'
       }
     }
