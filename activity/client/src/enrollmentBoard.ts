@@ -11,6 +11,14 @@ type SortOrder = 'th' | 'skill' | 'alpha'
 // league-adjusted score regardless of this choice — this only controls what's *displayed*.
 type DisplayMetric = 'avg_stars' | 'skill'
 
+// Backend tier strings are e.g. "Master League I" / "Champion League II" — drop the word
+// "League" so it reads "Master I" / "Champion II". Module-level so both the column header
+// (formatTier, nested in renderEnrollmentBoard below) and the tooltip's preferred-league line
+// (buildTooltipLines, tracker #0057) share one implementation.
+function formatLeagueTier(tier: string | null): string | null {
+  return tier ? tier.replace(' League', '') : null
+}
+
 function metricValue(player: EnrollmentPlayer, metric: DisplayMetric): number | null {
   return metric === 'avg_stars' ? player.avg_stars : player.skill_score
 }
@@ -101,7 +109,10 @@ const HOVER_TOOLTIP_DELAY_MS = 1500
 // Score/Avg stars per attack/Attack-Defense ratio/Missed CWL attacks — Skill Score and Avg
 // stars/attack moved here from their own standalone lines since they're now computed over the
 // SAME trailing-3-month window as the other three (see compute_league_adjusted_skill_scores'
-// own docstring for that consistency fix) — then Guest status, unconditionally last.
+// own docstring for that consistency fix) — then Guest status, unconditionally last. Preferred
+// League (tracker #0057) was slotted right after Response, still inside the identity/status
+// block — it's a per-player preference read alongside the rest of that group, not a computed
+// CWL stat — and, like th_level, only shown when actually set.
 function buildTooltipLines(
   player: EnrollmentPlayer,
   resolveClanName: (tag: string) => string | null,
@@ -141,6 +152,13 @@ function buildTooltipLines(
         : isVisibleStatus(player.signup_status) ? STATUS_LABEL[player.signup_status] : 'No response yet'
     }`,
   )
+  // Tracker #0057: only shown when the player actually set one — this season's per-invite answer
+  // if they gave one, else their standing default (see EnrollmentPlayer.preferred_league_rank's
+  // own comment for the precedence). Silently omitted otherwise, same "if set" convention as the
+  // th_level line above.
+  if (player.preferred_league_rank != null) {
+    pushLine(`Preferred League: ${formatLeagueTier(player.preferred_league_rank)}`)
+  }
 
   const statLines: string[] = []
   if (playerStats && playerStats.attacks !== null) statLines.push(`Attacks: ${playerStats.attacks}`)
@@ -788,12 +806,6 @@ export function renderEnrollmentBoard(
   resizeBoard()
   window.addEventListener('resize', resizeBoard)
 
-  // Backend tier strings are e.g. "Master League I" / "Champion League II" — drop the word
-  // "League" so the header just reads "Master I" / "Champion II".
-  function formatTier(tier: string | null): string | null {
-    return tier ? tier.replace(' League', '') : null
-  }
-
   function playersFor(clanTag: string | null): EnrollmentPlayer[] {
     const matches =
       clanTag === ORPHANED_COLUMN_TAG
@@ -1042,7 +1054,7 @@ export function renderEnrollmentBoard(
     nameLine.appendChild(countSpan)
     columnHeader.appendChild(nameLine)
 
-    const tierText = formatTier(clan?.tier ?? null)
+    const tierText = formatLeagueTier(clan?.tier ?? null)
     if (tierText) {
       const tierLine = document.createElement('div')
       tierLine.className = 'column-header-tier'

@@ -416,6 +416,11 @@ function buildSeasonRow(
 
   if (enrollmentOpen) {
     const currentStatus = row.signup_status
+    // null = no cwl_signups row for this event yet, i.e. the account was never invited
+    // (tracker #0054, live bug report) — both buttons stay disabled until an invite creates
+    // a row to confirm/decline against.
+    const notInvited = currentStatus === null
+
     const imInButton = document.createElement('button')
     imInButton.textContent = t('button_im_in')
     imInButton.className = 'status-action-button'
@@ -423,15 +428,20 @@ function buildSeasonRow(
     // report): it was seeded automatically by a standing opt-in preference, not a genuine click,
     // so the member can still turn it into a real confirmation — which the tooltip below explains
     // is preferable, since it gives the clan leader more clarity than an automatic one.
-    imInButton.disabled = currentStatus === 'confirmed'
+    imInButton.disabled = notInvited || currentStatus === 'confirmed'
     if (currentStatus === 'auto_confirmed') {
       imInButton.title = t('confirm_tooltip_auto_confirmed')
+    } else if (notInvited) {
+      imInButton.title = t('status_action_tooltip_not_invited')
     }
 
     const imOutButton = document.createElement('button')
     imOutButton.textContent = t('button_im_out')
     imOutButton.className = 'status-action-button'
-    imOutButton.disabled = currentStatus === 'declined'
+    imOutButton.disabled = notInvited || currentStatus === 'declined'
+    if (notInvited) {
+      imOutButton.title = t('status_action_tooltip_not_invited')
+    }
 
     const fireStatusChange = async (action: PlayerPrefsStatusAction): Promise<void> => {
       imInButton.disabled = true

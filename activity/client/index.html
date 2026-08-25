@@ -189,8 +189,12 @@
          Activity). `max-width` alone (no explicit `width`) is what keeps this responsive: a plain
          block-level flex container already fills its available width up to that cap, so a
          narrower viewport (mobile) still shrinks it exactly like before this change — only wide
-         screens are newly constrained. */
-      .guests-search-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; max-width: 420px; }
+         screens are newly constrained.
+         Bumped 420px -> 640px (2026-08-25, tracker #0055, live bug report: 420px was tight enough
+         that .guest-result-label's ellipsis truncation (below) was clipping normal-length player
+         rows like "Qaplop (#PQGYR99V) — not linked, can't DM you") — same reasoning as #0050,
+         just a wider cap so real rows fit without cutting into "well over 2000px" territory. */
+      .guests-search-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; max-width: 640px; }
       .guests-search-input { flex: 1; min-width: 220px; }
       /* Clear ("×") button at the end of the search field (2026-08-24, tracker #0049) — square,
          same visual weight as the input's own height so it reads as part of the same control
@@ -209,7 +213,7 @@
         cursor: pointer;
       }
       .guests-search-clear-button:hover { background: #3f4147; color: #f2f3f5; }
-      .guests-results { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; max-width: 420px; }
+      .guests-results { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; max-width: 640px; }
       .guest-result {
         display: flex;
         align-items: center;
@@ -256,7 +260,7 @@
          above it. */
       .guest-players-section { margin-top: 14px; }
       .guest-players-panel { margin-top: 8px; }
-      .guest-players-list { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; margin-bottom: 8px; max-width: 420px; }
+      .guest-players-list { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; margin-bottom: 8px; max-width: 640px; }
       .guest-players-row { display: flex; align-items: center; gap: 8px; padding: 4px 8px; background: #1e1f22; border: 1px solid #3f4147; border-radius: 4px; font-size: 0.85rem; }
       .guest-players-actions { display: flex; align-items: center; gap: 10px; }
 

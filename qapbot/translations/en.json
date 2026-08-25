@@ -1035,6 +1035,7 @@
       "button_im_in": "I'm in",
       "button_im_out": "I'm out",
       "confirm_tooltip_auto_confirmed": "You're already in via your standing preference — clicking this confirms it for real, which gives your clan leader more clarity than an automatic confirmation.",
+      "status_action_tooltip_not_invited": "You haven't been invited to CWL for this account yet — there's nothing to confirm or decline.",
       "enrollment_not_open": "Enrollment isn't open for this season yet.",
       "saved": "Saved.",
       "saving": "Saving…",

@@ -1,6 +1,29 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-25 (1)
+- Fixed: tracker #0054, live bug report -- the Player CWL Settings Hub's "Ich bin dabei"/"Ich bin
+  raus" (confirm/decline) buttons stayed clickable even for an account with no cwl_signups row
+  for the current season, i.e. one that was never actually invited -- clicking them had nothing
+  real to confirm/decline against. buildSeasonRow() in playerPrefs.ts now disables both buttons
+  whenever signup_status is null, with a new tooltip (status_action_tooltip_not_invited)
+  explaining why.
+- Fixed: tracker #0055, live bug report -- the #0050 fix's 420px max-width cap on the Guests
+  search results/list panels was tight enough to clip normal-length rows via the existing
+  ellipsis truncation (e.g. "Qaplop (#PQGYR99V) -- not linked, can't DM you"). Bumped
+  .guests-search-row/.guests-results/.guest-players-list to 640px in activity/client/index.html.
+- Added: tracker #0057, feature request -- the "Manage Teams" board's hover tooltip now shows a
+  player's preferred CWL league tier when set (this season's per-invite cwl_signups.
+  preferred_league_rank if the player gave one, else their standing user_players.
+  cwl_default_preferred_league_rank default), right after the Response line. New
+  EnrollmentPlayer.preferred_league_rank field threaded from _build_enrollment_payload_sync()
+  through to enrollmentBoard.ts's buildTooltipLines(); extracted the existing "drop the word
+  League" formatter to a module-level formatLeagueTier() shared by the column header and the new
+  tooltip line.
+  Files: activity/client/src/{playerPrefs,types,enrollmentBoard}.ts, activity/client/index.html,
+  qapbot/web_bridge.py, qapbot/translations/{en,de}.json. Client typecheck+build clean. 2709
+  tests pass.
+
 2026-08-24 (3)
 - Fixed: tracker #45, "My Accounts" (and the link/verify chooser) silently truncated the player
   picker to Discord's 25-option Select limit -- a user with ~60 linked accounts couldn't reach,

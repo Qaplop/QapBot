@@ -1035,6 +1035,7 @@
       "button_im_in": "Ich bin dabei",
       "button_im_out": "Ich bin raus",
       "confirm_tooltip_auto_confirmed": "Du bist durch deine dauerhafte Einstellung bereits dabei — ein Klick bestätigt das verbindlich, was deinem Clanleiter mehr Klarheit gibt als eine automatische Bestätigung.",
+      "status_action_tooltip_not_invited": "Du wurdest für diesen Account noch nicht zur CWL eingeladen — es gibt nichts zu bestätigen oder abzulehnen.",
       "enrollment_not_open": "Die Anmeldephase für diese Saison ist noch nicht geöffnet.",
       "saved": "Gespeichert.",
       "saving": "Wird gespeichert…",
