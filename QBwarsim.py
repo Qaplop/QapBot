@@ -36,7 +36,7 @@ from concurrent.futures import ProcessPoolExecutor, wait as _cf_wait, ALL_COMPLE
 from typing import Tuple, List, Dict, Any, Optional
 
 # ---------------------------------------------------------------------------
-# CWL league star distribution data (source: clashspot.net, 2026-07)
+# CWL league star distribution data (source: clashspot.net, 2026-08)
 #
 # This dict's key set mirrors the current CoC league ladder — the actual single source of truth
 # for that ladder is qapbot/constants.py's CWL_LEAGUE_ORDER (used to derive
@@ -55,44 +55,43 @@ from typing import Tuple, List, Dict, Any, Optional
 # produce per-attack star distributions that are calibrated to the actual
 # performance level of each CWL tier.
 #
-# Legend League had 0 participants in 2026-07 (still rolling out); it uses
-# Titan League I as proxy (the highest tier with real data this month).
-# Titan League I/II/III now have real 2026-07 data (11 / 37 / 82 groups).
-# All other leagues use 2026-07 clashspot.net data.
+# Legend League has real 2026-08 data for the first time (4 groups, 26 clans) — no longer needs
+# the Titan League I proxy that 2026-07's table used while Legend was still rolling out.
+# All leagues below use 2026-08 clashspot.net data (tracker #0048).
 # Source columns: [3★, 2★, 1★, 0★_with_dmg, 0★_missed]; the last two are
 # combined into p_0★ to produce [p_0★, p_1★, p_2★, p_3★] stored here.
 # ---------------------------------------------------------------------------
 CWL_LEAGUE_STAR_DISTRIBUTION: Dict[str, List[float]] = {
-    # Legend: 0 participants in 2026-07 — proxy from Titan League I
-    "Legend League":       [0.0016, 0.0306, 0.3239, 0.6439],
-    # Titan leagues (2026-07 data: 11 / 37 / 82 groups)
-    "Titan League I":      [0.0016, 0.0306, 0.3239, 0.6439],
-    "Titan League II":     [0.0035, 0.0275, 0.2530, 0.7160],
-    "Titan League III":    [0.0043, 0.0407, 0.3145, 0.6405],
-    # Champion leagues (2026-07 data)
-    "Champion League I":   [0.0063, 0.0171, 0.1070, 0.8695],
-    "Champion League II":  [0.0093, 0.0202, 0.1236, 0.8469],
-    "Champion League III": [0.0142, 0.0299, 0.1562, 0.7998],
-    # Master leagues (2026-07 data)
-    "Master League I":     [0.0275, 0.0432, 0.2062, 0.7230],
-    "Master League II":    [0.0419, 0.0515, 0.2562, 0.6504],
-    "Master League III":   [0.0642, 0.0583, 0.2960, 0.5816],
-    # Crystal leagues (2026-07 data)
-    "Crystal League I":    [0.1045, 0.0650, 0.3082, 0.5223],
-    "Crystal League II":   [0.1627, 0.0702, 0.2820, 0.4850],
-    "Crystal League III":  [0.2382, 0.0722, 0.2335, 0.4561],
-    # Gold leagues (2026-07 data)
-    "Gold League I":       [0.3218, 0.0713, 0.1793, 0.4277],
-    "Gold League II":      [0.3995, 0.0676, 0.1322, 0.4007],
-    "Gold League III":     [0.4656, 0.0624, 0.0981, 0.3738],
-    # Silver leagues (2026-07 data)
-    "Silver League I":     [0.5294, 0.0557, 0.0717, 0.3433],
-    "Silver League II":    [0.5906, 0.0482, 0.0531, 0.3080],
-    "Silver League III":   [0.6855, 0.0336, 0.0324, 0.2485],
-    # Bronze leagues (2026-07 data)
-    "Bronze League I":     [0.6576, 0.0485, 0.0461, 0.2478],
-    "Bronze League II":    [0.8146, 0.0158, 0.0136, 0.1560],
-    "Bronze League III":   [0.8660, 0.0089, 0.0074, 0.1177],
+    # Legend (2026-08 data: 4 groups — first month with real participants)
+    "Legend League":       [0.0027, 0.0237, 0.2890, 0.6845],
+    # Titan leagues (2026-08 data)
+    "Titan League I":      [0.0041, 0.0394, 0.3776, 0.5789],
+    "Titan League II":     [0.0066, 0.0310, 0.2686, 0.6938],
+    "Titan League III":    [0.0043, 0.0436, 0.3237, 0.6283],
+    # Champion leagues (2026-08 data)
+    "Champion League I":   [0.0066, 0.0179, 0.1151, 0.8604],
+    "Champion League II":  [0.0112, 0.0238, 0.1326, 0.8324],
+    "Champion League III": [0.0155, 0.0326, 0.1662, 0.7857],
+    # Master leagues (2026-08 data)
+    "Master League I":     [0.0315, 0.0457, 0.2138, 0.7091],
+    "Master League II":    [0.0472, 0.0539, 0.2608, 0.6382],
+    "Master League III":   [0.0716, 0.0598, 0.2976, 0.5710],
+    # Crystal leagues (2026-08 data)
+    "Crystal League I":    [0.1128, 0.0663, 0.3066, 0.5143],
+    "Crystal League II":   [0.1708, 0.0714, 0.2820, 0.4758],
+    "Crystal League III":  [0.2427, 0.0739, 0.2350, 0.4484],
+    # Gold leagues (2026-08 data)
+    "Gold League I":       [0.3237, 0.0726, 0.1807, 0.4229],
+    "Gold League II":      [0.3951, 0.0685, 0.1354, 0.4010],
+    "Gold League III":     [0.4556, 0.0643, 0.1014, 0.3787],
+    # Silver leagues (2026-08 data)
+    "Silver League I":     [0.5179, 0.0572, 0.0737, 0.3513],
+    "Silver League II":    [0.5761, 0.0496, 0.0550, 0.3192],
+    "Silver League III":   [0.6625, 0.0365, 0.0347, 0.2663],
+    # Bronze leagues (2026-08 data)
+    "Bronze League I":     [0.7706, 0.0209, 0.0198, 0.1887],
+    "Bronze League II":    [0.8232, 0.0139, 0.0131, 0.1498],
+    "Bronze League III":   [0.8494, 0.0103, 0.0084, 0.1319],
 }
 
 

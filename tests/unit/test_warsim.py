@@ -28,6 +28,37 @@ class TestThStarProbabilities:
         assert higher[3] >= equal[3]
 
 
+class TestCwlLeagueStarDistribution:
+    """Tracker #0048: this table is hand-transcribed from a clashspot.net screenshot each time
+    CoC's season resets, so it has no other guard against a row being mistyped or a league
+    dropped — these checks exist to catch exactly that."""
+
+    @pytest.mark.smoke
+    def test_covers_every_league_in_the_ladder(self):
+        from QBwarsim import CWL_LEAGUE_STAR_DISTRIBUTION
+        from qapbot.constants import CWL_LEAGUE_ORDER
+
+        assert set(CWL_LEAGUE_STAR_DISTRIBUTION.keys()) == set(CWL_LEAGUE_ORDER)
+
+    @pytest.mark.smoke
+    @pytest.mark.parametrize("league_name", [
+        "Legend League", "Titan League I", "Titan League II", "Titan League III",
+        "Champion League I", "Champion League II", "Champion League III",
+        "Master League I", "Master League II", "Master League III",
+        "Crystal League I", "Crystal League II", "Crystal League III",
+        "Gold League I", "Gold League II", "Gold League III",
+        "Silver League I", "Silver League II", "Silver League III",
+        "Bronze League I", "Bronze League II", "Bronze League III",
+    ])
+    def test_row_sums_to_one(self, league_name):
+        from QBwarsim import get_league_star_probs
+
+        probs = get_league_star_probs(league_name)
+        assert probs is not None
+        assert len(probs) == 4
+        assert abs(sum(probs) - 1.0) < 1e-3
+
+
 class TestMaxPossibleStars:
     @pytest.mark.smoke
     def test_calculate_max_possible_stars_returns_non_negative(self, sample_war_data):

@@ -1,6 +1,17 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (12)
+- Updated: tracker #0048, refreshed CWL_LEAGUE_STAR_DISTRIBUTION with 2026-08 season star-rate
+  data from clashspot.net (screenshot attached to the ticket). Notably Legend League now has its
+  own real data (4 groups) for the first time -- 2026-07's table had to proxy it off Titan League
+  I because Legend had 0 CWL participants that month; that proxy is gone now. All 22 league tiers
+  (Legend through Bronze III) updated from the screenshot's per-league 3-star/2-star/1-star/
+  0-star-with-damage/missed breakdown. Added a sanity-test class (row sums to 1.0, full ladder
+  coverage) so a future manual transcription slip gets caught by run_tests.ps1 instead of only by
+  simulation output looking subtly off.
+  File: QBwarsim.py. Tests: tests/unit/test_warsim.py (23 new). 2769 tests pass.
+
 2026-08-29 (11)
 - Fixed: tracker #0056, corrected diagnosis. The earlier "probably already fixed by #45"
   conclusion (entry (8) below) turned out wrong once the reporter clarified the crash happened
