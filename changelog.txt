@@ -1,15 +1,25 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (30)
+- Deployed: activity/server (Worker) to PROD too, per explicit follow-up request ("all changes we
+  ever made, server and client, latest version"). `tsc --noEmit` clean. Deployed version
+  df58bdf2, still at commit 6cae501 (Phase 5d/5e player-prefs routes) since no server source has
+  changed since. Correction to entry (29) below: `wrangler deployments list --env prod` reported
+  the last PROD deploy as 9 days stale, which was WRONG -- `wrangler versions list --env prod`
+  shows the server was actually already redeployed several times since, including once this same
+  morning (2026-08-29T11:23) -- `deployments list` just doesn't reflect this Worker's real deploy
+  history (a gradual-rollout-tracking quirk, not an actual gap). Both activity/client and
+  activity/server are now confirmed at the tip of main on PROD.
+
 2026-08-29 (29)
 - Deployed: activity/client to PROD (user request), catching up 4 commits that had only been on
   DEV -- 58f8e35 (Not Invited Yet icon), 1acb644 (notinvited.svg XML-comment fix), 05759e5
   (legend comma placement), 68ae4db (dm_sent-based "Not Invited Yet" semantics). `tsc --noEmit`
   clean. https://126ea102.cwl-clan-config-prod.pages.dev (`npm run deploy:prod`).
   Note: activity/server (Worker) was NOT touched here -- no server source changed in this batch --
-  but its own last PROD deploy predates this by 9 days and is missing Phase 5d/5e (player-prefs
-  routes + Activity screen, merged 2026-08-24); flagged to the user rather than bundled in,
-  since that's an unrelated, untested-in-PROD backlog this request didn't ask for.
+  flagged its deploy staleness to the user rather than bundling a redeploy in unprompted; see
+  entry (30) above for the correction once actually investigated further.
 
 2026-08-29 (28)
 - Fixed: live bug report (round 2) on the CWL Coordinators picker -- the round-1 re-entrancy fix
