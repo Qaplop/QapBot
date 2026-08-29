@@ -1,4 +1,5 @@
 import unlinkedIconUrl from './assets/unlinked.svg'
+import notInvitedIconUrl from './assets/notinvited.svg'
 import type { AdminSettableStatus, EnrollmentPayload, EnrollmentPlayer, SetStatusResult } from './types'
 import { STATUS_ICON, STATUS_LABEL, isVisibleStatus } from './signupStatus'
 import type { VisibleStatus } from './signupStatus'
@@ -33,6 +34,12 @@ function metricLabel(metric: DisplayMetric): string {
 // about what they look like.
 
 const UNLINKED_LABEL = 'Not Linked'
+// Tracker #0043 — a linked current clan member who is in this season's pool but has no
+// `cwl_signups` row at all yet (never seeded/DMed by any invite pass), as opposed to `pending`
+// (DM sent, no response yet). Same "mutually exclusive with the real signup-status icons" shape
+// as UNLINKED_LABEL above — this only ever replaces the empty spacer a player with signup_status
+// null used to get.
+const NOT_INVITED_LABEL = 'Not Invited Yet'
 
 const EVENT_STATUS_LABEL: Record<string, string> = {
   draft: 'Draft',
@@ -149,7 +156,7 @@ function buildTooltipLines(
     `Response: ${
       player.discord_id == null
         ? UNLINKED_LABEL
-        : isVisibleStatus(player.signup_status) ? STATUS_LABEL[player.signup_status] : 'No response yet'
+        : isVisibleStatus(player.signup_status) ? STATUS_LABEL[player.signup_status] : NOT_INVITED_LABEL
     }`,
   )
   // Tracker #0057 (precedence corrected #0058/#0059): only shown when a value is actually known —
@@ -722,6 +729,10 @@ export function renderEnrollmentBoard(
       "No Discord account is linked to this player, so they can't receive or respond to the enrollment DM.",
       ',',
     ),
+    buildLegendItem(
+      notInvitedIconUrl, NOT_INVITED_LABEL,
+      "A current clan member in this season's pool who hasn't been sent the enrollment DM yet.",
+    ),
     // Guest indicator (2026-08-16, live-testing feedback: "what is the meaning of the small
     // yellow band" — the .guest-card left-accent already had a hover tooltip, but that's not
     // discoverable without hovering every card; a legend entry is) — a small swatch reproducing
@@ -973,10 +984,16 @@ export function renderEnrollmentBoard(
       icon.title = STATUS_LABEL[player.signup_status]
       row.appendChild(icon)
     } else {
-      const spacer = document.createElement('span')
-      spacer.className = 'status-icon'
-      spacer.style.visibility = 'hidden'
-      row.appendChild(spacer)
+      // Tracker #0043: linked, in the pool, but no cwl_signups row at all — nobody has invited
+      // them yet. Previously an invisible spacer here, indistinguishable from a real status icon
+      // that just hadn't loaded — the whole point of this ticket was making these players visible
+      // to the clan lead instead of blending in.
+      const icon = document.createElement('img')
+      icon.className = 'status-icon'
+      icon.src = notInvitedIconUrl
+      icon.alt = NOT_INVITED_LABEL
+      icon.title = NOT_INVITED_LABEL
+      row.appendChild(icon)
     }
 
     card.appendChild(row)

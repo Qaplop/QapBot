@@ -1,0 +1,8 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- Red circle with a white horizontal bar -- the international "prohibited"/no-entry sign
+       (project owner's spec, tracker #0043), distinct in SHAPE (not just color) from the other
+       rounded-square status icons so it reads as its own category at a glance: a linked pool
+       member who is a current clan member but has never been sent the enrollment DM at all. -->
+  <circle cx="32" cy="32" r="22" fill="#c23a3a"/>
+  <rect x="14" y="28" width="36" height="8" rx="2" fill="white"/>
+</svg>

@@ -1,6 +1,19 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (16)
+- Added: tracker #0043, a new "Not Invited Yet" status/icon on the CWL Manage Teams board
+  (activity/client) for a linked current clan member who's in this season's pool but has no
+  cwl_signups row at all yet -- previously an invisible spacer indistinguishable from a loading
+  icon, so the clan lead had no way to see who simply hadn't been invited. Red-circle-with-white-
+  bar "no entry" icon (project owner's spec), styled deliberately as a circle rather than the
+  other statuses' rounded squares so it reads as a distinct category at a glance. Added to the
+  card icon slot, the hover tooltip's Response line (replacing the vaguer "No response yet"), and
+  the board's legend.
+  Files: activity/client/src/enrollmentBoard.ts, activity/client/src/assets/notinvited.svg.
+  No Python files touched -- activity/client typecheck and build clean; 2777 Python tests pass
+  (unaffected).
+
 2026-08-29 (15)
 - Fixed: tracker #0067, CWL Settings hub's three activate/deactivate toggle buttons ("CWL
   Management Hub", "Player CWL Settings Hub", "Include All Linked Accounts") colored themselves
