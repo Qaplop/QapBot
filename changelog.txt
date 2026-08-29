@@ -1,6 +1,22 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (11)
+- Fixed: tracker #0056, corrected diagnosis. The earlier "probably already fixed by #45"
+  conclusion (entry (8) below) turned out wrong once the reporter clarified the crash happened
+  testing tracker #45's OWN just-deployed pagination, not before it -- ruling that theory out.
+  Real root cause: #45 added several new AccountManagementView handlers (page-turn, select,
+  verify, set-primary, unlink, unlink-all, and especially Refresh -- a real CoC API fetch across
+  every linked account before its own edit, by far the widest window) that all edit the same
+  ephemeral message with ZERO re-entrancy guard between them. A rapid second click -- exactly
+  what a user exploring a brand-new 3-page UI (their ~60 accounts) would do -- could race two
+  edit_message() calls against each other, badly enough to crash the reporter's Discord client
+  ("Cannot read property 'label' of undefined"), not just double-write data the way this same
+  bug class usually manifests. Fixed with a per-instance _busy flag + _guard_reentrant() helper
+  guarding every state-mutating handler, checked before any await.
+  File: qapbot/ui_registration.py. Docs: COPILOT_PITFALLS_COOKBOOK.md Pitfall 49 (also documents
+  the earlier misdiagnosis as a process note). 2746 tests pass (2 new).
+
 2026-08-29 (10)
 - Added: tracker #0053 -- /list action:Accounts gained an optional discord_user parameter to
   show one Discord user's CoC accounts only, instead of always listing every registered account.

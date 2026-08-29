@@ -1030,6 +1030,17 @@ class AccountManagementView(discord.ui.View):
         self.prev_button: Optional[discord.ui.Button] = None
         self.page_indicator: Optional[discord.ui.Button] = None
         self.next_button: Optional[discord.ui.Button] = None
+        # Re-entrancy guard (tracker #0056): every handler below rebuilds this view's own
+        # components (player_select, pagination row, action-button disabled state) and edits the
+        # SAME message in place. A rapid second click landing while a first click's edit is still
+        # in flight -- very plausible right on this view's own pagination buttons, added by the
+        # #0045 rewrite that gave a many-account user (this bug's reporter had ~60, so 3 pages) a
+        # brand-new reason to click quickly through pages -- races two edit_message() calls
+        # against each other on one message, which can desync a Discord client's local component
+        # diffing badly enough to crash it (reported: "Cannot read property 'label' of
+        # undefined", first invocation only -- a slower, deliberate retry afterward worked fine).
+        # See _guard_reentrant()'s own docstring.
+        self._busy = False
 
         from qapbot.i18n import t
 
@@ -1088,7 +1099,18 @@ class AccountManagementView(discord.ui.View):
         )
         self.unlink_button.callback = self._on_unlink_click  # type: ignore[assignment]
         self.add_item(self.unlink_button)  # type: ignore[arg-type]
-    
+
+    def _guard_reentrant(self) -> bool:
+        """True if the caller may proceed (and marks this view busy until it calls
+        `self._busy = False` itself, normally in a `finally`); False if a prior click on this
+        same view is still mid-flight, in which case the caller must just defer-and-return
+        rather than run its handler body. Checked as the literal first statement, before any
+        `await` — see this view's `_busy` field for why (tracker #0056)."""
+        if self._busy:
+            return False
+        self._busy = True
+        return True
+
     def _build_player_select(self, selected_tag: Optional[str] = None):
         """Build player selection dropdown from user's accounts.
         
@@ -1197,27 +1219,45 @@ class AccountManagementView(discord.ui.View):
 
     async def _on_page_prev(self, interaction: discord.Interaction) -> None:
         """Handle Prev page button — move back one page and clear the current selection."""
-        self.current_page = max(0, self.current_page - 1)
-        self.selected_player_tag = None
-        self.verify_button.disabled = True
-        self.primary_button.disabled = True
-        self.unlink_button.disabled = True
-        self.remove_item(self.player_select)  # type: ignore[arg-type]
-        self._build_player_select()
-        overview_text = self._build_message_content()  # type: ignore[attr-defined]
-        await interaction.response.edit_message(content=overview_text, view=self)
+        if not self._guard_reentrant():
+            try:
+                await interaction.response.defer(thinking=False)
+            except discord.HTTPException:
+                pass
+            return
+        try:
+            self.current_page = max(0, self.current_page - 1)
+            self.selected_player_tag = None
+            self.verify_button.disabled = True
+            self.primary_button.disabled = True
+            self.unlink_button.disabled = True
+            self.remove_item(self.player_select)  # type: ignore[arg-type]
+            self._build_player_select()
+            overview_text = self._build_message_content()  # type: ignore[attr-defined]
+            await interaction.response.edit_message(content=overview_text, view=self)
+        finally:
+            self._busy = False
 
     async def _on_page_next(self, interaction: discord.Interaction) -> None:
         """Handle Next page button — move forward one page and clear the current selection."""
-        self.current_page += 1
-        self.selected_player_tag = None
-        self.verify_button.disabled = True
-        self.primary_button.disabled = True
-        self.unlink_button.disabled = True
-        self.remove_item(self.player_select)  # type: ignore[arg-type]
-        self._build_player_select()
-        overview_text = self._build_message_content()  # type: ignore[attr-defined]
-        await interaction.response.edit_message(content=overview_text, view=self)
+        if not self._guard_reentrant():
+            try:
+                await interaction.response.defer(thinking=False)
+            except discord.HTTPException:
+                pass
+            return
+        try:
+            self.current_page += 1
+            self.selected_player_tag = None
+            self.verify_button.disabled = True
+            self.primary_button.disabled = True
+            self.unlink_button.disabled = True
+            self.remove_item(self.player_select)  # type: ignore[arg-type]
+            self._build_player_select()
+            overview_text = self._build_message_content()  # type: ignore[attr-defined]
+            await interaction.response.edit_message(content=overview_text, view=self)
+        finally:
+            self._busy = False
 
     def _build_message_content(self, status_message: Optional[str] = None, show_selection_prompt: bool = True) -> str:
         """Build message content with account overview.
@@ -1336,207 +1376,274 @@ class AccountManagementView(discord.ui.View):
     
     async def _on_player_select(self, interaction: discord.Interaction):
         """Handle player selection - update message and enable/disable buttons."""
-        selected_tag = self.player_select.values[0]
-        self.selected_player_tag = selected_tag
-        
-        if selected_tag == "none":
-            # Keep buttons disabled
-            overview_text = self._build_message_content()  # type: ignore[attr-defined]
-            await interaction.response.edit_message(content=overview_text, view=self)
+        if not self._guard_reentrant():
+            try:
+                await interaction.response.defer(thinking=False)
+            except discord.HTTPException:
+                pass
             return
-        
-        # Get player data
-        user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
-        user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
-        
-        player_data = None
-        for player in user_players:
-            player_tag = player.get("player_tag")  # type: ignore[misc]
-            if isinstance(player, dict) and player_tag == selected_tag:  # type: ignore[misc]
-                player_data = player
-                break
-        
-        if not player_data:
-            # Keep buttons disabled
+        try:
+            selected_tag = self.player_select.values[0]
+            self.selected_player_tag = selected_tag
+
+            if selected_tag == "none":
+                # Keep buttons disabled
+                overview_text = self._build_message_content()  # type: ignore[attr-defined]
+                await interaction.response.edit_message(content=overview_text, view=self)
+                return
+
+            # Get player data
+            user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
+            user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
+
+            player_data = None
+            for player in user_players:
+                player_tag = player.get("player_tag")  # type: ignore[misc]
+                if isinstance(player, dict) and player_tag == selected_tag:  # type: ignore[misc]
+                    player_data = player
+                    break
+
+            if not player_data:
+                # Keep buttons disabled
+                overview_text = self._build_message_content()  # type: ignore[attr-defined]
+                await interaction.response.edit_message(content=overview_text, view=self)
+                return
+
+            # Update button states based on player data
+            verified = player_data.get("verified", False)
+            is_primary = player_data.get("is_primary", False)
+
+            # Verify button: only enabled if not verified
+            self.verify_button.disabled = verified
+
+            # Set Primary button: only enabled if not already primary
+            self.primary_button.disabled = is_primary
+
+            # Unlink button: always enabled when player selected
+            self.unlink_button.disabled = False
+
+            # Rebuild the select with the selected value as default to persist selection
+            # Remove old select and add new one with default_values
+            self.remove_item(self.player_select)  # type: ignore[arg-type]
+            self._build_player_select(selected_tag=selected_tag)
+
+            # Update message content (dropdown will show selection)
             overview_text = self._build_message_content()  # type: ignore[attr-defined]
+
             await interaction.response.edit_message(content=overview_text, view=self)
-            return
-        
-        # Update button states based on player data
-        verified = player_data.get("verified", False)
-        is_primary = player_data.get("is_primary", False)
-        
-        # Verify button: only enabled if not verified
-        self.verify_button.disabled = verified
-        
-        # Set Primary button: only enabled if not already primary
-        self.primary_button.disabled = is_primary
-        
-        # Unlink button: always enabled when player selected
-        self.unlink_button.disabled = False
-        
-        # Rebuild the select with the selected value as default to persist selection
-        # Remove old select and add new one with default_values
-        self.remove_item(self.player_select)  # type: ignore[arg-type]
-        self._build_player_select(selected_tag=selected_tag)
-        
-        # Update message content (dropdown will show selection)
-        overview_text = self._build_message_content()  # type: ignore[attr-defined]
-        
-        await interaction.response.edit_message(content=overview_text, view=self)
+        finally:
+            self._busy = False
 
 
     async def _on_verify_click(self, interaction: discord.Interaction):
         """Handle Verify button click - show verification modal."""
-        if not self.selected_player_tag:
+        if not self._guard_reentrant():
+            try:
+                await interaction.response.defer(thinking=False)
+            except discord.HTTPException:
+                pass
             return
-        
-        user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
-        user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
-        
-        player_data = None
-        for player in user_players:
-            if isinstance(player, dict):  # type: ignore[misc]
-                current_tag = player.get("player_tag", "")
-                if current_tag == self.selected_player_tag:  # type: ignore[misc]
-                    player_data = player
-                    break
-        
-        if not player_data:
-            return
-        
-        modal = VerifyAccountModal(
-            player_data=player_data,
-            action_view_interaction=self.original_interaction,
-            guild_id=self.guild_id,
-            parent_view=self
-        )
-        await interaction.response.send_modal(modal)
-    
-    async def _on_set_primary_click(self, interaction: discord.Interaction):
-        """Handle Set Primary button click - update in place."""
-        from qapbot.QBdiscocmdshelper import set_primary_account
-        
-        if not self.selected_player_tag:
-            return
-        
-        user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
-        user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
-        
-        player_data = None
-        for player in user_players:
-            if isinstance(player, dict):  # type: ignore[misc]
-                current_tag = player.get("player_tag", "")
-                if current_tag == self.selected_player_tag:  # type: ignore[misc]
-                    player_data = player
-                    break
-        
-        if not player_data:
-            return
-        
-        player_name = player_data.get("player_name", "Unknown")
-        
-        success = await set_primary_account(self.user_id, self.selected_player_tag)
-        
-        if success:
-            # Refresh player data after change
+        try:
+            if not self.selected_player_tag:
+                return
+
             user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
             user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
-            
+
+            player_data = None
             for player in user_players:
                 if isinstance(player, dict):  # type: ignore[misc]
                     current_tag = player.get("player_tag", "")
                     if current_tag == self.selected_player_tag:  # type: ignore[misc]
                         player_data = player
                         break
-            
-            # Update button states (primary button should now be disabled)
-            self.primary_button.disabled = True
-            
-            # Rebuild select to update star indicator in dropdown
-            self.remove_item(self.player_select)  # type: ignore[arg-type]
-            self._build_player_select(selected_tag=self.selected_player_tag)
-            
-            # Update message content (updated player list shows the change)
-            overview_text = self._build_message_content()  # type: ignore[attr-defined]
-            
-            await interaction.response.edit_message(content=overview_text, view=self)
-            logging.info(f"USER ACTION: {interaction.user} set {player_name} ({self.selected_player_tag}) as primary account")
-        else:
-            overview_text = self._build_message_content()  # type: ignore[attr-defined]
-            await interaction.response.edit_message(content=overview_text, view=self)
+
+            if not player_data:
+                return
+
+            modal = VerifyAccountModal(
+                player_data=player_data,
+                action_view_interaction=self.original_interaction,
+                guild_id=self.guild_id,
+                parent_view=self
+            )
+            await interaction.response.send_modal(modal)
+        finally:
+            self._busy = False
+
+    async def _on_set_primary_click(self, interaction: discord.Interaction):
+        """Handle Set Primary button click - update in place."""
+        from qapbot.QBdiscocmdshelper import set_primary_account
+
+        if not self._guard_reentrant():
+            try:
+                await interaction.response.defer(thinking=False)
+            except discord.HTTPException:
+                pass
+            return
+        try:
+            if not self.selected_player_tag:
+                return
+
+            user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
+            user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
+
+            player_data = None
+            for player in user_players:
+                if isinstance(player, dict):  # type: ignore[misc]
+                    current_tag = player.get("player_tag", "")
+                    if current_tag == self.selected_player_tag:  # type: ignore[misc]
+                        player_data = player
+                        break
+
+            if not player_data:
+                return
+
+            player_name = player_data.get("player_name", "Unknown")
+
+            success = await set_primary_account(self.user_id, self.selected_player_tag)
+
+            if success:
+                # Refresh player data after change
+                user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
+                user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
+
+                for player in user_players:
+                    if isinstance(player, dict):  # type: ignore[misc]
+                        current_tag = player.get("player_tag", "")
+                        if current_tag == self.selected_player_tag:  # type: ignore[misc]
+                            player_data = player
+                            break
+
+                # Update button states (primary button should now be disabled)
+                self.primary_button.disabled = True
+
+                # Rebuild select to update star indicator in dropdown
+                self.remove_item(self.player_select)  # type: ignore[arg-type]
+                self._build_player_select(selected_tag=self.selected_player_tag)
+
+                # Update message content (updated player list shows the change)
+                overview_text = self._build_message_content()  # type: ignore[attr-defined]
+
+                await interaction.response.edit_message(content=overview_text, view=self)
+                logging.info(f"USER ACTION: {interaction.user} set {player_name} ({self.selected_player_tag}) as primary account")
+            else:
+                overview_text = self._build_message_content()  # type: ignore[attr-defined]
+                await interaction.response.edit_message(content=overview_text, view=self)
+        finally:
+            self._busy = False
     
     async def _on_unlink_click(self, interaction: discord.Interaction):
         """Handle Unlink button click - show confirmation inline."""
         from qapbot.i18n import t
-        
-        if not self.selected_player_tag:
+
+        if not self._guard_reentrant():
+            try:
+                await interaction.response.defer(thinking=False)
+            except discord.HTTPException:
+                pass
             return
-        
-        user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
-        user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
-        
-        player_data = None
-        for player in user_players:
-            if isinstance(player, dict):  # type: ignore[misc]
-                current_tag = player.get("player_tag", "")
-                if current_tag == self.selected_player_tag:  # type: ignore[misc]
-                    player_data = player
-                    break
-        
-        if not player_data:
-            return
-        
-        player_name = player_data.get("player_name", "Unknown")
-        
-        # Show confirmation view inline
-        confirm_view = UnlinkConfirmView(
-            player_data=player_data,
-            user_id=self.user_id,
-            guild_id=self.guild_id,
-            parent_view=self
-        )
-        
-        confirm_text = self._build_message_content(  # type: ignore[attr-defined]
-            status_message=f"⚠️ {t('playerregistration.unlink_confirm', guild_id=self.guild_id, player_name=player_name, player_tag=self.selected_player_tag)}",
-            show_selection_prompt=False
-        )
-        
-        await interaction.response.edit_message(
-            content=confirm_text,
-            view=confirm_view
-        )
+        try:
+            if not self.selected_player_tag:
+                return
+
+            user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
+            user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
+
+            player_data = None
+            for player in user_players:
+                if isinstance(player, dict):  # type: ignore[misc]
+                    current_tag = player.get("player_tag", "")
+                    if current_tag == self.selected_player_tag:  # type: ignore[misc]
+                        player_data = player
+                        break
+
+            if not player_data:
+                return
+
+            player_name = player_data.get("player_name", "Unknown")
+
+            # Show confirmation view inline
+            confirm_view = UnlinkConfirmView(
+                player_data=player_data,
+                user_id=self.user_id,
+                guild_id=self.guild_id,
+                parent_view=self
+            )
+
+            confirm_text = self._build_message_content(  # type: ignore[attr-defined]
+                status_message=f"⚠️ {t('playerregistration.unlink_confirm', guild_id=self.guild_id, player_name=player_name, player_tag=self.selected_player_tag)}",
+                show_selection_prompt=False
+            )
+
+            await interaction.response.edit_message(
+                content=confirm_text,
+                view=confirm_view
+            )
+        finally:
+            self._busy = False
 
     async def _on_unlink_all_click(self, interaction: discord.Interaction):
         """Handle Unlink All button click - show a bulk-unlink confirmation inline."""
         from qapbot.i18n import t
 
-        user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
-        user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
-        account_count = len(user_players)
-
-        if account_count == 0:
+        if not self._guard_reentrant():
+            try:
+                await interaction.response.defer(thinking=False)
+            except discord.HTTPException:
+                pass
             return
+        try:
+            user_entry = CACHE.user_accounts.get(self.user_id, {"players": []})
+            user_players: List[Dict[str, Any]] = user_entry.get("players", [])  # type: ignore[assignment]
+            account_count = len(user_players)
 
-        confirm_view = UnlinkAllConfirmView(
-            user_id=self.user_id,
-            guild_id=self.guild_id,
-            account_count=account_count,
-            parent_view=self
-        )
+            if account_count == 0:
+                return
 
-        confirm_text = self._build_message_content(  # type: ignore[attr-defined]
-            status_message=f"⚠️ {t('playerregistration.unlink_all_confirm', guild_id=self.guild_id, count=account_count)}",
-            show_selection_prompt=False
-        )
+            confirm_view = UnlinkAllConfirmView(
+                user_id=self.user_id,
+                guild_id=self.guild_id,
+                account_count=account_count,
+                parent_view=self
+            )
 
-        await interaction.response.edit_message(
-            content=confirm_text,
-            view=confirm_view
-        )
+            confirm_text = self._build_message_content(  # type: ignore[attr-defined]
+                status_message=f"⚠️ {t('playerregistration.unlink_all_confirm', guild_id=self.guild_id, count=account_count)}",
+                show_selection_prompt=False
+            )
+
+            await interaction.response.edit_message(
+                content=confirm_text,
+                view=confirm_view
+            )
+        finally:
+            self._busy = False
 
     async def _on_refresh_click(self, interaction: discord.Interaction) -> None:
-        """Handle Refresh button — fetch fresh player data from CoC API for all linked accounts."""
+        """Handle Refresh button — fetch fresh player data from CoC API for all linked accounts.
+
+        Tracker #0056: this is the WIDEST re-entrancy window in this view — a real CoC API
+        fetch across every linked account (up to several seconds for a many-account user, the
+        exact profile of this bug's reporter) sits between defer() and the final edit, versus
+        every other handler's near-instant CACHE-only round trip. Guarded first, before even
+        deferring, so a second click anywhere on this view while a refresh is in flight is
+        dropped rather than racing its eventual edit_original_response() below.
+        """
+        if not self._guard_reentrant():
+            try:
+                await interaction.response.defer(thinking=False)
+            except discord.HTTPException:
+                pass
+            return
+        try:
+            await self._do_refresh(interaction)
+        finally:
+            self._busy = False
+
+    async def _do_refresh(self, interaction: discord.Interaction) -> None:
+        """The actual refresh body, split out of _on_refresh_click() only so the re-entrancy
+        guard's try/finally doesn't have to wrap this much logic inline."""
         # Defer immediately so we can do async API work before responding
         await interaction.response.defer(ephemeral=True)
 

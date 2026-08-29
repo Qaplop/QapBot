@@ -15,8 +15,11 @@ Covers:
     current selection (so a stale selected_player_tag from another page can't drive an action).
   - AccountActionView: "Link new account" is a standalone button (not a Select option burning
     a slot), and its unverified-player Select paginates the same way.
+  - Tracker #0056: AccountManagementView's re-entrancy guard against a second click landing
+    while a prior one (esp. the CoC-API-fetching Refresh) is still mid-flight.
 """
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -204,3 +207,84 @@ async def test_action_view_select_paginates_unverified_players(monkeypatch: pyte
     assert view.current_page == 1
     assert len(view.select.options) == 5  # 30 - 25
     assert view.next_button.disabled is True
+
+
+# ---------------------------------------------------------------------------
+# Tracker #0056: re-entrancy guard. Reported crash ("Cannot read property 'label' of
+# undefined" on the reporter's Discord client) happened on the reporter's FIRST invocation of
+# this view right after the #45 pagination fix deployed, with a retry immediately afterward
+# working fine — consistent with a rapid second click racing a first click's still-in-flight
+# message edit (this view has multiple new same-message-editing handlers post-#45: page-turn,
+# selection, and especially Refresh, which does a real CoC API fetch before its own edit).
+# AccountManagementView._busy now guards every state-mutating handler against exactly this.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_refresh_click_guards_against_reentrant_second_click(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second click (here: Next page) landing while Refresh's CoC API fetch is still in
+    flight must be dropped, not run a second overlapping edit against the same message."""
+    import qapbot.ui_registration as ui
+
+    cache = FakeCache()
+    cache.user_accounts["123"] = {"players": _players(5)}
+    monkeypatch.setattr(ui, "CACHE", cache)
+    monkeypatch.setattr(ui, "t", identity_t)
+
+    release = asyncio.Event()
+    fetch_started = asyncio.Event()
+
+    async def _slow_get_player(tag, force_fresh=False):
+        fetch_started.set()
+        await release.wait()
+        return None
+
+    cache.get_player = _slow_get_player
+
+    view = ui.AccountManagementView(user_id="123", guild_id=1, display_name="Alice")
+    refresh_interaction = make_interaction(user_id=123)
+    page_interaction = make_interaction(user_id=123)
+
+    task1 = asyncio.create_task(view._on_refresh_click(refresh_interaction))
+    await asyncio.wait_for(fetch_started.wait(), timeout=5)
+    assert view._busy is True  # Refresh is now blocked mid-fetch, holding the guard
+
+    original_page = view.current_page
+    await view._on_page_next(page_interaction)
+
+    # Dropped: current_page unchanged, and the second interaction only got a bare defer, never
+    # reached edit_message (which would have raced Refresh's own eventual response).
+    assert view.current_page == original_page
+    page_interaction.response.defer.assert_awaited()
+    page_interaction.response.edit_message.assert_not_called()
+
+    release.set()
+    await task1
+    assert view._busy is False  # guard released once Refresh actually finishes
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_page_next_guards_against_reentrant_second_click(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same guard, exercised on the page-turn handler itself (the button tracker #0056's
+    reporter — ~60 accounts, 3 pages — had every reason to click quickly through)."""
+    import qapbot.ui_registration as ui
+
+    cache = FakeCache()
+    cache.user_accounts["123"] = {"players": _players(60)}
+    monkeypatch.setattr(ui, "CACHE", cache)
+    monkeypatch.setattr(ui, "t", identity_t)
+
+    view = ui.AccountManagementView(user_id="123", guild_id=1, display_name="Alice")
+
+    # Simulate a first click still "in flight" by holding the guard directly, the same state
+    # _guard_reentrant() would leave mid-handler between its own two awaits.
+    assert view._guard_reentrant() is True
+
+    interaction = make_interaction(user_id=123)
+    original_page = view.current_page
+    await view._on_page_next(interaction)
+
+    assert view.current_page == original_page  # dropped
+    interaction.response.defer.assert_awaited()
+    interaction.response.edit_message.assert_not_called()

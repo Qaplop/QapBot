@@ -2165,3 +2165,56 @@ explicit presence/existence check instead (a `dict.get(key, SENTINEL)`, an `is n
 lookup object, or a boolean "was this key ever set" companion). This is the same "can't tell
 false-because-unset from false-because-off" trap as Pitfall 25's shared-table-column overload,
 just one level up at read-time instead of write-time.
+
+---
+
+## Pitfall 49: a session-scoped view with NO re-entrancy guard on ANY of its state-mutating handlers can desync a Discord client badly enough to crash it — not just double-write data (Pitfall 41's usual consequence)
+
+**Symptom (tracker #0056, corrected diagnosis 2026-08-29):** the reporter's Discord app crashed
+outright ("Cannot read property 'label' of undefined") on their FIRST use of "My Accounts" right
+after tracker #45's pagination rewrite deployed — a retry moments later worked fine. Originally
+misdiagnosed as "probably already fixed by #45's rewrite" (a plausible-sounding but untested
+guess); the reporter later clarified the crash happened testing #45's OWN new behavior, which
+ruled that theory out and pointed at the rewrite itself.
+
+**Root cause:** tracker #45 added several NEW handlers to `AccountManagementView`
+(`ui_registration.py`) that all follow the shape "read `self` state → mutate it → rebuild
+components → `edit_message()` on the view's own message" — page-turn (Prev/Next), player
+selection, Verify, Set Primary, Unlink, Unlink All, and especially Refresh (a real CoC API fetch
+across every linked account before its own edit — by far the widest window, seconds long for a
+many-account user, which the reporter with ~60 accounts firmly is). None of them had ANY guard
+against a second click landing while a first was still mid-flight — the exact shape Pitfall 41
+already named, but that pitfall's two known consequences (duplicate tracker items, five duplicate
+DMs) undersold what's possible: here, two `edit_message()` calls racing on the SAME ephemeral
+response message can leave a Discord client's local component-diffing state badly enough out of
+sync to crash the client outright, not just double up a side effect. A user given a brand-new
+multi-page UI for the first time (3 pages at 60 accounts) is exactly who rage-clicks through it
+while exploring — which is what "crashed on first deliberate test of the new pagination, fine on
+the calmer retry" actually describes.
+
+**Fix:** added a `self._busy` instance flag (this view is a fresh, session-scoped, one-per-open
+instance — never shared across users, so an instance-level flag is the right granularity here,
+unlike tracker #0066's fix which needed a module-level per-guild `set` because that toggle
+callback is ALSO reachable through a single view instance shared across every guild) and a
+`_guard_reentrant()` helper, checked as the literal first statement of every state-mutating
+handler, before any `await`. A second click while busy gets a bare `defer()` and nothing else —
+dropped, not queued, not double-processed. `finally: self._busy = False` in every handler
+guarantees the guard releases even if the handler raises.
+
+**How to apply:** when a session-scoped view gains new handlers that all edit the same message,
+check every one of them for a re-entrancy guard — not just the ones an incident report happens
+to name. A view with 3+ same-message-editing handlers and zero guards anywhere is a guaranteed
+eventual repeat of this bug on whichever handler has the widest async window (usually the one
+doing real I/O, not the pure-CACHE ones) — that's the one to write the regression test against,
+using a controllable `asyncio.Event` to hold it mid-flight while a second call is attempted, the
+way `test_refresh_click_guards_against_reentrant_second_click` does.
+
+**Process note:** don't let a plausible root-cause story substitute for verification when the
+reporter can supply a more specific timeline. The first pass on this ticket reasoned from
+circumstantial evidence (same reporter, same subsystem, same day as another fix) to "probably
+already fixed" and shipped that as the answer — reasonable given what was known, but wrong, and
+avoidable: the ticket comment even said "I can't force-reproduce a third-party crash… please
+verify" — which was the right instinct, just not followed by actually re-opening the code with
+the reporter's fuller account once it came back. When new facts (here: "it happened testing the
+JUST-DEPLOYED fix, not before it") contradict a prior diagnosis, re-derive from those facts
+rather than patching the old theory.
