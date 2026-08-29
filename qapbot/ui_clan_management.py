@@ -2278,10 +2278,10 @@ class ClanManagementView(discord.ui.View):
             import QBcore
             if current_enabled == False:  # Was disabled, now enabling
                 # Post the registration message immediately
-                QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False))
+                QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False, guild_id=guild_id_int))
             else:  # Was enabled, now disabling
                 # Delete the registration message immediately
-                QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False))
+                QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False, guild_id=guild_id_int))
         except Exception as e:
             logging.warning(f"Could not update registration message immediately: {e}")
         
@@ -3011,7 +3011,7 @@ class ChannelConfigurationView(discord.ui.View):
             try:
                 from QapBot import repost_playerregistration_messages
                 import QBcore
-                QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False))
+                QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False, guild_id=interaction.guild.id))
                 logging.debug(f"Repost task created after apply")
             except Exception as e:
                 logging.warning(f"Could not trigger repost after channel config apply: {e}")
@@ -3104,7 +3104,7 @@ class LanguageConfigurationView(discord.ui.View):
             from QapBot import repost_playerregistration_messages
             import QBcore
             # Delete old and post new with updated language immediately
-            QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False))
+            QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False, guild_id=interaction.guild.id))
             logging.info(f"Triggered welcome message repost with language '{self.selected_language}' for guild {interaction.guild.id}")
         except Exception as e:
             logging.warning(f"Could not trigger welcome message repost after language change: {e}")

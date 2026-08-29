@@ -3893,6 +3893,7 @@ async def repost_anchored_message(
     dev_mode_allowed_channel_id: Optional[int] = None,
     only_if_not_bottom: bool = False,
     bump_cooldown_seconds: int = 300,
+    guild_id: Optional[int] = None,
 ) -> Tuple[int, int]:
     """
     Generic anchored-message lifecycle shared by every persistent, per-guild tracked message
@@ -3915,6 +3916,12 @@ async def repost_anchored_message(
             (None/0 = no DEV-mode filtering).
         only_if_not_bottom: if True, only repost when the tracked message is NOT the newest
             message in the channel (rate-limited by bump_cooldown_seconds).
+        guild_id: if given, process ONLY this one guild instead of sweeping every guild in
+            CACHE.server_config (tracker #0061: a single guild's settings change — toggling the
+            hub on/off, changing its channel, changing the guild's language — must not delete and
+            repost every OTHER enabled guild's anchored message too). Periodic/startup callers
+            (main()'s bump cycle, on_ready()) omit this to keep sweeping the whole fleet, which is
+            their actual job.
 
     Returns:
         (posted_count, filtered_count) — filtered_count only ever increments in DEV mode.
@@ -3924,9 +3931,18 @@ async def repost_anchored_message(
     posted_count = 0
     filtered_count = 0
 
-    logging.debug(f"repost_anchored_message({log_label}) called, processing {len(server_config)} guilds")
+    if guild_id is not None:
+        guild_id_str_filter = str(guild_id)
+        guilds_to_process = (
+            [(guild_id_str_filter, server_config[guild_id_str_filter])]
+            if guild_id_str_filter in server_config else []
+        )
+        logging.debug(f"repost_anchored_message({log_label}) called, processing single guild {guild_id}")
+    else:
+        guilds_to_process = list(server_config.items())
+        logging.debug(f"repost_anchored_message({log_label}) called, processing {len(guilds_to_process)} guilds")
 
-    for guild_id_str, config in server_config.items():
+    for guild_id_str, config in guilds_to_process:
         try:
             guild_id_int = int(guild_id_str)
         except (ValueError, TypeError):
@@ -4080,13 +4096,13 @@ async def repost_anchored_message(
     return posted_count, filtered_count
 
 
-async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False, bump_cooldown_seconds: int = PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS) -> None:
+async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False, bump_cooldown_seconds: int = PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS, guild_id: Optional[int] = None) -> None:
     """
     Repost player registration messages on bot startup for guilds with registration messages enabled.
 
     This function scans CACHE.server_config for guilds with registration_channel_id and
     registration_message_enabled=True, then posts or reposts registration messages with persistent buttons.
-    
+
     Also handles cleanup:
     - Deletes messages when registration_message_enabled is False
     - Deletes messages from old channel and posts to new channel if registration_channel_id changed
@@ -4094,6 +4110,8 @@ async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False
     Args:
         only_if_not_bottom: If True, only repost when the tracked registration message is NOT the newest message in the channel.
         bump_cooldown_seconds: Minimum seconds between bumps per channel when only_if_not_bottom=True.
+        guild_id: if given, only process this one guild (see repost_anchored_message()'s guild_id
+            doc — tracker #0061).
 
     In DEV mode, only processes the configured DISCORD_GUILD_ID.
 
@@ -4122,6 +4140,7 @@ async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False
         dev_mode_allowed_channel_id=CONFIG.dev_playerregistration_channel_id or None,
         only_if_not_bottom=only_if_not_bottom,
         bump_cooldown_seconds=bump_cooldown_seconds,
+        guild_id=guild_id,
     )
 
     # Update logging to include filtered count in DEV mode
@@ -4137,7 +4156,7 @@ async def repost_playerregistration_messages(*, only_if_not_bottom: bool = False
             logging.info("No registration messages to repost")
 
 
-async def repost_cwl_management_messages(*, only_if_not_bottom: bool = False, bump_cooldown_seconds: int = PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS) -> None:
+async def repost_cwl_management_messages(*, only_if_not_bottom: bool = False, bump_cooldown_seconds: int = PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS, guild_id: Optional[int] = None) -> None:
     """
     Repost CWL Management Hub messages for guilds with the hub enabled
     (CWL_ROSTER_PLANNING_PLAN.md Phase 1) — the admin-facing anchored message showing the
@@ -4147,6 +4166,9 @@ async def repost_cwl_management_messages(*, only_if_not_bottom: bool = False, bu
     Thin wrapper around the generic repost_anchored_message() driver, same discipline as
     repost_playerregistration_messages() above — only the config keys and message content/view
     differ per anchored-message feature.
+
+    guild_id: if given, only process this one guild (see repost_anchored_message()'s guild_id
+        doc — tracker #0061).
     """
     from qapbot.ui_cwl_roster import CwlManagementHubView, add_cwl_management_components
     from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_management
@@ -4172,6 +4194,7 @@ async def repost_cwl_management_messages(*, only_if_not_bottom: bool = False, bu
         dev_mode_allowed_channel_id=CONFIG.dev_playerregistration_channel_id or None,
         only_if_not_bottom=only_if_not_bottom,
         bump_cooldown_seconds=bump_cooldown_seconds,
+        guild_id=guild_id,
     )
 
     if cwl_management_count > 0:
@@ -4185,7 +4208,7 @@ async def repost_cwl_management_messages(*, only_if_not_bottom: bool = False, bu
         else:
             logging.info("No CWL Management Hub messages to repost")
 
-async def repost_cwl_player_hub_messages(*, only_if_not_bottom: bool = False, bump_cooldown_seconds: int = PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS) -> None:
+async def repost_cwl_player_hub_messages(*, only_if_not_bottom: bool = False, bump_cooldown_seconds: int = PLAYERREGISTRATION_BUMP_COOLDOWN_SECONDS, guild_id: Optional[int] = None) -> None:
     """
     Repost Player CWL Settings Hub messages for guilds with the hub enabled
     (plans/cwl-personal-hub.md Phase 3) — the player-facing anchored message, structurally
@@ -4194,6 +4217,9 @@ async def repost_cwl_player_hub_messages(*, only_if_not_bottom: bool = False, bu
     Thin wrapper around the generic repost_anchored_message() driver, same discipline as every
     other anchored-message feature in this file — only the config keys and message
     content/view differ per feature.
+
+    guild_id: if given, only process this one guild (see repost_anchored_message()'s guild_id
+        doc — tracker #0061).
     """
     from qapbot.ui_cwl_roster import build_cwl_player_hub_content_and_view
 
@@ -4209,6 +4235,7 @@ async def repost_cwl_player_hub_messages(*, only_if_not_bottom: bool = False, bu
         dev_mode_allowed_channel_id=CONFIG.dev_playerregistration_channel_id or None,
         only_if_not_bottom=only_if_not_bottom,
         bump_cooldown_seconds=bump_cooldown_seconds,
+        guild_id=guild_id,
     )
 
     if cwl_player_hub_count > 0:

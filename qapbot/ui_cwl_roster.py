@@ -188,7 +188,7 @@ def _make_cwl_settings_toggle_callback(view: discord.ui.View):
         try:
             from QapBot import repost_cwl_management_messages
             import QBcore
-            QBcore.spawn_tracked("repost-cwl-management-msg", repost_cwl_management_messages(only_if_not_bottom=False))
+            QBcore.spawn_tracked("repost-cwl-management-msg", repost_cwl_management_messages(only_if_not_bottom=False, guild_id=guild_id_int))
         except Exception as e:
             logging.warning(f"Could not update CWL Management Hub message immediately: {e}")
 
@@ -228,7 +228,7 @@ def _make_cwl_settings_toggle_player_hub_callback(view: discord.ui.View):
         try:
             from QapBot import repost_cwl_player_hub_messages
             import QBcore
-            QBcore.spawn_tracked("repost-cwl-player-hub-msg", repost_cwl_player_hub_messages(only_if_not_bottom=False))
+            QBcore.spawn_tracked("repost-cwl-player-hub-msg", repost_cwl_player_hub_messages(only_if_not_bottom=False, guild_id=guild_id_int))
         except Exception as e:
             logging.warning(f"Could not update Player CWL Settings Hub message immediately: {e}")
 

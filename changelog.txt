@@ -1,6 +1,27 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (4)
+- Fixed: tracker #0061 -- toggling ONE guild's CWL Management Hub, Player CWL Hub, or
+  registration message setting (or changing its channel, or changing the guild's language) was
+  deleting and reposting the SAME anchored message in every OTHER guild that had it enabled too,
+  not just the guild whose setting actually changed. Root cause: all four settings-change
+  handlers call the shared repost_anchored_message() driver (QapBot.py), which unconditionally
+  sweeps every guild in CACHE.server_config -- correct for the periodic/startup maintenance
+  sweep it was designed for, but wrong for a single-guild UI action, since only_if_not_bottom=
+  False there meant every enabled guild's message got deleted and reposted immediately with a
+  new message ID.
+  Fix: repost_anchored_message() and its three wrappers (repost_playerregistration_messages(),
+  repost_cwl_management_messages(), repost_cwl_player_hub_messages()) gained an optional
+  guild_id parameter that, when given, restricts processing to that one guild. The five
+  single-guild call sites (ui_cwl_roster.py's two hub toggles; ui_clan_management.py's
+  registration toggle, channel-config apply, and language-change handler) now pass guild_id=...;
+  every periodic/startup caller (main()'s bump cycle, on_ready()) omits it and keeps sweeping
+  the whole fleet as before.
+  Files: QapBot.py, qapbot/ui_cwl_roster.py, qapbot/ui_clan_management.py.
+  2734 tests pass (2 new in tests/unit/test_repost_cwl_player_hub_messages.py: guild_id scopes
+  to one guild, omitting guild_id still sweeps every guild).
+
 2026-08-29 (3)
 - Fixed: tracker #0060 (PROD verification of today's #0009 follow-up work) -- the /bug and
   /feature report modal ignored guild/user language entirely, always showing English field

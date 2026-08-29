@@ -216,3 +216,67 @@ async def test_only_if_not_bottom_reposts_when_tracked_message_is_not_newest(mon
     await QapBot.repost_cwl_player_hub_messages(only_if_not_bottom=True, bump_cooldown_seconds=300)
 
     channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_guild_id_scopes_repost_to_only_that_guild(monkeypatch):
+    """Tracker #0061: a single guild's settings-change handlers pass guild_id=... so toggling
+    ONE guild's hub doesn't also delete-and-repost every OTHER enabled guild's hub message.
+    Two guilds enabled; only the one matching guild_id should be touched."""
+    target_channel = _fake_channel(guild_name="TargetGuild")
+    other_channel = _fake_channel(guild_name="OtherGuild")
+
+    def _get_channel(channel_id: int):
+        return {111: target_channel, 222: other_channel}.get(channel_id)
+
+    fake_bot = MagicMock()
+    fake_bot.get_channel = MagicMock(side_effect=_get_channel)
+    monkeypatch.setattr(QBcore, "bot", fake_bot)
+
+    CACHE.server_config["801"] = {
+        "cwl_player_hub_message_enabled": True,
+        "cwl_player_hub_channel_id": "111",
+        "cwl_player_hub_message_id": None,
+    }
+    CACHE.server_config["802"] = {
+        "cwl_player_hub_message_enabled": True,
+        "cwl_player_hub_channel_id": "222",
+        "cwl_player_hub_message_id": None,
+    }
+
+    await QapBot.repost_cwl_player_hub_messages(only_if_not_bottom=False, guild_id=801)
+
+    target_channel.send.assert_awaited_once()
+    other_channel.send.assert_not_awaited()
+    assert CACHE.server_config["802"]["cwl_player_hub_message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_omitting_guild_id_still_sweeps_every_enabled_guild(monkeypatch):
+    """The periodic/startup callers rely on the default (guild_id=None) continuing to process
+    every guild in server_config, unchanged by the tracker #0061 fix."""
+    channel_a = _fake_channel(guild_name="GuildA")
+    channel_b = _fake_channel(guild_name="GuildB")
+
+    def _get_channel(channel_id: int):
+        return {111: channel_a, 222: channel_b}.get(channel_id)
+
+    fake_bot = MagicMock()
+    fake_bot.get_channel = MagicMock(side_effect=_get_channel)
+    monkeypatch.setattr(QBcore, "bot", fake_bot)
+
+    CACHE.server_config["803"] = {
+        "cwl_player_hub_message_enabled": True,
+        "cwl_player_hub_channel_id": "111",
+        "cwl_player_hub_message_id": None,
+    }
+    CACHE.server_config["804"] = {
+        "cwl_player_hub_message_enabled": True,
+        "cwl_player_hub_channel_id": "222",
+        "cwl_player_hub_message_id": None,
+    }
+
+    await QapBot.repost_cwl_player_hub_messages(only_if_not_bottom=False)
+
+    channel_a.send.assert_awaited_once()
+    channel_b.send.assert_awaited_once()

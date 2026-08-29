@@ -2035,3 +2035,44 @@ larger change (spec enforcement rejects any attribute a test sets that isn't on 
 that's actually wrong. If a fixture-level test double for a well-known class starts accumulating
 per-test workarounds for the same quirk in multiple files, that repetition is the signal the fix
 belongs in the fixture, not in the next test that hits it.
+
+---
+
+## Pitfall 46: a shared "sweep every guild" helper has no per-guild scoping, so a single-guild UI handler calling it reposts every OTHER enabled guild's message too
+
+**Symptom (tracker #0061, 2026-08-29):** the reporter deactivated the CWL Management Hub for
+ONE guild and (separately, in the same session) changed a channel-config setting in that same
+guild — and both actions deleted-and-reposted the SAME anchored message in several completely
+unrelated guilds, each getting a brand-new message ID.
+
+**Root cause:** `repost_anchored_message()` (`QapBot.py`) and its three thin wrappers
+(`repost_playerregistration_messages()`, `repost_cwl_management_messages()`,
+`repost_cwl_player_hub_messages()`) were written for exactly one calling shape — a fleet-wide
+maintenance sweep (`for guild_id_str, config in server_config.items(): ...`), called from
+`on_ready()` and `main()`'s periodic bump cycle, both of which genuinely do want every guild
+processed. Four single-guild UI handlers (`ui_cwl_roster.py`'s two hub toggles;
+`ui_clan_management.py`'s registration toggle, channel-config apply, and language-change
+handler) call the exact same functions to immediately reflect a change for the ONE guild being
+edited (`only_if_not_bottom=False`, i.e. unconditional) — but had no way to tell the driver
+"only this guild", so every other guild with the feature enabled got swept too, on every single
+settings tweak.
+
+**Why it wasn't caught sooner:** each call site's own comment ("mirrors
+`ClanManagementView._on_toggle_registration`", "trigger repost after apply") only describes
+*that this guild's* message should update — the fleet-wide side effect on every other guild is
+invisible unless you trace into the shared driver's loop and notice it has no guild filter at
+all. In DEV mode there's usually only one guild configured, so the bug is invisible there; it
+only shows up once multiple real guilds share a PROD bot instance with the same feature enabled.
+
+**Fix:** `repost_anchored_message()` and its three wrappers gained an optional `guild_id`
+parameter — when given, only that one guild's `server_config` entry is processed instead of the
+whole dict. The five single-guild call sites now pass `guild_id=...`; every periodic/startup
+caller omits it and keeps sweeping the whole fleet exactly as before.
+
+**How to apply:** before wiring a single-entity UI action ("apply this one guild's/user's/
+item's setting change now") to a helper whose name or docstring says it processes "every
+guild"/"every user"/etc., check whether that helper actually accepts a scoping parameter — if it
+doesn't, calling it from a single-entity handler will silently touch every OTHER entity too. A
+fleet-wide sweep helper and a single-entity apply-now action are different jobs; either give the
+shared helper a scoping parameter (as done here) or write a dedicated single-entity path rather
+than reusing the sweep unscoped.
