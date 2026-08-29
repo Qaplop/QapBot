@@ -7,6 +7,8 @@ war-file lifecycle). Refactoring that immediately before a CWL season is the wro
 also exactly when the memory pressure this addresses is worst, so the *measurement* window right
 after the season is the useful one anyway.
 
+This is a critical change of the update cycle code. Do it with Opus and not with Sonnet!
+
 **Origin:** §5.1 of `plans/implemented/tracker-0009-memory-analysis.md`, the one recommendation
 deliberately left out of commit `280537a`. Read §3b of that document first — it has the measured
 numbers this plan builds on.
