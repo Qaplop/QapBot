@@ -30,15 +30,92 @@ Twenty design decisions were confirmed with the project owner and are baked into
 
 The plan below ships in 7 independently testable phases — the original 5, bracketed by a new Phase 0 (DM interaction foundation) and Phase 6 (switch-verification alarms) — each building on the last, using the discord.py 2.7.1 `DynamicItem` API (confirmed available) for the restart-safe DM buttons.
 
-**⚠️ Operational directives, added 2026-08-10 while starting Phase 2 — do not forget:**
-- **PROD freeze.** v1.3.1 (which includes Phases 0-1 and the clan-config Activity) is the current stable PROD build. Leave PROD entirely untouched — no PROD deploys/restarts, no touching the PROD `cloudflared` tunnel config, no PROD Activity redeploy — until the project owner explicitly says otherwise. Work continues on `main`/commits as usual (that convention doesn't change), but nothing gets rolled out to PROD from this point until told.
-- **DEV-mode DM recipient guard, required before any real DM-blast testing (Phase 2's "Start Enrollment" confirm/opt-out blast, and later Phase 5's final-notification blast / Phase 6's switch alarms).** Whenever `GLOBAL_GUILD_ID > 0` (DEV mode — see `QapBot.py:227`), any CWL bulk-DM sender must only actually deliver to the configured `SERVER_ADMIN` Discord user ID (Qaplop's own account, `_is_configured_admin()`/`QBdiscocmdshelper.py:1862`) — every other would-be recipient is skipped and counted in the existing "skipped" summary bucket (Phase 2's `start_cwl_enrollment()` / Phase 5's `send_cwl_final_notifications()` already return contacted/skipped counts, so this is an additional skip reason, not a new return shape). This must land as part of Phase 2's DM-blast slice, before it's exercised live in DEV — the whole point is to let the project owner test the real end-to-end DM flow against their own account(s) without risking a DM blast to actual clan members while the feature is still unfinished. PROD is unaffected (`GLOBAL_GUILD_ID == 0` there): the guard only ever activates in DEV.
+---
+
+## ⚠️ Where this actually stands — status audit, 2026-08-29
+
+This document grew organically over ~3 weeks of daily live-testing rounds, and large parts of it
+describe designs that were **superseded while being built**. Read this section first; it is the
+authoritative map of plan-vs-reality. Everything below it is either marked shipped, marked
+superseded, or is genuinely still-unbuilt forward-looking design (Phases 5 and 6).
+
+| Area | Plan says | Reality (verified against the code, 2026-08-29) |
+| --- | --- | --- |
+| Data model | 4 new tables | **8** CWL tables + `guild_config`/`user_players` columns — see the rewritten Data Model section |
+| Phase 0a/0b (DM foundation) | shipped | ✅ shipped, unchanged (`resolve_guild_context()`, `QBdiscocmdshelper.py:2064`) |
+| Phase 1 (settings + season setup) | shipped | ✅ shipped, then heavily extended (season select, carry-over prompt, coordinators, auto-launch) |
+| Phase 2 slices 1-2 (template copy, DM buttons, Start Enrollment) | shipped | ✅ shipped, then rewritten repeatedly (global dedup, reroute, retraction, reminders) |
+| Phase 2's "Personal CWL Hub" | designed here | ❌ **never built as designed** — redesigned as the *Player CWL Settings Hub*, now ✅ fully shipped; see `plans/implemented/cwl-personal-hub.md` |
+| Phase 3 (scoring engine) | full design | ❌ **superseded, never built.** No `suggest_cwl_assignments()`, no `composite`/`data_confidence` scoring, no `FAMILY_BASELINE`. Replaced by a last-real-CWL-attack seed + the league-weighted `skill_score` (display/sort only, never an assignment decision) |
+| Phase 4 (native Discord override screen) | full design | ❌ **superseded, never built.** No `CwlAssignmentManagementView`, no Finalize button, no Starting-Roster/Reserves split, no move/kick/bring-in controls. Replaced by the drag-and-drop Discord Activity board |
+| Phase 5 (final DM blast) | designed here | ✅ **shipped 2026-08-29** as **"Start CWL"** — rewritten below, then built |
+| Phase 6 (switch alarms) | designed here | ✅ **shipped 2026-08-29** — rewritten below, then built |
+| Retention purge | designed here | ⚠️ **half-built**: `guild_config.cwl_retention_months` + its settings UI exist and persist, but `nightly_db_maintenance()` still has only its original 3 steps — nothing ever purges. The setting is currently inert |
+| Paged select-menu helper | designed here | ❌ never built — the Activity replaced every picker that would have needed it |
+| `qapbot/docs/CWL_ROSTER_PLANNING.md` | designed here | ❌ never written. This plan doc is still the only design record |
+
+**The event status machine never got past step one.** `cwl_events.status` has exactly one
+production writer: `start_cwl_enrollment()`'s `draft → signup_open` transition
+(`QBdiscocmdshelper_cwl.py:2704`). `finalized` and `announced` are **never written by any code
+path** — they exist only in the schema comment, in read-side guards that tolerate them, and in
+tests. Every gate throughout the live feature is therefore expressed as
+`status not in ("draft", "cancelled")`, never as `== "finalized"`. Phases 5 and 6 below are what
+finally give those two statuses a writer — and deliberately collapse them into one
+(`signup_open → announced`), because the Finalize screen that was to have set `finalized`
+(Phase 4) no longer exists.
+
+**Dead schema columns.** `cwl_assignments.notified` / `.switched_at` / `.alarm_stage_sent` and
+`cwl_event_clans.locked_at` were created 2026-08-09 for Phases 5/6 and sat unread and unwritten for
+three weeks — **claimed and now live as of 2026-08-29**, when Phases 5/6 finally shipped. Still dead:
+`cwl_assignments.suggested_clan_tag` / `.score` / `.score_breakdown_json` — Phase 3's scoring engine,
+which was to have written them, was superseded and never built.
+
+**Operational directives (2026-08-10) — both now historical:**
+- ~~**PROD freeze.**~~ Lifted. PROD is deployed to routinely again (changelog 2026-08-29 (29)/(30):
+  both `activity/client` and `activity/server` confirmed at the tip of `main` on PROD). The standing
+  rule that replaced it: **never deploy the Python bot** — the project owner does that themselves on
+  DEV and PROD.
+- **DM recipient guard — shipped, then generalized.** Originally `is_dev_mode`-scoped; now the
+  explicit `CONFIG.cwl_dm_restrict_to_admin` flag (`_dm_guard_blocks()`,
+  `QBdiscocmdshelper_cwl.py:2923`), hardcoded `False` on PROD and defaulting to `True` on DEV, with
+  a PROD-tester allowance (`CACHE.testers`). **Every new CWL bulk-DM sender must call
+  `_dm_guard_blocks()`** — including Phase 5's "Start CWL" blast and Phase 6's alarms.
 
 ---
 
 ## Data Model (new tables, hot DB only) ✅ shipped 2026-08-09 (changelog (20))
 
 Add to `qapbot/db_manager.py`'s existing `CREATE TABLE IF NOT EXISTS` schema-creation block (same method that creates `clans`/`clan_families`/`guild_member_clans`, ~line 1538 area), so tables are created idempotently on `initialize()` like everything else. **Hot DB only** — no history-DB mirroring (per `qapbot/docs/DATABASE_ARCHITECTURE.md`, only `war_attacks`/`war_summary`/`cwl_league_groups`/`cwl_league_rounds` get mirrored). This is short-lived per-season operational data with a configurable retention policy (see Cross-Cutting Work below), so no history-split is needed even for long-retained guilds — deletion, not archival, is the mechanism.
+
+> **⚠️ 2026-08-29: this section describes the 2026-08-09 *starting* schema, not today's.** The 4
+> tables below all still exist with these columns, but the real CWL schema has since grown to
+> **8 tables**. The additions, each documented at its own `CREATE TABLE` in `db_manager.py`:
+>
+> - **`cwl_event_clans.participating`** (INTEGER NOT NULL DEFAULT 1) — unchecking a clan must not
+>   delete its row, or `roster_size`/`cwl_start_at`/`target_league_rank` are lost on every
+>   toggle-off. "Row exists" is *not* the participation signal; this column is. Every read in this
+>   feature filters on it.
+> - **`cwl_signups.dmed_discord_id`** — renamed from `discord_id` on 2026-08-22 (Pitfall 37).
+>   It records *who this event's enrollment DM went to*, a historical fact — it is **not** an
+>   ownership field and must never be read as "who owns this account." Live ownership always comes
+>   from `db.get_player_links_sync()`. Same rename/rule on `cwl_shared_clan_players.dmed_discord_id`
+>   and `cwl_player_season_status.dmed_discord_id`.
+> - **`cwl_signups.origin_shared_clan_id`** — tags a local row created by the foreign-guest
+>   conversion, so it can be purged when the real owning guild reassigns that player.
+> - **`cwl_shared_clans` / `cwl_shared_clan_guilds` / `cwl_shared_clan_players`** — the cross-guild
+>   shared-clan layer (2026-08-15). `cwl_shared_clan_players` carries `status` **and** `assigned` as
+>   two structurally independent columns, each with its own single-purpose writer; see Pitfall 25.
+> - **`cwl_player_season_status`** — the global, cross-guild, one-row-per-player-per-season truth
+>   for two independent facts: `dm_sent` (has *any* guild already DMed this player this season) and
+>   `status`/`responded_at` (their own genuine response, fanned out to every guild's local mirror by
+>   `propagate_cwl_player_response()`). `cwl_signups.status` and `cwl_shared_clan_players.status`
+>   are read-optimized **mirrors** of this, not independent truths.
+> - **`cwl_clan_coordinators`** (tracker #0046) — standing, *non-season-scoped* per-clan coordinator
+>   Discord users, carried forward every CWL month. Phase 6 below uses this as its leadership
+>   escalation target.
+> - **`guild_config`** additionally gained `cwl_retention_months`, `cwl_selected_season`,
+>   `cwl_enrollment_include_all_linked_accounts`, and the player-hub columns from
+>   `plans/implemented/cwl-personal-hub.md`.
 
 **Shipped exactly as designed**, with two implementation notes worth recording:
 - `create_cwl_event_sync()` uses `INSERT ... ON CONFLICT(guild_id, cwl_season) DO UPDATE SET updated_at = datetime('now') RETURNING id` — a single round-trip idempotent upsert (SQLite's bundled version supports `RETURNING`) rather than an insert-then-select pair, so "Configure Participating Clans" can be applied repeatedly against the same draft event without a race between the two queries.
@@ -53,10 +130,14 @@ CREATE TABLE IF NOT EXISTS cwl_events (
     guild_id              TEXT    NOT NULL,
     cwl_season            TEXT    NOT NULL,   -- normalize_cwl_season() output
     status                TEXT    NOT NULL DEFAULT 'draft',
-                          -- draft -> signup_open -> finalized -> announced (+ cancelled)
-                          -- (an earlier draft had an 'assigning' status between signup_open and
-                          --  finalized; dropped — no code path ever set it: Phase 4's suggestion
-                          --  runs happen while 'signup_open' and Finalize goes straight to 'finalized')
+                          -- designed: draft -> signup_open -> finalized -> announced (+ cancelled)
+                          -- ⚠️ LIVE REALITY (2026-08-29): only `draft -> signup_open` is ever
+                          --    written (start_cwl_enrollment, QBdiscocmdshelper_cwl.py:2704).
+                          --    'finalized' has no writer at all — the Phase 4 Finalize screen that
+                          --    was to have set it was superseded. Read-side gates are therefore
+                          --    written as `status not in ('draft','cancelled')`, never `== 'finalized'`.
+                          --    Phase 5 below adds the one missing writer: signup_open -> announced.
+                          --    'finalized' is retired outright rather than left as a dead value.
     signup_deadline_at    TEXT,               -- start time is NOT here — it's per-clan, see cwl_event_clans.cwl_start_at
     template_season       TEXT,               -- source season copied as template, NULL if none used
     created_by_discord_id TEXT    NOT NULL,
@@ -80,8 +161,9 @@ CREATE TABLE IF NOT EXISTS cwl_event_clans (
     target_league_rank  TEXT,               -- e.g. 'Champion League III'; NULL = infer from last season's cwl_league_groups.league_rank
     roster_size         INTEGER NOT NULL DEFAULT 15,  -- CoC only allows 5, 15, or 30; UI is a preset dropdown, not free entry
     tier_order           INTEGER NOT NULL DEFAULT 0,  -- 0 = highest tier; drives assignment priority
-    cwl_start_at        TEXT,               -- ISO-8601 UTC; per-clan (clans in the same family can start at different times); NULL allowed until Finalize requires it for every participating clan
-    locked_at           TEXT,               -- Phase 6: set once this clan's CWL roster is observed locked (is_cwl on the mandatory current-war fetch, or a cwl_league_groups row as fallback); NULL = not yet locked. Never cleared once set.
+    cwl_start_at        TEXT,               -- "YYYY-MM-DDTHH:MMZ" UTC; per-clan. Live: defaulted to `{season}-01T08:00Z` on auto-enable, editable in the Activity, rendered via cwl_start_at_compact()/cwl_start_at_discord_timestamp(). Phase 5 below is what finally makes it *required*.
+    locked_at           TEXT,               -- ⚰️ dead until Phase 6 below claims it
+    participating       INTEGER NOT NULL DEFAULT 1,  -- ⚠️ NOT in the original design; added later. Unchecking a clan flips this, never deletes the row (settings must survive a toggle cycle).
     created_at          TEXT    NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (event_id) REFERENCES cwl_events(id) ON DELETE CASCADE,
     FOREIGN KEY (clan_tag) REFERENCES clans(clan_tag) ON DELETE CASCADE,
@@ -119,14 +201,14 @@ CREATE TABLE IF NOT EXISTS cwl_assignments (
     event_id              INTEGER NOT NULL,
     player_tag            TEXT    NOT NULL,
     assigned_clan_tag     TEXT    NOT NULL,
-    suggested_clan_tag    TEXT,               -- original algorithm output, kept even after override (for diff display)
-    assignment_source     TEXT    NOT NULL DEFAULT 'suggested',  -- suggested | admin_override
-    score                 REAL,
-    score_breakdown_json  TEXT,               -- {"skill":.., "reliability":.., "data_confidence":.., "preference_override":bool}
-    locked                BOOLEAN NOT NULL DEFAULT 0,  -- admin pin: re-suggesting won't move this player
-    notified              BOOLEAN NOT NULL DEFAULT 0,  -- Phase 5 blast sent for this row
-    switched_at           TEXT,               -- Phase 6: when player_tag was first observed in assigned_clan_tag's live member list; NULL = not yet switched
-    alarm_stage_sent      INTEGER NOT NULL DEFAULT 0,  -- Phase 6: highest escalation stage DM'd so far (0=none, 1=first nudge, 2=urgent) — prevents re-sending the same stage
+    suggested_clan_tag    TEXT,               -- ⚰️ DEAD (Phase 3 superseded, never written)
+    assignment_source     TEXT    NOT NULL DEFAULT 'suggested',  -- live values: admin_override | auto_assigned | auto_seeded | guest_invite
+    score                 REAL,               -- ⚰️ DEAD (Phase 3 superseded, never written)
+    score_breakdown_json  TEXT,               -- ⚰️ DEAD (Phase 3 superseded, never written)
+    locked                BOOLEAN NOT NULL DEFAULT 0,  -- live: set by every deliberate drag-and-drop placement; `assign_cwl_player_sync(deliberate=False)` refuses to move a locked row
+    notified              BOOLEAN NOT NULL DEFAULT 0,  -- ⚰️ dead until Phase 5 below claims it ("Start CWL" DM sent for this row)
+    switched_at           TEXT,               -- ⚰️ dead until Phase 6 below claims it
+    alarm_stage_sent      INTEGER NOT NULL DEFAULT 0,  -- ⚰️ dead until Phase 6 below claims it
     updated_at            TEXT    NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (event_id) REFERENCES cwl_events(id) ON DELETE CASCADE,
     FOREIGN KEY (assigned_clan_tag) REFERENCES clans(clan_tag) ON DELETE CASCADE,
@@ -277,10 +359,10 @@ Each `guild_only()` decorator left in place — and each sub-action-level guard 
 > The project owner redesigned it with a materially different spec (renamed **"Player CWL
 > Settings Hub"**; single **"Your CWL Preferences"** button opening a Discord Activity web UI
 > instead of the two-button ephemeral-view design below; adds a general opt-in preference with a
-> new `auto_confirmed` signup status, and an opt-out "send the DM anyway" override). See
-> `plans/cwl-personal-hub.md` for the current design and implementation status — Phases 0-4
-> (schema, enrollment semantics, admin config, repost wiring) are implemented; the Activity
-> screen itself (Phase 5) and its i18n plumbing (Phase 6) are not yet. The section below is kept
+> new `auto_confirmed` signup status, and an opt-out "send the DM anyway" override). **Now fully
+> shipped** (updated 2026-08-29): all phases including the Activity screen itself, its i18n
+> plumbing, and the `/cwl preferences` slash command landed, and the plan was archived to
+> `plans/implemented/cwl-personal-hub.md` (commit `5247ce7`). The section below is kept
 > for its still-accurate historical context (why the feature was scoped as a Phase 2 slice, the
 > Personal-vs-Management Hub separation rationale) but no longer describes what ships.
 
@@ -751,6 +833,23 @@ Rejected: a `draft` or `cancelled` event (409 — nothing enrolled to override, 
 
 ## Phase 3 — Auto-Assignment Suggestion Engine (superseded — see "Manage Enrollment" above)
 
+> **⚰️ NEVER BUILT. Nothing below this line exists in the code.** No `suggest_cwl_assignments()`,
+> no `composite`/`data_confidence`/`FAMILY_BASELINE` scoring, no `preference_override` flag, no
+> extension of `compute_roster_stats_sync()`. `cwl_assignments.score`/`.score_breakdown_json`/
+> `.suggested_clan_tag` are dead columns.
+>
+> **What shipped instead**, in two unrelated pieces:
+> 1. **Assignment** is decided by `resolve_prior_cwl_assignments()` — each player's own single most
+>    recent *real* CWL attack (`attack_order > 0`), any clan, assigned there if that clan
+>    participates this season. No scores involved. Everything after that seed is human
+>    drag-and-drop.
+> 2. **`skill_score`** (league-weighted avg stars over the trailing 3 CWL months,
+>    `compute_league_adjusted_skill_scores()`) exists, but purely as a **display and sort** field on
+>    the board. It has never fed an assignment decision, and deliberately so — the project owner
+>    chose a human-driven board over an algorithmic placement engine.
+>
+> Kept for the record of *why* the scoring approach was dropped, not as a spec.
+
 **Ships:** pure computation — reads `cwl_signups` where `status='confirmed'`, scores each player, writes `cwl_assignments` rows (`assignment_source='suggested'`). No player/clan-visible change yet.
 
 ### Scoring — reuses existing formulas, doesn't reinvent them
@@ -778,6 +877,23 @@ composite    = data_confidence * (0.6*skill + 0.4*reliability)
 
 ## Phase 4 — Leadership Management/Override Screen (superseded — see "Manage Enrollment" above)
 
+> **⚰️ NEVER BUILT. Nothing below this line exists in the code.** No `CwlAssignmentManagementView`,
+> no per-clan embed pages, no Move/Kick/Bring-in selects, no "Generate/Refresh Suggestions" button,
+> no Starting-Roster/Reserves render split, **and no Finalize button** — which is why
+> `cwl_events.status` never reaches `finalized` (see the status-audit section at the top).
+>
+> **What shipped instead:** the "Manage Teams" drag-and-drop Discord Activity board
+> (`activity/client/src/enrollmentBoard.ts`), reached via the dynamically-labeled row-3 button.
+> Columns are the participating clans plus an Unassigned pool and an "Assigned to other Guild"
+> pseudo-column; every placement is a live `POST /api/cwl/enrollment/assign` routed through the one
+> shared `assign_cwl_player_sync()`. Access is admin-**or-leader** (`_resolve_admin_or_leader`), and
+> per-clan CWL Coordinators (tracker #0046) were added later as a third access tier.
+>
+> **Two design decisions from this section did survive** and are carried into Phase 5 below:
+> per-clan `cwl_start_at` (never one event-wide value), and the requirement that *every*
+> participating clan have one before the season can be announced. Phase 5 is where that gate finally
+> gets a real implementation — it is the successor to this section's Finalize step.
+
 **Ships:** admin screen showing all signups + current assignments for an event, with move/kick/bring-in controls and the finalize gate.
 
 - **Entry point**: the "Manage Assignments" button inside Phase 1's `cwl_management` screen, reachable from **either** shell (`/clan management` or the CWL Management Hub) — same ephemeral-follow-up-with-`parent_view`-back-reference pattern as `MemberClansConfigurationView` (generalized per Phase 1's Shared content layer note), so closing/finalizing this screen refreshes whichever parent screen opened it. **This phase also flips the button from Phase 1's hardcoded `disabled=True` placeholder to its real gating condition** (`status` is `signup_open` or later) — the button becomes clickable for the first time here, once `CwlAssignmentManagementView` actually exists.
@@ -792,43 +908,362 @@ composite    = data_confidence * (0.6*skill + 0.4*reliability)
 
 ---
 
-## Phase 5 — Final DM Notification Blast
+## Phase 5 — "Start CWL" ✅ shipped 2026-08-29 (rewritten same day against the shipped architecture)
 
-**Ships:** "press a button, DM every finalized participant with date/time + join link."
+> **Built exactly as specified below.** `start_cwl()` / `resolve_cwl_start_targets_sync()` /
+> `send_cwl_start_dm_group()` / `has_cwl_assignments_to_start()` (`QBdiscocmdshelper_cwl.py`),
+> `CwlStartCwlConfirmView` + the row-4 button (`ui_cwl_roster.py`), the
+> `cwl_shared_clan_players.notified` column and its single-purpose writer (`db_manager.py`), and
+> `cwl.start.*` / `cwl.management.start_cwl_*` in `en.json`/`de.json`.
+>
+> Two things worth recording that the design below didn't anticipate:
+> - **`CACHE.get_clan_name(tag)` defaults to the literal `"Unknown"`**, so the missing-start-time
+>   error named "Unknown" instead of the clan. Caught by a test, not live. Every call site here now
+>   passes the tag as the default (`get_clan_name(tag, tag)`), matching this file's own existing
+>   convention at `format_clan_management_cwl_management()`.
+> - **A DM-guard-skipped recipient must NOT be marked notified**, or they'd be permanently
+>   unreachable once the guard is lifted — the `notified` write is inside the "actually contacted"
+>   branch, and there's a test pinning it.
+>
+> Tests: 30 in `tests/integration/test_cwl_start_and_switch.py` + 4 button-gating tests in
+> `tests/discord/test_ui_cwl_roster.py`. `.\run_tests.ps1`: 2850 pass. Migration verified against a
+> simulated pre-existing database (columns added, existing rows untouched, second restart a no-op).
+> **Not yet verified live** — no DEV click-through yet.
 
-- **Join link**: CoC's native clan-profile deep link. **Already centralized (2026-08-08)**: `coc_deep_link(action, tag)` / `coc_clan_profile_url()` / `coc_player_profile_url()` in `QBhelperfunctions.py` replaced all inline construction across the repo (previously 3 inconsistent inline sites, one of them — `QapBot.py:3064` — missing the `%23` encoding the others used; normalized to the working `%23`-encoded form). Use `coc_clan_profile_url(clan_tag)` here rather than re-inlining the URL. Derived at send-time from `clans.clan_tag` — no new storage needed, no invite-link infra exists in the repo today, and CoC's API has no auto-move capability, so this is the practical ceiling (opens the clan profile in-game; the player still taps Join/Request themselves).
-- **`ui_cwl_roster.py`**: "Send Final Notifications" button on `CwlAssignmentManagementView`, enabled only when `status == 'finalized'`. Confirmation step first (Yes/No view, precedent: `UnlinkConfirmView`) since this is an irreversible mass-DM.
-- **New function `send_cwl_final_notifications(event_id)` in `QBdiscocmdshelper_cwl.py`** — iterates `cwl_assignments` joined to `cwl_signups.discord_id` **and** `cwl_event_clans` (on `assigned_clan_tag`) to pull each recipient's *own assigned clan's* `cwl_start_at` — since start time is per-clan (see Data Model), a player moving to a clan that starts Tuesday must not see Thursday's time just because another participating clan starts then. Skips `notified=1` rows (idempotent — safe to re-run for stragglers), calls the Phase 2-extended `send_user_dm(..., embed=...)` with clan name, join link, and that clan's start time. **Start-time rendering (research-corrected)**: `war_notifications.py` has *no* per-user-locale date formatter to reuse (verified — it uses relative-time `t()` keys plus hardcoded `strftime("%Y-%m-%d %H:%M:%S")`). Use Discord's native timestamp markup instead: `<t:{unix_ts}:F>` (full date) plus `<t:{unix_ts}:R>` (relative countdown) — the Discord client renders these in each viewer's own locale *and timezone* automatically, which is strictly better than any server-side formatting and needs zero i18n keys. (`<t:` markup is currently unused anywhere in the repo, so this introduces it — trivially, it's just string formatting of the assigned clan's `cwl_start_at` parsed to a unix timestamp.) Marks `notified=1` on success. Rows with `discord_id IS NULL` are collected into a summary returned to the admin ("N players could not be notified — no linked account") rather than silently skipped.
-- Transitions `cwl_events.status → announced` after the blast completes (regardless of individual DM failures, consistent with `send_user_dm`'s existing best-effort `bool` contract).
+**Ships:** one admin button, **"Start CWL"**, that DMs every player assigned to a clan telling them
+where they play and when it starts — with the message tailored to whether they are *already* in
+their assigned clan or still need to move there.
 
-**Tests:** idempotency (re-run skips `notified=1`), unlinked-account summary counting; and one end-to-end lifecycle test (`tests/integration/test_cwl_roster_lifecycle.py`) covering create → template copy → simulated confirms → generate suggestions → manual override → finalize → notify → verify final DB state — the single highest-value test in the feature since it exercises every table's write path in sequence.
+This replaces the original "Send Final Notifications" design, which assumed the Phase 4 Finalize
+screen that was never built. The requirement, project owner's spec (2026-08-29), verbatim:
+
+> I would like to have a "Start CWL" button that sends DMs to all players that are assigned to a
+> clan. Those who are already green get a info that they are already in their assigned clan and
+> that their CWL starts at date/time. The amber ones need to get an info that they have to switch
+> to their assignes clan well before date/time with a direct html link to their assigned clan.
+
+### The green/amber split is the board's own signal — reuse it, never re-derive it
+
+"Green" and "amber" are the Manage Teams board's existing player-card colors
+(`clanMatchClass()`, `activity/client/src/enrollmentBoard.ts:85`): green when a player's real
+`current_clan_tag` already equals their `assigned_clan_tag`, amber when it doesn't. **The DM must be
+driven by exactly the same computation**, or a lead reading the board and a player reading their DM
+see contradictory statements about the same fact.
+
+That means sourcing `current_clan_tag` the way `_build_enrollment_payload_sync()` already does
+(`web_bridge.py`) — `get_current_clan_members_sync()` over the pool clans, then the player-scoped
+`get_current_clan_tags_for_players_sync()` fallback for anyone the clan-scoped pass missed. Both are
+kept fresh by every regular clan poll (`update_player_info_in_user_accounts()`, `coc_cache.py`), so
+no CoC API call is needed here at all.
+
+**One deliberate divergence from the board:** where `current_clan_tag` is `None` (player not
+currently tracked in any clan), the board renders a plain, uncolored card — but this DM must pick a
+side. It sends the **amber** variant, because amber's text ("make sure you're in *clan* before
+*time*") is true regardless of where they actually are, whereas green's ("you're already in the
+right clan") would be an outright false statement we can't back up. Never guess green.
+
+### Recipient set — who counts as "assigned to a clan"
+
+The union of the two placement stores the board itself merges, restricted to clans that are
+**currently participating in this event**:
+1. `cwl_assignments` rows for this event whose `assigned_clan_tag` is a participating clan.
+2. `cwl_shared_clan_players` rows with `assigned = 1` for each shared clan participating in this event.
+
+Deliberately **excluded**: an assignment pointing at a clan that is *not* a current column here —
+i.e. the board's "Assigned to other Guild" pseudo-column. That player's real placement belongs to
+another guild's event, and that guild's own Start CWL is what should tell them about it. DMing them
+from here would mean two guilds announcing the same player's CWL, with potentially different start
+times.
+
+**Cross-guild dedup for shared clans: only the owner guild sends.** A shared clan
+(`cwl_shared_clans.owner_guild_id`) appears as a real column on *every* attached guild's board, so
+without this rule each attached guild's Start CWL would DM that clan's whole roster. Non-owner
+guilds skip shared clans entirely and report them as `skipped_not_owner` in the summary, so the
+admin can see it was intentional rather than a silent omission. This is the same ownership model
+eviction and the read-side settings lock already use — no new concept.
+
+### Grouped one-DM-per-Discord-user, not one per account
+
+A member with a main in one clan and an alt in another must get **one** coherent message, not two
+DMs that each look like the whole story. Precedent already in the codebase:
+`send_cwl_reminder_dm_group()` (tracker #0038) does exactly this grouping for the reminder flow.
+
+Shape: a short personally-addressed intro, then **one block per assigned account** — each block
+independently green or amber, each carrying *its own* clan's `cwl_start_at`, because start times are
+per-clan (`cwl_event_clans.cwl_start_at`) and two of one person's accounts can legitimately start on
+different days. A mixed green/amber DM is a normal, expected case, not an edge case.
+
+Per-block content:
+- **Green:** "**{player_name}** — you're already in **{clan_name}**. Your CWL starts
+  {`<t:…:F>`} ({`<t:…:R>`}). Stay put." No link needed; they're there.
+- **Amber:** "**{player_name}** — you're currently in **{current_clan_name}** and need to move to
+  **{clan_name}** *well before* {`<t:…:F>`} ({`<t:…:R>`}). → {`coc_clan_profile_url(clan_tag)`}"
+  Phrase "well before" explicitly, per the spec — a player who transfers at T-2min is already too
+  late, since the roster locks at the CoC backend's own preparation-phase start.
+
+**Both timestamp renderings already exist** — `cwl_start_at_discord_timestamp(cwl_start_at, "F")`
+and `(…, "R")` (`QBdiscocmdshelper_cwl.py:187`). Discord renders these in each viewer's own locale
+*and* timezone. (The original Phase 5 text claimed `<t:` markup was unused in the repo and would be
+introduced here — stale; it shipped with the clan-config Activity.)
+
+**The link** is `coc_clan_profile_url(clan_tag)` (`QBhelperfunctions.py:106`) — an
+`https://link.clashofclans.com/...` URL, which is exactly the "direct html link" asked for: a real
+clickable https link that hands off to the CoC app on the clan's profile. CoC's API has no
+auto-move capability, so opening the clan profile is the practical ceiling — the player still taps
+Join themselves.
+
+### Gating and placement
+
+Row 4 of the CWL Management screen, beside "Notify New Pool Members" and "Remind Pending" — row 3 is
+full (configure / coordinators / start-enrollment-or-manage / delete / add-season = Discord's cap of
+5). Follows those two buttons' established **omit-entirely-rather-than-disable** convention:
+
+Shown when the event exists, `status not in ('draft', 'cancelled')`, and **at least one assigned
+player has not been notified yet**. That last clause makes the button self-managing in exactly the
+way "Notify New Pool Members" already is: it disappears once everyone has been told, and reappears
+on its own the moment a lead drags a late arrival onto the board. No separate "re-notify" button, no
+stale-looking permanently-greyed control.
+
+**Start-time validation is a click-time check, not a gating condition.** If any participating clan
+still has `cwl_start_at IS NULL`, the click responds with an ephemeral error naming those clans and
+pointing at Configure Participating Clans — deliberately *not* a hidden or greyed-out button, since
+"you have one more thing to fill in" needs to be sayable, and an invisible button can't say it. This
+is the surviving half of Phase 4's Finalize gate ("every participating clan, individually").
+
+Confirmation dialog first (`CwlStartCwlConfirmView`), structurally identical to
+`CwlNotifyNewMembersConfirmView` / `CwlRemindPendingConfirmView`: disable both buttons and edit to a
+"processing…" state as the *immediate* interaction response before the multi-second blast starts
+(the lesson from Start Enrollment's own dialog), then edit in the summary.
+
+### `start_cwl(guild_id, season)` — `QBdiscocmdshelper_cwl.py`
+
+Re-fetches the event fresh by `(guild_id, season)` — never trusts a caller-held event dict, matching
+the re-read discipline used everywhere in this feature. Then:
+
+1. Resolve participating clans + their `cwl_start_at`; abort with `error='missing_start_times'` and
+   the offending clan list if any is unset.
+2. Resolve the recipient set (above), skipping non-owned shared clans.
+3. Resolve **live** Discord ownership via `db.get_player_links_sync()` — never
+   `cwl_signups.dmed_discord_id`, which is an enrollment-time snapshot and explicitly *not* an
+   ownership field (Pitfall 37). Unlinked accounts are counted in `skipped_unlinked` and named in the
+   summary, since they are precisely the players a lead has to chase by hand.
+4. Group by Discord id, apply `_dm_guard_blocks()` per recipient (`skipped_dm_guard`).
+5. Send via `CACHE.send_user_dm_detailed()`, bucketing outcomes into the same
+   `blocked` / `no_mutual_guild` / `failed` lists every other CWL batch already returns, so the
+   existing generic summary i18n lines are reused rather than duplicated.
+6. Mark each successfully-notified row: `cwl_assignments.notified = 1`, or — for a shared clan —
+   the new `cwl_shared_clan_players.notified`.
+7. Transition `cwl_events.status` `signup_open → announced` once the blast completes (regardless of
+   individual DM failures, consistent with the best-effort `send_user_dm` contract). **This is the
+   first and only writer of `announced` in the codebase**; `finalized` stays retired.
+
+**New column:** `cwl_shared_clan_players.notified INTEGER NOT NULL DEFAULT 0`, via the standard
+`_add_column_if_missing()` migration block. Per that table's own hard-won discipline (Pitfall 25 —
+`status` and `assigned` never share a writer), this gets its **own** single-purpose writer,
+`set_cwl_shared_clan_player_notified_sync()`, whose `UPDATE` mentions neither of the other two
+columns. Three independent facts, three writers.
+
+**Deliberately NOT done: retracting the still-live enrollment DMs.** A pending Confirm/Opt Out
+button stays clickable after Start CWL. Rationale: a late "actually, I can't play" is genuinely
+useful information for a lead who still has time to reshuffle, and silently revoking a player's
+ability to answer is worse than a slightly stale prompt. (`cleanup_stale_cwl_enrollment_dms()` is
+right there if the project owner wants the opposite behavior — a one-line change, flagged here so
+the decision is explicit rather than accidental.)
+
+**Tests:** green vs amber block selection (including `current_clan_tag IS NULL` → amber);
+per-account start times inside one grouped DM (a player with two accounts in clans starting on
+different days sees both, correctly); idempotency (re-run skips `notified=1` rows and the button
+vanishes once none remain); the missing-start-time abort naming the right clans; shared-clan
+owner-only sending (owner sends, attached non-owner skips and reports); unlinked/blocked/failed
+bucket counting; the `signup_open → announced` transition; a `_dm_guard_blocks()` test proving DEV
+still restricts delivery to the admin. Plus one end-to-end lifecycle test
+(`tests/integration/test_cwl_roster_lifecycle.py`): create season → start enrollment → simulated
+confirms → drag-assign → Start CWL → verify final DB state across all placement tables.
 
 ---
 
-## Phase 6 — Switch Verification & Alarms
+## Phase 6 — Switch Verification & Alarms ✅ shipped 2026-08-29 (rewritten same day)
 
-**Ships:** ongoing monitoring during the prep window between Phase 5's DM blast and each clan's actual start time — detecting which players haven't yet moved to their assigned clan and escalating reminders, both to the player and to leadership. Deliberately separate from Phase 5: Phase 5 is a one-shot blast that can be fully tested and shipped on its own; this phase is multi-day background monitoring layered on top of it.
+> **Built as specified below**, including the decision *not* to build the original plan's
+> accelerated-refresh bucket. `check_cwl_roster_switches()` / `resolve_cwl_switch_monitoring_sync()`
+> / `_due_cwl_alarm_stage()` / `_hours_until()` / `_send_cwl_switch_alarm()` /
+> `_notify_cwl_coordinators_of_missing()` (`QBdiscocmdshelper_cwl.py`), the "Still Missing" section
+> in `format_clan_management_cwl_management()`, the `cwl_shared_clan_players.switched_at` /
+> `.alarm_stage_sent` columns + writers and `mark_cwl_event_clan_locked_sync()` /
+> `get_announced_cwl_events_sync()` / `get_clans_in_cwl_league_group_sync()` (`db_manager.py`),
+> `cwl.alarm.*` i18n, and the once-per-cycle call in `QapBot.py` beside the war-notification pass.
+>
+> One design refinement made while building: `_due_cwl_alarm_stage()` returns the **highest** due
+> stage, not the next one up. A bot that was down across the 24h threshold must go straight to the
+> urgent 2h message rather than sending a now-pointless nudge first; and a start time already in
+> the past yields the urgent stage, since a player who still hasn't moved by then is the most
+> urgent case there is, not the least. Parametrized test covers all eight cases.
+>
+> Also pinned by test: an unreachable player's stage is bumped anyway (otherwise the sweep retries
+> them every cycle forever — the coordinator escalation is what actually covers them), and the lock
+> stamp is write-once across repeated sweeps.
+>
+> **Not yet verified live** — this phase in particular leans on real multi-day timing and on the CoC
+> backend's own lock moment, which mocked tests can only approximate; see its Manual verification
+> note below.
 
-- **Detection**: a player counts as "switched" once their `player_tag` is observed in their `cwl_assignments.assigned_clan_tag`'s **live** member list. That member list already flows through the existing clan-metadata fetch (`CoCClanCache` / `Phase 1a` of the update cycle, `qapbot/docs/CLAN_AND_WAR_CYCLE_ARCHITECTURE.md:55-77` — role-enabled clans refresh every ~30min today) — no new API-fetch pattern is needed, just a new consumer of data already being pulled in.
-- **Accelerated refresh for affected clans**: the existing update-cycle categorization (`QapBot.py`, "Step 1: Categorize Clans to Update") already has a precedent for conditionally forcing a clan into the every-cycle bucket regardless of its normal throttle — "CWL group expansion: add group-mate clans if main clan is active." Add a parallel rule: any clan that is a participating clan (`cwl_event_clans`) of an event in status `finalized` or `announced`, **and whose `cwl_event_clans.locked_at` is still NULL (see below)**, is added to the every-cycle bucket too — so member-list freshness is high specifically during the window it matters, without a bespoke second polling loop.
-- **Automatic per-clan termination — primary trigger is the regular current-war API call, not the admin-entered start time.** Every clan in the accelerated-refresh bucket already gets the **mandatory** current-war fetch every cycle (Phase 1b of the existing update cycle — `fetch_clan_war_data()`, `qapbot/docs/CLAN_AND_WAR_CYCLE_ARCHITECTURE.md:79-88`, returning `{"clan_tag", "war_obj", "opponent_tag", "state"}`). `coc_war_obj.is_cwl` is already a reliable field on that same response — true from the moment the clan's CWL round-1 preparation phase begins (`state == "preparation"` already included, per `cache_manager.py`'s existing `temp_war_metadata` tracking), which per `qapbot/docs/COC_GAME_MECHANICS.md:41-45` is essentially the same moment the clan is matched into its group and its roster locks. **Primary trigger**: `war_obj.is_cwl is True` on that cycle's mandatory fetch result for the clan → locked. This costs zero extra API calls — it's read off a fetch that already has to happen for these clans anyway.
-  - **Secondary/fallback trigger**: for clans where the mandatory current-war fetch can't directly observe this (private-warlog clans get `coc.PrivateWarLog`/`coc.NotFound` from `get_current_war()` and fall back to `_find_active_cwl_war_for_clan()` per the existing CWL-fallback path) — or simply as a safety net for any cycle where the primary check is inconclusive — fall back to checking whether a row now exists in `cwl_league_groups` (existing table, `PRIMARY KEY (cwl_season, clan_tag)`, `CWL_ROUND_TRACKING_PLAN.md`) for `(cwl_events.cwl_season, clan_tag)`. That table is exactly what the private-warlog fallback path already populates opportunistically, so this costs nothing extra either — it's the natural fallback for precisely the clans the primary trigger can't see directly. (This was the primary design in an earlier draft of this plan; it's now demoted to fallback because the current-war `is_cwl` flag is more direct, more immediate, and literally the same data already being pulled for every clan in this bucket regardless.)
-  - **Persisted once, single source of truth**: the first cycle either trigger fires for a clan, write `cwl_event_clans.locked_at = now()` (new column, see Data Model) — permanent, never cleared. Every downstream consumer (accelerated-refresh categorization, the alarm sender, the leadership summary) reads this one persisted flag rather than re-deriving lock state from live API data or in-memory cycle state, so it stays correct even across bot restarts between cycles. Once locked: the clan drops out of the accelerated-refresh bucket (reverts to its normal throttle) and stops receiving further switch checks/alarms for its assignments — there is nothing further a player or leadership can do about that clan's roster at that point, so continuing to nag would be actively wrong, not just wasteful.
-- **New function `check_cwl_roster_switches()`**, hooked into the same periodic cycle as the accelerated refresh above, consuming that cycle's already-fetched war-state results (no separate re-fetch). First runs the lock check above for any not-yet-locked participating clan just fetched this cycle. Then, for each `cwl_assignments` row of a `finalized`/`announced` event whose clan is still unlocked and has `switched_at IS NULL`: checks the live member list, sets `switched_at = now()` if found. For rows still not switched as their clan's `cwl_start_at` approaches, sends an escalating reminder DM (reusing `send_user_dm()` + the `<t:...:R>` relative-timestamp markup from Phase 5) and bumps `alarm_stage_sent` so the same stage is never sent twice. **Default escalation stages** (adjustable later, not re-confirmed with the project owner at this level of granularity): stage 1 at 24h before `cwl_start_at`, stage 2 (more urgent tone) at 2h before. A player who switches, or whose clan locks, at any point stops receiving further alarms (both checked every cycle before considering escalation).
-- **Leadership summary**: extends `_format_clan_management_cwl_management()` (Phase 1) with a "Still Missing" section, live-queried (not stored) — for each participating clan of a `finalized`/`announced` event with `locked_at IS NULL`, which assigned players haven't switched yet and how long until that clan's start time (`<t:...:R>`); a clan with `locked_at` set instead shows "CWL started — roster locked" rather than a stale missing-count. Shown identically in both Phase 1 entry points (shared content layer, same principle as everywhere else in this plan) — no separate implementation for the Hub vs `/clan management`.
-- **`db_manager.py`**: `mark_cwl_assignment_switched_sync(event_id, player_tag)`, `get_unswitched_cwl_assignments_sync(event_id, clan_tag=None)` (used by both the alarm sender and the leadership summary), `bump_cwl_alarm_stage_sync(assignment_id, stage)`, `mark_cwl_event_clan_locked_sync(clan_tag)` (sets `locked_at = now()` on every still-unlocked `cwl_event_clans` row for that `clan_tag` whose `cwl_events.status` is `finalized`/`announced` — no `event_id` param needed since a lock is a fact about the clan in the real world, not about one guild's event; handles the edge case of the same clan appearing in more than one active event cleanly).
+**Ships:** multi-day background monitoring of the window between Phase 5's "Start CWL" blast and
+each clan's own start time — detecting which amber players still haven't moved, escalating reminders
+to them, and escalating to that clan's **CWL Coordinators** when they don't. Layered on top of
+Phase 5 and independently shippable.
 
-**Tests:** unit tests for switch-detection given a member list vs an assignment (present/absent), escalation-stage dedup (a stage already sent is never re-sent, even across multiple cycles before the next stage's threshold), the lock-detection logic (primary trigger fires on `is_cwl=True` in a fetch result; secondary trigger fires on a `cwl_league_groups` row when the primary is inconclusive; neither firing leaves `locked_at` NULL), the accelerated-cycle clan-inclusion rule (finalized/announced + `locked_at IS NULL` → included; draft/signup_open, or already locked, → not included); integration test confirming a clan that becomes locked mid-monitoring immediately drops out of both the accelerated-refresh bucket and further alarms while its sibling clans in the same event keep being monitored; integration test for the leadership summary rendering identically from both Phase 1 entry points and correctly showing "roster locked" for a locked clan; end-to-end test extending Phase 5's lifecycle test with a simulated "player never switches" case through both alarm stages, then a simulated lock (via each trigger path) that stops further alarms.
+### Detection is a DB read, not a new API consumer
 
-**Manual verification**: in dev, finalize an event with a near-future per-clan start time, have a test account deliberately not switch clans, confirm the "Still Missing" section appears in both `cwl_management` entry points, confirm the escalating DM arrives at each configured threshold and stops once the account joins the target clan (or is simulated as switched via the dev DB); separately, simulate a clan's current war becoming CWL (or, for the fallback path, insert a `cwl_league_groups` row directly) for one participating clan and confirm that specific clan drops out of the accelerated-refresh bucket and its leadership-summary section flips to "roster locked" on the next cycle, while other participating clans in the same event are unaffected.
+The original design had this consume the live member list off the clan-metadata fetch. Unnecessary:
+`user_players.current_clan_tag` is already maintained for every member of every polled clan by
+`update_player_info_in_user_accounts()` (`coc_cache.py`) — including unlinked players, via the
+UNASSIGNED shadow-entry mechanism. That is the **exact same signal Phase 5's green/amber split and
+the board's card colors use**, so "has this player switched yet?" is
+`get_current_clan_tags_for_players_sync([tag]) == assigned_clan_tag` and nothing more.
+
+Using one signal for all three surfaces is the point: a player shown amber on the board, told to
+switch by their Phase 5 DM, and nagged by a Phase 6 alarm must never disagree with each other
+because two of them consulted different sources.
+
+### ⚠️ The accelerated-refresh bucket from the original design is dropped
+
+The original plan wanted every participating clan forced into the every-cycle fetch bucket while
+monitoring. **Do not build that.** It has since been overtaken by three separate pieces of work
+pushing in the opposite direction:
+
+- **Tracker #0009** — the 6 GB RSS plateau, root-caused to unbounded 22h re-check waves and fixed by
+  *bounding* per-cycle clan work (`_MAX_INACTIVE_PER_CYCLE`, `QapBot.py`).
+- **Tracker #0017** — removed redundant mid-month CWL war re-fetches outright (the `cwl_ended` sweep).
+- The throttle/backlog machinery around `clans_to_update` now actively defers clans to later cycles
+  under pressure.
+
+Adding a rule that force-promotes a whole family's clans every cycle would re-create precisely the
+load pattern those three fixes removed. And it buys nothing here: participating CWL clans are
+already actively-polled clans, membership is refreshed on the normal cadence (~30 min for
+role-enabled clans), and the monitored window is **days** long. A 30-minute staleness on "has this
+player transferred yet" is irrelevant to a T-24h and T-2h alarm schedule.
+
+**Net effect: Phase 6 adds zero API calls and zero new fetch pressure.** It is a periodic read over
+data already in the DB.
+
+### Per-clan lock detection — still worth doing, but only to *stop* alarms
+
+Once a clan's CWL roster locks at the CoC backend, nothing a player or lead does matters any more,
+so alarms must stop — nagging someone about a roster they can no longer join is actively wrong.
+Both triggers from the original design survive unchanged, because both still cost nothing:
+
+- **Primary:** `war_obj.is_cwl is True` on the clan's mandatory current-war fetch
+  (`fetch_clan_war_data()`), true from the moment its CWL round-1 preparation phase begins — read
+  off a fetch that already happens for these clans regardless.
+- **Fallback:** a `cwl_league_groups` row now existing for `(cwl_season, clan_tag)` — the table the
+  private-warlog path already populates opportunistically, covering exactly the clans the primary
+  signal can't observe directly.
+
+First trigger to fire writes `cwl_event_clans.locked_at = now()` (finally claiming that dead column)
+— persisted once, never cleared, and the single source of truth every consumer reads, so it survives
+a restart mid-window. What changes versus the original design: `locked_at` no longer gates an
+accelerated-refresh bucket (there isn't one). Its only jobs are stopping alarms and flipping the
+leadership display to "roster locked."
+
+### `check_cwl_roster_switches()` — `QBdiscocmdshelper_cwl.py`
+
+Hooked into the once-per-cycle sweep slot in `main()`, the established precedent being
+`sweep_cwl_ended_flags()` (`QBhelperfunctions.py`, tracker #0017) — a periodic, cheap, DB-bound CWL
+housekeeping pass called once per cycle. Same slot, same shape.
+
+Per cycle, for each `announced` event:
+1. Run the lock check for any participating clan with `locked_at IS NULL`, using this cycle's
+   already-fetched war state.
+2. For each notified assignment in a still-unlocked clan with `switched_at IS NULL`: if the player's
+   current clan now equals their assigned clan, set `switched_at = now()` and stop tracking them.
+3. For anyone still not switched, compare *their own assigned clan's* `cwl_start_at` against now and
+   send the next escalation stage if its threshold has passed — **stage 1 at T-24h**, **stage 2
+   (urgent) at T-2h** — bumping `alarm_stage_sent` so a stage is never re-sent, even across many
+   cycles inside one threshold window. Reuses Phase 5's amber DM body plus the `<t:…:R>` countdown
+   and the same clan link.
+4. **Leadership escalation at stage 2:** DM that clan's `cwl_clan_coordinators` (tracker #0046) a
+   consolidated "still missing from *clan*, CWL starts in *T*" list. This is new versus the original
+   design, which only offered a passive list in the management embed — coordinators are a standing,
+   per-clan, already-shipped concept and are exactly the right recipients. One DM per coordinator per
+   clan per stage, never per missing player. Falls back to nothing (not to a guild-wide broadcast) if
+   a clan has no coordinators configured; the embed section below still covers that case.
+
+Every DM in this phase goes through `_dm_guard_blocks()`, same as every other CWL sender.
+
+Both alarm stages and the switched check stop immediately once a clan's `locked_at` is set, checked
+before considering escalation rather than after.
+
+### Shared-clan parity
+
+`cwl_shared_clan_players` needs the same two tracking columns Phase 5 gave it `notified` for:
+`switched_at TEXT` and `alarm_stage_sent INTEGER NOT NULL DEFAULT 0`, via `_add_column_if_missing()`,
+each with its own single-purpose writer per that table's non-conflation discipline. As in Phase 5,
+**only the owner guild alarms** for a shared clan.
+
+### Leadership summary
+
+Extends `format_clan_management_cwl_management()` (`QBdiscocmdshelper_cwl.py:397`) with a
+"Still Missing" section — live-queried, never stored. Per participating clan of an `announced` event
+with `locked_at IS NULL`: which assigned players haven't switched, and `<t:…:R>` until that clan's
+start. A clan with `locked_at` set shows "CWL started — roster locked" instead of a stale count.
+Because that function is the shared content layer, this renders identically in `/clan management`
+and in the CWL Management Hub with one implementation — the invariant this feature has held
+throughout.
+
+### `db_manager.py` additions
+
+`mark_cwl_assignment_switched_sync(event_id, player_tag)`,
+`get_unswitched_cwl_assignments_sync(event_id, clan_tag=None)` (shared by the alarm sender and the
+embed), `bump_cwl_alarm_stage_sync(assignment_id, stage)`, and
+`mark_cwl_event_clan_locked_sync(clan_tag, cwl_season)` — which sets `locked_at` on **every**
+still-unlocked `cwl_event_clans` row for that clan_tag in that season across all guilds' events, not
+one event's. A roster lock is a fact about the clan in the real world, not about one guild's
+planning record, so a shared clan locks for everyone at once.
+
+**Tests:** switch detection (current clan matches / doesn't / unknown); escalation dedup (a stage
+already sent is never re-sent across repeated cycles inside the same window); both lock triggers
+(primary `is_cwl=True`; fallback `cwl_league_groups` row when the primary is inconclusive; neither →
+`locked_at` stays NULL); a clan locking mid-window stops its own alarms while sibling clans in the
+same event keep being monitored; coordinator escalation fires once per coordinator per clan per
+stage and not at all when none are configured; shared-clan owner-only alarming; and an end-to-end
+test extending Phase 5's lifecycle test with a player who never switches, through both stages, then
+a simulated lock that stops everything.
+
+**Manual verification:** in DEV, announce an event with a near-future per-clan start time, leave a
+test account in the wrong clan, and confirm — the "Still Missing" section appears in both
+`cwl_management` entry points; each escalation DM arrives once at its threshold and not again;
+moving the account into the assigned clan stops further alarms within one cycle; a coordinator DM
+lands at stage 2. Separately, simulate one clan's current war becoming CWL (or insert a
+`cwl_league_groups` row for the fallback path) and confirm that clan alone flips to "roster locked"
+and goes quiet while its siblings keep monitoring.
 
 ---
 
 ## Cross-Cutting Work
 
-**Retention (configurable auto-cleanup)**: add `cwl_retention_months INTEGER NOT NULL DEFAULT 0` to `guild_config` (0 = keep indefinitely, matching current behavior for guilds that don't opt in), settable via the Retention `Select` in Phase 1's `cwl_settings` mode. Hook a `purge_old_cwl_events()` step into the existing `db_manager.nightly_db_maintenance()` (confirmed entry point, db_manager.py:6428 — note it currently has **no** per-guild cleanup steps at all, only global WAL-checkpoint/VACUUM-or-REINDEX/ANALYZE, so this is a genuinely new step appended after the existing three, not an extension of an existing pattern) — for each guild with `cwl_retention_months > 0`, delete `cwl_events` rows with `status IN ('announced', 'cancelled')` and `updated_at` older than that many months; cascade deletes handle the 3 child tables automatically. Non-terminal-status events (still `draft`/`signup_open`/`finalized`) are never auto-deleted regardless of age, so an in-progress planning cycle can't be swept accidentally.
+**Retention (configurable auto-cleanup)** — ⚠️ **HALF-BUILT, currently inert.** The setting shipped:
+`guild_config.cwl_retention_months` exists (default 0 = keep indefinitely), persists through the full
+column pipeline, and is settable via the Retention `Select` in the `cwl_settings` screen
+(`ui_cwl_roster.py:305`/`:382`). **The purge itself was never written** —
+`nightly_db_maintenance()` (`db_manager.py:10871`) still has exactly its original three steps
+(WAL checkpoint → VACUUM-or-REINDEX → ANALYZE) and no per-guild cleanup of any kind. A guild that
+sets "keep 3 months" today gets no cleanup at all, silently.
 
-**Paged select-menu helper** (needed by Phase 1's clan picker and Phase 4's move/bring-in pickers, since neither guild clan counts nor per-clan rosters are capped at 25): no existing "paged select that swaps its 25 options via Prev/Next while preserving selection state" exists in the repo (only whole-embed pagination and simple `options[:25]` truncation do). Build once as a small reusable helper in `qapbot/ui_common.py` (alongside the existing `GenericSelectView`, line 69) with server-side draft state — never encode selections in `custom_id` (100-char cap) — and consume from `ui_cwl_roster.py`.
+Still to build, unchanged in design: a `purge_old_cwl_events()` step appended after the existing
+three — for each guild with `cwl_retention_months > 0`, delete `cwl_events` rows with
+`status IN ('announced', 'cancelled')` and `updated_at` older than that many months; the cascade
+handles the child tables. Non-terminal events are never swept regardless of age.
+**Note the Phase 5 interaction:** `announced` gained its first writer when Phase 5 shipped
+(2026-08-29), so as of now this retention policy would finally have something real to purge — which
+makes building the purge step the natural next piece of work on this feature.
+One caveat to handle when building it: `cwl_player_season_status` is deliberately **not**
+FK-cascaded, and `delete_cwl_event_sync()` clears only the subset entirely attributable to the
+deleted event — the purge must go through that same function, never a raw `DELETE FROM cwl_events`.
+
+**Paged select-menu helper** — ❌ **never built, and no longer needed.** Every picker that would have
+required it (the clan multi-select, Phase 4's move/bring-in controls) moved into the Discord Activity,
+which has no 25-option limit. The one Discord-native picker added since — the CWL Coordinators
+select (tracker #0046) — is bounded by `CWL_COORDINATOR_LIMIT` instead. Dropped from scope.
 
 **Docs**: new `qapbot/docs/CWL_ROSTER_PLANNING.md` (structured like `CWL_ROUND_TRACKING_PLAN.md`: schema, flow diagrams, the event status state machine `draft → signup_open → finalized → announced` / `cancelled`, the `cwl_settings`/`cwl_management` mode additions to `ClanManagementView`, the dual-entry-point/shared-content-layer design behind the CWL Management Hub, the per-clan (not per-event) `cwl_start_at` model, the Starting-Roster/Reserves display-time split, the switch-verification/alarm mechanism from Phase 6, and explicit documentation of the `DynamicItem` persistent-DM-button mechanism since it's a genuinely new pattern for the codebase). Update `README.md`'s doc index. Separately, Phase 0's bot-wide DM support (guild-context resolver, permission-check adaptation, `on_message` handler) is generic bot infrastructure, not CWL-specific — document it in `qapbot/docs/CODE_STRUCTURE.md` or a new standalone doc, not folded into `CWL_ROSTER_PLANNING.md`, and remove the now-fulfilled backlog line at `backlog.txt:37` once it ships. Update `/help` in `QBdiscordcmds.py` (the `categories` dict is *dynamically built with `t()` calls* at ~lines 1043-1050, not a static dict; autocomplete at ~line 1084) — only for the two member-facing commands, `/cwl signup` and `/cwl withdraw`; the admin functionality has no `/help` entries of its own since it's discovered via `/clan management`'s existing mode dropdown, same as "Manage Registrations" today. Matching `commands.help."cwl signup"`/`"cwl withdraw"` blocks in `en.json`/`de.json` (mirror the existing `"analyse cwl_opponent"` block, en.json:222). Note: no top-level `cwl.*` translation namespace exists yet (current CWL-related keys are scattered, e.g. `wartype_cwl`) — this feature introduces it.
 
@@ -840,7 +1275,15 @@ composite    = data_confidence * (0.6*skill + 0.4*reliability)
 
 ## Verification
 
-- Run `.\run_tests.ps1` after each phase; new test files per phase as listed above, plus the Phase 5 end-to-end lifecycle test (extended by Phase 6) as the final gate before considering the feature complete.
+> **⚠️ The per-phase manual-verification checklist below is largely historical.** Phases 3 and 4
+> were superseded and never built, so their steps (inspect generated scores, Finalize, Reserves
+> split, Generate Suggestions) describe UI that does not exist. Phases 0-2's steps were all
+> exercised, many times over, across the ~15 live-testing rounds recorded in this document. The
+> steps that still describe unbuilt work are Phase 5's and Phase 6's, which are restated in full and
+> up to date in those two phases' own sections above. Treat those two as authoritative and this list
+> as background.
+
+- Run `.\run_tests.ps1` after each phase; new test files per phase as listed above, plus the Phase 5 end-to-end lifecycle test (extended by Phase 6) as the final gate before considering the feature complete. Baseline at the time of this audit: **2822 tests passing** (2026-08-29).
 - Manual verification per phase in a dev Discord guild: Phase 0 — see that phase's own Manual verification note (DM free-text fallback, guild-picker for multi-guild accounts, cross-guild permission rejection, then per-command-group DM parity as Phase 0b lands); Phase 1 — open `/clan management`, confirm `cwl_settings` and `cwl_management` appear in the mode dropdown, configure both Hub channels/retention, open "Configure Participating Clans" on a guild with a prior season's data and confirm the carry-over pre-selection is correct, confirm the per-clan roster-size dropdown (5/15/30) and per-clan start-time modal both persist correctly, confirm clan multi-select persists and re-opens correctly, then post the CWL Management Hub message and confirm it renders **identical** content/buttons to the `/clan management` path for the same guild state (the core claim of the shared-content-layer design), confirm both entry points' "Configure Participating Clans" button correctly refreshes whichever screen opened it, and confirm "Start Enrollment"/"Manage Assignments" render **visibly greyed out** (present, disabled) rather than absent or clickable-but-broken; Phase 2 — trigger template copy, click DM buttons from a test account, confirm `/cwl signup` dropdown and duplicate handling, post the Hub message and confirm "My Status"/"My Preferences" render correctly for an account with multiple linked players, confirm the opt-out toggle (single and "apply to all") actually suppresses that account from the next template-copy run, and confirm "Start Enrollment" is now enabled/clickable once its gating condition is met (while "Manage Assignments" remains greyed out until Phase 4); Phase 3 — inspect generated `cwl_assignments` rows/scores directly in the dev DB for a seeded roster; Phase 4 — confirm "Manage Assignments" is now enabled/clickable, move/kick/bring-in players, confirm the Starting-Roster/Reserves split renders at the right boundary per clan, confirm re-suggestion preserves manual edits, confirm non-admin is rejected mid-session, confirm Finalize blocks until every participating clan (not just one) has a start time; Phase 5 — confirm the DM content renders correctly (clan name, join link, that recipient's own assigned clan's start time — not another clan's) and `notified`/`status` flags update as expected; Phase 6 — see that phase's own Manual verification note (still-missing summary, escalating alarm DMs, alarms stopping once switched, and per-clan monitoring/alarms stopping once that clan's CWL group locks — independently of its sibling clans in the same event).
 - Confirm a bot restart between sending template DMs and a member clicking them still resolves correctly (the specific scenario `DynamicItem` is meant to fix) — test this explicitly in dev before considering Phase 2 done.
 

@@ -2322,6 +2322,17 @@ class WarHistoryDB:
                 dmed_discord_id   TEXT,
                 status            TEXT    NOT NULL DEFAULT 'pending',
                 assigned          INTEGER NOT NULL DEFAULT 0,
+                -- Three more independent facts, three more single-purpose writers (Phase 5/6,
+                -- CWL_ROSTER_PLANNING_PLAN.md). The shared-clan counterparts of the identically
+                -- named cwl_assignments columns, needed because a shared clan's placement lives
+                -- here instead of there. Same non-conflation rule as status/assigned above:
+                --   - `notified`         -> set_cwl_shared_clan_player_notified_sync   ("Start CWL" DM sent)
+                --   - `switched_at`      -> set_cwl_shared_clan_player_switched_sync   (observed in the clan)
+                --   - `alarm_stage_sent` -> set_cwl_shared_clan_player_alarm_stage_sync (escalation dedup)
+                -- None of these three UPDATEs mentions any column but its own.
+                notified          INTEGER NOT NULL DEFAULT 0,
+                switched_at       TEXT,
+                alarm_stage_sent  INTEGER NOT NULL DEFAULT 0,
                 source            TEXT    NOT NULL,
                 added_by_guild_id TEXT    NOT NULL,
                 responded_at      TEXT,
@@ -2621,6 +2632,17 @@ class WarHistoryDB:
         if assigned_column_added:
             await self._conn.execute("UPDATE cwl_shared_clan_players SET assigned = 1 WHERE status = 'confirmed'")
             logging.info("[DB-MIGRATE] Backfilled cwl_shared_clan_players.assigned from legacy status='confirmed' rows")
+
+        # "Start CWL" (Phase 5) + switch verification (Phase 6), CWL_ROSTER_PLANNING_PLAN.md.
+        # cwl_assignments already carries notified/switched_at/alarm_stage_sent (created 2026-08-09,
+        # dead until now); cwl_shared_clan_players — the placement store for a cross-guild SHARED
+        # clan, which has no cwl_assignments row at all — needs the same three. Each gets its own
+        # single-purpose writer, never a combined one: that table already learned the hard way
+        # (Pitfall 25, status vs assigned) that two independent facts sharing a write path is how
+        # one silently destroys the other. These are three MORE independent facts on the same row.
+        await self._add_column_if_missing("cwl_shared_clan_players", "notified", "INTEGER NOT NULL DEFAULT 0")
+        await self._add_column_if_missing("cwl_shared_clan_players", "switched_at", "TEXT")
+        await self._add_column_if_missing("cwl_shared_clan_players", "alarm_stage_sent", "INTEGER NOT NULL DEFAULT 0")
 
         logging.debug("[DB-SCHEMA] Maindata schema created/verified")
 
@@ -5838,6 +5860,123 @@ class WarHistoryDB:
                 conn.rollback()
                 return False
 
+    def _set_cwl_assignment_field_sync(
+        self, event_id: int, player_tag: str, column: str, value: Any, caller: str,
+    ) -> bool:
+        """Shared UPDATE body for the three single-purpose cwl_assignments writers below
+        (`notified`, `switched_at`, `alarm_stage_sent` — created 2026-08-09, first written by
+        Phase 5/6). Same whitelist-not-caller-supplied discipline, and same reason, as
+        _set_cwl_shared_clan_player_field_sync: none of these three may ever be able to disturb
+        `assigned_clan_tag`/`locked`/`assignment_source`, which are placement facts owned solely by
+        assign_cwl_player_sync. Pure UPDATE — a missing row means the player was unassigned
+        concurrently, correctly a no-op."""
+        import sqlite3
+
+        _ALLOWED = {"notified", "switched_at", "alarm_stage_sent"}
+        if column not in _ALLOWED:  # pragma: no cover - guards a programming error, not input
+            raise ValueError(f"{caller}: refusing to update non-whitelisted column {column!r}")
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        f"UPDATE cwl_assignments SET {column} = ?, updated_at = datetime('now') "
+                        f"WHERE event_id = ? AND player_tag = ?",
+                        (value, event_id, player_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] {caller} failed for event {event_id} player {player_tag}: {e}")
+                conn.rollback()
+                return False
+
+    def mark_cwl_assignment_notified_sync(self, event_id: int, player_tag: str, notified: bool = True) -> bool:
+        """Record that the "Start CWL" DM (Phase 5) went out for this assignment — and ONLY that.
+        Drives that button's idempotency: a re-run skips already-notified rows, and the button
+        itself disappears once none remain."""
+        return self._set_cwl_assignment_field_sync(
+            event_id, player_tag, "notified", 1 if notified else 0, "mark_cwl_assignment_notified_sync",
+        )
+
+    def mark_cwl_assignment_switched_sync(self, event_id: int, player_tag: str, switched_at: str) -> bool:
+        """Record when this player was first observed actually sitting in their assigned clan
+        (Phase 6) — and ONLY that. Once set, they stop being alarmed."""
+        return self._set_cwl_assignment_field_sync(
+            event_id, player_tag, "switched_at", switched_at, "mark_cwl_assignment_switched_sync",
+        )
+
+    def bump_cwl_alarm_stage_sync(self, event_id: int, player_tag: str, stage: int) -> bool:
+        """Record the highest switch-alarm escalation stage already DMed (Phase 6) — and ONLY
+        that. This is what makes an every-cycle alarm sweep safe to run repeatedly inside one
+        threshold window without re-sending the same nudge."""
+        return self._set_cwl_assignment_field_sync(
+            event_id, player_tag, "alarm_stage_sent", stage, "bump_cwl_alarm_stage_sync",
+        )
+
+    def mark_cwl_event_clan_locked_sync(self, clan_tag: str, cwl_season: str) -> int:
+        """Stamp `cwl_event_clans.locked_at` for a clan whose CWL roster has been observed locked
+        by the CoC backend (Phase 6) — across EVERY guild's event for that season, not one.
+
+        A roster lock is a fact about the clan in the real world, not about one guild's planning
+        record: a clan shared between two guilds (or simply configured by two unrelated guilds)
+        locks for both at the same instant, and alarms must stop for both. Scoped to non-cancelled
+        events, and only ever stamps rows that are still NULL — the column is write-once, never
+        cleared, so a restart mid-window can't reset it and a second observation can't move it.
+
+        Returns the number of rows newly stamped (0 = already locked, or no such participating
+        clan), so the caller can log a real state change rather than every cycle's re-observation.
+        """
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    cursor = conn.execute(
+                        """
+                        UPDATE cwl_event_clans SET locked_at = datetime('now')
+                        WHERE clan_tag = ? AND locked_at IS NULL AND participating = 1
+                          AND event_id IN (
+                              SELECT id FROM cwl_events WHERE cwl_season = ? AND status != 'cancelled'
+                          )
+                        """,
+                        (clan_tag, cwl_season),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return cursor.rowcount or 0
+            except sqlite3.Error as e:
+                logging.error(f"[DB-WRITE-SYNC] mark_cwl_event_clan_locked_sync failed for {clan_tag} {cwl_season}: {e}")
+                conn.rollback()
+                return 0
+
+    def get_announced_cwl_events_sync(self) -> List[Dict[str, Any]]:
+        """Every event currently in 'announced' — i.e. "Start CWL" has run and Phase 6's switch
+        monitoring applies. Fleet-wide (all guilds) since the monitoring sweep runs once per cycle
+        for the whole bot, not per guild. Kept trivially small in practice: at most one row per
+        guild per active CWL month."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM cwl_events WHERE status = 'announced'"
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_announced_cwl_events_sync failed: {e}")
+                return []
+
     # ------------------------------------------------------------------
     # Cross-guild shared CWL clans (2026-08-15) — see cwl_shared_clans'
     # CREATE TABLE comment above for the design rationale.
@@ -6348,6 +6487,78 @@ class WarHistoryDB:
                 )
                 conn.rollback()
                 return False
+
+    def _set_cwl_shared_clan_player_field_sync(
+        self, shared_clan_id: int, player_tag: str, column: str, value: Any, caller: str,
+    ) -> bool:
+        """Shared UPDATE body for the three single-purpose shared-clan writers below (`notified`,
+        `switched_at`, `alarm_stage_sent`, Phase 5/6). `column` is NEVER caller-supplied — each
+        public wrapper passes its own hardcoded literal, and the whitelist below refuses anything
+        else, so this cannot become a general "update any column" backdoor that would undo the
+        one-writer-per-fact discipline (Pitfall 25) these wrappers exist to enforce.
+
+        Pure UPDATE, never an upsert: all three facts are only ever true of a player who is
+        ALREADY placed in this shared clan, so a missing row means the placement was removed
+        concurrently (another guild's drag-and-drop) — correctly a no-op, not a row to resurrect.
+        """
+        import sqlite3
+
+        _ALLOWED = {"notified", "switched_at", "alarm_stage_sent"}
+        if column not in _ALLOWED:  # pragma: no cover - guards a programming error, not input
+            raise ValueError(f"{caller}: refusing to update non-whitelisted column {column!r}")
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        f"UPDATE cwl_shared_clan_players SET {column} = ?, updated_at = datetime('now') "
+                        f"WHERE shared_clan_id = ? AND player_tag = ?",
+                        (value, shared_clan_id, player_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] {caller} failed for shared_clan {shared_clan_id} player {player_tag}: {e}"
+                )
+                conn.rollback()
+                return False
+
+    def set_cwl_shared_clan_player_notified_sync(
+        self, shared_clan_id: int, player_tag: str, notified: bool = True,
+    ) -> bool:
+        """Record that the "Start CWL" DM (Phase 5) went out for this shared-clan roster slot — and
+        ONLY that. Never touches `status` (the player's own response) or `assigned` (their
+        placement); see this table's CREATE TABLE comment. The shared-clan counterpart of
+        mark_cwl_assignment_notified_sync."""
+        return self._set_cwl_shared_clan_player_field_sync(
+            shared_clan_id, player_tag, "notified", 1 if notified else 0,
+            "set_cwl_shared_clan_player_notified_sync",
+        )
+
+    def set_cwl_shared_clan_player_switched_sync(
+        self, shared_clan_id: int, player_tag: str, switched_at: str,
+    ) -> bool:
+        """Record when this player was first observed actually sitting in the shared clan
+        (Phase 6) — and ONLY that. Shared-clan counterpart of mark_cwl_assignment_switched_sync."""
+        return self._set_cwl_shared_clan_player_field_sync(
+            shared_clan_id, player_tag, "switched_at", switched_at,
+            "set_cwl_shared_clan_player_switched_sync",
+        )
+
+    def set_cwl_shared_clan_player_alarm_stage_sync(
+        self, shared_clan_id: int, player_tag: str, stage: int,
+    ) -> bool:
+        """Record the highest switch-alarm escalation stage already DMed (Phase 6) — and ONLY
+        that. Shared-clan counterpart of bump_cwl_alarm_stage_sync."""
+        return self._set_cwl_shared_clan_player_field_sync(
+            shared_clan_id, player_tag, "alarm_stage_sent", stage,
+            "set_cwl_shared_clan_player_alarm_stage_sync",
+        )
 
     def delete_cwl_shared_clan_player_sync(self, shared_clan_id: int, player_tag: str) -> bool:
         """Remove one player from a shared clan's roster — the shared-clan equivalent of
@@ -7743,6 +7954,41 @@ class WarHistoryDB:
                 return {row["clan_tag"] for row in rows}
         except sqlite3.Error as e:
             logging.error(f"[DB-QUERY-SYNC] get_clans_with_cwl_data_for_season_sync failed for season {season}: {e}")
+            return set()
+
+    def get_clans_in_cwl_league_group_sync(self, clan_tags: List[str], season: str) -> Set[str]:
+        """The subset of clan_tags that already have a cwl_league_groups row for `season` — i.e.
+        this bot has observed them matched into their 8-clan CWL group.
+
+        Phase 6's FALLBACK roster-lock signal (CWL_ROSTER_PLANNING_PLAN.md). The primary signal is
+        get_clans_with_cwl_data_for_season_sync() — a real is_cwl war_summary row — which is more
+        direct but can't be observed for a private-warlog clan; those are exactly the clans this
+        table still gets populated for, opportunistically, by the existing CWL fallback path. Same
+        batched, hot+history shape as the primary query directly above, deliberately, since the two
+        are always called as a pair over the same clan list."""
+        import sqlite3
+
+        if not self.db_path or not clan_tags:
+            return set()
+
+        try:
+            with self._sync_conn() as conn:
+                placeholders = ",".join("?" * len(clan_tags))
+                rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT clan_tag FROM (
+                        SELECT clan_tag FROM main.cwl_league_groups
+                            WHERE cwl_season = ? AND clan_tag IN ({placeholders})
+                        UNION ALL
+                        SELECT clan_tag FROM history.cwl_league_groups
+                            WHERE cwl_season = ? AND clan_tag IN ({placeholders})
+                    )
+                    """,
+                    (season, *clan_tags, season, *clan_tags),
+                ).fetchall()
+                return {row["clan_tag"] for row in rows}
+        except sqlite3.Error as e:
+            logging.error(f"[DB-QUERY-SYNC] get_clans_in_cwl_league_group_sync failed for season {season}: {e}")
             return set()
 
     def get_all_war_summaries_brief_sync(self) -> List[Tuple[str, str, str, int]]:

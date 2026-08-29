@@ -1975,6 +1975,18 @@ async def main() -> None:
     except Exception as e:
         logging.error(f"Error in war notifications: {e}")
 
+    # CWL switch verification + escalating alarms (Phase 6, CWL_ROSTER_PLANNING_PLAN.md). Placed
+    # next to the war-notification reminders above because it's the same kind of thing — a periodic,
+    # best-effort DM reminder pass — and, like them, deliberately BEFORE the Discord-health gate:
+    # its lock detection and switch detection are pure DB work that must keep running during an
+    # outage even when the DMs themselves can't go out. Costs zero CoC API calls; see the
+    # function's own docstring for why the plan's original accelerated-refresh bucket was dropped.
+    try:
+        from qapbot.QBdiscocmdshelper_cwl import check_cwl_roster_switches
+        await check_cwl_roster_switches()
+    except Exception as e:
+        logging.error(f"Error in CWL roster switch check: {e}")
+
     # All remaining steps post to Discord — skip them entirely during a known outage.
     from qapbot.discord_health import is_discord_available
     if not is_discord_available():

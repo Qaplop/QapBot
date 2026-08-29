@@ -1013,7 +1013,21 @@
       "remind_pending_summary": "✅ Done.\nReminded (accounts): {contacted}\nReminded (Discord users): {contacted_users}\nSkipped (DM guard): {skipped_dm_guard}\nSkipped (no linked account): {skipped_unlinked}\nSkipped (permanently opted out): {skipped_optout}{dm_issues}",
       "remind_pending_error_no_database": "⚠️ Database not ready — try again shortly.",
       "remind_pending_error_no_event": "⚠️ No CWL event found for this season anymore — it may have been deleted.",
-      "remind_pending_error_not_open": "⚠️ Enrollment hasn't been started yet for this season."
+      "remind_pending_error_not_open": "⚠️ Enrollment hasn't been started yet for this season.",
+      "still_missing_block_title": "⚠️ Still Missing (not yet in their assigned clan)",
+      "still_missing_locked": "CWL started — roster locked",
+      "button_start_cwl": "Start CWL",
+      "button_confirm_start_cwl": "Yes, announce the roster",
+      "start_cwl_confirm_body": "\ud83d\udce3 Announce the CWL roster for season **{season}** to every assigned player? Everyone already in their assigned clan is told when their CWL starts; everyone who still has to move gets their clan, the deadline and a direct join link.",
+      "start_cwl_processing": "\u23f3 Announcing the roster, this can take a few seconds\u2026",
+      "start_cwl_summary": "\u2705 Done.\nAnnounced (accounts): {contacted}\nAnnounced (Discord users): {contacted_users}\nSkipped (DM guard): {skipped_dm_guard}\nSkipped (no linked account): {skipped_unlinked}\nSkipped (clan managed by another guild): {skipped_not_owner}{dm_issues}",
+      "start_cwl_cancelled": "\u274c Cancelled \u2014 nothing was announced.",
+      "start_cwl_unlinked_line": "\n\u26a0\ufe0f No linked Discord account, please tell them yourself: {names}",
+      "start_cwl_error_no_database": "\u26a0\ufe0f Database not ready \u2014 try again shortly.",
+      "start_cwl_error_no_event": "\u26a0\ufe0f No CWL event found for this season anymore \u2014 it may have been deleted.",
+      "start_cwl_error_not_open": "\u26a0\ufe0f Enrollment hasn't been started yet for this season.",
+      "start_cwl_error_nobody_to_notify": "\u26a0\ufe0f Nobody to announce to \u2014 no player is assigned to a participating clan yet.",
+      "start_cwl_error_missing_start_times": "\u26a0\ufe0f These clans still have no CWL start time, so nothing was announced: **{clans}**\nSet it per clan in \"Configure Participating Clans\", then try again."
     },
     "player_hub": {
       "title": "🛡️ Your CWL Preferences",
@@ -1071,6 +1085,17 @@
       "not_your_signup": "⚠️ This sign-up belongs to a different account.",
       "signup_closed": "⚠️ Sign-up isn't open for this season anymore.",
       "db_unavailable": "⚠️ Database not ready — try again shortly."
+    },
+    "start": {
+      "dm_intro": "\ud83d\udce3 Hi **{display_name}**, the CWL roster for season **{season}** is set \u2014 here is where you play ({count} account(s)):",
+      "dm_line_green": "\n\u2705 **{player_name}** \u2014 you're already in **{clan_name}**. Your CWL starts {start_full} ({start_rel}). Nothing to do, just stay put.",
+      "dm_line_amber": "\n\u26a0\ufe0f **{player_name}** \u2014 you're currently in **{current_clan_name}** and need to move to **{clan_name}** *well before* {start_full} ({start_rel}).\n\u27a1\ufe0f {clan_url}",
+      "dm_unknown_clan": "no clan"
+    },
+    "alarm": {
+      "dm_header_stage1": "\u23f0 **{player_name}** \u2014 reminder: you haven't moved to your CWL clan yet.",
+      "dm_header_stage2": "\ud83d\udea8 **{player_name}** \u2014 URGENT: CWL is about to start and you're still not in your assigned clan!",
+      "coordinator_body": "\ud83d\udea8 CWL **{season}** \u2014 **{clan_name}** starts {start_rel} and {count} assigned player(s) still haven't joined:\n{names}"
     },
     "reminder": {
       "dm_intro_body": "👋 Hi **{display_name}**,\n\nwe're still waiting on your reply for CWL season **{season}** — you currently have **{count}** pending sign-up(s) in the CWL roster pool that we haven't heard back from you about.\n\nPlease confirm or opt out in the next message as soon as you can — you'll find a separate Confirm/Opt Out button pair for each of your accounts there. A fast reply really helps us with roster planning this season.",

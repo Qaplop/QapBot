@@ -2172,6 +2172,114 @@ async def test_notify_new_members_button_present_when_someone_missing_dm(db):
 
 
 # ---------------------------------------------------------------------------
+# "Start CWL" button gating (Phase 5, CWL_ROSTER_PLANNING_PLAN.md)
+# ---------------------------------------------------------------------------
+
+def _start_cwl_button(view: discord.ui.View):
+    return next(
+        (c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_start_cwl"), None
+    )
+
+
+async def _seed_start_cwl_scenario(db, guild_id: str, *, status: str, assign: bool) -> int:
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, guild_id, {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id] = {"member_clans": ["#CLAN1"], "member_families": []}
+    event_id = db.create_cwl_event_sync(guild_id, "2026-08", "discordid1")
+    db.set_cwl_event_clans_sync(
+        event_id, [{"clan_tag": "#CLAN1", "participating": True, "cwl_start_at": "2026-08-01T08:00Z"}]
+    )
+    if status != "draft":
+        db.update_cwl_event_status_sync(event_id, status)
+    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('10', '10')")
+    await db.conn.execute(
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
+        "VALUES ('10', '#P1', 'Player', 1, '#CLAN1')"
+    )
+    await db.conn.commit()
+    if assign:
+        db.upsert_cwl_assignment_sync(
+            event_id, "#P1", "#CLAN1", assignment_source="admin_override", locked=True
+        )
+    return event_id
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_start_cwl_button_absent_while_draft(db):
+    """Nothing is assigned yet while an event is still a draft, so there is no roster to announce."""
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    await _seed_start_cwl_scenario(db, "8901", status="draft", assign=True)
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 8901)
+
+    assert _start_cwl_button(view) is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_start_cwl_button_absent_when_nobody_is_assigned(db):
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    await _seed_start_cwl_scenario(db, "8902", status="signup_open", assign=False)
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 8902)
+
+    assert _start_cwl_button(view) is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_start_cwl_button_present_when_an_assigned_player_is_unannounced(db):
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    await _seed_start_cwl_scenario(db, "8903", status="signup_open", assign=True)
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 8903)
+
+    button = _start_cwl_button(view)
+    assert button is not None
+    # Same row-4/green convention as the other two conditional DM actions beside it.
+    assert button.row == 4  # type: ignore[union-attr]
+    assert button.style == discord.ButtonStyle.success  # type: ignore[union-attr]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_start_cwl_button_disappears_once_everyone_is_announced(db):
+    """The self-managing gate: no separate "re-announce" action, the button simply goes away — and
+    comes back on its own when a late arrival is assigned."""
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    event_id = await _seed_start_cwl_scenario(db, "8904", status="announced", assign=True)
+    db.mark_cwl_assignment_notified_sync(event_id, "#P1")
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 8904)
+    assert _start_cwl_button(view) is None
+
+    # A late arrival lands on the board -> the button is back, with no admin action in between.
+    await db.conn.execute(
+        "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
+        "VALUES ('10', '#P2', 'Latecomer', 1, '#CLAN1')"
+    )
+    await db.conn.commit()
+    db.upsert_cwl_assignment_sync(
+        event_id, "#P2", "#CLAN1", assignment_source="admin_override", locked=True
+    )
+
+    view2 = discord.ui.View(timeout=300)
+    add_cwl_management_components(view2, 8904)
+    assert _start_cwl_button(view2) is not None
+
+
+# ---------------------------------------------------------------------------
 # Start Enrollment (Phase 2) — button gating, confirm dialog, DynamicItem DM buttons
 # ---------------------------------------------------------------------------
 

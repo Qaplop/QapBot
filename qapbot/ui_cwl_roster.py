@@ -575,6 +575,27 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
             remind_pending_button.callback = _make_cwl_management_remind_pending_callback(view)  # type: ignore[assignment]
             view.add_item(remind_pending_button)  # type: ignore[arg-type]
 
+    # "Start CWL" (Phase 5, CWL_ROSTER_PLANNING_PLAN.md) — announces the finished roster to every
+    # assigned player. Same row-4, omit-entirely-rather-than-disable convention as the two buttons
+    # above, gated by has_cwl_assignments_to_start (at least one assigned player not yet announced
+    # to). That gate makes the button self-managing: it vanishes once everyone has been told and
+    # comes back on its own when a lead drags a late arrival onto the board, so there's no separate
+    # "re-announce" action. Deliberately NOT gated on every clan having a start time — that has to
+    # produce a *sayable* error on click (which clans are missing one), and an invisible button
+    # can't say anything.
+    if event is not None and event["status"] not in ("draft", "cancelled"):
+        from qapbot.QBdiscocmdshelper_cwl import has_cwl_assignments_to_start
+
+        if has_cwl_assignments_to_start(guild_id, season):
+            start_cwl_button = discord.ui.Button(
+                label=t('cwl.management.button_start_cwl', guild_id=guild_id),
+                style=discord.ButtonStyle.success,
+                custom_id="cwl_management_start_cwl",
+                row=4,
+            )
+            start_cwl_button.callback = _make_cwl_management_start_cwl_callback(view)  # type: ignore[assignment]
+            view.add_item(start_cwl_button)  # type: ignore[arg-type]
+
     if event is not None:
         # Surfaced so an admin opening this screen can see at a glance whether every
         # participating clan already has a start time set (Finalize, Phase 4, will require it).
@@ -1832,6 +1853,146 @@ class CwlNotifyNewMembersConfirmView(discord.ui.View):
             await interaction.delete_original_response()
         except discord.NotFound:
             pass
+
+
+def _make_cwl_management_start_cwl_callback(view: discord.ui.View):
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        if not interaction.guild:
+            return
+        from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+
+        db = CACHE.db_manager
+        season = resolve_selected_cwl_season(interaction.guild.id)
+        event = db.get_cwl_event_sync(str(interaction.guild.id), season) if db is not None else None
+        if event is None:
+            return
+        confirm_view = CwlStartCwlConfirmView(
+            parent_view=view,
+            guild_id=interaction.guild.id,
+            season=event["cwl_season"],
+        )
+        await interaction.followup.send(
+            confirm_view._build_content(),  # type: ignore[attr-defined]
+            view=confirm_view,
+            ephemeral=True,
+        )
+
+    return callback
+
+
+class CwlStartCwlConfirmView(discord.ui.View):
+    """Confirm/cancel dialog for "Start CWL" (Phase 5, CWL_ROSTER_PLANNING_PLAN.md) — sends real
+    DMs to every assigned player, so never a single-click action. Structurally identical to
+    CwlRemindPendingConfirmView / CwlNotifyNewMembersConfirmView, including their double-click
+    guard: buttons disabled + edit_message() as the immediate interaction response, before the
+    multi-second blast starts (Cardinal Rule 7 / Pitfall 41)."""
+
+    def __init__(self, parent_view: discord.ui.View, guild_id: int, season: str, timeout: int = 60):
+        super().__init__(timeout=timeout)
+        self.parent_view = parent_view
+        self.guild_id = guild_id
+        self.season = season
+
+        from qapbot.i18n import t
+
+        confirm_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.management.button_confirm_start_cwl', guild_id=guild_id),
+            style=discord.ButtonStyle.success,
+            custom_id="cwl_start_cwl_confirm",
+        )
+        confirm_button.callback = self._on_confirm  # type: ignore[assignment]
+        self.add_item(confirm_button)
+
+        cancel_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.setup.button_cancel', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_start_cwl_cancel",
+        )
+        cancel_button.callback = self._on_cancel  # type: ignore[assignment]
+        self.add_item(cancel_button)
+
+    def _build_content(self) -> str:
+        from qapbot.i18n import t
+
+        return t('cwl.management.start_cwl_confirm_body', guild_id=self.guild_id, season=self.season)
+
+    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        from qapbot.i18n import t
+
+        for item in self.children:
+            item.disabled = True  # type: ignore[union-attr]
+        await interaction.response.edit_message(
+            content=t('cwl.management.start_cwl_processing', guild_id=self.guild_id), view=self
+        )
+        from qapbot.QBdiscocmdshelper_cwl import start_cwl
+
+        result = await start_cwl(self.guild_id, self.season)
+        if not result["ok"]:
+            if result["error"] == "missing_start_times":
+                # The one error worth spelling out rather than reducing to a generic line: the
+                # admin needs to know WHICH clans to go fix, not just that something is missing.
+                content = t(
+                    'cwl.management.start_cwl_error_missing_start_times',
+                    guild_id=self.guild_id, clans=", ".join(result["missing_start_times"]),
+                )
+            else:
+                content = t(f"cwl.management.start_cwl_error_{result['error']}", guild_id=self.guild_id)
+        else:
+            # Same blocked/failed reporting shape as every other CWL DM batch — reuses Start
+            # Enrollment's own generic i18n lines rather than duplicating them.
+            dm_issues = ""
+            if result["blocked"]:
+                dm_issues += t(
+                    'cwl.management.start_enrollment_dm_blocked_line',
+                    guild_id=self.guild_id, names=", ".join(result["blocked"]),
+                )
+            if result["no_mutual_guild"]:
+                dm_issues += t(
+                    'cwl.management.start_enrollment_dm_no_mutual_guild_line',
+                    guild_id=self.guild_id, names=", ".join(result["no_mutual_guild"]),
+                )
+            if result["failed"]:
+                from qapbot.cache_manager import DM_SEND_MAX_RETRIES
+
+                dm_issues += t(
+                    'cwl.management.start_enrollment_dm_failed_line',
+                    guild_id=self.guild_id, retries=DM_SEND_MAX_RETRIES, names=", ".join(result["failed"]),
+                )
+            if result["unlinked_names"]:
+                # Named, not just counted: these are precisely the players a lead has to chase by
+                # hand, since the bot has no way to reach them at all.
+                dm_issues += t(
+                    'cwl.management.start_cwl_unlinked_line',
+                    guild_id=self.guild_id, names=", ".join(result["unlinked_names"]),
+                )
+            content = t(
+                'cwl.management.start_cwl_summary',
+                guild_id=self.guild_id,
+                contacted=result["contacted"],
+                contacted_users=result["contacted_users"],
+                skipped_dm_guard=result["skipped_dm_guard"],
+                skipped_unlinked=result["skipped_unlinked"],
+                skipped_not_owner=result["skipped_not_owner"],
+                dm_issues=dm_issues,
+            )
+        try:
+            await interaction.edit_original_response(content=content, view=None)
+        except discord.NotFound:
+            pass
+        if result["ok"]:
+            await _refresh_parent(self.parent_view, interaction, "cwl_management")
+
+    async def _on_cancel(self, interaction: discord.Interaction) -> None:
+        from qapbot.i18n import t
+
+        await interaction.response.edit_message(
+            content=t('cwl.management.start_cwl_cancelled', guild_id=self.guild_id), view=None
+        )
 
 
 class CwlRemindPendingConfirmView(discord.ui.View):

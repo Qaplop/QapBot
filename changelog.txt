@@ -1,6 +1,64 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (31)
+- Added: "Start CWL" (CWL_ROSTER_PLANNING_PLAN.md Phase 5) -- a new CWL Management button that
+  announces the finished roster to every assigned player by DM. Each player's message is tailored
+  to the same green/amber split the Manage Teams board shows: someone already in their assigned
+  clan is told their CWL start time and to stay put; someone still elsewhere is told which clan to
+  move to, that they must do it well before the start time, and gets a direct clashofclans.com
+  join link for that exact clan. One grouped DM per Discord user (never one per account), so a
+  main and an alt in two different clans with two different start times arrive as one coherent
+  message. A player with no current clan on record deliberately gets the amber variant, since the
+  green text would assert something the bot can't back up.
+  Recipients are the union of cwl_assignments and a shared clan's cwl_shared_clan_players
+  (assigned=1), restricted to currently-participating clans; a shared clan is announced ONLY by its
+  owner guild, so two attached guilds can't both DM the same player about the same clan. Discord
+  ownership is resolved live (get_player_links_sync), never from the enrollment-time snapshot
+  (Pitfall 37). Refuses outright, naming the clans, if any participating clan still has no start
+  time -- the surviving half of the never-built Phase 4 "Finalize" gate. Marks each announced
+  placement notified, which makes the whole action re-runnable for late arrivals and makes the
+  button self-managing: it disappears once everyone's been told and comes back on its own when a
+  lead drags a new player onto the board. Transitions the event signup_open -> announced, the first
+  and only writer of 'announced' in the codebase.
+- Added: CWL switch verification + escalating alarms (Phase 6). A once-per-cycle sweep detects who
+  has actually moved into their assigned clan, DMs escalating reminders to those who haven't (24h
+  then 2h before that player's OWN clan's start time), and escalates at the urgent stage to that
+  clan's standing CWL Coordinators (tracker #0046). A new "Still Missing" section in the CWL
+  Management embed shows leadership the same list passively, in both entry points via the shared
+  content layer. Monitoring stops per clan the moment its CWL roster locks -- detected from a real
+  is_cwl war row, falling back to a cwl_league_groups row for private-warlog clans -- since nagging
+  someone about a roster they can no longer join is actively wrong.
+  Costs ZERO CoC API calls: "has this player moved?" is answered from user_players.current_clan_tag,
+  which every regular clan poll already refreshes and which is the same signal the board's card
+  colors use. The original plan's "force every participating clan into the every-cycle fetch bucket"
+  was deliberately NOT built -- it would have re-created exactly the per-cycle load pattern trackers
+  #0009 (the 6 GB RSS plateau) and #0017 (redundant mid-month CWL fetches) were fixed by removing,
+  and buys nothing over a ~30 min staleness across a multi-DAY monitoring window.
+- Fixed (found by test, not live): CACHE.get_clan_name() returns the literal "Unknown" for a clan
+  that isn't in the name cache, so the missing-start-time error named "Unknown" instead of the clan
+  an admin has to go fix. Every new call site now passes the tag as the default, matching this
+  file's own existing convention.
+- Schema: cwl_shared_clan_players gains notified/switched_at/alarm_stage_sent (the shared-clan
+  counterparts of the identically named cwl_assignments columns, which existed since 2026-08-09 and
+  had never been read or written until now). Each gets its OWN single-purpose writer whose UPDATE
+  mentions no other column -- that table already learned the hard way (Pitfall 25, status vs
+  assigned) that two independent facts sharing a write path is how one silently destroys the other.
+  Auto-migrates on restart via _add_column_if_missing; verified against a simulated pre-existing
+  database (columns added, existing rows untouched, second restart a clean no-op).
+- Docs: CWL_ROSTER_PLANNING_PLAN.md substantially rewritten. Added a status-audit table at the top
+  mapping plan-vs-reality after ~3 weeks of live-testing drift (Phase 3's scoring engine and Phase
+  4's native override screen were superseded and NEVER built; the Personal CWL Hub shipped under a
+  different design; the retention setting exists but its purge was never written and is currently
+  inert; the paged-select helper was dropped as unnecessary). Documented that cwl_events.status
+  never had a writer past signup_open and that 'finalized' is retired outright rather than left as
+  a dead value. Phases 5 and 6 rewritten from scratch against the shipped architecture, then built.
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/ui_cwl_roster.py, qapbot/db_manager.py, QapBot.py,
+  qapbot/translations/{en,de}.json, CWL_ROSTER_PLANNING_PLAN.md. Tests: new tests/integration/
+  test_cwl_start_and_switch.py (27) + 4 button-gating tests in tests/discord/test_ui_cwl_roster.py.
+  2850 tests pass.
+  NOTE: not yet verified live -- needs a bot restart on DEV and a click-through of both phases.
+
 2026-08-29 (30)
 - Deployed: activity/server (Worker) to PROD too, per explicit follow-up request ("all changes we
   ever made, server and client, latest version"). `tsc --noEmit` clean. Deployed version
