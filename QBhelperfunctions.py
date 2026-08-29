@@ -7077,7 +7077,7 @@ async def process_cwl_recovery_batch(archive_set: Set[str]) -> int:
     return batch_size
 
 
-async def predict_war_between_clans(clan1_tag: str, clan2_tag: str, n_players: int = 15, apm: int = 1) -> str:
+async def predict_war_between_clans(clan1_tag: str, clan2_tag: str, n_players: int = 15, apm: int = 2) -> str:
     """
     Predict the outcome of a hypothetical war between two clans using their top-N players by TH.
 
@@ -7088,7 +7088,7 @@ async def predict_war_between_clans(clan1_tag: str, clan2_tag: str, n_players: i
         clan1_tag: Normalized clan tag (with #) treated as "our" clan.
         clan2_tag: Normalized clan tag (with #) of the opponent.
         n_players: Number of top players (by TH level) to include per side. Defaults to 15.
-        apm: Attacks per member — 1 for regular CW, 2 for CWL. Defaults to 1.
+        apm: Attacks per member — 2 for regular CW, 1 for CWL (tracker #0068). Defaults to 2.
 
     Returns:
         Discord-ready formatted string with roster emojis and win/lose/draw probabilities.

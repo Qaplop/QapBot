@@ -184,6 +184,53 @@ async def test_list_accounts_legend_and_icons_match_clan_management(monkeypatch:
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attacks_field_value,expected_apm",
+    [
+        ("", 2),      # left blank -- the common case -- must default to regular CW (2)
+        ("2", 2),     # explicit regular CW
+        ("1", 1),     # explicit CWL
+        ("garbage", 2),  # anything not exactly "1" also falls back to the regular-CW default
+    ],
+)
+async def test_war_predict_modal_apm_matches_corrected_label(
+    monkeypatch: pytest.MonkeyPatch, mock_interaction, attacks_field_value, expected_apm,
+):
+    """Tracker #0068: regular CW is 2 attacks/member, CWL is 1 (the modal's label had this
+    backwards). The parsing logic had the same inversion baked in -- fix both together so the
+    corrected label text actually matches what submitting the form does."""
+    import QBdiscordcmds
+    import qapbot.QBdiscocmdshelper as helper
+
+    monkeypatch.setattr(helper, "check_bot_admin_only", lambda interaction, server_admin: True)
+
+    captured: Dict[str, Any] = {}
+
+    async def fake_predict(clan1_tag, clan2_tag, n_players, apm):
+        captured["apm"] = apm
+        return "prediction result"
+
+    monkeypatch.setattr("QBhelperfunctions.predict_war_between_clans", fake_predict)
+
+    await QBdiscordcmds.admin.callback(mock_interaction, action="WAR_PREDICT")  # type: ignore[arg-type]
+
+    mock_interaction.response.send_modal.assert_awaited_once()
+    modal = mock_interaction.response.send_modal.await_args.args[0]
+
+    assert "2 = regular CW, 1 = CWL" in modal.attacks_input.label
+
+    modal.clan1._value = "#ABCDE12"  # type: ignore[attr-defined]
+    modal.clan2._value = "#FGHJK34"  # type: ignore[attr-defined]
+    modal.participants._value = "15"  # type: ignore[attr-defined]
+    modal.attacks_input._value = attacks_field_value  # type: ignore[attr-defined]
+
+    await modal.on_submit(mock_interaction)
+
+    assert captured["apm"] == expected_apm
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_list_accounts_discord_user_with_no_accounts_shows_dedicated_message(monkeypatch: pytest.MonkeyPatch, mock_interaction):
     """A discord_user with no CACHE.user_accounts entry at all must not be conflated with the
     generic "nobody has any accounts" empty state — the message should name the actual user."""

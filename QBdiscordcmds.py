@@ -1564,7 +1564,7 @@ async def admin(
             clan1 = discord.ui.TextInput(label="Clan 1 Tag (treated as \"our\" clan)", placeholder="#CLAN1TAG", max_length=15)  # type: ignore[var-annotated]
             clan2 = discord.ui.TextInput(label="Clan 2 Tag (opponent)", placeholder="#CLAN2TAG", max_length=15)  # type: ignore[var-annotated]
             participants = discord.ui.TextInput(label="Players per side (e.g. 5, 10, 15)", placeholder="15", max_length=3, required=False)  # type: ignore[var-annotated]
-            attacks_input = discord.ui.TextInput(label="Attacks per player (1 = regular CW, 2 = CWL)", placeholder="1", max_length=1, required=False)  # type: ignore[var-annotated]
+            attacks_input = discord.ui.TextInput(label="Attacks per player (2 = regular CW, 1 = CWL)", placeholder="2", max_length=1, required=False)  # type: ignore[var-annotated]
 
             async def on_submit(self, modal_interaction: discord.Interaction) -> None:
                 if not await _safe_defer(modal_interaction, thinking=True, ephemeral=True):
@@ -1593,8 +1593,11 @@ async def admin(
                 except (ValueError, TypeError):
                     n_players = 15
 
+                # tracker #0068: regular CW is 2 attacks per member, CWL is 1 -- blank/anything
+                # but "1" defaults to the more common regular-CW case, matching this field's
+                # placeholder of "2".
                 raw_apm = str(self.attacks_input.value).strip()  # type: ignore[attr-defined]
-                apm = 2 if raw_apm == "2" else 1
+                apm = 1 if raw_apm == "1" else 2
 
                 from QBhelperfunctions import predict_war_between_clans  # type: ignore[attr-defined]
                 result_msg = await predict_war_between_clans(tag1, tag2, n_players, apm)

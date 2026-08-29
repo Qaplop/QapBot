@@ -1,6 +1,18 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (14)
+- Fixed: tracker #0068, /admin action:WAR_PREDICT modal had the CW/CWL attack-count mapping
+  backwards -- label said "1 = regular CW, 2 = CWL", but regular CW is actually 2 attacks per
+  member and CWL is 1. This wasn't just wrong text: the modal's own parsing (`apm = 2 if
+  raw_apm == "2" else 1`) and predict_war_between_clans()'s docstring/default both baked in the
+  same inverted convention, while other CWL-prediction code elsewhere in QBhelperfunctions.py
+  already correctly used apm=1 for CWL. Fixed the label, placeholder (now "2"), parsing (blank or
+  anything but "1" now defaults to 2, the common regular-CW case), and the docstring/default of
+  predict_war_between_clans().
+  Files: QBdiscordcmds.py, QBhelperfunctions.py. Tests: tests/discord/test_commands.py (4 new,
+  parametrized). 2774 tests pass.
+
 2026-08-29 (13)
 - Fixed: tracker #0069, /list account showed only 2 statuses (API-Verified/Not Verified) with the
   wrong icons -- GCHECK for verified and REDX for not-verified. Every row in this list is by
