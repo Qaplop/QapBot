@@ -1,6 +1,23 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (26)
+- Fixed/Changed: CWL Coordinators live bug reports. A follow-up test showed removing a
+  coordinator via the picker's own chip "x" then immediately clicking Save could persist the
+  PRE-removal selection -- CwlCoordinatorConfigurationView had zero re-entrancy guards on any
+  handler (Pitfall 49's class of bug: a fast second click starting while a still-in-flight first
+  one hasn't yet written its own state change lets Save's read race ahead of the removal's
+  write). Added the same guard shape as ui_registration.py's AccountManagementView. Separately,
+  further testing traced "still possible to select more than 2" to a genuine Discord UX trap, not
+  a persistence bug: clicking 'Save Configuration' while the coordinator dropdown is still open
+  only closes the dropdown (standard click-outside-to-dismiss behavior, not something bot code
+  can override) -- the click never reaches the button, so nothing saves, easily mistaken for "it
+  let me pick 3". Reworded the header and the "currently selected" status text to flag this
+  explicitly ("Not saved yet", "if a dropdown was still open, that click only closed it -- click
+  again") so a silently-absorbed click is obvious rather than assumed to have worked.
+  Files: qapbot/ui_cwl_roster.py, qapbot/translations/{en,de}.json. Tests: tests/discord/
+  test_ui_cwl_roster.py (1 new). 2817 tests pass.
+
 2026-08-29 (25)
 - Fixed: tracker #0073, the CWL season overview's "Unlinked sign-ups" line renamed to "Unlinked
   players" (project owner's preference; DE: "Nicht verknüpfte Spieler"). No data/logic change --

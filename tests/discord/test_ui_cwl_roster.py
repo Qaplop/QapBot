@@ -3714,6 +3714,60 @@ async def test_coordinator_user_select_clamps_to_two_even_if_discord_sends_more(
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_coordinator_view_guards_against_reentrant_double_click(mock_interaction):
+    """Live bug report (2026-08-29): removing a coordinator via the picker's own chip "x" then
+    immediately clicking Save could persist the PRE-removal selection — this view had zero
+    re-entrancy guards on any handler, the exact class of bug Pitfall 49
+    (COPILOT_PITFALLS_COOKBOOK.md) already documents: a fast second click can start running while
+    a still-in-flight first one hasn't yet written its own state change, so Save's read of
+    self.coordinators_by_clan races ahead of the removal's write to it. Mirrors
+    ui_registration.py's AccountManagementView._guard_reentrant()."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    CACHE.db_manager = MagicMock()
+    save_mock = AsyncMock()
+    CACHE.db_manager.save_cwl_clan_coordinators = save_mock
+    CACHE.server_config[str(mock_interaction.guild.id)] = {}
+
+    view = CwlCoordinatorConfigurationView(
+        guild=mock_interaction.guild, clan_tags=["#CLAN1"],
+        current_coordinator_ids_by_clan={"#CLAN1": ["111", "222"]},
+    )
+
+    release = asyncio.Event()
+    call_count = 0
+
+    async def blocking_edit(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        await release.wait()
+
+    mock_interaction.edit_original_response = blocking_edit
+    mock_interaction.data = {"values": ["111"]}  # simulate removing "222" via the chip's own "x"
+
+    task1 = asyncio.create_task(view._on_user_select(mock_interaction))
+    for _ in range(200):
+        if call_count:
+            break
+        await asyncio.sleep(0.01)
+    assert call_count == 1  # task1 is now blocked inside _refresh_message's own message edit
+
+    # Save lands while the removal is still mid-flight — must be dropped, not race ahead of it.
+    await view._on_save(mock_interaction)
+    save_mock.assert_not_awaited()
+
+    release.set()
+    await task1
+    assert view.coordinators_by_clan["#CLAN1"] == ["111"]
+
+    # Once the removal has actually finished, Save works normally and persists the real result.
+    await view._on_save(mock_interaction)
+    save_mock.assert_awaited_once_with(str(mock_interaction.guild.id), "#CLAN1", ["111"])
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_coordinator_user_select_callback_updates_state_for_current_clan_only(mock_interaction):
     from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
 

@@ -724,7 +724,7 @@
       "placeholder_user_select": "Select up to 2 CWL coordinators...",
       "button_clear": "❌ Clear All",
       "button_save": "✅ Save Configuration",
-      "updated_message": "**CWL Coordinators — {clan}**\n\nCurrently selected: {mentions}\n\nClick 'Save Configuration' to apply.",
+      "updated_message": "**CWL Coordinators — {clan}**\n\n⚠️ Not saved yet — currently selected: {mentions}\n\nClick 'Save Configuration' to apply. If a dropdown was still open, that click only closed it — click 'Save Configuration' again.",
       "saved_message": "✅ CWL coordinators saved for {clan}: {mentions}"
     },
     "notification_settings": {
@@ -964,7 +964,7 @@
       "button_configure_clans": "Configure Participating Clans",
       "button_manage_coordinators": "Manage CWL Coordinators",
       "coordinators_no_clans": "⚠️ No clans configured for this guild yet — add one via Clan Family Management first.",
-      "coordinators_header": "**CWL Coordinators**\n\nSelect a clan, then up to 2 Discord users to serve as its CWL Coordinators. Standing per-clan config, independent of any one season — set once, carries forward automatically every CWL month.",
+      "coordinators_header": "**CWL Coordinators**\n\nSelect a clan, then up to 2 Discord users to serve as its CWL Coordinators. Standing per-clan config, independent of any one season — set once, carries forward automatically every CWL month.\n\n💡 If a dropdown is still open, clicking 'Save Configuration' only closes it — it won't save yet. Click 'Save Configuration' again once the dropdown is closed.",
       "table_header_coordinators": "Coordinators",
       "coordinators_table_none": "—",
       "coordinators_table_no_season": "*No active CWL season — nothing to show here yet.*",
