@@ -1248,10 +1248,14 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
                 # Plain display names, not <@id> mention syntax — mentions don't resolve inside a
                 # code block (they'd render as literal, broken-looking text), same reasoning the
                 # season overview's own "Participating Clans" table already follows for names.
+                # Also never fall back to <@id> outside the code block either (2026-08-29 live
+                # bug report): an @mention in an ephemeral admin-only message still pushes a
+                # notification to the mentioned user even though only the admin can see it —
+                # nobody but the admin should ever be pinged by this config screen.
                 names = []
                 for uid in coord_ids:
                     member = self.guild.get_member(int(uid)) if self.guild else None
-                    names.append(member.display_name if member else f"<@{uid}>")
+                    names.append(member.display_name if member else uid)
                 coord_text = ", ".join(names)
             else:
                 coord_text = none_label
@@ -1274,10 +1278,20 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
         regardless, so putting the table first here is the whole of what "in front of" means."""
         return f"{self._build_active_clans_table()}\n\n{body}"
 
-    def _current_mentions_text(self) -> str:
+    def _current_names_text(self) -> str:
+        """Plain display names, never <@id> mention syntax (2026-08-29 live bug report: an
+        @mention posted into an ephemeral admin-only message still pushes a notification to the
+        mentioned user even though only the admin can see the message — this status text is
+        never the place that should actually ping anyone; that's war_notifications.py's own job,
+        which deliberately keeps real @mentions with allowed_mentions=... for exactly that
+        purpose)."""
         if not self.coordinator_ids:
             return "❌ None selected"
-        return " ".join(f"<@{uid}>" for uid in self.coordinator_ids)
+        names = []
+        for uid in self.coordinator_ids:
+            member = self.guild.get_member(int(uid)) if self.guild else None
+            names.append(member.display_name if member else uid)
+        return ", ".join(names)
 
     async def _on_clan_select(self, interaction: discord.Interaction) -> None:
         if not self._guard_reentrant():
@@ -1362,10 +1376,22 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
             from qapbot.i18n import t
             user_id = str(interaction.user.id)
             guild_id_for_t = interaction.guild.id if interaction.guild else None
+
+            # Clear the "⚠️ Not saved yet" warning from the working message itself now that this
+            # clan's selection actually matches what's persisted (2026-08-29 live bug report: the
+            # warning was staying up even after a successful Save, since _on_save previously only
+            # ever sent a separate followup confirmation and never touched the original message).
+            status = t(
+                'ui_components.cwl_coordinator_configuration.saved_state_message',
+                user_id=user_id, guild_id=guild_id_for_t,
+                clan=self._current_clan_label(), names=self._current_names_text(),
+            )
+            await interaction.edit_original_response(content=self.build_content(status), view=self)
+
             msg = t(
                 'ui_components.cwl_coordinator_configuration.saved_message',
                 user_id=user_id, guild_id=guild_id_for_t,
-                clan=self._current_clan_label(), mentions=self._current_mentions_text(),
+                clan=self._current_clan_label(), names=self._current_names_text(),
             )
             await interaction.followup.send(msg, ephemeral=True)
         finally:
@@ -1378,7 +1404,7 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
         msg = t(
             'ui_components.cwl_coordinator_configuration.updated_message',
             user_id=user_id, guild_id=guild_id_for_t,
-            clan=self._current_clan_label(), mentions=self._current_mentions_text(),
+            clan=self._current_clan_label(), names=self._current_names_text(),
         )
         await interaction.edit_original_response(content=self.build_content(msg), view=self)
 

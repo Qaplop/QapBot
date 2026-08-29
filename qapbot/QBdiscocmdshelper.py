@@ -4390,14 +4390,22 @@ async def _format_clan_management_notifications(clan_tag: str, guild: discord.Gu
     channel_status_emoji = BotEmojis.ENABLED if channel_notifications_enabled else BotEmojis.DISABLED
     channel_display = f"<#{war_notification_channel_id}>" if war_notification_channel_id else t('ui_components.war_notifications_display.channel_not_configured', guild_id=guild_id_int)
     if custodian_ids:
-        mentions_display = ", ".join(f"<@{uid}>" for uid in custodian_ids)
+        # Plain display names, never <@id> mention syntax (2026-08-29): this is a read-only status
+        # summary in an admin-only ephemeral panel, not the actual war notification — pinging
+        # custodians here on every panel view/refresh is exactly the unwanted push-notification
+        # bug this fix removes. The real ping, with allowed_mentions=..., stays in
+        # war_notifications.py where it belongs.
+        names_display = ", ".join(
+            (guild.get_member(int(uid)).display_name if guild.get_member(int(uid)) else uid)
+            for uid in custodian_ids
+        )
     else:
-        mentions_display = t('ui_components.war_notifications_display.no_custodians', guild_id=guild_id_int)
+        names_display = t('ui_components.war_notifications_display.no_custodians', guild_id=guild_id_int)
 
     channel_section_text = (
         f"{channel_status_emoji} **{t('ui_components.war_notifications_display.channel_notifications_title', guild_id=guild_id_int)}**\n"
         f"{t('ui_components.war_notifications_display.channel_notifications_channel', guild_id=guild_id_int, channel=channel_display)}\n"
-        f"{t('ui_components.war_notifications_display.channel_notifications_mentions', guild_id=guild_id_int, mentions=mentions_display)}\n\n"
+        f"{t('ui_components.war_notifications_display.channel_notifications_mentions', guild_id=guild_id_int, names=names_display)}\n\n"
     )
 
     # Get current clan members from API (via cache)

@@ -3785,10 +3785,18 @@ class CustodianConfigurationView(discord.ui.View):
         self._add_clear_button()
         self._add_apply_button()
 
-    def _current_mentions_text(self) -> str:
+    def _current_names_text(self) -> str:
+        """Plain display names, never <@id> mention syntax (2026-08-29: an @mention posted into
+        an ephemeral admin-only message still pushes a notification to the mentioned user even
+        though only the admin can see the message — this status text should never ping anyone;
+        the real notification, sent with allowed_mentions=..., is war_notifications.py's job)."""
         if not self.custodian_ids:
             return "❌ None selected"
-        return " ".join(f"<@{uid}>" for uid in self.custodian_ids)
+        names = []
+        for uid in self.custodian_ids:
+            member = self.guild.get_member(int(uid)) if self.guild else None
+            names.append(member.display_name if member else uid)
+        return ", ".join(names)
 
     async def _on_user_select(self, interaction: discord.Interaction) -> None:
         """Handle custodian selection."""
@@ -3802,7 +3810,7 @@ class CustodianConfigurationView(discord.ui.View):
         guild_id_for_t = interaction.guild.id if interaction.guild else None
         msg = t('ui_components.custodian_configuration.updated_message',
                 user_id=user_id, guild_id=guild_id_for_t,
-                mentions=self._current_mentions_text())
+                names=self._current_names_text())
 
         await interaction.edit_original_response(
             content=msg,
@@ -3821,7 +3829,7 @@ class CustodianConfigurationView(discord.ui.View):
         guild_id_for_t = interaction.guild.id if interaction.guild else None
         msg = t('ui_components.custodian_configuration.updated_message',
                 user_id=user_id, guild_id=guild_id_for_t,
-                mentions=self._current_mentions_text())
+                names=self._current_names_text())
 
         await interaction.edit_original_response(
             content=msg,
@@ -3851,7 +3859,7 @@ class CustodianConfigurationView(discord.ui.View):
         guild_id_for_t = interaction.guild.id if interaction.guild else None
         msg = t('ui_components.custodian_configuration.saved_message',
                 user_id=user_id, guild_id=guild_id_for_t,
-                mentions=self._current_mentions_text())
+                names=self._current_names_text())
         await interaction.followup.send(msg, ephemeral=True)
 
 

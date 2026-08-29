@@ -3943,9 +3943,12 @@ async def test_build_active_clans_table_lists_active_clans_with_coordinators(db)
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_build_active_clans_table_falls_back_to_mention_syntax_for_unresolvable_member(db):
+async def test_build_active_clans_table_falls_back_to_raw_id_for_unresolvable_member(db):
     """A coordinator who isn't in the live gateway member cache (e.g. left the server) still
-    shows something identifiable rather than silently vanishing from the table."""
+    shows something identifiable rather than silently vanishing from the table — but never as
+    <@id> mention syntax (2026-08-29 live bug report): an @mention in this admin-only ephemeral
+    table still pushes a notification to that user even though only the admin can see the
+    message, so the fallback must stay a plain, non-pinging id."""
     from qapbot.cache_manager import CACHE
     from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
 
@@ -3967,7 +3970,8 @@ async def test_build_active_clans_table_falls_back_to_mention_syntax_for_unresol
 
     table = view._build_active_clans_table()
 
-    assert "<@999>" in table
+    assert "999" in table
+    assert "<@999>" not in table
 
 
 @pytest.mark.discord

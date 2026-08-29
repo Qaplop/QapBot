@@ -1,6 +1,26 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (27)
+- Fixed: two live bug reports on the CWL Coordinators picker (screenshot: removing a coordinator
+  and clicking Save left the "Not saved yet" warning showing even after the save actually went
+  through; the confirmation flow never touched the working message itself, only sent a separate
+  followup). _on_save now also edits the original ephemeral message to a clean "Saved" status
+  (new saved_state_message key) once the DB write succeeds. Separately: this and the sibling
+  "War Notification Custodians" picker, plus the /clan management "Channel Notifications" summary
+  line, were all building their "currently selected" status text with <@id> Discord mention
+  syntax -- live testing confirmed an @mention posted into an ephemeral, admin-only message still
+  pushes a notification to the mentioned user even though only the admin can see the message.
+  These three are read-only config summaries, not the actual notification -- switched all of them
+  to plain display names (falling back to the raw id, never <@id>, when the user isn't a resolvable
+  guild member). The real war-attack-reminder ping in the channel (war_notifications.py) is
+  untouched -- that one is supposed to notify the custodians and keeps its @mention with
+  allowed_mentions=... exactly as before.
+  Files: qapbot/ui_cwl_roster.py, qapbot/ui_clan_management.py, qapbot/QBdiscocmdshelper.py,
+  qapbot/translations/{en,de}.json, tests/conftest.py. Tests: tests/discord/test_ui_cwl_roster.py,
+  tests/discord/test_ui_clan_management_custodians.py (updated). 2820 tests pass (one pre-existing,
+  unrelated order-dependent flake in test_cwl_clan_ownership.py, passes standalone).
+
 2026-08-29 (26)
 - Fixed/Changed: CWL Coordinators live bug reports. A follow-up test showed removing a
   coordinator via the picker's own chip "x" then immediately clicking Save could persist the

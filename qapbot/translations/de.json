@@ -546,7 +546,7 @@
       "title": "Verwaltung der Kriegsbenachrichtigungen",
       "channel_notifications_title": "Kanal-Benachrichtigungen:",
       "channel_notifications_channel": "Kanal: {channel}",
-      "channel_notifications_mentions": "Erwähnungen: {mentions}",
+      "channel_notifications_mentions": "Betreuer: {names}",
       "channel_not_configured": "Kein Kanal konfiguriert",
       "no_custodians": "Keine Betreuer festgelegt",
       "personal_dm_title": "Persönliche DM-Benachrichtigungen:",
@@ -716,16 +716,17 @@
       "placeholder_user_select": "Wähle bis zu 5 Betreuer für die @Erwähnung...",
       "button_clear": "❌ Alle löschen",
       "button_save": "✅ Konfiguration speichern",
-      "updated_message": "**Kriegsbenachrichtigungs-Betreuer**\n\nAktuell ausgewählt: {mentions}\n\nKlicke auf 'Konfiguration speichern', um die Änderung zu übernehmen.",
-      "saved_message": "✅ Betreuer gespeichert: {mentions}"
+      "updated_message": "**Kriegsbenachrichtigungs-Betreuer**\n\nAktuell ausgewählt: {names}\n\nKlicke auf 'Konfiguration speichern', um die Änderung zu übernehmen.",
+      "saved_message": "✅ Betreuer gespeichert: {names}"
     },
     "cwl_coordinator_configuration": {
       "placeholder_clan_select": "Wähle einen Clan zum Konfigurieren...",
       "placeholder_user_select": "Wähle bis zu 2 CWL-Koordinatoren...",
       "button_clear": "❌ Alle löschen",
       "button_save": "✅ Konfiguration speichern",
-      "updated_message": "**CWL-Koordinatoren — {clan}**\n\n⚠️ Noch nicht gespeichert — aktuell ausgewählt: {mentions}\n\nKlicke auf 'Konfiguration speichern', um die Änderung zu übernehmen. War noch ein Dropdown geöffnet, hat dieser Klick es nur geschlossen — klicke danach erneut auf 'Konfiguration speichern'.",
-      "saved_message": "✅ CWL-Koordinatoren für {clan} gespeichert: {mentions}"
+      "updated_message": "**CWL-Koordinatoren — {clan}**\n\n⚠️ Noch nicht gespeichert — aktuell ausgewählt: {names}\n\nKlicke auf 'Konfiguration speichern', um die Änderung zu übernehmen. War noch ein Dropdown geöffnet, hat dieser Klick es nur geschlossen — klicke danach erneut auf 'Konfiguration speichern'.",
+      "saved_state_message": "**CWL-Koordinatoren — {clan}**\n\n✅ Gespeichert — aktuell: {names}\n\nWähle einen Clan oder ändere die Koordinatoren, um zu aktualisieren.",
+      "saved_message": "✅ CWL-Koordinatoren für {clan} gespeichert: {names}"
     },
     "notification_settings": {
       "button_back_to_first": "⬅️ Zurück zur ersten Seite",

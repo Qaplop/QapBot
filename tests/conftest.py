@@ -97,6 +97,12 @@ def mock_interaction():
     interaction.guild = MagicMock()
     interaction.guild.id = 987654321
     interaction.guild.name = "TestGuild"
+    # A bare MagicMock's get_member() auto-returns a truthy MagicMock rather than None, which
+    # breaks any code doing `member.display_name if guild.get_member(uid) else uid` against a
+    # test id with no matching real member — explicit None here matches real discord.py behavior
+    # for an id nobody registered as a member on this mock guild. Tests that need a resolvable
+    # member override this per-test (e.g. `guild.get_member = MagicMock(return_value=member)`).
+    interaction.guild.get_member = MagicMock(return_value=None)
 
     interaction.response = AsyncMock()
     # discord.InteractionResponse.is_done() is SYNCHRONOUS in real discord.py — every other
