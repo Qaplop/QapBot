@@ -8,13 +8,20 @@ The cache uses a two-tier TTL approach:
 - Expired (> hard TTL): blocking API refresh
 
 Memory Usage:
-    ~8-10 KB per clan (with full 50 members)
-    For 20 clans (typical): ~200 KB
+    OUTDATED (was: "~8-10 KB per clan (with full 50 members) / For 20 clans (typical): ~200 KB")
+    Measured 2026-08-29 (tracker #0009) against real coc.Clan objects: ~69 KB for a
+    36-member clan, ~90 KB for a 50-member clan — roughly 9x the figure above. A cached
+    coc.Clan is only ~2.4 KB by itself, but coc.py's `Clan._iter_members` is an
+    un-exhausted generator expression closing over the raw API response's `memberList`,
+    so each cached clan pins its whole raw payload whether or not `.members` is ever read.
+    That is why this cache is size-capped (MAX_ENTRIES below), not TTL-only.
 """
 
 import asyncio
+import gc as _gc_mod
 import logging
 import sys
+import types as _types_mod
 from typing import Dict, Any, List, Optional, Set, TYPE_CHECKING
 from datetime import datetime, timezone
 
@@ -27,6 +34,18 @@ from qapbot.exceptions import CacheError
 from qapbot.coc_health import coc_retry
 from qapbot.constants import WAR_UPDATE_LEAGUES as _WAR_UPDATE_LEAGUES
 
+# Maximum number of coc.Clan objects held in the cache at any time (tracker #0009).
+# Before this cap the cache was TTL-only (hard_ttl_seconds), swept once per update cycle
+# by clear_expired().  During a 22h-recheck wave a single cycle polls thousands of clans,
+# so the cache grew unbounded until the cycle ended — PROD logged
+# "[COC-CACHE-CLEANUP] Removed 5007 expired entries", i.e. ~5000 entries x ~75 KB = ~375 MB
+# resident inside one cycle.  Steady-state occupancy is 300-800 entries (measured from two
+# live memory profiles), so this cap never evicts during normal operation; it only clips
+# the waves.  Eviction is FIFO on insertion order, which for a pure TTL cache means
+# "closest to expiry first" — the same policy (and rationale) as _MAX_TEMP_WAR_OBJECTS
+# in cache_manager.py.
+MAX_COC_CLAN_CACHE_ENTRIES = 1500
+
 
 class CoCClanCache:
     """
@@ -38,26 +57,38 @@ class CoCClanCache:
     - Expired (> hard TTL): blocking API refresh
     
     Memory Usage:
-        ~8-10 KB per clan (with full 50 members)
-        For 100 clans: ~1 MB
-        For 20 clans (typical): ~200 KB
-    
+        OUTDATED (was: "~8-10 KB per clan (with full 50 members) / For 100 clans: ~1 MB /
+        For 20 clans (typical): ~200 KB")
+        Measured 2026-08-29 (tracker #0009): ~69 KB per 36-member clan, ~90 KB per
+        50-member clan — see this module's docstring for why a "lazy" coc.Clan is far from
+        free, and MAX_COC_CLAN_CACHE_ENTRIES for the size cap that follows from it.
+        At the 1500-entry cap: ~100-135 MB.
+
     Example:
         cache = CoCClanCache(soft_ttl_seconds=280, hard_ttl_seconds=600)
         clan = await cache.get_clan("#2C9UR9GJY")
     """
     
-    def __init__(self, soft_ttl_seconds: int = 280, hard_ttl_seconds: int = 600):
+    def __init__(
+        self,
+        soft_ttl_seconds: int = 280,
+        hard_ttl_seconds: int = 600,
+        max_entries: int = MAX_COC_CLAN_CACHE_ENTRIES,
+    ):
         """
         Initialize the clan cache with stale-while-revalidate TTLs.
-        
+
         Args:
             soft_ttl_seconds: Soft TTL — data younger than this is considered fresh (default: 280s)
             hard_ttl_seconds: Hard TTL — data older than this requires a blocking refresh (default: 600s)
+            max_entries: Hard size cap; oldest-inserted entries are evicted past it
+                         (default: MAX_COC_CLAN_CACHE_ENTRIES — see that constant for why)
         """
         self.cache: Dict[str, Dict[str, Any]] = {}  # clan_tag -> {"data": clan_obj, "timestamp": datetime}
         self.soft_ttl_seconds = soft_ttl_seconds
         self.hard_ttl_seconds = hard_ttl_seconds
+        self.max_entries = max_entries
+        self.evicted_by_cap: int = 0  # lifetime counter, surfaced by get_stats()
         self._refreshing: set[str] = set()  # Clan tags currently being refreshed in background
         # Serializes update_player_info_in_user_accounts() per clan_tag (2026-08-21 incident fix)
         # — this method can be entered concurrently for the SAME clan from two independent call
@@ -158,11 +189,16 @@ class CoCClanCache:
             _fetch_clan,
             operation_name=f"get_clan({clan_tag})"
         )
+        # Re-insert at the end so insertion order stays "oldest fetch first" even when an
+        # existing entry is refreshed — otherwise a refreshed-in-place entry would keep its
+        # original (now wrong) position and _evict_over_cap() would drop genuinely newer data.
+        self.cache.pop(clan_tag, None)
         self.cache[clan_tag] = {
             "data": clan_obj,  # type: ignore[dict-item]
             "timestamp": now
         }
-        
+        self._evict_over_cap()
+
         # Update clan_name_cache and player info if cache_manager is available
         if self.cache_manager:
             await self._update_clan_metadata(clan_obj, now)
@@ -769,10 +805,40 @@ class CoCClanCache:
             del self.cache[clan_tag]
             logging.debug(f"[COC-CACHE-INVALIDATE] {clan_tag} evicted — next get_clan() will hit API")
     
+    def _evict_over_cap(self) -> int:
+        """Drop oldest-inserted entries until the cache is back within ``max_entries``.
+
+        FIFO on insertion order.  For a TTL-only cache that ordering is also "closest to
+        expiry first", so no recency-tracking (OrderedDict.move_to_end on every hit) is
+        needed to make it the right victim choice — the same reasoning as
+        ``_MAX_TEMP_WAR_OBJECTS`` in ``cache_manager.save_war_object()``.
+
+        A cap eviction is not a correctness event: the next ``get_clan()`` for an evicted
+        tag simply re-fetches from the API, exactly as a TTL expiry would have.
+
+        Returns:
+            Number of entries evicted (0 in normal operation — see MAX_COC_CLAN_CACHE_ENTRIES).
+        """
+        if self.max_entries <= 0 or len(self.cache) <= self.max_entries:
+            return 0
+        evicted = 0
+        while len(self.cache) > self.max_entries:
+            try:
+                self.cache.pop(next(iter(self.cache)))
+            except StopIteration:  # pragma: no cover — cache emptied concurrently
+                break
+            evicted += 1
+        self.evicted_by_cap += evicted
+        logging.info(
+            f"[COC-CACHE-CAP] Evicted {evicted} oldest entr{'y' if evicted == 1 else 'ies'} "
+            f"— cache at size cap {self.max_entries}"
+        )
+        return evicted
+
     def clear_expired(self) -> int:
         """
         Remove all expired entries from cache.
-        
+
         Returns:
             Number of entries removed
         """
@@ -800,7 +866,13 @@ class CoCClanCache:
             Dict with cache size and age information
         """
         if not self.cache:
-            return {"size": 0, "oldest_age_seconds": 0, "newest_age_seconds": 0}
+            return {
+                "size": 0,
+                "oldest_age_seconds": 0,
+                "newest_age_seconds": 0,
+                "max_entries": self.max_entries,
+                "evicted_by_cap": self.evicted_by_cap,
+            }
         
         now = datetime.now(timezone.utc)
         ages = [(now - cached["timestamp"]).total_seconds() for cached in self.cache.values()]
@@ -809,7 +881,9 @@ class CoCClanCache:
             "size": len(self.cache),
             "oldest_age_seconds": max(ages),
             "newest_age_seconds": min(ages),
-            "ttl_seconds": self.hard_ttl_seconds
+            "ttl_seconds": self.hard_ttl_seconds,
+            "max_entries": self.max_entries,
+            "evicted_by_cap": self.evicted_by_cap,
         }
     
     def get_memory_usage_mb(self) -> float:
@@ -826,37 +900,96 @@ class CoCClanCache:
         even wired up to THIS method (it read a nonexistent 'estimated_size_mb' key off
         get_stats() instead, which never set it — a second, separate bug fixed alongside this).
 
-        Deliberately generic — walks __dict__ for arbitrary objects rather than a hand-maintained
-        field list — so it doesn't silently go stale if coc.py's model classes gain attributes.
+        Deliberately generic — walks attributes for arbitrary objects rather than a
+        hand-maintained field list — so it doesn't silently go stale if coc.py's model
+        classes gain attributes.
+
+        2026-08-29 fix (tracker #0009): the 2026-08-22 version above never actually ran.
+        It recursed via ``hasattr(value, "__dict__")``, but EVERY coc.py model class
+        (Clan, ClanMember, League, Icon, Badge, ...) declares ``__slots__`` and therefore
+        has no ``__dict__`` at all — verified: ``hasattr(coc.Clan(...), "__dict__")`` is
+        False.  So the walk stopped dead at the top-level object and returned a bare
+        ``sys.getsizeof(clan)`` = 360 bytes for an entire 50-member clan, which is why the
+        memory report kept printing ~0.1 MB for this cache.
+
+        Attribute-walking (__dict__ + __slots__) was tried first and still under-reported by
+        3x, because the dominant cost here is NOT reachable by attribute access at all: most
+        of a cached clan is the raw API ``memberList`` pinned by coc.py's un-exhausted
+        ``Clan._iter_members`` generator expression, which lives in that generator's frame.
+        So the walk now recurses through ``gc.get_referents()``, which sees generators,
+        frames, iterators and closures as well as both attribute layouts. Validated against
+        tracemalloc on 300 realistic 36-member clans: 73.4 KB/entry reported vs 67.2 KB/entry
+        actually allocated (~9% over), where attribute-walking reported 22.2 KB and the
+        original ``__dict__``-only version reported ~0.36 KB.
+
+        ``seen`` is pre-seeded with the shared client / cache_manager roots so the walk
+        cannot wander out of the cache and into the live aiohttp session, throttler and the
+        whole CacheManager (which every coc.Clan references via ``_client``) — and cannot
+        charge that shared graph once per cached clan.
         """
         if not self.cache:
             return 0.0
 
+        # Scalars can't hold references — never worth a get_referents() call.
+        _LEAF_TYPES = (str, bytes, bytearray, int, float, bool, complex, type(None), datetime)
+        # Never recurse INTO these: they are shared program structure, not cache payload, and
+        # gc.get_referents() on a class or module reaches its whole __dict__ (and from there,
+        # effectively the entire process). Their own getsizeof is still counted at the point
+        # of reference; only the recursion stops.
+        # coc.Client is listed by type rather than only seeded by id below, because every
+        # coc.py model holds a `_client` back-reference: if the walk ever reaches it (e.g.
+        # this cache is measured before cache_manager/coc_client are wired up, as in unit
+        # tests) it would charge the client's whole graph — session, throttler, CacheManager —
+        # once per cached clan. Measured impact of missing this: 96.8 KB/entry reported
+        # against 67.1 KB/entry actual.
+        _NO_RECURSE_TYPES = (
+            type, _types_mod.ModuleType, _types_mod.FunctionType,
+            _types_mod.BuiltinFunctionType, _types_mod.MethodType, _types_mod.CodeType,
+            coc.Client,
+        )
+
         def _deep(value: Any, seen: set, depth: int = 0) -> int:
-            # coc.py's own model nesting is only a few levels deep (Clan -> ClanMember ->
-            # League -> Icon); this cap is a safety net against something unexpectedly
-            # self-referential, not a real limit expected to bite in practice.
-            if depth > 8:
+            # Converges by depth ~8 for coc.py's object graph (Clan -> _iter_members generator
+            # -> frame -> list_iterator -> memberList -> member dict -> league -> iconUrls);
+            # 12 leaves headroom without being a real limit. Verified: depths 8/10/12/14 all
+            # produce an identical total.
+            if depth > 12:
                 return 0
             obj_id = id(value)
             if obj_id in seen:
                 return 0  # already counted — cycle guard / shared-reference dedup
             seen.add(obj_id)
             size = sys.getsizeof(value)
+            if isinstance(value, _LEAF_TYPES):
+                return size
             if isinstance(value, dict):
                 for k, v in value.items():
                     size += _deep(k, seen, depth + 1) + _deep(v, seen, depth + 1)
             elif isinstance(value, (list, tuple, set, frozenset)):
                 for item in value:
                     size += _deep(item, seen, depth + 1)
-            elif hasattr(value, "__dict__"):
-                for v in vars(value).values():
-                    size += _deep(v, seen, depth + 1)
+            elif not isinstance(value, _NO_RECURSE_TYPES):
+                # gc.get_referents() covers __dict__, __slots__, closures, generator frames
+                # and iterators uniformly — see this method's docstring for why the last two
+                # matter more than the attributes here.
+                try:
+                    referents = _gc_mod.get_referents(value)
+                except Exception:
+                    referents = []
+                for ref in referents:
+                    size += _deep(ref, seen, depth + 1)
             return size
+
+        # Roots that every cached clan references but that are emphatically NOT part of this
+        # cache's own footprint. Seeding them as "already seen" stops the walk at the boundary.
+        _roots: set = {id(self), id(self.cache), id(self.cache_manager)}
+        _client = getattr(self.cache_manager, "coc_client", None)
+        if _client is not None:
+            _roots.add(id(_client))
 
         total_bytes = 0
         for cached in self.cache.values():
-            seen: set = set()
+            seen: set = set(_roots)
             total_bytes += _deep(cached["data"], seen) + sys.getsizeof(cached["timestamp"])
 
         return total_bytes / (1024 * 1024)

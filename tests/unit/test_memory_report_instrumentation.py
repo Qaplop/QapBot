@@ -202,3 +202,163 @@ class TestCocClanCacheMemoryUsage:
         lines = "\n".join(_build_cache_summary(cache))
         cache.coc_clan_cache.get_memory_usage_mb.assert_called_once()
         assert "42.5 MB" in lines
+
+
+class TestSharedReferenceAccounting:
+    """2026-08-29 (tracker #0009): `_estimate_dict_size_mb` reset its id()-based `seen` set
+    once per sampled entry. Anything shared BETWEEN entries — above all the dict KEYS, which
+    are the same interned string objects in every entry — was therefore counted once per
+    entry and then scaled by the full entry count. On PROD's clan_name_cache that reported
+    462 MB against a true 263 MB, a 76% over-count that made the cache look like the single
+    biggest RSS consumer when it is ~4%."""
+
+    @staticmethod
+    def _shared_key_dict(n: int) -> Dict[str, Any]:
+        # One big key string object, reused as the key of every value dict — the same
+        # aliasing that real cache entries have with their (few, fixed) field names.
+        shared_key = "K" * 4000
+        return {f"#C{i}": {shared_key: f"v{i}"} for i in range(n)}
+
+    def test_shared_content_is_not_multiplied_by_entry_count(self):
+        d = self._shared_key_dict(1_000)
+
+        # Reference implementation of the OLD behaviour (seen reset per entry), so the
+        # contrast this test protects is visible in the test itself rather than implied.
+        import sys as _sys
+
+        def _deep(value: Any, seen: set) -> int:
+            if id(value) in seen:
+                return 0
+            seen.add(id(value))
+            size = _sys.getsizeof(value)
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    size += _deep(k, seen) + _deep(v, seen)
+            return size
+
+        per_entry_seen_bytes = 0
+        for i, (k, v) in enumerate(d.items()):
+            if i >= 200:
+                break
+            seen: set = set()
+            per_entry_seen_bytes += _deep(k, seen) + _deep(v, seen)
+        old_mb = (per_entry_seen_bytes / 200) * len(d) / (1024 * 1024)
+
+        new_mb = _estimate_dict_size_mb(d)
+
+        assert old_mb > 3.0, "reference 'old' implementation should blow up on shared keys"
+        assert new_mb < old_mb / 10, (
+            f"shared key string is still being charged per entry: {new_mb:.2f} MB vs "
+            f"{old_mb:.2f} MB under the old per-entry `seen` reset"
+        )
+
+    def test_unique_per_entry_content_still_scales(self):
+        """The shared-reference fix must not flatten genuinely distinct per-entry data."""
+        def _unique(n: int) -> Dict[str, Any]:
+            return {f"#C{i}": {"blob": f"{i}" + "x" * 2000} for i in range(n)}
+
+        small = _estimate_dict_size_mb(_unique(300))
+        large = _estimate_dict_size_mb(_unique(3_000))
+        assert large > small * 5
+
+
+class TestSlotsAndGeneratorWalking:
+    """2026-08-29 (tracker #0009): `get_memory_usage_mb()` recursed via
+    `hasattr(value, "__dict__")`. Every coc.py model class declares `__slots__` and so has NO
+    `__dict__` — the walk stopped at the top-level object and returned a bare
+    `sys.getsizeof(clan)` (360 bytes for a full 50-member clan), which is why the report
+    printed ~0.1 MB for a cache actually holding ~69-90 KB per entry.
+
+    The pre-existing tests above did not catch it because their fixtures were ordinary
+    `__dict__` classes. These use `__slots__` (and a generator-pinned payload) deliberately."""
+
+    @staticmethod
+    def _populated_cache(data: Any) -> Any:
+        from datetime import datetime, timezone
+        from qapbot.coc_cache import CoCClanCache
+
+        cache = CoCClanCache()
+        cache.cache["#C1"] = {"data": data, "timestamp": datetime.now(timezone.utc)}
+        return cache
+
+    def test_slots_only_object_is_walked(self):
+        import sys as _sys
+
+        class _SlotMember:
+            __slots__ = ("tag", "blob")
+
+            def __init__(self, i: int):
+                self.tag = f"#P{i}"
+                # Built per-instance rather than as a `"x" * 1000` literal: CPython folds
+                # that at compile time into ONE shared constant, so every member would
+                # alias it and the id()-based `seen` set would (correctly) count ~1 KB
+                # total instead of ~50 KB — the fixture, not the walk, would be wrong.
+                self.blob = "x" * 1000 + str(i)
+
+        class _SlotClan:
+            __slots__ = ("tag", "members")
+
+            def __init__(self):
+                self.tag = "#C1"
+                self.members = [_SlotMember(i) for i in range(50)]
+
+        clan = _SlotClan()
+        assert not hasattr(clan, "__dict__"), "fixture must reproduce the __slots__ layout"
+
+        reported = self._populated_cache(clan).get_memory_usage_mb() * 1024 * 1024
+        shallow = _sys.getsizeof(clan)
+        assert reported > 40_000, (
+            f"__slots__ payload not walked: reported {reported:.0f} B for ~50 KB of members"
+        )
+        assert reported > shallow * 100
+
+    def test_generator_pinned_payload_is_counted(self):
+        """coc.py keeps the raw API `memberList` alive through an un-exhausted
+        `_iter_members` generator expression — not through any attribute — which is why
+        attribute-walking alone still under-reported this cache by ~3x."""
+        # Distinct blob per entry — see the note in the __slots__ test above.
+        payload = [{"tag": f"#P{i}", "blob": "y" * 1000 + str(i)} for i in range(50)]
+
+        class _LazyClan:
+            __slots__ = ("tag", "_iter_members")
+
+            def __init__(self, members: Any):
+                self.tag = "#C1"
+                self._iter_members = (m for m in members)
+
+        clan = _LazyClan(payload)
+        del payload  # only the un-exhausted generator keeps it alive now
+
+        reported = self._populated_cache(clan).get_memory_usage_mb() * 1024 * 1024
+        assert reported > 40_000, (
+            f"generator-pinned payload not counted: reported {reported:.0f} B"
+        )
+
+    def test_does_not_wander_into_the_coc_client(self):
+        """Every coc.py model holds a `_client` back-reference. Recursing through it would
+        charge the client's whole graph (aiohttp session, throttler, CacheManager) once per
+        cached clan — measured as a 44% over-report before coc.Client was excluded."""
+        import asyncio as _asyncio
+
+        import coc as _coc
+
+        try:
+            _asyncio.get_event_loop()
+        except RuntimeError:
+            _asyncio.set_event_loop(_asyncio.new_event_loop())
+        client = _coc.Client()
+        # coc.Client is itself __slots__-based, so hang the marker off one of its own
+        # container slots instead of setting a new attribute (~1 MB reachable from client).
+        client._clans.update({f"#M{i}": "z" * 5000 + str(i) for i in range(200)})
+
+        class _ClanWithClient:
+            __slots__ = ("tag", "_client")
+
+            def __init__(self):
+                self.tag = "#C1"
+                self._client = client
+
+        reported = self._populated_cache(_ClanWithClient()).get_memory_usage_mb() * 1024 * 1024
+        assert reported < 100_000, (
+            f"walk followed _client into the shared client graph: reported {reported:.0f} B"
+        )

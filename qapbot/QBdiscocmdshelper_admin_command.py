@@ -1358,8 +1358,24 @@ def _estimate_dict_size_mb(d: Any, sample: int = 200) -> float:
     payload (payload -> clan -> members[] -> attacks[]). Verified against a realistic war
     payload: the depth-capped version undercounted by ~5x versus a pickle-size lower bound.
     Replaced with a full recursive walk, guarded against cycles/shared references by an
-    id()-based `seen` set (reset per sampled entry, so the estimate stays a true per-entry
-    average rather than crediting a shared substructure to only the first entry that touches it).
+    id()-based `seen` set.
+
+    2026-08-29 fix (tracker #0009): that `seen` set was reset per sampled entry, on the
+    reasoning that a per-entry reset keeps the result "a true per-entry average". It does the
+    opposite for anything genuinely shared BETWEEN entries — above all the dict KEYS, which are
+    the same interned string objects in every entry. clan_name_cache's 8 keys were therefore
+    counted once per clan and scaled by 447k clans: the report said 462 MB against a true cost
+    of 263 MB (617 B/entry, measured with tracemalloc across the whole build including the
+    strings the cache retains), a 76% over-count. The set is now shared across the whole
+    sample, so each distinct object is counted exactly once — that reports 249 MB, 5% under
+    truth. A globally-shared object is then over-scaled by total/sample instead (2237x for
+    447k entries at sample=200), but on ~480 B of shared keys that is ~1 MB, two orders of
+    magnitude below the error it replaces.
+
+    Measurement caveat worth recording, because it caught this investigation out once: an
+    RSS-delta measurement taken AFTER the source DB rows are already in memory charges the
+    retained strings to those rows, not to the cache, and reports only 126 MB here. Both
+    numbers are "real"; the 263 MB one is the one that answers "how much of RSS is this cache".
 
     Samples rather than walking everything: these dicts run to hundreds of thousands of entries
     and this is called from an interactive admin command — good enough to rank caches against
@@ -1388,8 +1404,9 @@ def _estimate_dict_size_mb(d: Any, sample: int = 200) -> float:
 
         sampled = 0
         sampled_bytes = 0
+        # One `seen` for the whole sample — see the 2026-08-29 note in the docstring.
+        seen: set = set()
         for key, value in d.items():
-            seen: set = set()
             sampled_bytes += _deep(key, seen) + _deep(value, seen)
             sampled += 1
             if sampled >= sample:
@@ -1563,6 +1580,26 @@ def save_memtrace_snapshot(cache: Any) -> str:
     lines.extend(cache_summary)
 
     lines.append("\n[GC OBJECT COUNTS — top 15 by type]")
+    # Frozen-generation caveat (2026-08-29, tracker #0009). gc.get_objects() walks generations
+    # 0-2 only; gc.freeze() moves objects into a separate PERMANENT generation that it does not
+    # return at all — verified: 1000 objects, 0 visible after gc.freeze(). Startup and every
+    # nightly maintenance run call gc.freeze() (see Pitfall 21 — it is what keeps automatic
+    # gen-2 sweeps from stalling the event loop for seconds), and PROD logs
+    # "re-froze 1908052 object(s) into the permanent generation". So for most of each day these
+    # counts silently omit ~1.9M objects, which is exactly the kind of blind spot that makes a
+    # profile look like it disproves a hypothesis when it merely cannot see it. Report the
+    # frozen count alongside rather than unfreezing to enumerate them: unfreezing would undo
+    # the GC-pause optimisation this bot deliberately relies on.
+    try:
+        import gc as _gc_mod
+        _frozen = _gc_mod.get_freeze_count()
+    except Exception:
+        _frozen = -1
+    if _frozen >= 0:
+        lines.append(
+            f"  NOTE: {_frozen:,} additional object(s) sit in the frozen permanent generation "
+            f"and are NOT included below — gc.get_objects() cannot see them."
+        )
     for tname, cnt in top_types:
         lines.append(f"  {tname:<40} {cnt:>10,}")
 

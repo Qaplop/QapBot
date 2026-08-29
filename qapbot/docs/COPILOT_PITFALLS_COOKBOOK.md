@@ -1923,3 +1923,65 @@ code with no behavioral benefit (or worse, a second repost racing the startup on
 init sequence). Only build a real repair mechanism when the *periodic* maintenance path is the
 only thing that would ever touch that guild's message again (e.g. a guild that never gets a
 fresh bot restart for a long time in a deployment model where that's actually possible).
+
+---
+
+## Pitfall 44: a deep-size estimator that recurses via `__dict__` silently measures nothing on a `__slots__` class — and even attribute-walking misses what a lazy library object pins
+
+**Symptom:** the `/admin` Memory Profile report kept printing `coc_clan_cache : 322 entries,
+~0.1 MB` for a cache whose real cost is ~69-90 KB *per entry*. Two separate rounds of
+investigation into tracker #0009's 6 GB RSS therefore treated that cache as irrelevant and
+went looking elsewhere.
+
+**Root cause (two layers, found 2026-08-29):**
+
+1. `get_memory_usage_mb()` recursed with `elif hasattr(value, "__dict__"): for v in
+   vars(value).values(): ...`. Every coc.py model class (`Clan`, `ClanMember`, `League`,
+   `Icon`, `Badge`, ...) declares `__slots__`, and a `__slots__`-only class has **no**
+   `__dict__` at all — `hasattr(coc.Clan(...), "__dict__")` is `False`. So the walk stopped
+   dead at the top-level object and returned a bare `sys.getsizeof(clan)` = 360 bytes for a
+   50-member clan. The 2026-08-22 commit that "deepened it to walk each member's
+   League/Icon/Badge sub-objects" never executed a single one of those recursions.
+2. Switching to a `__dict__` + `__slots__`-across-the-MRO walk fixed layer 1 and *still*
+   under-reported by 3x (22 KB/entry vs 67 KB actual). The dominant cost is not an attribute:
+   coc.py builds `self._iter_members = (cls(data=m, ...) for m in data["members"])`, an
+   **un-exhausted generator expression** whose frame holds the raw API `memberList`. That
+   payload is reachable only through the generator, never by attribute access — so a lazily
+   constructed "cheap" `coc.Clan` actually pins its whole ~120 KB API response, and does so
+   whether or not `.members` is ever read.
+
+**Why the existing tests didn't catch it:** the fixtures were ordinary classes with
+`__dict__`, and their payload strings were written as `"x" * 1000` literals — which CPython
+constant-folds into ONE shared object that the walk's `id()`-based `seen` set then correctly
+counts once. Both choices made a broken walk look like a working one.
+
+**Fix:** recurse through `gc.get_referents(value)`, which covers `__dict__`, `__slots__`,
+closures, generator frames and iterators uniformly. Guard it with (a) a no-recurse type list
+(`type`, module, function, method, code) so it can't reach a class `__dict__` and from there
+the whole process, and (b) a `seen` set pre-seeded with shared roots — here the `coc.Client`
+that every model back-references, which otherwise gets charged once per cached clan (measured:
+44% over-report). Validated against `tracemalloc`: 73.4 KB/entry reported vs 67.2 KB actual.
+
+**How to apply:**
+- Never write a memory walker that recurses on `__dict__` alone. `gc.get_referents()` is the
+  only traversal that sees every layout; if you must hand-roll, walk `__slots__` across
+  `type(obj).__mro__` too (and remember `__slots__` may be a bare string).
+- Always validate a size estimator against `tracemalloc` or an RSS delta on realistic data,
+  and check the *per-entry* figure against something you can sanity-check by hand. A walker
+  that returns a plausible-looking non-zero total can still be off by 250x.
+- In estimator test fixtures, build payload strings per instance (`"x" * 1000 + str(i)`) so
+  constant folding doesn't quietly alias them into a single object.
+- When a library advertises lazy parsing, verify what the "lazy" object retains before
+  treating it as cheap. `sys.getsizeof(coc.Clan(...))` is 360 bytes; the object costs ~90 KB.
+
+**Related:** the sibling bug in `_estimate_dict_size_mb()` (same report) was the mirror image —
+its `seen` set was reset *per sampled entry*, so shared dict KEYS were charged to every entry
+and `clan_name_cache` was over-reported 462 MB against a true 263 MB. One `seen` per walk
+under-counts shared structure; one `seen` per entry over-counts it. For a "how much of RSS is
+this cache" question, share the set across the whole sample.
+
+**Measurement caveat that caught this investigation out once:** an RSS-delta measurement taken
+*after* the source rows are already in memory charges retained strings to those rows, not to
+the structure under test — it reported 126 MB for `clan_name_cache` where a `tracemalloc`
+window spanning the whole build (query included) reports 263 MB. Both numbers are real; only
+the second answers "how much of RSS is this".

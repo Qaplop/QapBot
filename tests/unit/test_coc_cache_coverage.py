@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from qapbot.coc_cache import CoCClanCache
+from qapbot.coc_cache import MAX_COC_CLAN_CACHE_ENTRIES, CoCClanCache
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +91,15 @@ class TestGetStats:
     def test_empty_cache(self):
         c = CoCClanCache()
         stats = c.get_stats()
-        assert stats == {"size": 0, "oldest_age_seconds": 0, "newest_age_seconds": 0}
+        # Field-wise rather than whole-dict equality: get_stats() gained max_entries /
+        # evicted_by_cap with the 2026-08-29 size cap (tracker #0009), and an exact-dict
+        # assertion here fails on every future additive change without indicating a real
+        # regression.
+        assert stats["size"] == 0
+        assert stats["oldest_age_seconds"] == 0
+        assert stats["newest_age_seconds"] == 0
+        assert stats["max_entries"] == MAX_COC_CLAN_CACHE_ENTRIES
+        assert stats["evicted_by_cap"] == 0
 
     def test_single_entry(self):
         c = CoCClanCache(hard_ttl_seconds=600)
@@ -868,3 +876,75 @@ class TestUpdateClanMetadataLeagueGate:
         await c._update_clan_metadata(clan, datetime.now(timezone.utc))
         assert cm.clan_name_cache["#D"]["is_deleted"] is False
         cm.persist_clan.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Size cap (tracker #0009, 2026-08-29)
+# ---------------------------------------------------------------------------
+
+class TestSizeCap:
+    """The cache used to be TTL-only, swept once per update cycle. During a 22h-recheck wave
+    a single cycle polls thousands of clans, so it grew unbounded until the cycle ended —
+    PROD logged 'Removed 5007 expired entries', i.e. ~375 MB resident inside one cycle at the
+    ~75 KB/entry a cached coc.Clan actually costs."""
+
+    @staticmethod
+    def _entry(tag: str) -> Dict[str, Any]:
+        return {"data": tag, "timestamp": datetime.now(timezone.utc)}
+
+    def test_cap_bounds_the_cache_size(self):
+        c = CoCClanCache(max_entries=10)
+        for i in range(50):
+            c.cache[f"#T{i}"] = self._entry(f"#T{i}")
+            c._evict_over_cap()
+        assert len(c.cache) == 10
+        assert c.evicted_by_cap == 40
+
+    def test_eviction_is_fifo_so_the_newest_survive(self):
+        """Insertion order in a TTL cache is also 'closest to expiry first', which is why no
+        recency tracking is needed to pick the right victim."""
+        c = CoCClanCache(max_entries=5)
+        for i in range(12):
+            c.cache[f"#T{i}"] = self._entry(f"#T{i}")
+            c._evict_over_cap()
+        assert list(c.cache) == [f"#T{i}" for i in range(7, 12)]
+
+    def test_under_cap_evicts_nothing(self):
+        c = CoCClanCache(max_entries=100)
+        for i in range(20):
+            c.cache[f"#T{i}"] = self._entry(f"#T{i}")
+        assert c._evict_over_cap() == 0
+        assert len(c.cache) == 20
+        assert c.evicted_by_cap == 0
+
+    def test_non_positive_cap_disables_the_bound(self):
+        c = CoCClanCache(max_entries=0)
+        for i in range(50):
+            c.cache[f"#T{i}"] = self._entry(f"#T{i}")
+        assert c._evict_over_cap() == 0
+        assert len(c.cache) == 50
+
+    def test_default_cap_is_the_module_constant(self):
+        assert CoCClanCache().max_entries == MAX_COC_CLAN_CACHE_ENTRIES
+        # Steady-state occupancy measured on PROD was 322 and 784 entries in two live memory
+        # profiles, so the default must stay comfortably above that or normal operation
+        # starts paying for API re-fetches it never used to need.
+        assert MAX_COC_CLAN_CACHE_ENTRIES >= 1000
+
+    @pytest.mark.asyncio
+    async def test_refresh_moves_an_existing_entry_to_the_back(self):
+        """A refreshed-in-place entry must be re-inserted, not updated at its old position —
+        otherwise FIFO eviction would drop genuinely newer data while keeping a just-refreshed
+        (but early-inserted) one."""
+        c = CoCClanCache(max_entries=10)
+        c.cache_manager = MagicMock()
+        c.cache_manager.coc_client.get_clan = AsyncMock(side_effect=lambda tag: f"clan:{tag}")
+        c._update_clan_metadata = AsyncMock()
+
+        for tag in ("#A", "#B", "#C"):
+            await c._fetch_and_cache(tag)
+        assert list(c.cache) == ["#A", "#B", "#C"]
+
+        await c._fetch_and_cache("#A")
+        assert list(c.cache) == ["#B", "#C", "#A"]
+        assert len(c.cache) == 3, "refresh must not duplicate the entry"

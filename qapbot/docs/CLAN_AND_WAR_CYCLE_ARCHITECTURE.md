@@ -39,6 +39,7 @@ the base schema was updated to include these columns from the start).
 ### 1. CoCClanCache (qapbot/coc_cache.py)
 - In-memory cache with stale-while-revalidate strategy
 - Soft TTL: 280s (4m40s), Hard TTL: 600s (10m)
+- Size cap: `MAX_COC_CLAN_CACHE_ENTRIES` = 1500 entries, FIFO eviction on insert
 - Stores: `{clan_tag: {"data": clan_obj, "timestamp": datetime}}`
 
 **Key Methods**:
@@ -46,6 +47,15 @@ the base schema was updated to include these columns from the start).
 - `_fetch_and_cache(clan_tag)`: Fetches from API and updates cache + clan_name_cache
 - `_update_clan_metadata()`: Updates clan_name_cache, war_league, warlog status
 - `clear_expired()`: Removes stale entries
+- `_evict_over_cap()`: Drops oldest-inserted entries past `max_entries`
+
+**Memory cost per entry (measured 2026-08-29, tracker #0009)**: ~69 KB for a 36-member clan,
+~90 KB for a 50-member clan — NOT the "~8-10 KB" the class docstring claimed for years. A
+`coc.Clan` object is only ~2.4 KB by itself, but coc.py's `Clan._iter_members` is an
+un-exhausted generator expression closing over the raw API response's `memberList`, so every
+cached clan pins its entire raw payload whether or not `.members` is ever read. That is why
+the cache is size-capped and not TTL-only: before the cap, a single 22h-recheck wave grew it
+to 5007 entries inside one cycle (~375 MB) before `clear_expired()` ran at cycle end.
 
 ### 2. CACHE.get_current_war_from_api(clan_tag)
 **Location**: [qapbot/cache_manager.py](../cache_manager.py#L2832)
@@ -59,14 +69,47 @@ at L543; parallel fetch loop/semaphore at L850-L949)
 
 ### Step 1: Categorize Clans to Update
 - Active clans (has_active_subscriptions=True): update every cycle
-- Inactive clans: update if >22h since last_war_update
+- Inactive clans: update if >22h since last_war_update, PLUS a stable per-clan 0-2h offset
+  (`compute_recheck_offset_seconds()`, see below)
 - Passive clans (track_war_updates=False): skip entirely
 - CWL group expansion: add group-mate clans if main clan is active
+- Per-cycle cap: `_MAX_INACTIVE_PER_CYCLE` = 1500 generic inactive clans (war-critical clans
+  in preparation/in_war are exempt); the remainder is deferred and reported as
+  `throttle_backlog` in CYCLE-SUMMARY
+
+#### Re-check waves and why the schedule is jittered (2026-08-29, tracker #0009)
+
+A flat 22h threshold is self-clumping: every clan polled in one cycle comes due again in one
+cycle 22h later, forever. On PROD this produced 3000-4200-clan bursts recurring at exactly 22h
+and drifting 2h earlier each day as 22h aliased against the 24h day (08-25 07:11 -> 08-26 05:19
+-> 08-27 03:21). Each burst cost +541 to +700 MB of RSS in a SINGLE cycle, because every clan
+polled in a cycle is held in memory simultaneously (its `coc.ClanWar` in `fetch_results` until
+Phase 3 consumes it, its `coc.Clan` in `coc_clan_cache`), and quiet cycles only gave back
+10-40 MB — so each wave ratcheted the floor up until the process sat at ~6 GB.
+
+`compute_recheck_offset_seconds(clan_tag)` (QapBot.py, module level) adds a stable
+`crc32(tag) % 7200` seconds on top of the 22h interval. Stability is the whole point: a fresh
+random draw per cycle would jitter each due-time around the same clump centre without ever
+dispersing it, whereas a fixed per-clan phase spreads a clumped population over the window once
+and keeps it spread. The offset is always >= 0, so no clan is polled more often than before.
+
+Clans whose `temp_war_metadata.state` is `preparation`/`in_war` are EXEMPT from the jitter,
+for the same reason they are exempt from `_MAX_INACTIVE_PER_CYCLE`: their `last_war_update` is
+deliberately backdated so the next poll lands 30min after war start / 8min BEFORE war end, and
+up to 2h of added delay would push that poll past the moment it exists to capture.
 
 ### Step 2: Parallel API Fetches
 - Concurrency: 20 concurrent requests (bounded by asyncio.Semaphore)
 - For each clan: call `fetch_clan_war_data(clan_tag)`
 - Record cycle stats: api_fetched, api_no_war, api_fail:*
+
+**Memory note**: the semaphore bounds concurrent HTTP, NOT concurrent retained results.
+`asyncio.gather()` holds every result until the last fetch returns, and each result carries a
+`coc.ClanWar` pinning ~120-170 KB of raw API payload (same `_iter_members` mechanism as above).
+Phase 3's loop therefore clears each `fetch_results` slot as it consumes it, rather than
+waiting for the bulk `del fetch_results` after Phase 3B/notifications/leaderboards. Bounding
+`_MAX_INACTIVE_PER_CYCLE` is what bounds the peak itself — the results must all exist before
+Phase 2 can build its `failed_clans` set, so the peak is structurally equal to the clan count.
 
 ### Step 3: fetch_clan_war_data()
 **Location**: [QBhelperfunctions.py](../../QBhelperfunctions.py#L6230-L6597)

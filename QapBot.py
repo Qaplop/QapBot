@@ -171,6 +171,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, List, Optional, Tuple
 import signal  # added for graceful shutdown
 import time
+import zlib as _zlib_mod  # crc32 → stable per-clan re-check phase offset (tracker #0009)
 import QBcore
 from qapbot.config import CONFIG
 from qapbot.cache_manager import CACHE
@@ -195,6 +196,45 @@ from QBhelperfunctions import (
 # Phase 3 can update last_war_update for the no-war case (removing the clan from
 # the overdue backlog for 22h) while leaving genuine failures for retry next cycle.
 _NOT_IN_WAR: dict[str, Any] = {"__not_in_war__": True}
+
+# Width of the window over which warless clans' 22h re-checks are spread (tracker #0009).
+# See compute_recheck_offset_seconds() for why this exists.
+RECHECK_JITTER_SECONDS = 7200  # 2h
+
+
+def compute_recheck_offset_seconds(
+    clan_tag: str, jitter_seconds: int = RECHECK_JITTER_SECONDS
+) -> int:
+    """Stable per-clan phase offset added to the flat INACTIVE_CLAN_UPDATE_INTERVAL_HOURS check.
+
+    A flat 22h threshold makes the polling schedule self-clumping: every clan polled in the
+    same cycle becomes due again in the same cycle 22h later, forever. Confirmed on PROD
+    (tracker #0009) — 3000-4200-clan bursts recurred at exactly 22h and drifted 2h earlier
+    each day as 22h aliased against the 24h day (08-25 07:11 -> 08-26 05:19 -> 08-27 03:21,
+    and 08-25 11:48 -> 08-26 09:48 -> 08-27 07:48). Those waves drove +541 to +700 MB
+    single-cycle RSS jumps, because every clan polled in a cycle is held simultaneously
+    (its coc.ClanWar in fetch_results, its coc.Clan in coc_clan_cache).
+
+    The offset MUST be stable per clan rather than a fresh random draw per cycle: a fresh
+    draw would only jitter each due-time back and forth around the same clump centre, never
+    dispersing it. crc32 of the tag is deterministic and uniformly distributed, survives
+    restarts with nothing to persist, and — because each clan keeps its own phase on every
+    subsequent poll — a clumped population spreads over the window once and then stays spread.
+
+    Only ever DELAYS a poll (offset >= 0), so no clan is polled more often than before.
+
+    Args:
+        clan_tag: Clan tag, e.g. "#2C9UR9GJY". Used only as a hash input.
+        jitter_seconds: Width of the spread window. <= 0 disables jitter entirely
+                        (offset 0), restoring the flat threshold.
+
+    Returns:
+        Seconds in [0, jitter_seconds) to add on top of the 22h interval for this clan.
+    """
+    if jitter_seconds <= 0:
+        return 0
+    return _zlib_mod.crc32(clan_tag.encode("utf-8")) % jitter_seconds
+
 
 # --- Constants (already defined above with logging setup) ---
 # DATA_DIR, TEMP_DIR, LOGS_DIR, LOG_LEVEL already configured
@@ -864,6 +904,13 @@ async def main() -> None:
     cutoff_dt = now - timedelta(hours=INACTIVE_CLAN_UPDATE_INTERVAL_HOURS)
     _dt_cache: dict[str, tuple[str, datetime]] = CACHE.clan_dt_cache
 
+    # Per-clan re-check phase offset (2026-08-29, tracker #0009) — spreads the warless 22h
+    # re-checks over a 2h window so they stop re-forming into one huge per-cycle wave.
+    # Full rationale in compute_recheck_offset_seconds() at module level.
+    def _recheck_cutoff_for(clan_tag: str) -> datetime:
+        """Per-clan due-time cutoff: the flat 22h cutoff pushed back by a stable 0-2h offset."""
+        return cutoff_dt - timedelta(seconds=compute_recheck_offset_seconds(clan_tag))
+
     # Categorize clans based on subscription status and last update time.
     #
     # PERFORMANCE/BLOCKING NOTE: CACHE.clan_name_cache holds ~380K entries in
@@ -972,12 +1019,25 @@ async def main() -> None:
                     last_update_dt = last_update_dt.replace(tzinfo=timezone.utc)
                 _dt_cache[clan_tag] = (last_update, last_update_dt)
 
-            if last_update_dt <= cutoff_dt:
+            # Check if clan has ongoing war using IN-MEMORY metadata (no disk I/O).
+            # Hoisted above the due-check (2026-08-29) because the jitter below needs it too;
+            # the else-branch consumer further down reuses this same lookup.
+            meta = CACHE.temp_war_metadata.get(clan_tag)
+            # War-critical clans (preparation/in_war) are EXEMPT from the re-check jitter, for
+            # exactly the reason they are exempt from _MAX_INACTIVE_PER_CYCLE further below:
+            # the else-branch smart-backdating sets their last_war_update to land the next poll
+            # at a precise moment (30min after war start / 8min BEFORE war end). Adding up to 2h
+            # of jitter on top would push that poll past the moment it exists to capture — the
+            # in_war snapshot would miss late attacks and the preparation temp file would never
+            # be overwritten. Only warless clans, whose 22h re-check has no such deadline, are
+            # spread out.
+            _is_war_critical = bool(meta) and meta.get('state', '') in ('preparation', 'in_war', 'inwar')
+            _due_cutoff = cutoff_dt if _is_war_critical else _recheck_cutoff_for(clan_tag)
+
+            if last_update_dt <= _due_cutoff:
                 clans_to_update.append((clan_tag, False))
             else:
                 hours_since_update = (now - last_update_dt).total_seconds() / SECONDS_PER_HOUR
-                # Check if clan has ongoing war using IN-MEMORY metadata (no disk I/O)
-                meta = CACHE.temp_war_metadata.get(clan_tag)
                 if meta:
                     war_state = meta.get('state', '')
 
@@ -1058,7 +1118,19 @@ async def main() -> None:
     # time, but a staleness-only cap would defer them behind the huge warless
     # backlog (starvation), defeating the schedule.  Active-war clans are extremely
     # rare in the inactive pool (~2 per 5000), so exempting them is near-zero cost.
-    _MAX_INACTIVE_PER_CYCLE = 5000
+    #
+    # 2026-08-29 (tracker #0009): lowered 5000 -> 1500 as a memory bound, not a runtime one.
+    # Every clan polled in a cycle is held simultaneously — its coc.ClanWar sits in
+    # fetch_results until Phase 3 consumes it (each pinning ~120-170 KB of raw API payload via
+    # coc.py's un-exhausted _iter_members generator), and its coc.Clan sits in coc_clan_cache
+    # (~69-90 KB each, measured). A 3800-4200-clan wave cost +541 to +700 MB of RSS in a SINGLE
+    # cycle on PROD, and quiet cycles only give back 10-40 MB, so each wave ratcheted the floor
+    # up until the process sat at ~6 GB. Distribution over 963 cycles: median 669, p75 857,
+    # p90 1317, p95 1929, mean 817 — so 1500 clips only the top ~8% of cycles and leaves ~2x
+    # headroom over the mean for the deferred backlog to drain (a 4200-clan wave spills ~2700,
+    # which clears in 3-4 following cycles = ~20 min against a 22h SLA). War-critical clans stay
+    # exempt from the cap below, so nothing latency-sensitive is deferred by this.
+    _MAX_INACTIVE_PER_CYCLE = 1500
     _overdue_total = len(inactive_clans)  # snapshot before capping, for CYCLE-SUMMARY
     if len(inactive_clans) > _MAX_INACTIVE_PER_CYCLE:
         # Partition into war-critical (exempt) and generic (cappable) clans.
@@ -1436,6 +1508,17 @@ async def main() -> None:
         # yielding every 10 iterations caps blocking at ~100-500ms.
         if _idx % 10 == 0:
             await asyncio.sleep(0)
+
+        # ── Memory hygiene: drop the list's reference to this result as soon as it is in
+        # hand (2026-08-29, tracker #0009). Each result holds a coc.ClanWar whose
+        # un-exhausted _iter_members generator pins the whole raw API payload (~120-170 KB
+        # measured), and fetch_results is only deleted much further down — after Phase 3B,
+        # notifications, leaderboards and role sync. Clearing the slot here means at most ONE
+        # war payload (the `result` local, rebound next iteration) outlives its own iteration,
+        # instead of the entire cycle's worth staying resident to the end of the cycle.
+        # Assignment (not resize) during enumerate() is safe. Placed before the type guards so
+        # every `continue` path below is covered by this single line.
+        fetch_results[_idx] = None  # type: ignore[call-overload]
 
         # Handle exceptions from asyncio.gather
         if isinstance(result, Exception):

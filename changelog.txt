@@ -1,6 +1,45 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (1)
+- Fixed: tracker #0009, memory consumption -- PROD sat at a ~6.1 GB plateau (peaks 7.1 GB) that
+  was NOT a leak: daily averages after the first day were flat (6142/6082/6254 MB). Measured
+  against the real PROD data on DEV, live cache content is only ~1.9 GB (temp_war_objects
+  1195 MB, temp_war_stats 449 MB, clan_name_cache 263 MB); the rest was burst-driven.
+  Root cause: INACTIVE_CLAN_UPDATE_INTERVAL_HOURS=22 is self-clumping, so clans polled together
+  came due together forever -- 3000-4200-clan waves recurring at exactly 22h, drifting 2h
+  earlier daily. Every clan polled in a cycle is held simultaneously (its coc.ClanWar in
+  fetch_results pinning ~120-170 KB of raw API payload, its coc.Clan in coc_clan_cache at
+  ~69-90 KB), so a wave cost +541 to +700 MB of RSS in ONE cycle while quiet cycles gave back
+  only 10-40 MB -- each wave ratcheted the floor up.
+  Four changes: (1) new compute_recheck_offset_seconds() adds a stable crc32-derived 0-2h phase
+  offset per clan so waves disperse and stay dispersed (war-critical prep/in_war clans exempt --
+  their backdated poll must land 8min before war end); (2) _MAX_INACTIVE_PER_CYCLE 5000 -> 1500
+  (clips only the top ~8% of cycles; mean demand is 817/cycle); (3) coc_clan_cache gained a
+  1500-entry FIFO size cap -- it was TTL-only and hit 5007 entries (~375 MB) inside one cycle;
+  (4) Phase 3 now clears each fetch_results slot as it consumes it instead of holding the whole
+  cycle's wars until after leaderboards/notifications.
+  Files: QapBot.py, qapbot/coc_cache.py. 2729 tests pass.
+- Fixed: tracker #0009, three bugs in the Memory Profile report itself that made the previous
+  two investigations chase the wrong caches. (a) _estimate_dict_size_mb() reset its id()-based
+  `seen` per sampled entry, charging shared dict KEYS to every entry -- clan_name_cache reported
+  462 MB against a true 263 MB; now one `seen` per sample (reports 249 MB). (b)
+  get_memory_usage_mb() recursed via hasattr(value, "__dict__"), but every coc.py model class is
+  __slots__-based and has NO __dict__, so the walk returned a bare 360 bytes for a whole
+  50-member clan (report showed ~0.1 MB for the entire cache); now walks gc.get_referents(),
+  which also catches the raw API payload pinned by coc.py's un-exhausted _iter_members generator
+  -- validated against tracemalloc at 73.4 KB/entry vs 67.2 KB actual. Note the earlier
+  2026-08-22 "deepened it to walk League/Icon/Badge" fix never executed a single recursion.
+  (c) [GC OBJECT COUNTS] is blind to the frozen permanent generation (gc.freeze() removes
+  objects from gc.get_objects() entirely) -- it now reports gc.get_freeze_count() alongside,
+  rather than silently omitting the ~1.9M objects nightly maintenance freezes.
+  Files: qapbot/QBdiscocmdshelper_admin_command.py, qapbot/coc_cache.py. 2729 tests pass.
+- Docs: new Pitfall 44 (deep-size estimators vs __slots__ and lazily-parsed library objects) in
+  COPILOT_PITFALLS_COOKBOOK.md + short entry 33 in copilot-instructions.md;
+  CLAN_AND_WAR_CYCLE_ARCHITECTURE.md gained the re-check-wave/jitter section, the coc_clan_cache
+  size cap and its measured per-entry cost, and the Phase-1 gather retention note. Analysis
+  write-up in plans/tracker-0009-memory-analysis.md.
+
 2026-08-25 (1)
 - Fixed: tracker #0054, live bug report -- the Player CWL Settings Hub's "Ich bin dabei"/"Ich bin
   raus" (confirm/decline) buttons stayed clickable even for an account with no cwl_signups row
