@@ -263,6 +263,17 @@ def _make_cwl_settings_toggle_player_hub_callback(view: discord.ui.View):
             except Exception as e:
                 logging.warning(f"Could not update Player CWL Settings Hub message immediately: {e}")
 
+            # Tracker #0070: the line above reposts the PLAYER-facing hub, but the ADMIN anchored
+            # CWL Management Hub message also displays this toggle's own status/button as part of
+            # its cwl_settings screen — without this, toggling from a DIFFERENT surface than that
+            # anchored message (e.g. /clan management's own session-scoped screen) left it stuck
+            # showing the pre-toggle state indefinitely, until someone happened to click its
+            # manual Refresh button. No explicit mode: this handler has no idea which screen the
+            # anchored message currently shows (see refresh_cwl_management_hub_message's own
+            # docstring) — auto-detected from the live message instead, so this can never force
+            # it onto cwl_settings if it was actually showing cwl_management.
+            await refresh_cwl_management_hub_message(guild_id_int)
+
             await _refresh_parent(view, interaction, "cwl_settings")
         finally:
             if guild_id_int is not None:
@@ -297,6 +308,11 @@ def _make_cwl_settings_toggle_include_all_accounts_callback(view: discord.ui.Vie
             config.get("cwl_enrollment_include_all_linked_accounts", False)
         )
         await CACHE.persist_server_config(guild_id_str)
+        # Tracker #0070: also push this to the ADMIN anchored CWL Management Hub message, which
+        # displays this same setting as part of its cwl_settings screen — see the identical
+        # comment on the Player Hub toggle above for why this call exists and why it passes no
+        # explicit mode.
+        await refresh_cwl_management_hub_message(interaction.guild.id)
         await _refresh_parent(view, interaction, "cwl_settings")
 
     return callback
@@ -347,6 +363,10 @@ class CwlRetentionModal(discord.ui.Modal):
         config = CACHE.server_config.setdefault(guild_id_str, {})
         config["cwl_retention_months"] = months
         await CACHE.persist_server_config(guild_id_str)
+        # Tracker #0070: also push this to the ADMIN anchored CWL Management Hub message — see
+        # the identical comment on the Player Hub toggle above for why.
+        if interaction.guild is not None:
+            await refresh_cwl_management_hub_message(interaction.guild.id)
         await _refresh_parent(self.parent_view, interaction, "cwl_settings")
 
 
@@ -2195,12 +2215,39 @@ async def _refresh_parent(view: discord.ui.View, interaction: discord.Interactio
         logging.warning(f"[CWL] parent_view {type(view).__name__} has no refresh_cwl_view() — cannot refresh in place")
 
 
-async def refresh_cwl_management_hub_message(guild_id: int, mode: str) -> None:
+def _detect_cwl_management_hub_mode(message: discord.Message) -> str:
+    """Infers which screen (cwl_settings vs cwl_management) the anchored CWL Management Hub
+    message currently shows, from its own Settings/Season Management toggle buttons' styles
+    (CwlManagementHubView._add_toggle_buttons: the active mode's button is primary, the inactive
+    one secondary) — tracker #0070, used by refresh_cwl_management_hub_message() when the caller
+    doesn't itself know the message's current mode (it holds no such state of its own — see
+    CwlManagementHubView's own docstring). Defaults to "cwl_management" (the class's own
+    __init__ default) if detection fails for any reason."""
+    for action_row in message.components or []:
+        for child in getattr(action_row, "children", []):
+            if getattr(child, "custom_id", None) == "cwl_admin_hub_mode_settings":
+                if getattr(child, "style", None) == discord.ButtonStyle.primary:
+                    return "cwl_settings"
+                return "cwl_management"
+    return "cwl_management"
+
+
+async def refresh_cwl_management_hub_message(guild_id: int, mode: Optional[str] = None) -> None:
     """Resolve and edit a guild's anchored CWL Management Hub message directly via the bot
     client — no discord.Interaction needed at all, so this is callable from contexts that
     don't have one (the web bridge's HTTP handlers, Phase B) as well as from
     CwlManagementHubView.refresh_cwl_view() (which just derives guild_id from its interaction
     and delegates here). Silently no-ops if the guild has no Hub message configured/tracked.
+
+    mode: which screen to rebuild the message with. Every existing caller already knows this
+    (a click on the anchored message itself, or a web Activity action that's always about
+    cwl_management) and passes it explicitly. Omit it (tracker #0070) when the caller has no way
+    to know — e.g. a cwl_settings mutation made from /clan management's own session-scoped
+    screen, a different surface than the anchored message, which previously left the anchored
+    message showing stale settings indefinitely until a manual Refresh click. In that case the
+    current mode is detected from the live message's own toggle-button state instead of forcing
+    a specific screen, so a background refresh can never flip the admin's anchored message to a
+    screen they didn't ask for.
     """
     import QBcore
 
@@ -2218,24 +2265,32 @@ async def refresh_cwl_management_hub_message(guild_id: int, mode: str) -> None:
     if channel is None or not isinstance(channel, (discord.TextChannel, discord.Thread)):
         return
 
+    try:
+        message = await channel.fetch_message(int(message_id))
+    except discord.NotFound:
+        logging.debug(f"[CWL] Hub message {message_id} not found in channel {channel_id} (guild {guild_id_str}) — will be reposted on the next repost_cwl_management_messages() cycle")
+        return
+    except Exception as e:
+        logging.warning(f"[CWL] refresh_cwl_management_hub_message() could not fetch message: {e}")
+        return
+
+    resolved_mode = mode if mode is not None else _detect_cwl_management_hub_mode(message)
+
     view = CwlManagementHubView()
     view.clear_items()
-    view._add_toggle_buttons(mode)
-    if mode == "cwl_settings":
+    view._add_toggle_buttons(resolved_mode)
+    if resolved_mode == "cwl_settings":
         add_cwl_settings_components(view, guild_id)
     else:
         add_cwl_management_components(view, guild_id)
 
     from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_settings, format_clan_management_cwl_management
 
-    builder = format_clan_management_cwl_settings if mode == "cwl_settings" else format_clan_management_cwl_management
+    builder = format_clan_management_cwl_settings if resolved_mode == "cwl_settings" else format_clan_management_cwl_management
     embed, _, _, _ = await builder(guild)
 
     try:
-        message = await channel.fetch_message(int(message_id))
         await message.edit(embed=embed, view=view)
-    except discord.NotFound:
-        logging.debug(f"[CWL] Hub message {message_id} not found in channel {channel_id} (guild {guild_id_str}) — will be reposted on the next repost_cwl_management_messages() cycle")
     except Exception as e:
         logging.warning(f"[CWL] refresh_cwl_management_hub_message() could not update message: {e}")
 

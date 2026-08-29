@@ -785,6 +785,190 @@ async def test_cwl_management_hub_view_refresh_noop_without_tracked_message():
 
 
 # ---------------------------------------------------------------------------
+# Tracker #0070: refresh_cwl_management_hub_message() mode auto-detection, and the three
+# cwl_settings toggle/modal handlers that previously never touched the anchored Hub message when
+# triggered from a DIFFERENT surface (e.g. /clan management's own session-scoped screen), leaving
+# it stuck showing stale settings until a manual Refresh click.
+# ---------------------------------------------------------------------------
+
+def _make_toggle_button_component(custom_id: str, style: discord.ButtonStyle) -> MagicMock:
+    component = MagicMock()
+    component.custom_id = custom_id
+    component.style = style
+    return component
+
+
+def _make_action_row(*components: MagicMock) -> MagicMock:
+    row = MagicMock()
+    row.children = list(components)
+    return row
+
+
+@pytest.mark.discord
+def test_detect_cwl_management_hub_mode_settings_active():
+    from qapbot.ui_cwl_roster import _detect_cwl_management_hub_mode
+
+    message = MagicMock()
+    message.components = [
+        _make_action_row(
+            _make_toggle_button_component("cwl_admin_hub_mode_settings", discord.ButtonStyle.primary),
+            _make_toggle_button_component("cwl_admin_hub_mode_management", discord.ButtonStyle.secondary),
+        )
+    ]
+    assert _detect_cwl_management_hub_mode(message) == "cwl_settings"
+
+
+@pytest.mark.discord
+def test_detect_cwl_management_hub_mode_management_active():
+    from qapbot.ui_cwl_roster import _detect_cwl_management_hub_mode
+
+    message = MagicMock()
+    message.components = [
+        _make_action_row(
+            _make_toggle_button_component("cwl_admin_hub_mode_settings", discord.ButtonStyle.secondary),
+            _make_toggle_button_component("cwl_admin_hub_mode_management", discord.ButtonStyle.primary),
+        )
+    ]
+    assert _detect_cwl_management_hub_mode(message) == "cwl_management"
+
+
+@pytest.mark.discord
+def test_detect_cwl_management_hub_mode_defaults_to_management_when_undetectable():
+    from qapbot.ui_cwl_roster import _detect_cwl_management_hub_mode
+
+    message = MagicMock()
+    message.components = []
+    assert _detect_cwl_management_hub_mode(message) == "cwl_management"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_refresh_hub_message_without_mode_preserves_settings_screen(monkeypatch):
+    """The core tracker #0070 fix: omitting `mode` must rebuild whichever screen the anchored
+    message is CURRENTLY showing (detected live), never force a specific one — a background
+    refresh triggered from elsewhere must not flip an admin's Season-Management view to Settings
+    or vice versa."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+
+    CACHE.server_config["779"] = {
+        "cwl_management_channel_id": "111",
+        "cwl_management_message_id": "222",
+    }
+    CACHE.db_manager = None
+
+    fake_message = AsyncMock()
+    fake_message.components = [
+        _make_action_row(
+            _make_toggle_button_component("cwl_admin_hub_mode_settings", discord.ButtonStyle.primary),
+            _make_toggle_button_component("cwl_admin_hub_mode_management", discord.ButtonStyle.secondary),
+        )
+    ]
+    fake_channel = MagicMock(spec=discord.TextChannel)
+    fake_channel.fetch_message = AsyncMock(return_value=fake_message)
+    fake_bot = MagicMock()
+    fake_bot.get_channel = MagicMock(return_value=fake_channel)
+    fake_bot.get_guild = MagicMock(return_value=MagicMock())
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", fake_bot)
+
+    settings_builder_called = False
+
+    async def fake_settings_builder(guild):
+        nonlocal settings_builder_called
+        settings_builder_called = True
+        return MagicMock(), None, [], []
+
+    async def fake_management_builder(guild):
+        raise AssertionError("management builder must not run when the message is on Settings")
+
+    import qapbot.QBdiscocmdshelper_cwl as helper_cwl
+    monkeypatch.setattr(helper_cwl, "format_clan_management_cwl_settings", fake_settings_builder)
+    monkeypatch.setattr(helper_cwl, "format_clan_management_cwl_management", fake_management_builder)
+
+    await refresh_cwl_management_hub_message(779)  # no mode -> auto-detect
+
+    assert settings_builder_called is True
+    fake_message.edit.assert_awaited_once()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_hub_toggle_refreshes_admin_anchored_hub_message(db, monkeypatch, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    import qapbot.ui_cwl_roster as ui_cwl_roster_module
+    from qapbot.ui_cwl_roster import _make_cwl_settings_toggle_player_hub_callback
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {"cwl_player_hub_channel_id": "555"}
+
+    async def fake_repost(*args, **kwargs):
+        return None
+
+    import QapBot
+    monkeypatch.setattr(QapBot, "repost_cwl_player_hub_messages", fake_repost)
+
+    hub_refresh = AsyncMock()
+    monkeypatch.setattr(ui_cwl_roster_module, "refresh_cwl_management_hub_message", hub_refresh)
+
+    view = MagicMock()
+    view.refresh_cwl_view = AsyncMock()
+    callback = _make_cwl_settings_toggle_player_hub_callback(view)
+
+    await callback(mock_interaction)
+
+    hub_refresh.assert_awaited_once_with(mock_interaction.guild.id)
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_include_all_accounts_toggle_refreshes_admin_anchored_hub_message(db, monkeypatch, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    import qapbot.ui_cwl_roster as ui_cwl_roster_module
+    from qapbot.ui_cwl_roster import _make_cwl_settings_toggle_include_all_accounts_callback
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {}
+
+    hub_refresh = AsyncMock()
+    monkeypatch.setattr(ui_cwl_roster_module, "refresh_cwl_management_hub_message", hub_refresh)
+
+    view = MagicMock()
+    view.refresh_cwl_view = AsyncMock()
+    callback = _make_cwl_settings_toggle_include_all_accounts_callback(view)
+
+    await callback(mock_interaction)
+
+    hub_refresh.assert_awaited_once_with(mock_interaction.guild.id)
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_retention_modal_submit_refreshes_admin_anchored_hub_message(db, monkeypatch, mock_interaction):
+    from qapbot.cache_manager import CACHE
+    import qapbot.ui_cwl_roster as ui_cwl_roster_module
+    from qapbot.ui_cwl_roster import CwlRetentionModal
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {}
+
+    hub_refresh = AsyncMock()
+    monkeypatch.setattr(ui_cwl_roster_module, "refresh_cwl_management_hub_message", hub_refresh)
+
+    parent_view = MagicMock()
+    parent_view.refresh_cwl_view = AsyncMock()
+    modal = CwlRetentionModal(parent_view, guild_id=mock_interaction.guild.id, current_months=0)
+
+    await modal.on_submit(mock_interaction)
+
+    hub_refresh.assert_awaited_once_with(mock_interaction.guild.id)
+
+
+# ---------------------------------------------------------------------------
 # CwlRetentionModal — radio-button retention picker (replaces the inline Select)
 # ---------------------------------------------------------------------------
 

@@ -1,6 +1,25 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (20)
+- Fixed: tracker #0070, changing a CWL Settings toggle (Player CWL Settings Hub, Include All
+  Linked Accounts, Data Retention) from /clan management's own session-scoped screen correctly
+  updated that screen, but left the separate, anchored admin CWL Management Hub message -- which
+  displays the exact same status lines and toggle buttons -- stuck showing the pre-change state
+  indefinitely, until someone happened to click its manual Refresh button. Root cause: these
+  three handlers only ever refreshed the ONE surface that received the click
+  (_refresh_parent()), never the OTHER surface rendering the same shared content
+  (add_cwl_settings_components() is attached to both /clan management's view AND the anchored
+  Hub message). Fixed by having all three also push a refresh to the anchored Hub message.
+  refresh_cwl_management_hub_message()'s `mode` param is now optional: when omitted (these three
+  new call sites have no way to know what the anchored message currently shows), the current
+  screen is detected from the message's own live toggle-button styles rather than forcing a
+  specific one -- so this refresh can never flip an admin's anchored message from Season
+  Management to Settings (or back) just because a setting changed elsewhere. See Pitfall 50,
+  qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md, for the full writeup.
+  File: qapbot/ui_cwl_roster.py. Tests: tests/discord/test_ui_cwl_roster.py (7 new). 2800 tests
+  pass.
+
 2026-08-29 (19)
 - Clarified: tracker #0042, "ungleiche zahlen" -- a user reported the CWL season overview's
   unlinked-accounts count didn't match "Notify New Pool Members"' own "Skipped (no linked

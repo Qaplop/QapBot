@@ -2218,3 +2218,58 @@ verify" — which was the right instinct, just not followed by actually re-openi
 the reporter's fuller account once it came back. When new facts (here: "it happened testing the
 JUST-DEPLOYED fix, not before it") contradict a prior diagnosis, re-derive from those facts
 rather than patching the old theory.
+
+---
+
+## Pitfall 50: a toggle's "refresh the surface that was clicked" call only ever refreshes ONE of several views rendering the same underlying data — a different, currently-open view of it goes stale with no signal that it needs a refresh at all
+
+**Symptom (tracker #0070, 2026-08-29):** toggling "Player CWL Settings Hub" from `/clan
+management`'s own session-scoped `cwl_settings` screen correctly updated that screen AND
+reposted the player-facing hub message — but the ADMIN's anchored CWL Management Hub message
+(also currently open, also showing a `cwl_settings` screen with its own copy of this exact
+status line and toggle button) kept showing the pre-toggle state indefinitely, until someone
+happened to click its manual Refresh button.
+
+**Root cause:** `add_cwl_settings_components()` (`qapbot/ui_cwl_roster.py`) is a *shared content
+layer* rendered onto two independent surfaces — `ClanManagementView` (entry point a, a fresh
+ephemeral message per `/clan management` invocation) and the anchored `CwlManagementHubView`
+(entry point b, one persistent message per guild) — per the file's own top-of-file docstring.
+Every toggle handler already called `_refresh_parent(view, interaction, mode)`, which correctly
+refreshes *whichever one of the two views received this specific click* — but that's a
+`view`-scoped self-refresh, not "refresh every place this data is currently displayed." The
+Player Hub toggle handler additionally reposted the *player-facing* hub message (a third,
+different message, correct on its own terms) but never touched the *admin* anchored Hub message
+unless the click happened to originate there. Two other cwl_settings mutations
+(`_make_cwl_settings_toggle_include_all_accounts_callback`, `CwlRetentionModal.on_submit`)
+shared the identical gap — they only ever called `_refresh_parent`, with no anchored-message
+refresh at all, regardless of origin.
+
+**Why it wasn't caught by Pitfall 47's fix (same file, same day, earlier ticket):** #47 fixed a
+*race* between an already-existing refresh of the anchored message and a background repost of
+that SAME message — it never needed to ask whether every mutation refreshes EVERY surface, only
+whether the ones that already did so raced each other. A handler that never attempts to refresh
+a second surface at all has no race to fix; the gap is invisible until an admin has two views of
+the same data open side by side, which single-session testing rarely does.
+
+**Fix:** `refresh_cwl_management_hub_message(guild_id, mode)`'s `mode` parameter became optional.
+Every EXISTING caller already knows the mode it wants (a click on the anchored message itself,
+or a web Activity action, always `cwl_management`) and keeps passing it explicitly — unchanged.
+The three gap handlers above now also call `refresh_cwl_management_hub_message(guild_id)` with
+NO mode: since none of them have any way to know what the anchored message currently shows (it
+holds no such state of its own — see `CwlManagementHubView`'s own docstring on why), the function
+now detects it from the LIVE message's own Settings/Season-Management toggle-button styles
+(`_detect_cwl_management_hub_mode()`) when `mode` is omitted, defaulting to `"cwl_management"`
+only if detection genuinely fails. This was the key design constraint: a blind
+`refresh_cwl_management_hub_message(guild_id, "cwl_settings")` call from these handlers would
+have *fixed* this ticket's exact repro while *introducing* a worse one — silently flipping an
+admin's anchored message from Season Management to Settings just because someone changed a
+setting somewhere else, whenever it wasn't already on Settings.
+
+**How to apply:** when a UI element is built by one shared function but attached to more than one
+independently-refreshable surface (view instance, anchored message, ephemeral panel...), a
+mutation handler's job isn't done once it refreshes "the view it was called from" — enumerate
+every OTHER surface that shared function also gets attached to and displays the same data, and
+push a refresh to each one explicitly, not just the one holding the interaction that triggered
+the change. If a refresh target can't tell you what state to render itself into (no "current
+mode" of its own), detect it from that target's own live state rather than assuming — never pass
+a hardcoded value that might silently overwrite an unrelated choice the viewer already made.
