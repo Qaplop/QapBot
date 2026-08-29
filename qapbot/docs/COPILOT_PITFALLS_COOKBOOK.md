@@ -2076,3 +2076,53 @@ doesn't, calling it from a single-entity handler will silently touch every OTHER
 fleet-wide sweep helper and a single-entity apply-now action are different jobs; either give the
 shared helper a scoping parameter (as done here) or write a dedicated single-entity path rather
 than reusing the sweep unscoped.
+
+---
+
+## Pitfall 47: firing a "post/delete the anchored message now" step in the background (fire-and-forget) right before a foreground refresh of THAT SAME message races the refresh against the still-in-flight delete/repost
+
+**Symptom (tracker #0066, 2026-08-29):** clicking the CWL Management Hub's own enable/disable
+toggle button intermittently left the button showing its pre-click state — only a manual
+"Refresh" click fixed it. Happened "twice… not during several other tries" per the reporter, and
+they explicitly asked to check whether the Player CWL Settings Hub toggle had the same bug (it
+did — identical shape).
+
+**Root cause:** `_make_cwl_settings_toggle_callback()` (`qapbot/ui_cwl_roster.py`) toggled the
+config flag, then kicked off `repost_cwl_management_messages(...)` via `QBcore.spawn_tracked()`
+— fire-and-forget, not awaited — and immediately followed it with `await _refresh_parent(...)`.
+This toggle button is rendered by the SAME shared-content function
+(`add_cwl_settings_components()`) on both entry points: the session-scoped `/clan management`
+screen AND the anchored CWL Management Hub message itself. On the latter, `_refresh_parent()`
+resolves to `refresh_cwl_management_hub_message()`, which reads `cwl_management_message_id` from
+`CACHE.server_config` and edits that message — the EXACT message the backgrounded repost task is
+concurrently deleting-and-replacing (a disable) or otherwise mutating. Whichever of the two
+concurrent Discord API operations "won" the race determined whether the visible button reflected
+the new state or the stale one — a genuine, timing-dependent, real-world race, not just a test
+artifact.
+
+**Why it wasn't caught sooner:** the fire-and-forget pattern (`QBcore.spawn_tracked` instead of
+`await`) was a deliberate choice elsewhere in this same file to keep a UI response snappy, and
+"kick off the repost, then refresh" reads as perfectly sequential in the source even though the
+first step doesn't actually block the second. It only misbehaves when the two steps target the
+SAME underlying message AND the repost is slow enough to still be in flight when the refresh
+runs — intermittent by nature, and invisible in DEV where there's usually only one guild and no
+real network latency to widen the window.
+
+**Fix:** changed the repost call from fire-and-forget to `await`ed, for both the CWL Management
+Hub and Player CWL Hub toggle callbacks — `_refresh_parent()` now only ever runs once the repost
+has fully settled, eliminating the race outright rather than narrowing its window. Also added a
+per-guild re-entrancy guard (module-level `set`, checked synchronously before any `await`) since
+a rapid double-click was independently possible: this callback is shared by a session-scoped
+view (fresh instance per refresh, no surviving `self` state — Pitfall 41's usual
+`_consume_once()` instance-flag guard doesn't apply) AND a single `CwlManagementHubView`
+instance shared across every guild's anchored message (a `self` flag there would incorrectly
+block every OTHER guild too) — hence the guard keys off `guild_id` in module scope instead of
+either.
+
+**How to apply:** when a callback backgrounds a step (`spawn_tracked`, `create_task`, or any
+other fire-and-forget) and then immediately performs a SEPARATE foreground action that reads or
+edits the SAME resource that backgrounded step is mutating, that's a race regardless of how
+sequential the code reads — either `await` the step directly (simplest, and usually fine unless
+there's a real reason the caller can't block), or make the foreground action's read tolerant of
+the backgrounded step still being in flight. Don't assume "it's just kicking off a task, the
+real work happens after" is safe when both paths touch the same object.

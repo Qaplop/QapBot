@@ -2989,6 +2989,7 @@ class ChannelConfigurationView(discord.ui.View):
             CACHE.server_config[guild_id_str] = {}
         guild_config = CACHE.server_config[guild_id_str]
 
+        touched_slot_keys: set = set()
         for slot in self.slots:
             old_channel_id = guild_config.get(slot.config_key)
             selected_channel = self.selected_channels.get(slot.key)
@@ -2997,24 +2998,46 @@ class ChannelConfigurationView(discord.ui.View):
                 guild_config[slot.config_key] = new_channel_id
                 if slot.on_apply:
                     slot.on_apply(guild_id_str, old_channel_id, new_channel_id)
+                if old_channel_id != new_channel_id:
+                    touched_slot_keys.add(slot.key)
             elif slot.config_key in guild_config:
                 # If cleared, remove from config and disable the dependent feature(s)
                 del guild_config[slot.config_key]
                 for flag_key in slot.disable_flag_keys:
                     guild_config[flag_key] = False
+                touched_slot_keys.add(slot.key)
 
         await CACHE.persist_server_config(guild_id_str)
 
-        # Trigger repost if registration message is enabled (handles channel change or other updates)
-        if guild_config.get("registration_message_enabled", False):
-            logging.debug(f"Registration message enabled, triggering repost after apply")
-            try:
-                from QapBot import repost_playerregistration_messages
-                import QBcore
-                QBcore.spawn_tracked("repost-registration-msg", repost_playerregistration_messages(only_if_not_bottom=False, guild_id=interaction.guild.id))
-                logging.debug(f"Repost task created after apply")
-            except Exception as e:
-                logging.warning(f"Could not trigger repost after channel config apply: {e}")
+        # Trigger an immediate repost for every anchored-message slot whose channel actually
+        # changed this apply (tracker #0066: this used to be special-cased for "registration"
+        # only, so a CWL Management Hub / Player CWL Hub channel change silently waited for the
+        # next periodic sweep or bot restart to actually move/delete the message -- reported as
+        # "changing the channel while the hub message is enabled doesn't properly delete the
+        # message in the old channel and repost it in the new"). Each repost_*() call's own
+        # internal enabled-check decides post/migrate/delete/no-op, so it's safe to call
+        # unconditionally for any touched slot regardless of the feature's current on/off state
+        # -- e.g. clearing a channel that had an enabled message now correctly deletes it
+        # immediately too, instead of only on the next periodic sweep.
+        if touched_slot_keys:
+            from QapBot import (
+                repost_playerregistration_messages,
+                repost_cwl_management_messages,
+                repost_cwl_player_hub_messages,
+            )
+            repost_fns = {
+                "registration": repost_playerregistration_messages,
+                "cwl_management": repost_cwl_management_messages,
+                "cwl_player_hub": repost_cwl_player_hub_messages,
+            }
+            for slot_key in touched_slot_keys:
+                repost_fn = repost_fns.get(slot_key)
+                if repost_fn is None:
+                    continue  # e.g. "war" has no anchored message
+                try:
+                    await repost_fn(only_if_not_bottom=False, guild_id=interaction.guild.id)
+                except Exception as e:
+                    logging.warning(f"Could not update {slot_key} message immediately after channel apply: {e}")
 
         # Refresh whichever screen opened this configuration flow (basic config, cwl_settings,
         # or the CWL Management Hub) — refresh_cwl_view() is the duck-typed contract both

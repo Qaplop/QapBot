@@ -1,6 +1,28 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (7)
+- Fixed: tracker #0066, two bugs in the CWL Management Hub / Player CWL Hub workflow.
+  (1) The Hub toggle buttons' repost was fire-and-forget (QBcore.spawn_tracked) immediately
+  followed by a foreground refresh of the SAME anchored message -- an intermittent race where
+  the refresh could run while the delete/repost was still mid-flight, leaving the visible button
+  in its pre-click state until a manual Refresh. Fixed by awaiting the repost before refreshing,
+  plus a per-guild re-entrancy guard (module-level set, checked before any await) against a
+  rapid double-click running two overlapping toggle cycles -- neither toggle callback can use the
+  usual Pitfall 41 self-flag guard, since one entry point is a fresh view per refresh and the
+  other is a single Hub-view instance shared across every guild.
+  (2) Applying a channel change (ChannelConfigurationView._on_apply) triggered an immediate
+  repost only for the "registration" slot -- a CWL Management Hub or Player CWL Hub channel
+  change (or clearing either while enabled) silently waited for the next periodic sweep or bot
+  restart to actually move/delete the message, reported as "changing the channel while the hub
+  message is enabled doesn't properly delete the message in the old channel and repost it in the
+  new". This gap predates today's #0061 fix (confirmed via git blame -- introduced when the CWL
+  hub channel slots were added, the apply-trigger was never generalized past registration).
+  Fixed by triggering the correct repost for every channel slot actually touched this apply, not
+  just registration.
+  Files: qapbot/ui_cwl_roster.py, qapbot/ui_clan_management.py. Docs: COPILOT_PITFALLS_COOKBOOK.md
+  Pitfall 47. 2738 tests pass (4 new).
+
 2026-08-29 (6)
 - Fixed: tracker #0065 -- /bug and /feature's cooldown (2 uses per 300s per user) could block a
   reporter for up to ~5 minutes after filing just 2 reports back to back. Loosened to 8 uses per

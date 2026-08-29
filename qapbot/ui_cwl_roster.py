@@ -159,40 +159,65 @@ def _make_cwl_settings_channels_callback(view: discord.ui.View):
     return callback
 
 
+# Tracker #0066: both toggle callbacks below fire from BOTH the session-scoped
+# ClanManagementView (entry point a — a brand-new instance is built by every refresh, so no
+# `self` flag survives across clicks) and CwlManagementHubView, a single instance shared across
+# every guild's anchored Hub message (entry point b — a `self` flag there would incorrectly
+# block every OTHER guild's toggle too). Neither location can use the usual Pitfall 41
+# `_consume_once()` instance-flag guard, so these module-level per-guild sets stand in instead —
+# checked synchronously before ANY `await`, so two rapid clicks starting near-simultaneously
+# can't both pass.
+_CWL_HUB_TOGGLE_IN_PROGRESS: set = set()
+_CWL_PLAYER_HUB_TOGGLE_IN_PROGRESS: set = set()
+
+
 def _make_cwl_settings_toggle_callback(view: discord.ui.View):
     async def callback(interaction: discord.Interaction) -> None:
-        if not await _check_cwl_admin_permission(interaction):
-            return
-        await interaction.response.defer(thinking=False, ephemeral=False)
-        if not interaction.guild:
-            return
-        from qapbot.i18n import t
-
-        guild_id_str = str(interaction.guild.id)
-        guild_id_int = interaction.guild.id
-        config = CACHE.server_config.setdefault(guild_id_str, {})
-        currently_enabled = bool(config.get("cwl_management_message_enabled", False))
-
-        if not currently_enabled and not config.get("cwl_management_channel_id"):
-            await interaction.followup.send(
-                t('cwl.settings.no_channel_set', guild_id=guild_id_int),
-                ephemeral=True,
-            )
-            return
-
-        config["cwl_management_message_enabled"] = not currently_enabled
-        await CACHE.persist_server_config(guild_id_str)
-
-        # Post/delete the anchored Hub message immediately rather than waiting for the
-        # next periodic cycle or bot restart — mirrors ClanManagementView._on_toggle_registration.
+        guild_id_int = interaction.guild.id if interaction.guild else None
+        if guild_id_int is not None:
+            if guild_id_int in _CWL_HUB_TOGGLE_IN_PROGRESS:
+                return
+            _CWL_HUB_TOGGLE_IN_PROGRESS.add(guild_id_int)
         try:
-            from QapBot import repost_cwl_management_messages
-            import QBcore
-            QBcore.spawn_tracked("repost-cwl-management-msg", repost_cwl_management_messages(only_if_not_bottom=False, guild_id=guild_id_int))
-        except Exception as e:
-            logging.warning(f"Could not update CWL Management Hub message immediately: {e}")
+            if not await _check_cwl_admin_permission(interaction):
+                return
+            await interaction.response.defer(thinking=False, ephemeral=False)
+            if not interaction.guild:
+                return
+            from qapbot.i18n import t
 
-        await _refresh_parent(view, interaction, "cwl_settings")
+            guild_id_str = str(guild_id_int)
+            config = CACHE.server_config.setdefault(guild_id_str, {})
+            currently_enabled = bool(config.get("cwl_management_message_enabled", False))
+
+            if not currently_enabled and not config.get("cwl_management_channel_id"):
+                await interaction.followup.send(
+                    t('cwl.settings.no_channel_set', guild_id=guild_id_int),
+                    ephemeral=True,
+                )
+                return
+
+            config["cwl_management_message_enabled"] = not currently_enabled
+            await CACHE.persist_server_config(guild_id_str)
+
+            # Post/delete the anchored Hub message immediately rather than waiting for the next
+            # periodic cycle or bot restart — mirrors ClanManagementView._on_toggle_registration.
+            # AWAITED (tracker #0066), not fire-and-forget: when this toggle button lives ON the
+            # anchored Hub message itself (entry point b), a backgrounded repost could still be
+            # mid-flight -- deleting/replacing that very message -- while _refresh_parent() just
+            # below concurrently tried to read/edit it, intermittently leaving the visible button
+            # in its pre-toggle state until a manual Refresh. Awaiting first guarantees
+            # _refresh_parent() always runs against the fully-settled post-repost state.
+            try:
+                from QapBot import repost_cwl_management_messages
+                await repost_cwl_management_messages(only_if_not_bottom=False, guild_id=guild_id_int)
+            except Exception as e:
+                logging.warning(f"Could not update CWL Management Hub message immediately: {e}")
+
+            await _refresh_parent(view, interaction, "cwl_settings")
+        finally:
+            if guild_id_int is not None:
+                _CWL_HUB_TOGGLE_IN_PROGRESS.discard(guild_id_int)
 
     return callback
 
@@ -201,38 +226,44 @@ def _make_cwl_settings_toggle_player_hub_callback(view: discord.ui.View):
     """Structural copy of _make_cwl_settings_toggle_callback above, for the Player CWL Settings
     Hub instead of the admin CWL Management Hub (plans/cwl-personal-hub.md Phase 2b)."""
     async def callback(interaction: discord.Interaction) -> None:
-        if not await _check_cwl_admin_permission(interaction):
-            return
-        await interaction.response.defer(thinking=False, ephemeral=False)
-        if not interaction.guild:
-            return
-        from qapbot.i18n import t
-
-        guild_id_str = str(interaction.guild.id)
-        guild_id_int = interaction.guild.id
-        config = CACHE.server_config.setdefault(guild_id_str, {})
-        currently_enabled = bool(config.get("cwl_player_hub_message_enabled", False))
-
-        if not currently_enabled and not config.get("cwl_player_hub_channel_id"):
-            await interaction.followup.send(
-                t('cwl.settings.no_player_hub_channel_set', guild_id=guild_id_int),
-                ephemeral=True,
-            )
-            return
-
-        config["cwl_player_hub_message_enabled"] = not currently_enabled
-        await CACHE.persist_server_config(guild_id_str)
-
-        # Post/delete the anchored Hub message immediately rather than waiting for the
-        # next periodic cycle or bot restart — mirrors the admin hub toggle just above.
+        guild_id_int = interaction.guild.id if interaction.guild else None
+        if guild_id_int is not None:
+            if guild_id_int in _CWL_PLAYER_HUB_TOGGLE_IN_PROGRESS:
+                return
+            _CWL_PLAYER_HUB_TOGGLE_IN_PROGRESS.add(guild_id_int)
         try:
-            from QapBot import repost_cwl_player_hub_messages
-            import QBcore
-            QBcore.spawn_tracked("repost-cwl-player-hub-msg", repost_cwl_player_hub_messages(only_if_not_bottom=False, guild_id=guild_id_int))
-        except Exception as e:
-            logging.warning(f"Could not update Player CWL Settings Hub message immediately: {e}")
+            if not await _check_cwl_admin_permission(interaction):
+                return
+            await interaction.response.defer(thinking=False, ephemeral=False)
+            if not interaction.guild:
+                return
+            from qapbot.i18n import t
 
-        await _refresh_parent(view, interaction, "cwl_settings")
+            guild_id_str = str(guild_id_int)
+            config = CACHE.server_config.setdefault(guild_id_str, {})
+            currently_enabled = bool(config.get("cwl_player_hub_message_enabled", False))
+
+            if not currently_enabled and not config.get("cwl_player_hub_channel_id"):
+                await interaction.followup.send(
+                    t('cwl.settings.no_player_hub_channel_set', guild_id=guild_id_int),
+                    ephemeral=True,
+                )
+                return
+
+            config["cwl_player_hub_message_enabled"] = not currently_enabled
+            await CACHE.persist_server_config(guild_id_str)
+
+            # AWAITED, not fire-and-forget — same race fix as the admin hub toggle above.
+            try:
+                from QapBot import repost_cwl_player_hub_messages
+                await repost_cwl_player_hub_messages(only_if_not_bottom=False, guild_id=guild_id_int)
+            except Exception as e:
+                logging.warning(f"Could not update Player CWL Settings Hub message immediately: {e}")
+
+            await _refresh_parent(view, interaction, "cwl_settings")
+        finally:
+            if guild_id_int is not None:
+                _CWL_PLAYER_HUB_TOGGLE_IN_PROGRESS.discard(guild_id_int)
 
     return callback
 

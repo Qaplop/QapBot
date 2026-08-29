@@ -6,6 +6,7 @@ the sole clan-config entry point; the native toggle-and-carry-over flow was reti
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock
@@ -339,6 +340,133 @@ async def test_player_hub_toggle_flips_flag_and_persists_when_channel_set(db, mo
     assert persisted["cwl_player_hub_message_enabled"] is True
 
 
+# ---------------------------------------------------------------------------
+# Tracker #0066: toggle-button race condition ("doesn't flip over to the correct state ...
+# only after pressing the refresh button"). Two independent defects, both fixed together:
+# (a) the repost was fire-and-forget (QBcore.spawn_tracked), racing against the immediate
+#     _refresh_parent() call right after it -- now awaited instead, so refresh always sees the
+#     fully-settled post-repost state;
+# (b) no guard against a rapid double-click running two overlapping toggle+repost+refresh
+#     cycles for the same guild -- now a module-level per-guild set, checked synchronously
+#     before any await (see _CWL_HUB_TOGGLE_IN_PROGRESS's own comment).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_management_toggle_reposts_before_refreshing(db, mock_interaction, monkeypatch):
+    """The repost must complete (be awaited) before the parent view is refreshed, not merely
+    kicked off in the background — otherwise refresh_cwl_view() can run against stale state."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_settings_components
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {"cwl_management_channel_id": "123456"}
+
+    events: List[str] = []
+
+    async def fake_repost(*, only_if_not_bottom, guild_id):
+        events.append("repost")
+
+    monkeypatch.setattr("QapBot.repost_cwl_management_messages", fake_repost)
+
+    class _FakeParentView(discord.ui.View):
+        async def refresh_cwl_view(self, interaction: discord.Interaction, mode: str) -> None:
+            events.append("refresh")
+
+    view = _FakeParentView(timeout=None)
+    add_cwl_settings_components(view, mock_interaction.guild.id)
+    button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_hub")
+
+    await button.callback(mock_interaction)
+
+    assert events == ["repost", "refresh"]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_management_toggle_guards_against_reentrant_double_click(db, mock_interaction, monkeypatch):
+    """A second click landing while the first is still mid-flight (e.g. blocked inside the
+    repost call) must be dropped, not run a second overlapping toggle+repost+refresh cycle."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_settings_components
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {"cwl_management_channel_id": "123456"}
+
+    call_count = 0
+    release = asyncio.Event()
+
+    async def fake_repost(*, only_if_not_bottom, guild_id):
+        nonlocal call_count
+        call_count += 1
+        await release.wait()
+
+    monkeypatch.setattr("QapBot.repost_cwl_management_messages", fake_repost)
+
+    view = discord.ui.View(timeout=None)
+    add_cwl_settings_components(view, mock_interaction.guild.id)
+    button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_hub")
+
+    task1 = asyncio.create_task(button.callback(mock_interaction))
+    # Real DB I/O (persist_server_config) happens on aiosqlite's worker thread, so a single
+    # sleep(0) isn't reliably enough loop ticks for task1 to reach the repost call — poll instead.
+    for _ in range(200):
+        if call_count:
+            break
+        await asyncio.sleep(0.01)
+    assert call_count == 1  # task1 reached (and is now blocked inside) the repost call
+
+    # Second click lands while the first is still in flight and holding the guard.
+    await button.callback(mock_interaction)
+    assert call_count == 1  # the second click never reached the repost call
+
+    release.set()
+    await task1
+    assert call_count == 1  # task1's own single repost call, unchanged
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_hub_toggle_guards_against_reentrant_double_click(db, mock_interaction, monkeypatch):
+    """Same re-entrancy guard as the admin hub toggle above, for the Player CWL Settings Hub."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_settings_components
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {"cwl_player_hub_channel_id": "999888777"}
+
+    call_count = 0
+    release = asyncio.Event()
+
+    async def fake_repost(*, only_if_not_bottom, guild_id):
+        nonlocal call_count
+        call_count += 1
+        await release.wait()
+
+    monkeypatch.setattr("QapBot.repost_cwl_player_hub_messages", fake_repost)
+
+    view = discord.ui.View(timeout=None)
+    add_cwl_settings_components(view, mock_interaction.guild.id)
+    button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_player_hub")
+
+    task1 = asyncio.create_task(button.callback(mock_interaction))
+    for _ in range(200):
+        if call_count:
+            break
+        await asyncio.sleep(0.01)
+    assert call_count == 1
+
+    await button.callback(mock_interaction)
+    assert call_count == 1
+
+    release.set()
+    await task1
+    assert call_count == 1
+
+
 @pytest.mark.discord
 def test_clan_management_view_cwl_management_mode_constructs_without_row_conflict():
     from qapbot.cache_manager import CACHE
@@ -462,6 +590,57 @@ async def test_channel_configuration_view_apply_refreshes_hub_and_closes_ephemer
 
     assert CACHE.server_config[guild_id_str]["cwl_management_channel_id"] == str(channel.id)
     config_view.config_message.delete.assert_awaited_once()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_channel_apply_triggers_immediate_repost_for_cwl_slots(db, mock_interaction, monkeypatch):
+    """Tracker #0066: applying a channel change used to trigger an immediate repost ONLY for
+    the "registration" slot — a CWL Management Hub or Player CWL Hub channel change silently
+    waited for the next periodic sweep / bot restart to actually move the message ("changing
+    the channel while the hub message is enabled doesn't properly delete the message in the old
+    channel and repost it in the new"). Only the slot(s) whose channel actually changed this
+    apply should fire; an untouched slot must not."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_clan_management import ChannelConfigurationView, CWL_CONFIG_CHANNEL_SLOTS
+    from qapbot.ui_cwl_roster import CwlManagementHubView
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {"cwl_management_channel_id": "111"}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    calls: List[str] = []
+
+    async def fake_repost_cwl_management(*, only_if_not_bottom, guild_id):
+        calls.append("cwl_management")
+
+    async def fake_repost_cwl_player_hub(*, only_if_not_bottom, guild_id):
+        calls.append("cwl_player_hub")
+
+    monkeypatch.setattr("QapBot.repost_cwl_management_messages", fake_repost_cwl_management)
+    monkeypatch.setattr("QapBot.repost_cwl_player_hub_messages", fake_repost_cwl_player_hub)
+
+    hub_view = CwlManagementHubView()
+    new_channel = MagicMock()
+    new_channel.id = 222333444
+
+    config_view = ChannelConfigurationView(
+        guild=mock_interaction.guild,
+        clan_management_view=hub_view,
+        original_interaction=mock_interaction,
+        current_channels={"cwl_management": None, "cwl_player_hub": None},
+        slots=CWL_CONFIG_CHANNEL_SLOTS,
+        origin_mode="cwl_settings",
+    )
+    # Only cwl_management's channel is actually changed this apply; cwl_player_hub is left as-is.
+    config_view.selected_channels["cwl_management"] = new_channel
+    config_view.config_message = AsyncMock()
+
+    await config_view._on_apply(mock_interaction)
+
+    assert calls == ["cwl_management"]
 
 
 # ---------------------------------------------------------------------------
