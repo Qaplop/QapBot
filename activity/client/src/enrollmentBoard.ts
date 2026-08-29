@@ -719,19 +719,21 @@ export function renderEnrollmentBoard(
       STATUS_ICON.auto_confirmed, STATUS_LABEL.auto_confirmed,
       'Standing opt-in seeded this — the invitation DM was still sent.',
     ),
-    // Trailing comma appended to this item's own label text, not as a separate flex child
-    // (2026-08-16, live-testing feedback: the guest swatch below doesn't belong to the "User
-    // response:" group — a comma marks that boundary, but as a sibling flex item it'd pick up the
-    // row's own gap on both sides and float away from "Not Linked" instead of reading as one
-    // word).
     buildLegendItem(
       unlinkedIconUrl, UNLINKED_LABEL,
       "No Discord account is linked to this player, so they can't receive or respond to the enrollment DM.",
-      ',',
     ),
+    // Trailing comma appended to this item's own label text, not as a separate flex child
+    // (2026-08-16, live-testing feedback: the guest swatch below doesn't belong to the "User
+    // response:" group — a comma marks that boundary, but as a sibling flex item it'd pick up the
+    // row's own gap on both sides and float away from the last item instead of reading as one
+    // word). Moved here from "Not Linked" (tracker #0043) when "Not Invited Yet" became the new
+    // last item of this group — the comma always belongs on whichever item is last, not a fixed
+    // one.
     buildLegendItem(
       notInvitedIconUrl, NOT_INVITED_LABEL,
       "A current clan member in this season's pool who hasn't been sent the enrollment DM yet.",
+      ',',
     ),
     // Guest indicator (2026-08-16, live-testing feedback: "what is the meaning of the small
     // yellow band" — the .guest-card left-accent already had a hover tooltip, but that's not

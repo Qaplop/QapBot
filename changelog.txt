@@ -1,6 +1,13 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (21)
+- Fixed: tracker #0043 follow-up, the legend's boundary comma (marking where the "User response:"
+  icon group ends, before the separate Guest swatch) was still trailing "Not Linked" even though
+  "Not Invited Yet" is now the last item in that group -- read as "... Not Linked, Not Invited
+  Yet" with no comma after it. Moved the comma to "Not Invited Yet".
+  File: activity/client/src/enrollmentBoard.ts. Re-deployed to DEV.
+
 2026-08-29 (20)
 - Fixed: tracker #0070, changing a CWL Settings toggle (Player CWL Settings Hub, Include All
   Linked Accounts, Data Retention) from /clan management's own session-scoped screen correctly
