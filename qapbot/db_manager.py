@@ -4643,16 +4643,23 @@ class WarHistoryDB:
 
     def get_player_links_sync(self, player_tags: List[str]) -> Dict[str, Dict[str, Any]]:
         """player_tag -> {discord_id, player_name, verified, cwl_permanent_optout,
-        cwl_permanent_optin, cwl_optout_send_dm_anyway} for whichever of
+        cwl_permanent_optin, cwl_optout_send_dm_anyway, preferred_league_rank} for whichever of
         player_tags are linked to a Discord account (user_players), regardless of current clan — a
         player_tag with no linked account simply isn't a key in the returned dict. Used by the CWL
         guest search (web_bridge.py's _search_cwl_guests_sync) to show whether a found player can
         actually be DMed, without needing clan context the way get_current_clan_members_sync does,
         and by start_cwl_enrollment() to resolve exactly that for an already-pooled guest player
-        no clan-scoped query can reach. The three cwl_* preference fields (plans/cwl-personal-hub.md
+        no clan-scoped query can reach. The four cwl_* preference fields (plans/cwl-personal-hub.md
         Phase 1) are what let resolve_cwl_pool_dm_targets_sync() apply a guest/shared-clan player's
         standing preference — sources it can only ever resolve through this method, never through
-        the clan-scoped get_current_clan_members_sync."""
+        the clan-scoped get_current_clan_members_sync.
+
+        preferred_league_rank (added tracker #0059) is this same player-scoped fallback role for
+        the enrollment board's tooltip — web_bridge.py's clan-scoped preferred_league_by_tag (from
+        get_current_clan_members_sync) never covers a pooled player whose CURRENT clan isn't in the
+        guild's own family (e.g. account-wide-expansion, or a player who's since transferred out),
+        exactly the same blind spot cwl_permanent_optout already had before it started reading this
+        method as its own fallback."""
         import sqlite3
 
         if not self.db_path:
@@ -4666,7 +4673,8 @@ class WarHistoryDB:
                     conn,
                     """
                     SELECT player_tag, player_name, discord_id, verified, cwl_permanent_optout,
-                           cwl_permanent_optin, cwl_optout_send_dm_anyway
+                           cwl_permanent_optin, cwl_optout_send_dm_anyway,
+                           cwl_default_preferred_league_rank
                     FROM user_players
                     WHERE player_tag IN ({placeholders})
                     ORDER BY verified DESC, (discord_id = 'UNASSIGNED') ASC
@@ -4694,6 +4702,7 @@ class WarHistoryDB:
                 "cwl_permanent_optout": bool(row["cwl_permanent_optout"]),
                 "cwl_permanent_optin": bool(row["cwl_permanent_optin"]),
                 "cwl_optout_send_dm_anyway": bool(row["cwl_optout_send_dm_anyway"]),
+                "preferred_league_rank": row["cwl_default_preferred_league_rank"],
             }
         return links
 

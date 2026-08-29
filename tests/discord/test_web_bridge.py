@@ -2457,6 +2457,99 @@ async def test_enrollment_get_resolves_link_live_not_from_signup_snapshot(db, br
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_enrollment_get_prefers_live_preferred_league_over_frozen_signup_snapshot(db, bridge_config, client, monkeypatch):
+    """Tracker #0058 live bug report: a player reset their standing preferred-league default
+    back to "no preference" via playerPrefs.ts, but the CWL board tooltip kept showing the old
+    tier forever after. cwl_signups.preferred_league_rank is a one-time snapshot of the standing
+    default taken when Start Enrollment seeded the row, never refreshed afterward — same
+    staleness class as the discord_id bug above, and the fix is the same shape: the live
+    user_players value must win over the frozen snapshot."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "836", {"#CLANM": "MasterClan"})
+    CACHE.db_manager = db
+    CACHE.server_config["836"] = {"member_clans": ["#CLANM"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("836", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLANM", "participating": True}])
+
+    # Frozen snapshot, as Start Enrollment left it when the player still preferred Master League I.
+    db.upsert_cwl_signup_sync(
+        event_id, "#LANCE", "Sir Lancelot", "lanceowner", "Master League I", "template_confirm", "declined",
+    )
+
+    # Reality now: the player reset their standing preference back to "no preference" afterward.
+    # _seed_current_clan_member() never sets cwl_default_preferred_league_rank, so it's NULL —
+    # exactly "no preference" — by omission, matching the live DB state after the reset.
+    await _seed_current_clan_member(db, "lanceowner", "#LANCE", "#CLANM")
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(836, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "836", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+
+    assert players_by_tag["#LANCE"]["preferred_league_rank"] is None
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_enrollment_get_falls_back_to_player_scoped_link_for_preferred_league(db, bridge_config, client, monkeypatch):
+    """Tracker #0059 live bug report: a player set their standing preferred league tier, but the
+    CWL board tooltip didn't show it at all. preferred_league_by_tag (from
+    get_current_clan_members_sync) is scoped to the guild's own family/participating clans — a
+    pooled player whose CURRENT clan is outside that set (e.g. transferred to an unrelated clan)
+    was never covered there, unlike cwl_permanent_optout which already has a links_by_tag
+    fallback for exactly this blind spot. preferred_league_rank now gets the same fallback."""
+    from qapbot.cache_manager import CACHE
+
+    await _seed_guild_and_clans(db, "837", {"#CLANQ": "QCrew", "#OUTSIDE": "Outside Clan"})
+    CACHE.db_manager = db
+    CACHE.server_config["837"] = {"member_clans": ["#CLANQ"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("837", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLANQ", "participating": True}])
+
+    # Signup snapshot never captured a preference (None) — isolates the links_by_tag fallback.
+    db.upsert_cwl_signup_sync(
+        event_id, "#QAP", "Qaplop", "qaplopowner", None, "template_confirm", "confirmed",
+    )
+
+    # Qaplop's CURRENT clan ("#OUTSIDE") is neither this guild's family nor a participating clan
+    # this season — get_current_clan_members_sync(all_member_clan_tags) never returns him.
+    await _seed_current_clan_member(db, "qaplopowner", "#QAP", "#OUTSIDE")
+    await db.conn.execute(
+        "UPDATE user_players SET cwl_default_preferred_league_rank = 'Master League I' WHERE player_tag = '#QAP'"
+    )
+    await db.conn.commit()
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(837, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "837", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+
+    assert players_by_tag["#QAP"]["preferred_league_rank"] == "Master League I"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_enrollment_get_clears_link_for_account_returned_to_unassigned_pool(db, bridge_config, client, monkeypatch):
     """The other direction of the same staleness (2026-08-22): a signup snapshot naming an owner
     for an account that has since been unlinked (its only user_players row is the UNASSIGNED
@@ -5846,6 +5939,23 @@ async def test_player_prefs_post_null_player_tag_applies_to_all_owned_accounts(d
     assert links["#ONE"]["cwl_permanent_optout"] is True
     assert links["#TWO"]["cwl_permanent_optout"] is True
     assert links["#OTHER"]["cwl_permanent_optout"] is False
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_get_player_links_sync_returns_preferred_league_rank(db):
+    """Tracker #0059: get_player_links_sync is the player-scoped fallback the enrollment board
+    uses for preferred_league_rank when the clan-scoped get_current_clan_members_sync doesn't
+    cover a player — it must actually carry the value, not just the other cwl_* prefs."""
+    await _link_player_prefs_account(
+        db, "70", "#PREF", cwl_default_preferred_league_rank="Champion League II",
+    )
+    await _link_player_prefs_account(db, "71", "#NOPREF")
+
+    links = db.get_player_links_sync(["#PREF", "#NOPREF"])
+
+    assert links["#PREF"]["preferred_league_rank"] == "Champion League II"
+    assert links["#NOPREF"]["preferred_league_rank"] is None
 
 
 @pytest.mark.discord

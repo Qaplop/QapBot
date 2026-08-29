@@ -107,12 +107,15 @@ export type EnrollmentPlayer = {
   // invite (POST /api/cwl/enrollment/guest), never by any other signup path. Display-only badge,
   // doesn't change pool/eligibility logic (2026-08-15).
   is_guest: boolean
-  // The player's preferred CWL league tier (tracker #0057, e.g. "Master League I") — this
-  // season's per-invite answer (cwl_signups.preferred_league_rank) if the player set one when
-  // responding, else their standing default (user_players.cwl_default_preferred_league_rank, the
-  // "Bevorzugte Liga" dropdown in playerPrefs.ts). Null when neither is set — display-only,
-  // shown in the hover tooltip's identity block only when non-null (see enrollmentBoard.ts's
-  // buildTooltipLines).
+  // The player's preferred CWL league tier (tracker #0057, e.g. "Master League I") — the LIVE
+  // standing default (user_players.cwl_default_preferred_league_rank, the "Bevorzugte Liga"
+  // dropdown in playerPrefs.ts) whenever known, falling back to the frozen enrollment-time
+  // snapshot (cwl_signups.preferred_league_rank) only if the player has no user_players row at
+  // all (tracker #0058 correction, 2026-08-29: the snapshot is NOT a genuine distinct per-invite
+  // answer — no response flow ever asks that question — so showing it ahead of a live, possibly
+  // since-changed standing default was stale-by-design; see web_bridge.py's build_enrollment_
+  // payload for the exact precedence). Null when neither is set — display-only, shown in the
+  // hover tooltip's identity block only when non-null (see enrollmentBoard.ts's buildTooltipLines).
   preferred_league_rank: string | null
 }
 

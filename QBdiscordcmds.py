@@ -3836,7 +3836,8 @@ async def ping(interaction: discord.Interaction):
     action="Select what to list: Accounts, Families, or Players",
     clan="(Players only) Clan tag or name to list players for",
     family="(Players only) Clan family tag to list players for",
-    season="(Managed CWLs only) CWL season as YYYY-MM — defaults to the next upcoming season"
+    season="(Managed CWLs only) CWL season as YYYY-MM — defaults to the next upcoming season",
+    discord_user="(Accounts only) Show CoC accounts for this Discord user only, instead of everyone",
 )
 @app_commands.choices(action=[
     app_commands.Choice(name="Accounts - List all Discord user accounts and registered players", value="ACCOUNTS"),
@@ -3853,7 +3854,8 @@ async def list(
     action: str,
     clan: Optional[str] = None,
     family: Optional[str] = None,
-    season: Optional[str] = None
+    season: Optional[str] = None,
+    discord_user: Optional[discord.User] = None,
 ):
     """
     Consolidated list command with three actions: Accounts, Families, and Players.
@@ -3864,44 +3866,60 @@ async def list(
     - Players: List all players for a given clan or family
     """
     action_norm = action.upper()
-    _log_cmd(interaction, "list", action=action, clan=clan, family=family, season=season)
-    
+    _log_cmd(interaction, "list", action=action, clan=clan, family=family, season=season, discord_user=discord_user)
+
     # Handle ACCOUNTS action
     if action_norm == "ACCOUNTS":
         if not await _safe_defer(interaction, thinking=True, ephemeral=True):
             return
-        
-        if not CACHE.user_accounts or all(tag == "UNASSIGNED" for tag in CACHE.user_accounts.keys()):
+
+        # tracker #0053: optionally scope to a single Discord user instead of listing everyone.
+        # Filtered here (a dict subset) rather than threading a discord_user param through the
+        # loop below, so every downstream line (empty-state check, totals, embed body) works
+        # unchanged for both the filtered and unfiltered case.
+        if discord_user is not None:
+            accounts_to_show = {
+                tag: entry for tag, entry in CACHE.user_accounts.items()
+                if tag == str(discord_user.id)
+            }
+        else:
+            accounts_to_show = CACHE.user_accounts
+
+        if not accounts_to_show or all(tag == "UNASSIGNED" for tag in accounts_to_show.keys()):
+            if discord_user is not None:
+                empty_description = f"{discord_user.mention} has no registered accounts."
+            else:
+                empty_description = "No registered accounts found."
             empty_embed = discord.Embed(
                 title="Registered Accounts",
-                description="No registered accounts found.",
+                description=empty_description,
                 color=0x2B2D31  # Dark gray
             )
             await send_and_track(interaction, command_name='list_accounts', embed=empty_embed, ephemeral=True)
             return
 
         from qapbot.formatting import best_practice_player_cell
-        
+
         # Unicode left-to-right marks for proper text direction
         LRM = "\u200E"
         RLM = "\u200F"
-        
+
         # Build embed
         embed = discord.Embed(
             color=0x2B2D31  # Dark gray matching clan_management style
         )
-        
+
         # Set title
-        embed.set_author(name="Registered Accounts")
-        
+        embed.set_author(name=f"Registered Accounts \u2014 {discord_user.display_name}" if discord_user is not None else "Registered Accounts")
+
         # Build description with header
         description = f"**Legend: ({BotEmojis.GCHECK} API-Verified / {BotEmojis.REDX} Not Verified)**\n\n"
-        
+
         # Count total players and verified players
         total_players = 0
         verified_players = 0
-        
-        for account_tag, entry in CACHE.user_accounts.items():
+
+        for account_tag, entry in accounts_to_show.items():
             # Skip the UNASSIGNED pool - only show real Discord user accounts
             if account_tag == "UNASSIGNED":
                 continue

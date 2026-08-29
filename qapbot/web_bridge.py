@@ -480,11 +480,14 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
         })
 
     players_by_tag: Dict[str, Dict[str, Any]] = {}
-    # This season's per-invite answer to "which league tier would you prefer" (cwl_signups.
-    # preferred_league_rank, set when the player responds to the enrollment DM) — kept in its own
-    # map (tracker #0057) rather than directly on players_by_tag, since cwl_shared_clan_players has
-    # no equivalent column at all (see the shared-clan merge block below) and the standing-default
-    # fallback (preferred_league_by_tag, below) needs to apply uniformly regardless of source.
+    # cwl_signups.preferred_league_rank — a frozen, one-time COPY of the standing default taken
+    # when Start Enrollment first seeded this row, NOT a genuine distinct per-invite answer (tracker
+    # #0058 correction: no DM/response flow ever actually asks the player this question; see this
+    # value's use below for the full explanation and why it's now only the LAST-resort fallback).
+    # Kept in its own map (tracker #0057) rather than directly on players_by_tag, since
+    # cwl_shared_clan_players has no equivalent column at all (see the shared-clan merge block
+    # below) and the live-default fallback (links_by_tag, below) needs to apply uniformly
+    # regardless of source.
     signup_preferred_league_by_tag: Dict[str, Optional[str]] = {}
     for signup in db.get_cwl_signups_for_event_sync(event["id"]):
         players_by_tag[signup["player_tag"]] = {
@@ -512,17 +515,11 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
     live_th_by_tag: Dict[str, int] = {}
     optout_by_tag: Dict[str, bool] = {}
     current_clan_by_tag: Dict[str, str] = {}
-    # Standing default (user_players.cwl_default_preferred_league_rank, block I's "Bevorzugte
-    # Liga" dropdown in playerPrefs.ts) — the fallback tracker #0057's tooltip line uses whenever
-    # this specific season's cwl_signups row has no per-invite answer of its own (see
-    # signup_preferred_league_by_tag above and its use in the finalize loop below).
-    preferred_league_by_tag: Dict[str, Optional[str]] = {}
     for member in db.get_current_clan_members_sync(all_member_clan_tags):
         if member.get("th_level") is not None:
             live_th_by_tag[member["player_tag"]] = member["th_level"]
         optout_by_tag[member["player_tag"]] = bool(member["cwl_permanent_optout"])
         current_clan_by_tag[member["player_tag"]] = member["clan_tag"]
-        preferred_league_by_tag[member["player_tag"]] = member.get("preferred_league_rank")
         if member["player_tag"] not in players_by_tag:
             players_by_tag[member["player_tag"]] = {
                 "player_tag": member["player_tag"],
@@ -704,11 +701,27 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
         player["cwl_permanent_optout"] = optout_by_tag.get(
             player_tag, bool(link["cwl_permanent_optout"]) if link is not None else False
         )
-        # Per-invite answer for this specific season wins over the standing default (tracker
-        # #0057) — a player who set one preference generally but told this season's invite DM
-        # something different meant that answer for this season specifically.
+        # Live standing default wins over the frozen enrollment-time snapshot (tracker #0058
+        # correction, 2026-08-29): despite tracker #0057's original framing, cwl_signups.
+        # preferred_league_rank is NOT a genuine "this season's own answer" the player gives when
+        # responding to the invite DM — no DM/response flow ever asks that question. It's purely a
+        # one-time COPY of the standing default taken when Start Enrollment first seeded the row
+        # (see the signups_to_create block in start_cwl_enrollment(), QBdiscocmdshelper_cwl.py) and
+        # never refreshed after — confirm/decline (handle_cwl_signup_response, ui_cwl_roster.py)
+        # just writes it straight back unchanged. Live bug report: a player who changed their
+        # standing preference to "None" AFTER already responding still saw their old tier in the
+        # tooltip forever, because the stale snapshot was checked first.
+        #
+        # `link is not None` (from links_by_tag, tracker #0059 — player-scoped, queried for every
+        # tag regardless of clan, unlike the clan-scoped get_current_clan_members_sync pass above)
+        # is the correct test for "is there live data at all", NOT `or` on the value itself: the
+        # live value legitimately IS None for "no preference" (exactly Sir Lancelot's case above),
+        # and `None or signup_value` would wrongly fall through to the stale snapshot in that case
+        # — the same "can't tell false-because-unset from false-because-off" trap `or` always has.
+        # Only a player with NO user_players row at all (never linked — a guest tag added by
+        # search) has no live signal, and keeps the frozen snapshot as the sole surviving one.
         player["preferred_league_rank"] = (
-            signup_preferred_league_by_tag.get(player_tag) or preferred_league_by_tag.get(player_tag)
+            link["preferred_league_rank"] if link is not None else signup_preferred_league_by_tag.get(player_tag)
         )
         # None only when truly unknown (no current_clan_tag on record anywhere) — lets the board
         # tell that apart from "currently in a different clan than their assignment"

@@ -1,6 +1,44 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (10)
+- Added: tracker #0053 -- /list action:Accounts gained an optional discord_user parameter to
+  show one Discord user's CoC accounts only, instead of always listing every registered account.
+  Omitting it keeps today's behavior unchanged. A target user with no linked accounts gets a
+  dedicated "has no registered accounts" message naming them, rather than the generic
+  "no registered accounts found" (which implies nobody has any).
+  File: QBdiscordcmds.py. 2744 tests pass (3 new).
+
+2026-08-29 (9)
+- Fixed: tracker #0058/#0059, the CWL enrollment board tooltip's "Preferred League" line could
+  show a stale value (#0058) or nothing at all (#0059) despite the player having a current
+  standing preference. Root cause: cwl_signups.preferred_league_rank -- despite tracker #0057's
+  original framing as "this season's per-invite answer" -- is actually just a frozen, one-time
+  COPY of the standing default taken when Start Enrollment first seeded the row; no DM/response
+  flow ever asks the player a distinct question. The board's precedence checked that frozen
+  snapshot FIRST, so a player who changed their standing preference AFTER responding kept seeing
+  the old value forever (#0058, Sir Lancelot resetting to "None"); separately, the live-default
+  source (get_current_clan_members_sync) is clan-scoped to the guild's own family, so a pooled
+  player whose current clan falls outside that set had no fallback at all (#0059, Qaplop).
+  Fixed by using get_player_links_sync (already player-scoped, queried for every player_tag
+  regardless of clan) as the authoritative live source, falling back to the frozen snapshot only
+  when there's no user_players row at all (never linked).
+  Files: qapbot/web_bridge.py, qapbot/db_manager.py (get_player_links_sync gained
+  preferred_league_rank). Docs: activity/client/src/types.ts, enrollmentBoard.ts comments
+  corrected. 2741 tests pass (4 new).
+
+2026-08-29 (8)
+- Investigated: tracker #0056 ("Fatal Crash" -- Discord mobile app crashed with "Cannot read
+  property 'label' of undefined" while Zuurn tried to unlink one of his accounts). Strong
+  circumstantial evidence this was a symptom of the SAME defect tracker #45 already fixed
+  earlier the same day (commit 0ccf19b): same reporter ("Zuurn, ~60 linked accounts"), same
+  subsystem (the "My Accounts" self-service unlink flow), and #45's fix rewrote exactly the
+  code path implicated -- replacing a hard [:25]/[:24] truncation with real pagination and
+  fixing a stale-selection bug on page changes, either of which could produce the kind of
+  inconsistent component state a Discord client could choke on. No further code change made;
+  #45's already-comprehensive pagination test suite (60-account walkthrough, stale-selection
+  clearing) covers the scenario. See tracker #0056's comment thread for the full reasoning.
+
 2026-08-29 (7)
 - Fixed: tracker #0066, two bugs in the CWL Management Hub / Player CWL Hub workflow.
   (1) The Hub toggle buttons' repost was fire-and-forget (QBcore.spawn_tracked) immediately

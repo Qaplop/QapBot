@@ -1103,6 +1103,7 @@ class TestGetPlayerLinks:
             "player_name": "Player", "discord_id": "d1", "verified": True,
             "cwl_permanent_optout": False,
             "cwl_permanent_optin": False, "cwl_optout_send_dm_anyway": False,
+            "preferred_league_rank": None,
         }
 
     @pytest.mark.integration
@@ -1202,6 +1203,7 @@ class TestChunkedInQuery:
         "player_name": "Player0", "discord_id": "d0", "verified": True,
         "cwl_permanent_optout": False,
         "cwl_permanent_optin": False, "cwl_optout_send_dm_anyway": False,
+        "preferred_league_rank": None,
     }
         assert tags[1] not in links
 

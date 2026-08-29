@@ -64,6 +64,111 @@ class _FakeCache:
     def get_war_file_stats(self) -> Dict[str, int]:
         return {"total": 0, "prep": 0, "in_war": 0, "war_ended": 0, "cwl_known": 0}
 
+    def is_player_verified(self, user_id: str, player_tag: str) -> bool:
+        user_entry = self.user_accounts.get(user_id)
+        if not user_entry:
+            return False
+        for player in user_entry.get("players", []):
+            if player.get("player_tag", "") == player_tag:
+                return bool(player.get("verified", False))
+        return False
+
+
+# ---------------------------------------------------------------------------
+# /list action:Accounts discord_user:<@user> (tracker #0053, project owner's spec: let /list
+# accounts optionally scope to one Discord user instead of always listing everyone).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_list_accounts_filters_to_one_discord_user(monkeypatch: pytest.MonkeyPatch, mock_interaction):
+    import QBdiscordcmds
+
+    fake_cache = _FakeCache()
+    fake_cache.user_accounts = {
+        "111": {
+            "display_name": "Alice",
+            "players": [{"player_name": "AlicePlayer", "player_tag": "#ALICE1", "verified": True}],
+        },
+        "222": {
+            "display_name": "Bob",
+            "players": [{"player_name": "BobPlayer", "player_tag": "#BOB1", "verified": False}],
+        },
+    }
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+
+    target_user = MagicMock()
+    target_user.id = 111
+    target_user.display_name = "Alice"
+
+    await QBdiscordcmds.list.callback(mock_interaction, action="ACCOUNTS", discord_user=target_user)  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited()
+    _, kwargs = mock_interaction.followup.send.await_args
+    embed = kwargs["embed"]
+    assert "Alice" in embed.author.name
+    assert "AlicePlayer" in embed.description
+    assert "#ALICE1" in embed.description
+    assert "Bob" not in embed.description
+    assert "#BOB1" not in embed.description
+    assert kwargs.get("ephemeral") is True
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_list_accounts_no_discord_user_still_lists_everyone(monkeypatch: pytest.MonkeyPatch, mock_interaction):
+    """Omitting discord_user must keep today's behavior unchanged — every account listed."""
+    import QBdiscordcmds
+
+    fake_cache = _FakeCache()
+    fake_cache.user_accounts = {
+        "111": {
+            "display_name": "Alice",
+            "players": [{"player_name": "AlicePlayer", "player_tag": "#ALICE1", "verified": True}],
+        },
+        "222": {
+            "display_name": "Bob",
+            "players": [{"player_name": "BobPlayer", "player_tag": "#BOB1", "verified": False}],
+        },
+    }
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+
+    await QBdiscordcmds.list.callback(mock_interaction, action="ACCOUNTS")  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited()
+    _, kwargs = mock_interaction.followup.send.await_args
+    embed = kwargs["embed"]
+    assert "Alice" in embed.description
+    assert "Bob" in embed.description
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_list_accounts_discord_user_with_no_accounts_shows_dedicated_message(monkeypatch: pytest.MonkeyPatch, mock_interaction):
+    """A discord_user with no CACHE.user_accounts entry at all must not be conflated with the
+    generic "nobody has any accounts" empty state — the message should name the actual user."""
+    import QBdiscordcmds
+
+    fake_cache = _FakeCache()
+    fake_cache.user_accounts = {
+        "222": {"display_name": "Bob", "players": [{"player_name": "BobPlayer", "player_tag": "#BOB1", "verified": False}]},
+    }
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+
+    target_user = MagicMock()
+    target_user.id = 999
+    target_user.mention = "<@999>"
+    target_user.display_name = "NoAccountsUser"
+
+    await QBdiscordcmds.list.callback(mock_interaction, action="ACCOUNTS", discord_user=target_user)  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited()
+    _, kwargs = mock_interaction.followup.send.await_args
+    embed = kwargs["embed"]
+    assert "<@999>" in embed.description
+    assert "Bob" not in embed.description
+    assert kwargs.get("ephemeral") is True
+
 
 @pytest.mark.discord
 @pytest.mark.asyncio

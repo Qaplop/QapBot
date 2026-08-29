@@ -152,10 +152,9 @@ function buildTooltipLines(
         : isVisibleStatus(player.signup_status) ? STATUS_LABEL[player.signup_status] : 'No response yet'
     }`,
   )
-  // Tracker #0057: only shown when the player actually set one — this season's per-invite answer
-  // if they gave one, else their standing default (see EnrollmentPlayer.preferred_league_rank's
-  // own comment for the precedence). Silently omitted otherwise, same "if set" convention as the
-  // th_level line above.
+  // Tracker #0057 (precedence corrected #0058/#0059): only shown when a value is actually known —
+  // see EnrollmentPlayer.preferred_league_rank's own comment for the live-first precedence.
+  // Silently omitted otherwise, same "if set" convention as the th_level line above.
   if (player.preferred_league_rank != null) {
     pushLine(`Preferred League: ${formatLeagueTier(player.preferred_league_rank)}`)
   }

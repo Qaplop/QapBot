@@ -2126,3 +2126,42 @@ sequential the code reads — either `await` the step directly (simplest, and us
 there's a real reason the caller can't block), or make the foreground action's read tolerant of
 the backgrounded step still being in flight. Don't assume "it's just kicking off a task, the
 real work happens after" is safe when both paths touch the same object.
+
+---
+
+## Pitfall 48: chaining fallback sources with `or` breaks the moment a HIGHER-priority source's live value can legitimately BE `None` — it silently falls through to a lower-priority stale one
+
+**Symptom (tracker #0058, 2026-08-29):** a player reset their standing CWL league preference
+back to "no preference" (`None`), but the enrollment board's tooltip kept showing their old tier
+forever afterward — until this fix, the exact same class of staleness `web_bridge.py` had
+already fixed once before for `discord_id` (2026-08-22) and was fixing again in the same sitting
+for a second field.
+
+**Root cause:** `player["preferred_league_rank"] = signup_snapshot.get(tag) or live_default.get(tag)`
+looks like ordinary "prefer A, fall back to B" — but `cwl_signups.preferred_league_rank` is a
+frozen, one-time COPY of the standing default taken when Start Enrollment first seeded the row
+(not, despite its own introducing comment's claim, a genuine distinct "this season's answer" —
+no response flow ever asks that question), so it was checked FIRST. When a player later changed
+their LIVE standing default to `None` ("no preference"), the code's actual bug wasn't precedence
+order in the abstract — it was using bare `or` at all: `or` cannot distinguish "the live source
+has no opinion" from "the live source explicitly says None", so even after the precedence was
+flipped to check the live source first, `None or frozen_snapshot` still silently fell through to
+the stale value. The fix needed an explicit presence check (`link is not None`), not just a
+reordered `or` chain.
+
+**Fix:** replaced the `or` chain with `live_value if <live-source-exists> else fallback_value`,
+using a real "does this source have a row for this key at all" signal — here, `link is not None`
+from a lookup (`get_player_links_sync`) that already runs unconditionally for every key,
+independent of whatever clan-scoped query might also cover it. The companion tracker #0059 fix
+in the same commit covers the other half of the same one line: a fallback source can also simply
+have too NARROW a scope (clan-scoped, missing a pooled player outside the guild's family) — both
+problems hit the same precedence expression and needed fixing together.
+
+**How to apply:** before writing `primary.get(key) or fallback.get(key)` (or any `or`/truthiness
+chain) to combine a live value with a cached/frozen/less-authoritative one, ask: can the live
+source's *legitimate* value ever be falsy (`None`, `False`, `0`, `""`)? If yes, `or` will
+misreport "no live data" whenever the live answer legitimately IS the falsy one — use an
+explicit presence/existence check instead (a `dict.get(key, SENTINEL)`, an `is not None` on a
+lookup object, or a boolean "was this key ever set" companion). This is the same "can't tell
+false-because-unset from false-because-off" trap as Pitfall 25's shared-table-column overload,
+just one level up at read-time instead of write-time.
