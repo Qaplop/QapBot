@@ -1,6 +1,16 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (29)
+- Deployed: activity/client to PROD (user request), catching up 4 commits that had only been on
+  DEV -- 58f8e35 (Not Invited Yet icon), 1acb644 (notinvited.svg XML-comment fix), 05759e5
+  (legend comma placement), 68ae4db (dm_sent-based "Not Invited Yet" semantics). `tsc --noEmit`
+  clean. https://126ea102.cwl-clan-config-prod.pages.dev (`npm run deploy:prod`).
+  Note: activity/server (Worker) was NOT touched here -- no server source changed in this batch --
+  but its own last PROD deploy predates this by 9 days and is missing Phase 5d/5e (player-prefs
+  routes + Activity screen, merged 2026-08-24); flagged to the user rather than bundled in,
+  since that's an unrelated, untested-in-PROD backlog this request didn't ask for.
+
 2026-08-29 (28)
 - Fixed: live bug report (round 2) on the CWL Coordinators picker -- the round-1 re-entrancy fix
   (entry 27/26) replaced a missing guard with a busy-bool that silently DROPPED any selection
