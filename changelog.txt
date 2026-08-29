@@ -1,6 +1,23 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (6)
+- Fixed: tracker #0065 -- /bug and /feature's cooldown (2 uses per 300s per user) could block a
+  reporter for up to ~5 minutes after filing just 2 reports back to back. Loosened to 8 uses per
+  60s per command (same precedent as the open-items hard cap already removed 2026-08-22 for the
+  identical reason) -- still an abuse guard against a runaway script or accidental double-fire
+  loop, not a throttle on someone filing several real reports in a row.
+  File: QBdiscordcmds.py.
+
+2026-08-29 (5)
+- Fixed: tracker #0064 -- the War Notification Settings screen labelled its language setting
+  "Notification Language", which undersold what it actually controls: that field writes to the
+  SAME user_language CACHE field that drives the bot's whole UI language for that user (modals,
+  DMs, etc. -- see tracker #0060's fix earlier today), not just war-end DM reminders. Renamed to
+  "Preferred Language" / "Bevorzugte Sprache" in both locales.
+  Files: qapbot/translations/en.json, qapbot/translations/de.json, qapbot/ui_notifications.py
+  (log line wording only).
+
 2026-08-29 (4)
 - Fixed: tracker #0061 -- toggling ONE guild's CWL Management Hub, Player CWL Hub, or
   registration message setting (or changing its channel, or changing the guild's language) was

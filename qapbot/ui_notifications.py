@@ -515,7 +515,7 @@ class LanguageSelectionView(TrackedView):
         CACHE.user_accounts[self.user_id] = user_data
         await CACHE.persist_user(self.user_id)
         
-        logging.info(f"User {interaction.user.name} (ID {self.user_id}) changed notification language to {selected_language} (locked: {user_data.get('user_language_locked', False)})")
+        logging.info(f"User {interaction.user.name} (ID {self.user_id}) changed preferred language to {selected_language} (locked: {user_data.get('user_language_locked', False)})")
         
         # Get updated settings
         from qapbot.QBdiscocmdshelper import format_notification_settings

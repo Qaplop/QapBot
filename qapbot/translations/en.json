@@ -126,7 +126,7 @@
     "mode_repeated_desc": " (multiple reminders starting {hours} hours before war ends)",
     "timing_label": "**Timing:**",
     "timing_hours": " hours",
-    "language_label": "**Notification Language:**",
+    "language_label": "**Preferred Language:**",
     "language_english": "English",
     "language_german": "German",
     "language_auto": "Auto (from Discord)",

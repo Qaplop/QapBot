@@ -1009,7 +1009,13 @@ async def highlightme(interaction: discord.Interaction):
     attachment2="Optional screenshot/log file",
     attachment3="Optional screenshot/log file",
 )
-@app_commands.checks.cooldown(2, 300.0, key=lambda i: i.user.id)
+# Abuse guard, not a throttle on legitimate use — tracker #0065 (project owner, verbatim: "I use
+# them in rapid succession when filing several bugs/features in a row"): the original 2-per-300s
+# window meant a 3rd report inside 5 minutes could block for up to ~5 minutes. Loosened to 8-per-
+# 60s, same precedent as the open-items hard cap already removed 2026-08-22 for the same reason
+# (BUG_FEATURE_TRACKER_PLAN.md §5.5) — still guards against a runaway script/accidental double-fire
+# loop, not against a person filing several real reports back to back.
+@app_commands.checks.cooldown(8, 60.0, key=lambda i: i.user.id)
 async def bug(
     interaction: discord.Interaction,
     attachment1: Optional[discord.Attachment] = None,
@@ -1028,7 +1034,8 @@ async def bug(
     attachment2="Optional screenshot/mockup file",
     attachment3="Optional screenshot/mockup file",
 )
-@app_commands.checks.cooldown(2, 300.0, key=lambda i: i.user.id)
+# Same abuse-guard loosening as /bug just above — see its comment (tracker #0065).
+@app_commands.checks.cooldown(8, 60.0, key=lambda i: i.user.id)
 async def feature(
     interaction: discord.Interaction,
     attachment1: Optional[discord.Attachment] = None,

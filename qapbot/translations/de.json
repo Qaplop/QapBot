@@ -126,7 +126,7 @@
     "mode_repeated_desc": " (mehrere Erinnerungen ab {hours} Stunden vor Kriegsende)",
     "timing_label": "**Zeitpunkt:**",
     "timing_hours": " Stunden",
-    "language_label": "**Benachrichtigungssprache:**",
+    "language_label": "**Bevorzugte Sprache:**",
     "language_english": "Englisch",
     "language_german": "Deutsch",
     "language_auto": "Automatisch (von Discord)",

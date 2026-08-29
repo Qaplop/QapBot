@@ -433,7 +433,9 @@ Custom-id scheme (stable, parseable): `tracker:<action>:<item_number>` — e.g.
   - Registered **only when** `CONFIG.tracker_enabled` (§3.1); while the
     `bot_settings.tracker_enabled` runtime flag is off, they reply ephemerally that the
     tracker is disabled.
-  - Cooldown: `@app_commands.checks.cooldown(2, 300.0, key=lambda i: i.user.id)` — abuse guard.
+  - Cooldown: `@app_commands.checks.cooldown(8, 60.0, key=lambda i: i.user.id)` — abuse guard,
+    loosened from the original `(2, 300.0)` 2026-08-29 (tracker #0065) after the project owner
+    hit it while filing several reports back to back; see `BUG_FEATURE_TRACKER.md`.
   - **Available in guilds and in DMs** (§8.8) — no `guild_only()`. Items always post into the
     central tracker guild's channels; for DM-filed items `tracker_items.guild_id` is `NULL`
     and all `t()` calls use the user's language (`user_id` only).
