@@ -328,6 +328,10 @@ async def test_start_cwl_amber_dm_carries_the_clan_join_link(db, monkeypatch):
     body = sent.await_args.args[1]
     assert "link.clashofclans.com" in body
     assert "%23CLAN1" in body  # the ASSIGNED clan, never the current one
+    # Tracker #0076, live bug report: a bare URL in plain DM content makes Discord auto-unfurl
+    # it into a big link-preview card — angle brackets (<...>) suppress that.
+    assert "<https://link.clashofclans.com" in body
+    assert "%23CLAN1>" in body
 
 
 @pytest.mark.asyncio

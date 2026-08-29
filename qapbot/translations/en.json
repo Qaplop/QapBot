@@ -1089,7 +1089,7 @@
     "start": {
       "dm_intro": "\ud83d\udce3 Hi **{display_name}**, the CWL roster for season **{season}** is set \u2014 here is where you play ({count} account(s)):",
       "dm_line_green": "\n\u2705 **{player_name}** \u2014 you're already in **{clan_name}**. Your CWL starts {start_full} ({start_rel}). Nothing to do, just stay put.",
-      "dm_line_amber": "\n\u26a0\ufe0f **{player_name}** \u2014 you're currently in **{current_clan_name}** and need to move to **{clan_name}** *well before* {start_full} ({start_rel}).\n\u27a1\ufe0f {clan_url}",
+      "dm_line_amber": "\n\u26a0\ufe0f **{player_name}** \u2014 you're currently in **{current_clan_name}** and need to move to **{clan_name}** *well before* {start_full} ({start_rel}).\n\u27a1\ufe0f <{clan_url}>",
       "dm_unknown_clan": "no clan"
     },
     "alarm": {

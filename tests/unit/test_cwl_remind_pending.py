@@ -296,6 +296,27 @@ class TestCountCwlPoolMembersMissingDm:
         assert count_cwl_pool_members_missing_dm(816, "2026-09") == 0
 
     @pytest.mark.asyncio
+    async def test_settled_status_without_dm_sent_is_not_counted(self, db):
+        """Tracker #0075, live bug report: "Stay shows 3 uninvited, but in the team management
+        view only 1 is shown". A standing opt-in seeds 'auto_confirmed' immediately and the send
+        is always attempted (resolve_seeded_cwl_signup_status branch 3), but it can still fail
+        silently (DM guard, blocked, left every mutual guild, a transient failure) same as any
+        other recipient — leaving dm_sent False for an account that has already answered via its
+        standing preference. enrollmentBoard.ts's hasVisibleRealStatus() never shows such a
+        player as "Not Invited Yet" (only a 'pending' row without dm_sent gets that treatment),
+        so this count must agree and exclude it too."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.QBdiscocmdshelper_cwl import count_cwl_pool_members_missing_dm
+
+        event_id = await _seed(db, "819", "#CLANQ")
+        db.update_cwl_event_status_sync(event_id, "signup_open")
+        CACHE.db_manager = db
+        await _link(db, "owner1", "#OPTIN1")
+        db.upsert_cwl_signup_sync(event_id, "#OPTIN1", "Optin1", "owner1", None, "auto_optin", "auto_confirmed")
+
+        assert count_cwl_pool_members_missing_dm(819, "2026-09") == 0
+
+    @pytest.mark.asyncio
     async def test_unlinked_pool_members_are_not_counted(self, db):
         """Nobody to DM — mirrors resolve_cwl_pool_dm_targets_sync's own skipped_unlinked bucket."""
         from qapbot.cache_manager import CACHE

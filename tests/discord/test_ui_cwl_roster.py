@@ -4114,6 +4114,54 @@ def test_build_active_clans_table_shows_no_active_season_when_none_exists(db):
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_build_active_clans_table_ignores_unsaved_selection_until_save(mock_interaction, db):
+    """Tracker #0074, live bug report: "The table that shows the current settings should only be
+    changed after the save button is pressed. Currently it also shows unsaved changes." Picking a
+    coordinator must not move this table at all — only pressing Save may."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "The QCrew"}}
+    CACHE.server_config["9705"] = {"cwl_selected_season": "2026-09"}
+
+    await _seed_guild_and_clans(db, "9705", {"#CLAN1": "The QCrew"})
+    event_id = db.create_cwl_event_sync("9705", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+
+    guild = MagicMock()
+    guild.id = 9705
+    member = MagicMock()
+    member.display_name = "Tobi"
+    guild.get_member = MagicMock(side_effect=lambda uid: member if uid == 222 else None)
+
+    view = CwlCoordinatorConfigurationView(
+        guild=guild, clan_tags=["#CLAN1"], current_coordinator_ids_by_clan={},
+    )
+    assert "Tobi" not in view._build_active_clans_table()
+
+    mock_interaction.data = {"values": ["222"]}
+    mock_interaction.edit_original_response = AsyncMock()
+    await view._on_user_select(mock_interaction)
+
+    # Working copy advanced (drives the picker's own default_values / status text)...
+    assert view.coordinators_by_clan["#CLAN1"] == ["222"]
+    # ...but the table must still show nothing new — save was never pressed.
+    assert "Tobi" not in view._build_active_clans_table()
+
+    guild_id_str = str(guild.id)
+    CACHE.server_config.setdefault(guild_id_str, {})
+    mock_interaction.guild = guild
+    mock_interaction.response.defer = AsyncMock()
+    mock_interaction.followup.send = AsyncMock()
+    mock_interaction.edit_original_response = AsyncMock()
+    await view._on_save(mock_interaction)
+
+    assert "Tobi" in view._build_active_clans_table()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_build_active_clans_table_lists_active_clans_with_coordinators(db):
     from qapbot.cache_manager import CACHE
     from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView

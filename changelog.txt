@@ -1,6 +1,34 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (33)
+- Fixed (tracker #0076, live bug report): the "Start CWL" announcement DM's amber (move-clans)
+  line carried its clashofclans.com join link as a bare URL in plain message content, which makes
+  Discord auto-unfurl it into a big link-preview card pushed to the bottom of the DM -- wrapped
+  the {clan_url} placeholder in angle brackets (<...>) in both cwl.start.dm_line_amber templates
+  (qapbot/translations/en.json, de.json), matching the same suppression QapBot.py:3670 already
+  used for its own clan-profile link. 1 test strengthened (test_start_cwl_amber_dm_carries_the_clan_join_link,
+  tests/integration/test_cwl_start_and_switch.py). Full suite: 2852 passed, 4 deselected.
+
+2026-08-29 (32)
+- Fixed (tracker #0074, live bug report): the CWL Coordinators config screen's "Clan |
+  Coordinators" table was updating the instant a coordinator was picked, before "Save
+  Configuration" was ever pressed -- read as "did this already save?" CwlCoordinatorConfigurationView
+  now tracks a second snapshot (saved_coordinators_by_clan) separate from the in-progress working
+  copy; the table always renders from the snapshot, which only advances inside _on_save, right
+  after the DB write succeeds. qapbot/ui_cwl_roster.py. 2 new/updated tests.
+- Fixed (tracker #0075, live bug report: "Stay shows 3 uninvited, but in the team management view
+  only 1 is shown"): the season overview's "New players without DM invitation" count disagreed
+  with the Manage Teams board's "Not Invited Yet" cards for a player whose standing opt-in
+  preference already seeded 'auto_confirmed' (a real, settled answer) but whose invitation DM
+  itself silently failed to send (DM guard, blocked, left every mutual guild, a transient
+  failure) -- the count still flagged them as "missing DM" while the board correctly showed their
+  real auto_confirmed icon instead of "Not Invited Yet" (enrollmentBoard.ts's hasVisibleRealStatus
+  only defers to dm_sent for a 'pending' row). count_cwl_pool_members_missing_dm() now excludes any
+  tag whose local cwl_signups row already carries a real settled status
+  (confirmed/declined/auto_confirmed), matching the board's own rule exactly. qapbot/QBdiscocmdshelper_cwl.py.
+  1 new test. Full suite: 2852 passed, 4 deselected.
+
 2026-08-29 (31)
 - Added: "Start CWL" (CWL_ROSTER_PLANNING_PLAN.md Phase 5) -- a new CWL Management button that
   announces the finished roster to every assigned player by DM. Each player's message is tailored

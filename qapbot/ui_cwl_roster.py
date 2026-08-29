@@ -1119,6 +1119,14 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
         self.coordinators_by_clan: Dict[str, List[str]] = {
             tag: list(ids) for tag, ids in current_coordinator_ids_by_clan.items()
         }
+        # Tracker #0074 (live bug report): the active-clans table must only ever reflect what's
+        # actually persisted, never the in-progress working copy above — a second, independent
+        # snapshot updated only inside _on_save, right after the DB write succeeds. Reflecting
+        # live edits (the original design) meant the table changed the instant a user was picked,
+        # before Save was ever pressed, which read as "did this already save?" to the reporter.
+        self.saved_coordinators_by_clan: Dict[str, List[str]] = {
+            tag: list(ids) for tag, ids in current_coordinator_ids_by_clan.items()
+        }
         self.clan_tag = clan_tags[0]
         self._rebuild_counter = 0
         # Serializing lock (2026-08-29, two live bug reports against this same mechanism):
@@ -1237,9 +1245,10 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
         active in the CURRENTLY SELECTED CWL season — deliberately narrower than self.clan_tags
         (the clan picker below covers the whole family, since coordinators are standing config
         independent of any one season) since this table answers "who's covering THIS month's
-        CWL", not "every clan that could ever have coordinators". Reflects live in-progress
-        edits (self.coordinators_by_clan), not just what's already saved, so picking someone is
-        immediately visible here too, before Save."""
+        CWL", not "every clan that could ever have coordinators". Reflects only what's actually
+        persisted (self.saved_coordinators_by_clan), never in-progress edits still awaiting Save
+        (tracker #0074, live bug report: picking a coordinator was changing this table
+        immediately, before Save was ever pressed, which read as "did this already save?")."""
         from qapbot.i18n import t
         from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
 
@@ -1265,7 +1274,7 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
         rows = []
         for c in sorted(active_clans, key=lambda c: (CACHE.get_clan_name(c["clan_tag"], c["clan_tag"]) or c["clan_tag"]).lower()):
             name = CACHE.get_clan_name(c["clan_tag"], c["clan_tag"]) or c["clan_tag"]
-            coord_ids = self.coordinators_by_clan.get(c["clan_tag"], [])
+            coord_ids = self.saved_coordinators_by_clan.get(c["clan_tag"], [])
             if coord_ids:
                 # Plain display names, not <@id> mention syntax — mentions don't resolve inside a
                 # code block (they'd render as literal, broken-looking text), same reasoning the
@@ -1382,6 +1391,13 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
                 coordinators[self.clan_tag] = self.coordinator_ids
             else:
                 coordinators.pop(self.clan_tag, None)
+
+            # Tracker #0074: the table only ever shows this snapshot — advance it now that the
+            # write above actually succeeded, so this clan's row updates on Save and nowhere else.
+            if self.coordinator_ids:
+                self.saved_coordinators_by_clan[self.clan_tag] = list(self.coordinator_ids)
+            else:
+                self.saved_coordinators_by_clan.pop(self.clan_tag, None)
 
             # Clear the "⚠️ Not saved yet" warning from the working message itself now that this
             # clan's selection actually matches what's persisted (2026-08-29 live bug report: the
