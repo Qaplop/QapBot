@@ -1985,3 +1985,53 @@ this cache" question, share the set across the whole sample.
 the structure under test — it reported 126 MB for `clan_name_cache` where a `tracemalloc`
 window spanning the whole build (query included) reports 263 MB. Both numbers are real; only
 the second answers "how much of RSS is this".
+
+---
+
+## Pitfall 45: a blanket `AsyncMock()` for `interaction.response` makes its ONE synchronous method (`is_done()`) async too — the unawaited call is always truthy and silently picks the wrong branch
+
+**Symptom:** `.\run_tests.ps1` printed a `RuntimeWarning: coroutine 'AsyncMockMixin._execute_mock_call' was never awaited` from `ui_cwl_roster.py:1891`'s `if not interaction.response.is_done():`, and the test asserting that branch
+(`test_check_cwl_admin_or_leader_permission_rejects_regular_member`) had to accept either of two
+outcomes instead of the one real discord.py actually produces, with a comment already noting the
+mock "doesn't reliably resolve one specific branch".
+
+**Root cause:** `discord.InteractionResponse` has exactly one synchronous method —
+`is_done() -> bool` — surrounded by seven async ones (`send_message`, `defer`, `edit_message`,
+`send_modal`, `autocomplete`, `launch_activity`, `pong`). The shared `mock_interaction` fixture
+(`tests/conftest.py`) built `interaction.response = AsyncMock()`, which auto-generates every
+child attribute — including `is_done` — as another `AsyncMock`. Setting
+`interaction.response.is_done.return_value = False` only configures what the *awaited* call
+resolves to; called synchronously (as real code does: `if not interaction.response.is_done():`),
+it returns an unawaited coroutine object instead of `False`. A coroutine object has no
+`__bool__`, so it is always truthy — `not is_done()` is therefore always `False`, and the code
+under test permanently takes the "already responded" branch regardless of the configured
+`return_value`. The unawaited coroutine then triggers the RuntimeWarning at garbage-collection
+time.
+
+**Why it wasn't caught sooner:** four other test files had already independently discovered and
+worked around this exact quirk, per-test, with matching comments — `test_dm_command_invocation.py`
+(4 occurrences), `test_ui_cwl_roster.py` (3 occurrences) — each overriding with
+`mock_interaction.response.is_done = MagicMock(return_value=False)` locally instead of fixing the
+shared fixture once. The one test that never got the treatment is the one that leaked a live
+warning into `run_tests.ps1`'s output.
+
+**Fix:** the shared fixture now does the override once —
+`interaction.response.is_done = MagicMock(return_value=False)` right after
+`interaction.response = AsyncMock()` — so every test gets the correct sync mock by default. The
+one broken test's dual-branch-tolerant assertion collapsed to the single real outcome
+(`response.send_message.assert_awaited_once()` + `followup.send.assert_not_awaited()`). The four
+already-patched files were left untouched — their local overrides are now redundant but harmless,
+and touching four unrelated files for pure cleanup was out of scope for the warning fix itself.
+
+**How to apply:** when mocking a discord.py object with a blanket `AsyncMock()` (or any
+autospec-free mock), check whether it has a *sync* method mixed in with its async ones before
+trusting `.return_value` alone — `AsyncMock`'s auto-generated children are async by default
+regardless of what the real attribute actually is. `MagicMock(spec=RealClass)` /
+`AsyncMock(spec=RealClass)` would derive the sync/async split automatically from the real class
+(`inspect.iscoroutinefunction` per member) and prevent this whole category of bug, but this
+project's `mock_interaction` fixture predates that discipline and a spec-based rewrite is a much
+larger change (spec enforcement rejects any attribute a test sets that isn't on the real
+`discord.Interaction` — a real risk across dozens of call sites) than fixing the one attribute
+that's actually wrong. If a fixture-level test double for a well-known class starts accumulating
+per-test workarounds for the same quirk in multiple files, that repetition is the signal the fix
+belongs in the fixture, not in the next test that hits it.

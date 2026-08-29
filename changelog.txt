@@ -1,6 +1,28 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (2)
+- Fixed: run_tests.ps1's two long-standing pytest warnings. (a) qapbot/ui_tracker.py's
+  TrackerItemModal migrated title_input/description_input/details_input from plain TextInput
+  (whose .label getter/setter is deprecated in discord.py 2.6+) to discord.ui.Label-wrapped
+  TextInputs, matching the existing environment_select/priority_select idiom in the same class
+  -- _localize() now sets .text instead of the deprecated .label, and .default/.value moved
+  under .component. Confirmed against Discord's own developer docs that a nested Text Input's
+  label field is optional/deprecated in favor of the wrapping Label, not just a discord.py
+  client-side abstraction. (b) tests/conftest.py's shared mock_interaction fixture built
+  interaction.response as a blanket AsyncMock(), which silently made is_done() -- the ONE
+  synchronous method on real discord.InteractionResponse -- async too; called without
+  awaiting (as real code does), it returned an unawaited coroutine (always truthy, and the
+  source of the RuntimeWarning), so `.return_value = False` never took effect and any
+  `if not interaction.response.is_done():` branch always went the wrong way. Fixed once in the
+  fixture (interaction.response.is_done = MagicMock(return_value=False)) instead of the
+  per-test workaround four other files had already independently discovered.
+  Files: qapbot/ui_tracker.py, tests/conftest.py, tests/discord/test_ui_tracker_items.py,
+  tests/unit/test_check_admin_or_leader_permission.py. 2729 tests pass, 0 warnings (was 40).
+- Docs: new Pitfall 45 (AsyncMock hiding a mixed-sync/async method) in
+  COPILOT_PITFALLS_COOKBOOK.md + short entry 34 in copilot-instructions.md; CODE_STRUCTURE.md's
+  Modal Pattern section gained the Label-wrapped-TextInput idiom for translated field labels.
+
 2026-08-29 (1)
 - Fixed: tracker #0009, memory consumption -- PROD sat at a ~6.1 GB plateau (peaks 7.1 GB) that
   was NOT a leak: daily averages after the first day were flat (6142/6082/6254 MB). Measured

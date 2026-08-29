@@ -528,12 +528,28 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
     (draft_view), or editing an already-posted item (item_number)."""
 
     # TextInput/Label MUST be class attributes for discord.py's Modal system (Cardinal Rule 10).
-    title_input = discord.ui.TextInput(label="Title", required=True, max_length=TRACKER_TITLE_MAX_LENGTH)
-    description_input = discord.ui.TextInput(
-        label="Description", style=discord.TextStyle.paragraph, required=True, max_length=4000
+    # Label-wrapped (discord.py 2.7+, same idiom as environment_select/priority_select below) --
+    # 2026-08-29: TextInput.label's getter/setter are deprecated in favor of wrapping in
+    # discord.ui.Label, which is also the only way left to give a TextInput a per-instance
+    # translated label (Cardinal Rule 6) without the deprecation warning -- `_localize()` sets
+    # `.text` on the Label instead. Every other TextInput touch-point below moved under
+    # `.component` accordingly (`.default`, `.value`); `label=` is dropped from the inner
+    # TextInput's own constructor since the wrapping Label now supplies the visible label.
+    title_input = discord.ui.Label(
+        text="Title",
+        component=discord.ui.TextInput(required=True, max_length=TRACKER_TITLE_MAX_LENGTH),
     )
-    details_input = discord.ui.TextInput(
-        label="Details", style=discord.TextStyle.paragraph, required=False, max_length=4000
+    description_input = discord.ui.Label(
+        text="Description",
+        component=discord.ui.TextInput(
+            style=discord.TextStyle.paragraph, required=True, max_length=4000
+        ),
+    )
+    details_input = discord.ui.Label(
+        text="Details",
+        component=discord.ui.TextInput(
+            style=discord.TextStyle.paragraph, required=False, max_length=4000
+        ),
     )
     # Label-wrapped RadioGroup (discord.py 2.7+ Components V2) — see CODE_STRUCTURE.md §
     # Discord.py Patterns "Radio Groups Inside Modals" for why this replaces a plain
@@ -592,9 +608,9 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         self.initial_details = initial_details
         self.predownload_task: Optional['asyncio.Task[List[Dict[str, Any]]]'] = None
         self._localize()
-        self.title_input.default = initial_title
-        self.description_input.default = initial_description
-        self.details_input.default = initial_details
+        self.title_input.component.default = initial_title
+        self.description_input.component.default = initial_description
+        self.details_input.component.default = initial_details
         self._set_priority_options(initial_priority)
         if item_type == "bug":
             self._set_environment_options(initial_environment)
@@ -605,9 +621,9 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         title_key = 'ui_components.tracker.modal_title_bug' if self.item_type == 'bug' else 'ui_components.tracker.modal_title_feature'
         details_key = 'ui_components.tracker.field_details_bug' if self.item_type == 'bug' else 'ui_components.tracker.field_details_feature'
         self.title = t(title_key, user_id=self.user_id, guild_id=self.guild_id)
-        self.title_input.label = t('ui_components.tracker.field_title', user_id=self.user_id, guild_id=self.guild_id)
-        self.description_input.label = t('ui_components.tracker.field_description', user_id=self.user_id, guild_id=self.guild_id)
-        self.details_input.label = t(details_key, user_id=self.user_id, guild_id=self.guild_id)
+        self.title_input.text = t('ui_components.tracker.field_title', user_id=self.user_id, guild_id=self.guild_id)
+        self.description_input.text = t('ui_components.tracker.field_description', user_id=self.user_id, guild_id=self.guild_id)
+        self.details_input.text = t(details_key, user_id=self.user_id, guild_id=self.guild_id)
         self.environment_select.text = t('ui_components.tracker.field_environment', user_id=self.user_id, guild_id=self.guild_id)
         self.priority_select.text = t('ui_components.tracker.field_priority', user_id=self.user_id, guild_id=self.guild_id)
 
@@ -634,9 +650,9 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         from qapbot.cache_manager import CACHE
 
-        title_val = self.title_input.value.strip()
-        description_val = self.description_input.value.strip()
-        details_val = (self.details_input.value or "").strip()
+        title_val = self.title_input.component.value.strip()
+        description_val = self.description_input.component.value.strip()
+        details_val = (self.details_input.component.value or "").strip()
         environment_val = self.environment_select.component.value if self.item_type == "bug" else ""
         priority_val = _normalize_priority(self.priority_select.component.value)
 

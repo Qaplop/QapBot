@@ -99,7 +99,17 @@ def mock_interaction():
     interaction.guild.name = "TestGuild"
 
     interaction.response = AsyncMock()
-    interaction.response.is_done.return_value = False
+    # discord.InteractionResponse.is_done() is SYNCHRONOUS in real discord.py — every other
+    # InteractionResponse method (send_message, defer, edit_message, ...) is async, is_done()
+    # is the one exception. Plain `.return_value = False` on the AsyncMock-auto-generated child
+    # leaves `is_done` itself an AsyncMock, so calling it without awaiting returns an unawaited
+    # coroutine object — always truthy, and never actually awaited (an "unawaited coroutine"
+    # RuntimeWarning at GC time). Any `if not interaction.response.is_done():` branch under test
+    # then always takes the "already done" path regardless of the intended return_value. Override
+    # with a real sync MagicMock so the mock matches the real method's sync/async split; this was
+    # previously worked around per-test in several files (test_dm_command_invocation.py,
+    # test_ui_cwl_roster.py) instead of fixed once here — see Pitfall 45.
+    interaction.response.is_done = MagicMock(return_value=False)
     interaction.followup = AsyncMock()
 
     interaction.channel = AsyncMock()

@@ -321,8 +321,8 @@ def test_modal_clamps_overlong_initial_title_on_edit():
         initial_description="D",
     )
 
-    assert len(modal.title_input.default) <= TRACKER_TITLE_MAX_LENGTH
-    assert modal.initial_title == modal.title_input.default  # on_submit's change-check stays consistent
+    assert len(modal.title_input.component.default) <= TRACKER_TITLE_MAX_LENGTH
+    assert modal.initial_title == modal.title_input.component.default  # on_submit's change-check stays consistent
 
 
 def test_modal_environment_and_priority_are_radio_groups_not_dropdowns():
@@ -360,15 +360,17 @@ def _edit_modal(item, new_title=None, new_description=None, new_details=None):
     directly. discord.py's TextInput has no public setter for `.value` -- only `.default`,
     which drives the modal UI's pre-filled text, not what on_submit() reads back -- so a
     programmatic "user typed this and hit submit" simulation has to set the private `_value`
-    discord.py itself populates from the real Discord submission payload."""
+    discord.py itself populates from the real Discord submission payload. Reaches through
+    `.component` -- title_input/description_input/details_input are Label-wrapped TextInputs
+    (2026-08-29, replacing the deprecated TextInput.label setter -- see ui_tracker.py)."""
     modal = TrackerItemModal(
         item["item_type"], guild_id=None, user_id="1", item_number=item["item_number"],
         initial_title=item["title"], initial_description=item["description"],
         initial_details=item.get("details") or "",
     )
-    modal.title_input._value = new_title if new_title is not None else item["title"]
-    modal.description_input._value = new_description if new_description is not None else item["description"]
-    modal.details_input._value = new_details if new_details is not None else (item.get("details") or "")
+    modal.title_input.component._value = new_title if new_title is not None else item["title"]
+    modal.description_input.component._value = new_description if new_description is not None else item["description"]
+    modal.details_input.component._value = new_details if new_details is not None else (item.get("details") or "")
     return modal
 
 

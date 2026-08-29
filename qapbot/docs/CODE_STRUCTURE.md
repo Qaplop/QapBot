@@ -166,6 +166,34 @@ class MyModal(discord.ui.Modal, title="My Modal Title"):
         await interaction.followup.send("Done", ephemeral=True)
 ```
 
+**`placeholder` is fine to set post-construction like above — `label` is NOT (discord.py 2.6+).**
+`TextInput.label`'s getter/setter are deprecated in favor of wrapping the TextInput in
+`discord.ui.Label`, per Discord's own developer docs: *"The `label` field on a Text Input is
+deprecated in favor of `label` and `description` on the Label component"* — `label` is not a
+required field on the wire-level Text Input structure, so a nested TextInput built with no
+`label=` argument (sending `label: null`) is the documented, sanctioned shape, not a workaround.
+This matters whenever a modal field's label needs i18n translation (Cardinal Rule 6) — which,
+same as `placeholder` above, can only happen per-instance in `__init__`/a `_localize()` method,
+after the field's per-user/guild `t()` call is possible, i.e. exactly where the deprecated
+`.label =` assignment used to live:
+```python
+class MyModal(discord.ui.Modal, title="..."):
+    my_input = discord.ui.Label(
+        text="Input Label",  # English fallback / used before _localize() runs
+        component=discord.ui.TextInput(placeholder="Placeholder"),  # no label= here
+    )
+
+    def _localize(self, guild_id=None):
+        self.my_input.text = t('key', guild_id=guild_id)  # NOT .my_input.label
+
+    async def on_submit(self, interaction):
+        value = self.my_input.component.value  # NOT .my_input.value
+```
+Real-world example: `qapbot/ui_tracker.py`'s `TrackerItemModal.title_input`/`description_input`/
+`details_input` (migrated 2026-08-29, tracker #0009 follow-up work — see Pitfall 44's sibling
+fix note). Same idiom as "Select Menus Inside Modals" below, just for a plain text field instead
+of a Select/RadioGroup.
+
 ### Select Menus Inside Modals (discord.py 2.6+)
 Plain `discord.ui.Select`/etc. can't be added to a `Modal` directly — wrap it in
 `discord.ui.Label` (Components V2), still as a class attribute per Cardinal Rule 10:

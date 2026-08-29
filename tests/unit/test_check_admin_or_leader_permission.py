@@ -139,12 +139,11 @@ async def test_check_cwl_admin_or_leader_permission_rejects_regular_member(mock_
     result = await _check_cwl_admin_or_leader_permission(mock_interaction)
 
     assert result is False
-    # Rejection message goes via response.send_message() or followup.send() depending on
-    # whether the interaction was already responded to — either is correct here; the fixture's
-    # AsyncMock-flavored response.is_done() doesn't reliably resolve one specific branch.
-    sent_via_response = mock_interaction.response.send_message.await_count > 0
-    sent_via_followup = mock_interaction.followup.send.await_count > 0
-    assert sent_via_response or sent_via_followup
+    # mock_interaction.response.is_done() is a real sync MagicMock returning False (conftest.py),
+    # matching discord.py's actual sync is_done() — so the rejection deterministically goes via
+    # response.send_message(), not followup.send().
+    mock_interaction.response.send_message.assert_awaited_once()
+    mock_interaction.followup.send.assert_not_awaited()
 
 
 @pytest.mark.discord
