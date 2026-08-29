@@ -528,6 +528,99 @@ def test_clan_management_view_cwl_management_mode_constructs_without_row_conflic
 
 
 @pytest.mark.discord
+def test_clan_management_view_registers_open_cwl_settings_session():
+    """Tracker #0070 follow-up: constructing a /clan management view in cwl_settings or
+    cwl_management mode registers it into CACHE.cwl_settings_open_view, so a mutation made
+    elsewhere (the anchored Hub message) can push a refresh back to this session."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_clan_management import ClanManagementView
+
+    CACHE.server_config["9601"] = {}
+    CACHE.db_manager = None
+    guild = MagicMock()
+    guild.id = 9601
+    sent_message = MagicMock(guild=guild)
+
+    view = ClanManagementView(
+        clan_tag="#CLAN1", guild_clans=["#CLAN1"], unlinked_players=[],
+        sent_message=sent_message, mode="cwl_settings", timeout=300,
+    )
+
+    assert CACHE.cwl_settings_open_view["9601"] is view
+
+
+@pytest.mark.discord
+def test_clan_management_view_does_not_register_for_unrelated_modes():
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_clan_management import ClanManagementView
+
+    CACHE.server_config["9602"] = {}
+    CACHE.db_manager = None
+    CACHE.cwl_settings_open_view.pop("9602", None)
+    guild = MagicMock()
+    guild.id = 9602
+    sent_message = MagicMock(guild=guild)
+
+    ClanManagementView(
+        clan_tag="#CLAN1", guild_clans=["#CLAN1"], unlinked_players=[],
+        sent_message=sent_message, mode="registrations", timeout=300,
+    )
+
+    assert "9602" not in CACHE.cwl_settings_open_view
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_refresh_cwl_view_works_without_a_live_interaction():
+    """The whole point of the registry: a mutation from the anchored Hub message has no
+    interaction belonging to this session at all, only a guild_id — refresh_cwl_view() must be
+    callable with interaction=None, deriving the guild from self.sent_message instead."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_clan_management import ClanManagementView
+
+    CACHE.server_config["9605"] = {}
+    CACHE.db_manager = None
+    guild = MagicMock()
+    guild.id = 9605
+    sent_message = AsyncMock()
+    sent_message.guild = guild
+
+    view = ClanManagementView(
+        clan_tag="#CLAN1", guild_clans=["#CLAN1"], unlinked_players=[],
+        sent_message=sent_message, mode="cwl_settings", timeout=300,
+    )
+
+    await view.refresh_cwl_view(None, "cwl_settings")
+
+    sent_message.edit.assert_awaited_once()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_push_refresh_to_open_cwl_settings_session_calls_tracked_view():
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_clan_management import push_refresh_to_open_cwl_settings_session
+
+    fake_view = MagicMock()
+    fake_view.refresh_cwl_view = AsyncMock()
+    CACHE.cwl_settings_open_view["9603"] = fake_view
+
+    await push_refresh_to_open_cwl_settings_session(9603, "cwl_settings")
+
+    fake_view.refresh_cwl_view.assert_awaited_once_with(None, "cwl_settings")
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_push_refresh_to_open_cwl_settings_session_noop_when_none_tracked():
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_clan_management import push_refresh_to_open_cwl_settings_session
+
+    CACHE.cwl_settings_open_view.pop("9604", None)
+    await push_refresh_to_open_cwl_settings_session(9604, "cwl_settings")  # must not raise
+
+
+@pytest.mark.discord
 def test_clan_management_view_cwl_mode_select_options_present():
     from qapbot.cache_manager import CACHE
     from qapbot.ui_clan_management import ClanManagementView
@@ -966,6 +1059,124 @@ async def test_retention_modal_submit_refreshes_admin_anchored_hub_message(db, m
     await modal.on_submit(mock_interaction)
 
     hub_refresh.assert_awaited_once_with(mock_interaction.guild.id)
+
+
+# ---------------------------------------------------------------------------
+# Tracker #0070 follow-up: the earlier fix only reached the ANCHORED Hub message — a mutation
+# made through the Hub itself still had no way to reach an already-open /clan management session
+# (a plain ephemeral message with no persistent identity anywhere). CACHE.cwl_settings_open_view
+# (cache_manager.py) + push_refresh_to_open_cwl_settings_session (ui_clan_management.py) close
+# that direction too.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_hub_enable_toggle_pushes_refresh_to_open_clan_management_session(db, monkeypatch, mock_interaction):
+    import qapbot.ui_clan_management as ui_clan_management_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_settings_components
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {"cwl_management_channel_id": "123456"}
+
+    async def fake_repost(*, only_if_not_bottom, guild_id):
+        return None
+
+    monkeypatch.setattr("QapBot.repost_cwl_management_messages", fake_repost)
+
+    push_refresh = AsyncMock()
+    monkeypatch.setattr(ui_clan_management_module, "push_refresh_to_open_cwl_settings_session", push_refresh)
+
+    view = discord.ui.View(timeout=None)
+    add_cwl_settings_components(view, mock_interaction.guild.id)
+    button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_hub")
+
+    await button.callback(mock_interaction)
+
+    push_refresh.assert_awaited_once_with(mock_interaction.guild.id, "cwl_settings")
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_player_hub_toggle_pushes_refresh_to_open_clan_management_session(db, monkeypatch, mock_interaction):
+    import qapbot.ui_clan_management as ui_clan_management_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import _make_cwl_settings_toggle_player_hub_callback
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {"cwl_player_hub_channel_id": "555"}
+
+    async def fake_repost(*args, **kwargs):
+        return None
+
+    import QapBot
+    monkeypatch.setattr(QapBot, "repost_cwl_player_hub_messages", fake_repost)
+
+    hub_refresh = AsyncMock()
+    import qapbot.ui_cwl_roster as ui_cwl_roster_module
+    monkeypatch.setattr(ui_cwl_roster_module, "refresh_cwl_management_hub_message", hub_refresh)
+    push_refresh = AsyncMock()
+    monkeypatch.setattr(ui_clan_management_module, "push_refresh_to_open_cwl_settings_session", push_refresh)
+
+    view = MagicMock()
+    view.refresh_cwl_view = AsyncMock()
+    callback = _make_cwl_settings_toggle_player_hub_callback(view)
+
+    await callback(mock_interaction)
+
+    push_refresh.assert_awaited_once_with(mock_interaction.guild.id, "cwl_settings")
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_include_all_accounts_toggle_pushes_refresh_to_open_clan_management_session(db, monkeypatch, mock_interaction):
+    import qapbot.ui_clan_management as ui_clan_management_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import _make_cwl_settings_toggle_include_all_accounts_callback
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {}
+
+    import qapbot.ui_cwl_roster as ui_cwl_roster_module
+    monkeypatch.setattr(ui_cwl_roster_module, "refresh_cwl_management_hub_message", AsyncMock())
+    push_refresh = AsyncMock()
+    monkeypatch.setattr(ui_clan_management_module, "push_refresh_to_open_cwl_settings_session", push_refresh)
+
+    view = MagicMock()
+    view.refresh_cwl_view = AsyncMock()
+    callback = _make_cwl_settings_toggle_include_all_accounts_callback(view)
+
+    await callback(mock_interaction)
+
+    push_refresh.assert_awaited_once_with(mock_interaction.guild.id, "cwl_settings")
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_retention_modal_submit_pushes_refresh_to_open_clan_management_session(db, monkeypatch, mock_interaction):
+    import qapbot.ui_clan_management as ui_clan_management_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlRetentionModal
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.db_manager = db
+    CACHE.server_config[guild_id_str] = {}
+
+    import qapbot.ui_cwl_roster as ui_cwl_roster_module
+    monkeypatch.setattr(ui_cwl_roster_module, "refresh_cwl_management_hub_message", AsyncMock())
+    push_refresh = AsyncMock()
+    monkeypatch.setattr(ui_clan_management_module, "push_refresh_to_open_cwl_settings_session", push_refresh)
+
+    parent_view = MagicMock()
+    parent_view.refresh_cwl_view = AsyncMock()
+    modal = CwlRetentionModal(parent_view, guild_id=mock_interaction.guild.id, current_months=0)
+
+    await modal.on_submit(mock_interaction)
+
+    push_refresh.assert_awaited_once_with(mock_interaction.guild.id, "cwl_settings")
 
 
 # ---------------------------------------------------------------------------

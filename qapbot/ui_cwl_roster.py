@@ -217,6 +217,14 @@ def _make_cwl_settings_toggle_callback(view: discord.ui.View):
             except Exception as e:
                 logging.warning(f"Could not update CWL Management Hub message immediately: {e}")
 
+            # Tracker #0070: the two lines above only ever reach whichever surface (the anchored
+            # Hub message via the repost, or _refresh_parent's own self-refresh) is directly
+            # involved in THIS click — this also pushes to any separately-open /clan management
+            # session, the direction that was still missing after the earlier #0070 fix (see
+            # push_refresh_to_open_cwl_settings_session's own docstring, ui_clan_management.py).
+            from qapbot.ui_clan_management import push_refresh_to_open_cwl_settings_session
+            await push_refresh_to_open_cwl_settings_session(guild_id_int, "cwl_settings")
+
             await _refresh_parent(view, interaction, "cwl_settings")
         finally:
             if guild_id_int is not None:
@@ -273,6 +281,11 @@ def _make_cwl_settings_toggle_player_hub_callback(view: discord.ui.View):
             # docstring) — auto-detected from the live message instead, so this can never force
             # it onto cwl_settings if it was actually showing cwl_management.
             await refresh_cwl_management_hub_message(guild_id_int)
+            # Tracker #0070 follow-up: that call only ever reaches the anchored Hub message —
+            # this also pushes to any separately-open /clan management session (see
+            # push_refresh_to_open_cwl_settings_session's own docstring, ui_clan_management.py).
+            from qapbot.ui_clan_management import push_refresh_to_open_cwl_settings_session
+            await push_refresh_to_open_cwl_settings_session(guild_id_int, "cwl_settings")
 
             await _refresh_parent(view, interaction, "cwl_settings")
         finally:
@@ -313,6 +326,11 @@ def _make_cwl_settings_toggle_include_all_accounts_callback(view: discord.ui.Vie
         # comment on the Player Hub toggle above for why this call exists and why it passes no
         # explicit mode.
         await refresh_cwl_management_hub_message(interaction.guild.id)
+        # Tracker #0070 follow-up: that call only ever reaches the anchored Hub message — this
+        # also pushes to any separately-open /clan management session (see
+        # push_refresh_to_open_cwl_settings_session's own docstring, ui_clan_management.py).
+        from qapbot.ui_clan_management import push_refresh_to_open_cwl_settings_session
+        await push_refresh_to_open_cwl_settings_session(interaction.guild.id, "cwl_settings")
         await _refresh_parent(view, interaction, "cwl_settings")
 
     return callback
@@ -367,6 +385,11 @@ class CwlRetentionModal(discord.ui.Modal):
         # the identical comment on the Player Hub toggle above for why.
         if interaction.guild is not None:
             await refresh_cwl_management_hub_message(interaction.guild.id)
+            # Tracker #0070 follow-up: that call only ever reaches the anchored Hub message —
+            # this also pushes to any separately-open /clan management session (see
+            # push_refresh_to_open_cwl_settings_session's own docstring, ui_clan_management.py).
+            from qapbot.ui_clan_management import push_refresh_to_open_cwl_settings_session
+            await push_refresh_to_open_cwl_settings_session(interaction.guild.id, "cwl_settings")
         await _refresh_parent(self.parent_view, interaction, "cwl_settings")
 
 

@@ -235,6 +235,23 @@ class CacheManager:
         # restart just falls back to the "clan_config" default, same as an entry that was never
         # recorded at all.
         self.pending_cwl_activity_screen: Dict[Tuple[str, str], str] = {}
+        # Tracker #0070 (2026-08-29): the most recently opened/refreshed /clan management
+        # ClanManagementView currently showing a cwl_settings or cwl_management screen, one slot
+        # per guild — lets a mutation made from the ANCHORED CWL Management Hub message push a
+        # live update back to this session too, not just refresh itself. Unlike the Hub message
+        # (a stable, persisted channel_id/message_id this bot can always locate), a `/clan
+        # management` session is a plain ephemeral message with no persistent identity anywhere —
+        # this is the only record of it, deliberately in-memory only (a bot restart just loses
+        # the ability to push to whatever was open before, same as if nothing had been open — the
+        # session's own manual Refresh button still works regardless). Single slot per guild, not
+        # a list: if two admins have it open concurrently, only the one who opened/refreshed
+        # theirs most recently gets the live push; the other still works via manual Refresh. Set
+        # in ClanManagementView.__init__ (ui_clan_management.py) whenever constructed in one of
+        # these two modes; never explicitly cleared on mode-switch-away, so a stale entry (the
+        # admin navigated elsewhere, or the interaction/webhook has since expired) just fails
+        # silently on the next push attempt rather than needing active cleanup — see
+        # push_refresh_to_open_cwl_settings_session()'s own docstring.
+        self.cwl_settings_open_view: Dict[str, Any] = {}
         self.last_db_maintenance: Optional[datetime] = None  # UTC timestamp of last nightly DB maintenance run
         self.last_history_migration: Optional[datetime] = None  # UTC timestamp of last monthly hot->history DB migration
         # Cross-cycle datetime parse cache for the clan categorization loop.

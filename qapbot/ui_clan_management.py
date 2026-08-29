@@ -320,7 +320,15 @@ class ClanManagementView(discord.ui.View):
         self.mode = mode
         self.all_embeds = all_embeds or []
         self.current_page = current_page
-        
+
+        # Tracker #0070: track this session for cross-surface push-refresh (a mutation made
+        # through the anchored CWL Management Hub message must be able to update this ephemeral
+        # session too, not just itself) — see CACHE.cwl_settings_open_view's own docstring
+        # (cache_manager.py) for the full design and its single-slot-per-guild limitation.
+        if mode in ("cwl_settings", "cwl_management") and sent_message is not None and sent_message.guild is not None:
+            from qapbot.cache_manager import CACHE
+            CACHE.cwl_settings_open_view[str(sent_message.guild.id)] = self
+
         logging.debug(f"About to call _add_mode_select()")
         # Add mode selection dropdown
         self._add_mode_select()  # type: ignore[attr-defined]
@@ -2416,7 +2424,7 @@ class ClanManagementView(discord.ui.View):
         except Exception as e:
             logging.error(f"Failed to refresh config view: {e}")
 
-    async def refresh_cwl_view(self, interaction: discord.Interaction, mode: str) -> None:
+    async def refresh_cwl_view(self, interaction: Optional[discord.Interaction], mode: str) -> None:
         """Duck-typed refresh target for the CWL settings/management sub-screens
         (qapbot/ui_cwl_roster.py's _refresh_parent()) — same pattern as
         _refresh_config_view() above, generalized to take the mode explicitly rather than
@@ -2431,16 +2439,25 @@ class ClanManagementView(discord.ui.View):
         until someone happens to click something on it. No-ops harmlessly if the guild has no
         Hub message configured/tracked. Mirrors the same call the web bridge already makes after
         an Activity save (web_bridge.py) and CwlManagementHubView's own self-refresh.
+
+        `interaction` is optional (tracker #0070) and, when given, used ONLY for logging context
+        elsewhere — the guild comes from `self.sent_message.guild` instead of
+        `interaction.guild`, since `self.sent_message` already carries its own live reference and
+        this makes the whole method callable with no interaction at all. That's what lets
+        push_refresh_to_open_cwl_settings_session() (below) trigger this same refresh from the
+        anchored Hub message's OWN toggle handlers — a mutation made there has no interaction on
+        this session to hand in, only a guild_id.
         """
         from qapbot.QBdiscocmdshelper import format_clan_management_message
 
-        if not interaction.guild:
+        guild = self.sent_message.guild if self.sent_message else None
+        if guild is None:
             return
 
         try:
             main_embed, _, _, _ = await format_clan_management_message(
                 self.clan_tag,
-                interaction.guild,
+                guild,
                 mode=mode,
             )
             new_view = ClanManagementView(
@@ -2460,7 +2477,7 @@ class ClanManagementView(discord.ui.View):
 
         if mode in ("cwl_settings", "cwl_management"):
             from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
-            await refresh_cwl_management_hub_message(interaction.guild.id, mode)
+            await refresh_cwl_management_hub_message(guild.id, mode)
 
     async def _on_select_channels(self, interaction: discord.Interaction) -> None:
         """Open channel configuration view."""
@@ -2765,6 +2782,29 @@ class ClanManagementView(discord.ui.View):
         )
         # Store reference to message so view can edit it later
         clans_config_view.sent_message = msg
+
+
+async def push_refresh_to_open_cwl_settings_session(guild_id: int, mode: str) -> None:
+    """Tracker #0070: pushes a refresh to this guild's tracked open `/clan management`
+    cwl_settings/cwl_management session (CACHE.cwl_settings_open_view — see its own docstring,
+    cache_manager.py, for the full design and single-slot-per-guild limitation), if one is
+    currently tracked. The counterpart to refresh_cwl_management_hub_message() (ui_cwl_roster.py)
+    for the OTHER direction: a mutation made through the anchored Hub message previously had no
+    way at all to reach an already-open `/clan management` session, since that session is a
+    plain ephemeral message with no persistent identity anywhere for this bot to look up later —
+    unlike the Hub message's stable channel_id/message_id, the only record of an open session is
+    the live view instance this registry holds onto.
+
+    Best-effort and silent: a stale entry (the admin navigated elsewhere, or the underlying
+    interaction/webhook has since expired) just fails the edit inside refresh_cwl_view()'s own
+    try/except and is left in the registry as-is — it'll be overwritten the next time this guild
+    opens or refreshes a real session, same as it would if this function were never called."""
+    from qapbot.cache_manager import CACHE
+
+    view = CACHE.cwl_settings_open_view.get(str(guild_id))
+    if view is None:
+        return
+    await view.refresh_cwl_view(None, mode)
 
 
 # ============================================================================

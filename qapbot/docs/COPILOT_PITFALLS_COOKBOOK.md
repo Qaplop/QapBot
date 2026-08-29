@@ -2265,6 +2265,43 @@ have *fixed* this ticket's exact repro while *introducing* a worse one — silen
 admin's anchored message from Season Management to Settings just because someone changed a
 setting somewhere else, whenever it wasn't already on Settings.
 
+**Follow-up (same day, same ticket): this fix only closed ONE of the two directions.** After the
+above shipped, live testing showed `/clan management` → anchored Hub message worked, but anchored
+Hub message → `/clan management` still didn't — the exact opposite direction from how the
+original symptom above reads, which was itself an artifact of guessing which surface a
+before/after screenshot's mutation had originated from rather than confirming it. There are
+actually THREE surfaces sharing this content (`add_cwl_settings_components()`'s own two entry
+points, PLUS the caller had a separate, already-open `/clan management` session sitting
+untouched the whole time), not two — the initial write-up above only accounted for two. Pushing
+*to* an already-open `/clan management` session turns out to be a fundamentally different problem
+than pushing to the anchored Hub message: the Hub message has a stable, persisted
+`channel_id`/`message_id` this bot can always locate (`CACHE.server_config`); a `/clan
+management` session is a plain ephemeral message with NO persistent identity anywhere — nothing
+to look up later once the interaction that created it is gone. Fixed with a new lightweight
+in-memory registry, `CACHE.cwl_settings_open_view: Dict[str, Any]` (`cache_manager.py`) — one
+slot per guild, holding the most recently opened/refreshed `ClanManagementView` instance while
+it's showing `cwl_settings`/`cwl_management`, set directly in `ClanManagementView.__init__()`.
+`push_refresh_to_open_cwl_settings_session(guild_id, mode)` (`ui_clan_management.py`) looks it up
+and calls its `refresh_cwl_view()`, now consulted by all FOUR settings-mutation handlers (the
+original three, plus the admin-hub-enable toggle this pitfall's own fix never touched). Needed
+`refresh_cwl_view(interaction, mode)` to accept `interaction=None` too (deriving the guild from
+`self.sent_message.guild` instead of `interaction.guild`) — the whole reason for this call is
+that the caller has no interaction belonging to this session, only a guild_id. Single slot per
+guild is a deliberate, disclosed simplification: two admins with the session open concurrently
+means only the more-recently-opened one gets the live push; the other still has its own manual
+Refresh button. A stale entry (message closed, interaction/webhook long expired) just fails
+silently inside `refresh_cwl_view()`'s existing try/except and gets overwritten next time a real
+session opens — no active cleanup needed.
+
+**How to apply (updated):** before declaring a "refresh every surface" fix complete, enumerate
+literally every surface sharing the data, not just the ones already have an established refresh
+mechanism to reuse — a surface with NO existing push mechanism at all (like a bare ephemeral
+message) is exactly the one that's easiest to overlook, precisely because there's no obvious
+function to extend. When live-testing a "does the other view update" fix, test literally every
+directional pair, not just the one direction happened to be convenient to set up first — this
+class of bug is direction-sensitive by nature (an existing partial refresh in one direction can
+mask that the reverse direction was never wired up at all).
+
 **How to apply:** when a UI element is built by one shared function but attached to more than one
 independently-refreshable surface (view instance, anchored message, ephemeral panel...), a
 mutation handler's job isn't done once it refreshes "the view it was called from" — enumerate

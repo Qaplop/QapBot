@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (23)
+- Fixed: tracker #0070 follow-up, the earlier fix only closed the /clan management -> anchored
+  Hub message direction -- live testing showed the reverse (a change made through the anchored
+  Hub message itself) still left an already-open /clan management CWL Settings session stale.
+  Root cause: unlike the anchored Hub message (a stable, persisted channel_id/message_id this bot
+  can always locate), a /clan management session is a plain ephemeral message with no persistent
+  identity anywhere once its own interaction is gone -- there was nothing to push a refresh to.
+  Fixed with a new lightweight in-memory registry (CACHE.cwl_settings_open_view, one slot per
+  guild) tracking the most recently opened/refreshed session; all four CWL Settings mutation
+  handlers (CWL Management Hub toggle, Player CWL Settings Hub toggle, Include All Linked
+  Accounts toggle, Data Retention modal) now push a refresh to it, not just the anchored message.
+  Single slot per guild is a deliberate simplification -- two admins with it open concurrently
+  means only the more-recently-opened one gets the live push, the other still has its manual
+  Refresh button. See Pitfall 50's follow-up section, qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md,
+  for the full writeup including why the first fix addressed the wrong direction.
+  Files: qapbot/cache_manager.py, qapbot/ui_clan_management.py, qapbot/ui_cwl_roster.py. Tests:
+  tests/discord/test_ui_cwl_roster.py (9 new). 2810 tests pass.
+
 2026-08-29 (22)
 - Changed: CWL enrollment, "Not Invited Yet" (tracker #0043's icon) now means what its name says
   -- "hasn't received the enrollment DM yet" -- rather than "has no cwl_signups row". A 'pending'
