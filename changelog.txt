@@ -1,6 +1,23 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (28)
+- Fixed: live bug report (round 2) on the CWL Coordinators picker -- the round-1 re-entrancy fix
+  (entry 27/26) replaced a missing guard with a busy-bool that silently DROPPED any selection
+  change arriving while another was mid-flight. Live testing showed the cost of that: picking 3
+  coordinators in quick succession got "Save successful", but only the first selection actually
+  persisted -- later change events were dropped entirely, so CWL_COORDINATOR_LIMIT's own
+  server-side clamp never even ran against the real final selection, and the picker kept showing
+  Discord's own (never-corrected) 3-chip client state. Replaced the busy-bool with an
+  asyncio.Lock: every handler now waits its turn instead of bailing out, so no selection-change
+  event is ever lost and Save always reads state only after every earlier-queued mutation has
+  actually applied. Also added a defense-in-depth clamp directly inside _on_save with an explicit
+  "only the first {limit} were actually saved" warning message, in case this invariant is ever
+  violated by some path not yet understood -- never silently truncate without saying so.
+  Files: qapbot/ui_cwl_roster.py, qapbot/translations/{en,de}.json. Tests: tests/discord/
+  test_ui_cwl_roster.py (1 rewritten, 2 new). 2822 tests pass (one pre-existing, unrelated
+  order-dependent flake in test_cwl_clan_ownership.py, passes standalone).
+
 2026-08-29 (27)
 - Fixed: two live bug reports on the CWL Coordinators picker (screenshot: removing a coordinator
   and clicking Save left the "Not saved yet" warning showing even after the save actually went

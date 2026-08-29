@@ -726,7 +726,8 @@
       "button_save": "✅ Save Configuration",
       "updated_message": "**CWL Coordinators — {clan}**\n\n⚠️ Not saved yet — currently selected: {names}\n\nClick 'Save Configuration' to apply. If a dropdown was still open, that click only closed it — click 'Save Configuration' again.",
       "saved_state_message": "**CWL Coordinators — {clan}**\n\n✅ Saved — currently: {names}\n\nSelect a clan or change the coordinators to update.",
-      "saved_message": "✅ CWL coordinators saved for {clan}: {names}"
+      "saved_message": "✅ CWL coordinators saved for {clan}: {names}",
+      "saved_message_was_clamped": "⚠️ More than {limit} were selected when you clicked Save — only the first {limit} were actually saved for {clan}: {names}"
     },
     "notification_settings": {
       "button_back_to_first": "⬅️ Back to first page",

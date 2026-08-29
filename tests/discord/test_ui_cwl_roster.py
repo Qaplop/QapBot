@@ -3714,14 +3714,22 @@ async def test_coordinator_user_select_clamps_to_two_even_if_discord_sends_more(
 
 @pytest.mark.discord
 @pytest.mark.asyncio
-async def test_coordinator_view_guards_against_reentrant_double_click(mock_interaction):
-    """Live bug report (2026-08-29): removing a coordinator via the picker's own chip "x" then
-    immediately clicking Save could persist the PRE-removal selection — this view had zero
-    re-entrancy guards on any handler, the exact class of bug Pitfall 49
-    (COPILOT_PITFALLS_COOKBOOK.md) already documents: a fast second click can start running while
-    a still-in-flight first one hasn't yet written its own state change, so Save's read of
-    self.coordinators_by_clan races ahead of the removal's write to it. Mirrors
-    ui_registration.py's AccountManagementView._guard_reentrant()."""
+async def test_coordinator_view_serializes_save_behind_an_in_flight_selection_change(mock_interaction):
+    """Live bug report (2026-08-29, round 1): removing a coordinator via the picker's own chip
+    "x" then immediately clicking Save could persist the PRE-removal selection — this view had
+    zero guards on any handler, the exact class of bug Pitfall 49 (COPILOT_PITFALLS_COOKBOOK.md)
+    documents: a fast second click can start running while a still-in-flight first one hasn't yet
+    written its own state change, so Save's read of self.coordinators_by_clan races ahead of the
+    removal's write to it.
+
+    Round 1's fix used a busy-bool that DROPPED the second click outright (silently deferred, no
+    state change) whenever one was already in flight. Round 2's live bug report showed why that's
+    wrong: a user picking 3 coordinators in quick succession got "Save successful" but only the
+    first selection actually persisted — the later selection-change event(s) got dropped by that
+    same guard, so CWL_COORDINATOR_LIMIT's own clamp never even ran for them, and Save read
+    whatever stale state the drop left behind. Fixed with an asyncio.Lock instead: every handler
+    now WAITS for its turn rather than bailing out, so no selection-change event is ever lost —
+    Save simply queues up behind it and reads the correct state once it actually lands."""
     from qapbot.cache_manager import CACHE
     from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
 
@@ -3746,24 +3754,80 @@ async def test_coordinator_view_guards_against_reentrant_double_click(mock_inter
     mock_interaction.edit_original_response = blocking_edit
     mock_interaction.data = {"values": ["111"]}  # simulate removing "222" via the chip's own "x"
 
+    select_task = asyncio.create_task(view._on_user_select(mock_interaction))
+    for _ in range(200):
+        if call_count:
+            break
+        await asyncio.sleep(0.01)
+    assert call_count == 1  # select_task is now blocked inside _refresh_message's own edit,
+    # holding the lock — the removal has NOT been written to coordinators_by_clan's message yet.
+
+    # Save lands while the removal is still mid-flight — must WAIT for it, not read stale state
+    # and not get dropped/silently ignored.
+    save_task = asyncio.create_task(view._on_save(mock_interaction))
+    await asyncio.sleep(0.05)
+    save_mock.assert_not_awaited()  # still queued behind the lock select_task is holding
+
+    release.set()
+    await select_task
+    await save_task
+
+    assert view.coordinators_by_clan["#CLAN1"] == ["111"]
+    save_mock.assert_awaited_once_with(str(mock_interaction.guild.id), "#CLAN1", ["111"])
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_coordinator_rapid_selection_changes_are_never_dropped(mock_interaction):
+    """Live bug report (2026-08-29, round 2): a user picking 3 coordinators in quick succession
+    saw the picker visually show all 3, got "Save successful" from a follow-up Save click, but
+    only the FIRST selection change had actually persisted -- round 1's busy-bool guard silently
+    dropped the later selection-change event(s) instead of processing them, so
+    CWL_COORDINATOR_LIMIT's own clamp never ran against the real final selection at all. Proves
+    the asyncio.Lock replacement queues a second selection-change event rather than dropping it,
+    so the view's own state always ends up matching the LAST thing the user actually picked
+    (clamped to the limit), never a stale snapshot from whichever event happened to win a race."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView, CWL_COORDINATOR_LIMIT
+
+    CACHE.server_config[str(mock_interaction.guild.id)] = {}
+
+    view = CwlCoordinatorConfigurationView(
+        guild=mock_interaction.guild, clan_tags=["#CLAN1"], current_coordinator_ids_by_clan={},
+    )
+
+    release = asyncio.Event()
+    call_count = 0
+
+    async def blocking_edit(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            await release.wait()
+
+    mock_interaction.edit_original_response = blocking_edit
+    mock_interaction.data = {"values": ["222"]}
+
     task1 = asyncio.create_task(view._on_user_select(mock_interaction))
     for _ in range(200):
         if call_count:
             break
         await asyncio.sleep(0.01)
-    assert call_count == 1  # task1 is now blocked inside _refresh_message's own message edit
+    assert call_count == 1  # task1 blocked mid-flight, holding the lock
 
-    # Save lands while the removal is still mid-flight — must be dropped, not race ahead of it.
-    await view._on_save(mock_interaction)
-    save_mock.assert_not_awaited()
+    # A second, later selection change arrives (the user picked two more users) while the first
+    # is still mid-flight -- must be processed once task1 releases the lock, not dropped.
+    mock_interaction.data = {"values": ["111", "222", "333"]}
+    task2 = asyncio.create_task(view._on_user_select(mock_interaction))
+    await asyncio.sleep(0.05)
+    assert view.coordinators_by_clan.get("#CLAN1") != ["111", "222"]  # task2 hasn't run yet
 
     release.set()
     await task1
-    assert view.coordinators_by_clan["#CLAN1"] == ["111"]
+    await task2
 
-    # Once the removal has actually finished, Save works normally and persists the real result.
-    await view._on_save(mock_interaction)
-    save_mock.assert_awaited_once_with(str(mock_interaction.guild.id), "#CLAN1", ["111"])
+    assert call_count == 2  # both edits actually ran -- neither event was silently dropped
+    assert view.coordinators_by_clan["#CLAN1"] == ["111", "222"][:CWL_COORDINATOR_LIMIT]
 
 
 @pytest.mark.discord
@@ -3878,6 +3942,42 @@ async def test_coordinator_save_with_empty_selection_clears_cache_entry(mock_int
 
     CACHE.db_manager.save_cwl_clan_coordinators.assert_awaited_once_with(guild_id_str, "#CLAN1", [])
     assert "#CLAN1" not in CACHE.server_config[guild_id_str]["cwl_clan_coordinators"]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_coordinator_save_clamps_and_warns_if_state_ever_exceeds_limit(mock_interaction):
+    """Defense in depth (2026-08-29 round 2 live bug report): _on_user_select's own clamp plus
+    the serializing lock should already guarantee self.coordinator_ids never exceeds
+    CWL_COORDINATOR_LIMIT by the time Save runs -- but if that invariant is ever violated by some
+    path not yet understood, Save must clamp AND say so, rather than either persisting more than
+    the limit or silently truncating without telling the admin (the exact "said success, but a
+    selection got quietly dropped" complaint this whole fix exists to resolve)."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.server_config[guild_id_str] = {}
+    CACHE.db_manager = MagicMock()
+    CACHE.db_manager.save_cwl_clan_coordinators = AsyncMock()
+
+    view = CwlCoordinatorConfigurationView(
+        guild=mock_interaction.guild, clan_tags=["#CLAN1"], current_coordinator_ids_by_clan={},
+    )
+    # Force the invariant violation directly -- the normal picker path is already guarded against
+    # ever producing this state; this test is about Save's own fallback, not how state gets here.
+    view.coordinators_by_clan["#CLAN1"] = ["111", "222", "333"]
+    mock_interaction.edit_original_response = AsyncMock()
+
+    await view._on_save(mock_interaction)
+
+    CACHE.db_manager.save_cwl_clan_coordinators.assert_awaited_once_with(guild_id_str, "#CLAN1", ["111", "222"])
+    assert view.coordinators_by_clan["#CLAN1"] == ["111", "222"]
+    mock_interaction.followup.send.assert_awaited_once()
+    (msg,), _ = mock_interaction.followup.send.call_args
+    assert "⚠️" in msg
+    assert "111" in msg and "222" in msg
+    assert "333" not in msg
 
 
 # ---------------------------------------------------------------------------

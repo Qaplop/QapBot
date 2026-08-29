@@ -726,7 +726,8 @@
       "button_save": "✅ Konfiguration speichern",
       "updated_message": "**CWL-Koordinatoren — {clan}**\n\n⚠️ Noch nicht gespeichert — aktuell ausgewählt: {names}\n\nKlicke auf 'Konfiguration speichern', um die Änderung zu übernehmen. War noch ein Dropdown geöffnet, hat dieser Klick es nur geschlossen — klicke danach erneut auf 'Konfiguration speichern'.",
       "saved_state_message": "**CWL-Koordinatoren — {clan}**\n\n✅ Gespeichert — aktuell: {names}\n\nWähle einen Clan oder ändere die Koordinatoren, um zu aktualisieren.",
-      "saved_message": "✅ CWL-Koordinatoren für {clan} gespeichert: {names}"
+      "saved_message": "✅ CWL-Koordinatoren für {clan} gespeichert: {names}",
+      "saved_message_was_clamped": "⚠️ Beim Klick auf Speichern waren mehr als {limit} ausgewählt — es wurden nur die ersten {limit} für {clan} gespeichert: {names}"
     },
     "notification_settings": {
       "button_back_to_first": "⬅️ Zurück zur ersten Seite",

@@ -1100,31 +1100,32 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
         }
         self.clan_tag = clan_tags[0]
         self._rebuild_counter = 0
-        # Re-entrancy guard (2026-08-29 live bug report: removing a coordinator via the
-        # picker's own chip "x" then immediately clicking Save could persist the PRE-removal
-        # selection — this view had zero guards on any handler, the exact class of bug Pitfall 49
-        # (COPILOT_PITFALLS_COOKBOOK.md) already documents: a fast second click can start running
-        # concurrently with a still-in-flight first one, and if Save's own read of
-        # self.coordinators_by_clan races ahead of the removal's write to it, Save persists stale
-        # data even though the message goes on to display the correct post-removal state a moment
-        # later — same shape as ui_registration.py's AccountManagementView._guard_reentrant().
-        self._busy = False
+        # Serializing lock (2026-08-29, two live bug reports against this same mechanism):
+        #
+        # 1) Removing a coordinator via the picker's own chip "x" then immediately clicking Save
+        #    could persist the PRE-removal selection — this view originally had zero guards on
+        #    any handler, the exact class of bug Pitfall 49 (COPILOT_PITFALLS_COOKBOOK.md)
+        #    documents: a fast second click starts running while a still-in-flight first one
+        #    hasn't yet written its own state change, so Save's read of self.coordinators_by_clan
+        #    races ahead of the removal's write to it.
+        #
+        # 2) The first fix used a busy-bool that DROPPED (silently deferred, no state change) any
+        #    interaction arriving while another was mid-flight. That created a worse bug: a live
+        #    report showed 3 users getting picked, Save reporting success, but only 1 actually
+        #    persisted — the 2nd/3rd selection's own change-event arrived while the first was
+        #    still being processed, got dropped entirely, and Discord's client kept showing the
+        #    (never confirmed) 3-chip state client-side since our response never corrected it.
+        #    The CWL_COORDINATOR_LIMIT clamp below never even ran for that dropped event.
+        #
+        # A lock fixes both without losing any event: every handler awaits the lock instead of
+        # bailing out, so a second click still runs — just after the first one finishes — and
+        # Save always reads state only after every earlier-queued mutation has actually applied.
+        self._lock = asyncio.Lock()
 
         self._add_clan_select()
         self._add_user_select()
         self._add_clear_button()
         self._add_save_button()
-
-    def _guard_reentrant(self) -> bool:
-        """True if the caller may proceed (and marks this view busy until it sets
-        `self._busy = False` itself, normally in a `finally`); False if a prior click on this
-        same view is still mid-flight — checked as the literal first statement, before any
-        `await`, so two near-simultaneous clicks can't both pass. See this view's `_busy` field
-        (set in __init__) for the full rationale."""
-        if self._busy:
-            return False
-        self._busy = True
-        return True
 
     @property
     def coordinator_ids(self) -> List[str]:
@@ -1294,73 +1295,61 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
         return ", ".join(names)
 
     async def _on_clan_select(self, interaction: discord.Interaction) -> None:
-        if not self._guard_reentrant():
-            try:
-                await interaction.response.defer(thinking=False, ephemeral=False)
-            except discord.HTTPException:
-                pass
-            return
-        try:
-            await interaction.response.defer(thinking=False, ephemeral=False)
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        async with self._lock:
             values = interaction.data.get('values', [])  # type: ignore[union-attr]
             if values:
                 self.clan_tag = values[0]
             self._rebuild_view()
             await self._refresh_message(interaction)
-        finally:
-            self._busy = False
 
     async def _on_user_select(self, interaction: discord.Interaction) -> None:
-        if not self._guard_reentrant():
-            try:
-                await interaction.response.defer(thinking=False, ephemeral=False)
-            except discord.HTTPException:
-                pass
-            return
-        try:
-            await interaction.response.defer(thinking=False, ephemeral=False)
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        async with self._lock:
             # Tracker #0072 (live bug report): Discord's own client-side max_values enforcement
             # isn't airtight for a UserSelect that was just replaced with a new custom_id + fresh
             # default_values (this component is rebuilt from scratch on every change, per the
             # dynamic custom_id below) — a live report showed 3 users getting through despite
             # max_values=CWL_COORDINATOR_LIMIT (2). Clamp server-side regardless of why the client
             # let it happen — never trust the client for the real limit, same discipline
-            # clanConfigTable.ts's own guest-search length check already applies.
+            # clanConfigTable.ts's own guest-search length check already applies. The clamp only
+            # actually fixes the display once this handler is guaranteed to run for every
+            # selection change rather than being dropped — see the lock's own docstring in
+            # __init__ for the 2026-08-29 follow-up report where the drop-based guard silently
+            # ate a selection change entirely, leaving 3 chips showing client-side while our own
+            # state (and the next Save) never advanced past the last change that DID get through.
             values = interaction.data.get('values', [])[:CWL_COORDINATOR_LIMIT]  # type: ignore[union-attr]
             self.coordinators_by_clan[self.clan_tag] = values
             self._rebuild_view()
             await self._refresh_message(interaction)
-        finally:
-            self._busy = False
 
     async def _on_clear(self, interaction: discord.Interaction) -> None:
-        if not self._guard_reentrant():
-            try:
-                await interaction.response.defer(thinking=False, ephemeral=False)
-            except discord.HTTPException:
-                pass
-            return
-        try:
-            await interaction.response.defer(thinking=False, ephemeral=False)
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        async with self._lock:
             self.coordinators_by_clan[self.clan_tag] = []
             self._rebuild_view()
             await self._refresh_message(interaction)
-        finally:
-            self._busy = False
 
     async def _on_save(self, interaction: discord.Interaction) -> None:
         """Persist the coordinator configuration for the currently-selected clan only — matches
         CustodianConfigurationView._on_apply's own "one clan at a time" scope; switching clans
         via the picker without saving discards that clan's unsaved edits, same as navigating away
         from a form without submitting."""
-        if not self._guard_reentrant():
-            try:
-                await interaction.response.defer(thinking=False, ephemeral=True)
-            except discord.HTTPException:
-                pass
-            return
-        try:
-            await interaction.response.defer(thinking=False, ephemeral=True)
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        async with self._lock:
+            from qapbot.i18n import t
+            user_id = str(interaction.user.id)
+            guild_id_for_t = interaction.guild.id if interaction.guild else None
+
+            # Defense in depth only — _on_user_select's own clamp plus the lock above should
+            # already guarantee this never actually exceeds the limit by the time Save runs.
+            # Kept anyway (2026-08-29 live bug report) rather than trusting that invariant blindly:
+            # if it's ever violated in some case not yet understood, silently truncating and
+            # saying nothing would repeat the exact "Save said success but a selection got
+            # silently dropped" complaint this whole fix exists to resolve.
+            over_limit = len(self.coordinator_ids) > CWL_COORDINATOR_LIMIT
+            if over_limit:
+                self.coordinators_by_clan[self.clan_tag] = self.coordinator_ids[:CWL_COORDINATOR_LIMIT]
 
             guild_id = str(self.guild.id)
             await CACHE.db_manager.save_cwl_clan_coordinators(guild_id, self.clan_tag, self.coordinator_ids)
@@ -1373,10 +1362,6 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
             else:
                 coordinators.pop(self.clan_tag, None)
 
-            from qapbot.i18n import t
-            user_id = str(interaction.user.id)
-            guild_id_for_t = interaction.guild.id if interaction.guild else None
-
             # Clear the "⚠️ Not saved yet" warning from the working message itself now that this
             # clan's selection actually matches what's persisted (2026-08-29 live bug report: the
             # warning was staying up even after a successful Save, since _on_save previously only
@@ -1388,14 +1373,18 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
             )
             await interaction.edit_original_response(content=self.build_content(status), view=self)
 
+            saved_key = (
+                'ui_components.cwl_coordinator_configuration.saved_message_was_clamped'
+                if over_limit else
+                'ui_components.cwl_coordinator_configuration.saved_message'
+            )
             msg = t(
-                'ui_components.cwl_coordinator_configuration.saved_message',
+                saved_key,
                 user_id=user_id, guild_id=guild_id_for_t,
                 clan=self._current_clan_label(), names=self._current_names_text(),
+                limit=CWL_COORDINATOR_LIMIT,
             )
             await interaction.followup.send(msg, ephemeral=True)
-        finally:
-            self._busy = False
 
     async def _refresh_message(self, interaction: discord.Interaction) -> None:
         from qapbot.i18n import t
