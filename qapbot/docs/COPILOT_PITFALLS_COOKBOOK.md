@@ -2310,3 +2310,52 @@ push a refresh to each one explicitly, not just the one holding the interaction 
 the change. If a refresh target can't tell you what state to render itself into (no "current
 mode" of its own), detect it from that target's own live state rather than assuming — never pass
 a hardcoded value that might silently overwrite an unrelated choice the viewer already made.
+
+---
+
+## Pitfall 51: Pitfall 49's "drop, don't queue" re-entrancy guard is only safe when the dropped event carries NO new information — for a handler whose event payload can differ each time (a growing multi-select), dropping loses real user input
+
+**Symptom (tracker #0072, follow-up live bug report, 2026-08-29):** `CwlCoordinatorConfigurationView`
+had just been given a re-entrancy guard, built exactly to Pitfall 49's own prescription, to fix a
+DIFFERENT race (chip-removal-then-immediate-Save persisting the pre-removal selection). The very
+next live test showed a new failure: picking 3 coordinators in quick succession got "Save
+successful", but only the FIRST of the three selections had actually persisted — the later
+selection-change event(s) vanished with no error, no warning, nothing.
+
+**Root cause:** Pitfall 49's guard shape — `if self._busy: return (bare defer, nothing else)` —
+is correct for handlers where a dropped second click is equivalent to the user never having
+clicked it at all (Verify, Set Primary, Unlink: idempotent-ish actions where "try again" recovers
+cleanly). `CwlCoordinatorConfigurationView._on_user_select` isn't that shape: Discord's UserSelect
+delivers the FULL current selection on every change event, so each successive click's payload is
+strictly new information (2 users, then 3, then whatever the user settles on) — dropping event N
+doesn't mean "the user's click didn't happen," it means "the view's own state now permanently
+disagrees with what the user actually picked," with no error surfaced anywhere. Worse, the
+server-side `CWL_COORDINATOR_LIMIT` clamp (`values[:CWL_COORDINATOR_LIMIT]`, added for tracker
+#0072's ORIGINAL report) lives inside the same handler the guard was dropping — so the guard
+didn't just lose an update, it disabled the very limit-enforcement it was sitting next to,
+letting Discord's own (uncorrected) 3-chip client-side display stand as if it had been accepted.
+
+**Fix:** replaced the busy-bool with an `asyncio.Lock` (`self._lock`, `__init__`). Every handler
+still `defer()`s immediately (so Discord never sees a timeout regardless of queue depth), then
+does its mutation inside `async with self._lock:` instead of checking-and-bailing. A second
+interaction landing mid-flight now WAITS instead of being dropped — processed in arrival order
+once the lock frees up, so no selection-change event is ever lost, and `_on_save` reading
+`self.coordinator_ids` inside the same lock is guaranteed to see every earlier-queued mutation's
+result, not a stale snapshot. This still closes the ORIGINAL Pitfall-49-style race (Save can't run
+concurrently with a mutation) while no longer discarding legitimate input. Also added a
+defense-in-depth clamp + explicit "only the first N were actually saved" warning message directly
+in `_on_save`, in case this invariant is ever violated by a path not yet understood — the
+principle this whole pitfall is really about: never let a safety mechanism fail silently when the
+thing it's guarding against can also just… happen anyway.
+
+**How to apply:** before reaching for Pitfall 49's drop-based guard on a NEW handler, ask
+whether a dropped event is truly redundant with "try again" — i.e., whether every future click on
+this same component will eventually deliver an equivalent, superseding payload the guard's next
+successful pass will pick up anyway (true for a fixed action like Verify or Unlink; NOT true for
+a multi-select, a text input, or anything else where each event's payload can carry genuinely
+different data the user typed/picked just once). If it's the latter, use a lock that queues
+instead of a flag that drops — same call-site shape (`async with self._lock:` vs.
+`if not self._guard_reentrant(): return`), same protection against Save-vs-mutation races, but
+no data loss. When in doubt, prefer the lock: queuing a redundant event is harmless, but dropping
+a non-redundant one is a silent correctness bug that live testing may not catch for a while (this
+one shipped, passed its own regression tests, and only surfaced on the NEXT live click sequence).
