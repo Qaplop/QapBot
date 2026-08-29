@@ -1,6 +1,15 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (17)
+- Fixed: tracker #0043 follow-up, notinvited.svg's own comment used " -- " as a dash separator,
+  which is illegal inside an XML/SVG comment (no double hyphen allowed in comment content). Since
+  the icon renders via a data:image/svg+xml <img> src, browsers parse it as strict XML rather than
+  lenient HTML, so the malformed comment made the whole icon fail to load (broken image) instead
+  of being harmlessly ignored. Reworded the comment; verified all 6 status icon SVGs parse cleanly
+  with ElementTree. Re-deployed to DEV.
+  File: activity/client/src/assets/notinvited.svg.
+
 2026-08-29 (16)
 - Added: tracker #0043, a new "Not Invited Yet" status/icon on the CWL Manage Teams board
   (activity/client) for a linked current clan member who's in this season's pool but has no
