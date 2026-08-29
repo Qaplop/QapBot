@@ -268,7 +268,7 @@ def test_player_hub_toggle_button_present_disabled_state():
 
     button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_player_hub")
     assert button.label == "Activate Player CWL Settings Hub Message"
-    assert button.style == discord.ButtonStyle.secondary
+    assert button.style == discord.ButtonStyle.success  # tracker #0067: activate = green
 
 
 @pytest.mark.discord
@@ -283,7 +283,42 @@ def test_player_hub_toggle_button_present_enabled_state():
 
     button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_player_hub")
     assert button.label == "Deactivate Player CWL Settings Hub Message"
-    assert button.style == discord.ButtonStyle.success
+    assert button.style == discord.ButtonStyle.danger  # tracker #0067: deactivate = red
+
+
+@pytest.mark.discord
+@pytest.mark.parametrize(
+    "custom_id,config_key,enabled_label_prefix",
+    [
+        ("cwl_settings_toggle_hub", "cwl_management_message_enabled", "Deactivate CWL Management"),
+        ("cwl_settings_toggle_player_hub", "cwl_player_hub_message_enabled", "Deactivate Player CWL"),
+        ("cwl_settings_toggle_include_all_accounts", "cwl_enrollment_include_all_linked_accounts", "Stop Including"),
+    ],
+)
+def test_toggle_button_color_reflects_its_own_action_not_current_state(
+    custom_id: str, config_key: str, enabled_label_prefix: str,
+) -> None:
+    """Tracker #0067: color must follow what clicking the button DOES (danger for an action
+    that deactivates/stops something, success for one that activates/starts it), not the
+    feature's current on/off state -- the previous code colored a button green whenever the
+    underlying flag was already True, which made "Deactivate ..." render green."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_settings_components
+
+    for enabled, expected_style, expected_prefix in [
+        (True, discord.ButtonStyle.danger, enabled_label_prefix),
+        (False, discord.ButtonStyle.success, None),
+    ]:
+        guild_id = hash((custom_id, enabled)) % 100000 + 600000  # unique per case, no cross-talk
+        CACHE.server_config[str(guild_id)] = {config_key: enabled}
+        view = discord.ui.View(timeout=None)
+
+        add_cwl_settings_components(view, guild_id)
+
+        button = next(c for c in view.children if getattr(c, "custom_id", None) == custom_id)
+        assert button.style == expected_style
+        if expected_prefix is not None:
+            assert button.label.startswith(expected_prefix)  # type: ignore[union-attr]
 
 
 @pytest.mark.discord

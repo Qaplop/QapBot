@@ -1,6 +1,17 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (15)
+- Fixed: tracker #0067, CWL Settings hub's three activate/deactivate toggle buttons ("CWL
+  Management Hub", "Player CWL Settings Hub", "Include All Linked Accounts") colored themselves
+  by current on/off state (green whenever the underlying flag was already True) instead of by
+  what clicking them actually does. That made "Deactivate ..." and "Stop Including ..." render
+  green -- backwards from clan_management's own role-toggle buttons, which already correctly
+  color by action (danger for disable, success for enable). Swapped all three to match: danger
+  when the button's action is to deactivate/stop, success when it's to activate/include.
+  File: qapbot/ui_cwl_roster.py. Tests: tests/discord/test_ui_cwl_roster.py (1 new parametrized,
+  2 existing style assertions corrected). 2777 tests pass.
+
 2026-08-29 (14)
 - Fixed: tracker #0068, /admin action:WAR_PREDICT modal had the CW/CWL attack-count mapping
   backwards -- label said "1 = regular CW, 2 = CWL", but regular CW is actually 2 attacks per

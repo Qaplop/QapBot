@@ -62,6 +62,9 @@ def add_cwl_settings_components(view: discord.ui.View, guild_id: int) -> None:
     channel_button.callback = _make_cwl_settings_channels_callback(view)  # type: ignore[assignment]
     view.add_item(channel_button)  # type: ignore[arg-type]
 
+    # tracker #0067: button color reflects the ACTION the click performs, not the current
+    # enabled/disabled state -- "Deactivate ..." is always danger (red), "Activate ..." is
+    # always success (green), regardless of which one that happens to be right now.
     hub_enabled = bool(guild_config.get("cwl_management_message_enabled", False))
     toggle_button = discord.ui.Button(
         label=(
@@ -69,7 +72,7 @@ def add_cwl_settings_components(view: discord.ui.View, guild_id: int) -> None:
             if hub_enabled
             else t('cwl.settings.button_activate_hub', guild_id=guild_id)
         ),
-        style=discord.ButtonStyle.success if hub_enabled else discord.ButtonStyle.secondary,
+        style=discord.ButtonStyle.danger if hub_enabled else discord.ButtonStyle.success,
         custom_id="cwl_settings_toggle_hub",
         row=1,
     )
@@ -85,7 +88,7 @@ def add_cwl_settings_components(view: discord.ui.View, guild_id: int) -> None:
             if player_hub_enabled
             else t('cwl.settings.button_activate_player_hub', guild_id=guild_id)
         ),
-        style=discord.ButtonStyle.success if player_hub_enabled else discord.ButtonStyle.secondary,
+        style=discord.ButtonStyle.danger if player_hub_enabled else discord.ButtonStyle.success,
         custom_id="cwl_settings_toggle_player_hub",
         row=1,
     )
@@ -112,7 +115,7 @@ def add_cwl_settings_components(view: discord.ui.View, guild_id: int) -> None:
             if include_all_accounts
             else t('cwl.settings.button_enable_include_all_accounts', guild_id=guild_id)
         ),
-        style=discord.ButtonStyle.success if include_all_accounts else discord.ButtonStyle.secondary,
+        style=discord.ButtonStyle.danger if include_all_accounts else discord.ButtonStyle.success,
         custom_id="cwl_settings_toggle_include_all_accounts",
         row=3,
     )
