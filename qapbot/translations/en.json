@@ -719,6 +719,14 @@
       "updated_message": "**War Notification Custodians**\n\nCurrently selected: {mentions}\n\nClick 'Save Configuration' to apply.",
       "saved_message": "✅ Custodians saved: {mentions}"
     },
+    "cwl_coordinator_configuration": {
+      "placeholder_clan_select": "Select a clan to configure...",
+      "placeholder_user_select": "Select up to 2 CWL coordinators...",
+      "button_clear": "❌ Clear All",
+      "button_save": "✅ Save Configuration",
+      "updated_message": "**CWL Coordinators — {clan}**\n\nCurrently selected: {mentions}\n\nClick 'Save Configuration' to apply.",
+      "saved_message": "✅ CWL coordinators saved for {clan}: {mentions}"
+    },
     "notification_settings": {
       "button_back_to_first": "⬅️ Back to first page",
       "button_load_more": "Load more players...",
@@ -954,6 +962,9 @@
       "signup_status_missing_dm": "New players without DM invitation",
       "signups_block_title": "Sign-Ups",
       "button_configure_clans": "Configure Participating Clans",
+      "button_manage_coordinators": "Manage CWL Coordinators",
+      "coordinators_no_clans": "⚠️ No clans configured for this guild yet — add one via Clan Family Management first.",
+      "coordinators_header": "**CWL Coordinators**\n\nSelect a clan, then up to 2 Discord users to serve as its CWL Coordinators. Standing per-clan config, independent of any one season — set once, carries forward automatically every CWL month.",
       "button_start_enrollment": "Start Enrollment",
       "button_manage_assignment": "Manage Teams",
       "button_open_enrollment_after_start": "Open Teams Management",

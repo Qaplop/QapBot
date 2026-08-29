@@ -1,6 +1,22 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (18)
+- Added: tracker #0046, CWL Coordinators — a new "Manage CWL Coordinators" button in the CWL
+  Management screen lets an admin assign up to 2 Discord users (any member of the guild, not
+  just that clan's own roster) as a clan's standing CWL Coordinators. Independent of any one CWL
+  season/event -- set once, carries forward automatically every CWL month, same as the clan's
+  identity itself -- rather than living on cwl_event_clans and needing to be re-picked each
+  season. New cwl_clan_coordinators DB table (mirrors guild_clan_custodians' shape, kept as a
+  separate table since custodians are a distinct war-notification-@mention role). UI mirrors
+  ui_clan_management.CustodianConfigurationView's UserSelect/Clear/Save mechanics, with a clan
+  picker in front since this button isn't opened already-scoped to one clan. This ticket is
+  config-only -- the "notify a coordinator when their assigned clan's members haven't joined by
+  CWL start" behavior itself is future work, not part of this change.
+  Files: qapbot/db_manager.py, qapbot/ui_cwl_roster.py, qapbot/translations/{en,de}.json.
+  Tests: tests/integration/test_guild_roles.py (7 new), tests/discord/test_ui_cwl_roster.py
+  (9 new, 1 existing row-count assertion updated). 2793 tests pass.
+
 2026-08-29 (17)
 - Fixed: tracker #0043 follow-up, notinvited.svg's own comment used " -- " as a dash separator,
   which is illegal inside an XML/SVG comment (no double hyphen allowed in comment content). Since

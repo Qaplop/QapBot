@@ -519,10 +519,12 @@ def test_clan_management_view_cwl_management_mode_constructs_without_row_conflic
         sent_message=sent_message, mode="cwl_management", timeout=300,
     )
 
-    # mode select + refresh + configure(web)/start(disabled)/delete/add_season — the row-3 slot
-    # is a single dynamically-labeled start/manage button now (slice 5), not two side by side.
+    # mode select + refresh + configure(web)/coordinators/start(disabled)/delete/add_season — the
+    # row-3 slot is a single dynamically-labeled start/manage button now (slice 5), not two side
+    # by side. "Manage CWL Coordinators" (tracker #0046) added 2026-08-29 — standing config, not
+    # season-gated, so it's always present regardless of event state.
     # (no season select: CACHE.db_manager is None here, so there are no events to list)
-    assert len(view.children) == 6
+    assert len(view.children) == 7
 
 
 @pytest.mark.discord
@@ -872,6 +874,7 @@ def test_cwl_start_at_discord_timestamp_renders_native_markup():
     assert cwl_start_at_discord_timestamp("not a date") is None
 
 
+@pytest.mark.discord
 def test_timezone_abbreviation_reflects_dst_state_at_season_start():
     from qapbot.QBdiscocmdshelper_cwl import timezone_abbreviation
 
@@ -881,6 +884,7 @@ def test_timezone_abbreviation_reflects_dst_state_at_season_start():
     assert timezone_abbreviation("UTC", "2026-09") == "UTC"
 
 
+@pytest.mark.discord
 def test_timezone_abbreviation_falls_back_to_the_raw_name_on_bad_input():
     from qapbot.QBdiscocmdshelper_cwl import timezone_abbreviation
 
@@ -2552,6 +2556,7 @@ async def test_find_active_cwl_participation_no_conflict_for_unrelated_clan(db):
     assert find_active_cwl_participation("9204", {"#CLAN2"}) == {}
 
 
+@pytest.mark.discord
 def test_find_active_cwl_participation_returns_empty_without_db_manager():
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import find_active_cwl_participation
@@ -2731,6 +2736,7 @@ async def test_resolve_prior_cwl_assignments_independent_of_current_clan(db):
     assert resolve_prior_cwl_assignments(["#P1"], ["#CLAN1"]) == {"#P1": "#CLAN1"}
 
 
+@pytest.mark.discord
 def test_resolve_prior_cwl_assignments_returns_empty_without_db_manager():
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
@@ -2739,6 +2745,7 @@ def test_resolve_prior_cwl_assignments_returns_empty_without_db_manager():
     assert resolve_prior_cwl_assignments(["#P1"], ["#CLAN1"]) == {}
 
 
+@pytest.mark.discord
 def test_resolve_prior_cwl_assignments_returns_empty_for_no_players():
     from qapbot.QBdiscocmdshelper_cwl import resolve_prior_cwl_assignments
 
@@ -2749,6 +2756,7 @@ def test_resolve_prior_cwl_assignments_returns_empty_for_no_players():
 # resolve_guild_member_clan_tags — CWL enrollment's candidate-pool source (2026-08-14)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.discord
 def test_resolve_guild_member_clan_tags_individual_and_family(monkeypatch):
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import resolve_guild_member_clan_tags
@@ -2762,6 +2770,7 @@ def test_resolve_guild_member_clan_tags_individual_and_family(monkeypatch):
     assert resolve_guild_member_clan_tags(9401) == ["#CLAN1", "#CLAN2", "#CLAN3"]
 
 
+@pytest.mark.discord
 def test_resolve_guild_member_clan_tags_dedupes_clan_in_both_direct_and_family(monkeypatch):
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import resolve_guild_member_clan_tags
@@ -2775,6 +2784,7 @@ def test_resolve_guild_member_clan_tags_dedupes_clan_in_both_direct_and_family(m
     assert resolve_guild_member_clan_tags(9402) == ["#CLAN1", "#CLAN2"]
 
 
+@pytest.mark.discord
 def test_resolve_guild_member_clan_tags_unknown_guild_returns_empty(monkeypatch):
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import resolve_guild_member_clan_tags
@@ -2789,18 +2799,21 @@ def test_resolve_guild_member_clan_tags_unknown_guild_returns_empty(monkeypatch)
 # project owner: 1.4x per league group, +3%/step within a group)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.discord
 def test_league_weight_baseline_for_bronze_iii():
     from qapbot.QBdiscocmdshelper_cwl import _league_weight
 
     assert _league_weight("Bronze League III") == pytest.approx(1.0)
 
 
+@pytest.mark.discord
 def test_league_weight_legend_is_about_ten_and_a_half_times_bronze():
     from qapbot.QBdiscocmdshelper_cwl import _league_weight
 
     assert _league_weight("Legend League") == pytest.approx(1.4 ** 7, rel=1e-9)
 
 
+@pytest.mark.discord
 def test_league_weight_one_group_step_is_1_4x():
     from qapbot.QBdiscocmdshelper_cwl import _league_weight
 
@@ -2809,6 +2822,7 @@ def test_league_weight_one_group_step_is_1_4x():
     assert champion_ii / master_ii == pytest.approx(1.4, rel=1e-9)
 
 
+@pytest.mark.discord
 def test_league_weight_subtier_bonus_orders_i_above_ii_above_iii():
     from qapbot.QBdiscocmdshelper_cwl import _league_weight
 
@@ -2818,6 +2832,7 @@ def test_league_weight_subtier_bonus_orders_i_above_ii_above_iii():
     assert w3 < w2 < w1
 
 
+@pytest.mark.discord
 def test_league_weight_unknown_tier_returns_baseline():
     from qapbot.QBdiscocmdshelper_cwl import _league_weight
 
@@ -2915,6 +2930,7 @@ async def test_compute_league_adjusted_skill_scores_absent_for_player_with_no_cw
     assert compute_league_adjusted_skill_scores(["#NEVERPLAYED"]) == {}
 
 
+@pytest.mark.discord
 def test_compute_league_adjusted_skill_scores_returns_empty_without_db_manager():
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import compute_league_adjusted_skill_scores
@@ -2984,6 +3000,7 @@ async def test_compute_avg_stars_per_attack_absent_for_player_with_no_cwl_histor
     assert compute_avg_stars_per_attack(["#NEVERPLAYED"]) == {}
 
 
+@pytest.mark.discord
 def test_compute_avg_stars_per_attack_returns_empty_without_db_manager():
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import compute_avg_stars_per_attack
@@ -3176,3 +3193,200 @@ async def test_cwl_preferences_command_does_nothing_outside_a_guild(mock_interac
     await QBdiscordcmds.cwl_preferences.callback(mock_interaction)  # type: ignore[arg-type]
 
     mock_interaction.client.http.request.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# "Manage CWL Coordinators" (tracker #0046) — standing (season-independent) per-clan CWL
+# Coordinators. add_cwl_management_components() button + _make_cwl_management_coordinators_
+# callback + CwlCoordinatorConfigurationView. Mirrors
+# tests/discord/test_ui_clan_management_custodians.py's coverage shape for
+# CustodianConfigurationView (identical UserSelect/Clear/Save mechanics, separate DB table).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+def test_add_cwl_management_components_always_includes_coordinators_button():
+    """Unlike every other button add_cwl_management_components() adds, this one is never gated
+    on an event existing — coordinators are standing config, independent of any one season."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    CACHE.server_config["9501"] = {}
+    CACHE.db_manager = None
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 9501)
+
+    coordinators_button = next(
+        (c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_manage_coordinators"), None
+    )
+    assert coordinators_button is not None
+    assert coordinators_button.disabled is not True  # type: ignore[union-attr]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_coordinators_callback_with_no_family_clans_sends_ephemeral_error(mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import _make_cwl_management_coordinators_callback
+
+    CACHE.server_config[str(mock_interaction.guild.id)] = {}
+    view = discord.ui.View(timeout=300)
+    callback = _make_cwl_management_coordinators_callback(view)
+
+    await callback(mock_interaction)
+
+    mock_interaction.response.send_message.assert_awaited_once()
+    _, kwargs = mock_interaction.response.send_message.call_args
+    assert kwargs.get("ephemeral") is True
+    mock_interaction.followup.send.assert_not_awaited()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_coordinators_callback_opens_view_seeded_from_cache(mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import _make_cwl_management_coordinators_callback, CwlCoordinatorConfigurationView
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.server_config[guild_id_str] = {
+        "member_clans": ["#CLAN1", "#CLAN2"],
+        "cwl_clan_coordinators": {"#CLAN1": ["111", "222"]},
+    }
+    view = discord.ui.View(timeout=300)
+    callback = _make_cwl_management_coordinators_callback(view)
+
+    await callback(mock_interaction)
+
+    mock_interaction.followup.send.assert_awaited_once()
+    _, kwargs = mock_interaction.followup.send.call_args
+    coordinators_view = kwargs["view"]
+    assert isinstance(coordinators_view, CwlCoordinatorConfigurationView)
+    assert coordinators_view.clan_tag == "#CLAN1"
+    assert coordinators_view.coordinator_ids == ["111", "222"]
+
+
+@pytest.mark.discord
+def test_coordinator_user_select_enforces_cap_of_two(mock_interaction):
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView, CWL_COORDINATOR_LIMIT
+
+    view = CwlCoordinatorConfigurationView(
+        guild=mock_interaction.guild, clan_tags=["#CLAN1"], current_coordinator_ids_by_clan={},
+    )
+    user_select = next(c for c in view.children if isinstance(c, discord.ui.UserSelect))
+    assert CWL_COORDINATOR_LIMIT == 2
+    assert user_select.max_values == 2
+    assert user_select.min_values == 0
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_coordinator_user_select_callback_updates_state_for_current_clan_only(mock_interaction):
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    view = CwlCoordinatorConfigurationView(
+        guild=mock_interaction.guild,
+        clan_tags=["#CLAN1", "#CLAN2"],
+        current_coordinator_ids_by_clan={"#CLAN2": ["999"]},
+    )
+    mock_interaction.data = {"values": ["333", "444"]}
+    mock_interaction.edit_original_response = AsyncMock()
+
+    await view._on_user_select(mock_interaction)
+
+    assert view.coordinators_by_clan["#CLAN1"] == ["333", "444"]
+    assert view.coordinators_by_clan["#CLAN2"] == ["999"]  # untouched
+    mock_interaction.edit_original_response.assert_awaited_once()
+    _, kwargs = mock_interaction.edit_original_response.call_args
+    assert "333" in kwargs["content"]
+    assert "444" in kwargs["content"]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_coordinator_clan_select_switches_working_clan_and_reloads_its_selection(mock_interaction):
+    """Switching clans via the picker must show THAT clan's own current selection, not carry
+    over whatever was showing for the previously-selected clan."""
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    view = CwlCoordinatorConfigurationView(
+        guild=mock_interaction.guild,
+        clan_tags=["#CLAN1", "#CLAN2"],
+        current_coordinator_ids_by_clan={"#CLAN1": ["111"], "#CLAN2": ["222"]},
+    )
+    assert view.clan_tag == "#CLAN1"
+    assert view.coordinator_ids == ["111"]
+
+    mock_interaction.data = {"values": ["#CLAN2"]}
+    mock_interaction.edit_original_response = AsyncMock()
+
+    await view._on_clan_select(mock_interaction)
+
+    assert view.clan_tag == "#CLAN2"
+    assert view.coordinator_ids == ["222"]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_coordinator_clear_button_empties_selection_for_current_clan_only(mock_interaction):
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    view = CwlCoordinatorConfigurationView(
+        guild=mock_interaction.guild,
+        clan_tags=["#CLAN1", "#CLAN2"],
+        current_coordinator_ids_by_clan={"#CLAN1": ["111"], "#CLAN2": ["222"]},
+    )
+    mock_interaction.edit_original_response = AsyncMock()
+
+    await view._on_clear(mock_interaction)
+
+    assert view.coordinators_by_clan["#CLAN1"] == []
+    assert view.coordinators_by_clan["#CLAN2"] == ["222"]  # untouched
+    clear_button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_coordinator_clear")
+    assert clear_button.disabled is True  # type: ignore[union-attr]
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_coordinator_save_persists_current_clan_and_updates_cache(mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.server_config[guild_id_str] = {}
+    CACHE.db_manager = MagicMock()
+    CACHE.db_manager.save_cwl_clan_coordinators = AsyncMock()
+
+    view = CwlCoordinatorConfigurationView(
+        guild=mock_interaction.guild,
+        clan_tags=["#CLAN1"],
+        current_coordinator_ids_by_clan={"#CLAN1": ["111", "222"]},
+    )
+
+    await view._on_save(mock_interaction)
+
+    CACHE.db_manager.save_cwl_clan_coordinators.assert_awaited_once_with(guild_id_str, "#CLAN1", ["111", "222"])
+    assert CACHE.server_config[guild_id_str]["cwl_clan_coordinators"]["#CLAN1"] == ["111", "222"]
+    mock_interaction.followup.send.assert_awaited_once()
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_coordinator_save_with_empty_selection_clears_cache_entry(mock_interaction):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    guild_id_str = str(mock_interaction.guild.id)
+    CACHE.server_config[guild_id_str] = {"cwl_clan_coordinators": {"#CLAN1": ["111"]}}
+    CACHE.db_manager = MagicMock()
+    CACHE.db_manager.save_cwl_clan_coordinators = AsyncMock()
+
+    view = CwlCoordinatorConfigurationView(
+        guild=mock_interaction.guild,
+        clan_tags=["#CLAN1"],
+        current_coordinator_ids_by_clan={},
+    )
+
+    await view._on_save(mock_interaction)
+
+    CACHE.db_manager.save_cwl_clan_coordinators.assert_awaited_once_with(guild_id_str, "#CLAN1", [])
+    assert "#CLAN1" not in CACHE.server_config[guild_id_str]["cwl_clan_coordinators"]

@@ -2454,6 +2454,29 @@ class WarHistoryDB:
             "CREATE INDEX IF NOT EXISTS idx_guild_clan_custodians_guild_id ON guild_clan_custodians(guild_id)"
         )
 
+        # Standing per-clan CWL Coordinators (tracker #0046): up to CWL_COORDINATOR_LIMIT
+        # (ui_cwl_roster.py) Discord users per clan, independent of any one CWL season/event —
+        # set once, carries forward automatically every CWL month, same "standing config" shape
+        # as guild_clan_roles/guild_clan_custodians above rather than living on cwl_event_clans.
+        # A separate table from guild_clan_custodians (not a reuse) despite the identical shape:
+        # custodians are for war-notification @mentions, coordinators are a distinct CWL-specific
+        # role (planned use: notifying someone when their assigned clan's members don't join
+        # during the CWL start phase) — conflating the two would make one purpose's config bleed
+        # into the other's UI.
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS cwl_clan_coordinators (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                clan_tag TEXT NOT NULL,
+                discord_user_id TEXT NOT NULL,
+                FOREIGN KEY (guild_id) REFERENCES guild_config(guild_id) ON DELETE CASCADE,
+                UNIQUE (guild_id, clan_tag, discord_user_id)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_clan_coordinators_guild_id ON cwl_clan_coordinators(guild_id)"
+        )
+
         # Subscriptions table
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -9367,6 +9390,17 @@ class WarHistoryDB:
         for custodian_row in await custodians_cursor.fetchall():
             clan_custodians.setdefault(custodian_row["clan_tag"], []).append(custodian_row["discord_user_id"])
 
+        # Load standing per-clan CWL coordinators (tracker #0046, multiple Discord users per
+        # clan_tag) — same shape as clan_custodians above, separate table (see
+        # cwl_clan_coordinators' own CREATE TABLE comment for why).
+        cwl_coordinators_cursor = await self._conn.execute(
+            "SELECT clan_tag, discord_user_id FROM cwl_clan_coordinators WHERE guild_id = ?",
+            (guild_id,)
+        )
+        cwl_clan_coordinators: Dict[str, List[str]] = {}
+        for coordinator_row in await cwl_coordinators_cursor.fetchall():
+            cwl_clan_coordinators.setdefault(coordinator_row["clan_tag"], []).append(coordinator_row["discord_user_id"])
+
         # Access by column name – immune to column order changes from ALTER TABLE migrations.
         return {
             "language": row["language"],
@@ -9396,6 +9430,7 @@ class WarHistoryDB:
             "member_clans": clans,
             "clan_roles": clan_roles,
             "clan_custodians": clan_custodians,
+            "cwl_clan_coordinators": cwl_clan_coordinators,
             "cwl_player_hub_channel_id": row["cwl_player_hub_channel_id"],
             "cwl_player_hub_message_id": row["cwl_player_hub_message_id"],
             "cwl_player_hub_message_enabled": bool(row["cwl_player_hub_message_enabled"]) if row["cwl_player_hub_message_enabled"] is not None else False,
@@ -9613,6 +9648,24 @@ class WarHistoryDB:
             if user_ids:
                 await self._conn.executemany(
                     "INSERT INTO guild_clan_custodians (guild_id, clan_tag, discord_user_id) VALUES (?, ?, ?)",
+                    [(guild_id, clan_tag, uid) for uid in user_ids]
+                )
+            await self._conn.commit()
+
+    async def save_cwl_clan_coordinators(self, guild_id: str, clan_tag: str, user_ids: List[str]) -> None:
+        """Replace the full set of standing CWL coordinators for a guild+clan (upsert-by-replace),
+        tracker #0046. Independent of any season/event — same shape as
+        save_guild_clan_custodians above, separate table (see cwl_clan_coordinators' own CREATE
+        TABLE comment for why coordinators and custodians stay distinct)."""
+        await self._ensure_connection()
+        async with self._write_lock:
+            await self._conn.execute(
+                "DELETE FROM cwl_clan_coordinators WHERE guild_id = ? AND clan_tag = ?",
+                (guild_id, clan_tag)
+            )
+            if user_ids:
+                await self._conn.executemany(
+                    "INSERT INTO cwl_clan_coordinators (guild_id, clan_tag, discord_user_id) VALUES (?, ?, ?)",
                     [(guild_id, clan_tag, uid) for uid in user_ids]
                 )
             await self._conn.commit()

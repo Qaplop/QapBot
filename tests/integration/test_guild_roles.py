@@ -222,3 +222,87 @@ class TestGuildClanCustodiansCRUD:
         row = await cursor.fetchone()
         assert row is not None
         assert row["cnt"] == 0
+
+
+@pytest.mark.integration
+class TestCwlClanCoordinatorsCRUD:
+    """save_cwl_clan_coordinators + get_guild_config returns cwl_clan_coordinators (tracker
+    #0046) — mirrors TestGuildClanCustodiansCRUD above (identical shape, separate table)."""
+
+    async def test_save_and_retrieve_coordinators(self, db: "WarHistoryDB"):
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        await db.save_cwl_clan_coordinators(GUILD_ID, "#CLAN1", ["111", "222"])
+
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert loaded["cwl_clan_coordinators"] == {"#CLAN1": ["111", "222"]}
+
+    async def test_replace_overwrites_previous_set(self, db: "WarHistoryDB"):
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        await db.save_cwl_clan_coordinators(GUILD_ID, "#CLAN1", ["111", "222"])
+        await db.save_cwl_clan_coordinators(GUILD_ID, "#CLAN1", ["333"])
+
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert loaded["cwl_clan_coordinators"]["#CLAN1"] == ["333"]
+
+    async def test_empty_list_clears_coordinators(self, db: "WarHistoryDB"):
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        await db.save_cwl_clan_coordinators(GUILD_ID, "#CLAN1", ["111"])
+        await db.save_cwl_clan_coordinators(GUILD_ID, "#CLAN1", [])
+
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert "#CLAN1" not in loaded["cwl_clan_coordinators"]
+
+    async def test_multiple_clans_independent(self, db: "WarHistoryDB"):
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        await db.save_cwl_clan_coordinators(GUILD_ID, "#A", ["1"])
+        await db.save_cwl_clan_coordinators(GUILD_ID, "#B", ["2", "3"])
+
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert loaded["cwl_clan_coordinators"]["#A"] == ["1"]
+        assert loaded["cwl_clan_coordinators"]["#B"] == ["2", "3"]
+
+        await db.save_cwl_clan_coordinators(GUILD_ID, "#A", [])
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert "#A" not in loaded["cwl_clan_coordinators"]
+        assert loaded["cwl_clan_coordinators"]["#B"] == ["2", "3"]
+
+    async def test_coordinators_empty_when_none_saved(self, db: "WarHistoryDB"):
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert loaded["cwl_clan_coordinators"] == {}
+
+    async def test_cascade_delete_on_guild_config_removal(self, db: "WarHistoryDB"):
+        """Deleting guild_config should cascade-delete cwl_clan_coordinators."""
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        await db.save_cwl_clan_coordinators(GUILD_ID, "#CLAN1", ["111"])
+
+        async with db._write_lock:  # type: ignore[reportPrivateUsage]
+            await db.conn.execute(  # type: ignore[union-attr]
+                "DELETE FROM guild_config WHERE guild_id = ?", (GUILD_ID,)
+            )
+            await db.conn.commit()  # type: ignore[union-attr]
+
+        cursor = await db.conn.execute(  # type: ignore[union-attr]
+            "SELECT COUNT(*) AS cnt FROM cwl_clan_coordinators WHERE guild_id = ?", (GUILD_ID,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["cnt"] == 0
+
+    async def test_custodians_and_coordinators_stay_independent(self, db: "WarHistoryDB"):
+        """The two tables must never bleed into each other despite the identical shape — a
+        custodian for a clan is not automatically a coordinator, and vice versa."""
+        await db.save_guild_config(GUILD_ID, {"language": "en"})
+        await db.save_guild_clan_custodians(GUILD_ID, "#CLAN1", ["111"])
+        await db.save_cwl_clan_coordinators(GUILD_ID, "#CLAN1", ["222"])
+
+        loaded = await db.get_guild_config(GUILD_ID)
+        assert loaded is not None
+        assert loaded["clan_custodians"]["#CLAN1"] == ["111"]
+        assert loaded["cwl_clan_coordinators"]["#CLAN1"] == ["222"]

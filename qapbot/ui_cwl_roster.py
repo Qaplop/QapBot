@@ -410,6 +410,24 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     configure_button.callback = _make_cwl_management_open_web_callback(view)  # type: ignore[assignment]
     view.add_item(configure_button)  # type: ignore[arg-type]
 
+    # "Manage CWL Coordinators" (tracker #0046) — unlike every other button in this row, NOT
+    # season-scoped: coordinators are standing per-clan config (see cwl_clan_coordinators' own
+    # CREATE TABLE comment, db_manager.py) that carries forward automatically every CWL month, so
+    # this button is never gated on `event` existing. Placed in row 3 anyway, right after
+    # "Configure Participating Clans" (the other per-clan-config action), rather than getting its
+    # own row — rows 0-2 are already fully claimed in one or both of this function's two calling
+    # shells (row 0: refresh/hub-toggle buttons; row 1: the season select above; row 2:
+    # ClanManagementView's own mode select, ui_clan_management.py) and row 3 always has at least
+    # one free slot (configure/start/delete is 3, +add_season is at most 4, Discord's cap is 5).
+    coordinators_button = discord.ui.Button(
+        label=t('cwl.management.button_manage_coordinators', guild_id=guild_id),
+        style=discord.ButtonStyle.secondary,
+        custom_id="cwl_management_manage_coordinators",
+        row=3,
+    )
+    coordinators_button.callback = _make_cwl_management_coordinators_callback(view)  # type: ignore[assignment]
+    view.add_item(coordinators_button)  # type: ignore[arg-type]
+
     # Start Enrollment / Manage Assignment — one dynamically-labeled button in the same row-3
     # slot ("Manage Enrollment", 2026-08-10): "Start Enrollment" while the event is still draft
     # (unchanged Phase 2 gating/callback), "Manage Assignment" once signup_open or later — opens
@@ -962,6 +980,232 @@ def _make_cwl_management_open_enrollment_web_callback(view: discord.ui.View):
             await _launch_cwl_activity(interaction, guild_id, "enrollment")
 
     return callback
+
+
+CWL_COORDINATOR_LIMIT = 2
+
+
+def _make_cwl_management_coordinators_callback(view: discord.ui.View):
+    """Opens the CwlCoordinatorConfigurationView (tracker #0046) for the "Manage CWL
+    Coordinators" button — a fresh ephemeral message, same shape as
+    _make_cwl_management_notify_new_members_callback below, rather than editing the anchored Hub
+    message itself (this config isn't part of that message's own content)."""
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        if not interaction.guild:
+            return
+        guild_id_int = interaction.guild.id
+
+        from qapbot.i18n import t
+        from qapbot.QBdiscocmdshelper_cwl import resolve_guild_member_clan_tags
+
+        clan_tags = resolve_guild_member_clan_tags(guild_id_int)
+        if not clan_tags:
+            await interaction.response.send_message(
+                t('cwl.management.coordinators_no_clans', guild_id=guild_id_int), ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        guild_id_str = str(guild_id_int)
+        current_by_clan = CACHE.server_config.get(guild_id_str, {}).get("cwl_clan_coordinators", {})
+
+        coordinators_view = CwlCoordinatorConfigurationView(
+            guild=interaction.guild,
+            clan_tags=clan_tags,
+            current_coordinator_ids_by_clan=current_by_clan,
+            timeout=300,
+        )
+        header = t('cwl.management.coordinators_header', guild_id=guild_id_int)
+        await interaction.followup.send(header, view=coordinators_view, ephemeral=True)  # type: ignore[arg-type]
+
+    return callback
+
+
+class CwlCoordinatorConfigurationView(discord.ui.View):
+    """Tracker #0046 — standing (season-independent) per-clan CWL Coordinators: up to
+    CWL_COORDINATOR_LIMIT Discord users per clan, any member of the guild (not restricted to
+    that clan's own roster — project owner's spec), persisted independent of any one season so
+    they carry forward automatically every CWL month rather than needing to be re-picked. Mirrors
+    ui_clan_management.CustodianConfigurationView's UserSelect/Clear/Save shape almost exactly,
+    with one addition up front: a clan picker, since "Manage CWL Coordinators" is reached without
+    the caller already knowing which single clan the admin wants (unlike CustodianConfigurationView,
+    which is only ever opened from a screen already scoped to one clan_tag).
+    """
+
+    def __init__(
+        self,
+        guild: discord.Guild,
+        clan_tags: List[str],
+        current_coordinator_ids_by_clan: Dict[str, List[str]],
+        timeout: int = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.clan_tags = clan_tags
+        # Own working copy — edits here must never mutate the CACHE dict the caller passed in
+        # until Save actually runs (same "hold in a working copy, only persist on an explicit
+        # action" discipline the web Activity's clanConfigTable.ts uses).
+        self.coordinators_by_clan: Dict[str, List[str]] = {
+            tag: list(ids) for tag, ids in current_coordinator_ids_by_clan.items()
+        }
+        self.clan_tag = clan_tags[0]
+        self._rebuild_counter = 0
+
+        self._add_clan_select()
+        self._add_user_select()
+        self._add_clear_button()
+        self._add_save_button()
+
+    @property
+    def coordinator_ids(self) -> List[str]:
+        return self.coordinators_by_clan.get(self.clan_tag, [])
+
+    def _add_clan_select(self) -> None:
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+
+        options = []
+        for tag in sorted(self.clan_tags, key=lambda tag: (CACHE.get_clan_name(tag, tag) or tag).lower())[:25]:
+            name = CACHE.get_clan_name(tag, tag)
+            label = f"{name} ({tag})"
+            if len(label) > 100:
+                label = label[:97] + "..."
+            options.append(discord.SelectOption(label=label, value=tag, default=(tag == self.clan_tag)))
+
+        clan_select: discord.ui.Select[Any] = discord.ui.Select(
+            placeholder=t('ui_components.cwl_coordinator_configuration.placeholder_clan_select', guild_id=guild_id),
+            min_values=1,
+            max_values=1,
+            options=options,  # type: ignore[arg-type]
+            custom_id=f"cwl_coordinator_clan_select_{self._rebuild_counter}",
+            row=0,
+        )
+        clan_select.callback = self._on_clan_select  # type: ignore[assignment]
+        self.add_item(clan_select)  # type: ignore[arg-type]
+
+    def _add_user_select(self) -> None:
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+        default_values = [discord.Object(id=int(uid)) for uid in self.coordinator_ids] or None
+
+        # Dynamic custom_id forces Discord to treat this as a new component after rebuilds (same
+        # fix CustodianConfigurationView._add_user_select() applies for the same stale-selection
+        # issue).
+        user_select = discord.ui.UserSelect(
+            placeholder=t('ui_components.cwl_coordinator_configuration.placeholder_user_select', guild_id=guild_id),
+            min_values=0,
+            max_values=CWL_COORDINATOR_LIMIT,
+            custom_id=f"cwl_coordinator_user_select_{self._rebuild_counter}",
+            row=1,
+            default_values=default_values,  # type: ignore[arg-type]
+        )
+        user_select.callback = self._on_user_select  # type: ignore[assignment]
+        self.add_item(user_select)  # type: ignore[arg-type]
+
+    def _add_clear_button(self) -> None:
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+
+        clear_button = discord.ui.Button(
+            label=t('ui_components.cwl_coordinator_configuration.button_clear', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_coordinator_clear",
+            row=2,
+            disabled=(len(self.coordinator_ids) == 0),
+        )
+        clear_button.callback = self._on_clear  # type: ignore[assignment]
+        self.add_item(clear_button)  # type: ignore[arg-type]
+
+    def _add_save_button(self) -> None:
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+
+        save_button = discord.ui.Button(
+            label=t('ui_components.cwl_coordinator_configuration.button_save', guild_id=guild_id),
+            style=discord.ButtonStyle.success,
+            custom_id="cwl_coordinator_save",
+            row=2,
+        )
+        save_button.callback = self._on_save  # type: ignore[assignment]
+        self.add_item(save_button)  # type: ignore[arg-type]
+
+    def _rebuild_view(self) -> None:
+        self._rebuild_counter += 1
+        self.clear_items()
+        self._add_clan_select()
+        self._add_user_select()
+        self._add_clear_button()
+        self._add_save_button()
+
+    def _current_clan_label(self) -> str:
+        return f"{CACHE.get_clan_name(self.clan_tag, self.clan_tag)} ({self.clan_tag})"
+
+    def _current_mentions_text(self) -> str:
+        if not self.coordinator_ids:
+            return "❌ None selected"
+        return " ".join(f"<@{uid}>" for uid in self.coordinator_ids)
+
+    async def _on_clan_select(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        values = interaction.data.get('values', [])  # type: ignore[union-attr]
+        if values:
+            self.clan_tag = values[0]
+        self._rebuild_view()
+        await self._refresh_message(interaction)
+
+    async def _on_user_select(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        self.coordinators_by_clan[self.clan_tag] = interaction.data.get('values', [])  # type: ignore[union-attr]
+        self._rebuild_view()
+        await self._refresh_message(interaction)
+
+    async def _on_clear(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        self.coordinators_by_clan[self.clan_tag] = []
+        self._rebuild_view()
+        await self._refresh_message(interaction)
+
+    async def _on_save(self, interaction: discord.Interaction) -> None:
+        """Persist the coordinator configuration for the currently-selected clan only — matches
+        CustodianConfigurationView._on_apply's own "one clan at a time" scope; switching clans
+        via the picker without saving discards that clan's unsaved edits, same as navigating away
+        from a form without submitting."""
+        await interaction.response.defer(thinking=False, ephemeral=True)
+
+        guild_id = str(self.guild.id)
+        await CACHE.db_manager.save_cwl_clan_coordinators(guild_id, self.clan_tag, self.coordinator_ids)
+
+        if guild_id not in CACHE.server_config:
+            CACHE.server_config[guild_id] = {}
+        coordinators = CACHE.server_config[guild_id].setdefault("cwl_clan_coordinators", {})
+        if self.coordinator_ids:
+            coordinators[self.clan_tag] = self.coordinator_ids
+        else:
+            coordinators.pop(self.clan_tag, None)
+
+        from qapbot.i18n import t
+        user_id = str(interaction.user.id)
+        guild_id_for_t = interaction.guild.id if interaction.guild else None
+        msg = t(
+            'ui_components.cwl_coordinator_configuration.saved_message',
+            user_id=user_id, guild_id=guild_id_for_t,
+            clan=self._current_clan_label(), mentions=self._current_mentions_text(),
+        )
+        await interaction.followup.send(msg, ephemeral=True)
+
+    async def _refresh_message(self, interaction: discord.Interaction) -> None:
+        from qapbot.i18n import t
+        user_id = str(interaction.user.id)
+        guild_id_for_t = interaction.guild.id if interaction.guild else None
+        msg = t(
+            'ui_components.cwl_coordinator_configuration.updated_message',
+            user_id=user_id, guild_id=guild_id_for_t,
+            clan=self._current_clan_label(), mentions=self._current_mentions_text(),
+        )
+        await interaction.edit_original_response(content=msg, view=self)
 
 
 class CwlDeleteSeasonConfirmView(discord.ui.View):
