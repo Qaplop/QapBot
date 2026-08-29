@@ -464,7 +464,10 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     # one free slot (configure/start/delete is 3, +add_season is at most 4, Discord's cap is 5).
     coordinators_button = discord.ui.Button(
         label=t('cwl.management.button_manage_coordinators', guild_id=guild_id),
-        style=discord.ButtonStyle.secondary,
+        # Blue/primary (tracker #0071, project owner's spec): "since it is a setting it should be
+        # blue" — matches "Configure Participating Clans" right next to it, the other
+        # per-clan-config action in this row.
+        style=discord.ButtonStyle.primary,
         custom_id="cwl_management_manage_coordinators",
         row=3,
     )
@@ -1062,7 +1065,8 @@ def _make_cwl_management_coordinators_callback(view: discord.ui.View):
             timeout=300,
         )
         header = t('cwl.management.coordinators_header', guild_id=guild_id_int)
-        await interaction.followup.send(header, view=coordinators_view, ephemeral=True)  # type: ignore[arg-type]
+        content = coordinators_view.build_content(header)
+        await interaction.followup.send(content, view=coordinators_view, ephemeral=True)  # type: ignore[arg-type]
 
     return callback
 
@@ -1186,6 +1190,70 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
     def _current_clan_label(self) -> str:
         return f"{CACHE.get_clan_name(self.clan_tag, self.clan_tag)} ({self.clan_tag})"
 
+    def _build_active_clans_table(self) -> str:
+        """Tracker #0071 (project owner's spec): "Clan | Coordinators" for every clan actually
+        active in the CURRENTLY SELECTED CWL season — deliberately narrower than self.clan_tags
+        (the clan picker below covers the whole family, since coordinators are standing config
+        independent of any one season) since this table answers "who's covering THIS month's
+        CWL", not "every clan that could ever have coordinators". Reflects live in-progress
+        edits (self.coordinators_by_clan), not just what's already saved, so picking someone is
+        immediately visible here too, before Save."""
+        from qapbot.i18n import t
+        from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+
+        guild_id = self.guild.id if self.guild else None
+        db = CACHE.db_manager
+        no_season_text = t('cwl.management.coordinators_table_no_season', guild_id=guild_id)
+        if db is None or guild_id is None:
+            return no_season_text
+
+        season = resolve_selected_cwl_season(guild_id)
+        event = db.get_cwl_event_sync(str(guild_id), season)
+        if event is None:
+            return no_season_text
+
+        active_clans = [c for c in db.get_cwl_event_clans_sync(event["id"]) if c.get("participating", 1)]
+        if not active_clans:
+            return no_season_text
+
+        header_clan = t('cwl.management.table_header_clan', guild_id=guild_id)
+        header_coord = t('cwl.management.table_header_coordinators', guild_id=guild_id)
+        none_label = t('cwl.management.coordinators_table_none', guild_id=guild_id)
+
+        rows = []
+        for c in sorted(active_clans, key=lambda c: (CACHE.get_clan_name(c["clan_tag"], c["clan_tag"]) or c["clan_tag"]).lower()):
+            name = CACHE.get_clan_name(c["clan_tag"], c["clan_tag"]) or c["clan_tag"]
+            coord_ids = self.coordinators_by_clan.get(c["clan_tag"], [])
+            if coord_ids:
+                # Plain display names, not <@id> mention syntax — mentions don't resolve inside a
+                # code block (they'd render as literal, broken-looking text), same reasoning the
+                # season overview's own "Participating Clans" table already follows for names.
+                names = []
+                for uid in coord_ids:
+                    member = self.guild.get_member(int(uid)) if self.guild else None
+                    names.append(member.display_name if member else f"<@{uid}>")
+                coord_text = ", ".join(names)
+            else:
+                coord_text = none_label
+            rows.append((name, coord_text))
+
+        name_w = max(len(header_clan), *(len(r[0]) for r in rows))
+        coord_w = max(len(header_coord), *(len(r[1]) for r in rows))
+        lines = [
+            f"{header_clan.ljust(name_w)}  {header_coord}",
+            f"{'-' * name_w}  {'-' * coord_w}",
+        ]
+        for name, coord_text in rows:
+            lines.append(f"{name.ljust(name_w)}  {coord_text}")
+        return "```\n" + "\n".join(lines) + "\n```"
+
+    def build_content(self, body: str) -> str:
+        """Prepends the active-clans table (tracker #0071: "Put the table in front of the info
+        text and the clan selection") to whatever status/info text is currently showing — the
+        clan-select/user-select components themselves always render below any text content
+        regardless, so putting the table first here is the whole of what "in front of" means."""
+        return f"{self._build_active_clans_table()}\n\n{body}"
+
     def _current_mentions_text(self) -> str:
         if not self.coordinator_ids:
             return "❌ None selected"
@@ -1201,7 +1269,15 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
 
     async def _on_user_select(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=False, ephemeral=False)
-        self.coordinators_by_clan[self.clan_tag] = interaction.data.get('values', [])  # type: ignore[union-attr]
+        # Tracker #0072 (live bug report): Discord's own client-side max_values enforcement isn't
+        # airtight for a UserSelect that was just replaced with a new custom_id + fresh
+        # default_values (this component is rebuilt from scratch on every change, per the dynamic
+        # custom_id below) — a live report showed 3 users getting through despite
+        # max_values=CWL_COORDINATOR_LIMIT (2). Clamp server-side regardless of why the client let
+        # it happen — never trust the client for the real limit, same discipline
+        # clanConfigTable.ts's own guest-search length check already applies.
+        values = interaction.data.get('values', [])[:CWL_COORDINATOR_LIMIT]  # type: ignore[union-attr]
+        self.coordinators_by_clan[self.clan_tag] = values
         self._rebuild_view()
         await self._refresh_message(interaction)
 
@@ -1248,7 +1324,7 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
             user_id=user_id, guild_id=guild_id_for_t,
             clan=self._current_clan_label(), mentions=self._current_mentions_text(),
         )
-        await interaction.edit_original_response(content=msg, view=self)
+        await interaction.edit_original_response(content=self.build_content(msg), view=self)
 
 
 class CwlDeleteSeasonConfirmView(discord.ui.View):

@@ -500,14 +500,15 @@ async def format_clan_management_cwl_management(
     )
     # Tracker #0042 (live bug report, "ungleiche zahlen" — this line's number didn't match
     # "Notify New Pool Members"' own "Skipped (no linked account)" result count): the two are
-    # NOT the same population and were never meant to match. This line ("Unlinked sign-ups", the
-    # i18n key literally says "signup_status_*") is scoped to players who already have a pending
+    # NOT the same population and were never meant to match. This line (i18n key
+    # signup_status_unlinked, label "Unlinked players" — tracker #0073, reverted from an
+    # interim "Unlinked sign-ups" wording) is scoped to players who already have a pending
     # cwl_signups row (split_cwl_pending_signups_by_link_sync's docstring). The notify/start/
     # remind action summaries' "Skipped (no linked account)" is scoped to the FULL current pool —
     # every guild-member-clan member, resolved fresh via resolve_cwl_pool_dm_targets_sync — which
     # is a superset that also includes members who've never been seeded into cwl_signups at all.
-    # Renamed "Unlinked accounts" -> "Unlinked sign-ups" (and DE equivalent) to make that scope
-    # explicit rather than reading as "unlinked accounts in this clan" — no data/logic change.
+    # The label itself no longer spells this scope out (project owner's preference, #0073) — this
+    # comment is the only remaining record of the distinction; no data/logic change either time.
     signup_lines = [
         f"{t('cwl.management.signup_status_unlinked', guild_id=guild_id_int)}: {pending_unlinked}",
         f"{t('cwl.management.signup_status_pending', guild_id=guild_id_int)}: {pending_linked}",

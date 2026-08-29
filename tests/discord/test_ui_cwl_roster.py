@@ -3619,6 +3619,25 @@ def test_add_cwl_management_components_always_includes_coordinators_button():
 
 
 @pytest.mark.discord
+def test_coordinators_button_is_primary_style():
+    """Tracker #0071: "since it is a setting it should be blue" — matches "Configure
+    Participating Clans" right next to it, the other per-clan-config action in this row."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import add_cwl_management_components
+
+    CACHE.server_config["9506"] = {}
+    CACHE.db_manager = None
+
+    view = discord.ui.View(timeout=300)
+    add_cwl_management_components(view, 9506)
+
+    coordinators_button = next(
+        c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_manage_coordinators"
+    )
+    assert coordinators_button.style == discord.ButtonStyle.primary  # type: ignore[union-attr]
+
+
+@pytest.mark.discord
 @pytest.mark.asyncio
 async def test_coordinators_callback_with_no_family_clans_sends_ephemeral_error(mock_interaction):
     from qapbot.cache_manager import CACHE
@@ -3671,6 +3690,26 @@ def test_coordinator_user_select_enforces_cap_of_two(mock_interaction):
     assert CWL_COORDINATOR_LIMIT == 2
     assert user_select.max_values == 2
     assert user_select.min_values == 0
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_coordinator_user_select_clamps_to_two_even_if_discord_sends_more(mock_interaction):
+    """Tracker #0072 (live bug report): a live DEV test showed 3 users getting through despite
+    max_values=2 — Discord's own client-side enforcement isn't airtight for this component shape
+    (rebuilt with a fresh custom_id + default_values on every change). Never trust the client for
+    the real limit; clamp server-side regardless of what Discord's payload actually contains."""
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    view = CwlCoordinatorConfigurationView(
+        guild=mock_interaction.guild, clan_tags=["#CLAN1"], current_coordinator_ids_by_clan={},
+    )
+    mock_interaction.data = {"values": ["111", "222", "333"]}
+    mock_interaction.edit_original_response = AsyncMock()
+
+    await view._on_user_select(mock_interaction)
+
+    assert view.coordinators_by_clan["#CLAN1"] == ["111", "222"]
 
 
 @pytest.mark.discord
@@ -3785,3 +3824,114 @@ async def test_coordinator_save_with_empty_selection_clears_cache_entry(mock_int
 
     CACHE.db_manager.save_cwl_clan_coordinators.assert_awaited_once_with(guild_id_str, "#CLAN1", [])
     assert "#CLAN1" not in CACHE.server_config[guild_id_str]["cwl_clan_coordinators"]
+
+
+# ---------------------------------------------------------------------------
+# Tracker #0071: "Clan | Coordinators" table for clans active in the current CWL season,
+# rendered in front of the info text and the clan picker.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+def test_build_active_clans_table_shows_no_active_season_when_none_exists(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    CACHE.db_manager = db
+    CACHE.server_config["9701"] = {"cwl_selected_season": "2026-09"}
+    guild = MagicMock()
+    guild.id = 9701
+
+    view = CwlCoordinatorConfigurationView(
+        guild=guild, clan_tags=["#CLAN1"], current_coordinator_ids_by_clan={},
+    )
+
+    table = view._build_active_clans_table()
+
+    assert "No active CWL season" in table
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_build_active_clans_table_lists_active_clans_with_coordinators(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "The QCrew"}, "#CLAN2": {"name": "StayCalm"}}
+    CACHE.server_config["9702"] = {"cwl_selected_season": "2026-09"}
+
+    await _seed_guild_and_clans(db, "9702", {"#CLAN1": "The QCrew", "#CLAN2": "StayCalm"})
+    event_id = db.create_cwl_event_sync("9702", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [
+        {"clan_tag": "#CLAN1", "participating": True},
+        {"clan_tag": "#CLAN2", "participating": True},
+    ])
+
+    guild = MagicMock()
+    guild.id = 9702
+    # #CLAN1's coordinator resolves to a live display name; #CLAN2 has none configured.
+    member = MagicMock()
+    member.display_name = "Qaplop"
+    guild.get_member = MagicMock(side_effect=lambda uid: member if uid == 111 else None)
+
+    view = CwlCoordinatorConfigurationView(
+        guild=guild, clan_tags=["#CLAN1", "#CLAN2"],
+        current_coordinator_ids_by_clan={"#CLAN1": ["111"]},
+    )
+
+    table = view._build_active_clans_table()
+
+    assert "The QCrew" in table
+    assert "Qaplop" in table
+    assert "StayCalm" in table
+    assert "—" in table  # #CLAN2's "no coordinators" placeholder
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_build_active_clans_table_falls_back_to_mention_syntax_for_unresolvable_member(db):
+    """A coordinator who isn't in the live gateway member cache (e.g. left the server) still
+    shows something identifiable rather than silently vanishing from the table."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "The QCrew"}}
+    CACHE.server_config["9703"] = {"cwl_selected_season": "2026-09"}
+
+    await _seed_guild_and_clans(db, "9703", {"#CLAN1": "The QCrew"})
+    event_id = db.create_cwl_event_sync("9703", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+
+    guild = MagicMock()
+    guild.id = 9703
+    guild.get_member = MagicMock(return_value=None)
+
+    view = CwlCoordinatorConfigurationView(
+        guild=guild, clan_tags=["#CLAN1"], current_coordinator_ids_by_clan={"#CLAN1": ["999"]},
+    )
+
+    table = view._build_active_clans_table()
+
+    assert "<@999>" in table
+
+
+@pytest.mark.discord
+def test_build_content_places_table_before_info_text(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    CACHE.db_manager = db
+    CACHE.server_config["9704"] = {"cwl_selected_season": "2026-09"}
+    guild = MagicMock()
+    guild.id = 9704
+
+    view = CwlCoordinatorConfigurationView(
+        guild=guild, clan_tags=["#CLAN1"], current_coordinator_ids_by_clan={},
+    )
+
+    content = view.build_content("THE INFO TEXT MARKER")
+
+    table_index = content.index("No active CWL season")
+    info_index = content.index("THE INFO TEXT MARKER")
+    assert table_index < info_index

@@ -1,6 +1,26 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (25)
+- Fixed: tracker #0073, the CWL season overview's "Unlinked sign-ups" line renamed to "Unlinked
+  players" (project owner's preference; DE: "Nicht verknüpfte Spieler"). No data/logic change --
+  see tracker #0042's code comment (QBdiscocmdshelper_cwl.py) for what this count actually scopes
+  to, now that the label itself no longer spells it out.
+  Files: qapbot/translations/{en,de}.json, qapbot/QBdiscocmdshelper_cwl.py.
+
+2026-08-29 (24)
+- Added/Fixed: tracker #0071/#0072, CWL Coordinators management view improvements. #0071: the
+  "Manage CWL Coordinators" view now shows a "Clan | Coordinators" table (for every clan active
+  in the CURRENTLY SELECTED CWL season, reflecting live in-progress edits) in front of the info
+  text and the clan/user pickers; the "Manage CWL Coordinators" button is now blue/primary
+  (project owner: "since it is a setting it should be blue"), matching "Configure Participating
+  Clans" next to it. #0072: a live DEV test showed the coordinator UserSelect letting 3 users
+  through despite max_values=2 -- Discord's own client-side enforcement isn't airtight for this
+  component shape (rebuilt with a fresh custom_id + default_values on every change); now clamped
+  server-side to CWL_COORDINATOR_LIMIT regardless of what Discord's payload actually contains.
+  File: qapbot/ui_cwl_roster.py, qapbot/translations/{en,de}.json. Tests: tests/discord/
+  test_ui_cwl_roster.py (7 new). 2816 tests pass.
+
 2026-08-29 (23)
 - Fixed: tracker #0070 follow-up, the earlier fix only closed the /clan management -> anchored
   Hub message direction -- live testing showed the reverse (a change made through the anchored
