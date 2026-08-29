@@ -3913,7 +3913,11 @@ async def list(
         embed.set_author(name=f"Registered Accounts \u2014 {discord_user.display_name}" if discord_user is not None else "Registered Accounts")
 
         # Build description with header
-        description = f"**Legend: ({BotEmojis.GCHECK} API-Verified / {BotEmojis.REDX} Not Verified)**\n\n"
+        # tracker #0069: every entry in this list is by definition already linked to the
+        # Discord user showing it, so "Unregistered" (REDX, meaning "not linked at all") never
+        # applies here -- only the same two icons clan_management's registration display uses
+        # for its "linked" rows: VERIFIED (API-token-verified) vs GCHECK (linked, not verified).
+        description = f"**Legend: ({BotEmojis.VERIFIED} Verified / {BotEmojis.GCHECK} Registered)**\n\n"
 
         # Count total players and verified players
         total_players = 0
@@ -3952,7 +3956,7 @@ async def list(
                     is_verified = CACHE.is_player_verified(account_tag, player_tag)
                     if is_verified:
                         verified_players += 1
-                    verification_emoji = BotEmojis.GCHECK if is_verified else BotEmojis.REDX
+                    verification_emoji = BotEmojis.VERIFIED if is_verified else BotEmojis.GCHECK
                     
                     # Build line with inline code block
                     line = f"{verification_emoji} `{LRM}{player_padded}{RLM}`"

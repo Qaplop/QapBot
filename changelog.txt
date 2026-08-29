@@ -1,6 +1,16 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (13)
+- Fixed: tracker #0069, /list account showed only 2 statuses (API-Verified/Not Verified) with the
+  wrong icons -- GCHECK for verified and REDX for not-verified. Every row in this list is by
+  definition already a linked account, so the "Unregistered" (REDX, unlinked) state from
+  clan_management's registration display never legitimately applies here; the bug was using the
+  wrong icon for each of the two states that DO apply. Now matches clan_management's own mapping:
+  VERIFIED (shield) for API-verified, GCHECK for linked-but-not-verified ("Registered"). Legend
+  text updated to match.
+  File: QBdiscordcmds.py. Tests: tests/discord/test_commands.py (1 new). 2770 tests pass.
+
 2026-08-29 (12)
 - Updated: tracker #0048, refreshed CWL_LEAGUE_STAR_DISTRIBUTION with 2026-08 season star-rate
   data from clashspot.net (screenshot attached to the ticket). Notably Legend League now has its

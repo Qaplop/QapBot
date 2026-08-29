@@ -144,6 +144,46 @@ async def test_list_accounts_no_discord_user_still_lists_everyone(monkeypatch: p
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_list_accounts_legend_and_icons_match_clan_management(monkeypatch: pytest.MonkeyPatch, mock_interaction):
+    """Tracker #0069: every row here is already a linked account (that's what makes it eligible
+    to be listed at all), so REDX/"Unregistered" -- clan_management's icon for a player with no
+    Discord link -- can never legitimately appear. The two icons that DO apply must match
+    clan_management's own meaning: VERIFIED (shield) for API-verified, GCHECK for linked-but-not.
+    """
+    import QBdiscordcmds
+    from qapbot.emojis import BotEmojis
+
+    fake_cache = _FakeCache()
+    fake_cache.user_accounts = {
+        "111": {
+            "display_name": "Alice",
+            "players": [
+                {"player_name": "VerifiedPlayer", "player_tag": "#V1", "verified": True},
+                {"player_name": "UnverifiedPlayer", "player_tag": "#U1", "verified": False},
+            ],
+        },
+    }
+    monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+
+    await QBdiscordcmds.list.callback(mock_interaction, action="ACCOUNTS")  # type: ignore[arg-type]
+
+    mock_interaction.followup.send.assert_awaited()
+    _, kwargs = mock_interaction.followup.send.await_args
+    description = kwargs["embed"].description
+
+    assert BotEmojis.VERIFIED in description  # the verified player's row
+    assert BotEmojis.GCHECK in description  # the unverified-but-registered player's row
+    assert BotEmojis.REDX not in description  # never applicable: nothing listed here is unlinked
+
+    legend_line = next(line for line in description.splitlines() if "Legend" in line)
+    assert "Verified" in legend_line
+    assert "Registered" in legend_line
+    assert "Unregistered" not in legend_line
+    assert "API-Verified" not in legend_line  # old, incorrect wording
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_list_accounts_discord_user_with_no_accounts_shows_dedicated_message(monkeypatch: pytest.MonkeyPatch, mock_interaction):
     """A discord_user with no CACHE.user_accounts entry at all must not be conflated with the
     generic "nobody has any accounts" empty state — the message should name the actual user."""
