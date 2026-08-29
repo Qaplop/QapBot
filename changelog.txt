@@ -1,6 +1,29 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (22)
+- Changed: CWL enrollment, "Not Invited Yet" (tracker #0043's icon) now means what its name says
+  -- "hasn't received the enrollment DM yet" -- rather than "has no cwl_signups row". A 'pending'
+  row is seeded BEFORE a DM is even attempted (tracker #0016, so its response buttons have
+  something to resolve against), so a player whose actual send never went out for any reason (DM
+  guard, blocked, left every mutual guild, a transient failure) previously still showed "Pending"
+  despite never having received anything -- on DEV, where DM guard blocks nearly everyone, this
+  made the "Not Invited Yet" icon effectively never appear. The Manage Enrollment board now
+  carries a real `dm_sent` field per player (same dm_sent_status table the "Notify New Pool
+  Members" gating and the season overview's "New players without DM invitation" line already use)
+  and shows "Not Invited Yet" for any player whose signup_status is 'pending' but dm_sent is
+  false, alongside the pre-existing "no row at all" case. confirmed/declined/auto_confirmed are
+  unaffected -- those are real, settled outcomes independent of whether a courtesy DM went out.
+  Also (Start Enrollment specifically): a LINKED participant this guild's own DM-testing guard
+  (CONFIG.cwl_dm_restrict_to_admin) blocks no longer gets a 'pending' row seeded at all, so the
+  season overview's own pending/unlinked counts stay honest too -- an UNLINKED participant still
+  always gets seeded regardless (a current pool member must always "enter the pool", per
+  test_untracked_guest_clan_members_still_enter_the_pool).
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/web_bridge.py, activity/client/src/{types,
+  enrollmentBoard}.ts. Tests: tests/integration/test_cwl_start_enrollment.py (assertions
+  updated/strengthened), tests/discord/test_web_bridge.py (1 new). 2801 Python tests pass;
+  activity/client typecheck clean. Deployed to DEV.
+
 2026-08-29 (21)
 - Fixed: tracker #0043 follow-up, the legend's boundary comma (marking where the "User response:"
   icon group ends, before the separate Guest swatch) was still trailing "Not Linked" even though

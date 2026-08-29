@@ -672,6 +672,16 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
     links_by_tag = db.get_player_links_sync(list(players_by_tag.keys()))
     skill_scores_by_tag = compute_league_adjusted_skill_scores(list(players_by_tag.keys()))
     avg_stars_by_tag = compute_avg_stars_per_attack(list(players_by_tag.keys()))
+    # 2026-08-29, project owner's spec (live bug report/clarification): "Not Invited Yet" means
+    # "hasn't received the enrollment DM yet" — NOT "has no cwl_signups row". A 'pending' row
+    # gets created for a player Start Enrollment/Notify New Pool Members merely INTENDED to DM
+    # (seeded before the send so the DM's buttons have something to resolve against, per tracker
+    # #0016), even when the actual send never went out (DM guard, blocked, left every mutual
+    # guild, a transient failure) — dm_sent is the one signal that's only ever true once a DM
+    # genuinely reached them, the same bulk lookup _send_cwl_enrollment_dm_batch()'s own dedup
+    # check and the season overview's "New players without DM invitation" line already use, so
+    # the board can finally agree with those instead of taking cwl_signups.status at face value.
+    dm_sent_by_tag = db.get_cwl_player_season_dm_status_bulk_sync(list(players_by_tag.keys()), season)
     for player_tag, player in players_by_tag.items():
         player["assigned_clan_tag"] = assigned_clan_by_tag.get(player_tag)
         th_level = live_th_by_tag.get(
@@ -681,6 +691,7 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
         player["th_icon_url"] = th_icon_url(th_level) if th_level is not None else None
         player["skill_score"] = skill_scores_by_tag.get(player_tag)
         player["avg_stars"] = avg_stars_by_tag.get(player_tag)
+        player["dm_sent"] = dm_sent_by_tag.get(player_tag, False)
         # Live link overrides the enrollment-time snapshot (see links_by_tag above).
         link = links_by_tag.get(player_tag)
         if link is not None:

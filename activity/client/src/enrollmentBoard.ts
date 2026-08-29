@@ -65,6 +65,19 @@ function isOptedOut(player: EnrollmentPlayer): boolean {
   return player.cwl_permanent_optout || player.signup_status === 'declined'
 }
 
+// Whether a player's REAL status (confirmed/declined/auto_confirmed/pending) should actually be
+// shown, as opposed to "Not Invited Yet" (2026-08-29, project owner's clarification). 'pending'
+// is the one status that specifically means "sent, awaiting response" — a cwl_signups row gets
+// seeded with it before a DM is even attempted (tracker #0016, so its response buttons have
+// something to resolve against), so a player whose actual send never went out (DM guard,
+// blocked, left every mutual guild, a transient failure) still carries status 'pending' despite
+// never having received anything. dm_sent is the only signal that distinguishes those two cases.
+// confirmed/declined/auto_confirmed are all real, settled outcomes (an actual response, or a
+// standing preference) independent of dm_sent, so they always show regardless.
+function hasVisibleRealStatus(status: string | null | undefined, dmSent: boolean): status is VisibleStatus {
+  return isVisibleStatus(status) && (status !== 'pending' || dmSent)
+}
+
 // Green when an assigned player's real current clan already matches their assignment, amber
 // when it doesn't (assigned but hasn't transferred yet) — null (no extra class, default card
 // shade) for an Unassigned player or one whose current clan isn't on record at all, since
@@ -156,7 +169,9 @@ function buildTooltipLines(
     `Response: ${
       player.discord_id == null
         ? UNLINKED_LABEL
-        : isVisibleStatus(player.signup_status) ? STATUS_LABEL[player.signup_status] : NOT_INVITED_LABEL
+        : hasVisibleRealStatus(player.signup_status, player.dm_sent)
+          ? STATUS_LABEL[player.signup_status]
+          : NOT_INVITED_LABEL
     }`,
   )
   // Tracker #0057 (precedence corrected #0058/#0059): only shown when a value is actually known —
@@ -978,7 +993,7 @@ export function renderEnrollmentBoard(
       icon.alt = UNLINKED_LABEL
       icon.title = UNLINKED_LABEL
       row.appendChild(icon)
-    } else if (isVisibleStatus(player.signup_status)) {
+    } else if (hasVisibleRealStatus(player.signup_status, player.dm_sent)) {
       const icon = document.createElement('img')
       icon.className = 'status-icon'
       icon.src = STATUS_ICON[player.signup_status]

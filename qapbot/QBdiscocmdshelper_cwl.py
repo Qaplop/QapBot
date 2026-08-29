@@ -2499,12 +2499,44 @@ async def _start_cwl_enrollment_locked(guild_id: int, season: str) -> Dict[str, 
     # unchanged 'pending'. Opted-out participants used to be skipped entirely (no row at all);
     # they now always get seeded, since the row itself is what makes them show as Declined on the
     # board and in the season overview instead of silently vanishing.
+    #
+    # 2026-08-29, project owner's spec (live bug report: DEV's DM guard makes almost the whole
+    # board show "Pending" instead of the newer "Not Invited Yet" status, tracker #0043's own
+    # icon): a bare 'pending' default means "sent the enrollment DM, awaiting response" — don't
+    # seed that for a LINKED participant this guild's own DM-testing guard
+    # (CONFIG.cwl_dm_restrict_to_admin) will prevent from ever actually being sent one. Leave them
+    # with NO row at all instead (shows "Not Invited Yet" on the board) so "Notify New Pool
+    # Members" naturally re-evaluates and catches them the moment DM guard is later disabled (or
+    # this runs on PROD) — mirrors the discipline _send_cwl_enrollment_dm_batch's own "seed only
+    # who we're about to DM" step (below) already applies to a guest player invited after
+    # enrollment started; this just extends it to Start Enrollment's own initial pass.
+    #
+    # Deliberately does NOT extend this to an UNLINKED participant (discord_id is None): a current
+    # pool member must always "enter the pool" (get a row, so they're visible/assignable on the
+    # board and counted) regardless of whether they can be DMed — a guarantee
+    # test_untracked_guest_clan_members_still_enter_the_pool
+    # (tests/integration/test_cwl_guest_clan_live_scenario.py) locks in for a guest clan's
+    # freshly-CoC-API-synced members, who commonly have no Discord link at all yet. The board
+    # already shows an unlinked participant as "Not Linked" regardless of their seeded status (see
+    # enrollmentBoard.ts's own icon precedence), so gating their seed here would change no visible
+    # outcome anyway — only the DM-guard case actually changes what the admin sees.
+    #
+    # Only ever applies to the bare 'template_confirm'/'pending' default — a real existing_global
+    # response or a permanent-preference-derived status (declined/auto_confirmed) is a genuine
+    # known fact regardless of whether THIS guild's DM can be sent, so those always seed
+    # immediately, unaffected by this check.
     signups_to_create: List[Dict[str, Any]] = []
     for participant in participants:
         existing_global = global_status_by_tag.get(participant["player_tag"])
         status, source = resolve_seeded_cwl_signup_status(
             existing_global, participant["cwl_permanent_optout"], participant["cwl_permanent_optin"],
         )
+        if (
+            status == "pending" and source == "template_confirm"
+            and participant["discord_id"] is not None
+            and _dm_guard_blocks(str(participant["discord_id"]))
+        ):
+            continue
         signups_to_create.append({
             "player_tag": participant["player_tag"],
             "player_name": participant["player_name"],

@@ -1918,6 +1918,56 @@ async def test_enrollment_get_returns_merged_players_and_clans(db, bridge_config
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_enrollment_get_dm_sent_reflects_whether_a_dm_actually_went_out(db, bridge_config, client, monkeypatch):
+    """2026-08-29, project owner's clarification: 'Not Invited Yet' means "hasn't received the
+    enrollment DM yet", not "has no cwl_signups row" -- a 'pending' row is seeded BEFORE the DM
+    is even attempted (tracker #0016), so a player whose actual send never went out (DM guard,
+    blocked, etc.) still carries status 'pending' despite never having received anything. The
+    board tells the two apart via this dm_sent field, so it must reflect the real dm_sent_status
+    table, not just "a pending row exists"."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_current_cwl_season
+
+    await _seed_guild_and_clans(db, "778", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha", "war_league": "Crystal League I"}}
+    CACHE.server_config["778"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    season = resolve_current_cwl_season()
+    event_id = db.create_cwl_event_sync("778", season, "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+
+    # #P1 was genuinely DMed (dm_sent recorded). #P2 has a 'pending' row too (e.g. seeded before
+    # a send that then got skipped/failed) but was NEVER actually DMed -- no dm_sent record.
+    db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha1", "10", None, "template_confirm", "pending")
+    db.upsert_cwl_signup_sync(event_id, "#P2", "Alpha2", "11", None, "template_confirm", "pending")
+    db.mark_cwl_player_dm_sent_sync("#P1", season, "Alpha1", "10", event_id, 778, "2026-08-17T09:00Z")
+    await _seed_current_clan_member(db, "10", "#P1", "#CLAN1")
+    await _seed_current_clan_member(db, "11", "#P2", "#CLAN1")
+    await db.conn.commit()
+
+    import QBcore
+    monkeypatch.setattr(QBcore, "bot", _fake_admin_bot(778, 42, is_admin=True))
+
+    resp = await client.get(
+        "/api/cwl/enrollment",
+        params={"guild_id": "778", "discord_user_id": "42"},
+        headers={"X-Bridge-Secret": "test-secret"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+
+    players_by_tag = {p["player_tag"]: p for p in body["players"]}
+    assert players_by_tag["#P1"]["signup_status"] == "pending"
+    assert players_by_tag["#P1"]["dm_sent"] is True
+    assert players_by_tag["#P2"]["signup_status"] == "pending"
+    assert players_by_tag["#P2"]["dm_sent"] is False
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_enrollment_get_includes_members_of_non_participating_member_clans(db, bridge_config, client, monkeypatch):
     """2026-08-14 (project owner's spec): the pool is every current member of every guild member
     clan, not just clans participating in CWL this season — so an admin can drag in a player

@@ -117,6 +117,16 @@ export type EnrollmentPlayer = {
   // payload for the exact precedence). Null when neither is set — display-only, shown in the
   // hover tooltip's identity block only when non-null (see enrollmentBoard.ts's buildTooltipLines).
   preferred_league_rank: string | null
+  // True only once a DM has genuinely reached this player this season — the same dm_sent bulk
+  // lookup _send_cwl_enrollment_dm_batch's own dedup check and the season overview's "New
+  // players without DM invitation" line already use (2026-08-29, project owner's clarification).
+  // Deliberately NOT derived from signup_status === null: a 'pending' cwl_signups row gets
+  // seeded before a DM is even attempted (tracker #0016, so its buttons have something to
+  // resolve against), so a player whose actual send never went out — DM guard, blocked, left
+  // every mutual guild, a transient failure — still shows signup_status 'pending' despite never
+  // having received anything. This is the one field the board actually needs to tell "sent,
+  // awaiting response" apart from "never invited yet" (enrollmentBoard.ts's icon logic).
+  dm_sent: boolean
 }
 
 export type EnrollmentPayload = {

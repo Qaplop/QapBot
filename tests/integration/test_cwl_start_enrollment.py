@@ -181,6 +181,11 @@ async def test_seeds_signups_and_dms_linked_confirmed_accounts(db, monkeypatch):
     summary = await start_cwl_enrollment(1005, "2026-08")
 
     assert summary["ok"] is True
+    # Both are still seeded — #P2 is unlinked, not DM-guard-blocked, and unlinked participants
+    # always "enter the pool" regardless of DM-ability (test_untracked_guest_clan_members_still_
+    # enter_the_pool, test_cwl_guest_clan_live_scenario.py, locks this in for a guest clan's
+    # freshly-synced members). Only a DM-guard-blocked LINKED participant skips seeding — see
+    # the dm-guard-specific tests below.
     assert summary["seeded"] == 2
     assert summary["contacted"] == 1
     assert summary["skipped_unlinked"] == 1
@@ -740,10 +745,18 @@ async def test_dm_guard_only_dms_the_configured_server_admin_in_dev(db, monkeypa
 
     summary = await start_cwl_enrollment(1007, "2026-08")
 
-    assert summary["seeded"] == 2  # both signup rows are still created — only DM delivery is guarded
+    # 2026-08-29, project owner's spec: a DM-guard-blocked participant no longer gets a
+    # 'pending' row at all — that status implies "sent the DM, awaiting response", which is
+    # false while the guard is on. Only #P1 (actually reachable) is seeded; #P2 stays with no
+    # row (shows "Not Invited Yet") so "Notify New Pool Members" naturally catches it once the
+    # guard no longer applies (e.g. this runs on PROD).
+    assert summary["seeded"] == 1
     assert summary["contacted"] == 1
     assert summary["skipped_dm_guard"] == 1
     assert sent_to == ["d1"]
+    event_id = db.get_cwl_event_sync("1007", "2026-08")["id"]
+    assert db.get_cwl_signup_sync(event_id, "#P1") is not None
+    assert db.get_cwl_signup_sync(event_id, "#P2") is None
 
 
 @pytest.mark.asyncio
@@ -779,6 +792,10 @@ async def test_dm_guard_only_dms_the_configured_server_admin_in_prod(db, monkeyp
     assert summary["contacted"] == 1
     assert summary["skipped_dm_guard"] == 1
     assert sent_to == ["d1"]
+    # 2026-08-29: the guarded participant gets no row at all, not a misleading 'pending' one.
+    event_id = db.get_cwl_event_sync("1009", "2026-08")["id"]
+    assert db.get_cwl_signup_sync(event_id, "#P1") is not None
+    assert db.get_cwl_signup_sync(event_id, "#P2") is None
 
 
 @pytest.mark.asyncio
@@ -817,6 +834,11 @@ async def test_dm_guard_also_dms_enrolled_testers_in_prod(db, monkeypatch):
     assert summary["contacted"] == 2
     assert summary["skipped_dm_guard"] == 1
     assert sorted(sent_to) == ["d1", "d2"]
+    # 2026-08-29: only the guarded #P3 gets no row; #P1/#P2 (admin + tester) are reachable.
+    event_id = db.get_cwl_event_sync("1010", "2026-08")["id"]
+    assert db.get_cwl_signup_sync(event_id, "#P1") is not None
+    assert db.get_cwl_signup_sync(event_id, "#P2") is not None
+    assert db.get_cwl_signup_sync(event_id, "#P3") is None
 
 
 @pytest.mark.asyncio
@@ -853,6 +875,10 @@ async def test_dm_guard_ignores_testers_in_dev(db, monkeypatch):
     assert summary["contacted"] == 1
     assert summary["skipped_dm_guard"] == 1
     assert sent_to == ["d1"]
+    # 2026-08-29: the guarded tester-in-DEV gets no row at all.
+    event_id = db.get_cwl_event_sync("1011", "2026-08")["id"]
+    assert db.get_cwl_signup_sync(event_id, "#P1") is not None
+    assert db.get_cwl_signup_sync(event_id, "#P2") is None
 
 
 @pytest.mark.asyncio
@@ -1056,8 +1082,16 @@ async def test_departed_member_is_not_auto_assigned(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_no_cwl_history_leaves_player_unassigned(db, monkeypatch):
+    from qapbot import config as config_module
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    # Not testing the DM guard here — disabled so seeding isn't incidentally gated by it
+    # (2026-08-29: seeding a bare 'pending' row now requires the DM to actually be reachable).
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
 
     await _seed_guild_and_clan(db, "1012")
     monkeypatch.setattr(CACHE, "db_manager", db)
@@ -1076,8 +1110,16 @@ async def test_no_cwl_history_leaves_player_unassigned(db, monkeypatch):
 async def test_account_wide_expansion_off_by_default(db, monkeypatch):
     """guild_config.cwl_enrollment_include_all_linked_accounts defaults False — an account's
     out-of-family player must NOT be pulled in unless the guild opts in (2026-08-15)."""
+    from qapbot import config as config_module
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    # Not testing the DM guard here — disabled so seeding isn't incidentally gated by it
+    # (2026-08-29: seeding a bare 'pending' row now requires the DM to actually be reachable).
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
 
     await _seed_guild_and_clan(db, "1013")
     monkeypatch.setattr(CACHE, "db_manager", db)
@@ -1103,8 +1145,16 @@ async def test_account_wide_expansion_off_by_default(db, monkeypatch):
 async def test_account_wide_expansion_pulls_in_other_clan_players_when_enabled(db, monkeypatch):
     """With the toggle on, d1's #P2 (an out-of-family clan player) is seeded alongside #P1 —
     the Marines/QCrew scenario from the project owner's own account."""
+    from qapbot import config as config_module
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
+
+    # Not testing the DM guard here — disabled so seeding isn't incidentally gated by it
+    # (2026-08-29: seeding a bare 'pending' row now requires the DM to actually be reachable).
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
 
     await _seed_guild_and_clan(db, "1014")
     monkeypatch.setattr(CACHE, "db_manager", db)
