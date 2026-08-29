@@ -1,6 +1,18 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (19)
+- Clarified: tracker #0042, "ungleiche zahlen" -- a user reported the CWL season overview's
+  unlinked-accounts count didn't match "Notify New Pool Members"' own "Skipped (no linked
+  account)" result count. Not a bug: the two numbers were never meant to match, they scope to
+  different populations. The overview's line is the unlinked subset of players who ALREADY have
+  a pending cwl_signups row; the notify action's count is the unlinked subset of the FULL current
+  pool (every guild-member-clan member), a superset that also includes players never seeded into
+  cwl_signups at all. Renamed "Unlinked accounts" -> "Unlinked sign-ups" (and the DE equivalent,
+  "Nicht verknüpfte Accounts" -> "Nicht verknüpfte Anmeldungen") to make that scope explicit --
+  no data or logic change.
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/translations/{en,de}.json.
+
 2026-08-29 (18)
 - Added: tracker #0046, CWL Coordinators — a new "Manage CWL Coordinators" button in the CWL
   Management screen lets an admin assign up to 2 Discord users (any member of the guild, not
