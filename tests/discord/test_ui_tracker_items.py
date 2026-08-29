@@ -268,6 +268,60 @@ async def test_build_tracker_embed_stays_english_regardless_of_guild_language(db
     assert "Gemeldet" not in embed.description  # would be the German "reported_by" phrasing
 
 
+def test_modal_respects_guild_language_unlike_the_posted_record(monkeypatch):
+    """2026-08-29 (tracker #0009 PROD-testing follow-up): the OPPOSITE boundary from the test
+    above. The tracker RECORD (build_tracker_embed, tested above) must stay English always --
+    but the REPORTING MODAL is personal/ephemeral, seen only by the one person filing the
+    report, and must translate like any other ephemeral UI (Cardinal Rule 6). Both were
+    previously forced English by the same module-level t() shadow; project owner: "The modal
+    should be translated while the resulting channel message or at least its status labels
+    should remain english always"."""
+    from qapbot.cache_manager import CACHE
+
+    monkeypatch.setattr(CACHE, "server_config", {"987654321": {"language": "de"}})
+    monkeypatch.setattr(CACHE, "user_accounts", {})  # no per-user override -- guild language applies
+
+    modal = TrackerItemModal("bug", guild_id=987654321, user_id="1")
+
+    assert modal.title == "Fehler melden"
+    assert modal.title_input.text == "Titel"
+    assert modal.description_input.text == "Beschreibung"
+    assert modal.details_input.text == "Schritte zur Reproduktion"
+    assert modal.environment_select.text == "Umgebung"
+    assert modal.priority_select.text == "Priorität"
+
+
+def test_modal_falls_back_to_english_without_a_guild_or_user_language(monkeypatch):
+    from qapbot.cache_manager import CACHE
+
+    monkeypatch.setattr(CACHE, "server_config", {})
+    monkeypatch.setattr(CACHE, "user_accounts", {})
+
+    modal = TrackerItemModal("bug", guild_id=None, user_id="1")
+
+    assert modal.title == "Report a Bug"
+    assert modal.title_input.text == "Title"
+
+
+@pytest.mark.asyncio
+async def test_tracker_disabled_and_not_configured_messages_respect_language(monkeypatch, mock_interaction):
+    """The two /bug and /feature early-return gating messages are ephemeral (seen only by the
+    person who ran the command), same category as the modal above -- not the posted record."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_tracker import start_tracker_item
+
+    monkeypatch.setattr(CACHE, "server_config", {"987654321": {"language": "de"}})
+    monkeypatch.setattr(CACHE, "user_accounts", {})
+    monkeypatch.setattr(CACHE, "tracker_settings", {"tracker_enabled": "0"})
+    mock_interaction.guild.id = 987654321
+
+    await start_tracker_item(mock_interaction, "bug")
+
+    mock_interaction.response.send_message.assert_awaited_once()
+    sent_text = mock_interaction.response.send_message.await_args.args[0]
+    assert "deaktiviert" in sent_text  # German for "disabled"
+
+
 @pytest.mark.asyncio
 async def test_build_tracker_embed_defaults_priority_when_missing(db):
     """A pre-migration row (or a caller that never set priority) falls back to MEDIUM rather

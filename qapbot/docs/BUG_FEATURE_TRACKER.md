@@ -184,18 +184,35 @@ including DEV, whose DB is a routine PROD-backup copy that can contain the exact
 
 ## Discord surface (`qapbot/ui_tracker.py`)
 
-**Always English, regardless of guild/user language (2026-08-23, live bug report)**: unlike the
-rest of the bot, tracker text is never localized. The module shadows `qapbot.i18n.t` right after
-its import (`t = ` wrapper defined immediately below `from qapbot.i18n import t as _t_localized`)
-with a version that drops any `guild_id`/`user_id` kwargs before delegating — every one of the
-~150 existing `t('ui_components.tracker...', guild_id=..., user_id=...)` call sites in this file
-keeps working unchanged, but `qapbot.i18n.t()` then has nothing to resolve a non-default language
-from and falls back to English every time. Reason: the tracker is a developer/triage tool, not
-end-user-facing — status labels like "Implemented" were rendering as "Umgesetzt" or not depending
-on which guild's (or reporter's) configured language happened to apply, which is confusing rather
-than helpful for whoever's actually triaging tickets. If you add a new tracker UI string, no
+**The posted RECORD is always English; the REPORTING interaction is translated
+(2026-08-23, live bug report; boundary corrected 2026-08-29, project owner: "The modal should
+be translated while the resulting channel message or at least its status labels should remain
+english always")**: unlike the rest of the bot, the tracker item as POSTED to the tracker
+channel — its embed, thread replies, comments, status-change notifications — is never localized.
+The module shadows `qapbot.i18n.t` right after its import (`t = ` wrapper defined immediately
+below `from qapbot.i18n import t as _t_localized`) with a version that drops any
+`guild_id`/`user_id` kwargs before delegating — every remaining `t('ui_components.tracker...',
+guild_id=..., user_id=...)` call site in this file keeps working unchanged, but `qapbot.i18n.t()`
+then has nothing to resolve a non-default language from and falls back to English every time.
+Reason: the tracker RECORD is a developer/triage tool, not end-user-facing — status labels like
+"Implemented" were rendering as "Umgesetzt" or not depending on which guild's (or reporter's)
+configured language happened to apply, confusing whoever's actually triaging tickets. If you add
+a new tracker-RECORD UI string (embed field, thread message, status notification, comment), no
 special handling is needed — just call `t(...)` as usual; the module-level shadow covers it
-automatically. This is local to `ui_tracker.py` only — no other module renders
+automatically.
+
+The one exception, carved out 2026-08-29: `TrackerItemModal` (the `/bug`/`/feature` REPORTING
+form itself — its title and every field label) and the two early-return "tracker
+disabled"/"tracker not configured" messages in `start_tracker_item()` are personal/ephemeral,
+seen only by the one person filing the report — the same category as any other DM/ephemeral UI
+elsewhere in the bot (Cardinal Rule 6), which IS translated. Those specific call sites bypass the
+module shadow and call `_t_localized(...)` directly instead (see `TrackerItemModal._localize()`,
+`_set_environment_options()`, `_set_priority_options()`, and `start_tracker_item()`). If you add
+a new string to the modal ITSELF (not the record it produces), use `_t_localized(...)`, not the
+shadowed `t(...)` — the module-level shadow will silently force it to English otherwise, exactly
+the bug this split was fixing. Everything else in this file (embeds, thread posts, comments,
+status-change notifications, the draft-view preview/discard messages) stays on the shadowed
+`t(...)` and stays English. This split is local to `ui_tracker.py` only — no other module renders
 `ui_components.tracker.*` keys.
 
 **Every side-effecting View callback must guard against double-clicks (2026-08-23, tracker

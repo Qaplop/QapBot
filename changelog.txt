@@ -1,6 +1,27 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-29 (3)
+- Fixed: tracker #0060 (PROD verification of today's #0009 follow-up work) -- the /bug and
+  /feature report modal ignored guild/user language entirely, always showing English field
+  labels regardless of the guild's configured language. Root cause: ui_tracker.py shadows
+  qapbot.i18n.t at module level to force the POSTED tracker record (embed, status labels,
+  thread/comments) to always read English for whoever's triaging (tracker item #0026 era
+  decision) -- but that same shadow was ALSO catching TrackerItemModal's own field labels and
+  the two /bug//feature "tracker unavailable" gating messages, which are personal/ephemeral
+  (seen only by the reporter) and should translate like any other ephemeral UI (Cardinal Rule
+  6). Reproduced and confirmed against the real code path (not guessed): a direct qapbot.i18n.t
+  call correctly resolved German while the same call made from inside _localize() returned
+  English, isolating the module-level shadow as the cause. Fix: TrackerItemModal._localize()/
+  _set_environment_options()/_set_priority_options() and start_tracker_item()'s two gating
+  messages now call _t_localized(...) directly, bypassing the shadow; the posted record (embed,
+  thread, comments, status notifications -- everything else in the file) is untouched and stays
+  forced English, matching the existing test_build_tracker_embed_stays_english_regardless_of_
+  guild_language coverage.
+  File: qapbot/ui_tracker.py. Docs: qapbot/docs/BUG_FEATURE_TRACKER.md's "Discord surface"
+  section rewritten for the new split. 2732 tests pass (3 new: modal respects language, modal
+  falls back to English with no config, gating messages respect language).
+
 2026-08-29 (2)
 - Fixed: run_tests.ps1's two long-standing pytest warnings. (a) qapbot/ui_tracker.py's
   TrackerItemModal migrated title_input/description_input/details_input from plain TextInput

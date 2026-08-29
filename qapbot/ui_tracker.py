@@ -39,14 +39,28 @@ from qapbot.i18n import t as _t_localized
 
 
 def t(key: str, **kwargs: Any) -> str:
-    """Shadows qapbot.i18n.t for this whole module: the bug/feature tracker is a developer/
-    triage tool, not end-user-facing, so its text must read the same for everyone regardless
+    """Shadows qapbot.i18n.t for this whole module: the bug/feature tracker RECORD (the item
+    posted to the tracker channel, its status labels, thread replies, comments) is a developer/
+    triage tool, not end-user-facing, so that text must read the same for everyone regardless
     of which guild or reporter it's rendered for -- always English (tracker item #0026 follow-
     up, project owner: status labels like "Implemented"/"Umgesetzt" showing inconsistently
     depending on the viewing guild's/user's language setting was confusing). Drops any
-    guild_id/user_id kwargs a call site still passes (every existing call in this file does)
-    rather than editing the ~150 call sites individually -- qapbot.i18n.t() already defaults to
-    English whenever neither is given."""
+    guild_id/user_id kwargs a call site still passes rather than editing every call site
+    individually -- qapbot.i18n.t() already defaults to English whenever neither is given.
+
+    2026-08-29 (tracker #0009 PROD-testing follow-up, project owner, verbatim: "The modal
+    should be translated while the resulting channel message or at least its status labels
+    should remain english always"): this blanket shadow originally caught the REPORTING
+    interaction too (TrackerItemModal's own field labels, its title, and the two "tracker
+    unavailable" gating messages in start_tracker_item()) -- those are personal/ephemeral,
+    seen only by the one person filing the report, the same category as any other DM/ephemeral
+    UI elsewhere in the bot (Cardinal Rule 6). That was the wrong side of the line: the intent
+    was always "the shared record stays English", not "everything in this file stays English".
+    Those specific call sites now bypass this wrapper and call _t_localized(...) directly
+    instead -- see TrackerItemModal._localize()/_set_environment_options()/
+    _set_priority_options() and start_tracker_item()'s two early-return messages. Every other
+    call site in this file (embeds, thread posts, comments, status-change notifications, the
+    draft-view preview/discard messages) is unaffected and still goes through this wrapper."""
     kwargs.pop("guild_id", None)
     kwargs.pop("user_id", None)
     return _t_localized(key, **kwargs)
@@ -618,30 +632,39 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
             self.remove_item(self.environment_select)
 
     def _localize(self) -> None:
+        """Modal chrome (title + every field label) is personal/ephemeral -- seen only by the
+        reporter filing this one report -- so it uses _t_localized() directly (real per-user/
+        guild translation), NOT this module's shadowed t() (see that function's docstring,
+        2026-08-29 update). The RECORD this modal produces (the posted embed, thread, status
+        labels) is a completely separate rendering path (build_tracker_embed() etc.) that still
+        goes through the shadowed t() and stays English -- untouched by this change."""
         title_key = 'ui_components.tracker.modal_title_bug' if self.item_type == 'bug' else 'ui_components.tracker.modal_title_feature'
         details_key = 'ui_components.tracker.field_details_bug' if self.item_type == 'bug' else 'ui_components.tracker.field_details_feature'
-        self.title = t(title_key, user_id=self.user_id, guild_id=self.guild_id)
-        self.title_input.text = t('ui_components.tracker.field_title', user_id=self.user_id, guild_id=self.guild_id)
-        self.description_input.text = t('ui_components.tracker.field_description', user_id=self.user_id, guild_id=self.guild_id)
-        self.details_input.text = t(details_key, user_id=self.user_id, guild_id=self.guild_id)
-        self.environment_select.text = t('ui_components.tracker.field_environment', user_id=self.user_id, guild_id=self.guild_id)
-        self.priority_select.text = t('ui_components.tracker.field_priority', user_id=self.user_id, guild_id=self.guild_id)
+        self.title = _t_localized(title_key, user_id=self.user_id, guild_id=self.guild_id)
+        self.title_input.text = _t_localized('ui_components.tracker.field_title', user_id=self.user_id, guild_id=self.guild_id)
+        self.description_input.text = _t_localized('ui_components.tracker.field_description', user_id=self.user_id, guild_id=self.guild_id)
+        self.details_input.text = _t_localized(details_key, user_id=self.user_id, guild_id=self.guild_id)
+        self.environment_select.text = _t_localized('ui_components.tracker.field_environment', user_id=self.user_id, guild_id=self.guild_id)
+        self.priority_select.text = _t_localized('ui_components.tracker.field_priority', user_id=self.user_id, guild_id=self.guild_id)
 
     def _set_environment_options(self, initial_environment: str) -> None:
+        # Real translation, same reasoning as _localize() above -- these are the modal's own
+        # radio-button labels, not the posted record.
         current = _normalize_environment(initial_environment)
         self.environment_select.component.options = [
             discord.RadioGroupOption(
-                label=t(_ENVIRONMENT_LABEL_KEYS[value], user_id=self.user_id, guild_id=self.guild_id),
+                label=_t_localized(_ENVIRONMENT_LABEL_KEYS[value], user_id=self.user_id, guild_id=self.guild_id),
                 value=value, default=(value == current),
             )
             for value in ENVIRONMENT_VALUES
         ]
 
     def _set_priority_options(self, initial_priority: str) -> None:
+        # Real translation, same reasoning as _localize() above.
         current = _normalize_priority(initial_priority)
         self.priority_select.component.options = [
             discord.RadioGroupOption(
-                label=t(_PRIORITY_LABEL_KEYS[value], user_id=self.user_id, guild_id=self.guild_id),
+                label=_t_localized(_PRIORITY_LABEL_KEYS[value], user_id=self.user_id, guild_id=self.guild_id),
                 value=value, default=(value == current),
             )
             for value in PRIORITY_VALUES
@@ -900,16 +923,19 @@ async def start_tracker_item(
     guild_id = interaction.guild.id if interaction.guild else None
     user_id = str(interaction.user.id)
 
+    # Real translation (_t_localized), not this module's shadowed t(): these two early-return
+    # messages are ephemeral and seen only by the person who ran /bug or /feature, same category
+    # as the modal itself (see TrackerItemModal._localize()'s docstring, 2026-08-29 update).
     if CACHE.tracker_settings.get(TRACKER_SETTING_ENABLED) == "0":
         await interaction.response.send_message(
-            t('ui_components.tracker.tracker_disabled', user_id=user_id, guild_id=guild_id), ephemeral=True
+            _t_localized('ui_components.tracker.tracker_disabled', user_id=user_id, guild_id=guild_id), ephemeral=True
         )
         return
 
     # Bugs and features share one channel (tracker item #0006).
     if not CACHE.tracker_settings.get(TRACKER_SETTING_BUG_CHANNEL):
         await interaction.response.send_message(
-            t('ui_components.tracker.tracker_not_configured', user_id=user_id, guild_id=guild_id), ephemeral=True
+            _t_localized('ui_components.tracker.tracker_not_configured', user_id=user_id, guild_id=guild_id), ephemeral=True
         )
         return
 
