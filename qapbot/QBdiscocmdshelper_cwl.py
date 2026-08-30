@@ -3763,12 +3763,25 @@ def count_cwl_pending_roster_updates(guild_id: int, season: str) -> int:
     """Total pending update DMs for the guild's selected season — the number every one of the
     three triggers (board button, close-DM, Hub button) keys off, so they can never disagree about
     whether anything is outstanding. Safe on the synchronous embed-render path, same as the other
-    button-gating helpers here."""
+    button-gating helpers here.
+
+    Excludes `signup_open` in addition to draft/cancelled (2026-08-30 fix, live bug report: closing
+    the Teams Management board during Enrollment produced "11 line-up update(s) still unsent" — a
+    message that only makes sense in Preparation/War). resolve_cwl_pending_roster_updates_sync()
+    correctly counts every never-announced assigned player as "new" — that's right for a caller
+    asking "what does Announce Rosters still need to reach", but wrong for THIS question, "what
+    does Send Roster Updates still need to reach", since a pre-announcement player was never told
+    anything to begin with — there's nothing to correct them about yet. The Hub's own button
+    avoided this by branching around the call entirely (`if status == "signup_open": ... else:
+    count_cwl_pending_roster_updates(...)`); the close-board DM (_dm_pending_roster_updates_notice,
+    web_bridge.py) had no such branch and called this function unconditionally, so the gate now
+    lives here instead — the one place every caller shares, rather than something each new caller
+    has to remember to re-derive."""
     db = CACHE.db_manager
     if db is None:
         return 0
     event = db.get_cwl_event_sync(str(guild_id), season)
-    if event is None or event["status"] in ("draft", "cancelled"):
+    if event is None or event["status"] in ("draft", "cancelled", "signup_open"):
         return 0
     pending = resolve_cwl_pending_roster_updates_sync(guild_id, event["id"], season)
     return len(pending["moved"]) + len(pending["dropped"]) + len(pending["new"])

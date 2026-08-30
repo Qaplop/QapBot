@@ -773,28 +773,19 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
     players = sorted(players_by_tag.values(), key=lambda p: (p["player_name"] or p["player_tag"]).lower())
 
     from qapbot.QBdiscocmdshelper_cwl import (
+        count_cwl_pending_roster_updates,
         count_cwl_pool_members_missing_dm,
         resolve_cwl_pending_reminder_targets_sync,
-        resolve_cwl_pending_roster_updates_sync,
     )
 
     # Same three action-button gates the Hub message uses (add_cwl_management_components,
     # ui_cwl_roster.py) — reused here rather than re-derived, so the Teams Management board's own
     # copies of these buttons (2026-08-30, project owner's spec: "same logic for all three buttons
     # ... in all three views") can never disagree with the Hub about who is eligible for what.
-    #
-    # "Send Roster Updates" is meaningless before the FIRST announcement — resolve_cwl_pending_
-    # roster_updates_sync compares against `notified_clan_tag`, which is None for literally every
-    # assigned player pre-announcement, so calling it during signup_open would count the entire
-    # not-yet-announced roster as "pending updates" (caught live, 2026-08-30: the board showed
-    # "Send Roster Updates (9)" during Enrollment, before Announce Rosters had ever been pressed).
-    # The Hub avoids this by only calling the resolver in its `else` branch (status != signup_open);
-    # mirrored here with the same branch.
-    if event["status"] in ("draft", "cancelled", "signup_open"):
-        pending_roster_updates = 0
-    else:
-        pending = resolve_cwl_pending_roster_updates_sync(guild_id, event["id"], season)
-        pending_roster_updates = len(pending["moved"]) + len(pending["dropped"]) + len(pending["new"])
+    # count_cwl_pending_roster_updates() carries its own signup_open/draft/cancelled gate (moved
+    # there 2026-08-30 after the close-board DM, which called it directly with no branch of its
+    # own, produced a "Send Roster Updates" prompt during Enrollment) — no branch needed here.
+    pending_roster_updates = count_cwl_pending_roster_updates(guild_id, season)
 
     if event["status"] in ("draft", "cancelled"):
         pool_missing_dm_count = 0

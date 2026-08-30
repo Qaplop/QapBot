@@ -524,6 +524,30 @@ async def test_enrollment_payload_hides_pending_updates_before_first_announcemen
 
 
 @pytest.mark.asyncio
+async def test_pending_roster_updates_stay_zero_during_enrollment(db):
+    """Regression (live bug report, 2026-08-30): closing the Teams Management board during
+    Enrollment produced a "11 line-up update(s) still unsent" DM — a message that only makes sense
+    in Preparation/War. _dm_pending_roster_updates_notice (web_bridge.py) calls
+    count_cwl_pending_roster_updates() directly with no phase branch of its own (unlike the Hub's
+    button, which only calls it from an `else: status != signup_open` branch) — so the phase gate
+    now lives inside count_cwl_pending_roster_updates() itself, the one function every caller
+    shares, rather than being each caller's job to re-derive."""
+    from qapbot.QBdiscocmdshelper_cwl import count_cwl_pending_roster_updates
+
+    guild_id = "325"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1"}], status="signup_open")
+    await _player(db, "u1", "#NEW", "#CLAN1", "Latecomer")
+    db.upsert_cwl_assignment_sync(event_id, "#NEW", "#CLAN1", assignment_source="admin_override", locked=True)
+
+    assert count_cwl_pending_roster_updates(int(guild_id), SEASON) == 0
+
+    db.update_cwl_event_status_sync(event_id, "announced")
+    db.mark_cwl_assignment_notified_sync(event_id, "#NEW", True, "#CLAN1")
+    assert count_cwl_pending_roster_updates(int(guild_id), SEASON) == 0, "just-announced, nothing changed since"
+
+
+@pytest.mark.asyncio
 async def test_send_roster_updates_dms_once_and_clears_pending(db, monkeypatch):
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import (
