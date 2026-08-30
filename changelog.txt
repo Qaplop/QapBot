@@ -1,6 +1,18 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-30 (36)
+- Fixed (tracker #0086, live report): the linked CWL Coordinator role had a "Configure Coordinator
+  Role" button but no readout anywhere, so the CWL Settings screen couldn't answer "is a role
+  linked, and which one?" without opening the sub-screen -- every other setting on that screen
+  already states its current value. Added a "CWL Coordinator Role" block to the settings embed
+  (format_clan_management_cwl_settings, qapbot/QBdiscocmdshelper_cwl.py). A role_id that no longer
+  resolves reads as "Not linked" rather than as a dangling raw id, matching what
+  sync_cwl_coordinator_role() does with it.
+- Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/translations/en.json + de.json.
+- Tests: 2 added (tests/unit/test_cwl_coordinator_role_and_mentions.py).
+  Full suite: 2908 passed, 4 deselected.
+
 2026-08-30 (35)
 - Added (tracker #0085): the CWL Coordinator role is now explained where it is configured and in
   the CWL help -- a coordinator starts the CWL in-game for that clan and is responsible for it all

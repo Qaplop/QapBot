@@ -954,6 +954,10 @@
       "enrollment_pool_block_title": "Enrollment Pool",
       "enrollment_pool_status": "Status: {status}",
       "enrollment_pool_description": "Include a signed-up member's other CoC accounts that currently are in clans that are not a member of this guild/family.",
+      "coordinator_role_block_title": "CWL Coordinator Role",
+      "coordinator_role_not_set": "Not linked",
+      "coordinator_role_value": "Role: {role}",
+      "coordinator_role_description": "Everyone configured as a CWL coordinator for any clan automatically holds this role.",
       "button_enable_include_all_accounts": "Include All Linked Accounts",
       "button_disable_include_all_accounts": "Stop Including All Linked Accounts"
     },

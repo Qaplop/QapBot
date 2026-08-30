@@ -954,6 +954,10 @@
       "enrollment_pool_block_title": "Anmeldepool",
       "enrollment_pool_status": "Status: {status}",
       "enrollment_pool_description": "Weitere CoC-Accounts eines angemeldeten Mitglieds einbeziehen, die sich aktuell in Clans befinden, die nicht Teil dieses Servers/dieser Familie sind.",
+      "coordinator_role_block_title": "CWL-Koordinatoren-Rolle",
+      "coordinator_role_not_set": "Nicht verknüpft",
+      "coordinator_role_value": "Rolle: {role}",
+      "coordinator_role_description": "Wer für irgendeinen Clan als CWL-Koordinator eingetragen ist, hat automatisch diese Rolle.",
       "button_enable_include_all_accounts": "Alle verknüpften Accounts einbeziehen",
       "button_disable_include_all_accounts": "Alle verknüpften Accounts nicht mehr einbeziehen"
     },

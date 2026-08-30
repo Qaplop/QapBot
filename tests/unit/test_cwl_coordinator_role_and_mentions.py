@@ -217,3 +217,55 @@ async def test_no_coordinator_line_when_clan_has_no_coordinators(monkeypatch):
     await wn._send_channel_war_notification("#CLAN1", war_data, players)
 
     assert sent[0]["content"] is None
+
+
+# ---------------------------------------------------------------------------
+# #0086 follow-up — the linked role must be VISIBLE on the CWL Settings screen
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cwl_settings_embed_shows_the_linked_coordinator_role():
+    """Live report (2026-08-30): the coordinator role had a Configure button but no readout, so
+    the settings screen couldn't answer "is a role linked, and which one?" without opening the
+    sub-screen — every other setting on that screen already states its current value."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_settings
+
+    role = MagicMock()
+    role.mention = "@cwl-coordinator"
+    guild = MagicMock()
+    guild.id = 9801
+    guild.name = "The QCrew"
+    guild.get_role = MagicMock(return_value=role)
+    guild.get_channel = MagicMock(return_value=None)
+
+    CACHE.server_config["9801"] = {"cwl_coordinator_role_id": "424242"}
+
+    embed, _, _, _ = await format_clan_management_cwl_settings(guild)
+
+    blocks = "\n".join(f.value for f in embed.fields)
+    assert "@cwl-coordinator" in blocks
+    guild.get_role.assert_called_once_with(424242)
+
+
+@pytest.mark.asyncio
+async def test_cwl_settings_embed_reports_a_deleted_role_as_not_linked():
+    """A role_id that no longer resolves is exactly what an admin needs to notice here, and it is
+    also what sync_cwl_coordinator_role() effectively treats it as (logs and no-ops) — so it must
+    read as not-linked, never as a dangling raw id."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import format_clan_management_cwl_settings
+
+    guild = MagicMock()
+    guild.id = 9802
+    guild.name = "The QCrew"
+    guild.get_role = MagicMock(return_value=None)  # role was deleted in Discord
+    guild.get_channel = MagicMock(return_value=None)
+
+    CACHE.server_config["9802"] = {"cwl_coordinator_role_id": "424242"}
+
+    embed, _, _, _ = await format_clan_management_cwl_settings(guild)
+
+    blocks = "\n".join(f.value for f in embed.fields)
+    assert "424242" not in blocks
+    assert "Not linked" in blocks

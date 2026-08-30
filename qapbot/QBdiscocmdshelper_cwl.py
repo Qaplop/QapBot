@@ -381,6 +381,31 @@ async def format_clan_management_cwl_settings(
         f"{t('cwl.settings.enrollment_pool_description', guild_id=guild_id_int)}"
     )
 
+    # Linked CWL Coordinator role (tracker #0086). Every other setting on this screen already
+    # states its current value here — this one only had its "Configure Coordinator Role" button and
+    # no readout at all, so the screen couldn't answer "is a role linked, and which one?" without
+    # opening the sub-screen (live report, 2026-08-30).
+    #
+    # A role_id that no longer resolves is reported as not-set rather than as a dangling id: the
+    # role having been deleted in Discord is exactly the case an admin needs to notice here, and it
+    # is also what sync_cwl_coordinator_role() effectively does with it (logs and no-ops).
+    coordinator_role_id = guild_config.get("cwl_coordinator_role_id")
+    coordinator_role = None
+    if coordinator_role_id:
+        try:
+            coordinator_role = guild.get_role(int(coordinator_role_id))
+        except (TypeError, ValueError):
+            coordinator_role = None
+    coordinator_role_display = (
+        coordinator_role.mention if coordinator_role
+        else f"❌ {t('cwl.settings.coordinator_role_not_set', guild_id=guild_id_int)}"
+    )
+    coordinator_role_block = (
+        f"⠀\n**{t('cwl.settings.coordinator_role_block_title', guild_id=guild_id_int)}**\n"
+        f"{t('cwl.settings.coordinator_role_value', guild_id=guild_id_int, role=coordinator_role_display)}\n"
+        f"{t('cwl.settings.coordinator_role_description', guild_id=guild_id_int)}"
+    )
+
     embed = discord.Embed(
         title=t('cwl.settings.title', guild_id=guild_id_int),
         description=t('cwl.settings.description', guild_id=guild_id_int, guild_name=guild.name),
@@ -390,6 +415,7 @@ async def format_clan_management_cwl_settings(
     embed.add_field(name="", value=player_hub_block, inline=False)
     embed.add_field(name="", value=retention_block, inline=False)
     embed.add_field(name="", value=enrollment_pool_block, inline=False)
+    embed.add_field(name="", value=coordinator_role_block, inline=False)
 
     return embed, None, [], []
 
