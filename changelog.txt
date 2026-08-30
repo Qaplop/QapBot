@@ -1,6 +1,33 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-30 (37)
+- Added: CWL retention purge -- guild_config.cwl_retention_months finally has a consumer. The
+  column, its settings UI and its readout on the CWL Settings screen all shipped long ago, but
+  nothing ever acted on them, so the setting was inert while telling admins their old seasons were
+  being purged. New WarHistoryDB.purge_expired_cwl_events(), run as Step 0.6 of QapBot.py's nightly
+  maintenance (before VACUUM, so freed pages are reclaimed in the same pass; wrapped so a purge
+  failure can't cost the checkpoint/VACUUM/ANALYZE). 0 = keep indefinitely, the default, purges
+  nothing.
+- Scoped by SEASON AGE, not event status: there is no 'completed' status in this lifecycle
+  (draft -> signup_open -> announced -> war, plus cancelled) -- a finished season just stays in
+  'war' forever, so status can't identify what's over. cwl_season ('YYYY-MM', zero-padded, so
+  lexical order is chronological) can.
+- The two cross-guild tables (cwl_locked_clan_members, cwl_player_season_status) are season-keyed
+  with no FK to cwl_events, so CASCADE never reaches them and purging them per-guild would destroy
+  data another guild still retains. They are swept referentially instead: a season's rows go only
+  once no cwl_events row anywhere references that season.
+- Changed: the retention readout said "Completed/cancelled events are purged after" -- inaccurate
+  on both counts (no 'completed' status exists, and drafts are purged too). Now reads "Past seasons
+  are deleted once they are older than". Both languages.
+- Fixed: a stale comment at db_manager.py's cwl_events CREATE TABLE pointed at
+  nightly_db_maintenance() for the purge, which never had one.
+- Files: qapbot/db_manager.py, QapBot.py, qapbot/translations/en.json + de.json,
+  CWL_ROSTER_PLANNING_PLAN.md, qapbot/docs/DATABASE_ARCHITECTURE.md.
+- Tests: 6 added (tests/unit/test_db_manager_cwl_roster.py) covering cutoff arithmetic incl. year
+  rollover, retention=0, cascade, and both cross-guild cases.
+  Full suite: 2914 passed, 4 deselected.
+
 2026-08-30 (36)
 - Fixed (tracker #0086, live report): the linked CWL Coordinator role had a "Configure Coordinator
   Role" button but no readout anywhere, so the CWL Settings screen couldn't answer "is a role

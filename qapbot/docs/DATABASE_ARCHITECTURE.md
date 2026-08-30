@@ -74,6 +74,14 @@ mirrored on both schemas: `war_attacks`, `war_summary`, `cwl_league_groups`,
 etc.) stay hot-only. Migration is batched (`_migrate_table_batch_by_date()`)
 rather than one giant transaction, to avoid holding the write lock for long.
 
+A second, unrelated retention rule covers the CWL roster tables, which are
+hot-only and never mirrored to `history`: `purge_expired_cwl_events()` deletes
+whole seasons past each guild's own `guild_config.cwl_retention_months` (`0` =
+keep indefinitely, the default). It runs as Step 0.6 of the nightly maintenance
+routine, before VACUUM so the freed pages are reclaimed in the same pass. See
+`CWL_ROSTER_PLANNING_PLAN.md` §11 for why it is scoped by season age rather than
+by event status, and how the two cross-guild tables are swept referentially.
+
 Queries that need the full time range (e.g. `/whois`, full-history reports)
 `UNION`/`UNION ALL` against `main.<table>` and `history.<table>` explicitly.
 

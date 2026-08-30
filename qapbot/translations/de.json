@@ -942,7 +942,7 @@
       "retention_never": "Unbegrenzt aufbewahren",
       "retention_months": "{months} Monate",
       "retention_block_title": "Datenaufbewahrung",
-      "retention_value": "Abgeschlossene/abgebrochene Events werden gelöscht nach: {value}",
+      "retention_value": "Vergangene Saisons werden gelöscht, sobald sie älter sind als: {value}",
       "retention_modal_title": "Datenaufbewahrung festlegen",
       "button_configure_channels": "Kanäle konfigurieren",
       "button_configure_retention": "Datenaufbewahrung konfigurieren",

@@ -942,7 +942,7 @@
       "retention_never": "Keep indefinitely",
       "retention_months": "{months} months",
       "retention_block_title": "Data Retention",
-      "retention_value": "Completed/cancelled events are purged after: {value}",
+      "retention_value": "Past seasons are deleted once they are older than: {value}",
       "retention_modal_title": "Set Data Retention",
       "button_configure_channels": "Configure Channels",
       "button_configure_retention": "Configure Data Retention",

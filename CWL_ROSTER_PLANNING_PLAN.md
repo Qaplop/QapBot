@@ -526,11 +526,26 @@ lost.
 `management`, `player_hub`, `activity`, `setup`, `template`, `phase`, `start`, `update`, `alarm`,
 `reminder`. Every user-facing string in this feature goes through `t()`.
 
-**Retention — the one unfinished piece.** `guild_config.cwl_retention_months` and its settings UI
-exist and persist, but `nightly_db_maintenance()` has no CWL purge step — the setting is currently
-**inert**. `announced`/`war` now have real writers (since 2026-08-29/30), so building the purge
-(delete `cwl_events` in a terminal status older than the configured months, cascading through the
-child tables) is the natural next piece of work on this feature.
+**Retention** (shipped 2026-08-30). `guild_config.cwl_retention_months` is enforced by
+`WarHistoryDB.purge_expired_cwl_events()`, run as Step 0.6 of `QapBot.py`'s nightly maintenance —
+before the VACUUM/REINDEX pass, so the freed pages are reclaimed in the same run. `0` means "keep
+indefinitely" (the default) and purges nothing.
+
+Scoped **by season age, not by event status**: there is deliberately no `completed` status in this
+lifecycle (`draft → signup_open → announced → war`, plus `cancelled`) — a finished season simply
+stays in `war` forever, so status cannot identify what is over. The `cwl_season` key can, since
+`YYYY-MM` is zero-padded and therefore sorts chronologically as a plain string; once a season's own
+calendar month is far enough in the past it is finished whatever status its row sits in, and an
+abandoned year-old `draft` is exactly as purgeable as a completed season. Future seasons are never
+at risk, their month not being in the past at all.
+
+`cwl_events` deletion cascades to `cwl_event_clans` / `cwl_signups` / `cwl_assignments` /
+`cwl_shared_clan_guilds` / `cwl_dropped_notified_players`. The two **cross-guild** tables
+(`cwl_locked_clan_members`, `cwl_player_season_status`) are keyed by `cwl_season` alone with no FK
+to `cwl_events`, and hold data shared between guilds — purging them on one guild's retention would
+destroy state another guild still keeps. They are therefore swept **referentially** instead: a
+season's rows go only once no `cwl_events` row anywhere still references that season. A guild set
+to "keep indefinitely" keeps its event, which keeps the shared rows alive for everyone.
 
 **Docs**: this file. No separate `qapbot/docs/CWL_ROSTER_PLANNING.md` was ever written — this
 remains the single design record, alongside the two companion plans listed at the top.

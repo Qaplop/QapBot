@@ -1578,3 +1578,135 @@ class TestSetCwlPreferencesSync:
         players = db.get_all_players_for_discord_ids_sync(["701"])
         assert len(players) == 1
         assert players[0]["cwl_permanent_optin"] is True
+
+
+# ---------------------------------------------------------------------------
+# Retention purge (purge_expired_cwl_events) — the consumer guild_config.
+# cwl_retention_months never had until 2026-08-30.
+# ---------------------------------------------------------------------------
+
+def test_retention_cutoff_season_arithmetic():
+    """Seasons are 'YYYY-MM' strings compared lexically, so the cutoff must be zero-padded and
+    must roll the year over correctly when subtracting past January."""
+    from datetime import datetime, timezone
+
+    cut = WarHistoryDB._cwl_retention_cutoff_season
+    assert cut(12, datetime(2026, 8, 15, tzinfo=timezone.utc)) == "2025-08"
+    assert cut(1, datetime(2026, 1, 15, tzinfo=timezone.utc)) == "2025-12"   # year rollover
+    assert cut(8, datetime(2026, 8, 15, tzinfo=timezone.utc)) == "2025-12"
+    assert cut(0, datetime(2026, 8, 15, tzinfo=timezone.utc)) == "2026-08"
+
+
+@pytest.mark.asyncio
+async def test_purge_removes_only_seasons_past_retention(db):
+    await _seed_guild_and_clan(db, "801")
+    await db.conn.execute("UPDATE guild_config SET cwl_retention_months = 12 WHERE guild_id = ?", ("801",))
+    await db.conn.commit()
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    old_season = f"{now.year - 3}-01"          # comfortably past a 12-month window
+    recent_season = f"{now.year}-{now.month:02d}"
+
+    old_id = db.create_cwl_event_sync("801", old_season, "u1")
+    recent_id = db.create_cwl_event_sync("801", recent_season, "u1")
+
+    result = await db.purge_expired_cwl_events()
+
+    assert result["events"] == 1
+    assert db.get_cwl_event_sync("801", old_season) is None
+    assert db.get_cwl_event_sync("801", recent_season) is not None
+    assert recent_id != old_id
+
+
+@pytest.mark.asyncio
+async def test_purge_skips_guilds_keeping_data_indefinitely(db):
+    """retention_months = 0 is "keep indefinitely" and is the default for every guild — it must
+    never purge anything, however old the season is."""
+    await _seed_guild_and_clan(db, "802")  # cwl_retention_months defaults to 0
+
+    from datetime import datetime, timezone
+    ancient = f"{datetime.now(timezone.utc).year - 5}-01"
+    db.create_cwl_event_sync("802", ancient, "u1")
+
+    result = await db.purge_expired_cwl_events()
+
+    assert result["events"] == 0
+    assert db.get_cwl_event_sync("802", ancient) is not None
+
+
+@pytest.mark.asyncio
+async def test_purge_cascades_to_child_tables(db):
+    await _seed_guild_and_clan(db, "803")
+    await db.conn.execute("UPDATE guild_config SET cwl_retention_months = 6 WHERE guild_id = ?", ("803",))
+    await db.conn.commit()
+
+    from datetime import datetime, timezone
+    ancient = f"{datetime.now(timezone.utc).year - 3}-01"
+    event_id = db.create_cwl_event_sync("803", ancient, "u1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
+    db.upsert_cwl_signup_sync(event_id, "#P1", "Alpha", "1", None, "tpl", "pending")
+
+    await db.purge_expired_cwl_events()
+
+    cur = await db.conn.execute("SELECT COUNT(*) FROM cwl_event_clans WHERE event_id = ?", (event_id,))
+    assert (await cur.fetchone())[0] == 0
+    cur = await db.conn.execute("SELECT COUNT(*) FROM cwl_signups WHERE event_id = ?", (event_id,))
+    assert (await cur.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_purge_keeps_cross_guild_rows_another_guild_still_retains(db):
+    """cwl_locked_clan_members/cwl_player_season_status are shared across guilds with no FK to
+    cwl_events. One guild's retention expiring must NOT destroy a season another guild is still
+    keeping — they are swept referentially, only once no event anywhere references the season."""
+    await _seed_guild_and_clan(db, "804")
+    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", ("805",))
+    # 804 purges aggressively; 805 keeps everything.
+    await db.conn.execute("UPDATE guild_config SET cwl_retention_months = 1 WHERE guild_id = ?", ("804",))
+    await db.conn.commit()
+
+    from datetime import datetime, timezone
+    shared_season = f"{datetime.now(timezone.utc).year - 3}-01"
+    db.create_cwl_event_sync("804", shared_season, "u1")
+    db.create_cwl_event_sync("805", shared_season, "u1")   # 805 still holds this season
+
+    await db.conn.execute(
+        "INSERT INTO cwl_locked_clan_members (cwl_season, clan_tag, player_tag, source) VALUES (?, ?, ?, ?)",
+        (shared_season, "#CLAN1", "#P1", "league_group"),
+    )
+    await db.conn.commit()
+
+    result = await db.purge_expired_cwl_events()
+
+    assert result["events"] == 1               # only 804's event went
+    assert result["locked_members"] == 0       # 805 still references the season
+    cur = await db.conn.execute(
+        "SELECT COUNT(*) FROM cwl_locked_clan_members WHERE cwl_season = ?", (shared_season,)
+    )
+    assert (await cur.fetchone())[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_purge_sweeps_cross_guild_rows_once_no_event_references_the_season(db):
+    await _seed_guild_and_clan(db, "806")
+    await db.conn.execute("UPDATE guild_config SET cwl_retention_months = 1 WHERE guild_id = ?", ("806",))
+    await db.conn.commit()
+
+    from datetime import datetime, timezone
+    season = f"{datetime.now(timezone.utc).year - 3}-01"
+    db.create_cwl_event_sync("806", season, "u1")
+    await db.conn.execute(
+        "INSERT INTO cwl_locked_clan_members (cwl_season, clan_tag, player_tag, source) VALUES (?, ?, ?, ?)",
+        (season, "#CLAN1", "#P1", "league_group"),
+    )
+    await db.conn.execute(
+        "INSERT INTO cwl_player_season_status (player_tag, cwl_season) VALUES (?, ?)", ("#P1", season)
+    )
+    await db.conn.commit()
+
+    result = await db.purge_expired_cwl_events()
+
+    assert result["events"] == 1
+    assert result["locked_members"] == 1
+    assert result["player_season_status"] == 1

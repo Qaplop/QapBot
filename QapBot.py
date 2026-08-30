@@ -2179,6 +2179,16 @@ async def run_nightly_maintenance_routine(
                 else CONFIG.history_migration_time_budget_minutes * 60
             )
             await db_mgr.monthly_history_migration(time_budget_seconds=_budget)
+        # Step 0.6: purge CWL seasons past each guild's configured retention
+        # (guild_config.cwl_retention_months). Placed here for the same reason
+        # as the migration step above — before the VACUUM/REINDEX pass, so the
+        # space its DELETEs free is reclaimed in the same run. Never allowed to
+        # abort the rest of maintenance: a purge failure must not cost the
+        # nightly checkpoint/VACUUM/ANALYZE, which matter far more.
+        try:
+            await db_mgr.purge_expired_cwl_events()
+        except Exception as _purge_exc:
+            logging.error(f"[CWL-PURGE] Failed, continuing with maintenance: {_purge_exc}", exc_info=True)
         # Steps 1-3: WAL checkpoint → REINDEX/VACUUM → ANALYZE (blocks
         # Discord commands internally via db_maintenance_mode).
         _result = await db_mgr.nightly_db_maintenance()

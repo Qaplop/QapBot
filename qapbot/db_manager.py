@@ -2116,7 +2116,8 @@ class WarHistoryDB:
 
         # CWL roster planning: one row per guild x season planning campaign.
         # Hot DB only, no history-DB mirroring — short-lived per-season operational data with a
-        # configurable retention purge (guild_config.cwl_retention_months), see nightly_db_maintenance().
+        # configurable retention purge (guild_config.cwl_retention_months), see
+        # purge_expired_cwl_events() — run as Step 0.6 of QapBot.py's nightly maintenance.
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS cwl_events (
                 id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4293,6 +4294,102 @@ class WarHistoryDB:
                 logging.error(f"[DB-WRITE-SYNC] delete_cwl_event_sync failed for event {event_id}: {e}")
                 conn.rollback()
                 return False
+
+    @staticmethod
+    def _cwl_retention_cutoff_season(months: int, now: Optional["datetime"] = None) -> str:
+        """The oldest cwl_season a guild with `months` retention still keeps, as 'YYYY-MM'.
+
+        Seasons are compared as plain strings throughout this feature — 'YYYY-MM' is
+        zero-padded, so lexical order IS chronological order and no per-row date parsing is
+        needed. Purging uses `cwl_season < cutoff` (strict), so a season is retained for at least
+        the full configured number of months.
+        """
+        from datetime import datetime, timezone
+
+        now = now or datetime.now(timezone.utc)
+        total_months = now.year * 12 + (now.month - 1) - months
+        return f"{total_months // 12:04d}-{total_months % 12 + 1:02d}"
+
+    async def purge_expired_cwl_events(self) -> Dict[str, int]:
+        """Delete CWL seasons past each guild's configured `guild_config.cwl_retention_months`.
+
+        This is the consumer the retention setting never had: the column, its settings UI and its
+        readout on the CWL Settings screen all shipped long before anything acted on them, leaving
+        the setting inert while telling admins their old seasons were being purged. Called as
+        Step 0.6 of QapBot.py's nightly maintenance, immediately before the VACUUM/REINDEX pass so
+        the freed pages are reclaimed in the same run (the same ordering, and the same reason, as
+        the history-migration step just above it).
+
+        **Scoped by season age, not by event status.** There is deliberately no 'completed' status
+        in this feature's lifecycle (draft -> signup_open -> announced -> war, plus cancelled): a
+        finished season simply stays in 'war' forever, so status can't identify what's over. The
+        season key can — once a season's own calendar month is far enough in the past, that season
+        is finished no matter which status its row happens to be sitting in, and an abandoned
+        'draft' from a year ago is exactly as purgeable as a completed one. A future season is
+        never at risk, since its month isn't in the past at all.
+
+        retention_months = 0 means "keep indefinitely" (the default for every guild) and is
+        skipped entirely.
+
+        **The two cross-guild tables need different treatment.** cwl_locked_clan_members and
+        cwl_player_season_status are keyed by cwl_season alone with no FK to cwl_events, so the
+        ON DELETE CASCADE that clears cwl_event_clans/cwl_signups/cwl_assignments/
+        cwl_shared_clan_guilds/cwl_dropped_notified_players never reaches them. They also hold
+        genuinely shared data: deleting a season's rows because ONE guild's retention expired
+        would destroy state another guild is still retaining. So they are swept referentially
+        instead of by age — a season's rows go only once NO cwl_events row anywhere references
+        that season any more. That self-corrects: a guild set to "keep indefinitely" keeps its
+        event, which keeps the shared rows alive for everyone.
+
+        Returns:
+            {"events": n, "locked_members": n, "player_season_status": n, "guilds": n}
+        """
+        result = {"events": 0, "locked_members": 0, "player_season_status": 0, "guilds": 0}
+        if self._conn is None:
+            return result
+
+        cursor = await self._conn.execute(
+            "SELECT guild_id, cwl_retention_months FROM guild_config "
+            "WHERE cwl_retention_months IS NOT NULL AND cwl_retention_months > 0"
+        )
+        guilds = await cursor.fetchall()
+
+        for row in guilds:
+            months = int(row["cwl_retention_months"])
+            cutoff = self._cwl_retention_cutoff_season(months)
+            deleted = await self._conn.execute(
+                "DELETE FROM cwl_events WHERE guild_id = ? AND cwl_season < ?",
+                (row["guild_id"], cutoff),
+            )
+            if deleted.rowcount and deleted.rowcount > 0:
+                result["events"] += deleted.rowcount
+                result["guilds"] += 1
+                logging.info(
+                    f"[CWL-PURGE] guild {row['guild_id']}: removed {deleted.rowcount} season(s) "
+                    f"older than {cutoff} (retention {months} months)"
+                )
+
+        # Orphan sweep for the two cross-guild, season-keyed tables — see the docstring above for
+        # why these can't be scoped per guild. Runs unconditionally rather than only when something
+        # was purged just now, so rows orphaned by an ordinary "Delete Season" are cleaned up too.
+        for table, key in (
+            ("cwl_locked_clan_members", "locked_members"),
+            ("cwl_player_season_status", "player_season_status"),
+        ):
+            orphaned = await self._conn.execute(
+                f"DELETE FROM {table} WHERE cwl_season NOT IN (SELECT cwl_season FROM cwl_events)"
+            )
+            if orphaned.rowcount and orphaned.rowcount > 0:
+                result[key] = orphaned.rowcount
+
+        if any(result[k] for k in ("events", "locked_members", "player_season_status")):
+            await self._conn.commit()
+            logging.info(
+                f"[CWL-PURGE] Done — events={result['events']} across {result['guilds']} guild(s), "
+                f"locked_members={result['locked_members']}, "
+                f"player_season_status={result['player_season_status']}"
+            )
+        return result
 
     def get_cwl_player_season_status_dm_refs_for_event_sync(self, event_id: int) -> List[Dict[str, Any]]:
         """Every (player_tag, dmed_discord_id, message_id, channel_id) for a DM this exact event
