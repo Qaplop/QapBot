@@ -209,6 +209,7 @@ function renderBlockOne(
   const applyButton = document.createElement('button')
   applyButton.textContent = t('apply')
   applyButton.className = 'status-action-button'
+  applyButton.title = t('apply_tooltip')
   applyModeSelect.addEventListener('change', () => {
     applyDmCheckbox.disabled = applyModeSelect.value !== 'optout'
     if (applyDmCheckbox.disabled) applyDmCheckbox.checked = false
@@ -368,6 +369,7 @@ function renderBlockTwo(
   for (const key of ['col_account', 'col_status', 'col_clan', 'col_tier', 'col_start']) {
     const th = document.createElement('th')
     th.textContent = t(key)
+    if (key === 'col_status') th.title = t('col_status_tooltip')
     headRow.appendChild(th)
   }
   thead.appendChild(headRow)
@@ -423,9 +425,13 @@ function buildSeasonRow(
     icon.className = 'status-icon'
     icon.src = STATUS_ICON[row.signup_status]
     icon.alt = statusLabel(row.signup_status, t)
+    // 'auto_confirmed' is the one status whose label alone doesn't say enough — see the "I'm in"
+    // button's own confirm_tooltip_auto_confirmed for the same nuance from the action side.
+    if (row.signup_status === 'auto_confirmed') icon.title = t('status_tooltip_auto_confirmed')
     statusInner.appendChild(icon)
     const label = document.createElement('span')
     label.textContent = statusLabel(row.signup_status, t)
+    if (row.signup_status === 'auto_confirmed') label.title = t('status_tooltip_auto_confirmed')
     statusInner.appendChild(label)
   }
 
@@ -448,6 +454,10 @@ function buildSeasonRow(
       imInButton.title = t('confirm_tooltip_auto_confirmed')
     } else if (notInvited) {
       imInButton.title = t('status_action_tooltip_not_invited')
+    } else if (currentStatus === 'confirmed') {
+      imInButton.title = t('confirm_tooltip_already_confirmed')
+    } else {
+      imInButton.title = t('confirm_tooltip_default')
     }
 
     const imOutButton = document.createElement('button')
@@ -456,6 +466,10 @@ function buildSeasonRow(
     imOutButton.disabled = notInvited || currentStatus === 'declined'
     if (notInvited) {
       imOutButton.title = t('status_action_tooltip_not_invited')
+    } else if (currentStatus === 'declined') {
+      imOutButton.title = t('optout_tooltip_already_declined')
+    } else {
+      imOutButton.title = t('optout_tooltip_default')
     }
 
     const fireStatusChange = async (action: PlayerPrefsStatusAction): Promise<void> => {
