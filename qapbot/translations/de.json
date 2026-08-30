@@ -1109,7 +1109,7 @@
     "update": {
       "dm_intro": "\ud83d\udccb Hallo **{display_name}**, deine CWL-Aufstellung f\u00fcr Saison **{season}** hat sich ge\u00e4ndert ({count} \u00c4nderung(en)):",
       "dm_confirm_prompt": "\n\nBitte best\u00e4tige unten, ob du diese CWL spielen m\u00f6chtest \u2014 deine Leitung wartet auf deine Antwort.",
-      "dm_line_dropped": "\n\u2796 **{player_name}** \u2014 du bist nicht mehr in der CWL-Aufstellung von **{clan_name}**. Deine Leitung kann dich vor dem Start noch anderweitig einteilen.",
+      "dm_line_dropped": "\n\u2796 **{player_name}** \u2014 du bist nicht mehr in der CWL-Aufstellung von **{clan_name}**. Deine Leitung kann dich vor dem Start noch anderweitig einteilen. Wende dich bei R\u00fcckfragen an deine Clanleitung.",
       "dm_line_moved_prefix": "\n\ud83d\udd04 **{player_name}** \u2014 ge\u00e4ndert von **{old_clan_name}**:"
     },
     "alarm": {

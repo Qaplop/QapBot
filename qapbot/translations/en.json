@@ -1109,7 +1109,7 @@
     "update": {
       "dm_intro": "\ud83d\udccb Hi **{display_name}**, your CWL line-up for season **{season}** has changed ({count} update(s)):",
       "dm_confirm_prompt": "\n\nPlease confirm below whether you want to play this CWL \u2014 your lead is waiting on your answer.",
-      "dm_line_dropped": "\n\u2796 **{player_name}** \u2014 you are no longer in the CWL line-up for **{clan_name}**. Your lead may still place you elsewhere before it starts.",
+      "dm_line_dropped": "\n\u2796 **{player_name}** \u2014 you are no longer in the CWL line-up for **{clan_name}**. Your lead may still place you elsewhere before it starts. Get in contact with your clan lead if this requires clarification.",
       "dm_line_moved_prefix": "\n\ud83d\udd04 **{player_name}** \u2014 changed from **{old_clan_name}**:"
     },
     "alarm": {
