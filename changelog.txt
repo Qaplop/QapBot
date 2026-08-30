@@ -29,6 +29,65 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   (confirmed/declined/auto_confirmed), matching the board's own rule exactly. qapbot/QBdiscocmdshelper_cwl.py.
   1 new test. Full suite: 2852 passed, 4 deselected.
 
+2026-08-30 (32)
+- Added: the CWL four-phase model -- Setup / Enrollment / Preparation / War -- with a step
+  indicator at the top of the CWL Management message (done / current / upcoming, as
+  checkmark / blue-dot-bold / hollow-circle). Phase is derived in exactly one place, so the
+  indicator, the buttons and the freeze guards can never disagree. The War step carries its clan
+  count ("War (2/8 started)") because a guild reaches War the moment its FIRST clan starts while
+  the rest are still moving players.
+- Renamed: "Start CWL" -> "Announce Rosters" (and "Send Roster Updates" once changes are pending).
+  The real CWL start is a manual in-game action only a clan lead can take; a bot button must not
+  claim to do it. start_cwl() became announce_cwl_rosters() rather than being left as a name that
+  lies about what it does.
+- Added: automatic War-phase transition. When the update cycle sees a participating clan's CWL
+  actually started in-game, it snapshots that clan's real locked roster (via the league group,
+  falling back to live membership), drops anyone who never transferred in back to the unassigned
+  pool with a one-off explanatory DM, and moves the event to the new 'war' status.
+- Added: per-clan roster freeze. A clan that has started can no longer be removed from the season,
+  its settings are forced back to stored values, and no player can be dragged into or out of its
+  column -- with the one exception the spec requires: anyone who WAS in the clan when it locked
+  stays eligible and can still be placed there. Enforced server-side in the single assignment
+  write path, with the board rendering a lock badge and non-draggable cards to match. Season
+  deletion is blocked entirely once any clan has started.
+- Added: batched roster-update DMs. Changing the board after players were told where they play no
+  longer risks a DM per drag: "pending" is a comparison against what was last SENT, so a player
+  dragged A->B->A cancels out and owes nobody a message. Flushed through three triggers sharing one
+  implementation -- a button beside Close on the board, a DM to the admin who closes the board with
+  changes outstanding, and a highlighted button on the Hub message.
+- Added: removing a clan mid-season tells its already-announced players; adding one late sends
+  never-contacted players ONE combined DM carrying both the assignment details and the
+  confirm/opt-out buttons, instead of an enrollment DM followed by an assignment DM.
+- Added: "Announce Rosters" now warns, in its confirmation dialog, which participating clans are
+  still short of their configured roster size, and asks whether to proceed anyway.
+- Added: 30 minutes before a clan's announced start, its CWL Coordinators get a status report --
+  roster full or short, and who still hasn't joined. Coordinators also gained Teams Management
+  access for clans participating in the current season.
+- Changed: the T-2h coordinator escalation added yesterday was REMOVED in favour of the above. It
+  fired 90 minutes earlier and said nearly the same thing; two near-identical leadership DMs is the
+  same avalanche problem this feature avoids everywhere else. Players keep both of their own
+  escalating alarms, so no lead time is lost.
+- Fixed (real latent bug, found while building): set_cwl_event_clans_sync is a DELETE + INSERT that
+  never carried locked_at (or created_at) forward, so every ordinary save of the clan-config screen
+  would have silently un-frozen every locked clan and bounced the guild out of War phase. Fixed in
+  the DB method rather than at the call sites -- its contract is "replace the configuration", not
+  "reset facts the configuration does not own".
+- Fixed: the "Still Missing" leadership section was gated on status == 'announced', so it vanished
+  the instant war started -- exactly when leadership needs it, since the remaining clans are still
+  waiting on transfers. Same trap the monitoring sweep's own status query had.
+- Note on the spec: an ephemeral message when the Activity is closed is NOT possible (an ephemeral
+  needs a live interaction token; discordSdk.close() is a client-side call with none behind it, and
+  the original LAUNCH_ACTIVITY already consumed its one response slot). Delivered as a DM with the
+  same button instead, via the existing /api/cwl/activity-closed hook.
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/ui_cwl_roster.py, qapbot/db_manager.py,
+  qapbot/web_bridge.py, qapbot/translations/{en,de}.json, activity/client/src/{enrollmentBoard,
+  main,types}.ts, activity/client/index.html, activity/server/src/index.ts.
+  Plan: plans/cwl-phase-model-and-war-phase.md. 2882 tests pass; client+server typecheck/build
+  clean.
+  NOTE: not yet verified live. Needs a bot restart AND deploys of BOTH activity/client and
+  activity/server (the Worker gained /cwl/enrollment/send-updates -- a stale Worker fails that
+  button silently).
+
 2026-08-29 (31)
 - Added: "Start CWL" (CWL_ROSTER_PLANNING_PLAN.md Phase 5) -- a new CWL Management button that
   announces the finished roster to every assigned player by DM. Each player's message is tailored

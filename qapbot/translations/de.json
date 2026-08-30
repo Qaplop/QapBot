@@ -1018,6 +1018,17 @@
       "still_missing_block_title": "⚠️ Fehlen noch (nicht im zugewiesenen Clan)",
       "still_missing_locked": "CWL gestartet — Aufstellung gesperrt",
       "delete_blocked_war_started": "\u26d4 Diese Saison kann nicht mehr gel\u00f6scht werden \u2014 die CWL hat im Spiel bereits begonnen f\u00fcr: **{clans}**.\nDeren Aufstellungen sind im Spiel gesperrt und ein L\u00f6schen w\u00fcrde Daten eines laufenden Krieges vernichten.",
+      "button_send_updates": "Aufstellungs-Updates senden",
+      "send_updates_confirm_body": "\ud83d\udccb Sollen die ausstehenden CWL-Aufstellungs\u00e4nderungen f\u00fcr Saison **{season}** gesendet werden? Es werden nur Spieler kontaktiert, deren Clan sich seit der letzten Info tats\u00e4chlich ge\u00e4ndert hat.",
+      "button_confirm_send_updates": "Ja, Updates senden",
+      "send_updates_processing": "\u23f3 Aufstellungs-Updates werden gesendet, dies kann einige Sekunden dauern\u2026",
+      "send_updates_summary": "\u2705 Fertig.\nIn anderen Clan verschoben: {moved}\nNeu zugewiesen: {new}\nAus der Aufstellung entfernt: {dropped}\nKontaktierte Discord-Nutzer: {contacted_users}\n\u00dcbersprungen (DM-Schutz): {skipped_dm_guard}\n\u00dcbersprungen (kein verkn\u00fcpfter Account): {skipped_unlinked}{dm_issues}",
+      "send_updates_cancelled": "\u274c Abgebrochen \u2014 es wurden keine Updates gesendet.",
+      "send_updates_error_no_database": "\u26a0\ufe0f Datenbank nicht bereit \u2014 bitte gleich erneut versuchen.",
+      "send_updates_error_no_event": "\u26a0\ufe0f F\u00fcr diese Saison wurde kein CWL-Event mehr gefunden \u2014 es wurde m\u00f6glicherweise gel\u00f6scht.",
+      "send_updates_error_not_open": "\u26a0\ufe0f Die Anmeldephase f\u00fcr diese Saison wurde noch nicht gestartet.",
+      "close_pending_updates_dm": "\ud83d\udccb Du hast die CWL-Teamverwaltung f\u00fcr **{season}** geschlossen, w\u00e4hrend noch **{count}** Aufstellungs\u00e4nderung(en) nicht gesendet wurden. Die betroffenen Spieler wurden noch nicht informiert.",
+      "announce_rosters_underfilled_warning": "\n\n\u26a0\ufe0f Diese Clans sind noch nicht voll:\n{clans}\nDu kannst trotzdem jetzt bekannt geben und sp\u00e4ter Spieler erg\u00e4nzen \u2014 sie erhalten dann eine Update-DM.",
       "button_announce_rosters": "Aufstellung bekannt geben",
       "button_confirm_announce_rosters": "Ja, Aufstellung bekannt geben",
       "announce_rosters_confirm_body": "\ud83d\udce3 Soll die CWL-Aufstellung f\u00fcr Saison **{season}** an alle zugewiesenen Spieler gesendet werden? Wer bereits im zugewiesenen Clan ist, erf\u00e4hrt, wann seine CWL startet; wer noch wechseln muss, bekommt Clan, Zeitpunkt und einen direkten Beitrittslink.",
@@ -1101,11 +1112,21 @@
       "dm_line_amber": "\n\u26a0\ufe0f **{player_name}** \u2014 du bist aktuell in **{current_clan_name}** und musst *rechtzeitig vor* {start_full} ({start_rel}) zu **{clan_name}** wechseln.\n\u27a1\ufe0f <{clan_url}>",
       "dm_unknown_clan": "keinem Clan"
     },
+    "update": {
+      "dm_intro": "\ud83d\udccb Hallo **{display_name}**, deine CWL-Aufstellung f\u00fcr Saison **{season}** hat sich ge\u00e4ndert ({count} \u00c4nderung(en)):",
+      "dm_confirm_prompt": "\n\nBitte best\u00e4tige unten, ob du diese CWL spielen m\u00f6chtest \u2014 deine Leitung wartet auf deine Antwort.",
+      "dm_line_dropped": "\n\u2796 **{player_name}** \u2014 du bist nicht mehr in der CWL-Aufstellung von **{clan_name}**. Deine Leitung kann dich vor dem Start noch anderweitig einteilen.",
+      "dm_line_moved_prefix": "\n\ud83d\udd04 **{player_name}** \u2014 ge\u00e4ndert von **{old_clan_name}**:"
+    },
     "alarm": {
       "dm_missed_lock": "\u26a0\ufe0f **{player_name}** \u2014 die CWL von **{clan_name}** ({season}) hat begonnen und du warst nicht rechtzeitig im Clan, daher bist du diese Saison nicht in deren Aufstellung.\n\nDu bist zur\u00fcck im Pool \u2014 deine Leitung kann dich noch einem anderen Clan zuweisen.",
+      "coordinator_start_reminder": "\u23f0 **{clan_name}** startet die CWL {start_rel} (Saison {season}).\n{roster_line}\n{missing_line}",
+      "coordinator_roster_full": "\u2705 Aufstellung: vollst\u00e4ndig.",
+      "coordinator_roster_short": "\u26a0\ufe0f Aufstellung: **{assigned}/{roster_size}** \u2014 es sind {roster_size} Pl\u00e4tze konfiguriert, es ist also noch Platz.",
+      "coordinator_missing_none": "\u2705 Alle zugewiesenen Spieler sind bereits im Clan.",
+      "coordinator_missing_some": "\u26a0\ufe0f Noch nicht im Clan ({count}): {names}",
       "dm_header_stage1": "\u23f0 **{player_name}** \u2014 Erinnerung: du bist noch nicht in deinen CWL-Clan gewechselt.",
-      "dm_header_stage2": "\ud83d\udea8 **{player_name}** \u2014 DRINGEND: die CWL startet gleich und du bist immer noch nicht in deinem zugewiesenen Clan!",
-      "coordinator_body": "\ud83d\udea8 CWL **{season}** \u2014 **{clan_name}** startet {start_rel} und {count} zugewiesene Spieler sind noch nicht beigetreten:\n{names}"
+      "dm_header_stage2": "\ud83d\udea8 **{player_name}** \u2014 DRINGEND: die CWL startet gleich und du bist immer noch nicht in deinem zugewiesenen Clan!"
     },
     "reminder": {
       "dm_intro_body": "👋 Hallo **{display_name}**,\n\nfür die CWL-Saison **{season}** warten wir noch auf deine Rückmeldung — du hast aktuell **{count}** offene Anmeldung(en) im CWL-Kader-Pool, auf die wir bisher keine Antwort von dir erhalten haben.\n\nBitte bestätige oder melde dich in der nächsten Nachricht so schnell wie möglich ab — dort findest du für jeden deiner Accounts eigene Bestätigen-/Abmelden-Buttons. Deine schnelle Rückmeldung hilft uns sehr bei der Kaderplanung dieser Saison.",

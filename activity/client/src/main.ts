@@ -279,6 +279,21 @@ async function setup(): Promise<void> {
           }
           return (await statusResponse.json()) as SetStatusResult
         },
+        // "Send Roster Updates" from the footer (2026-08-30, spec item 4 trigger (a)) — DMs every
+        // player whose clan changed since they were last told. The counts come back so the footer
+        // can say what actually went out rather than a bare "done".
+        async () => {
+          const updatesResponse = await fetch('/api/cwl/enrollment/send-updates', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+            body: JSON.stringify({ guild_id: guildId }),
+          })
+          if (!updatesResponse.ok) {
+            const body = await updatesResponse.text()
+            throw errorFromResponse(updatesResponse.status, body)
+          }
+          return (await updatesResponse.json()) as { moved: number; new: number; dropped: number }
+        },
       )
 
       // Event-driven live-update (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8 —

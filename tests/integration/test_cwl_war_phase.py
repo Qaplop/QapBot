@@ -400,6 +400,176 @@ async def test_delete_button_disabled_once_a_clan_started(db):
 
 
 # ---------------------------------------------------------------------------
+# Pending roster updates (spec item 4)
+# ---------------------------------------------------------------------------
+
+async def _announced_player(db, event_id, guild_id, tag, clan_tag, name, discord_id="u1"):
+    await _player(db, discord_id, tag, clan_tag, name)
+    db.upsert_cwl_assignment_sync(event_id, tag, clan_tag, assignment_source="admin_override", locked=True)
+    db.mark_cwl_assignment_notified_sync(event_id, tag, True, clan_tag)
+
+
+@pytest.mark.asyncio
+async def test_moving_an_announced_player_makes_an_update_pending(db):
+    from qapbot.QBdiscocmdshelper_cwl import (
+        assign_cwl_player_sync, resolve_cwl_pending_roster_updates_sync,
+    )
+
+    guild_id = "320"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1"}, {"clan_tag": "#CLAN2"}])
+    await _announced_player(db, event_id, guild_id, "#P1", "#CLAN1", "Mover")
+
+    pending = resolve_cwl_pending_roster_updates_sync(int(guild_id), event_id, SEASON)
+    assert pending == {"moved": [], "dropped": [], "new": []}, "nothing changed yet"
+
+    assign_cwl_player_sync(int(guild_id), event_id, SEASON, "#P1", "#CLAN2", source="admin_override")
+
+    pending = resolve_cwl_pending_roster_updates_sync(int(guild_id), event_id, SEASON)
+    assert len(pending["moved"]) == 1
+    assert pending["moved"][0]["notified_clan_tag"] == "#CLAN1"
+    assert pending["moved"][0]["clan_tag"] == "#CLAN2"
+
+
+@pytest.mark.asyncio
+async def test_dragging_there_and_back_cancels_itself_out(db):
+    """The avalanche protection, obtained structurally rather than by debouncing: "pending" is a
+    comparison against what was last SENT, so A→B→A ends up owing nobody a DM."""
+    from qapbot.QBdiscocmdshelper_cwl import (
+        assign_cwl_player_sync, resolve_cwl_pending_roster_updates_sync,
+    )
+
+    guild_id = "321"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1"}, {"clan_tag": "#CLAN2"}])
+    await _announced_player(db, event_id, guild_id, "#P1", "#CLAN1", "Indecisive")
+
+    assign_cwl_player_sync(int(guild_id), event_id, SEASON, "#P1", "#CLAN2", source="admin_override")
+    assign_cwl_player_sync(int(guild_id), event_id, SEASON, "#P1", "#CLAN1", source="admin_override")
+
+    pending = resolve_cwl_pending_roster_updates_sync(int(guild_id), event_id, SEASON)
+    assert pending["moved"] == [] and pending["dropped"] == [] and pending["new"] == []
+
+
+@pytest.mark.asyncio
+async def test_unassigning_an_announced_player_leaves_a_tombstone(db):
+    """Unassigning DELETES the assignment row, so without a tombstone the fact that this player is
+    owed a "you're off the roster" DM would vanish with it."""
+    from qapbot.QBdiscocmdshelper_cwl import (
+        assign_cwl_player_sync, resolve_cwl_pending_roster_updates_sync,
+    )
+
+    guild_id = "322"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1"}])
+    await _announced_player(db, event_id, guild_id, "#P1", "#CLAN1", "Dropped")
+
+    assign_cwl_player_sync(int(guild_id), event_id, SEASON, "#P1", None, source="admin_override")
+
+    pending = resolve_cwl_pending_roster_updates_sync(int(guild_id), event_id, SEASON)
+    assert len(pending["dropped"]) == 1
+    assert pending["dropped"][0]["notified_clan_tag"] == "#CLAN1"
+
+    # Putting them back clears it — a stale tombstone would send a contradictory removal notice.
+    assign_cwl_player_sync(int(guild_id), event_id, SEASON, "#P1", "#CLAN1", source="admin_override")
+    pending = resolve_cwl_pending_roster_updates_sync(int(guild_id), event_id, SEASON)
+    assert pending["dropped"] == [] and pending["moved"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_never_announced_player_counts_as_new_not_moved(db):
+    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_pending_roster_updates_sync
+
+    guild_id = "323"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1"}])
+    await _player(db, "u9", "#NEW", "#CLAN1", "Latecomer")
+    db.upsert_cwl_assignment_sync(event_id, "#NEW", "#CLAN1", assignment_source="admin_override", locked=True)
+
+    pending = resolve_cwl_pending_roster_updates_sync(int(guild_id), event_id, SEASON)
+    assert len(pending["new"]) == 1 and pending["moved"] == []
+
+
+@pytest.mark.asyncio
+async def test_send_roster_updates_dms_once_and_clears_pending(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import (
+        assign_cwl_player_sync, count_cwl_pending_roster_updates, send_cwl_roster_updates,
+    )
+
+    guild_id = "324"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1", "cwl_start_at": f"{SEASON}-01T08:00Z"},
+                                           {"clan_tag": "#CLAN2", "cwl_start_at": f"{SEASON}-01T08:00Z"}])
+    await _announced_player(db, event_id, guild_id, "#P1", "#CLAN1", "Mover")
+    assign_cwl_player_sync(int(guild_id), event_id, SEASON, "#P1", "#CLAN2", source="admin_override")
+    sent = AsyncMock(return_value=(True, "sent"))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", sent, raising=False)
+
+    assert count_cwl_pending_roster_updates(int(guild_id), SEASON) == 1
+    result = await send_cwl_roster_updates(int(guild_id), SEASON)
+
+    assert result["ok"] and result["moved"] == 1 and result["contacted_users"] == 1
+    body = sent.await_args.args[1]
+    assert "Mover" in body
+    # Draining it must actually clear the pending state, or the Hub button would never go away.
+    assert count_cwl_pending_roster_updates(int(guild_id), SEASON) == 0
+
+
+@pytest.mark.asyncio
+async def test_one_user_with_two_changed_accounts_gets_one_dm(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import assign_cwl_player_sync, send_cwl_roster_updates
+
+    guild_id = "325"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1", "cwl_start_at": f"{SEASON}-01T08:00Z"},
+                                           {"clan_tag": "#CLAN2", "cwl_start_at": f"{SEASON}-01T08:00Z"}])
+    await _announced_player(db, event_id, guild_id, "#MAIN", "#CLAN1", "Main", "u1")
+    await _announced_player(db, event_id, guild_id, "#ALT", "#CLAN1", "Alt", "u1")
+    assign_cwl_player_sync(int(guild_id), event_id, SEASON, "#MAIN", "#CLAN2", source="admin_override")
+    assign_cwl_player_sync(int(guild_id), event_id, SEASON, "#ALT", None, source="admin_override")
+    sent = AsyncMock(return_value=(True, "sent"))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", sent, raising=False)
+
+    result = await send_cwl_roster_updates(int(guild_id), SEASON)
+
+    assert result["moved"] == 1 and result["dropped"] == 1
+    assert result["contacted_users"] == 1
+    assert sent.await_count == 1, "one person, one DM — never one per account"
+    body = sent.await_args.args[1]
+    assert "Main" in body and "Alt" in body
+
+
+# ---------------------------------------------------------------------------
+# Roster completeness check (spec item 6)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_underfilled_clans_are_reported_and_full_ones_are_not(db):
+    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_underfilled_clans_sync
+
+    guild_id = "330"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [
+        {"clan_tag": "#CLAN1", "roster_size": 2},
+        {"clan_tag": "#CLAN2", "roster_size": 1},
+    ])
+    await _player(db, "u1", "#A", "#CLAN1")
+    await _player(db, "u2", "#B", "#CLAN2")
+    await _player(db, "u3", "#C", "#CLAN2")
+    db.upsert_cwl_assignment_sync(event_id, "#A", "#CLAN1", assignment_source="admin_override", locked=True)
+    db.upsert_cwl_assignment_sync(event_id, "#B", "#CLAN2", assignment_source="admin_override", locked=True)
+    db.upsert_cwl_assignment_sync(event_id, "#C", "#CLAN2", assignment_source="admin_override", locked=True)
+
+    short = resolve_cwl_underfilled_clans_sync(int(guild_id), event_id, SEASON)
+
+    # CLAN1 has 1 of 2; CLAN2 is over-filled (2 of 1) which is a deliberate reserve, not a problem.
+    assert [s["clan_tag"] for s in short] == ["#CLAN1"]
+    assert short[0]["assigned"] == 1 and short[0]["roster_size"] == 2
+
+
+# ---------------------------------------------------------------------------
 # Coordinator board access
 # ---------------------------------------------------------------------------
 

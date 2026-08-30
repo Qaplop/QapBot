@@ -2253,18 +2253,22 @@ async def test_announce_rosters_button_present_when_an_assigned_player_is_unanno
 @pytest.mark.discord
 @pytest.mark.asyncio
 async def test_announce_rosters_button_disappears_once_everyone_is_announced(db):
-    """The self-managing gate: no separate "re-announce" action, the button simply goes away — and
-    comes back on its own when a late arrival is assigned."""
+    """The self-managing gate: no separate "re-announce" action, the button simply goes away.
+
+    Once the season is announced (Preparation phase) that row-4 slot belongs to "Send Roster
+    Updates" instead (2026-08-30, spec item 4 trigger (c)), so a late arrival surfaces THAT button,
+    highlighted — not a second first-announcement."""
     from qapbot.ui_cwl_roster import add_cwl_management_components
 
     event_id = await _seed_announce_rosters_scenario(db, "8904", status="announced", assign=True)
-    db.mark_cwl_assignment_notified_sync(event_id, "#P1")
+    db.mark_cwl_assignment_notified_sync(event_id, "#P1", True, "#CLAN1")
 
     view = discord.ui.View(timeout=300)
     add_cwl_management_components(view, 8904)
     assert _announce_rosters_button(view) is None
+    assert _send_updates_button(view) is None, "nothing changed yet, so nothing is pending"
 
-    # A late arrival lands on the board -> the button is back, with no admin action in between.
+    # A late arrival lands on the board -> the update button appears, with no admin action between.
     await db.conn.execute(
         "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
         "VALUES ('10', '#P2', 'Latecomer', 1, '#CLAN1')"
@@ -2276,7 +2280,18 @@ async def test_announce_rosters_button_disappears_once_everyone_is_announced(db)
 
     view2 = discord.ui.View(timeout=300)
     add_cwl_management_components(view2, 8904)
-    assert _announce_rosters_button(view2) is not None
+    assert _announce_rosters_button(view2) is None
+    updates = _send_updates_button(view2)
+    assert updates is not None
+    # "active and highlighted" (project owner's spec) — danger is this screen's highlight style.
+    assert updates.style == discord.ButtonStyle.danger  # type: ignore[union-attr]
+
+
+def _send_updates_button(view: discord.ui.View):
+    return next(
+        (c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_send_roster_updates"),
+        None,
+    )
 
 
 # ---------------------------------------------------------------------------

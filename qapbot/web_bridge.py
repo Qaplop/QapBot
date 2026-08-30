@@ -478,11 +478,21 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
             owner_row = _owner_row_for(c["clan_tag"], shared["owner_event_id"])
             if owner_row is not None:
                 effective_row = owner_row
+        # Lock state (2026-08-30): the board renders a locked column read-only and blocks drops
+        # into it, except for the players who were already in the clan when its roster locked.
+        # Sent as an explicit tag list rather than a flag per player so the frontend can answer
+        # "may this specific card go here?" locally, without a round trip per drag.
+        locked_at = c.get("locked_at")
         clans.append({
             "clan_tag": c["clan_tag"],
             "name": CACHE.get_clan_name(c["clan_tag"], c["clan_tag"]),
             "tier": _tier_for(c),
             "roster_size": effective_row["roster_size"],
+            "locked_at": locked_at,
+            "eligible_player_tags": (
+                sorted(db.get_cwl_locked_clan_member_tags_sync(season, c["clan_tag"]))
+                if locked_at else []
+            ),
         })
 
     players_by_tag: Dict[str, Dict[str, Any]] = {}
@@ -762,12 +772,20 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
 
     players = sorted(players_by_tag.values(), key=lambda p: (p["player_name"] or p["player_tag"]).lower())
 
+    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_pending_roster_updates_sync
+
+    pending = resolve_cwl_pending_roster_updates_sync(guild_id, event["id"], season)
     return {
         "season": season,
         "event_status": event["status"],
         "clans": clans,
         "players": players,
         "version": get_enrollment_version(guild_id),
+        # Drives the board footer's "Send Roster Updates" button (2026-08-30, spec item 4). Sent
+        # with every payload so the client's own optimistic per-drag bump gets corrected back down
+        # on the next refresh — a drag that turned out to owe nobody a DM (A->B->A) must not leave
+        # the button stuck on forever.
+        "pending_roster_updates": len(pending["moved"]) + len(pending["dropped"]) + len(pending["new"]),
     }
 
 
@@ -2510,6 +2528,21 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
         except Exception as e:
             logging.warning(f"[WEB-BRIDGE] Clan {clan_tag} deactivated but shared-clan detach failed: {e}")
 
+    # Removing a clan strands anyone already TOLD they'd play for it (2026-08-30, spec item 5).
+    # They effectively return to the pool — _build_enrollment_payload drops assignments pointing at
+    # a non-participating clan — but the assignment row itself survives, so the ordinary
+    # moved/dropped comparison would never notice and they'd sit holding instructions for a clan
+    # that isn't in the season any more. Tombstoning them here routes them through the exact same
+    # "Send Roster Updates" batch as every other change, rather than inventing a second DM path.
+    if newly_deactivated_tags and event_status not in ("draft", "cancelled"):
+        try:
+            await asyncio.to_thread(
+                _tombstone_announced_players_of_removed_clans_sync,
+                event_id, newly_deactivated_tags,
+            )
+        except Exception as e:
+            logging.warning(f"[WEB-BRIDGE] Clan removal: could not record pending update DMs: {e}")
+
     # Best-effort — a failure here shouldn't fail the save itself (matches how Discord-side
     # callbacks treat repost/refresh failures as logged-not-raised).
     try:
@@ -2526,6 +2559,36 @@ async def handle_post_clan_config(request: web.Request) -> web.Response:
         await bump_enrollment_version(None)
 
     return web.json_response({"ok": True, "event_id": event_id})
+
+
+def _tombstone_announced_players_of_removed_clans_sync(event_id: int, removed_clan_tags: List[str]) -> int:
+    """Mark every already-announced player of a just-removed clan as owed an update DM
+    (2026-08-30, spec item 5). Returns how many were recorded.
+
+    Only players with a `notified_clan_tag` are recorded: someone who was never told where they'd
+    play has nothing to be corrected about, and telling them they've been removed from a roster
+    they never knew they were on would be pure noise."""
+    db = CACHE.db_manager
+    if db is None or not removed_clan_tags:
+        return 0
+    removed = set(removed_clan_tags)
+    names = {s["player_tag"]: s["player_name"] for s in db.get_cwl_signups_for_event_sync(event_id)}
+    recorded = 0
+    for assignment in db.get_cwl_assignments_sync(event_id):
+        if assignment["assigned_clan_tag"] not in removed or not assignment["notified_clan_tag"]:
+            continue
+        db.record_cwl_dropped_notified_player_sync(
+            event_id, assignment["player_tag"],
+            names.get(assignment["player_tag"]),
+            assignment["notified_clan_tag"],
+        )
+        recorded += 1
+    if recorded:
+        logging.info(
+            f"[CWL-UPDATE] event {event_id}: {recorded} announced player(s) pending a removal DM "
+            f"after clan(s) {', '.join(sorted(removed))} left the season"
+        )
+    return recorded
 
 
 async def handle_post_cwl_shared_clan_evict(request: web.Request) -> web.Response:
@@ -2829,7 +2892,85 @@ async def handle_post_cwl_activity_closed(request: web.Request) -> web.Response:
     except Exception as e:
         logging.warning(f"[WEB-BRIDGE] Activity-closed Hub refresh failed: {e}")
 
+    # Trigger (b) of the spec's three ways to flush pending line-up updates (2026-08-30). The spec
+    # asked for an ephemeral here; that is impossible — an ephemeral needs a live interaction token
+    # and discordSdk.close() is a client-side call with none behind it (the original
+    # LAUNCH_ACTIVITY both consumed its one response slot and expires after 15 minutes). A DM to
+    # the admin who just closed the board carries the same prompt and the same button.
+    try:
+        await _dm_pending_roster_updates_notice(guild_id, discord_user_id)
+    except Exception as e:
+        logging.warning(f"[WEB-BRIDGE] Activity-closed pending-updates DM failed: {e}")
+
     return web.json_response({"ok": True})
+
+
+async def handle_post_cwl_send_roster_updates(request: web.Request) -> web.Response:
+    """Trigger (a) of the three the spec asks for (2026-08-30): the "Send Roster Updates" button
+    sitting beside Close on the Teams Management board itself, so an admin who has just finished
+    reshuffling can flush the DMs without leaving the screen.
+
+    Gated by _resolve_admin_or_leader — the same gate as the board's other write actions, since an
+    admin-only gate here would let a leader (or, since 2026-08-30, a coordinator) rearrange the
+    board and then silently fail on the one action that tells anyone about it."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        guild_id = int(body["guild_id"])
+        discord_user_id = int(body["discord_user_id"])
+    except (KeyError, ValueError, TypeError):
+        return web.json_response({"error": "invalid request body"}, status=400)
+
+    if not await _resolve_admin_or_leader(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
+
+    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season, send_cwl_roster_updates
+
+    season = await asyncio.to_thread(resolve_selected_cwl_season, guild_id)
+    result = await send_cwl_roster_updates(guild_id, season)
+    if not result["ok"]:
+        return web.json_response({"error": result["error"]}, status=409)
+
+    from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+
+    try:
+        await refresh_cwl_management_hub_message(guild_id, "cwl_management")
+    except Exception as e:
+        logging.warning(f"[WEB-BRIDGE] Hub refresh after roster updates failed: {e}")
+    return web.json_response({
+        "ok": True, "moved": result["moved"], "new": result["new"], "dropped": result["dropped"],
+        "contacted_users": result["contacted_users"],
+        "skipped_unlinked": result["skipped_unlinked"],
+        "skipped_dm_guard": result["skipped_dm_guard"],
+    })
+
+
+async def _dm_pending_roster_updates_notice(guild_id: int, discord_user_id: int) -> None:
+    """DM whoever just closed the Teams Management board if they left line-up changes unsent.
+
+    Deliberately silent when nothing is pending — the overwhelmingly common case is closing a board
+    you only looked at, and a "you have 0 updates" DM on every close would train people to ignore
+    the one that matters. Best-effort throughout: this fires while the Activity is already closing,
+    so nothing here may raise into the response."""
+    from qapbot.QBdiscocmdshelper_cwl import (
+        count_cwl_pending_roster_updates, resolve_selected_cwl_season,
+    )
+    from qapbot.i18n import t
+    from qapbot.ui_cwl_roster import CwlPendingUpdatesDmView
+
+    season = await asyncio.to_thread(resolve_selected_cwl_season, guild_id)
+    pending = await asyncio.to_thread(count_cwl_pending_roster_updates, guild_id, season)
+    if not pending:
+        return
+    await CACHE.send_user_dm(
+        str(discord_user_id),
+        t(
+            'cwl.management.close_pending_updates_dm',
+            user_id=str(discord_user_id), guild_id=guild_id, season=season, count=pending,
+        ),
+        view=CwlPendingUpdatesDmView(guild_id, season),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3166,6 +3307,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/cwl/enrollment/guest-players/remove", handle_post_cwl_guest_players_remove)
     app.router.add_post("/api/cwl/shared-clan/evict", handle_post_cwl_shared_clan_evict)
     app.router.add_post("/api/cwl/activity-closed", handle_post_cwl_activity_closed)
+    app.router.add_post("/api/cwl/enrollment/send-updates", handle_post_cwl_send_roster_updates)
     app.router.add_get("/api/tracker/items", handle_get_tracker_items)
     app.router.add_post("/api/tracker/items", handle_post_tracker_create_item)
     app.router.add_get("/api/tracker/items/{item_number}", handle_get_tracker_item)

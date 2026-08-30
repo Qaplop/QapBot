@@ -1,6 +1,6 @@
 import unlinkedIconUrl from './assets/unlinked.svg'
 import notInvitedIconUrl from './assets/notinvited.svg'
-import type { AdminSettableStatus, EnrollmentPayload, EnrollmentPlayer, SetStatusResult } from './types'
+import type { AdminSettableStatus, EnrollmentClan, EnrollmentPayload, EnrollmentPlayer, SetStatusResult } from './types'
 import { STATUS_ICON, STATUS_LABEL, isVisibleStatus } from './signupStatus'
 import type { VisibleStatus } from './signupStatus'
 
@@ -328,6 +328,10 @@ export function renderEnrollmentBoard(
   // Optional, same reasoning as onResolveClanNames above — a caller that omits it just doesn't
   // get that submenu (buildContextMenuEntries is itself gated on this being set).
   onSetEnrollmentStatus?: (playerTag: string, status: AdminSettableStatus) => Promise<SetStatusResult>,
+  // "Send Roster Updates" from the footer (2026-08-30, spec item 4 trigger (a)). Optional like the
+  // callbacks above — a caller that omits it simply never shows the button, and the Hub's own
+  // highlighted button plus the DM-on-close still cover the same action.
+  onSendRosterUpdates?: () => Promise<{ moved: number; new: number; dropped: number }>,
 ): EnrollmentBoardHandle {
   const working: EnrollmentPlayer[] = payload.players.map((p) => ({ ...p }))
   const byTag = new Map(working.map((p) => [p.player_tag, p]))
@@ -809,9 +813,43 @@ export function renderEnrollmentBoard(
   // regardless of content/window height.
   // Close stays first/left (unchanged position); skillExplainer moves last with margin-left:
   // auto so it's pushed to the right edge instead of sitting immediately after Close.
+  // "Send Roster Updates" (2026-08-30, spec item 4 trigger (a)) — sits directly beside Close, so
+  // an admin who has just finished reshuffling can tell the affected players without leaving the
+  // screen. Shown ONLY once there is something outstanding, and hidden again the moment the send
+  // succeeds: a permanently-present button here would train people to ignore it, and the whole
+  // point of batching is that most drags produce nothing to send (a player moved A→B→A owes
+  // nobody a DM). The other two triggers — a DM on close, and the Hub's own highlighted button —
+  // are for the admin who closes the board without noticing this one.
+  const sendUpdatesButton = document.createElement('button')
+  sendUpdatesButton.className = 'primary-button send-updates-button'
+  sendUpdatesButton.textContent = 'Send Roster Updates'
+  sendUpdatesButton.hidden = true
+  sendUpdatesButton.addEventListener('click', () => {
+    sendUpdatesButton.disabled = true
+    setStatus('Sending roster updates...', false)
+    const send = onSendRosterUpdates ?? (() => Promise.resolve({ moved: 0, new: 0, dropped: 0 }))
+    send()
+      .then((result) => {
+        const parts = [
+          result.moved ? `${result.moved} moved` : '',
+          result.new ? `${result.new} newly assigned` : '',
+          result.dropped ? `${result.dropped} removed` : '',
+        ].filter(Boolean)
+        setStatus(parts.length ? `Updates sent: ${parts.join(', ')}.` : 'Nothing left to send.', false)
+        pendingUpdateCount = 0
+        refreshSendUpdatesButton()
+      })
+      .catch((err: unknown) => {
+        setStatus(`Could not send updates: ${err instanceof Error ? err.message : String(err)}`, true)
+      })
+      .finally(() => {
+        sendUpdatesButton.disabled = false
+      })
+  })
+
   const footer = document.createElement('div')
   footer.className = 'footer footer-fixed'
-  footer.append(closeButton, status, skillExplainer)
+  footer.append(closeButton, sendUpdatesButton, status, skillExplainer)
   container.appendChild(footer)
 
   // Now that the footer is pinned independently of content height (position: fixed above), the
@@ -831,6 +869,7 @@ export function renderEnrollmentBoard(
     board.style.height = `${Math.max(200, available)}px`
   }
   resizeBoard()
+  refreshSendUpdatesButton()
   window.addEventListener('resize', resizeBoard)
 
   function playersFor(clanTag: string | null): EnrollmentPlayer[] {
@@ -845,8 +884,63 @@ export function renderEnrollmentBoard(
     return [...sorted.filter((p) => !isOptedOut(p)), ...sorted.filter(isOptedOut)]
   }
 
+  function setStatus(message: string, isError: boolean): void {
+    status.textContent = message
+    status.className = isError ? 'save-status error' : 'save-status'
+  }
+
+  // How many players are currently owed an update DM. Maintained locally rather than refetched
+  // per drag: the bridge's own count is authoritative and arrives with every payload refresh, but
+  // an optimistic local bump is what makes the button appear the instant a drag lands instead of
+  // up to a poll-interval later.
+  let pendingUpdateCount = payload.pending_roster_updates ?? 0
+
+  function refreshSendUpdatesButton(): void {
+    sendUpdatesButton.hidden = pendingUpdateCount <= 0
+    sendUpdatesButton.textContent =
+      pendingUpdateCount > 0 ? `Send Roster Updates (${pendingUpdateCount})` : 'Send Roster Updates'
+  }
+
+  // ── Roster freeze helpers (2026-08-30) ────────────────────────────────────────────────
+  // A clan whose CWL has started in-game has a roster the game itself now owns. Both directions
+  // are blocked — you cannot pull someone out of a started clan any more than you can push a
+  // stranger in — with the single exception the spec calls out: someone who was already in the
+  // clan when it locked is genuinely able to play for it, so recording that is allowed even in
+  // War phase. These are the frontend half; the bridge enforces the same rule independently.
+
+  function clanByTag(clanTag: string | null): EnrollmentClan | undefined {
+    return clanTag === null ? undefined : payload.clans.find((c) => c.clan_tag === clanTag)
+  }
+
+  function isLocked(clanTag: string | null): boolean {
+    return Boolean(clanByTag(clanTag)?.locked_at)
+  }
+
+  function canDropInto(player: EnrollmentPlayer, targetClanTag: string | null): boolean {
+    if (player.assigned_clan_tag === targetClanTag) return true
+    if (isLocked(player.assigned_clan_tag)) return false
+    const target = clanByTag(targetClanTag)
+    if (!target?.locked_at) return true
+    return target.eligible_player_tags.includes(player.player_tag)
+  }
+
+  function freezeRefusalMessage(player: EnrollmentPlayer, targetClanTag: string | null): string {
+    const from = clanByTag(player.assigned_clan_tag)
+    if (isLocked(player.assigned_clan_tag)) {
+      return `${from?.name ?? from?.clan_tag ?? 'That clan'} has already started CWL — its roster is locked.`
+    }
+    const target = clanByTag(targetClanTag)
+    return `${displayName(player)} was not in ${target?.name ?? target?.clan_tag ?? 'that clan'} when its CWL roster locked, so they cannot play for it.`
+  }
+
   function handleDrop(player: EnrollmentPlayer, targetClanTag: string | null): void {
     if (player.assigned_clan_tag === targetClanTag) return
+    // Optimistic bump (2026-08-30): a move MAY turn out to owe nobody a DM — a player dragged back
+    // to the clan they were already announced for cancels out — so this is an upper bound that the
+    // next payload refresh corrects downwards. Over-showing the button is the safe direction;
+    // under-showing it would let an admin close the board believing everyone had been told.
+    pendingUpdateCount += 1
+    refreshSendUpdatesButton()
     const previousAssignment = player.assigned_clan_tag
     player.assigned_clan_tag = targetClanTag
     status.textContent = ''
@@ -907,7 +1001,10 @@ export function renderEnrollmentBoard(
         showContextMenu(contextMenuEntries, e.clientX, e.clientY)
       })
     }
-    card.draggable = true
+    // A card sitting in a clan whose CWL has already started cannot be moved out (2026-08-30):
+    // the game owns that roster now. Non-draggable rather than droppable-but-refused, so the
+    // freeze reads as a property of the card instead of a failure that only shows up on release.
+    card.draggable = !isLocked(player.assigned_clan_tag)
     card.addEventListener('dragstart', (e) => {
       hideTooltip()
       e.dataTransfer?.setData('text/plain', player.player_tag)
@@ -1085,6 +1182,17 @@ export function renderEnrollmentBoard(
       countSpan.classList.add(players.length >= rosterSize ? 'count-met' : 'count-under')
     }
     nameLine.appendChild(countSpan)
+    // Lock badge (2026-08-30) — a frozen column looks identical to an open one otherwise, and an
+    // admin needs to know why their drag isn't working BEFORE they try it, not after.
+    if (clan?.locked_at) {
+      const lockSpan = document.createElement('span')
+      lockSpan.className = 'column-lock'
+      lockSpan.textContent = '🔒'
+      lockSpan.title =
+        'CWL has started in-game for this clan — the game owns its roster now, so players can no ' +
+        'longer be moved in or out. Anyone who was in the clan when it locked can still be placed here.'
+      nameLine.appendChild(lockSpan)
+    }
     columnHeader.appendChild(nameLine)
 
     const tierText = formatLeagueTier(clan?.tier ?? null)
@@ -1183,7 +1291,16 @@ export function renderEnrollmentBoard(
       const playerTag = e.dataTransfer?.getData('text/plain')
       if (!playerTag) return
       const player = byTag.get(playerTag)
-      if (player) handleDrop(player, clanTag)
+      if (!player) return
+      // Roster freeze (2026-08-30): once a clan's CWL has started in-game its roster is fixed by
+      // the game. The one legitimate drop is a player who WAS in the clan at lock time and is
+      // simply being recorded — the bridge enforces the same rule, this just avoids the round trip
+      // and the visual snap-back of an optimistic move that was always going to be refused.
+      if (!canDropInto(player, clanTag)) {
+        setStatus(freezeRefusalMessage(player, clanTag), true)
+        return
+      }
+      handleDrop(player, clanTag)
     })
 
     return column

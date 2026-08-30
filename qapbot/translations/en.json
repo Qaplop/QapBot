@@ -1018,6 +1018,17 @@
       "still_missing_block_title": "⚠️ Still Missing (not yet in their assigned clan)",
       "still_missing_locked": "CWL started — roster locked",
       "delete_blocked_war_started": "\u26d4 This season can no longer be deleted \u2014 CWL has already started in-game for: **{clans}**.\nTheir rosters are locked by the game and deleting the season would destroy records of a war that is actually being played.",
+      "button_send_updates": "Send Roster Updates",
+      "send_updates_confirm_body": "\ud83d\udccb Send the outstanding CWL line-up updates for season **{season}**? Only players whose clan actually changed since they were last told will be contacted.",
+      "button_confirm_send_updates": "Yes, send updates",
+      "send_updates_processing": "\u23f3 Sending line-up updates, this can take a few seconds\u2026",
+      "send_updates_summary": "\u2705 Done.\nMoved to a different clan: {moved}\nNewly assigned: {new}\nRemoved from the line-up: {dropped}\nDiscord users contacted: {contacted_users}\nSkipped (DM guard): {skipped_dm_guard}\nSkipped (no linked account): {skipped_unlinked}{dm_issues}",
+      "send_updates_cancelled": "\u274c Cancelled \u2014 no updates were sent.",
+      "send_updates_error_no_database": "\u26a0\ufe0f Database not ready \u2014 try again shortly.",
+      "send_updates_error_no_event": "\u26a0\ufe0f No CWL event found for this season anymore \u2014 it may have been deleted.",
+      "send_updates_error_not_open": "\u26a0\ufe0f Enrollment hasn't been started yet for this season.",
+      "close_pending_updates_dm": "\ud83d\udccb You closed the CWL Teams Management view for **{season}** with **{count}** line-up update(s) still unsent. The affected players have not been told yet.",
+      "announce_rosters_underfilled_warning": "\n\n\u26a0\ufe0f These clans are not full yet:\n{clans}\nYou can still announce now and add players later \u2014 they will get an update DM.",
       "button_announce_rosters": "Announce Rosters",
       "button_confirm_announce_rosters": "Yes, announce the rosters",
       "announce_rosters_confirm_body": "\ud83d\udce3 Announce the CWL roster for season **{season}** to every assigned player? Everyone already in their assigned clan is told when their CWL starts; everyone who still has to move gets their clan, the deadline and a direct join link.",
@@ -1101,11 +1112,21 @@
       "dm_line_amber": "\n\u26a0\ufe0f **{player_name}** \u2014 you're currently in **{current_clan_name}** and need to move to **{clan_name}** *well before* {start_full} ({start_rel}).\n\u27a1\ufe0f <{clan_url}>",
       "dm_unknown_clan": "no clan"
     },
+    "update": {
+      "dm_intro": "\ud83d\udccb Hi **{display_name}**, your CWL line-up for season **{season}** has changed ({count} update(s)):",
+      "dm_confirm_prompt": "\n\nPlease confirm below whether you want to play this CWL \u2014 your lead is waiting on your answer.",
+      "dm_line_dropped": "\n\u2796 **{player_name}** \u2014 you are no longer in the CWL line-up for **{clan_name}**. Your lead may still place you elsewhere before it starts.",
+      "dm_line_moved_prefix": "\n\ud83d\udd04 **{player_name}** \u2014 changed from **{old_clan_name}**:"
+    },
     "alarm": {
       "dm_missed_lock": "\u26a0\ufe0f **{player_name}** \u2014 CWL has started for **{clan_name}** ({season}) and you were not in the clan in time, so you are not in their roster this season.\n\nYou are back in the pool \u2014 your lead may still place you in another clan.",
+      "coordinator_start_reminder": "\u23f0 **{clan_name}** starts CWL {start_rel} (season {season}).\n{roster_line}\n{missing_line}",
+      "coordinator_roster_full": "\u2705 Roster: full.",
+      "coordinator_roster_short": "\u26a0\ufe0f Roster: **{assigned}/{roster_size}** \u2014 {roster_size} slots configured, so there is still room.",
+      "coordinator_missing_none": "\u2705 Everyone assigned is already in the clan.",
+      "coordinator_missing_some": "\u26a0\ufe0f Still not in the clan ({count}): {names}",
       "dm_header_stage1": "\u23f0 **{player_name}** \u2014 reminder: you haven't moved to your CWL clan yet.",
-      "dm_header_stage2": "\ud83d\udea8 **{player_name}** \u2014 URGENT: CWL is about to start and you're still not in your assigned clan!",
-      "coordinator_body": "\ud83d\udea8 CWL **{season}** \u2014 **{clan_name}** starts {start_rel} and {count} assigned player(s) still haven't joined:\n{names}"
+      "dm_header_stage2": "\ud83d\udea8 **{player_name}** \u2014 URGENT: CWL is about to start and you're still not in your assigned clan!"
     },
     "reminder": {
       "dm_intro_body": "👋 Hi **{display_name}**,\n\nwe're still waiting on your reply for CWL season **{season}** — you currently have **{count}** pending sign-up(s) in the CWL roster pool that we haven't heard back from you about.\n\nPlease confirm or opt out in the next message as soon as you can — you'll find a separate Confirm/Opt Out button pair for each of your accounts there. A fast reply really helps us with roster planning this season.",

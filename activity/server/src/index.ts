@@ -350,6 +350,30 @@ api.post('/cwl/enrollment/assign', async (c) => {
   return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 409 | 503)
 })
 
+// "Send Roster Updates" from the board's own footer (2026-08-30, spec item 4 trigger (a)) —
+// flushes the DMs for players whose clan changed since they were last told, without leaving the
+// screen. Same verify-identity-then-proxy shape as /cwl/enrollment/assign above.
+api.post('/cwl/enrollment/send-updates', async (c) => {
+  const discordUserId = await verifiedDiscordUserId(c)
+  if (!discordUserId) return c.json({ error: 'unauthorized' }, 401)
+
+  if (!c.env.BRIDGE_URL || !c.env.BRIDGE_SECRET) return bridgeNotConfigured(c)
+
+  let body: Record<string, unknown>
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  const upstream = await fetch(`${c.env.BRIDGE_URL}/api/cwl/enrollment/send-updates`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': c.env.BRIDGE_SECRET },
+    body: JSON.stringify({ ...body, discord_user_id: discordUserId }),
+  })
+  return c.json(await upstream.json(), upstream.status as 200 | 400 | 403 | 409 | 503)
+})
+
 // Admin enrollment-status override from the board's right-click menu (2026-08-22, tracker
 // #0014) — same verify-identity-then-proxy shape as /cwl/enrollment/assign above.
 api.post('/cwl/enrollment/status', async (c) => {

@@ -156,6 +156,37 @@ and which assigned players are still not in the clan.
 
 ---
 
+---
+
+## Implementation status (2026-08-30)
+
+| Slice | Status |
+| --- | --- |
+| 1 — phase model, rename, step indicator | ✅ shipped (commit `5b276ee`) |
+| 2 — war transition, locked-roster snapshot, no-show reconciliation | ✅ shipped (`5b276ee`) |
+| 3 — freeze guards (assign, clan-config, season delete) | ✅ shipped (`5b276ee`) |
+| Coordinator board access (project owner follow-up) | ✅ shipped |
+| 4 — batched update DMs + all three triggers | ✅ shipped |
+| 5 — clan add/remove during Preparation | ✅ shipped |
+| 6 — roster completeness check | ✅ shipped |
+| 7 — 30-minute coordinator reminder | ✅ shipped |
+| Frontend (freeze rendering, footer button, Worker route) | ✅ shipped |
+
+**Design change made while building slice 7:** the stage-2 (T-2h) coordinator escalation added the
+previous day was **removed**. It DMed coordinators a "still missing" list 90 minutes before this
+slice's richer T-30min report, which says everything that one did plus the roster fill — two
+near-identical leadership DMs is the same avalanche problem the rest of this feature works to
+avoid, just aimed at leadership. Coordinators now get exactly one message per clan; players keep
+both of their own escalating alarms, so no lead time is lost.
+
+**Still outstanding**
+- Dedicated tests for slice 5's two paths (removal tombstoning, the combined late-add DM) — the
+  code is covered indirectly by the existing pending-update tests but not by its own.
+- No live verification of any of it: needs a DEV bot restart plus `activity/client` and
+  `activity/server` deploys (both changed), then a click-through.
+- `activity/server` gained `/cwl/enrollment/send-updates`, so the Worker MUST be redeployed, not
+  just the Pages client — a stale Worker fails this button silently with "not found".
+
 ## Test plan
 
 Per slice, in `tests/integration/test_cwl_start_and_switch.py` and a new

@@ -56,6 +56,14 @@ export type EnrollmentClan = {
   name: string | null
   tier: string | null
   roster_size: number
+  /** Non-null once this clan's CWL has actually started in-game (2026-08-30). Its roster is then
+   * fixed by the game, so the column is frozen: no drops in or out, EXCEPT for a player listed in
+   * `eligible_player_tags` below, who was already in the clan when it locked and can therefore
+   * still legitimately be recorded as playing for it. */
+  locked_at: string | null
+  /** Who was actually in the clan when its roster locked — the only players who may still be
+   * dropped into a locked column. Empty for an unlocked clan. */
+  eligible_player_tags: string[]
 }
 
 /** `signup_status` is null when the player is a current clan member who hasn't signed up (or
@@ -134,6 +142,9 @@ export type EnrollmentPayload = {
   event_status: string | null
   clans: EnrollmentClan[]
   players: EnrollmentPlayer[]
+  /** How many players currently owe an update DM because the board changed after they were
+   * told where they play (2026-08-30). Drives the footer's "Send Roster Updates" button. */
+  pending_roster_updates?: number
   // The wait loop's starting point (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8) —
   // every GET /api/cwl/enrollment response carries the guild's current enrollment version, so a
   // fresh page load (or a refetch triggered by the wait loop itself) always has a correct

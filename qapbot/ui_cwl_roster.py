@@ -589,17 +589,39 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     # produce a *sayable* error on click (which clans are missing one), and an invisible button
     # can't say anything.
     if event is not None and event["status"] not in ("draft", "cancelled"):
-        from qapbot.QBdiscocmdshelper_cwl import has_cwl_roster_announcements_pending
+        from qapbot.QBdiscocmdshelper_cwl import (
+            count_cwl_pending_roster_updates,
+            has_cwl_roster_announcements_pending,
+        )
 
-        if has_cwl_roster_announcements_pending(guild_id, season):
-            announce_rosters_button = discord.ui.Button(
-                label=t('cwl.management.button_announce_rosters', guild_id=guild_id),
-                style=discord.ButtonStyle.success,
-                custom_id="cwl_management_announce_rosters",
-                row=4,
-            )
-            announce_rosters_button.callback = _make_cwl_management_announce_rosters_callback(view)  # type: ignore[assignment]
-            view.add_item(announce_rosters_button)  # type: ignore[arg-type]
+        if event["status"] == "signup_open":
+            # Preparation hasn't started yet: this is the first announcement.
+            if has_cwl_roster_announcements_pending(guild_id, season):
+                announce_rosters_button = discord.ui.Button(
+                    label=t('cwl.management.button_announce_rosters', guild_id=guild_id),
+                    style=discord.ButtonStyle.success,
+                    custom_id="cwl_management_announce_rosters",
+                    row=4,
+                )
+                announce_rosters_button.callback = _make_cwl_management_announce_rosters_callback(view)  # type: ignore[assignment]
+                view.add_item(announce_rosters_button)  # type: ignore[arg-type]
+        else:
+            # Already in Preparation/War — the same slot becomes trigger (c) of the spec's three
+            # ways to flush outstanding update DMs (2026-08-30, project owner's spec: "in the hub
+            # message itself by having the button active and highlighted"). Highlighted =
+            # ButtonStyle.danger, this screen's only red-other-than-delete, since it means "real
+            # people are currently holding out-of-date instructions". Omitted entirely when nothing
+            # is pending, same convention as its neighbours.
+            pending_updates = count_cwl_pending_roster_updates(guild_id, season)
+            if pending_updates:
+                send_updates_button = discord.ui.Button(
+                    label=t('cwl.management.button_send_updates', guild_id=guild_id),
+                    style=discord.ButtonStyle.danger,
+                    custom_id="cwl_management_send_roster_updates",
+                    row=4,
+                )
+                send_updates_button.callback = _make_cwl_management_send_updates_callback(view)  # type: ignore[assignment]
+                view.add_item(send_updates_button)  # type: ignore[arg-type]
 
     if event is not None:
         # Surfaced so an admin opening this screen can see at a glance whether every
@@ -1913,10 +1935,16 @@ def _make_cwl_management_announce_rosters_callback(view: discord.ui.View):
         event = db.get_cwl_event_sync(str(interaction.guild.id), season) if db is not None else None
         if event is None:
             return
+        from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_underfilled_clans_sync
+
+        underfilled = await asyncio.to_thread(
+            resolve_cwl_underfilled_clans_sync, interaction.guild.id, event["id"], event["cwl_season"]
+        )
         confirm_view = CwlAnnounceRostersConfirmView(
             parent_view=view,
             guild_id=interaction.guild.id,
             season=event["cwl_season"],
+            underfilled=underfilled,
         )
         await interaction.followup.send(
             confirm_view._build_content(),  # type: ignore[attr-defined]
@@ -1927,18 +1955,216 @@ def _make_cwl_management_announce_rosters_callback(view: discord.ui.View):
     return callback
 
 
-class CwlAnnounceRostersConfirmView(discord.ui.View):
-    """Confirm/cancel dialog for "Start CWL" (Phase 5, CWL_ROSTER_PLANNING_PLAN.md) — sends real
-    DMs to every assigned player, so never a single-click action. Structurally identical to
-    CwlRemindPendingConfirmView / CwlNotifyNewMembersConfirmView, including their double-click
-    guard: buttons disabled + edit_message() as the immediate interaction response, before the
-    multi-second blast starts (Cardinal Rule 7 / Pitfall 41)."""
+def _make_cwl_management_send_updates_callback(view: discord.ui.View):
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        if not interaction.guild:
+            return
+        from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+
+        db = CACHE.db_manager
+        season = resolve_selected_cwl_season(interaction.guild.id)
+        event = db.get_cwl_event_sync(str(interaction.guild.id), season) if db is not None else None
+        if event is None:
+            return
+        confirm_view = CwlSendRosterUpdatesConfirmView(
+            parent_view=view, guild_id=interaction.guild.id, season=event["cwl_season"],
+        )
+        await interaction.followup.send(
+            confirm_view._build_content(),  # type: ignore[attr-defined]
+            view=confirm_view,
+            ephemeral=True,
+        )
+
+    return callback
+
+
+class CwlSendRosterUpdatesConfirmView(discord.ui.View):
+    """Confirm/cancel dialog for "Send Roster Updates" — trigger (c) of the three the spec asks for
+    (2026-08-30). Structurally identical to CwlAnnounceRostersConfirmView; the two are deliberately
+    separate views rather than one parameterised one, because their summaries report genuinely
+    different things (first announcement vs moved/new/dropped counts)."""
 
     def __init__(self, parent_view: discord.ui.View, guild_id: int, season: str, timeout: int = 60):
         super().__init__(timeout=timeout)
         self.parent_view = parent_view
         self.guild_id = guild_id
         self.season = season
+
+        from qapbot.i18n import t
+
+        confirm_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.management.button_confirm_send_updates', guild_id=guild_id),
+            style=discord.ButtonStyle.success,
+            custom_id="cwl_send_updates_confirm",
+        )
+        confirm_button.callback = self._on_confirm  # type: ignore[assignment]
+        self.add_item(confirm_button)
+
+        cancel_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.setup.button_cancel', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_send_updates_cancel",
+        )
+        cancel_button.callback = self._on_cancel  # type: ignore[assignment]
+        self.add_item(cancel_button)
+
+    def _build_content(self) -> str:
+        from qapbot.i18n import t
+
+        return t('cwl.management.send_updates_confirm_body', guild_id=self.guild_id, season=self.season)
+
+    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        from qapbot.i18n import t
+
+        for item in self.children:
+            item.disabled = True  # type: ignore[union-attr]
+        await interaction.response.edit_message(
+            content=t('cwl.management.send_updates_processing', guild_id=self.guild_id), view=self
+        )
+        from qapbot.QBdiscocmdshelper_cwl import send_cwl_roster_updates
+
+        result = await send_cwl_roster_updates(self.guild_id, self.season)
+        if not result["ok"]:
+            content = t(f"cwl.management.send_updates_error_{result['error']}", guild_id=self.guild_id)
+        else:
+            dm_issues = _format_cwl_dm_issue_lines(result, self.guild_id)
+            content = t(
+                'cwl.management.send_updates_summary', guild_id=self.guild_id,
+                moved=result["moved"], new=result["new"], dropped=result["dropped"],
+                contacted_users=result["contacted_users"],
+                skipped_dm_guard=result["skipped_dm_guard"],
+                skipped_unlinked=result["skipped_unlinked"],
+                dm_issues=dm_issues,
+            )
+        try:
+            await interaction.edit_original_response(content=content, view=None)
+        except discord.NotFound:
+            pass
+        if result["ok"]:
+            await _refresh_parent(self.parent_view, interaction, "cwl_management")
+
+    async def _on_cancel(self, interaction: discord.Interaction) -> None:
+        from qapbot.i18n import t
+
+        await interaction.response.edit_message(
+            content=t('cwl.management.send_updates_cancelled', guild_id=self.guild_id), view=None
+        )
+
+
+class CwlPendingUpdatesDmView(discord.ui.View):
+    """The single-button view on the "you closed the board with unsent updates" DM (trigger (b),
+    2026-08-30). Session-scoped rather than persistent: a DM whose button silently dies after a
+    bot restart is fine here, because the Hub's own highlighted button (trigger (c)) is the durable
+    path to the same action — this DM is the nudge, not the only way in.
+
+    Re-checks permission on click rather than trusting that the recipient still holds it: the DM
+    outlives the board session that produced it."""
+
+    def __init__(self, guild_id: int, season: str, timeout: int = 3600):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+        self.season = season
+        self._busy = False
+
+        from qapbot.i18n import t
+
+        button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.management.button_send_updates', guild_id=guild_id),
+            style=discord.ButtonStyle.danger,
+            custom_id="cwl_pending_updates_dm_send",
+        )
+        button.callback = self._on_send  # type: ignore[assignment]
+        self.add_item(button)
+
+    async def _on_send(self, interaction: discord.Interaction) -> None:
+        # Pitfall 41: a rapid second click would otherwise start a concurrent DM batch. Instance
+        # flag set before any await, since this view is never shared across users.
+        if self._busy:
+            return
+        self._busy = True
+        from qapbot.i18n import t
+
+        for item in self.children:
+            item.disabled = True  # type: ignore[union-attr]
+        await interaction.response.edit_message(
+            content=t('cwl.management.send_updates_processing', guild_id=self.guild_id), view=self
+        )
+        from qapbot.QBdiscocmdshelper_cwl import send_cwl_roster_updates
+
+        result = await send_cwl_roster_updates(self.guild_id, self.season)
+        if not result["ok"]:
+            content = t(f"cwl.management.send_updates_error_{result['error']}", guild_id=self.guild_id)
+        else:
+            content = t(
+                'cwl.management.send_updates_summary', guild_id=self.guild_id,
+                moved=result["moved"], new=result["new"], dropped=result["dropped"],
+                contacted_users=result["contacted_users"],
+                skipped_dm_guard=result["skipped_dm_guard"],
+                skipped_unlinked=result["skipped_unlinked"],
+                dm_issues=_format_cwl_dm_issue_lines(result, self.guild_id),
+            )
+        try:
+            await interaction.edit_original_response(content=content, view=None)
+        except discord.NotFound:
+            pass
+        from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+
+        await refresh_cwl_management_hub_message(self.guild_id, "cwl_management")
+
+
+def _format_cwl_dm_issue_lines(result: Dict[str, Any], guild_id: int) -> str:
+    """The blocked / left-the-server / failed tail every CWL DM batch summary appends. Extracted
+    2026-08-30 when a third batch action needed it verbatim — three copies of the same three
+    if-blocks was the point at which duplicating it stopped being cheaper than sharing it."""
+    from qapbot.i18n import t
+
+    issues = ""
+    if result.get("blocked"):
+        issues += t(
+            'cwl.management.start_enrollment_dm_blocked_line',
+            guild_id=guild_id, names=", ".join(result["blocked"]),
+        )
+    if result.get("no_mutual_guild"):
+        issues += t(
+            'cwl.management.start_enrollment_dm_no_mutual_guild_line',
+            guild_id=guild_id, names=", ".join(result["no_mutual_guild"]),
+        )
+    if result.get("failed"):
+        from qapbot.cache_manager import DM_SEND_MAX_RETRIES
+
+        issues += t(
+            'cwl.management.start_enrollment_dm_failed_line',
+            guild_id=guild_id, retries=DM_SEND_MAX_RETRIES, names=", ".join(result["failed"]),
+        )
+    return issues
+
+
+class CwlAnnounceRostersConfirmView(discord.ui.View):
+    """Confirm/cancel dialog for "Announce Rosters" — sends real DMs to every assigned player, so
+    never a single-click action. Structurally identical to CwlRemindPendingConfirmView /
+    CwlNotifyNewMembersConfirmView, including their double-click guard: buttons disabled +
+    edit_message() as the immediate interaction response, before the multi-second blast starts
+    (Cardinal Rule 7 / Pitfall 41).
+
+    `underfilled` (2026-08-30, spec item 6) is the list of participating clans still short of their
+    roster_size, resolved by the CALLER and passed in — same discipline as
+    CwlDeleteSeasonConfirmView's shared_clan_info: the preview an admin reads and the state they
+    confirm against must be the same snapshot, never two separate reads."""
+
+    def __init__(
+        self, parent_view: discord.ui.View, guild_id: int, season: str,
+        underfilled: Optional[List[Dict[str, Any]]] = None, timeout: int = 60,
+    ):
+        super().__init__(timeout=timeout)
+        self.parent_view = parent_view
+        self.guild_id = guild_id
+        self.season = season
+        self.underfilled = underfilled or []
 
         from qapbot.i18n import t
 
@@ -1961,7 +2187,25 @@ class CwlAnnounceRostersConfirmView(discord.ui.View):
     def _build_content(self) -> str:
         from qapbot.i18n import t
 
-        return t('cwl.management.announce_rosters_confirm_body', guild_id=self.guild_id, season=self.season)
+        content = t(
+            'cwl.management.announce_rosters_confirm_body', guild_id=self.guild_id, season=self.season
+        )
+        # Roster-completeness warning (2026-08-30, spec item 6). Folded into THIS dialog rather
+        # than added as a separate preceding one: the spec asks to "tell him and ask if he wants to
+        # start the next phase anyway", and this dialog already is that question — a second
+        # confirmation step for the same decision would just be two clicks for one choice.
+        # Computed in __init__ (not here) so the admin can't be shown one set of numbers and have
+        # a different set apply when they confirm.
+        if self.underfilled:
+            content += t(
+                'cwl.management.announce_rosters_underfilled_warning',
+                guild_id=self.guild_id,
+                clans="\n".join(
+                    f"• **{c['clan_name']}**: {c['assigned']}/{c['roster_size']}"
+                    for c in self.underfilled
+                ),
+            )
+        return content
 
     async def _on_confirm(self, interaction: discord.Interaction) -> None:
         if not await _check_cwl_admin_permission(interaction):

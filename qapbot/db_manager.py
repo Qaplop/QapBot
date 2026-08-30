@@ -2345,6 +2345,29 @@ class WarHistoryDB:
             "CREATE INDEX IF NOT EXISTS idx_cwl_shared_clan_players_shared_clan ON cwl_shared_clan_players(shared_clan_id)"
         )
 
+        # Tombstone for a player who was already told where they'd play and has since been taken
+        # OFF the roster entirely (2026-08-30). Needed because unassigning DELETES the
+        # cwl_assignments row, so without this the fact that they are owed a "you're no longer in
+        # the line-up" DM would vanish with it — every other pending-update case can be derived by
+        # comparing notified_clan_tag against the live assignment, but this one has no row left to
+        # compare. Cleared when they are re-assigned, or once the removal DM actually goes out.
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS cwl_dropped_notified_players (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id           INTEGER NOT NULL,
+                player_tag         TEXT    NOT NULL,
+                player_name        TEXT,
+                notified_clan_tag  TEXT    NOT NULL,
+                created_at         TEXT    NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (event_id) REFERENCES cwl_events(id) ON DELETE CASCADE,
+                UNIQUE (event_id, player_tag)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_dropped_notified_event "
+            "ON cwl_dropped_notified_players(event_id)"
+        )
+
         # The roster a clan was actually locked into when its CWL started in-game (2026-08-30,
         # plans/cwl-phase-model-and-war-phase.md). Snapshotted ONCE per clan per season, at the
         # moment lock is first detected, because it cannot be reconstructed afterwards:
@@ -2635,6 +2658,10 @@ class WarHistoryDB:
         await self._add_column_if_missing("guild_config", "cwl_enrollment_include_all_linked_accounts", "BOOLEAN NOT NULL DEFAULT 0")
         await self._add_column_if_missing("guild_config", "timezone_name", "TEXT NOT NULL DEFAULT 'UTC'")
         await self._add_column_if_missing("cwl_event_clans", "participating", "INTEGER NOT NULL DEFAULT 1")
+        # One-shot dedup for the 30-minutes-before roster status report to a clan's CWL
+        # Coordinators (2026-08-30, spec item 7). Per event-clan, not per season: two guilds sharing
+        # a clan each have their own coordinators who each want their own report.
+        await self._add_column_if_missing("cwl_event_clans", "coordinator_reminder_sent_at", "TEXT")
         await self._add_column_if_missing("cwl_signups", "origin_shared_clan_id", "INTEGER")
         await self._add_column_if_missing("cwl_player_season_status", "dm_sent_via_message_id", "TEXT")
         await self._add_column_if_missing("cwl_player_season_status", "dm_sent_via_channel_id", "TEXT")
@@ -2676,6 +2703,30 @@ class WarHistoryDB:
         await self._add_column_if_missing("cwl_shared_clan_players", "notified", "INTEGER NOT NULL DEFAULT 0")
         await self._add_column_if_missing("cwl_shared_clan_players", "switched_at", "TEXT")
         await self._add_column_if_missing("cwl_shared_clan_players", "alarm_stage_sent", "INTEGER NOT NULL DEFAULT 0")
+
+        # WHICH clan a player was last told they'd play for (2026-08-30). A bare `notified` bool
+        # cannot answer "does this player need an update DM?", because that question is really
+        # "is where they're assigned now different from what we last told them?" — so the answer
+        # has to be the clan, not a flag. Backfilled from the current assignment for anyone already
+        # notified under the old bool, since by definition that IS what they were told.
+        notified_clan_added = await self._add_column_if_missing(
+            "cwl_assignments", "notified_clan_tag", "TEXT"
+        )
+        if notified_clan_added:
+            await self._conn.execute(
+                "UPDATE cwl_assignments SET notified_clan_tag = assigned_clan_tag WHERE notified = 1"
+            )
+            logging.info("[DB-MIGRATE] Backfilled cwl_assignments.notified_clan_tag from notified=1 rows")
+        shared_notified_clan_added = await self._add_column_if_missing(
+            "cwl_shared_clan_players", "notified_clan_tag", "TEXT"
+        )
+        if shared_notified_clan_added:
+            await self._conn.execute(
+                "UPDATE cwl_shared_clan_players SET notified_clan_tag = ("
+                "  SELECT clan_tag FROM cwl_shared_clans WHERE id = cwl_shared_clan_players.shared_clan_id"
+                ") WHERE notified = 1"
+            )
+            logging.info("[DB-MIGRATE] Backfilled cwl_shared_clan_players.notified_clan_tag from notified=1 rows")
 
         logging.debug("[DB-SCHEMA] Maindata schema created/verified")
 
@@ -5949,13 +6000,123 @@ class WarHistoryDB:
                 conn.rollback()
                 return False
 
-    def mark_cwl_assignment_notified_sync(self, event_id: int, player_tag: str, notified: bool = True) -> bool:
-        """Record that the "Start CWL" DM (Phase 5) went out for this assignment — and ONLY that.
-        Drives that button's idempotency: a re-run skips already-notified rows, and the button
-        itself disappears once none remain."""
-        return self._set_cwl_assignment_field_sync(
-            event_id, player_tag, "notified", 1 if notified else 0, "mark_cwl_assignment_notified_sync",
-        )
+    def mark_cwl_assignment_notified_sync(
+        self, event_id: int, player_tag: str, notified: bool = True,
+        notified_clan_tag: Optional[str] = None,
+    ) -> bool:
+        """Record that the roster announcement went out for this assignment — and ONLY that.
+
+        Writes `notified` and `notified_clan_tag` together because they are one fact ("we told them
+        they play for X"), not two: a `notified` with no clan beside it is exactly the ambiguity
+        that made pending-update detection impossible before. Everything else on the row —
+        placement, lock, alarm state — is untouched, same discipline as the sibling writers.
+
+        Drives idempotency two ways: a re-announce skips rows whose notified_clan_tag already
+        matches their assignment, and a player moved afterwards is detectable precisely because it
+        no longer matches."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "UPDATE cwl_assignments SET notified = ?, notified_clan_tag = ?, "
+                        "updated_at = datetime('now') WHERE event_id = ? AND player_tag = ?",
+                        (1 if notified else 0, notified_clan_tag, event_id, player_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] mark_cwl_assignment_notified_sync failed for event {event_id} "
+                    f"player {player_tag}: {e}"
+                )
+                conn.rollback()
+                return False
+
+    def record_cwl_dropped_notified_player_sync(
+        self, event_id: int, player_tag: str, player_name: Optional[str], notified_clan_tag: str,
+    ) -> bool:
+        """Remember that an already-announced player was taken off the roster, so the "Send Roster
+        Updates" action can still tell them — their cwl_assignments row is gone by then.
+
+        `ON CONFLICT DO NOTHING`: the FIRST clan they were announced for is the one worth naming in
+        the DM, and repeated drag-drop-drag churn must not overwrite it with a clan they were never
+        actually told about."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "INSERT INTO cwl_dropped_notified_players "
+                        "(event_id, player_tag, player_name, notified_clan_tag) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(event_id, player_tag) DO NOTHING",
+                        (event_id, player_tag, player_name, notified_clan_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] record_cwl_dropped_notified_player_sync failed for event "
+                    f"{event_id} player {player_tag}: {e}"
+                )
+                conn.rollback()
+                return False
+
+    def clear_cwl_dropped_notified_player_sync(self, event_id: int, player_tag: str) -> bool:
+        """Drop the tombstone — either because the player was put back on a roster (so there is
+        nothing to apologise for) or because the removal DM has now been sent."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "DELETE FROM cwl_dropped_notified_players WHERE event_id = ? AND player_tag = ?",
+                        (event_id, player_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] clear_cwl_dropped_notified_player_sync failed for event "
+                    f"{event_id} player {player_tag}: {e}"
+                )
+                conn.rollback()
+                return False
+
+    def get_cwl_dropped_notified_players_sync(self, event_id: int) -> List[Dict[str, Any]]:
+        """Every announced player currently taken off this event's roster and still owed a
+        "you're no longer in the line-up" DM."""
+        import sqlite3
+
+        if not self.db_path:
+            return []
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM cwl_dropped_notified_players WHERE event_id = ?", (event_id,)
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-QUERY-SYNC] get_cwl_dropped_notified_players_sync failed for event {event_id}: {e}"
+                )
+                return []
 
     def mark_cwl_assignment_switched_sync(self, event_id: int, player_tag: str, switched_at: str) -> bool:
         """Record when this player was first observed actually sitting in their assigned clan
@@ -6010,6 +6171,33 @@ class WarHistoryDB:
                 logging.error(f"[DB-WRITE-SYNC] mark_cwl_event_clan_locked_sync failed for {clan_tag} {cwl_season}: {e}")
                 conn.rollback()
                 return 0
+
+    def mark_cwl_coordinator_reminder_sent_sync(self, event_id: int, clan_tag: str) -> bool:
+        """One-shot flag for the 30-minutes-before coordinator roster report (spec item 7). Only
+        ever stamps a row that is still NULL, so the every-cycle sweep can call it freely."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "UPDATE cwl_event_clans SET coordinator_reminder_sent_at = datetime('now') "
+                        "WHERE event_id = ? AND clan_tag = ? AND coordinator_reminder_sent_at IS NULL",
+                        (event_id, clan_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] mark_cwl_coordinator_reminder_sent_sync failed for event "
+                    f"{event_id} clan {clan_tag}: {e}"
+                )
+                conn.rollback()
+                return False
 
     def get_active_cwl_events_sync(self) -> List[Dict[str, Any]]:
         """Every event in 'announced' OR 'war' — i.e. rosters have been announced and the switch
@@ -6666,15 +6854,35 @@ class WarHistoryDB:
 
     def set_cwl_shared_clan_player_notified_sync(
         self, shared_clan_id: int, player_tag: str, notified: bool = True,
+        notified_clan_tag: Optional[str] = None,
     ) -> bool:
-        """Record that the "Start CWL" DM (Phase 5) went out for this shared-clan roster slot — and
-        ONLY that. Never touches `status` (the player's own response) or `assigned` (their
-        placement); see this table's CREATE TABLE comment. The shared-clan counterpart of
-        mark_cwl_assignment_notified_sync."""
-        return self._set_cwl_shared_clan_player_field_sync(
-            shared_clan_id, player_tag, "notified", 1 if notified else 0,
-            "set_cwl_shared_clan_player_notified_sync",
-        )
+        """Record that the roster announcement went out for this shared-clan slot — and ONLY that.
+        Never touches `status` (the player's own response) or `assigned` (their placement); see
+        this table's CREATE TABLE comment. The shared-clan counterpart of
+        mark_cwl_assignment_notified_sync, including its notified/notified_clan_tag pairing."""
+        import sqlite3
+
+        if not self.db_path:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    conn.execute(
+                        "UPDATE cwl_shared_clan_players SET notified = ?, notified_clan_tag = ?, "
+                        "updated_at = datetime('now') WHERE shared_clan_id = ? AND player_tag = ?",
+                        (1 if notified else 0, notified_clan_tag, shared_clan_id, player_tag),
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] set_cwl_shared_clan_player_notified_sync failed for "
+                    f"shared_clan {shared_clan_id} player {player_tag}: {e}"
+                )
+                conn.rollback()
+                return False
 
     def set_cwl_shared_clan_player_switched_sync(
         self, shared_clan_id: int, player_tag: str, switched_at: str,

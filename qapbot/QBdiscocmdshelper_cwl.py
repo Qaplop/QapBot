@@ -1328,11 +1328,13 @@ def assign_cwl_player_sync(
     # Enforced HERE rather than only in the board's UI because this is the one write path every
     # placement goes through; the frontend's disabled drop targets are the convenience layer, this
     # is the actual guard (and it also covers auto-assign, which has no UI at all).
+    existing_assignment = next(
+        (a for a in db.get_cwl_assignments_sync(event_id) if a["player_tag"] == player_tag), None
+    )
+
     locked_clan_tags = db.get_locked_cwl_clan_tags_sync(event_id)
     if locked_clan_tags:
-        current_assignment = next(
-            (a for a in db.get_cwl_assignments_sync(event_id) if a["player_tag"] == player_tag), None
-        )
+        current_assignment = existing_assignment
         current_clan_tag = current_assignment["assigned_clan_tag"] if current_assignment else None
 
         if current_clan_tag in locked_clan_tags and target_clan_tag != current_clan_tag:
@@ -1355,6 +1357,21 @@ def assign_cwl_player_sync(
                 )
             # Falls through: they WERE in the clan at lock time, so placing them is recording
             # reality, not changing it.
+
+    # Pending-update bookkeeping (2026-08-30, spec item 4). Taking an ALREADY-ANNOUNCED player off
+    # the roster deletes their assignment row, which would also delete the only evidence that they
+    # are owed a "you're no longer in the line-up" DM — so leave a tombstone. Putting anyone back
+    # on a roster clears theirs: whatever they were told is about to be superseded by the ordinary
+    # moved/new comparison, and a stale tombstone would send them a contradictory removal notice.
+    if existing_assignment is not None and existing_assignment["notified_clan_tag"] and target_clan_tag is None:
+        signup = db.get_cwl_signup_sync(event_id, player_tag)
+        db.record_cwl_dropped_notified_player_sync(
+            event_id, player_tag,
+            (signup or {}).get("player_name"),
+            existing_assignment["notified_clan_tag"],
+        )
+    elif target_clan_tag is not None:
+        db.clear_cwl_dropped_notified_player_sync(event_id, player_tag)
 
     shared_clans_by_tag = get_event_shared_clans_by_tag_sync(event_id, season)
 
@@ -3452,7 +3469,9 @@ def render_cwl_step_indicator(phase_info: Dict[str, Any], guild_id: int) -> Opti
     return " ── ".join(parts)
 
 
-def resolve_cwl_announcement_targets_sync(guild_id: int, event_id: int, season: str) -> Dict[str, Any]:
+def resolve_cwl_announcement_targets_sync(
+    guild_id: int, event_id: int, season: str, *, include_notified: bool = False,
+) -> Dict[str, Any]:
     """Resolve every player assigned to a participating clan of this event, annotated with whether
     they are already in that clan ("green") or still need to move ("amber"), grouped by the Discord
     user to DM.
@@ -3498,8 +3517,8 @@ def resolve_cwl_announcement_targets_sync(guild_id: int, event_id: int, season: 
 
     shared_by_tag = get_event_shared_clans_by_tag_sync(event_id, season)
 
-    # placements: player_tag -> (clan_tag, shared_clan_id or None, notified)
-    placements: Dict[str, Tuple[str, Optional[int], bool]] = {}
+    # placements: player_tag -> (clan_tag, shared_clan_id or None, notified, notified_clan_tag)
+    placements: Dict[str, Tuple[str, Optional[int], bool, Optional[str]]] = {}
     names_by_tag: Dict[str, Optional[str]] = {}
 
     for assignment in db.get_cwl_assignments_sync(event_id):
@@ -3507,7 +3526,9 @@ def resolve_cwl_announcement_targets_sync(guild_id: int, event_id: int, season: 
         if clan_tag not in participating or clan_tag in shared_by_tag:
             # Not a column here, or a shared clan whose real roster is read below instead.
             continue
-        placements[assignment["player_tag"]] = (clan_tag, None, bool(assignment["notified"]))
+        placements[assignment["player_tag"]] = (
+            clan_tag, None, bool(assignment["notified"]), assignment["notified_clan_tag"],
+        )
 
     for clan_tag, shared in shared_by_tag.items():
         if clan_tag not in participating:
@@ -3521,7 +3542,10 @@ def resolve_cwl_announcement_targets_sync(guild_id: int, event_id: int, season: 
             if not shared_player["assigned"]:
                 continue
             tag = shared_player["player_tag"]
-            placements[tag] = (clan_tag, shared["id"], bool(shared_player["notified"]))
+            placements[tag] = (
+                clan_tag, shared["id"], bool(shared_player["notified"]),
+                shared_player["notified_clan_tag"],
+            )
             names_by_tag[tag] = shared_player["player_name"]
 
     if not placements:
@@ -3535,10 +3559,15 @@ def resolve_cwl_announcement_targets_sync(guild_id: int, event_id: int, season: 
         names_by_tag.setdefault(signup["player_tag"], signup["player_name"])
 
     groups: Dict[str, List[Dict[str, Any]]] = {}
-    for tag, (clan_tag, shared_clan_id, notified) in placements.items():
+    for tag, (clan_tag, shared_clan_id, notified, notified_clan_tag) in placements.items():
         link = links.get(tag) or {}
         player_name = names_by_tag.get(tag) or link.get("player_name") or tag
-        if notified:
+        # `include_notified` is what turns this from "who still needs a first announcement" into
+        # "every assigned player and what they were last told" — the latter is what the pending-
+        # update comparison needs, and building it from one resolver rather than a second one is
+        # what stops the announcement and the update paths ever disagreeing about placement.
+        already_current = notified and notified_clan_tag == clan_tag
+        if notified and (not include_notified or already_current):
             result["already_notified"] += 1
             continue
         if not link.get("discord_id"):
@@ -3560,9 +3589,252 @@ def resolve_cwl_announcement_targets_sync(guild_id: int, event_id: int, season: 
             "current_clan_name": CACHE.get_clan_name(current_clan_tag, None) if current_clan_tag else None,
             "shared_clan_id": shared_clan_id,
             "notified": notified,
+            "notified_clan_tag": notified_clan_tag,
+            "discord_id": str(link["discord_id"]),
         })
     result["groups"] = groups
     return result
+
+
+def resolve_cwl_pending_roster_updates_sync(guild_id: int, event_id: int, season: str) -> Dict[str, Any]:
+    """Which already-announced players are now owed an UPDATE DM because the board changed under
+    them (2026-08-30, project owner's spec item 4).
+
+    Three categories, all DERIVED rather than queued — this is what makes drag-and-drop safe:
+
+      moved   — assigned somewhere other than the clan we last told them (notified_clan_tag)
+      dropped — announced, then taken off the roster entirely (the tombstone table, since their
+                assignment row no longer exists to compare against)
+      new     — assigned but never announced at all; the ordinary first-announcement case
+
+    Because "pending" is a comparison against what was last SENT, a player dragged A→B→A cancels
+    itself out completely and produces no DM. That is the avalanche protection the spec asks for,
+    obtained structurally instead of by debouncing timers — an admin can shuffle the whole board
+    for an hour and only the players whose end state actually differs get contacted.
+
+    Returns {"moved": [...], "dropped": [...], "new": [...]} where each entry carries enough to
+    render its DM. Plain sync (Pitfall 26); the caller wraps it in one to_thread hop."""
+    db = CACHE.db_manager
+    result: Dict[str, Any] = {"moved": [], "dropped": [], "new": []}
+    if db is None:
+        return result
+
+    targets = resolve_cwl_announcement_targets_sync(guild_id, event_id, season, include_notified=True)
+    for accounts in targets["groups"].values():
+        for account in accounts:
+            if account["notified_clan_tag"] is None:
+                result["new"].append(account)
+            elif account["notified_clan_tag"] != account["clan_tag"]:
+                result["moved"].append(account)
+
+    dropped_rows = db.get_cwl_dropped_notified_players_sync(event_id)
+    if dropped_rows:
+        links = db.get_player_links_sync([r["player_tag"] for r in dropped_rows])
+        for row in dropped_rows:
+            link = links.get(row["player_tag"]) or {}
+            result["dropped"].append({
+                "player_tag": row["player_tag"],
+                "player_name": row["player_name"] or link.get("player_name") or row["player_tag"],
+                "notified_clan_tag": row["notified_clan_tag"],
+                "clan_name": CACHE.get_clan_name(row["notified_clan_tag"], row["notified_clan_tag"]),
+                "discord_id": link.get("discord_id"),
+            })
+    return result
+
+
+def resolve_cwl_underfilled_clans_sync(guild_id: int, event_id: int, season: str) -> List[Dict[str, Any]]:
+    """Participating clans whose roster has fewer players than their configured roster_size
+    (2026-08-30, spec item 6: "do a check if the rosters of all participating clans are filled up
+    completely. If not give an ephemeral to the user telling him and ask if he wants to start the
+    next phase anyway").
+
+    Counts placements the same way the announcement itself does — local assignments, or the shared
+    roster for a cross-guild clan — so the number an admin is warned about is exactly the number of
+    people who will be DMed. Over-filled clans (deliberate reserves) are never flagged.
+
+    Returns [{"clan_tag", "clan_name", "assigned", "roster_size"}] for clans that are short."""
+    db = CACHE.db_manager
+    if db is None:
+        return []
+
+    participating = [
+        c for c in db.get_cwl_event_clans_sync(event_id) if c.get("participating", 1)
+    ]
+    if not participating:
+        return []
+    shared_by_tag = get_event_shared_clans_by_tag_sync(event_id, season)
+
+    counts: Dict[str, int] = {c["clan_tag"]: 0 for c in participating}
+    for assignment in db.get_cwl_assignments_sync(event_id):
+        clan_tag = assignment["assigned_clan_tag"]
+        if clan_tag in counts and clan_tag not in shared_by_tag:
+            counts[clan_tag] += 1
+    for clan_tag, shared in shared_by_tag.items():
+        if clan_tag not in counts:
+            continue
+        counts[clan_tag] = sum(
+            1 for p in db.get_cwl_shared_clan_players_sync(shared["id"]) if p["assigned"]
+        )
+
+    return [
+        {
+            "clan_tag": clan["clan_tag"],
+            "clan_name": CACHE.get_clan_name(clan["clan_tag"], clan["clan_tag"]),
+            "assigned": counts[clan["clan_tag"]],
+            "roster_size": clan["roster_size"],
+        }
+        for clan in participating
+        if counts[clan["clan_tag"]] < clan["roster_size"]
+    ]
+
+
+def count_cwl_pending_roster_updates(guild_id: int, season: str) -> int:
+    """Total pending update DMs for the guild's selected season — the number every one of the
+    three triggers (board button, close-DM, Hub button) keys off, so they can never disagree about
+    whether anything is outstanding. Safe on the synchronous embed-render path, same as the other
+    button-gating helpers here."""
+    db = CACHE.db_manager
+    if db is None:
+        return 0
+    event = db.get_cwl_event_sync(str(guild_id), season)
+    if event is None or event["status"] in ("draft", "cancelled"):
+        return 0
+    pending = resolve_cwl_pending_roster_updates_sync(guild_id, event["id"], season)
+    return len(pending["moved"]) + len(pending["dropped"]) + len(pending["new"])
+
+
+async def send_cwl_roster_updates(guild_id: int, season: str) -> Dict[str, Any]:
+    """Send the outstanding update DMs — the shared implementation behind all three triggers the
+    spec asks for (the board's own button, the DM sent when the board is closed with changes
+    outstanding, and the Hub's highlighted button).
+
+    Grouped per Discord user like every other CWL DM batch, so someone whose main moved AND whose
+    alt was dropped gets one message, not two."""
+    from qapbot.i18n import t
+
+    db = CACHE.db_manager
+    if db is None:
+        return {"ok": False, "error": "no_database"}
+    event = await asyncio.to_thread(db.get_cwl_event_sync, str(guild_id), season)
+    if event is None:
+        return {"ok": False, "error": "no_event"}
+    if event["status"] in ("draft", "cancelled"):
+        return {"ok": False, "error": "not_open"}
+
+    pending = await asyncio.to_thread(
+        resolve_cwl_pending_roster_updates_sync, guild_id, event["id"], season
+    )
+    summary: Dict[str, Any] = {
+        "ok": True, "moved": 0, "dropped": 0, "new": 0, "contacted_users": 0,
+        "skipped_dm_guard": 0, "skipped_unlinked": 0,
+        "blocked": [], "no_mutual_guild": [], "failed": [],
+    }
+
+    # One bucket per recipient, so a user with several affected accounts gets a single DM.
+    by_user: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+    for kind in ("moved", "new", "dropped"):
+        for account in pending[kind]:
+            discord_id = account.get("discord_id")
+            if not discord_id:
+                summary["skipped_unlinked"] += 1
+                continue
+            by_user.setdefault(str(discord_id), []).append((kind, account))
+
+    # One bulk lookup for the whole batch rather than one per recipient (Pitfall 26): who has
+    # already been asked the "do you want to play?" question at all this season, by ANY guild.
+    already_dm_by_tag = await asyncio.to_thread(
+        db.get_cwl_player_season_dm_status_bulk_sync,
+        [a["player_tag"] for entries in by_user.values() for _kind, a in entries],
+        season,
+    )
+
+    for discord_id, entries in by_user.items():
+        if _dm_guard_blocks(discord_id):
+            summary["skipped_dm_guard"] += len(entries)
+            continue
+        display_name = CACHE.user_accounts.get(discord_id, {}).get("display_name") or discord_id
+        intro = t(
+            'cwl.update.dm_intro', user_id=discord_id, guild_id=guild_id,
+            display_name=display_name, season=season, count=len(entries),
+        )
+        lines: List[str] = []
+        for kind, account in entries:
+            if kind == "dropped":
+                lines.append(t(
+                    'cwl.update.dm_line_dropped', user_id=discord_id, guild_id=guild_id,
+                    player_name=account["player_name"], clan_name=account["clan_name"],
+                ))
+            elif kind == "moved":
+                lines.extend(_build_cwl_roster_account_lines([account], discord_id, guild_id))
+                lines[-1] = t(
+                    'cwl.update.dm_line_moved_prefix', user_id=discord_id, guild_id=guild_id,
+                    player_name=account["player_name"],
+                    old_clan_name=CACHE.get_clan_name(
+                        account["notified_clan_tag"], account["notified_clan_tag"]
+                    ),
+                ) + lines[-1]
+            else:
+                lines.extend(_build_cwl_roster_account_lines([account], discord_id, guild_id))
+
+        # A player added to a roster in Preparation phase who was NEVER contacted at all this
+        # season (their clan joined the season after Start Enrollment ran — spec item 5) has two
+        # unanswered questions at once: "do you even want to play?" and "here's where you play".
+        # Sending those as two separate DMs is confusing and doubles the volume, so they go out as
+        # ONE message: the assignment lines above, plus this account's confirm/opt-out buttons.
+        never_asked = [
+            account for kind, account in entries
+            if kind == "new" and not already_dm_by_tag.get(account["player_tag"])
+        ]
+        view = None
+        if never_asked:
+            from qapbot.ui_cwl_roster import build_cwl_reminder_response_view
+
+            # Discord's 5-action-row cap at 2 buttons per account; a member with more linked
+            # accounts than that is vanishingly rare, and the overflow still gets the roster
+            # information — just not their buttons, and "Notify New Pool Members" covers them.
+            view = build_cwl_reminder_response_view(event["id"], never_asked[:5], guild_id)
+            lines.append(t('cwl.update.dm_confirm_prompt', user_id=discord_id, guild_id=guild_id))
+
+        sent, outcome = await _send_cwl_dm_chunks(discord_id, intro, lines, view=view)
+        if not sent:
+            names = [a["player_name"] for _kind, a in entries]
+            summary[outcome].extend(names)
+            continue
+        if never_asked and db is not None:
+            # Record the DM globally so "Notify New Pool Members" doesn't send them a second,
+            # redundant invitation — this message already asked the question.
+            sent_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+            for account in never_asked[:5]:
+                await asyncio.to_thread(
+                    db.mark_cwl_player_dm_sent_sync,
+                    account["player_tag"], season, account["player_name"], discord_id,
+                    event["id"], guild_id, sent_at, None, None,
+                )
+        summary["contacted_users"] += 1
+        for kind, account in entries:
+            summary[kind] += 1
+            if kind == "dropped":
+                await asyncio.to_thread(
+                    db.clear_cwl_dropped_notified_player_sync, event["id"], account["player_tag"]
+                )
+            elif account["shared_clan_id"] is not None:
+                await asyncio.to_thread(
+                    db.set_cwl_shared_clan_player_notified_sync,
+                    account["shared_clan_id"], account["player_tag"], True, account["clan_tag"],
+                )
+            else:
+                await asyncio.to_thread(
+                    db.mark_cwl_assignment_notified_sync,
+                    event["id"], account["player_tag"], True, account["clan_tag"],
+                )
+
+    logging.info(
+        f"[CWL-UPDATE] Roster updates sent: guild={guild_id} season={season} event={event['id']} "
+        f"moved={summary['moved']} new={summary['new']} dropped={summary['dropped']} "
+        f"users={summary['contacted_users']} skipped_dm_guard={summary['skipped_dm_guard']} "
+        f"skipped_unlinked={summary['skipped_unlinked']}"
+    )
+    return summary
 
 
 def has_cwl_roster_announcements_pending(guild_id: int, season: str) -> bool:
@@ -3623,9 +3895,15 @@ def _build_cwl_roster_account_lines(
     return lines
 
 
-async def _send_cwl_dm_chunks(discord_id: str, intro: str, lines: List[str]) -> Tuple[bool, str]:
+async def _send_cwl_dm_chunks(
+    discord_id: str, intro: str, lines: List[str], *, view: Optional[Any] = None,
+) -> Tuple[bool, str]:
     """Send an intro plus a list of per-account lines as one DM, splitting into further messages
     only if Discord's 2000-character limit would be exceeded (a member with many linked accounts).
+
+    `view`, when given, is attached to the LAST chunk — so the confirm/opt-out buttons for a
+    late-added player (spec item 5's combined DM) always sit directly under the roster information
+    they relate to, rather than in an earlier message the reader has already scrolled past.
 
     Returns (sent, outcome) using send_user_dm_detailed's own vocabulary. A partial send counts as
     sent — the recipient did get the announcement — but any failure after the first chunk is logged,
@@ -3645,7 +3923,10 @@ async def _send_cwl_dm_chunks(discord_id: str, intro: str, lines: List[str]) -> 
 
     first_outcome = "failed"
     for index, message in enumerate(messages):
-        sent, outcome = await CACHE.send_user_dm_detailed(discord_id, message)
+        is_last = index == len(messages) - 1
+        sent, outcome = await CACHE.send_user_dm_detailed(
+            discord_id, message, view=view if (is_last and view is not None) else None,
+        )
         if index == 0:
             if not sent:
                 return False, outcome
@@ -3745,14 +4026,17 @@ async def announce_cwl_rosters(guild_id: int, season: str) -> Dict[str, Any]:
         if group_result["contacted"]:
             summary["contacted_users"] += 1
             for account in accounts:
+                # Record WHICH clan they were told, not just that they were told — that's what
+                # makes a later move detectable as a pending update.
                 if account["shared_clan_id"] is not None:
                     await asyncio.to_thread(
                         db.set_cwl_shared_clan_player_notified_sync,
-                        account["shared_clan_id"], account["player_tag"], True,
+                        account["shared_clan_id"], account["player_tag"], True, account["clan_tag"],
                     )
                 else:
                     await asyncio.to_thread(
-                        db.mark_cwl_assignment_notified_sync, event["id"], account["player_tag"], True,
+                        db.mark_cwl_assignment_notified_sync,
+                        event["id"], account["player_tag"], True, account["clan_tag"],
                     )
         summary["blocked"].extend(group_result["blocked"])
         summary["no_mutual_guild"].extend(group_result["no_mutual_guild"])
@@ -3920,41 +4204,6 @@ async def _send_cwl_switch_alarm(account: Dict[str, Any], guild_id: int, stage: 
     return sent
 
 
-async def _notify_cwl_coordinators_of_missing(
-    guild_id: int, clan_tag: str, clan_name: str, missing: List[Dict[str, Any]], season: str,
-) -> int:
-    """Stage-2 leadership escalation: DM that clan's standing CWL Coordinators (tracker #0046) a
-    single consolidated "still missing" list.
-
-    Coordinators are the right recipients precisely because they're a standing, per-clan, already-
-    shipped concept — this needs no new configuration surface. One DM per coordinator per clan per
-    sweep, never one per missing player. A clan with no coordinators configured falls back to
-    nothing rather than to a guild-wide broadcast; the "Still Missing" section in the CWL Management
-    embed already covers that case passively."""
-    from qapbot.i18n import t
-
-    coordinators = (
-        CACHE.server_config.get(str(guild_id), {}).get("cwl_clan_coordinators", {}).get(clan_tag) or []
-    )
-    if not coordinators or not missing:
-        return 0
-    names = ", ".join(m["player_name"] for m in missing)
-    sent_count = 0
-    for coordinator_id in coordinators:
-        if _dm_guard_blocks(str(coordinator_id)):
-            continue
-        message = t(
-            'cwl.alarm.coordinator_body',
-            user_id=str(coordinator_id), guild_id=guild_id,
-            clan_name=clan_name, season=season, count=len(missing), names=names,
-            start_rel=cwl_start_at_discord_timestamp(missing[0]["cwl_start_at"], "R") or "?",
-        )
-        sent, _outcome = await CACHE.send_user_dm_detailed(str(coordinator_id), message)
-        if sent:
-            sent_count += 1
-    return sent_count
-
-
 async def snapshot_cwl_locked_clan_roster(clan_tag: str, season: str) -> int:
     """Capture who was actually in a clan when its CWL roster locked — the one moment this is
     knowable (see cwl_locked_clan_members' CREATE TABLE comment).
@@ -4071,6 +4320,93 @@ async def reconcile_cwl_locked_clan_roster(
     return result
 
 
+# How long before a clan's own cwl_start_at its coordinators get the roster status report
+# (2026-08-30, spec item 7). One shot, deduped by cwl_event_clans.coordinator_reminder_sent_at.
+_CWL_COORDINATOR_REMINDER_MINUTES = 30
+
+
+async def send_cwl_coordinator_start_reminders(
+    guild_id: int, event_id: int, season: str, clans: List[Dict[str, Any]],
+) -> int:
+    """Spec item 7: 30 minutes before a clan's announced start, DM its CWL Coordinators a status
+    report — is the roster full, and is everyone actually in the clan yet.
+
+    Those are the only two things a coordinator can still act on in the last half hour: pull in a
+    reserve to fill an empty slot, or chase whoever hasn't transferred. Anything else would be
+    noise at the one moment they're busiest.
+
+    Written as an informational report rather than a call to action with a link, because a
+    coordinator is NOT necessarily able to act on the board — coordinator status grants Teams
+    Management access only for clans participating this season (see
+    is_cwl_coordinator_for_current_season), and even then the fix is usually in-game, not in the
+    bot. Returns the number of DMs sent."""
+    from qapbot.i18n import t
+
+    db = CACHE.db_manager
+    if db is None:
+        return 0
+    now = datetime.now(timezone.utc)
+    sent_count = 0
+
+    coordinators_by_clan = (
+        CACHE.server_config.get(str(guild_id), {}).get("cwl_clan_coordinators") or {}
+    )
+    for clan in clans:
+        if not clan.get("participating", 1) or clan.get("coordinator_reminder_sent_at"):
+            continue
+        if clan.get("locked_at"):
+            continue  # already started — the report would be about a roster nobody can change
+        hours_left = _hours_until(clan.get("cwl_start_at"), now)
+        if hours_left is None or hours_left > _CWL_COORDINATOR_REMINDER_MINUTES / 60.0:
+            continue
+
+        clan_tag = clan["clan_tag"]
+        coordinators = coordinators_by_clan.get(clan_tag) or []
+        # Stamp regardless of whether anyone is configured: without this a clan with no
+        # coordinators would be re-evaluated every single cycle for the rest of the window.
+        await asyncio.to_thread(db.mark_cwl_coordinator_reminder_sent_sync, event_id, clan_tag)
+        if not coordinators:
+            continue
+
+        underfilled = await asyncio.to_thread(
+            resolve_cwl_underfilled_clans_sync, guild_id, event_id, season
+        )
+        shortfall = next((u for u in underfilled if u["clan_tag"] == clan_tag), None)
+        monitoring = await asyncio.to_thread(
+            resolve_cwl_switch_monitoring_sync, guild_id, event_id, season
+        )
+        missing = [p["player_name"] for p in monitoring["pending"] if p["clan_tag"] == clan_tag]
+        clan_name = CACHE.get_clan_name(clan_tag, clan_tag)
+
+        for coordinator_id in coordinators:
+            if _dm_guard_blocks(str(coordinator_id)):
+                continue
+            roster_line = t(
+                'cwl.alarm.coordinator_roster_short' if shortfall else 'cwl.alarm.coordinator_roster_full',
+                user_id=str(coordinator_id), guild_id=guild_id,
+                assigned=shortfall["assigned"] if shortfall else 0,
+                roster_size=shortfall["roster_size"] if shortfall else 0,
+            )
+            missing_line = t(
+                'cwl.alarm.coordinator_missing_some' if missing else 'cwl.alarm.coordinator_missing_none',
+                user_id=str(coordinator_id), guild_id=guild_id,
+                count=len(missing), names=", ".join(missing),
+            )
+            sent, _outcome = await CACHE.send_user_dm_detailed(
+                str(coordinator_id),
+                t(
+                    'cwl.alarm.coordinator_start_reminder',
+                    user_id=str(coordinator_id), guild_id=guild_id,
+                    clan_name=clan_name, season=season,
+                    start_rel=cwl_start_at_discord_timestamp(clan.get("cwl_start_at"), "R") or "?",
+                    roster_line=roster_line, missing_line=missing_line,
+                ),
+            )
+            if sent:
+                sent_count += 1
+    return sent_count
+
+
 async def check_cwl_roster_switches() -> Dict[str, int]:
     """Phase 6's once-per-cycle sweep: detect who has moved into their assigned clan, escalate to
     those who haven't, and stop entirely per clan the moment its CWL roster locks.
@@ -4168,7 +4504,6 @@ async def check_cwl_roster_switches() -> Dict[str, int]:
                 )
             counters["switched"] += 1
 
-        escalated_by_clan: Dict[str, List[Dict[str, Any]]] = {}
         for account in monitoring["pending"]:
             stage = _due_cwl_alarm_stage(account["hours_left"], account["alarm_stage_sent"])
             if stage is None:
@@ -4187,13 +4522,20 @@ async def check_cwl_roster_switches() -> Dict[str, int]:
                 await asyncio.to_thread(
                     db.bump_cwl_alarm_stage_sync, event["id"], account["player_tag"], stage,
                 )
-            if stage >= len(_CWL_ALARM_STAGES):
-                escalated_by_clan.setdefault(account["clan_tag"], []).append(account)
+        # NOTE: leadership escalation is deliberately NOT also fired here at stage 2 (2026-08-30).
+        # An earlier draft DMed coordinators a "still missing" list at T-2h as well as the T-30min
+        # status report below — 90 minutes apart, saying nearly the same thing. That is precisely
+        # the DM avalanche the rest of this feature works to avoid, just aimed at leadership instead
+        # of players. Coordinators now get exactly ONE message per clan (the richer one: roster fill
+        # AND who's missing), while players keep both of their own escalating alarms, so nobody
+        # loses lead time.
 
-        for clan_tag, missing in escalated_by_clan.items():
-            counters["coordinator_dms"] += await _notify_cwl_coordinators_of_missing(
-                guild_id, clan_tag, missing[0]["clan_name"], missing, season
-            )
+        # 30-minutes-before roster status report (spec item 7). Re-reads the clan rows so it sees
+        # this cycle's own locked_at stamps and doesn't report on a clan that just started.
+        counters["coordinator_dms"] += await send_cwl_coordinator_start_reminders(
+            guild_id, event["id"], season,
+            await asyncio.to_thread(db.get_cwl_event_clans_sync, event["id"]),
+        )
 
     if any(counters[key] for key in ("locked", "switched", "alarms", "coordinator_dms", "entered_war")):
         logging.info(

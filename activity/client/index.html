@@ -316,6 +316,23 @@
         cursor: pointer;
       }
       .cancel-button:disabled { opacity: 0.6; cursor: default; }
+      /* "Send Roster Updates" (2026-08-30, spec item 4 trigger (a)) — sits beside Close and is
+         shown ONLY when players are actually owed an update DM, so it reads as "something needs
+         doing" rather than as permanent furniture. Amber rather than blurple for the same reason
+         the Hub's own copy of this action is red: real people are currently holding out-of-date
+         instructions. */
+      .send-updates-button {
+        background: #f0b232;
+        color: #1e1f22;
+        border: none;
+        border-radius: 4px;
+        padding: 10px 20px;
+        font-size: 0.9rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .send-updates-button:hover:not(:disabled) { background: #ffc44d; }
+      .send-updates-button:disabled { opacity: 0.6; cursor: default; }
       .save-status { font-size: 0.85rem; color: #f2f3f5; }
       .save-status.success { color: #23a55a; }
       .save-status.error { color: #f23f42; }
@@ -420,6 +437,10 @@
          (no rosterSize class added there at all — see enrollmentBoard.ts's buildColumn()). */
       .column-count.count-met { color: #23a55a; }
       .column-count.count-under { color: #f0b232; }
+      /* Lock badge on a clan whose CWL has already started in-game (2026-08-30) — its roster is
+         owned by the game from that point, so the column is frozen. Shown in the header rather
+         than per card so an admin sees WHY a drag won't work before attempting it. */
+      .column-lock { flex-shrink: 0; margin-left: 4px; cursor: help; }
       .card-list {
         padding: 8px;
         display: flex;

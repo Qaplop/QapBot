@@ -1896,7 +1896,12 @@ async def test_enrollment_get_returns_merged_players_and_clans(db, bridge_config
     body = await resp.json()
     assert body["season"] == season
     assert body["event_status"] == "draft"
-    assert body["clans"] == [{"clan_tag": "#CLAN1", "name": "Alpha", "tier": "Crystal League I", "roster_size": 15}]
+    # locked_at/eligible_player_tags (2026-08-30) drive the board's roster freeze — an unstarted
+    # clan reports no lock and an empty eligible set, which the frontend reads as "no freeze".
+    assert body["clans"] == [{
+        "clan_tag": "#CLAN1", "name": "Alpha", "tier": "Crystal League I", "roster_size": 15,
+        "locked_at": None, "eligible_player_tags": [],
+    }]
 
     players_by_tag = {p["player_tag"]: p for p in body["players"]}
     assert players_by_tag["#P1"]["signup_status"] == "pending"

@@ -558,8 +558,14 @@ async def test_sweep_ignores_events_that_never_started_cwl(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stage2_escalates_to_the_clans_cwl_coordinators(db, monkeypatch):
-    """Tracker #0046's standing per-clan coordinators are the leadership escalation target."""
+async def test_coordinators_get_one_roster_report_before_the_start(db, monkeypatch):
+    """Spec item 7: 30 minutes before a clan's announced start, its CWL Coordinators (tracker
+    #0046) get ONE status report — roster fill plus who still isn't in the clan.
+
+    Exactly one, deliberately: an earlier draft also DMed them a "still missing" list at the 2h
+    player-alarm stage, 90 minutes earlier and saying nearly the same thing. Two near-identical
+    leadership DMs is the same avalanche problem this feature avoids everywhere else, so the
+    coordinator path was consolidated onto the richer of the two."""
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import check_cwl_roster_switches
 
@@ -567,21 +573,28 @@ async def test_stage2_escalates_to_the_clans_cwl_coordinators(db, monkeypatch):
     await _seed_guild_and_clans(db, guild_id, ("#CLAN1", "#CLAN2"))
     CACHE.server_config[guild_id]["cwl_clan_coordinators"] = {"#CLAN1": ["coord-1"]}
     event_id = await _make_announced_event(
-        db, guild_id, [{"clan_tag": "#CLAN1", "cwl_start_at": "2020-01-01T08:00Z"}], status="announced",
+        db, guild_id,
+        [{"clan_tag": "#CLAN1", "cwl_start_at": "2020-01-01T08:00Z", "roster_size": 15}],
+        status="announced",
     )
     await _seed_player(db, "u1", "#P1", "#CLAN2", "Missing Guy")
     _assign(db, event_id, "#P1", "#CLAN1")
-    db.mark_cwl_assignment_notified_sync(event_id, "#P1")
+    db.mark_cwl_assignment_notified_sync(event_id, "#P1", True, "#CLAN1")
     sent = AsyncMock(return_value=(True, "sent"))
     monkeypatch.setattr(CACHE, "send_user_dm_detailed", sent, raising=False)
 
     counters = await check_cwl_roster_switches()
 
     assert counters["coordinator_dms"] == 1
-    recipients = [call.args[0] for call in sent.await_args_list]
-    assert "coord-1" in recipients
-    coordinator_body = [c.args[1] for c in sent.await_args_list if c.args[0] == "coord-1"][0]
-    assert "Missing Guy" in coordinator_body
+    body = [c.args[1] for c in sent.await_args_list if c.args[0] == "coord-1"][0]
+    assert "Missing Guy" in body, "the report must name who hasn't transferred"
+    assert "1/15" in body, "and report the roster shortfall"
+
+    # One shot: a second sweep inside the same window must not re-send it.
+    sent.reset_mock()
+    again = await check_cwl_roster_switches()
+    assert again["coordinator_dms"] == 0
+    assert not [c for c in sent.await_args_list if c.args[0] == "coord-1"]
 
 
 @pytest.mark.asyncio
