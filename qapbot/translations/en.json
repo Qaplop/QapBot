@@ -1029,7 +1029,7 @@
       "send_updates_error_not_open": "\u26a0\ufe0f Enrollment hasn't been started yet for this season.",
       "close_pending_updates_dm": "\ud83d\udccb You closed the CWL Teams Management view for **{season}** with **{count}** line-up update(s) still unsent. The affected players have not been told yet.",
       "announce_rosters_underfilled_warning": "\n\n\u26a0\ufe0f These clans are not full yet:\n{clans}\nYou can still announce now and add players later \u2014 they will get an update DM.",
-      "button_announce_rosters": "Announce Rosters",
+      "button_announce_rosters": "Start Preparation",
       "button_confirm_announce_rosters": "Yes, announce the rosters",
       "announce_rosters_confirm_body": "\ud83d\udce3 Announce the CWL roster for season **{season}** to every assigned player? Everyone already in their assigned clan is told when their CWL starts; everyone who still has to move gets their clan, the deadline and a direct join link.",
       "announce_rosters_processing": "\u23f3 Announcing the roster, this can take a few seconds\u2026",

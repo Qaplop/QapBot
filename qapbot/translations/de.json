@@ -1029,7 +1029,7 @@
       "send_updates_error_not_open": "\u26a0\ufe0f Die Anmeldephase f\u00fcr diese Saison wurde noch nicht gestartet.",
       "close_pending_updates_dm": "\ud83d\udccb Du hast die CWL-Teamverwaltung f\u00fcr **{season}** geschlossen, w\u00e4hrend noch **{count}** Aufstellungs\u00e4nderung(en) nicht gesendet wurden. Die betroffenen Spieler wurden noch nicht informiert.",
       "announce_rosters_underfilled_warning": "\n\n\u26a0\ufe0f Diese Clans sind noch nicht voll:\n{clans}\nDu kannst trotzdem jetzt bekannt geben und sp\u00e4ter Spieler erg\u00e4nzen \u2014 sie erhalten dann eine Update-DM.",
-      "button_announce_rosters": "Aufstellung bekannt geben",
+      "button_announce_rosters": "Vorbereitung starten",
       "button_confirm_announce_rosters": "Ja, Aufstellung bekannt geben",
       "announce_rosters_confirm_body": "\ud83d\udce3 Soll die CWL-Aufstellung f\u00fcr Saison **{season}** an alle zugewiesenen Spieler gesendet werden? Wer bereits im zugewiesenen Clan ist, erf\u00e4hrt, wann seine CWL startet; wer noch wechseln muss, bekommt Clan, Zeitpunkt und einen direkten Beitrittslink.",
       "announce_rosters_processing": "\u23f3 Aufstellung wird bekannt gegeben, dies kann einige Sekunden dauern\u2026",
