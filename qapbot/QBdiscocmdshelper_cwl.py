@@ -669,16 +669,36 @@ def split_cwl_pending_signups_by_link_sync(event_id: int) -> Tuple[int, int]:
 
     Deliberately UNCHANGED by 'auto_confirmed' (plans/cwl-personal-hub.md Phase 4a): the
     `status == "pending"` filter below correctly excludes it — an auto-confirmed row was seeded
-    by a standing opt-in preference, not left unanswered, and must not inflate this count."""
+    by a standing opt-in preference, not left unanswered, and must not inflate this count.
+
+    `dm_sent` is required for the LINKED half (2026-08-30, tracker #0079, live bug report:
+    "Ausstehend says 2 but the only yellow ❓ in Teams verwalten is Minebot"). The board draws its
+    three icon states in a strict precedence — unlinked wins first, then a real status, then
+    "Not Invited Yet" — and `hasVisibleRealStatus()` (enrollmentBoard.ts) only treats a 'pending'
+    row as a real status once its DM has actually gone out. So a pending, linked, never-DMed
+    player renders as "Not Invited Yet", NOT as ❓, while this count used to include them. Adding
+    the same condition makes this line exactly the number of ❓ icons on the board, which is what
+    an admin reading both at once is entitled to assume. Those players are not lost from the
+    overview: they are precisely the population the "New players without DM invitation" line
+    reports (resolve_cwl_pool_tags_missing_dm_sync)."""
     db = CACHE.db_manager
     if db is None:
         return (0, 0)
     pending_tags = [s["player_tag"] for s in db.get_cwl_signups_for_event_sync(event_id) if s["status"] == "pending"]
     if not pending_tags:
         return (0, 0)
+    event = db.get_cwl_event_by_id_sync(event_id)
+    dm_sent_by_tag = (
+        db.get_cwl_player_season_dm_status_bulk_sync(pending_tags, event["cwl_season"])
+        if event is not None else {}
+    )
     links = db.get_player_links_sync(pending_tags)
-    linked = sum(1 for tag in pending_tags if (links.get(tag) or {}).get("discord_id"))
-    return (linked, len(pending_tags) - linked)
+    linked_and_invited = sum(
+        1 for tag in pending_tags
+        if (links.get(tag) or {}).get("discord_id") and dm_sent_by_tag.get(tag, False)
+    )
+    unlinked = sum(1 for tag in pending_tags if not (links.get(tag) or {}).get("discord_id"))
+    return (linked_and_invited, unlinked)
 
 
 def count_cwl_pool_members_missing_dm(guild_id: int, season: str) -> int:
@@ -717,23 +737,60 @@ def count_cwl_pool_members_missing_dm(guild_id: int, season: str) -> int:
     if event is None or event["status"] in ("draft", "cancelled"):
         return 0
 
+    return len(resolve_cwl_pool_tags_missing_dm_sync(guild_id, event["id"], season))
+
+
+def resolve_cwl_pool_tags_missing_dm_sync(guild_id: int, event_id: int, season: str) -> Set[str]:
+    """WHICH pooled, DM-able player_tags have never been sent the enrollment DM by any guild this
+    season — the set behind the "New players without DM invitation" count, the "Notify New Pool
+    Members" button's gating, AND that button's own send list.
+
+    Extracted 2026-08-30 (tracker #0079, live bug report: "Neue Spieler ohne DM-Einladung: 1, but
+    clicking the button lists 2 that couldn't be contacted"). The count and the send had genuinely
+    drifted: this function's settled-status exclusion below was added for tracker #0075 and applied
+    ONLY to the count, while notify_new_cwl_pool_members kept handing the raw pool to
+    _send_cwl_enrollment_dm_batch, whose own dedup checks nothing but global dm_sent. So a pooled
+    player with a settled local status and dm_sent=False was invisible to the number and still
+    DMed by the action — and, being settled, was someone who had already answered and should not
+    have been re-invited at all. Returning the SET rather than a count is what makes the two
+    provably identical instead of merely intended to be (notify_new_cwl_pool_members' docstring
+    already claimed they couldn't drift; it was true when written and quietly stopped being true).
+
+    Excludes a tag whose LOCAL cwl_signups row (this event only — never another guild's) already
+    carries a real settled status ('confirmed'/'declined'/'auto_confirmed'), even when dm_sent is
+    False for it (tracker #0075, live bug report: "Stay shows 3 uninvited, but in the team
+    management view only 1 is shown"). A standing opt-in seeds 'auto_confirmed' immediately and is
+    always attempted (resolve_seeded_cwl_signup_status's branch 3) but the send can still fail
+    silently (DM guard, blocked, left every mutual guild, a transient failure) — that account has
+    already answered via its standing preference, so it reads as "not invited" to nobody except a
+    DM-delivery audit, which is a different question than the board's own "Not Invited Yet" card
+    (enrollmentBoard.ts's hasVisibleRealStatus()) asks. That function only defers to dm_sent for
+    'pending' rows and always treats confirmed/declined/auto_confirmed as real regardless — this
+    mirrors that exact rule so the two surfaces can't disagree about the same players again.
+
+    Plain sync function (Pitfall 26) — safe on the synchronous render path (a handful of indexed
+    lookups, not the board payload builder); async callers wrap it in one to_thread hop."""
+    db = CACHE.db_manager
+    if db is None:
+        return set()
+
     tags_with_discord = [
         target["player_tag"]
-        for target in resolve_cwl_pool_dm_targets_sync(guild_id, event["id"], season)["targets"]
+        for target in resolve_cwl_pool_dm_targets_sync(guild_id, event_id, season)["targets"]
     ]
     if not tags_with_discord:
-        return 0
+        return set()
 
     dm_status = db.get_cwl_player_season_dm_status_bulk_sync(tags_with_discord, season)
     settled_statuses = {"confirmed", "declined", "auto_confirmed"}
     status_by_tag = {
         signup["player_tag"]: signup["status"]
-        for signup in db.get_cwl_signups_for_event_sync(event["id"])
+        for signup in db.get_cwl_signups_for_event_sync(event_id)
     }
-    return sum(
-        1 for tag in tags_with_discord
+    return {
+        tag for tag in tags_with_discord
         if not dm_status.get(tag, False) and status_by_tag.get(tag) not in settled_statuses
-    )
+    }
 
 
 def has_cwl_pool_members_missing_dm(guild_id: int, season: str) -> bool:

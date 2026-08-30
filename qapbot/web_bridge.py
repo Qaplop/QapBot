@@ -797,14 +797,19 @@ async def notify_new_cwl_pool_members(guild_id: int, season: str) -> Dict[str, A
     exact same functions start_cwl_enrollment uses, so this button and Start Enrollment can't
     drift apart about who counts as a pool member (2026-08-20 — see
     resolve_cwl_pool_dm_targets_sync's docstring for the bug that came of them not being shared).
-    The batch helper's own global dm_sent dedup (QBdiscocmdshelper_cwl.py) means this is
-    naturally "only the not-yet-contacted ones" — no separate filtering needed here. The
-    button-gating check (has_cwl_pool_members_missing_dm, QBdiscocmdshelper_cwl.py) is a
-    separate, cheaper function — it runs on the synchronous CWL Management screen render path,
-    which can't await this one."""
+    Who actually gets DMed is `resolve_cwl_pool_tags_missing_dm_sync()` — the SAME set the season
+    overview's "New players without DM invitation" line counts and the button's own visibility is
+    gated on, so the number on screen and the number contacted are the same thing by construction.
+
+    An earlier version of this docstring claimed the batch helper's own global dm_sent dedup made
+    that automatic, with "no separate filtering needed here". That was true when written and
+    quietly stopped being true: tracker #0075 added a settled-status exclusion to the COUNT only,
+    so the two drifted, and tracker #0079 caught it live (the line said 1, the action listed 2).
+    Shared resolution beats shared intent."""
     from qapbot.QBdiscocmdshelper_cwl import (
         _send_cwl_enrollment_dm_batch,
         resolve_cwl_pool_dm_targets_sync,
+        resolve_cwl_pool_tags_missing_dm_sync,
         resolve_seeded_cwl_signup_status,
     )
 
@@ -848,7 +853,18 @@ async def notify_new_cwl_pool_members(guild_id: int, season: str) -> Dict[str, A
             })
         await asyncio.to_thread(db.bulk_create_cwl_signups_sync, event["id"], extra_signups)
 
-    dm_result = await _send_cwl_enrollment_dm_batch(event["id"], guild_id, season, pool["targets"])
+    # Send to EXACTLY the set the "New players without DM invitation" count reports (2026-08-30,
+    # tracker #0079). The batch helper's own dedup only checks global dm_sent, which is a strictly
+    # wider net than the count's — it also excludes anyone whose local signup row already carries a
+    # settled status (tracker #0075). Filtering here rather than inside the batch helper is
+    # deliberate: Start Enrollment shares that helper and MUST still contact an auto_confirmed
+    # member (to tell them a standing preference enrolled them), so the narrowing belongs to this
+    # caller, whose whole job is "reach the people nobody has invited yet".
+    missing_dm_tags = await asyncio.to_thread(
+        resolve_cwl_pool_tags_missing_dm_sync, guild_id, event["id"], season
+    )
+    dm_targets = [t for t in pool["targets"] if t["player_tag"] in missing_dm_tags]
+    dm_result = await _send_cwl_enrollment_dm_batch(event["id"], guild_id, season, dm_targets)
     # dm_result["skipped_unlinked"] folds in both the pool-resolution-time count (pool's own
     # "no linked Discord account") and the send-time re-check inside _send_cwl_enrollment_dm_batch
     # (2026-08-22, live bug report: "Daniel" had no linked account at all yet still received a DM

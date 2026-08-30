@@ -1549,6 +1549,69 @@ async def test_notify_new_cwl_pool_members_only_dms_not_yet_contacted(db, monkey
 
 @pytest.mark.discord
 @pytest.mark.asyncio
+async def test_notify_new_cwl_pool_members_contacts_exactly_what_the_count_reports(db, monkeypatch):
+    """Tracker #0079: the season overview said "New players without DM invitation: 1" while
+    pressing the button listed 2 it couldn't reach.
+
+    Root cause: tracker #0075 added a settled-status exclusion to the COUNT only, while the action
+    still handed the raw pool to the batch helper, whose dedup checks nothing but global dm_sent.
+    A pooled player with dm_sent=False AND a settled local status was invisible to the number and
+    still DMed — and being settled, had already answered and should never have been re-invited.
+    Both now read the same set, so this asserts the two agree rather than that either is some
+    particular number."""
+    from qapbot import config as config_module
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import count_cwl_pool_members_missing_dm
+    from qapbot.web_bridge import notify_new_cwl_pool_members
+
+    monkeypatch.setattr(
+        config_module, "CONFIG",
+        dataclasses.replace(config_module.CONFIG, is_dev_mode=False, cwl_dm_restrict_to_admin=False),
+    )
+
+    await _seed_guild_and_clans(db, "834", {"#CLAN1": "Alpha"})
+    CACHE.db_manager = db
+    CACHE.clan_name_cache = {"#CLAN1": {"name": "Alpha", "war_league": "Master League II"}}
+    CACHE.server_config["834"] = {"member_clans": ["#CLAN1"], "member_families": []}
+    CACHE.subscriptions = {}
+    CACHE.clan_families = {}
+
+    event_id = db.create_cwl_event_sync("834", "2026-09", "discordid1")
+    db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
+    db.update_cwl_event_status_sync(event_id, "signup_open")
+
+    for discord_id, tag, name in (("10", "#FRESH", "Fresh"), ("20", "#SETTLED", "Settled")):
+        await db.conn.execute(
+            "INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id)
+        )
+        await db.conn.execute(
+            "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
+            "VALUES (?, ?, ?, 1, '#CLAN1')",
+            (discord_id, tag, name),
+        )
+    await db.conn.commit()
+    # Already answered via a standing preference, but the send never landed — dm_sent stays False.
+    # The count excludes them; the action must too, or it re-invites someone who already answered.
+    db.upsert_cwl_signup_sync(event_id, "#SETTLED", "Settled", "20", None, "auto_confirmed", "auto_confirmed")
+
+    contacted = []
+
+    async def fake_send_user_dm_detailed(user_id, message, view=None, embed=None, sent_message_out=None):
+        contacted.append(user_id)
+        return True, "sent"
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_send_user_dm_detailed)
+
+    reported = count_cwl_pool_members_missing_dm(834, "2026-09")
+    result = await notify_new_cwl_pool_members(834, "2026-09")
+
+    assert reported == 1
+    assert result["contacted"] == reported, "the number on screen and the number contacted agree"
+    assert contacted == ["10"], "the settled player is never re-invited"
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
 async def test_notify_new_cwl_pool_members_seeds_declined_for_an_optout_no_dm_new_member(db, monkeypatch):
     """plans/cwl-personal-hub.md Phase 4b-bis: a permanently-opted-out member who joins the pool
     AFTER enrollment already started — this button's whole purpose — is skipped from the DM by

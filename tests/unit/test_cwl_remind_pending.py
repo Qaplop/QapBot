@@ -53,7 +53,11 @@ async def _link(db: WarHistoryDB, discord_id: str, player_tag: str, optout: bool
 class TestSplitPendingSignupsByLink:
     """The old single "Ausstehend" count counted every pending cwl_signups row regardless of
     Discord link, while Teams-verwalten only shows a pending ❓ icon for a linked account — split
-    so the season overview shows both, matching what the board actually renders."""
+    so the season overview shows both, matching what the board actually renders.
+
+    Tightened again for tracker #0079: the board also requires the DM to have actually gone out
+    before it draws ❓ (a linked, never-DMed pending player renders "Not Invited Yet" instead), so
+    the linked half requires dm_sent too."""
 
     @pytest.mark.asyncio
     async def test_no_signups_is_zero_zero(self, db):
@@ -74,10 +78,30 @@ class TestSplitPendingSignupsByLink:
         CACHE.db_manager = db
         await _link(db, "owner1", "#LINKED1")
         db.upsert_cwl_signup_sync(event_id, "#LINKED1", "Linked1", "owner1", None, "template_confirm", "pending")
+        db.mark_cwl_player_dm_sent_sync("#LINKED1", "2026-09", "Linked1", "owner1", event_id, 802, "2026-09-01T08:00Z")
         db.upsert_cwl_signup_sync(event_id, "#GHOST1", "Ghost1", None, None, "guest_invite", "pending")
         db.upsert_cwl_signup_sync(event_id, "#GHOST2", "Ghost2", None, None, "guest_invite", "pending")
 
         assert split_cwl_pending_signups_by_link_sync(event_id) == (1, 2)
+
+    @pytest.mark.asyncio
+    async def test_linked_but_never_dmed_is_not_counted_as_pending(self, db):
+        """Tracker #0079: the reported symptom exactly — "Ausstehend" said 2 while the board showed
+        a single ❓. The second player was linked and pending but had never been sent a DM, so the
+        board drew "Not Invited Yet" for them while this counter still called them pending."""
+        from qapbot.cache_manager import CACHE
+        from qapbot.QBdiscocmdshelper_cwl import split_cwl_pending_signups_by_link_sync
+
+        event_id = await _seed(db, "804", "#CLAND")
+        CACHE.db_manager = db
+        await _link(db, "owner1", "#INVITED")
+        await _link(db, "owner2", "#NOTINVITED")
+        db.upsert_cwl_signup_sync(event_id, "#INVITED", "Invited", "owner1", None, "template_confirm", "pending")
+        db.mark_cwl_player_dm_sent_sync("#INVITED", "2026-09", "Invited", "owner1", event_id, 804, "2026-09-01T08:00Z")
+        db.upsert_cwl_signup_sync(event_id, "#NOTINVITED", "NotInvited", "owner2", None, "auto_seeded", "pending")
+
+        # Exactly one ❓ on the board, so exactly 1 here — never 2.
+        assert split_cwl_pending_signups_by_link_sync(event_id) == (1, 0)
 
     @pytest.mark.asyncio
     async def test_non_pending_rows_are_excluded_from_both_halves(self, db):

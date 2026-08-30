@@ -29,6 +29,37 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   (confirmed/declined/auto_confirmed), matching the board's own rule exactly. qapbot/QBdiscocmdshelper_cwl.py.
   1 new test. Full suite: 2852 passed, 4 deselected.
 
+2026-08-30 (34)
+- Fixed tracker #0078 ("Ausstehend Zahl oder symbol stimmt nicht"): the season overview's
+  "Ausstehend" line said 2 while the Teams-verwalten board showed a single yellow question mark.
+  The board draws its icons in a strict precedence -- Not Linked, then a real status, then
+  "Not Invited Yet" -- and hasVisibleRealStatus() only treats a 'pending' row as a real status
+  once its DM has actually gone out. A linked, pending, never-DMed player therefore renders as
+  "Not Invited Yet" while the counter still called them pending.
+  split_cwl_pending_signups_by_link_sync() now requires dm_sent for its linked half, so that line
+  is exactly the number of question-mark icons on the board. Those players are not lost from the
+  overview -- they are precisely who the "New players without DM invitation" line reports.
+- Fixed tracker #0079 ("Zahl stimmt nicht ueberein"): "New players without DM invitation" said 1,
+  but pressing "Notify New Pool Members" listed 2 that could not be contacted. The count and the
+  action had genuinely drifted: tracker #0075 added a settled-status exclusion (confirmed /
+  declined / auto_confirmed) to the COUNT only, while the action kept handing the raw pool to
+  _send_cwl_enrollment_dm_batch, whose own dedup checks nothing but global dm_sent. So a pooled
+  player with dm_sent=False and a settled local status was invisible to the number and still got
+  DMed -- and, being settled, was someone who had already answered and should not have been
+  re-invited at all.
+  Extracted resolve_cwl_pool_tags_missing_dm_sync(), which returns the SET rather than a count;
+  the overview line, the button's visibility and the button's send list are now the same set by
+  construction rather than by intention. The narrowing deliberately lives in
+  notify_new_cwl_pool_members rather than in the shared batch helper, because Start Enrollment
+  shares that helper and must still contact an auto_confirmed member to tell them a standing
+  preference enrolled them.
+  Note for the record: notify_new_cwl_pool_members' docstring had claimed the two could not drift
+  apart. That was true when written and quietly stopped being true when #0075 landed -- shared
+  resolution beats shared intent.
+  Files: qapbot/QBdiscocmdshelper_cwl.py, qapbot/web_bridge.py. Tests: 2 new regression tests
+  (the exact reported shape of each ticket) plus one existing test updated for the tightened
+  pending rule. 2888 tests pass.
+
 2026-08-30 (33)
 - Deployed: activity/server (Worker, version f54e977f) and activity/client (Pages, 7c4945f8) to
   DEV. Both halves were required this time -- the Worker gained /cwl/enrollment/send-updates, and
