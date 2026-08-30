@@ -1,16 +1,10 @@
 Project Backlog, Improvement Ideas and General Remarks
 
-Fable-5 Recommendation:
-Have Sonnet do batch 1 (Steps 1, 2, 4), the P0 meltdown fixes) as one deploy and verify on DEV with a worst-case
-#2-style search (search by Tag) before starting the P1 work.
-
 Immediate next steps:
 - Refactor the discord user / coc player linking for admins with a nice web-ui.
 - Add a feature to DM users of the guild server to remind them to link their coc player accounts. the dm could contain a button that easily allows them to do the linking. The mail could be signed by a configurable server admin so that it is more convincing.
-- New commands /feature and /bug that allow users to file feature requests and bug reports
 - Handling of DMs that can't be sent: e.g. notify the admin
 - Block players from CWL participation (just show an icon not a real technical blocking!) e.g. when players miss attack and are punished for that
-- After testing on PROD for the new CWL managaemnet features is complete we need to remove the feature toggle for the DM send guard on PROD. The DM send guard should only be effective on DEV after testing on PROD is finished.
 - Known lower-priority follow-up (not fixed,
   admin-only/rarely invoked, no crash risk): the `/admin` CWL-group-backfill
   handler in qapbot/QBdiscocmdshelper_admin_command.py
@@ -35,16 +29,12 @@ Immediate next steps:
 - Wrap the war simulation in a small piece of C code to gain performance
 - Add /admin Backup Data command that mimics the ArchiveOld.bat behaviour and auto-moves excessive .\archive file numbers to .\archive_old with nightly maintenance auto-run
 - log_time_gaps.py script anwenden und weitere blocking und langläufer operationen finden
-- STAY Family enable auto-role takes very long check on DEV and add some kind of working symbol!
-- /admin Cleanup Messages All takes VERY long. How can we speed this up? And maybe also improve logic top find more orphaned messages e.g. duplicate welcome-messages
 - Should probably be family: Posting leaderboard for clan #5053A40B67
 - Use custom emojis everywhere in the code
 - Update all channel messages when guild-language is switched
 - Create a Newsfeed-Channel (or Updates-Channel) that gets updates on what is going on
 - Player activity monitor, logins, raid weekends, clangames
 - Add subscription-type for playerlist for clan / clan-family and add function to update channels when player-lists change
-
-- Add on_message handler for DM so that bot can reply to direct chat input from users
 - /clan management: Regular users should be able to use the viewing functions but not the action buttons
 - New Feature: Add scores for "th-level difference" and "up-hits/drops" in CW/CWL
 
