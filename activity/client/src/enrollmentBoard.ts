@@ -824,6 +824,14 @@ export function renderEnrollmentBoard(
   sendUpdatesButton.className = 'primary-button send-updates-button'
   sendUpdatesButton.textContent = 'Send Roster Updates'
   sendUpdatesButton.hidden = true
+  // How many players are currently owed an update DM. Maintained locally rather than refetched
+  // per drag: the bridge's own count is authoritative and arrives with every payload refresh, but
+  // an optimistic local bump is what makes the button appear the instant a drag lands instead of
+  // up to a poll-interval later. Declared here (ahead of resizeBoard()/refreshSendUpdatesButton()'s
+  // first call below) rather than down by setStatus() — a `let` isn't hoisted with its initializer,
+  // so calling refreshSendUpdatesButton() before this line ran throws "Cannot access before
+  // initialization" (caught live on DEV, 2026-08-30).
+  let pendingUpdateCount = payload.pending_roster_updates ?? 0
   sendUpdatesButton.addEventListener('click', () => {
     sendUpdatesButton.disabled = true
     setStatus('Sending roster updates...', false)
@@ -888,12 +896,6 @@ export function renderEnrollmentBoard(
     status.textContent = message
     status.className = isError ? 'save-status error' : 'save-status'
   }
-
-  // How many players are currently owed an update DM. Maintained locally rather than refetched
-  // per drag: the bridge's own count is authoritative and arrives with every payload refresh, but
-  // an optimistic local bump is what makes the button appear the instant a drag lands instead of
-  // up to a poll-interval later.
-  let pendingUpdateCount = payload.pending_roster_updates ?? 0
 
   function refreshSendUpdatesButton(): void {
     sendUpdatesButton.hidden = pendingUpdateCount <= 0
