@@ -491,6 +491,39 @@ async def test_a_never_announced_player_counts_as_new_not_moved(db):
 
 
 @pytest.mark.asyncio
+async def test_enrollment_payload_hides_pending_updates_before_first_announcement(db):
+    """Regression (caught live, 2026-08-30): the Teams Management board showed "Send Roster
+    Updates (9)" during Enrollment, before Announce Rosters had ever been pressed.
+    resolve_cwl_pending_roster_updates_sync() correctly counts every never-announced assigned
+    player as "new" — that is right for count_cwl_pending_roster_updates() and the Hub, which both
+    only ever call it once status has left signup_open. _build_enrollment_payload_sync() had no
+    such guard and called it unconditionally, so pre-announcement "new" placements (which
+    Announce Rosters, not Send Roster Updates, is meant to handle) leaked into the board's own
+    pending count. Mirrors the Hub's own branch (add_cwl_management_components, ui_cwl_roster.py:
+    `if event["status"] == "signup_open": ... else: count_cwl_pending_roster_updates(...)`)."""
+    from qapbot.QBdiscocmdshelper_cwl import assign_cwl_player_sync
+    from qapbot.web_bridge import _build_enrollment_payload_sync
+
+    guild_id = "324"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1"}], status="signup_open")
+    await _player(db, "u1", "#NEW", "#CLAN1", "Latecomer")
+    db.upsert_cwl_assignment_sync(event_id, "#NEW", "#CLAN1", assignment_source="admin_override", locked=True)
+
+    payload = _build_enrollment_payload_sync(int(guild_id))
+    assert payload["event_status"] == "signup_open"
+    assert payload["pending_roster_updates"] == 0, "not-yet-announced players are Announce Rosters' job"
+
+    db.update_cwl_event_status_sync(event_id, "announced")
+    db.mark_cwl_assignment_notified_sync(event_id, "#NEW", True, "#CLAN1")
+    assign_cwl_player_sync(int(guild_id), event_id, SEASON, "#NEW", None, source="admin_override")
+
+    payload = _build_enrollment_payload_sync(int(guild_id))
+    assert payload["event_status"] == "announced"
+    assert payload["pending_roster_updates"] == 1, "dropping an announced player is a real pending update"
+
+
+@pytest.mark.asyncio
 async def test_send_roster_updates_dms_once_and_clears_pending(db, monkeypatch):
     from qapbot.cache_manager import CACHE
     from qapbot.QBdiscocmdshelper_cwl import (

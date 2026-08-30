@@ -143,8 +143,15 @@ export type EnrollmentPayload = {
   clans: EnrollmentClan[]
   players: EnrollmentPlayer[]
   /** How many players currently owe an update DM because the board changed after they were
-   * told where they play (2026-08-30). Drives the footer's "Send Roster Updates" button. */
+   * told where they play (2026-08-30). Drives the footer's "Send Roster Updates" button. Always
+   * 0 outside Preparation/War — the bridge only counts it once rosters have been announced. */
   pending_roster_updates?: number
+  /** How many pooled players have never been sent the enrollment DM (2026-08-30). Drives the
+   * footer's "Notify New Pool Members" button — same count and gate as the Hub's own button. */
+  pool_missing_dm_count?: number
+  /** How many still-pending signups have a live Discord link to remind (2026-08-30). Drives the
+   * footer's "Remind Pending" button — same count and gate as the Hub's own button. */
+  pending_reminder_count?: number
   // The wait loop's starting point (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8) —
   // every GET /api/cwl/enrollment response carries the guild's current enrollment version, so a
   // fresh page load (or a refetch triggered by the wait loop itself) always has a correct

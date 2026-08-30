@@ -41,11 +41,16 @@ const UNLINKED_LABEL = 'Not Linked'
 // null used to get.
 const NOT_INVITED_LABEL = 'Not Invited Yet'
 
+// Mirrors resolve_cwl_phase()'s status->phase mapping (QBdiscocmdshelper_cwl.py) and the
+// cwl.phase.step_* labels the Hub's step indicator uses, so the board's own title reads as the
+// same phase name rather than the raw event status (2026-08-30, project owner's spec: "should
+// use the same phase names as we just defined ... so that the title is consistent with the hub
+// message wording").
 const EVENT_STATUS_LABEL: Record<string, string> = {
-  draft: 'Draft',
-  signup_open: 'Signup Open',
-  finalized: 'Finalized',
-  announced: 'Announced',
+  draft: 'Setup',
+  signup_open: 'Enrollment',
+  announced: 'Preparation',
+  war: 'War',
   cancelled: 'Cancelled',
 }
 
@@ -332,6 +337,12 @@ export function renderEnrollmentBoard(
   // callbacks above — a caller that omits it simply never shows the button, and the Hub's own
   // highlighted button plus the DM-on-close still cover the same action.
   onSendRosterUpdates?: () => Promise<{ moved: number; new: number; dropped: number }>,
+  // "Notify New Pool Members" / "Remind Pending" from the footer (2026-08-30, project owner's
+  // spec: these two "would make sense" on this board too, gated by the exact same eligibility
+  // counts — payload.pool_missing_dm_count / pending_reminder_count — the Hub's own buttons use,
+  // "same logic ... in all three views"). Optional like every other callback here.
+  onNotifyNewPoolMembers?: () => Promise<{ contacted: number }>,
+  onRemindPending?: () => Promise<{ contacted: number }>,
 ): EnrollmentBoardHandle {
   const working: EnrollmentPlayer[] = payload.players.map((p) => ({ ...p }))
   const byTag = new Map(working.map((p) => [p.player_tag, p]))
@@ -855,9 +866,60 @@ export function renderEnrollmentBoard(
       })
   })
 
+  // "Notify New Pool Members" / "Remind Pending" (2026-08-30, project owner's spec: "would make
+  // sense here... same logic for all three buttons... in all three views") — the board's own
+  // copies of the Hub's two Enrollment-phase DM actions, gated on the exact same counts
+  // (pool_missing_dm_count / pending_reminder_count) the Hub buttons use, so an admin reshuffling
+  // the pool from this screen doesn't have to leave it to reach either action.
+  const notifyNewMembersButton = document.createElement('button')
+  notifyNewMembersButton.className = 'success-button notify-new-members-button'
+  notifyNewMembersButton.hidden = (payload.pool_missing_dm_count ?? 0) <= 0
+  notifyNewMembersButton.textContent = (payload.pool_missing_dm_count ?? 0) > 0
+    ? `Notify New Pool Members (${payload.pool_missing_dm_count})`
+    : 'Notify New Pool Members'
+  notifyNewMembersButton.addEventListener('click', () => {
+    notifyNewMembersButton.disabled = true
+    setStatus('Sending invitations...', false)
+    const send = onNotifyNewPoolMembers ?? (() => Promise.resolve({ contacted: 0 }))
+    send()
+      .then((result) => {
+        setStatus(result.contacted ? `Invited ${result.contacted} new player(s).` : 'Nothing left to send.', false)
+        notifyNewMembersButton.hidden = true
+      })
+      .catch((err: unknown) => {
+        setStatus(`Could not send invitations: ${err instanceof Error ? err.message : String(err)}`, true)
+      })
+      .finally(() => {
+        notifyNewMembersButton.disabled = false
+      })
+  })
+
+  const remindPendingButton = document.createElement('button')
+  remindPendingButton.className = 'success-button remind-pending-button'
+  remindPendingButton.hidden = (payload.pending_reminder_count ?? 0) <= 0
+  remindPendingButton.textContent = (payload.pending_reminder_count ?? 0) > 0
+    ? `Remind Pending (${payload.pending_reminder_count})`
+    : 'Remind Pending'
+  remindPendingButton.addEventListener('click', () => {
+    remindPendingButton.disabled = true
+    setStatus('Sending reminders...', false)
+    const send = onRemindPending ?? (() => Promise.resolve({ contacted: 0 }))
+    send()
+      .then((result) => {
+        setStatus(result.contacted ? `Reminded ${result.contacted} player(s).` : 'Nothing left to send.', false)
+        remindPendingButton.hidden = true
+      })
+      .catch((err: unknown) => {
+        setStatus(`Could not send reminders: ${err instanceof Error ? err.message : String(err)}`, true)
+      })
+      .finally(() => {
+        remindPendingButton.disabled = false
+      })
+  })
+
   const footer = document.createElement('div')
   footer.className = 'footer footer-fixed'
-  footer.append(closeButton, sendUpdatesButton, status, skillExplainer)
+  footer.append(closeButton, notifyNewMembersButton, remindPendingButton, sendUpdatesButton, status, skillExplainer)
   container.appendChild(footer)
 
   // Now that the footer is pinned independently of content height (position: fixed above), the
@@ -941,8 +1003,15 @@ export function renderEnrollmentBoard(
     // to the clan they were already announced for cancels out — so this is an upper bound that the
     // next payload refresh corrects downwards. Over-showing the button is the safe direction;
     // under-showing it would let an admin close the board believing everyone had been told.
-    pendingUpdateCount += 1
-    refreshSendUpdatesButton()
+    // Only meaningful once rosters have actually been announced (Preparation/War) — before that,
+    // notified_clan_tag is null for everyone and a drag is just ordinary initial placement, not an
+    // update to something someone was already told (caught live, 2026-08-30: bumping unconditionally
+    // made "Send Roster Updates" flash on for every drag during Enrollment, before Announce Rosters
+    // had ever run).
+    if (payload.event_status === 'announced' || payload.event_status === 'war') {
+      pendingUpdateCount += 1
+      refreshSendUpdatesButton()
+    }
     const previousAssignment = player.assigned_clan_tag
     player.assigned_clan_tag = targetClanTag
     status.textContent = ''

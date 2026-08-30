@@ -294,6 +294,32 @@ async function setup(): Promise<void> {
           }
           return (await updatesResponse.json()) as { moved: number; new: number; dropped: number }
         },
+        // "Notify New Pool Members" / "Remind Pending" from the footer (2026-08-30, project
+        // owner's spec: same two Hub actions, reachable from this board too).
+        async () => {
+          const response = await fetch('/api/cwl/enrollment/notify-new-members', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+            body: JSON.stringify({ guild_id: guildId }),
+          })
+          if (!response.ok) {
+            const body = await response.text()
+            throw errorFromResponse(response.status, body)
+          }
+          return (await response.json()) as { contacted: number }
+        },
+        async () => {
+          const response = await fetch('/api/cwl/enrollment/remind-pending', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+            body: JSON.stringify({ guild_id: guildId }),
+          })
+          if (!response.ok) {
+            const body = await response.text()
+            throw errorFromResponse(response.status, body)
+          }
+          return (await response.json()) as { contacted: number }
+        },
       )
 
       // Event-driven live-update (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md P1 Step 8 —

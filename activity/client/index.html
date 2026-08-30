@@ -333,6 +333,20 @@
       }
       .send-updates-button:hover:not(:disabled) { background: #ffc44d; }
       .send-updates-button:disabled { opacity: 0.6; cursor: default; }
+      /* "Notify New Pool Members" / "Remind Pending" (2026-08-30) — same green Discord uses for
+         these two actions on the Hub message, so the board's copies read as the same action. */
+      .success-button {
+        background: #248046;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        padding: 10px 20px;
+        font-size: 0.9rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .success-button:hover:not(:disabled) { background: #2b9c56; }
+      .success-button:disabled { opacity: 0.6; cursor: default; }
       .save-status { font-size: 0.85rem; color: #f2f3f5; }
       .save-status.success { color: #23a55a; }
       .save-status.error { color: #f23f42; }

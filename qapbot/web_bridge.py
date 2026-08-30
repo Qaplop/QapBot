@@ -772,9 +772,38 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
 
     players = sorted(players_by_tag.values(), key=lambda p: (p["player_name"] or p["player_tag"]).lower())
 
-    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_pending_roster_updates_sync
+    from qapbot.QBdiscocmdshelper_cwl import (
+        count_cwl_pool_members_missing_dm,
+        resolve_cwl_pending_reminder_targets_sync,
+        resolve_cwl_pending_roster_updates_sync,
+    )
 
-    pending = resolve_cwl_pending_roster_updates_sync(guild_id, event["id"], season)
+    # Same three action-button gates the Hub message uses (add_cwl_management_components,
+    # ui_cwl_roster.py) — reused here rather than re-derived, so the Teams Management board's own
+    # copies of these buttons (2026-08-30, project owner's spec: "same logic for all three buttons
+    # ... in all three views") can never disagree with the Hub about who is eligible for what.
+    #
+    # "Send Roster Updates" is meaningless before the FIRST announcement — resolve_cwl_pending_
+    # roster_updates_sync compares against `notified_clan_tag`, which is None for literally every
+    # assigned player pre-announcement, so calling it during signup_open would count the entire
+    # not-yet-announced roster as "pending updates" (caught live, 2026-08-30: the board showed
+    # "Send Roster Updates (9)" during Enrollment, before Announce Rosters had ever been pressed).
+    # The Hub avoids this by only calling the resolver in its `else` branch (status != signup_open);
+    # mirrored here with the same branch.
+    if event["status"] in ("draft", "cancelled", "signup_open"):
+        pending_roster_updates = 0
+    else:
+        pending = resolve_cwl_pending_roster_updates_sync(guild_id, event["id"], season)
+        pending_roster_updates = len(pending["moved"]) + len(pending["dropped"]) + len(pending["new"])
+
+    if event["status"] in ("draft", "cancelled"):
+        pool_missing_dm_count = 0
+        pending_reminder_count = 0
+    else:
+        pool_missing_dm_count = count_cwl_pool_members_missing_dm(guild_id, season)
+        reminder_groups = resolve_cwl_pending_reminder_targets_sync(event["id"])["groups"]
+        pending_reminder_count = sum(len(accounts) for accounts in reminder_groups.values())
+
     return {
         "season": season,
         "event_status": event["status"],
@@ -785,7 +814,11 @@ def _build_enrollment_payload_sync(guild_id: int) -> Dict[str, Any]:
         # with every payload so the client's own optimistic per-drag bump gets corrected back down
         # on the next refresh — a drag that turned out to owe nobody a DM (A->B->A) must not leave
         # the button stuck on forever.
-        "pending_roster_updates": len(pending["moved"]) + len(pending["dropped"]) + len(pending["new"]),
+        "pending_roster_updates": pending_roster_updates,
+        # Drive the board footer's "Notify New Pool Members" / "Remind Pending" buttons — same
+        # counts the season overview shows and the Hub buttons are gated on.
+        "pool_missing_dm_count": pool_missing_dm_count,
+        "pending_reminder_count": pending_reminder_count,
     }
 
 
@@ -2962,6 +2995,72 @@ async def handle_post_cwl_send_roster_updates(request: web.Request) -> web.Respo
     })
 
 
+async def handle_post_cwl_notify_new_pool_members(request: web.Request) -> web.Response:
+    """The Teams Management board's own copy of the Hub's "Notify New Pool Members" button
+    (2026-08-30, project owner's spec: "same logic for all three buttons... in all three views") —
+    same underlying notify_new_cwl_pool_members() the Hub button calls, just reachable from the
+    board itself so an admin reshuffling the pool doesn't have to leave it. Same admin-or-leader
+    gate as the board's other write actions (send-updates, assign)."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        guild_id = int(body["guild_id"])
+        discord_user_id = int(body["discord_user_id"])
+    except (KeyError, ValueError, TypeError):
+        return web.json_response({"error": "invalid request body"}, status=400)
+
+    if not await _resolve_admin_or_leader(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
+
+    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+
+    season = await asyncio.to_thread(resolve_selected_cwl_season, guild_id)
+    result = await notify_new_cwl_pool_members(guild_id, season)
+    if not result["ok"]:
+        return web.json_response({"error": result["error"]}, status=409)
+
+    from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+
+    try:
+        await refresh_cwl_management_hub_message(guild_id, "cwl_management")
+    except Exception as e:
+        logging.warning(f"[WEB-BRIDGE] Hub refresh after notify-new-members failed: {e}")
+    return web.json_response({"ok": True, "contacted": result["contacted"]})
+
+
+async def handle_post_cwl_remind_pending(request: web.Request) -> web.Response:
+    """The Teams Management board's own copy of the Hub's "Remind Pending" button (2026-08-30,
+    project owner's spec — same "same logic... in all three views" reasoning as notify-new-members
+    above). Same underlying remind_pending_cwl_players() the Hub button calls."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        guild_id = int(body["guild_id"])
+        discord_user_id = int(body["discord_user_id"])
+    except (KeyError, ValueError, TypeError):
+        return web.json_response({"error": "invalid request body"}, status=400)
+
+    if not await _resolve_admin_or_leader(guild_id, discord_user_id):
+        return web.json_response({"error": "not an admin or leader of this guild"}, status=403)
+
+    from qapbot.QBdiscocmdshelper_cwl import resolve_selected_cwl_season
+
+    season = await asyncio.to_thread(resolve_selected_cwl_season, guild_id)
+    result = await remind_pending_cwl_players(guild_id, season)
+    if not result["ok"]:
+        return web.json_response({"error": result["error"]}, status=409)
+
+    from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+
+    try:
+        await refresh_cwl_management_hub_message(guild_id, "cwl_management")
+    except Exception as e:
+        logging.warning(f"[WEB-BRIDGE] Hub refresh after remind-pending failed: {e}")
+    return web.json_response({"ok": True, "contacted": result["contacted"]})
+
+
 async def _dm_pending_roster_updates_notice(guild_id: int, discord_user_id: int) -> None:
     """DM whoever just closed the Teams Management board if they left line-up changes unsent.
 
@@ -3324,6 +3423,8 @@ def create_app() -> web.Application:
     app.router.add_post("/api/cwl/shared-clan/evict", handle_post_cwl_shared_clan_evict)
     app.router.add_post("/api/cwl/activity-closed", handle_post_cwl_activity_closed)
     app.router.add_post("/api/cwl/enrollment/send-updates", handle_post_cwl_send_roster_updates)
+    app.router.add_post("/api/cwl/enrollment/notify-new-members", handle_post_cwl_notify_new_pool_members)
+    app.router.add_post("/api/cwl/enrollment/remind-pending", handle_post_cwl_remind_pending)
     app.router.add_get("/api/tracker/items", handle_get_tracker_items)
     app.router.add_post("/api/tracker/items", handle_post_tracker_create_item)
     app.router.add_get("/api/tracker/items/{item_number}", handle_get_tracker_item)
