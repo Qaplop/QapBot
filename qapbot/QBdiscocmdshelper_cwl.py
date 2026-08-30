@@ -447,9 +447,13 @@ async def format_clan_management_cwl_management(
     )
     # A blank line on both sides (tracker #0081, live-testing feedback: "so that it visually peaks
     # out for the user") — the title touches the description directly with no gap of its own, so
-    # without the leading "\n" the indicator reads as glued to "CWL Management" instead of standing
-    # out as its own row above the season header.
-    embed.description = f"\n{indicator}\n\n{season_header}" if indicator else season_header
+    # without a leading blank line the indicator reads as glued to "CWL Management" instead of
+    # standing out as its own row above the season header. A plain leading "\n" doesn't survive
+    # Discord's embed rendering, which trims leading/trailing whitespace (including newlines) from
+    # the description — confirmed live, 2026-08-30: the gap was simply gone. A zero-width space
+    # (U+200B) makes that first line non-whitespace so Discord keeps it, while rendering as nothing
+    # visible itself.
+    embed.description = f"​\n{indicator}\n\n{season_header}" if indicator else season_header
 
     if not clans:
         clans_block = t('cwl.management.no_clans_configured', guild_id=guild_id_int)
