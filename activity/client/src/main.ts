@@ -343,7 +343,11 @@ async function setup(): Promise<void> {
         if (!pollResponse.ok) throw new Error(`enrollment refetch failed: ${pollResponse.status}`)
         const freshPayload = (await pollResponse.json()) as EnrollmentPayload
         knownVersion = freshPayload.version
-        boardHandle.applyPolledUpdate(freshPayload.players)
+        boardHandle.applyPolledUpdate(freshPayload.players, {
+          pool_missing_dm_count: freshPayload.pool_missing_dm_count,
+          pending_reminder_count: freshPayload.pending_reminder_count,
+          pending_roster_updates: freshPayload.pending_roster_updates,
+        })
       }
 
       // Tab hidden -> paused (no wait/refetch traffic at all while nobody can see the board);

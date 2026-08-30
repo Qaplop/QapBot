@@ -303,8 +303,19 @@ export type EnrollmentBoardHandle = {
    * "would it be possible to auto-update this view whenever a user changes his confirmation
    * setting?") — see the function's own definition below for exactly which fields merge (as of
    * 2026-08-17, that's all of them, including `assigned_clan_tag`) and the one still-excluded
-   * case (a player with a local drag-and-drop POST currently in flight). */
-  applyPolledUpdate: (freshPlayers: EnrollmentPlayer[]) => void
+   * case (a player with a local drag-and-drop POST currently in flight). `counts`, when given,
+   * refreshes the three DM-action buttons' own labels/visibility from the same poll (2026-08-30,
+   * live bug report: a player's card updated instantly on their DM response, but the button
+   * counts stayed frozen at whatever they were on initial load — nothing was feeding them fresh
+   * numbers). Independent of `freshPlayers` — always applied even if `isDragging` skips the rest. */
+  applyPolledUpdate: (
+    freshPlayers: EnrollmentPlayer[],
+    counts?: {
+      pool_missing_dm_count?: number
+      pending_reminder_count?: number
+      pending_roster_updates?: number
+    },
+  ) => void
 }
 
 export function renderEnrollmentBoard(
@@ -866,6 +877,16 @@ export function renderEnrollmentBoard(
       })
   })
 
+  // Shared label/count formatting for the three DM-action buttons below — also reused by
+  // applyPolledUpdate() to correct these counts on every live poll (2026-08-30, live bug report:
+  // a player's card updates the instant they respond to their DM, but the button counts sat frozen
+  // at whatever they were when the board first opened, since the poll loop only ever fed fresh
+  // player data into the board, never these three counts).
+  function setDmCountButton(button: HTMLButtonElement, baseLabel: string, count: number): void {
+    button.hidden = count <= 0
+    button.textContent = count > 0 ? `${baseLabel} (${count})` : baseLabel
+  }
+
   // "Notify New Pool Members" / "Remind Pending" (2026-08-30, project owner's spec: "would make
   // sense here... same logic for all three buttons... in all three views") — the board's own
   // copies of the Hub's two Enrollment-phase DM actions, gated on the exact same counts
@@ -873,10 +894,7 @@ export function renderEnrollmentBoard(
   // the pool from this screen doesn't have to leave it to reach either action.
   const notifyNewMembersButton = document.createElement('button')
   notifyNewMembersButton.className = 'success-button notify-new-members-button'
-  notifyNewMembersButton.hidden = (payload.pool_missing_dm_count ?? 0) <= 0
-  notifyNewMembersButton.textContent = (payload.pool_missing_dm_count ?? 0) > 0
-    ? `Notify New Pool Members (${payload.pool_missing_dm_count})`
-    : 'Notify New Pool Members'
+  setDmCountButton(notifyNewMembersButton, 'Notify New Pool Members', payload.pool_missing_dm_count ?? 0)
   notifyNewMembersButton.addEventListener('click', () => {
     notifyNewMembersButton.disabled = true
     setStatus('Sending invitations...', false)
@@ -896,10 +914,7 @@ export function renderEnrollmentBoard(
 
   const remindPendingButton = document.createElement('button')
   remindPendingButton.className = 'success-button remind-pending-button'
-  remindPendingButton.hidden = (payload.pending_reminder_count ?? 0) <= 0
-  remindPendingButton.textContent = (payload.pending_reminder_count ?? 0) > 0
-    ? `Remind Pending (${payload.pending_reminder_count})`
-    : 'Remind Pending'
+  setDmCountButton(remindPendingButton, 'Remind Pending', payload.pending_reminder_count ?? 0)
   remindPendingButton.addEventListener('click', () => {
     remindPendingButton.disabled = true
     setStatus('Sending reminders...', false)
@@ -1419,7 +1434,22 @@ export function renderEnrollmentBoard(
   // lands; every OTHER player's assigned_clan_tag still merges normally. Skips entirely while a
   // native drag gesture is in progress (isDragging) since tearing down the board mid-gesture
   // would silently abort it; the next wait/refetch cycle catches up.
-  function applyPolledUpdate(freshPlayers: EnrollmentPlayer[]): void {
+  function applyPolledUpdate(
+    freshPlayers: EnrollmentPlayer[],
+    counts?: {
+      pool_missing_dm_count?: number
+      pending_reminder_count?: number
+      pending_roster_updates?: number
+    },
+  ): void {
+    // Independent of isDragging below — these three buttons aren't part of the board/card DOM a
+    // drag gesture is manipulating, so there's nothing for a mid-drag refresh to disrupt here.
+    if (counts) {
+      setDmCountButton(notifyNewMembersButton, 'Notify New Pool Members', counts.pool_missing_dm_count ?? 0)
+      setDmCountButton(remindPendingButton, 'Remind Pending', counts.pending_reminder_count ?? 0)
+      pendingUpdateCount = counts.pending_roster_updates ?? 0
+      refreshSendUpdatesButton()
+    }
     if (isDragging) return
     let changed = false
     for (const fresh of freshPlayers) {
