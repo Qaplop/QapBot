@@ -3052,6 +3052,51 @@ async def notify_cwl_clan_shared(
         await _post_cwl_shared_clan_notice(int(other_guild_id), other_message, None)
 
 
+class CwlHelpView(discord.ui.View):
+    """Ephemeral two-layer help for the whole CWL workflow (tracker #0080): a compact overview of
+    the four phases first, with a toggle button that swaps in a fuller step-by-step breakdown for
+    anyone who wants it, and back again. Purely informational — nothing here reads or writes guild
+    data beyond the toggle's own embed swap, so unlike the rest of this module's views it carries
+    no parent-refresh hookup and a generous timeout (this can sit open a long time while someone
+    reads it)."""
+
+    def __init__(self, guild_id: int, timeout: int = 300):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+        self.expanded = False
+
+        from qapbot.i18n import t
+
+        self._toggle_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.management.help_button_show_details', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_help_toggle",
+        )
+        self._toggle_button.callback = self._on_toggle  # type: ignore[assignment]
+        self.add_item(self._toggle_button)
+
+    def build_embed(self) -> discord.Embed:
+        from qapbot.i18n import t
+
+        key = 'help_details' if self.expanded else 'help_overview'
+        return discord.Embed(
+            title=t(f'cwl.management.{key}_title', guild_id=self.guild_id),
+            description=t(f'cwl.management.{key}_description', guild_id=self.guild_id),
+            color=discord.Color.gold(),
+        )
+
+    async def _on_toggle(self, interaction: discord.Interaction) -> None:
+        from qapbot.i18n import t
+
+        self.expanded = not self.expanded
+        self._toggle_button.label = t(
+            'cwl.management.help_button_show_overview' if self.expanded
+            else 'cwl.management.help_button_show_details',
+            guild_id=self.guild_id,
+        )
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+
 # ---------------------------------------------------------------------------
 # CwlManagementHubView — entry point (b): dedicated anchored admin message
 # ---------------------------------------------------------------------------
@@ -3126,10 +3171,30 @@ class CwlManagementHubView(discord.ui.View):
         refresh_button.callback = self._make_refresh_callback(active_mode)  # type: ignore[assignment]
         self.add_item(refresh_button)
 
+        # Tracker #0080: opens a fresh ephemeral CwlHelpView rather than editing this anchored
+        # message — this is documentation, not a mode of the Hub, so it shouldn't replace whatever
+        # screen (Settings/Season Management) the admin currently has open.
+        help_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('cwl.management.button_help', guild_id=None),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_admin_hub_help",
+            row=0,
+        )
+        help_button.callback = self._on_help  # type: ignore[assignment]
+        self.add_item(help_button)
+
     def _make_refresh_callback(self, mode: str):
         async def callback(interaction: discord.Interaction) -> None:
             await self._render(interaction, mode)
         return callback
+
+    async def _on_help(self, interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        if not interaction.guild:
+            return
+        view = CwlHelpView(interaction.guild.id)
+        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
     async def _render(self, interaction: discord.Interaction, mode: str) -> None:
         if not await _check_cwl_admin_permission(interaction):

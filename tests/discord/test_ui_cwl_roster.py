@@ -782,9 +782,60 @@ def test_cwl_management_hub_view_constructs_with_toggle_buttons():
     from qapbot.ui_cwl_roster import CwlManagementHubView
 
     view = CwlManagementHubView()
-    assert len(view.children) == 3
+    assert len(view.children) == 4
     custom_ids = {c.custom_id for c in view.children}  # type: ignore[attr-defined]
-    assert custom_ids == {"cwl_admin_hub_mode_settings", "cwl_admin_hub_mode_management", "cwl_admin_hub_refresh"}
+    assert custom_ids == {
+        "cwl_admin_hub_mode_settings", "cwl_admin_hub_mode_management", "cwl_admin_hub_refresh",
+        "cwl_admin_hub_help",
+    }
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_management_hub_help_button_opens_ephemeral_help_view(mock_interaction):
+    """tracker #0080: the Help button opens a fresh ephemeral CwlHelpView via send_message,
+    rather than editing the anchored Hub message itself — this is documentation, not a Hub mode,
+    so it must not disturb whichever screen (Settings/Season Management) is currently open."""
+    from qapbot.ui_cwl_roster import CwlHelpView, CwlManagementHubView
+
+    view = CwlManagementHubView()
+    await view._on_help(mock_interaction)
+
+    mock_interaction.response.send_message.assert_awaited_once()
+    _, kwargs = mock_interaction.response.send_message.call_args
+    assert kwargs["ephemeral"] is True
+    assert isinstance(kwargs["view"], CwlHelpView)
+    assert kwargs["embed"].title == kwargs["view"].build_embed().title
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_cwl_help_view_toggle_switches_between_overview_and_details(mock_interaction):
+    """tracker #0080: the two-layer help — a single toggle button flips CwlHelpView between the
+    compact overview and the fuller step-by-step details, editing the same ephemeral message
+    each time rather than opening a new one."""
+    from qapbot.i18n import t
+    from qapbot.ui_cwl_roster import CwlHelpView
+
+    view = CwlHelpView(guild_id=987654321)
+    assert view.expanded is False
+    overview_embed = view.build_embed()
+    assert overview_embed.title == t('cwl.management.help_overview_title', guild_id=987654321)
+
+    toggle_button = view.children[0]
+    await toggle_button.callback(mock_interaction)  # type: ignore[misc]
+
+    assert view.expanded is True
+    mock_interaction.response.edit_message.assert_awaited_once()
+    _, kwargs = mock_interaction.response.edit_message.call_args
+    assert kwargs["embed"].title == t('cwl.management.help_details_title', guild_id=987654321)
+    assert kwargs["view"] is view
+
+    # Toggling again flips straight back to the overview.
+    await toggle_button.callback(mock_interaction)  # type: ignore[misc]
+    assert view.expanded is False
+    _, kwargs = mock_interaction.response.edit_message.call_args
+    assert kwargs["embed"].title == t('cwl.management.help_overview_title', guild_id=987654321)
 
 
 @pytest.mark.discord

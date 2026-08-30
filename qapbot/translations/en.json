@@ -1035,7 +1035,14 @@
       "announce_rosters_error_no_event": "\u26a0\ufe0f No CWL event found for this season anymore \u2014 it may have been deleted.",
       "announce_rosters_error_not_open": "\u26a0\ufe0f Enrollment hasn't been started yet for this season.",
       "announce_rosters_error_nobody_to_notify": "\u26a0\ufe0f Nobody to announce to \u2014 no player is assigned to a participating clan yet.",
-      "announce_rosters_error_missing_start_times": "\u26a0\ufe0f These clans still have no CWL start time, so nothing was announced: **{clans}**\nSet it per clan in \"Configure Participating Clans\", then try again."
+      "announce_rosters_error_missing_start_times": "\u26a0\ufe0f These clans still have no CWL start time, so nothing was announced: **{clans}**\nSet it per clan in \"Configure Participating Clans\", then try again.",
+      "button_help": "\u2753 Help",
+      "help_overview_title": "\ud83c\udfc6 CWL Workflow \u2014 Overview",
+      "help_overview_description": "**1\ufe0f\u20e3 Setup** \u2014 Configure participating clans (roster size, target league) and optionally assign standing CWL Coordinators. Add or select a season, then Start Enrollment when ready.\n\n**2\ufe0f\u20e3 Enrollment** \u2014 Members get a sign-up DM to confirm/decline. Assign confirmed players to each clan's roster (Manage Teams). Notify late joiners and remind pending members as needed.\n\n**3\ufe0f\u20e3 Preparation** \u2014 Start Preparation locks the rosters and DMs every assigned player their clan, tier and start time. Roster and coordinator changes are still possible \u2014 use Send Roster Updates to notify anyone whose clan changed.\n\n**4\ufe0f\u20e3 War** \u2014 Wars run in-game on each clan's own schedule; no action needed here. Once the season wraps up, Delete Season or move on to Setup for the next one.",
+      "help_details_title": "\ud83c\udfc6 CWL Workflow \u2014 Details",
+      "help_details_description": "**1\ufe0f\u20e3 Setup**\n\u2022 *Add New Season* \u2014 create the season (draft) to start configuring it.\n\u2022 *Configure Participating Clans* \u2014 pick which clans take part, and set each one's roster size, target league and CWL start time.\n\u2022 *Manage CWL Coordinators* \u2014 assign up to 2 standing coordinators per clan; this carries over automatically every season.\n\u2022 *Start Enrollment* \u2014 moves on to the Enrollment phase once clans are configured.\n\n**2\ufe0f\u20e3 Enrollment**\n\u2022 Every resolved pool member gets a confirm/opt-out sign-up DM (or is auto-confirmed based on their own standing CWL preferences).\n\u2022 *Notify New Pool Members* \u2014 DM anyone who joined the pool after Enrollment opened and hasn't been contacted yet.\n\u2022 *Remind Pending* \u2014 nudge members who still haven't responded.\n\u2022 *Manage Teams* \u2014 assign confirmed members to each clan's roster, up to its roster size.\n\n**3\ufe0f\u20e3 Preparation**\n\u2022 *Start Preparation* \u2014 locks every clan's roster and DMs each assigned player their clan, tier and CWL start time. Warns first if any roster is still underfilled or any clan has no coordinator set \u2014 you can still continue.\n\u2022 *Send Roster Updates* \u2014 re-notify only the players whose clan actually changed since the last announcement.\n\u2022 Coordinators can still be assigned at any point via *Manage CWL Coordinators*.\n\n**4\ufe0f\u20e3 War**\n\u2022 Wars are fought in Clash of Clans on each clan's own schedule \u2014 nothing to do here beyond monitoring.\n\u2022 When the season is over, *Delete Season* clears it, or start the next season's *Setup*.",
+      "help_button_show_details": "\ud83d\udcd6 Show Details",
+      "help_button_show_overview": "\u25c0 Back to Overview"
     },
     "player_hub": {
       "title": "🛡️ Your CWL Preferences",
@@ -1051,8 +1058,11 @@
       "no_linked_accounts": "You have no linked Clash accounts yet — use /link first.",
       "col_account": "Account",
       "col_league": "Preferred league",
+      "col_league_tooltip": "The CWL tier you'd like to play in. A preference for whoever builds the rosters — it isn't enforced automatically.",
       "col_participation": "CWL participation",
+      "col_participation_tooltip": "Whether you want to be pencilled in for CWL by default: always play, never play, or be asked fresh each season via your invitation DM.",
       "col_dm_anyway": "Send invitation DM anyway",
+      "col_dm_anyway_tooltip": "Only used when participation is set to \"Never play\": normally you won't be invited at all, but checking this still sends you the invitation DM every season in case you change your mind.",
       "col_status": "Status",
       "col_clan": "Clan",
       "col_tier": "League tier",

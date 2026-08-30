@@ -153,11 +153,22 @@ function renderBlockOne(
   scroll.className = 'table-scroll'
   const table = document.createElement('table')
 
+  // tracker #0083: mouse-over help for the three settings whose purpose isn't obvious from the
+  // column label alone — plain native `title` tooltips, the same lightweight pattern already used
+  // for the status-action buttons below and throughout enrollmentBoard.ts.
+  const COLUMN_TOOLTIPS: Partial<Record<string, string>> = {
+    col_league: 'col_league_tooltip',
+    col_participation: 'col_participation_tooltip',
+    col_dm_anyway: 'col_dm_anyway_tooltip',
+  }
+
   const thead = document.createElement('thead')
   const headRow = document.createElement('tr')
   for (const key of ['col_account', 'col_league', 'col_participation', 'col_dm_anyway']) {
     const th = document.createElement('th')
     th.textContent = t(key)
+    const tooltipKey = COLUMN_TOOLTIPS[key]
+    if (tooltipKey) th.title = t(tooltipKey)
     headRow.appendChild(th)
   }
   thead.appendChild(headRow)
