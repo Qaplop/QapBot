@@ -1,7 +1,20 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
-2026-08-30 (39)
+2026-08-30 (9)
+- Fixed: reverted yesterday's own audit change to the changelog numbering rule in
+  .github/copilot-instructions.md. The rule ("N increments per entry added that day, 1, 2, 3...")
+  was CORRECT; the audit rewrote it to describe a running counter after inferring the convention
+  from 2026-08-30's entries, which had themselves drifted. 2026-08-29 ran a clean (1)-(33), which
+  proves the documented rule. Restored verbatim, plus a note to read it literally and never
+  re-derive the convention from the file, since the file can be wrong.
+- Fixed: renumbered today's 8 entries from (32)-(39) to (1)-(8), the numbering the rule actually
+  calls for. This also clears a real collision the drift had created -- (32) and (33) existed twice,
+  once dated 2026-08-29 and once 2026-08-30. Verified unreferenced by any commit or doc first.
+- Files: .github/copilot-instructions.md, changelog.txt.
+- Docs only, no code change.
+
+2026-08-30 (8)
 - Docs audit across the whole project (memory + all docs), triggered by the CWL coordinator/purge
   work but not limited to it. Findings fixed:
 - Fixed: copilot-instructions.md's changelog rule said the "(N)" counter "increments per entry
@@ -30,7 +43,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   CLAN_AND_WAR_CYCLE_ARCHITECTURE,COPILOT_PITFALLS_COOKBOOK}.md.
 - Docs + one command-description string. Full suite: 2914 passed, 4 deselected.
 
-2026-08-30 (38)
+2026-08-30 (7)
 - Changed: CWL_ROSTER_PLANNING_PLAN.md moved from the repo root to qapbot/docs/. The feature is
   fully shipped and the file self-describes as reference documentation for the current
   implementation ("not its history"), so it belongs with the other architecture deep-dives rather
@@ -47,7 +60,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   plans/implemented/cwl-personal-hub.md.
 - Docs-only, no code change. Full suite: 2914 passed, 4 deselected.
 
-2026-08-30 (37)
+2026-08-30 (6)
 - Added: CWL retention purge -- guild_config.cwl_retention_months finally has a consumer. The
   column, its settings UI and its readout on the CWL Settings screen all shipped long ago, but
   nothing ever acted on them, so the setting was inert while telling admins their old seasons were
@@ -74,7 +87,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   rollover, retention=0, cascade, and both cross-guild cases.
   Full suite: 2914 passed, 4 deselected.
 
-2026-08-30 (36)
+2026-08-30 (5)
 - Fixed (tracker #0086, live report): the linked CWL Coordinator role had a "Configure Coordinator
   Role" button but no readout anywhere, so the CWL Settings screen couldn't answer "is a role
   linked, and which one?" without opening the sub-screen -- every other setting on that screen
@@ -86,7 +99,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
 - Tests: 2 added (tests/unit/test_cwl_coordinator_role_and_mentions.py).
   Full suite: 2908 passed, 4 deselected.
 
-2026-08-30 (35)
+2026-08-30 (4)
 - Added (tracker #0085): the CWL Coordinator role is now explained where it is configured and in
   the CWL help -- a coordinator starts the CWL in-game for that clan and is responsible for it all
   season, so they must be Leader/Co-Leader in the game. Plus a "Notify CWL Coordinators" button on
@@ -137,7 +150,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   (confirmed/declined/auto_confirmed), matching the board's own rule exactly. qapbot/QBdiscocmdshelper_cwl.py.
   1 new test. Full suite: 2852 passed, 4 deselected.
 
-2026-08-30 (34)
+2026-08-30 (3)
 - Fixed tracker #0078 ("Ausstehend Zahl oder symbol stimmt nicht"): the season overview's
   "Ausstehend" line said 2 while the Teams-verwalten board showed a single yellow question mark.
   The board draws its icons in a strict precedence -- Not Linked, then a real status, then
@@ -168,7 +181,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   (the exact reported shape of each ticket) plus one existing test updated for the tightened
   pending rule. 2888 tests pass.
 
-2026-08-30 (33)
+2026-08-30 (2)
 - Deployed: activity/server (Worker, version f54e977f) and activity/client (Pages, 7c4945f8) to
   DEV. Both halves were required this time -- the Worker gained /cwl/enrollment/send-updates, and
   a stale Worker would have failed the board's new "Send Roster Updates" button silently with
@@ -181,7 +194,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   NOTE: the bot itself still needs a restart on DEV to pick up yesterday's and today's Python
   changes -- the two Activity halves above are live now, the bot side is not.
 
-2026-08-30 (32)
+2026-08-30 (1)
 - Added: the CWL four-phase model -- Setup / Enrollment / Preparation / War -- with a step
   indicator at the top of the CWL Management message (done / current / upcoming, as
   checkmark / blue-dot-bold / hollow-circle). Phase is derived in exactly one place, so the
