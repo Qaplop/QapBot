@@ -1891,7 +1891,7 @@ just because the same variable is reused between the two.
 
 ## Pitfall 43: assuming a renamed persistent view's `custom_id`s need a dedicated repair pass — check whether the STARTUP repost is already unconditional first
 
-**Symptom (2026-08-23, found while implementing plans/cwl-personal-hub.md's Phase 2d):**
+**Symptom (2026-08-23, found while implementing plans/implemented/cwl-personal-hub.md's Phase 2d):**
 renaming `CwlManagementHubView`'s three `custom_id`s (`cwl_hub_mode_settings` etc. →
 `cwl_admin_hub_mode_settings` etc., to retire a prefix collision with an unrelated feature's own
 config columns) looked like it needed a one-time forced-repost repair with a persisted per-guild

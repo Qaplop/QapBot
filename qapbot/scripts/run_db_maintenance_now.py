@@ -16,6 +16,12 @@ What it does (see `WarHistoryDB.nightly_db_maintenance()` docstring for full det
      and 'history' (important after the history DB just received a large bulk insert
      from a migration run, since it starts with zero statistics otherwise).
 
+What it does NOT do: this runs `nightly_db_maintenance()` alone, not the surrounding
+`QapBot.run_nightly_maintenance_routine()` wrapper — so it skips that wrapper's Step 0.5
+monthly hot->history migration (use `run_history_migration_now.py`) AND its Step 0.6 CWL
+retention purge (`WarHistoryDB.purge_expired_cwl_events()`, added 2026-08-30). The `/admin`
+"Execute Nightly Maintenance" action DOES call the full wrapper, so it runs both.
+
 Safe to re-run: every step is idempotent. VACUUM is skipped automatically if the
 freelist is already small; REINDEX/ANALYZE are cheap and safe to repeat.
 

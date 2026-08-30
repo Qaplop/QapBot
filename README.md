@@ -36,6 +36,28 @@ A powerful, modular Discord bot designed for Clash of Clans clan management, fea
 - Log analysis with notification counting
 - Data consistency checking
 
+### CWL Roster Management
+- End-to-end Clan War League roster workflow across four phases —
+  **Setup → Enrollment → Preparation → War** — driven from a persistent **CWL Management Hub**
+  message, with a step indicator showing where the season currently stands
+- **Setup**: pick participating clans, set each one's roster size and CWL start time, and
+  optionally assign standing **CWL Coordinators** (the members who start the CWL in-game for a
+  clan). Coordinators are per-clan and carry forward every season; an existing Discord role can
+  be linked so coordinators automatically hold it
+- **Enrollment**: confirm/opt-out sign-up DMs to the whole pool, auto-confirmation from each
+  player's own standing preferences, plus reminders for late joiners and non-responders
+- **Preparation**: announce the finished roster by DM to every assigned player (clan, tier, start
+  time, and a join link for anyone who still has to move), with batched follow-up DMs for
+  later roster changes
+- **War**: automatic detection of when CWL actually starts in-game, per-clan roster freeze,
+  switch-verification alarms for players who never moved, and coordinator mentions in the war
+  notifications
+- Players manage their own standing preferences (preferred league, always/never/ask-each-season)
+  via a **Personal CWL Hub**; leadership assigns rosters by drag-and-drop on a Discord Activity
+  board
+- Per-guild retention purges whole past seasons on a configurable schedule
+- Full design record in `qapbot/docs/CWL_ROSTER_PLANNING_PLAN.md`
+
 ### CWL Clan-Config Discord Activity
 - Season-based CWL clan configuration (participating clans, roster size, start time) via a
   **Discord Activity** — a real web app embedded in Discord's client, launched from the CWL

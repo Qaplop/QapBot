@@ -241,7 +241,7 @@ button's gating, and the freeze guards can never disagree about where a guild is
 | --- | --- | --- |
 | 1 Setup | `draft` | "Add New Season" |
 | 2 Enrollment | `signup_open` | "Start Enrollment" |
-| 3 Preparation | `announced` | "Announce Rosters" (§8) |
+| 3 Preparation | `announced` | "Start Preparation" (§8) |
 | 4 War | `war` (or *any* participating clan `locked_at`) | Automatic, first clan lock (§10) |
 
 Phase 4 is derived from **either** signal deliberately: the sweep that flips `status` to `'war'`
@@ -271,7 +271,8 @@ every later addition (the step indicator, the "Still Missing" section, coordinat
 through it rather than being special-cased per shell.
 
 `cwl_settings` (rarely touched) holds: the two Hub channels, retention months, the CWL Coordinators
-manager, the account-wide-pool-expansion toggle.
+manager, the account-wide-pool-expansion toggle, and the linked **CWL Coordinator Role** (§1) —
+each with its current value shown in the embed, not just a button to change it.
 
 `cwl_management` (the season-by-season operational screen) holds the season select, and a row of
 action buttons whose visibility/label is entirely phase-driven:
@@ -279,16 +280,29 @@ action buttons whose visibility/label is entirely phase-driven:
 - **Configure Participating Clans** — always available regardless of phase (clans change plans
   last-minute even after enrollment starts); opens the Activity board's clan-config screen.
 - **Manage CWL Coordinators** — standing config, never gated on season status.
-- **Start Enrollment / Manage Assignment** — one dynamically-labeled button in the same slot:
-  "Start Enrollment" while `draft`, "Manage Assignment" (opens the Activity's Teams Management
+- **Start Enrollment / Manage Teams** — one dynamically-labeled button in the same slot:
+  "Start Enrollment" while `draft`, "Manage Teams" (opens the Activity's Teams Management
   board) from `signup_open` onward.
 - **Delete Season** — disabled once any participating clan has locked (§10) — an in-game CWL is
   running against that roster.
 - **Add New Season** — shown only when the current CWL month has no event yet (omitted entirely,
   not disabled, once it would be a no-op for the rest of the month).
-- **Notify New Pool Members** / **Remind Pending** / **Announce Rosters** (or **Send Roster
+- **Notify New Pool Members** / **Remind Pending** / **Start Preparation** (or **Send Roster
   Updates** once something is pending) — row 4, each shown only when it would actually do
   something; see §6, §6, §8/§9 respectively.
+
+**Button labels vs. function names.** The phase-3 button reads **"Start Preparation"** (tracker
+#0082) while the function behind it is `announce_cwl_rosters()`, and the i18n key is still
+`button_announce_rosters` — the phase name says *where you are*, the old name survives in code
+because renaming a shipped i18n key churns both translation files for nothing. Likewise
+**"Manage Teams"** is served by `button_manage_assignment`. Don't "fix" either mismatch by
+renaming the key; the label is the thing users see and it is already correct.
+
+**Help** (tracker #0080) — a ❓ button on the Hub's first row, beside Settings / Season Management /
+Refresh. Opens an ephemeral two-layer `CwlHelpView`: a compact four-phase overview, toggling to a
+step-by-step breakdown that names the actual buttons above. Deliberately a *fresh ephemeral
+message* rather than a fourth Hub mode — it is documentation, so it must not replace whichever
+screen the admin currently has open.
 
 ---
 
@@ -411,9 +425,10 @@ disagree about the same fact.
 
 ---
 
-## 8. Preparation phase — Announce Rosters
+## 8. Preparation phase — Start Preparation
 
-**"Announce Rosters"** (`announce_cwl_rosters()`, `QBdiscocmdshelper_cwl.py`) DMs every assigned
+**"Start Preparation"** (`announce_cwl_rosters()`, `QBdiscocmdshelper_cwl.py` — see §4 on why the
+label and the function name differ) DMs every assigned
 player where they play and when, tailored to the board's own green/amber split:
 
 - **Green**: "you're already in **X**, CWL starts `<t:…:F>` (`<t:…:R>`)."
@@ -459,7 +474,7 @@ separate assignment DM.
    delivered as a DM instead, through the `POST /api/cwl/activity-closed` hook that already fires
    on every close.
 3. The CWL Management Hub's own button, relabeled "Send Roster Updates" and highlighted
-   (`ButtonStyle.danger`) whenever anything is pending — the same slot "Announce Rosters" occupied
+   (`ButtonStyle.danger`) whenever anything is pending — the same slot "Start Preparation" occupied
    before Preparation began.
 
 Removing a participating clan mid-Preparation tombstones its already-announced players (routed

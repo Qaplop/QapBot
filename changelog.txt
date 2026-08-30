@@ -1,6 +1,35 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-30 (39)
+- Docs audit across the whole project (memory + all docs), triggered by the CWL coordinator/purge
+  work but not limited to it. Findings fixed:
+- Fixed: copilot-instructions.md's changelog rule said the "(N)" counter "increments per entry
+  added that day (1, 2, 3...)". It never did -- 2026-08-29 ran to (31) and 2026-08-30 continued at
+  (32). Following the documented rule would have produced a duplicate low number. Now documents the
+  real running-counter convention, plus the parallel-session collision hazard ((32)/(33) already
+  each appear twice under different dates).
+- Added: Cardinal Rule 6 now covers en/de translation key parity -- a genuinely enforced invariant
+  that was nowhere documented, with the verification one-liner and the rule that a factual string
+  change must land in both languages (a 2026-08-30 drift had to be resynced afterwards).
+- Fixed: CWL_ROSTER_PLANNING_PLAN.md still called the phase-3 button "Announce Rosters" and the
+  board button "Manage Assignment" in 4 places; both were renamed by tracker #0082 ("Start
+  Preparation"/"Manage Teams"). Documented why the i18n keys deliberately keep the old names.
+- Added: that doc's section 4 now covers the Help button (#0080) and the linked coordinator role in
+  cwl_settings; CODE_STRUCTURE.md's guild_role_manager function tree covers
+  sync_cwl_coordinator_role() and the create-vs-link ownership split.
+- Added: run_db_maintenance_now.py and CLAN_AND_WAR_CYCLE_ARCHITECTURE.md now state that the script
+  runs nightly_db_maintenance() alone and therefore skips the Step 0.6 CWL purge -- the identical
+  assumption about the migration step is what the 2026-08-01 correction there had to unpick.
+  /admin OPTIMIZE_DB does call the full wrapper; its description was corrected to say so.
+- Added: README had no CWL Roster Management section at all (only the clan-config Activity), the
+  single largest feature gap found. Added one covering all four phases.
+- Fixed: 2 doc references to plans/cwl-personal-hub.md, stale since it moved to plans/implemented/.
+- Files: .github/copilot-instructions.md, README.md, QBdiscordcmds.py,
+  qapbot/scripts/run_db_maintenance_now.py, qapbot/docs/{CWL_ROSTER_PLANNING_PLAN,CODE_STRUCTURE,
+  CLAN_AND_WAR_CYCLE_ARCHITECTURE,COPILOT_PITFALLS_COOKBOOK}.md.
+- Docs + one command-description string. Full suite: 2914 passed, 4 deselected.
+
 2026-08-30 (38)
 - Changed: CWL_ROSTER_PLANNING_PLAN.md moved from the repo root to qapbot/docs/. The feature is
   fully shipped and the file self-describes as reference documentation for the current

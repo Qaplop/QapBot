@@ -584,6 +584,10 @@ all rebuild/button-handler paths so the reference is never lost.
   Roles — full function inventory + sync/bootstrap call graph in Function Tree § guild_role_manager.py
 - Data model: `_get_highest_coc_role_for_user` reads `player["coc_role"]` (memory-only, set by
   coc_cache); values are `"member"`, `"elder"`, `"coLeader"`, `"leader"` (match COC_ROLE_PRIORITY)
+- Two ownership models live here: the CoC/clan roles above are **created and owned by the bot**,
+  while `sync_cwl_coordinator_role()` (tracker #0086) only **links an existing** admin-picked role
+  and syncs its membership — it never creates or deletes that role. Don't extend one model's
+  helpers onto the other's role without checking which kind you're touching.
 
 🟫 qapbot/QBdiscocmdshelper.py (~4713 lines)
 - Command helper functions (admin checks, display formatting, etc.)
@@ -1092,6 +1096,15 @@ kept here only for functions not narrated elsewhere.
 ├── sync_roles_for_clan_members(guild, guild_id, clan_tag, coc_members)
 │   └── Fast path from coc_cache.py's per-clan fetch trigger — calls sync_roles_for_user()
 │       for just this clan's registered members, bounded-concurrent via _ROLE_SYNC_CONCURRENCY
+├── sync_cwl_coordinator_role(guild) -> (added, removed)   [tracker #0086]
+│   ├── Reconciles guild_config.cwl_coordinator_role_id's holders against the UNION of
+│   │   cwl_clan_coordinators across every clan (so losing one clan never strips the role
+│   │   from someone still coordinating another). No-ops when no role is linked.
+│   ├── LINKS an existing role — never creates or deletes it, unlike every other role above
+│   └── Deliberately NOT called from sync_roles_for_user(): doing so would let an ordinary
+│       member sync strip the role from everyone whenever the CWL config is unloaded.
+│       Called only from the Manage CWL Coordinators save and the coordinator-role config
+│       save (ui_cwl_roster.py). See CWL_ROSTER_PLANNING_PLAN.md §1.
 ├── create_coc_ingame_roles / delete_all_coc_ingame_roles
 ├── create_clan_role / create_all_clan_roles / delete_clan_role_from_guild
 └── get_or_create_discord_role / normalize_discord_role_name
@@ -1159,8 +1172,12 @@ kept here only for functions not narrated elsewhere.
 │   │   │                           predict_war_between_clans() (bot admin)
 │   │   ├── START_UPDATE_CYCLE    — interrupt sleep and start next update cycle immediately
 │   │   │                           (bot admin); queues cycle if one is already running
-│   │   ├── OPTIMIZE_DB           — run nightly maintenance (archive move + DB
-│   │   │                           ANALYZE/REINDEX/VACUUM) immediately (bot admin)
+│   │   ├── OPTIMIZE_DB           — run nightly maintenance (archive move + CWL
+│   │   │                           retention purge + DB ANALYZE/REINDEX/VACUUM)
+│   │   │                           immediately (bot admin). Calls
+│   │   │                           run_nightly_maintenance_routine(), the full wrapper —
+│   │   │                           so unlike scripts/run_db_maintenance_now.py it DOES
+│   │   │                           run the Step 0.6 CWL purge.
 │   │   ├── MEMORY_PROFILE        — dump memory allocation stats to log file (bot admin)
 │   │   ├── MAINTENANCE_START     — suspend updates and close DB for safe data access
 │   │   └── MAINTENANCE_END       — restart bot and resume normal operation

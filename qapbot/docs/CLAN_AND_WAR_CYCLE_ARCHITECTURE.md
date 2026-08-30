@@ -549,6 +549,13 @@ ClashPerk embeds, not DB backup).
   gate, e.g. to resume a run that errored out partway. Run this first, then
   `run_db_maintenance_now.py` to reclaim the freed space — same order
   `run_nightly_maintenance_routine()` uses.
+  **The same split applies to the CWL retention purge** (2026-08-30):
+  `WarHistoryDB.purge_expired_cwl_events()` is Step 0.6 of `run_nightly_maintenance_routine()`,
+  *not* part of `nightly_db_maintenance()`, so `run_db_maintenance_now.py` does not run it either.
+  To force a purge, call `purge_expired_cwl_events()` directly (it is a plain async method with no
+  date gate), then run `run_db_maintenance_now.py` to reclaim the freed pages. Stated explicitly
+  here because the identical assumption about the migration step is what the 2026-08-01 correction
+  above had to unpick.
 - `attach_history_db(conn, db_path, history_db_path=None, read_only=False)` (module-level in
   `qapbot/db_manager.py`) — convenience helper for standalone scripts using a bare `sqlite3`
   connection instead of `WarHistoryDB`; ATTACHes history + creates its schema (skipped when

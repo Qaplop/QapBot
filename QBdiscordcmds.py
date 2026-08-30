@@ -1325,7 +1325,7 @@ async def do_maintenance_shutdown() -> None:
     app_commands.Choice(name="Backfill CWL Groups - Fetch league groups for clans with <7 rounds (bot admin)", value="BACKFILL_CWL_GROUPS"),
     app_commands.Choice(name="War Prediction - Predict outcome between two clans (bot admin)", value="WAR_PREDICT"),
     app_commands.Choice(name="Start Update Cycle - Skip sleep phase and start next update cycle immediately (bot admin)", value="START_UPDATE_CYCLE"),
-    app_commands.Choice(name="Execute Nightly Maintenance - Run archive move + DB ANALYZE/REINDEX/VACUUM now (bot admin)", value="OPTIMIZE_DB"),
+    app_commands.Choice(name="Execute Nightly Maintenance - Run archive move + CWL purge + DB ANALYZE/REINDEX/VACUUM now (bot admin)", value="OPTIMIZE_DB"),
     app_commands.Choice(name="Memory Profile - Dump memory allocation stats to log file (bot admin)", value="MEMORY_PROFILE"),
     app_commands.Choice(name="Maintenance Start - Suspend updates and close DB for safe data access (bot admin)", value="MAINTENANCE_START"),
     app_commands.Choice(name="Maintenance End - Restart bot and resume normal operation (bot admin)", value="MAINTENANCE_END"),
