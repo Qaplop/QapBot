@@ -1075,7 +1075,7 @@
       "unassigned": "Unassigned",
       "apply_to_all": "Apply to all my accounts",
       "apply": "Apply",
-      "apply_tooltip": "Overwrite every account above with the league, participation and DM setting selected in this row.",
+      "apply_tooltip": "Overwrite every account with the league, participation and DM setting selected in this row.",
       "save": "Save",
       "close": "Close",
       "status_pending": "Pending",
