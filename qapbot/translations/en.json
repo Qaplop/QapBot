@@ -1058,7 +1058,7 @@
       "no_linked_accounts": "You have no linked Clash accounts yet — use /link first.",
       "col_account": "Account",
       "col_league": "Preferred league",
-      "col_league_tooltip": "The CWL tier you'd like to play in. An info for whoever builds the rosters — it isn't enforced automatically.",
+      "col_league_tooltip": "The CWL tier you'd like to play in. An info for whoever builds the rosters — it isn't enforced automatically but clan lead will try to match it as close as possible.",
       "col_participation": "CWL participation",
       "col_participation_tooltip": "Whether you want to be pencilled in for CWL by default: always play, never play, or be asked fresh each season via your invitation DM.",
       "col_dm_anyway": "Send invitation DM anyway",
