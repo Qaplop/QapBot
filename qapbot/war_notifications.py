@@ -1472,7 +1472,7 @@ async def _send_channel_war_notification(clan_tag: str, war_data: Dict[str, Any]
             # The donation half of #0087/#0088 is a plain memory-aid sentence with no data behind it,
             # deliberately: the CoC API does not expose whether a war member's clan castle has been
             # filled, and nothing in this codebase tracks donations at all, so a real check isn't
-            # possible — see plans/tracker-0085-0086-0087-cwl-coordinator-role.md.
+            # possible — see plans/implemented/tracker-0085-0086-0087-cwl-coordinator-role.md.
             if war_data.get("is_cwl"):
                 coordinator_ids = guild_config.get("cwl_clan_coordinators", {}).get(clan_tag, [])
                 if coordinator_ids:

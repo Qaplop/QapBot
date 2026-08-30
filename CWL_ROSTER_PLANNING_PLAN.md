@@ -12,7 +12,7 @@ what exists today, kept current per Cardinal Rule 15 ("a stale doc is a bug").
 Two companion plans carry implementation detail this document summarizes rather than repeats:
 - `plans/implemented/cwl-personal-hub.md` — the player-facing preferences surface (`/cwl
   preferences`), fully shipped.
-- `plans/cwl-phase-model-and-war-phase.md` — the four-phase model, war detection, roster freeze,
+- `plans/implemented/cwl-phase-model-and-war-phase.md` — the four-phase model, war detection, roster freeze,
   and batched update DMs (2026-08-30), fully shipped; kept separately for its slice-by-slice
   build record.
 
@@ -169,6 +169,27 @@ Not season-scoped — carries forward automatically every CWL month. A distinct 
 war-notification custodians (a different existing feature): coordinators exist specifically for
 CWL roster-fill/switch reporting (§10) and, since 2026-08-30, for the third permission tier (§2).
 
+**What a coordinator *is*** (tracker #0085): the person who **starts the CWL in-game** for that
+clan and owns it for the season — so they must be Leader or Co-Leader *in the game*, not merely on
+Discord. Stated on the Manage CWL Coordinators screen and in the CWL help, because the original
+complaint was that coordinators were never told they were coordinators or what it meant.
+
+**Notification** (#0085): the config screen's "Notify CWL Coordinators" button DMs everyone whose
+status changed since the last press — added people get the explanation above, removed people a
+short notice. Deltas are captured in `_on_save` (the only moment the previous persisted state is
+still knowable) and accumulate across clans, so one press covers a whole reshuffle; an
+add-then-remove round-trip cancels out rather than sending a contradictory pair.
+
+**Linked Discord role** (#0086/#0088): `guild_config.cwl_coordinator_role_id` optionally links an
+**existing** guild role — typically the one already gating a server's coordinator channels. The bot
+never creates or deletes it, unlike the `coc_role_*` family;
+`guild_role_manager.sync_cwl_coordinator_role()` only reconciles membership against the **union of
+`cwl_clan_coordinators` across every clan**, so losing one clan never strips the role from someone
+still coordinating another. Deliberately *not* wired into `sync_roles_for_user()`'s per-member hot
+path — that would let any ordinary member sync strip the role from everyone whenever the CWL config
+happened to be unloaded. The accepted cost: a coordinator who leaves and rejoins the guild doesn't
+regain the role until the coordinator (or role) config is saved again.
+
 ### Extensions to existing tables
 
 `user_players` gains four standing, per-CoC-account preferences (not per Discord user — a member
@@ -182,8 +203,8 @@ Full semantics in `plans/implemented/cwl-personal-hub.md`.
 `guild_config` gains two anchored-message triplets (channel/message/enabled/last-bump, mirroring
 the registration message's own tracking) — one for the admin-facing **CWL Management Hub**, one
 for the player-facing **Personal CWL Hub** (`cwl_management_*` / `cwl_player_hub_*`) — plus
-`cwl_retention_months`, `cwl_selected_season`, and `cwl_enrollment_include_all_linked_accounts`
-(§7's account-wide pool toggle).
+`cwl_retention_months`, `cwl_selected_season`, `cwl_enrollment_include_all_linked_accounts`
+(§7's account-wide pool toggle), and `cwl_coordinator_role_id` (the linked coordinator role, §1).
 
 ---
 
@@ -536,6 +557,10 @@ fulfilling a long-standing backlog item. Shipped and stable; documented in
 `activity/client` and `activity/server` each have `npm run build` / `tsc --noEmit` as their
 verification (no frontend test framework).
 
-**Not yet verified live**: the 2026-08-30 phase-model/war-phase/batched-DM work
-(`plans/cwl-phase-model-and-war-phase.md`) — needs a bot restart and a real click-through of
-Preparation → War transition, the roster freeze, and all three update-DM triggers.
+**Live-verified** (2026-08-30): the phase-model/war-phase/batched-DM work
+(`plans/implemented/cwl-phase-model-and-war-phase.md`) plus the coordinator role/notification work
+(`plans/implemented/tracker-0085-0086-0087-cwl-coordinator-role.md`) are deployed to PROD and
+confirmed working by the project owner. The one exception, by explicit decision rather than
+oversight: the CWL coordinator @mention in the channel war notification (tracker #0087) can only
+fire during a real CWL war day, so it goes live unverified — if it doesn't work it surfaces as an
+ordinary bug report, and the failure mode is a missing reminder, not broken state.

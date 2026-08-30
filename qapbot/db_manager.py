@@ -2370,7 +2370,7 @@ class WarHistoryDB:
         )
 
         # The roster a clan was actually locked into when its CWL started in-game (2026-08-30,
-        # plans/cwl-phase-model-and-war-phase.md). Snapshotted ONCE per clan per season, at the
+        # plans/implemented/cwl-phase-model-and-war-phase.md). Snapshotted ONCE per clan per season, at the
         # moment lock is first detected, because it cannot be reconstructed afterwards:
         # user_players.current_clan_tag is live data that drifts as people leave, so "was this
         # player in the clan when it started?" has no answer later unless it was written down then.

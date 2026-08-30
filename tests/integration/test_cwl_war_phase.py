@@ -1,5 +1,5 @@
 """Tests for the four-phase CWL model, war-phase transition and roster freeze —
-plans/cwl-phase-model-and-war-phase.md (2026-08-30, project owner's spec).
+plans/implemented/cwl-phase-model-and-war-phase.md (2026-08-30, project owner's spec).
 
 The load-bearing idea under all of it: a clan's roster is fixed by the GAME the moment its CWL
 starts, so from that point the board records reality instead of planning it. Everything here is a
