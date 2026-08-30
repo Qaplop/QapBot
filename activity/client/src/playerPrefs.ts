@@ -38,6 +38,7 @@ function accountLabel(tag: string, name: string | null): string {
 
 function buildLeagueSelect(current: string | null, t: Translator): HTMLSelectElement {
   const select = document.createElement('select')
+  select.title = t('col_league_tooltip')
   const noPref = document.createElement('option')
   noPref.value = ''
   noPref.textContent = t('no_preference')
@@ -54,6 +55,7 @@ function buildLeagueSelect(current: string | null, t: Translator): HTMLSelectEle
 
 function buildModeSelect(current: PrefsMode, t: Translator): HTMLSelectElement {
   const select = document.createElement('select')
+  select.title = t('col_participation_tooltip')
   const options: [PrefsMode, string][] = [
     ['none', t('mode_none')],
     ['optin', t('mode_optin')],
@@ -202,6 +204,7 @@ function renderBlockOne(
   applyDmInner.className = 'checkbox-cell-inner'
   const applyDmCheckbox = document.createElement('input')
   applyDmCheckbox.type = 'checkbox'
+  applyDmCheckbox.title = t('col_dm_anyway_tooltip')
   applyDmCheckbox.disabled = applyModeSelect.value !== 'optout'
   const applyButton = document.createElement('button')
   applyButton.textContent = t('apply')
@@ -268,6 +271,7 @@ function renderBlockOne(
     dmInner.className = 'checkbox-cell-inner'
     const dmCheckbox = document.createElement('input')
     dmCheckbox.type = 'checkbox'
+    dmCheckbox.title = t('col_dm_anyway_tooltip')
     dmCheckbox.checked = account.send_dm_anyway
     dmCheckbox.disabled = account.mode !== 'optout'
     dmInner.appendChild(dmCheckbox)
