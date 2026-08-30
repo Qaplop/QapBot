@@ -180,8 +180,6 @@ avoid, just aimed at leadership. Coordinators now get exactly one message per cl
 both of their own escalating alarms, so no lead time is lost.
 
 **Still outstanding**
-- Dedicated tests for slice 5's two paths (removal tombstoning, the combined late-add DM) — the
-  code is covered indirectly by the existing pending-update tests but not by its own.
 - No live verification of any of it: needs a DEV bot restart plus `activity/client` and
   `activity/server` deploys (both changed), then a click-through.
 - `activity/server` gained `/cwl/enrollment/send-updates`, so the Worker MUST be redeployed, not

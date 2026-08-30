@@ -542,6 +542,100 @@ async def test_one_user_with_two_changed_accounts_gets_one_dm(db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Clan added / removed during Preparation (spec item 5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_removing_a_clan_makes_its_announced_players_pending(db):
+    """Removing a clan strands anyone already told they'd play for it. Their assignment row
+    survives (it just stops being rendered), so the ordinary moved/dropped comparison would never
+    notice — the tombstone is what routes them into the same update batch as every other change."""
+    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_pending_roster_updates_sync
+    from qapbot.web_bridge import _tombstone_announced_players_of_removed_clans_sync
+
+    guild_id = "340"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1"}, {"clan_tag": "#CLAN2"}])
+    await _announced_player(db, event_id, guild_id, "#TOLD", "#CLAN1", "Told", "u1")
+    # Never announced: nothing to correct, so telling them they've been removed from a roster they
+    # never knew they were on would be pure noise.
+    await _player(db, "u2", "#QUIET", "#CLAN1", "Quiet")
+    db.upsert_cwl_assignment_sync(event_id, "#QUIET", "#CLAN1", assignment_source="admin_override", locked=True)
+
+    recorded = _tombstone_announced_players_of_removed_clans_sync(event_id, ["#CLAN1"])
+
+    assert recorded == 1
+    pending = resolve_cwl_pending_roster_updates_sync(int(guild_id), event_id, SEASON)
+    assert [p["player_tag"] for p in pending["dropped"]] == ["#TOLD"]
+
+
+@pytest.mark.asyncio
+async def test_removing_an_unrelated_clan_touches_nobody(db):
+    from qapbot.web_bridge import _tombstone_announced_players_of_removed_clans_sync
+
+    guild_id = "341"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1"}, {"clan_tag": "#CLAN2"}])
+    await _announced_player(db, event_id, guild_id, "#P1", "#CLAN1", "Stays", "u1")
+
+    assert _tombstone_announced_players_of_removed_clans_sync(event_id, ["#CLAN2"]) == 0
+    assert db.get_cwl_dropped_notified_players_sync(event_id) == []
+
+
+@pytest.mark.asyncio
+async def test_late_added_never_contacted_player_gets_one_combined_dm(db, monkeypatch):
+    """Spec item 5's edge case: a player whose clan joined the season after Start Enrollment ran
+    has TWO unanswered questions — "do you want to play?" and "here's where you play". They arrive
+    as one message with the confirm/opt-out buttons attached, not two separate DMs."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import send_cwl_roster_updates
+
+    guild_id = "342"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1", "cwl_start_at": f"{SEASON}-01T08:00Z"}])
+    # Still sitting in another clan — the realistic late-add case, and the one that must carry a
+    # join link (a player already in their assigned clan gets the green variant, which has none).
+    await _player(db, "u1", "#LATE", "#CLAN2", "Latecomer")
+    db.upsert_cwl_assignment_sync(event_id, "#LATE", "#CLAN1", assignment_source="admin_override", locked=True)
+    sent = AsyncMock(return_value=(True, "sent"))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", sent, raising=False)
+
+    result = await send_cwl_roster_updates(int(guild_id), SEASON)
+
+    assert result["new"] == 1
+    assert sent.await_count == 1, "one message, not an enrollment DM plus an assignment DM"
+    assert sent.await_args.kwargs.get("view") is not None, "confirm/opt-out buttons must be attached"
+    body = sent.await_args.args[1]
+    assert "Latecomer" in body, "the roster half of the combined message"
+    assert "link.clashofclans.com" in body, "and its join link, since they aren't in the clan yet"
+    # The combined DM answers the enrollment question, so "Notify New Pool Members" must not then
+    # send them a second, redundant invitation.
+    assert db.get_cwl_player_season_dm_status_bulk_sync(["#LATE"], SEASON).get("#LATE") is True
+
+
+@pytest.mark.asyncio
+async def test_already_enrolled_player_gets_no_confirm_buttons(db, monkeypatch):
+    """Someone who already answered the enrollment question this season just needs the roster
+    information — re-asking would be the redundant second DM this design exists to avoid."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import send_cwl_roster_updates
+
+    guild_id = "343"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1", "cwl_start_at": f"{SEASON}-01T08:00Z"}])
+    await _player(db, "u1", "#ASKED", "#CLAN1", "Asked")
+    db.upsert_cwl_assignment_sync(event_id, "#ASKED", "#CLAN1", assignment_source="admin_override", locked=True)
+    db.mark_cwl_player_dm_sent_sync("#ASKED", SEASON, "Asked", "u1", event_id, int(guild_id), "2026-09-01T08:00Z")
+    sent = AsyncMock(return_value=(True, "sent"))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", sent, raising=False)
+
+    await send_cwl_roster_updates(int(guild_id), SEASON)
+
+    assert sent.await_count == 1
+    assert sent.await_args.kwargs.get("view") is None
+
+
+# ---------------------------------------------------------------------------
 # Roster completeness check (spec item 6)
 # ---------------------------------------------------------------------------
 
