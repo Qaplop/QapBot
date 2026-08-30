@@ -910,9 +910,9 @@ composite    = data_confidence * (0.6*skill + 0.4*reliability)
 
 ## Phase 5 — "Start CWL" ✅ shipped 2026-08-29 (rewritten same day against the shipped architecture)
 
-> **Built exactly as specified below.** `start_cwl()` / `resolve_cwl_start_targets_sync()` /
-> `send_cwl_start_dm_group()` / `has_cwl_assignments_to_start()` (`QBdiscocmdshelper_cwl.py`),
-> `CwlStartCwlConfirmView` + the row-4 button (`ui_cwl_roster.py`), the
+> **Built exactly as specified below.** `announce_cwl_rosters()` / `resolve_cwl_announcement_targets_sync()` /
+> `send_cwl_roster_dm_group()` / `has_cwl_roster_announcements_pending()` (`QBdiscocmdshelper_cwl.py`),
+> `CwlAnnounceRostersConfirmView` + the row-4 button (`ui_cwl_roster.py`), the
 > `cwl_shared_clan_players.notified` column and its single-purpose writer (`db_manager.py`), and
 > `cwl.start.*` / `cwl.management.start_cwl_*` in `en.json`/`de.json`.
 >
@@ -1030,12 +1030,12 @@ pointing at Configure Participating Clans — deliberately *not* a hidden or gre
 "you have one more thing to fill in" needs to be sayable, and an invisible button can't say it. This
 is the surviving half of Phase 4's Finalize gate ("every participating clan, individually").
 
-Confirmation dialog first (`CwlStartCwlConfirmView`), structurally identical to
+Confirmation dialog first (`CwlAnnounceRostersConfirmView`), structurally identical to
 `CwlNotifyNewMembersConfirmView` / `CwlRemindPendingConfirmView`: disable both buttons and edit to a
 "processing…" state as the *immediate* interaction response before the multi-second blast starts
 (the lesson from Start Enrollment's own dialog), then edit in the summary.
 
-### `start_cwl(guild_id, season)` — `QBdiscocmdshelper_cwl.py`
+### `announce_cwl_rosters(guild_id, season)` — `QBdiscocmdshelper_cwl.py`
 
 Re-fetches the event fresh by `(guild_id, season)` — never trusts a caller-held event dict, matching
 the re-read discipline used everywhere in this feature. Then:

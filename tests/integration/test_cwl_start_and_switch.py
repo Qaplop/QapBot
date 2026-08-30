@@ -108,7 +108,7 @@ def _assign(db: WarHistoryDB, event_id: int, player_tag: str, clan_tag: str) -> 
 @pytest.mark.asyncio
 async def test_start_targets_split_green_and_amber(db):
     """A player already in their assigned clan is green; one still elsewhere is amber."""
-    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_start_targets_sync
+    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_announcement_targets_sync
 
     guild_id = "100"
     await _seed_guild_and_clans(db, guild_id, ("#CLAN1", "#CLAN2"))
@@ -122,7 +122,7 @@ async def test_start_targets_split_green_and_amber(db):
     _assign(db, event_id, "#GREEN", "#CLAN1")   # already there
     _assign(db, event_id, "#AMBER", "#CLAN1")   # assigned to CLAN1, still sitting in CLAN2
 
-    targets = resolve_cwl_start_targets_sync(int(guild_id), event_id, SEASON)
+    targets = resolve_cwl_announcement_targets_sync(int(guild_id), event_id, SEASON)
 
     assert targets["total_assigned"] == 2
     green = targets["groups"]["u1"][0]
@@ -138,7 +138,7 @@ async def test_start_targets_split_green_and_amber(db):
 async def test_start_targets_unknown_current_clan_is_amber(db):
     """No current clan on record must render AMBER, never green — green would assert something we
     cannot back up, while amber's "be in X before Y" stays true wherever they are."""
-    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_start_targets_sync
+    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_announcement_targets_sync
 
     guild_id = "101"
     await _seed_guild_and_clans(db, guild_id)
@@ -148,7 +148,7 @@ async def test_start_targets_unknown_current_clan_is_amber(db):
     await _seed_player(db, "u1", "#GHOST", None, "Ghost")  # linked, but in no clan on record
     _assign(db, event_id, "#GHOST", "#CLAN1")
 
-    targets = resolve_cwl_start_targets_sync(int(guild_id), event_id, SEASON)
+    targets = resolve_cwl_announcement_targets_sync(int(guild_id), event_id, SEASON)
 
     account = targets["groups"]["u1"][0]
     assert account["in_clan"] is False
@@ -158,7 +158,7 @@ async def test_start_targets_unknown_current_clan_is_amber(db):
 @pytest.mark.asyncio
 async def test_start_targets_group_one_users_accounts_together(db):
     """A main and an alt in different clans belong in ONE DM, each carrying its own start time."""
-    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_start_targets_sync
+    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_announcement_targets_sync
 
     guild_id = "102"
     await _seed_guild_and_clans(db, guild_id, ("#CLAN1", "#CLAN2"))
@@ -172,7 +172,7 @@ async def test_start_targets_group_one_users_accounts_together(db):
     _assign(db, event_id, "#MAIN", "#CLAN1")
     _assign(db, event_id, "#ALT", "#CLAN2")
 
-    targets = resolve_cwl_start_targets_sync(int(guild_id), event_id, SEASON)
+    targets = resolve_cwl_announcement_targets_sync(int(guild_id), event_id, SEASON)
 
     assert list(targets["groups"].keys()) == ["u1"]
     by_tag = {a["player_tag"]: a for a in targets["groups"]["u1"]}
@@ -186,7 +186,7 @@ async def test_start_targets_group_one_users_accounts_together(db):
 async def test_start_targets_exclude_non_participating_and_notified(db):
     """An assignment pointing at a clan that isn't a column here ("Assigned to other Guild") is
     another guild's business; an already-notified one must not be announced twice."""
-    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_start_targets_sync
+    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_announcement_targets_sync
 
     guild_id = "103"
     await _seed_guild_and_clans(db, guild_id, ("#CLAN1", "#OTHER"))
@@ -201,7 +201,7 @@ async def test_start_targets_exclude_non_participating_and_notified(db):
     _assign(db, event_id, "#ELSEWHERE", "#OTHER")
     db.mark_cwl_assignment_notified_sync(event_id, "#DONE")
 
-    targets = resolve_cwl_start_targets_sync(int(guild_id), event_id, SEASON)
+    targets = resolve_cwl_announcement_targets_sync(int(guild_id), event_id, SEASON)
 
     assert targets["groups"] == {}
     assert targets["already_notified"] == 1
@@ -211,7 +211,7 @@ async def test_start_targets_exclude_non_participating_and_notified(db):
 async def test_start_targets_unlinked_player_is_named_not_dmed(db):
     """An unlinked account can't be reached at all — it must be counted AND named, since that's
     exactly who a lead has to chase by hand."""
-    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_start_targets_sync
+    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_announcement_targets_sync
 
     guild_id = "104"
     await _seed_guild_and_clans(db, guild_id)
@@ -221,7 +221,7 @@ async def test_start_targets_unlinked_player_is_named_not_dmed(db):
     await _seed_player(db, None, "#NOLINK", "#CLAN1", "Unlinked")
     _assign(db, event_id, "#NOLINK", "#CLAN1")
 
-    targets = resolve_cwl_start_targets_sync(int(guild_id), event_id, SEASON)
+    targets = resolve_cwl_announcement_targets_sync(int(guild_id), event_id, SEASON)
 
     assert targets["groups"] == {}
     assert targets["skipped_unlinked"] == 1
@@ -230,7 +230,7 @@ async def test_start_targets_unlinked_player_is_named_not_dmed(db):
 
 @pytest.mark.asyncio
 async def test_start_targets_missing_start_time_is_reported(db):
-    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_start_targets_sync
+    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_announcement_targets_sync
 
     guild_id = "105"
     await _seed_guild_and_clans(db, guild_id, ("#CLAN1", "#CLAN2"))
@@ -239,20 +239,20 @@ async def test_start_targets_missing_start_time_is_reported(db):
         [{"clan_tag": "#CLAN1", "cwl_start_at": f"{SEASON}-01T08:00Z"}, {"clan_tag": "#CLAN2"}],
     )
 
-    targets = resolve_cwl_start_targets_sync(int(guild_id), event_id, SEASON)
+    targets = resolve_cwl_announcement_targets_sync(int(guild_id), event_id, SEASON)
 
     assert targets["missing_start_times"] == ["#CLAN2"]
 
 
 # ---------------------------------------------------------------------------
-# Phase 5 — start_cwl() end to end
+# Phase 5 — announce_cwl_rosters() end to end
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_start_cwl_refuses_when_a_clan_has_no_start_time(db):
     """The surviving half of the original Phase 4 Finalize gate: no partial send, and the caller
     gets the offending clans back so it can name them."""
-    from qapbot.QBdiscocmdshelper_cwl import start_cwl
+    from qapbot.QBdiscocmdshelper_cwl import announce_cwl_rosters
 
     guild_id = "110"
     await _seed_guild_and_clans(db, guild_id, ("#CLAN1", "#CLAN2"))
@@ -263,7 +263,7 @@ async def test_start_cwl_refuses_when_a_clan_has_no_start_time(db):
     await _seed_player(db, "u1", "#P1", "#CLAN1")
     _assign(db, event_id, "#P1", "#CLAN1")
 
-    result = await start_cwl(int(guild_id), SEASON)
+    result = await announce_cwl_rosters(int(guild_id), SEASON)
 
     assert result["ok"] is False
     assert result["error"] == "missing_start_times"
@@ -275,7 +275,7 @@ async def test_start_cwl_refuses_when_a_clan_has_no_start_time(db):
 @pytest.mark.asyncio
 async def test_start_cwl_sends_marks_notified_and_announces(db, monkeypatch):
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import start_cwl
+    from qapbot.QBdiscocmdshelper_cwl import announce_cwl_rosters
 
     guild_id = "111"
     await _seed_guild_and_clans(db, guild_id)
@@ -287,7 +287,7 @@ async def test_start_cwl_sends_marks_notified_and_announces(db, monkeypatch):
     sent = AsyncMock(return_value=(True, "sent"))
     monkeypatch.setattr(CACHE, "send_user_dm_detailed", sent, raising=False)
 
-    result = await start_cwl(int(guild_id), SEASON)
+    result = await announce_cwl_rosters(int(guild_id), SEASON)
 
     assert result["ok"] is True
     assert result["contacted"] == 1
@@ -300,7 +300,7 @@ async def test_start_cwl_sends_marks_notified_and_announces(db, monkeypatch):
     assert db.get_cwl_assignments_sync(event_id)[0]["notified"] == 1
     assert db.get_cwl_event_sync(guild_id, SEASON)["status"] == "announced"
 
-    rerun = await start_cwl(int(guild_id), SEASON)
+    rerun = await announce_cwl_rosters(int(guild_id), SEASON)
     assert rerun["ok"] is False
     assert rerun["error"] == "nobody_to_notify"
     assert sent.await_count == 1  # no second DM
@@ -310,7 +310,7 @@ async def test_start_cwl_sends_marks_notified_and_announces(db, monkeypatch):
 async def test_start_cwl_amber_dm_carries_the_clan_join_link(db, monkeypatch):
     """The amber variant's whole point (project owner's spec): a direct link to the assigned clan."""
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import start_cwl
+    from qapbot.QBdiscocmdshelper_cwl import announce_cwl_rosters
 
     guild_id = "112"
     await _seed_guild_and_clans(db, guild_id, ("#CLAN1", "#CLAN2"))
@@ -323,7 +323,7 @@ async def test_start_cwl_amber_dm_carries_the_clan_join_link(db, monkeypatch):
     sent = AsyncMock(return_value=(True, "sent"))
     monkeypatch.setattr(CACHE, "send_user_dm_detailed", sent, raising=False)
 
-    await start_cwl(int(guild_id), SEASON)
+    await announce_cwl_rosters(int(guild_id), SEASON)
 
     body = sent.await_args.args[1]
     assert "link.clashofclans.com" in body
@@ -340,7 +340,7 @@ async def test_start_cwl_respects_the_dm_guard(db, monkeypatch):
     else — and a guarded recipient must NOT be marked notified, or they'd never be reachable."""
     import qapbot.config as config_module
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper_cwl import start_cwl
+    from qapbot.QBdiscocmdshelper_cwl import announce_cwl_rosters
 
     guild_id = "113"
     await _seed_guild_and_clans(db, guild_id)
@@ -358,7 +358,7 @@ async def test_start_cwl_respects_the_dm_guard(db, monkeypatch):
     sent = AsyncMock(return_value=(True, "sent"))
     monkeypatch.setattr(CACHE, "send_user_dm_detailed", sent, raising=False)
 
-    result = await start_cwl(int(guild_id), SEASON)
+    result = await announce_cwl_rosters(int(guild_id), SEASON)
 
     assert result["skipped_dm_guard"] == 1
     assert sent.await_count == 0

@@ -502,13 +502,18 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
     view.add_item(start_button)  # type: ignore[arg-type]
 
     # Mainly for testing/starting over — not gated behind a later phase like the two buttons
-    # above, so it's only disabled when there's genuinely nothing to delete.
+    # above, so it's only disabled when there's genuinely nothing to delete... or when at least one
+    # participating clan has already started CWL in-game (2026-08-30, project owner's spec:
+    # "Seasons should generally be un-deletable as soon as the first clan started the cwl season").
+    # Disabled rather than hidden here, unlike "Add New Season": the reason it's unavailable is a
+    # real state worth showing, and the confirm dialog re-checks it anyway.
+    any_clan_started = any(c.get("locked_at") for c in participating_clans)
     delete_button = discord.ui.Button(
         label=t('cwl.management.button_delete_season', guild_id=guild_id),
         style=discord.ButtonStyle.danger,
         custom_id="cwl_management_delete_season",
         row=3,
-        disabled=(event is None),
+        disabled=(event is None or any_clan_started),
     )
     delete_button.callback = _make_cwl_management_delete_callback(view)  # type: ignore[assignment]
     view.add_item(delete_button)  # type: ignore[arg-type]
@@ -577,24 +582,24 @@ def add_cwl_management_components(view: discord.ui.View, guild_id: int) -> None:
 
     # "Start CWL" (Phase 5, CWL_ROSTER_PLANNING_PLAN.md) — announces the finished roster to every
     # assigned player. Same row-4, omit-entirely-rather-than-disable convention as the two buttons
-    # above, gated by has_cwl_assignments_to_start (at least one assigned player not yet announced
+    # above, gated by has_cwl_roster_announcements_pending (at least one assigned player not yet announced
     # to). That gate makes the button self-managing: it vanishes once everyone has been told and
     # comes back on its own when a lead drags a late arrival onto the board, so there's no separate
     # "re-announce" action. Deliberately NOT gated on every clan having a start time — that has to
     # produce a *sayable* error on click (which clans are missing one), and an invisible button
     # can't say anything.
     if event is not None and event["status"] not in ("draft", "cancelled"):
-        from qapbot.QBdiscocmdshelper_cwl import has_cwl_assignments_to_start
+        from qapbot.QBdiscocmdshelper_cwl import has_cwl_roster_announcements_pending
 
-        if has_cwl_assignments_to_start(guild_id, season):
-            start_cwl_button = discord.ui.Button(
-                label=t('cwl.management.button_start_cwl', guild_id=guild_id),
+        if has_cwl_roster_announcements_pending(guild_id, season):
+            announce_rosters_button = discord.ui.Button(
+                label=t('cwl.management.button_announce_rosters', guild_id=guild_id),
                 style=discord.ButtonStyle.success,
-                custom_id="cwl_management_start_cwl",
+                custom_id="cwl_management_announce_rosters",
                 row=4,
             )
-            start_cwl_button.callback = _make_cwl_management_start_cwl_callback(view)  # type: ignore[assignment]
-            view.add_item(start_cwl_button)  # type: ignore[arg-type]
+            announce_rosters_button.callback = _make_cwl_management_announce_rosters_callback(view)  # type: ignore[assignment]
+            view.add_item(announce_rosters_button)  # type: ignore[arg-type]
 
     if event is not None:
         # Surfaced so an admin opening this screen can see at a glance whether every
@@ -1495,6 +1500,29 @@ class CwlDeleteSeasonConfirmView(discord.ui.View):
             return
         await interaction.response.defer(thinking=False, ephemeral=True)
         db = CACHE.db_manager
+        # War-phase delete block (2026-08-30, project owner's spec: "Seasons should generally be
+        # un-deletable as soon as the first clan started the cwl season"). Re-checked here rather
+        # than only hiding the button, because the confirm dialog can sit open across the exact
+        # cycle in which a clan starts — the button's own gating is a cosmetic head start, this is
+        # the decision. Deleting now would cascade away rosters an in-game CWL is actively being
+        # played against, and none of it could be reconstructed.
+        if db is not None:
+            locked = await asyncio.to_thread(db.get_locked_cwl_clan_tags_sync, self.event_id)
+            if locked:
+                from qapbot.i18n import t
+
+                names = ", ".join(CACHE.get_clan_name(tag, tag) or tag for tag in sorted(locked))
+                try:
+                    await interaction.edit_original_response(
+                        content=t(
+                            'cwl.management.delete_blocked_war_started',
+                            guild_id=self.guild_id, clans=names,
+                        ),
+                        view=None,
+                    )
+                except discord.NotFound:
+                    pass
+                return
         if db is not None:
             # Delete-season guard (2026-08-15) — MUST run before delete_cwl_event_sync(): repoints
             # ownership away from this guild for any shared clan that still has another guild
@@ -1871,7 +1899,7 @@ class CwlNotifyNewMembersConfirmView(discord.ui.View):
             pass
 
 
-def _make_cwl_management_start_cwl_callback(view: discord.ui.View):
+def _make_cwl_management_announce_rosters_callback(view: discord.ui.View):
     async def callback(interaction: discord.Interaction) -> None:
         if not await _check_cwl_admin_permission(interaction):
             return
@@ -1885,7 +1913,7 @@ def _make_cwl_management_start_cwl_callback(view: discord.ui.View):
         event = db.get_cwl_event_sync(str(interaction.guild.id), season) if db is not None else None
         if event is None:
             return
-        confirm_view = CwlStartCwlConfirmView(
+        confirm_view = CwlAnnounceRostersConfirmView(
             parent_view=view,
             guild_id=interaction.guild.id,
             season=event["cwl_season"],
@@ -1899,7 +1927,7 @@ def _make_cwl_management_start_cwl_callback(view: discord.ui.View):
     return callback
 
 
-class CwlStartCwlConfirmView(discord.ui.View):
+class CwlAnnounceRostersConfirmView(discord.ui.View):
     """Confirm/cancel dialog for "Start CWL" (Phase 5, CWL_ROSTER_PLANNING_PLAN.md) — sends real
     DMs to every assigned player, so never a single-click action. Structurally identical to
     CwlRemindPendingConfirmView / CwlNotifyNewMembersConfirmView, including their double-click
@@ -1915,9 +1943,9 @@ class CwlStartCwlConfirmView(discord.ui.View):
         from qapbot.i18n import t
 
         confirm_button: discord.ui.Button[Any] = discord.ui.Button(
-            label=t('cwl.management.button_confirm_start_cwl', guild_id=guild_id),
+            label=t('cwl.management.button_confirm_announce_rosters', guild_id=guild_id),
             style=discord.ButtonStyle.success,
-            custom_id="cwl_start_cwl_confirm",
+            custom_id="cwl_announce_rosters_confirm",
         )
         confirm_button.callback = self._on_confirm  # type: ignore[assignment]
         self.add_item(confirm_button)
@@ -1925,7 +1953,7 @@ class CwlStartCwlConfirmView(discord.ui.View):
         cancel_button: discord.ui.Button[Any] = discord.ui.Button(
             label=t('cwl.setup.button_cancel', guild_id=guild_id),
             style=discord.ButtonStyle.secondary,
-            custom_id="cwl_start_cwl_cancel",
+            custom_id="cwl_announce_rosters_cancel",
         )
         cancel_button.callback = self._on_cancel  # type: ignore[assignment]
         self.add_item(cancel_button)
@@ -1933,7 +1961,7 @@ class CwlStartCwlConfirmView(discord.ui.View):
     def _build_content(self) -> str:
         from qapbot.i18n import t
 
-        return t('cwl.management.start_cwl_confirm_body', guild_id=self.guild_id, season=self.season)
+        return t('cwl.management.announce_rosters_confirm_body', guild_id=self.guild_id, season=self.season)
 
     async def _on_confirm(self, interaction: discord.Interaction) -> None:
         if not await _check_cwl_admin_permission(interaction):
@@ -1943,21 +1971,21 @@ class CwlStartCwlConfirmView(discord.ui.View):
         for item in self.children:
             item.disabled = True  # type: ignore[union-attr]
         await interaction.response.edit_message(
-            content=t('cwl.management.start_cwl_processing', guild_id=self.guild_id), view=self
+            content=t('cwl.management.announce_rosters_processing', guild_id=self.guild_id), view=self
         )
-        from qapbot.QBdiscocmdshelper_cwl import start_cwl
+        from qapbot.QBdiscocmdshelper_cwl import announce_cwl_rosters
 
-        result = await start_cwl(self.guild_id, self.season)
+        result = await announce_cwl_rosters(self.guild_id, self.season)
         if not result["ok"]:
             if result["error"] == "missing_start_times":
                 # The one error worth spelling out rather than reducing to a generic line: the
                 # admin needs to know WHICH clans to go fix, not just that something is missing.
                 content = t(
-                    'cwl.management.start_cwl_error_missing_start_times',
+                    'cwl.management.announce_rosters_error_missing_start_times',
                     guild_id=self.guild_id, clans=", ".join(result["missing_start_times"]),
                 )
             else:
-                content = t(f"cwl.management.start_cwl_error_{result['error']}", guild_id=self.guild_id)
+                content = t(f"cwl.management.announce_rosters_error_{result['error']}", guild_id=self.guild_id)
         else:
             # Same blocked/failed reporting shape as every other CWL DM batch — reuses Start
             # Enrollment's own generic i18n lines rather than duplicating them.
@@ -1983,11 +2011,11 @@ class CwlStartCwlConfirmView(discord.ui.View):
                 # Named, not just counted: these are precisely the players a lead has to chase by
                 # hand, since the bot has no way to reach them at all.
                 dm_issues += t(
-                    'cwl.management.start_cwl_unlinked_line',
+                    'cwl.management.announce_rosters_unlinked_line',
                     guild_id=self.guild_id, names=", ".join(result["unlinked_names"]),
                 )
             content = t(
-                'cwl.management.start_cwl_summary',
+                'cwl.management.announce_rosters_summary',
                 guild_id=self.guild_id,
                 contacted=result["contacted"],
                 contacted_users=result["contacted_users"],
@@ -2007,7 +2035,7 @@ class CwlStartCwlConfirmView(discord.ui.View):
         from qapbot.i18n import t
 
         await interaction.response.edit_message(
-            content=t('cwl.management.start_cwl_cancelled', guild_id=self.guild_id), view=None
+            content=t('cwl.management.announce_rosters_cancelled', guild_id=self.guild_id), view=None
         )
 
 
@@ -2519,18 +2547,31 @@ async def _check_cwl_admin_permission(interaction: discord.Interaction) -> bool:
 
 async def _check_cwl_admin_or_leader_permission(interaction: discord.Interaction) -> bool:
     """Permission re-check for the "Manage Assignment" launch button specifically — admin,
-    configured bot admin, OR a current holder of the guild's Leader/Co-Leader Discord role
-    (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", 2026-08-10). Every other CWL Management
-    button stays on _check_cwl_admin_permission() (admin-only), unchanged."""
+    configured bot admin, a current holder of the guild's Leader/Co-Leader Discord role
+    (CWL_ROSTER_PLANNING_PLAN.md "Manage Enrollment", 2026-08-10), OR a standing CWL Coordinator of
+    a clan participating this season (2026-08-30). Every other CWL Management button stays on
+    _check_cwl_admin_permission() (admin-only), unchanged.
+
+    The coordinator tier is checked here AND independently re-derived in web_bridge.py's
+    _resolve_admin_or_leader() — the same defense-in-depth split the other two tiers already use,
+    since this gate only guards the launch click while the bridge guards every actual write."""
+    import asyncio
+
     from qapbot.config import CONFIG
     from qapbot.QBdiscocmdshelper import check_admin_or_leader_permission
+    from qapbot.QBdiscocmdshelper_cwl import is_cwl_coordinator_for_current_season
     from qapbot.i18n import t
 
     resolved_guild_id = interaction.guild.id if interaction.guild else None
     guild_config = CACHE.server_config.get(str(resolved_guild_id), {}) if resolved_guild_id else {}
-    if not await check_admin_or_leader_permission(
+    allowed = await check_admin_or_leader_permission(
         interaction, CONFIG.server_admin, guild_config, resolved_guild_id=resolved_guild_id
-    ):
+    )
+    if not allowed and resolved_guild_id is not None:
+        allowed = await asyncio.to_thread(
+            is_cwl_coordinator_for_current_season, resolved_guild_id, interaction.user.id
+        )
+    if not allowed:
         msg = t('commands.errors.admin_required', guild_id=resolved_guild_id)
         try:
             if not interaction.response.is_done():

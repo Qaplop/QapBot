@@ -434,12 +434,18 @@ async def format_clan_management_cwl_management(
         key=lambda c: (-cwl_league_rank(_tier_for(c)), (CACHE.get_clan_name(c["clan_tag"], c["clan_tag"]) or "").lower()),
     )
 
-    embed.description = t(
+    # Step indicator FIRST, above the season header (2026-08-30, project owner's spec: "at the top
+    # of the message"). Built from `all_clans`, not the tier-sorted `clans` — phase derivation only
+    # cares about participating/locked_at, and doing it here keeps it independent of display order.
+    phase_info = resolve_cwl_phase(event, all_clans)
+    indicator = render_cwl_step_indicator(phase_info, guild_id_int)
+    season_header = t(
         'cwl.management.season_header',
         guild_id=guild_id_int,
         season=event["cwl_season"],
         status=t(f'cwl.management.event_status_{event["status"]}', guild_id=guild_id_int),
     )
+    embed.description = f"{indicator}\n\n{season_header}" if indicator else season_header
 
     if not clans:
         clans_block = t('cwl.management.no_clans_configured', guild_id=guild_id_int)
@@ -540,7 +546,12 @@ async def format_clan_management_cwl_management(
     # go and "hasn't moved yet" is meaningless. Because this function is the shared content layer,
     # the section renders identically in /clan management and in the CWL Management Hub, with one
     # implementation — the invariant this whole feature has held throughout.
-    if event["status"] == "announced":
+    #
+    # 'war' MUST be included alongside 'announced' (2026-08-30): a guild flips to war status as soon
+    # as its FIRST clan starts in-game, so scoping this to 'announced' alone made the section vanish
+    # at precisely the point leadership most needs it — the remaining clans are still waiting on
+    # transfers. Same trap as get_active_cwl_events_sync()'s own status widening.
+    if event["status"] in ("announced", "war"):
         monitoring = await asyncio.to_thread(
             resolve_cwl_switch_monitoring_sync, guild_id_int, event["id"], event["cwl_season"]
         )
@@ -1303,6 +1314,47 @@ def assign_cwl_player_sync(
     db = CACHE.db_manager
     if db is None:
         return None
+
+    # ── Roster freeze (2026-08-30, project owner's spec) ──────────────────────────────────
+    # Once a clan has actually started CWL in-game its roster is fixed by the game itself, so the
+    # board must stop pretending otherwise: nobody can be moved INTO or OUT OF a locked clan.
+    #
+    # The one exception, verbatim from the spec: "As long as the player was member of the clan when
+    # it started its season he can still participate. So there are possibly players in the
+    # unassigned pool that still could participate. Allow the drag and drop for those player/clan
+    # combinations even in the war phase." That set is cwl_locked_clan_members — snapshotted at lock
+    # time precisely because it cannot be reconstructed from live membership afterwards.
+    #
+    # Enforced HERE rather than only in the board's UI because this is the one write path every
+    # placement goes through; the frontend's disabled drop targets are the convenience layer, this
+    # is the actual guard (and it also covers auto-assign, which has no UI at all).
+    locked_clan_tags = db.get_locked_cwl_clan_tags_sync(event_id)
+    if locked_clan_tags:
+        current_assignment = next(
+            (a for a in db.get_cwl_assignments_sync(event_id) if a["player_tag"] == player_tag), None
+        )
+        current_clan_tag = current_assignment["assigned_clan_tag"] if current_assignment else None
+
+        if current_clan_tag in locked_clan_tags and target_clan_tag != current_clan_tag:
+            if not deliberate:
+                return None
+            name = CACHE.get_clan_name(current_clan_tag, current_clan_tag) or current_clan_tag
+            return (
+                f"{name} has already started CWL — its roster is locked in-game and this player "
+                f"can no longer be moved out of it."
+            )
+        if target_clan_tag in locked_clan_tags and target_clan_tag != current_clan_tag:
+            eligible = db.get_cwl_locked_clan_member_tags_sync(season, target_clan_tag)
+            if player_tag not in eligible:
+                if not deliberate:
+                    return None
+                name = CACHE.get_clan_name(target_clan_tag, target_clan_tag) or target_clan_tag
+                return (
+                    f"{name} has already started CWL and this player was not in the clan when its "
+                    f"roster locked, so they cannot play for it this season."
+                )
+            # Falls through: they WERE in the clan at lock time, so placing them is recording
+            # reality, not changing it.
 
     shared_clans_by_tag = get_event_shared_clans_by_tag_sync(event_id, season)
 
@@ -3249,7 +3301,7 @@ def has_cwl_pending_signups_to_remind(guild_id: int, season: str) -> bool:
 # Phase 5 announces the finished roster to the players on it; Phase 6 then watches who
 # actually moved. Both hang off ONE fact — "is this player already sitting in the clan
 # they were assigned to?" — which is the same green/amber split the Manage Teams board
-# renders (clanMatchClass(), enrollmentBoard.ts). resolve_cwl_start_targets_sync() below
+# renders (clanMatchClass(), enrollmentBoard.ts). resolve_cwl_announcement_targets_sync() below
 # is the single place that computes it, so the board, the announcement DM and the alarms
 # can never disagree about the same player.
 # ----------------------------------------------------------------------------------
@@ -3260,8 +3312,147 @@ def has_cwl_pending_signups_to_remind(guild_id: int, season: str) -> bool:
 # window never re-sends. Ordered most-distant-first.
 _CWL_ALARM_STAGES: List[float] = [24.0, 2.0]
 
+# ----------------------------------------------------------------------------------
+# The four-phase model (2026-08-30, project owner's spec) — Setup -> Enrollment ->
+# Preparation -> War.
+#
+# Phase is DERIVED here and nowhere else, from two inputs: cwl_events.status and whether
+# any participating clan has locked_at set. Deriving it in one place is what lets the step
+# indicator, the button labels and the freeze guards never disagree about where a guild is.
+#
+# Note the deliberate asymmetry between the guild phase and the per-clan one: a guild enters
+# War as soon as the FIRST participating clan starts CWL in-game, while every other clan may
+# still be in Preparation. Clans in one family genuinely start at different times (it's a
+# manual in-game action), so there is no single moment the whole family transitions — which
+# is exactly why the freeze guards are per-clan (locked_at) and only the DISPLAY is per-guild.
+# ----------------------------------------------------------------------------------
 
-def resolve_cwl_start_targets_sync(guild_id: int, event_id: int, season: str) -> Dict[str, Any]:
+CWL_PHASE_SETUP = 1
+CWL_PHASE_ENROLLMENT = 2
+CWL_PHASE_PREPARATION = 3
+CWL_PHASE_WAR = 4
+_CWL_PHASE_KEYS = {
+    CWL_PHASE_SETUP: "setup",
+    CWL_PHASE_ENROLLMENT: "enrollment",
+    CWL_PHASE_PREPARATION: "preparation",
+    CWL_PHASE_WAR: "war",
+}
+
+
+def is_cwl_coordinator_for_current_season(guild_id: int, discord_user_id: int) -> bool:
+    """True when this user is a standing CWL Coordinator (tracker #0046) for a clan that is
+    actually PARTICIPATING in the guild's currently-selected season.
+
+    Grants "Teams Management" board access (2026-08-30, project owner's spec: "Coordinators should
+    get the right to open and use the Teams Management view for this season"). Like the Leader/
+    Co-Leader tier it sits beside, holding it for ONE clan grants the whole board — a coordinator
+    routinely has to move a player between their clan and a sibling, which is impossible if they
+    can only see one column.
+
+    Scoped to participating clans deliberately, per that "for this season" wording: the coordinator
+    config itself is standing and carries forward every CWL month (see cwl_clan_coordinators' own
+    CREATE TABLE comment), so without this scoping a coordinator of a clan sitting out the season
+    would still hold board access for a roster they have nothing to do with.
+
+    Plain sync (Pitfall 26) — two indexed lookups; callers on async paths wrap in one to_thread."""
+    db = CACHE.db_manager
+    if db is None:
+        return False
+    by_clan = CACHE.server_config.get(str(guild_id), {}).get("cwl_clan_coordinators") or {}
+    if not by_clan:
+        return False
+    coordinated = {
+        clan_tag for clan_tag, ids in by_clan.items() if str(discord_user_id) in {str(i) for i in ids}
+    }
+    if not coordinated:
+        return False
+
+    event = db.get_cwl_event_sync(str(guild_id), resolve_selected_cwl_season(guild_id))
+    if event is None or event["status"] == "cancelled":
+        return False
+    return any(
+        c["clan_tag"] in coordinated
+        for c in db.get_cwl_event_clans_sync(event["id"]) if c.get("participating", 1)
+    )
+
+
+def resolve_cwl_phase(
+    event: Optional[Dict[str, Any]], clans: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Which of the four phases a guild's CWL season is in, plus the clan counts the War step
+    needs. The single source of phase truth (see the module comment above).
+
+    Mapping — status is authoritative except that ANY locked participating clan means War, even
+    if the sweep hasn't yet written status='war' (it runs once per cycle, so there is a window
+    where the clan is demonstrably locked and the event row hasn't caught up; the indicator must
+    show reality, not lag behind it):
+        draft        -> 1 Setup
+        signup_open  -> 2 Enrollment
+        announced    -> 3 Preparation
+        war          -> 4 War
+        cancelled    -> phase 0, rendered as no indicator at all
+
+    Returns {"phase", "key", "clans_started", "clans_total"}."""
+    if event is None or event.get("status") == "cancelled":
+        return {"phase": 0, "key": None, "clans_started": 0, "clans_total": 0}
+
+    participating = [c for c in (clans or []) if c.get("participating", 1)]
+    started = sum(1 for c in participating if c.get("locked_at"))
+
+    status = event.get("status")
+    if status == "war" or started:
+        phase = CWL_PHASE_WAR
+    elif status == "announced":
+        phase = CWL_PHASE_PREPARATION
+    elif status == "signup_open":
+        phase = CWL_PHASE_ENROLLMENT
+    else:
+        phase = CWL_PHASE_SETUP
+    return {
+        "phase": phase, "key": _CWL_PHASE_KEYS[phase],
+        "clans_started": started, "clans_total": len(participating),
+    }
+
+
+def render_cwl_step_indicator(phase_info: Dict[str, Any], guild_id: int) -> Optional[str]:
+    """The step indicator shown at the top of the CWL Management embed (2026-08-30, project
+    owner's spec: "a clear visualization of the phases and where we are at the moment ... in the
+    form of a typical step indicator").
+
+    A web-style stepper with connector lines can't be reproduced in a Discord embed, so this uses
+    the same three-state vocabulary a stepper conveys visually — done / current / upcoming — as
+    ✅ / 🔵+bold / ⚪, joined by connectors. Deliberately NOT a code block: those don't render
+    emoji at a useful size and would lose the bold on the current step.
+
+    The War step carries its clan count ("War (2/8 started)") rather than reading as a flat
+    "everyone is at war" — a guild reaches War the moment the FIRST clan starts, while the rest
+    are still moving players around, and a bare label there would actively mislead.
+
+    Returns None when there's no season (or it was cancelled) — nothing to indicate."""
+    from qapbot.i18n import t
+
+    current = phase_info["phase"]
+    if not current:
+        return None
+
+    parts: List[str] = []
+    for step in (CWL_PHASE_SETUP, CWL_PHASE_ENROLLMENT, CWL_PHASE_PREPARATION, CWL_PHASE_WAR):
+        label = t(f'cwl.phase.step_{_CWL_PHASE_KEYS[step]}', guild_id=guild_id)
+        if step == CWL_PHASE_WAR and current == CWL_PHASE_WAR and phase_info["clans_total"]:
+            label = t(
+                'cwl.phase.step_war_progress', guild_id=guild_id,
+                label=label, started=phase_info["clans_started"], total=phase_info["clans_total"],
+            )
+        if step < current:
+            parts.append(f"✅ {label}")
+        elif step == current:
+            parts.append(f"🔵 **{label}**")
+        else:
+            parts.append(f"⚪ {label}")
+    return " ── ".join(parts)
+
+
+def resolve_cwl_announcement_targets_sync(guild_id: int, event_id: int, season: str) -> Dict[str, Any]:
     """Resolve every player assigned to a participating clan of this event, annotated with whether
     they are already in that clan ("green") or still need to move ("amber"), grouped by the Discord
     user to DM.
@@ -3374,7 +3565,7 @@ def resolve_cwl_start_targets_sync(guild_id: int, event_id: int, season: str) ->
     return result
 
 
-def has_cwl_assignments_to_start(guild_id: int, season: str) -> bool:
+def has_cwl_roster_announcements_pending(guild_id: int, season: str) -> bool:
     """Button-gating check for "Start CWL" (Phase 5), mirroring has_cwl_pending_signups_to_remind's
     own shape — true iff at least one assigned player still hasn't had their announcement DM.
 
@@ -3389,10 +3580,10 @@ def has_cwl_assignments_to_start(guild_id: int, season: str) -> bool:
     event = db.get_cwl_event_sync(str(guild_id), season)
     if event is None or event["status"] in ("draft", "cancelled"):
         return False
-    return bool(resolve_cwl_start_targets_sync(guild_id, event["id"], season)["groups"])
+    return bool(resolve_cwl_announcement_targets_sync(guild_id, event["id"], season)["groups"])
 
 
-def _build_cwl_start_account_lines(
+def _build_cwl_roster_account_lines(
     accounts: List[Dict[str, Any]], discord_id: str, guild_id: int,
 ) -> List[str]:
     """One rendered line per assigned account for the "Start CWL" DM — green ("you're already
@@ -3467,7 +3658,7 @@ async def _send_cwl_dm_chunks(discord_id: str, intro: str, lines: List[str]) -> 
     return True, first_outcome
 
 
-async def send_cwl_start_dm_group(
+async def send_cwl_roster_dm_group(
     guild_id: int, season: str, discord_id: str, accounts: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """"Start CWL"'s send, for one Discord user's whole set of assigned accounts at once.
@@ -3490,7 +3681,7 @@ async def send_cwl_start_dm_group(
         user_id=discord_id, guild_id=guild_id,
         display_name=display_name, season=season, count=len(accounts),
     )
-    lines = _build_cwl_start_account_lines(accounts, discord_id, guild_id)
+    lines = _build_cwl_roster_account_lines(accounts, discord_id, guild_id)
     sent, outcome = await _send_cwl_dm_chunks(discord_id, intro, lines)
     if not sent:
         result[outcome].extend(names)
@@ -3499,7 +3690,7 @@ async def send_cwl_start_dm_group(
     return result
 
 
-async def start_cwl(guild_id: int, season: str) -> Dict[str, Any]:
+async def announce_cwl_rosters(guild_id: int, season: str) -> Dict[str, Any]:
     """"Start CWL" (Phase 5): announce the finished roster to every assigned player — where they
     play, when it starts, and (for anyone not yet in their assigned clan) a direct link to move.
 
@@ -3528,7 +3719,7 @@ async def start_cwl(guild_id: int, season: str) -> Dict[str, Any]:
     if event["status"] in ("draft", "cancelled"):
         return {"ok": False, "error": "not_open"}
 
-    targets = await asyncio.to_thread(resolve_cwl_start_targets_sync, guild_id, event["id"], season)
+    targets = await asyncio.to_thread(resolve_cwl_announcement_targets_sync, guild_id, event["id"], season)
     if targets["missing_start_times"]:
         return {
             "ok": False, "error": "missing_start_times",
@@ -3549,7 +3740,7 @@ async def start_cwl(guild_id: int, season: str) -> Dict[str, Any]:
         if _dm_guard_blocks(discord_id):
             summary["skipped_dm_guard"] += len(accounts)
             continue
-        group_result = await send_cwl_start_dm_group(guild_id, season, discord_id, accounts)
+        group_result = await send_cwl_roster_dm_group(guild_id, season, discord_id, accounts)
         summary["contacted"] += group_result["contacted"]
         if group_result["contacted"]:
             summary["contacted_users"] += 1
@@ -3618,7 +3809,7 @@ def resolve_cwl_switch_monitoring_sync(guild_id: int, event_id: int, season: str
     """Phase 6's per-event read: every ANNOUNCED assignment in a still-unlocked participating clan,
     annotated with whether the player has since moved into that clan.
 
-    Deliberately built on resolve_cwl_start_targets_sync's own placement resolution rather than a
+    Deliberately built on resolve_cwl_announcement_targets_sync's own placement resolution rather than a
     second one — "who is assigned where, and are they there yet" is the same question Phase 5 asks,
     and two independent answers to it is exactly how the board and the DMs would drift apart. The
     difference is only which players are interesting: Phase 5 wants the NOT-yet-notified ones,
@@ -3724,7 +3915,7 @@ async def _send_cwl_switch_alarm(account: Dict[str, Any], guild_id: int, stage: 
         f'cwl.alarm.dm_header_stage{stage}',
         user_id=discord_id, guild_id=guild_id, player_name=account["player_name"],
     )
-    lines = _build_cwl_start_account_lines([{**account, "in_clan": False}], str(discord_id), guild_id)
+    lines = _build_cwl_roster_account_lines([{**account, "in_clan": False}], str(discord_id), guild_id)
     sent, _outcome = await _send_cwl_dm_chunks(str(discord_id), header, lines)
     return sent
 
@@ -3764,6 +3955,122 @@ async def _notify_cwl_coordinators_of_missing(
     return sent_count
 
 
+async def snapshot_cwl_locked_clan_roster(clan_tag: str, season: str) -> int:
+    """Capture who was actually in a clan when its CWL roster locked — the one moment this is
+    knowable (see cwl_locked_clan_members' CREATE TABLE comment).
+
+    Primary source is the CoC league group (CACHE.get_league_group, an existing cache_manager
+    wrapper per Cardinal Rule 9), which returns the authoritative locked roster straight from the
+    game. One call per clan per season, so the cost is negligible even for a large family.
+
+    Falls back to live user_players membership if that call fails or the clan isn't in the group
+    response yet — lock detection must never block on the API. The fallback is genuinely less
+    accurate (a player who left between the real in-game lock and this cycle's detection is
+    wrongly excluded), which is exactly why `source` is stored per row: a later investigation can
+    tell an authoritative snapshot from a best-effort one instead of guessing.
+
+    Returns the number of members recorded; 0 means a snapshot already existed (write-once)."""
+    db = CACHE.db_manager
+    if db is None:
+        return 0
+    if await asyncio.to_thread(db.get_cwl_locked_clan_member_tags_sync, season, clan_tag):
+        return 0  # already snapshotted — never re-taken, membership has drifted since
+
+    members: List[Dict[str, Any]] = []
+    source = "league_group"
+    try:
+        group = await CACHE.get_league_group(clan_tag)
+        for group_clan in (getattr(group, "clans", None) or []):
+            if str(getattr(group_clan, "tag", "")).upper() != clan_tag.upper():
+                continue
+            for member in (getattr(group_clan, "members", None) or []):
+                members.append({
+                    "player_tag": str(member.tag), "player_name": getattr(member, "name", None),
+                })
+    except Exception as e:
+        logging.warning(f"[CWL-LOCK] get_league_group({clan_tag}) failed, falling back to live membership: {e}")
+
+    if not members:
+        source = "live_membership"
+        members = [
+            {"player_tag": m["player_tag"], "player_name": m["player_name"]}
+            for m in await asyncio.to_thread(db.get_current_clan_members_sync, [clan_tag])
+        ]
+    stored = await asyncio.to_thread(db.store_cwl_locked_clan_members_sync, season, clan_tag, members, source)
+    logging.info(f"[CWL-LOCK] {clan_tag} {season}: locked roster snapshot = {stored} member(s) via {source}")
+    return stored
+
+
+async def reconcile_cwl_locked_clan_roster(
+    guild_id: int, event_id: int, season: str, clan_tag: str, clan_name: str,
+) -> Dict[str, Any]:
+    """Bring a just-locked clan's board roster in line with reality (2026-08-30, project owner's
+    spec): "A player that did not switch to the clan in time should be removed from that clan's
+    player roster and be sent to the unassigned pool instead."
+
+    Whoever is assigned to this clan but wasn't in it at lock time physically cannot play for it,
+    so their assignment is removed and they return to the pool where a lead can still place them
+    somewhere else. Each such player is DMed once — they were told to move, they didn't, and
+    silently dropping them means they turn up expecting to play (confirmed decision, 2026-08-30).
+
+    Deliberately DOES NOT touch anyone who IS eligible, and never adds anyone: a player who was in
+    the clan at lock time but sits unassigned on the board stays unassigned. They remain eligible
+    and a lead may drag them in (the one exception to the freeze), but that is a human decision
+    about who actually plays, not something to guess automatically."""
+    db = CACHE.db_manager
+    result: Dict[str, Any] = {"dropped": 0, "dm_sent": 0}
+    if db is None:
+        return result
+
+    eligible = await asyncio.to_thread(db.get_cwl_locked_clan_member_tags_sync, season, clan_tag)
+    if not eligible:
+        # No snapshot (API failed AND no live membership on record) — dropping the whole roster on
+        # the strength of an empty set would be catastrophic and wrong, so do nothing at all.
+        logging.warning(f"[CWL-LOCK] {clan_tag} {season}: no locked-roster snapshot, skipping reconciliation")
+        return result
+
+    assignments = await asyncio.to_thread(db.get_cwl_assignments_sync, event_id)
+    no_shows = [
+        a for a in assignments
+        if a["assigned_clan_tag"] == clan_tag and a["player_tag"] not in eligible
+    ]
+    if not no_shows:
+        return result
+
+    links = await asyncio.to_thread(db.get_player_links_sync, [a["player_tag"] for a in no_shows])
+    signup_names = {
+        s["player_tag"]: s["player_name"]
+        for s in await asyncio.to_thread(db.get_cwl_signups_for_event_sync, event_id)
+    }
+    from qapbot.i18n import t
+
+    for assignment in no_shows:
+        tag = assignment["player_tag"]
+        link = links.get(tag) or {}
+        player_name = signup_names.get(tag) or link.get("player_name") or tag
+        await asyncio.to_thread(db.delete_cwl_assignment_sync, event_id, tag)
+        result["dropped"] += 1
+        discord_id = link.get("discord_id")
+        # Only worth a DM if they were actually told to be there in the first place.
+        if not assignment["notified"] or not discord_id or _dm_guard_blocks(str(discord_id)):
+            continue
+        sent, _outcome = await CACHE.send_user_dm_detailed(
+            str(discord_id),
+            t(
+                'cwl.alarm.dm_missed_lock',
+                user_id=str(discord_id), guild_id=guild_id,
+                player_name=player_name, clan_name=clan_name, season=season,
+            ),
+        )
+        if sent:
+            result["dm_sent"] += 1
+    logging.info(
+        f"[CWL-LOCK] {clan_tag} {season} (guild {guild_id}): dropped {result['dropped']} no-show(s) "
+        f"to the unassigned pool, {result['dm_sent']} DM(s) sent"
+    )
+    return result
+
+
 async def check_cwl_roster_switches() -> Dict[str, int]:
     """Phase 6's once-per-cycle sweep: detect who has moved into their assigned clan, escalate to
     those who haven't, and stop entirely per clan the moment its CWL roster locks.
@@ -3781,11 +4088,14 @@ async def check_cwl_roster_switches() -> Dict[str, int]:
 
     Returns per-sweep counters for the caller's log line."""
     db = CACHE.db_manager
-    counters = {"events": 0, "locked": 0, "switched": 0, "alarms": 0, "coordinator_dms": 0}
+    counters = {
+        "events": 0, "locked": 0, "switched": 0, "alarms": 0, "coordinator_dms": 0,
+        "no_shows_dropped": 0, "entered_war": 0,
+    }
     if db is None:
         return counters
 
-    events = await asyncio.to_thread(db.get_announced_cwl_events_sync)
+    events = await asyncio.to_thread(db.get_active_cwl_events_sync)
     for event in events:
         guild_id = int(event["guild_id"])
         season = event["cwl_season"]
@@ -3807,6 +4117,7 @@ async def check_cwl_roster_switches() -> Dict[str, int]:
                 locked_now |= await asyncio.to_thread(
                     db.get_clans_in_cwl_league_group_sync, still_open, season
                 )
+            clan_names = {c["clan_tag"]: CACHE.get_clan_name(c["clan_tag"], c["clan_tag"]) for c in clans}
             for clan_tag in locked_now:
                 stamped = await asyncio.to_thread(db.mark_cwl_event_clan_locked_sync, clan_tag, season)
                 if stamped:
@@ -3815,6 +4126,30 @@ async def check_cwl_roster_switches() -> Dict[str, int]:
                         f"[CWL-SWITCH] {clan_tag} season={season}: CWL roster observed locked — "
                         f"switch monitoring stops for {stamped} event-clan row(s)"
                     )
+                # Snapshot + reconcile run for this guild's event even when `stamped` is 0 (another
+                # guild's sweep pass may have stamped the shared clan first) — the snapshot is
+                # write-once on its own, and each guild still has to clean up ITS OWN board.
+                await snapshot_cwl_locked_clan_roster(clan_tag, season)
+                reconciled = await reconcile_cwl_locked_clan_roster(
+                    guild_id, event["id"], season, clan_tag, clan_names.get(clan_tag, clan_tag)
+                )
+                counters["no_shows_dropped"] += reconciled["dropped"]
+
+        # A guild enters War phase the moment its FIRST participating clan starts in-game
+        # (2026-08-30, project owner's spec). Re-read rather than reusing `clans` above, which was
+        # fetched before this cycle's own locks were stamped.
+        if event["status"] == "announced":
+            refreshed = await asyncio.to_thread(db.get_cwl_event_clans_sync, event["id"])
+            if any(c.get("participating", 1) and c.get("locked_at") for c in refreshed):
+                await asyncio.to_thread(db.update_cwl_event_status_sync, event["id"], "war")
+                counters["entered_war"] += 1
+                logging.info(
+                    f"[CWL-SWITCH] guild={guild_id} season={season}: first clan started CWL — "
+                    f"event {event['id']} moved to war phase"
+                )
+                from qapbot.ui_cwl_roster import refresh_cwl_management_hub_message
+
+                await refresh_cwl_management_hub_message(guild_id)
 
         # 2. Switch detection + escalation for whatever is still open.
         monitoring = await asyncio.to_thread(
@@ -3860,11 +4195,12 @@ async def check_cwl_roster_switches() -> Dict[str, int]:
                 guild_id, clan_tag, missing[0]["clan_name"], missing, season
             )
 
-    if any(counters[key] for key in ("locked", "switched", "alarms", "coordinator_dms")):
+    if any(counters[key] for key in ("locked", "switched", "alarms", "coordinator_dms", "entered_war")):
         logging.info(
             f"[CWL-SWITCH] Sweep: events={counters['events']} locked={counters['locked']} "
             f"switched={counters['switched']} alarms={counters['alarms']} "
-            f"coordinator_dms={counters['coordinator_dms']}"
+            f"coordinator_dms={counters['coordinator_dms']} "
+            f"no_shows_dropped={counters['no_shows_dropped']} entered_war={counters['entered_war']}"
         )
     return counters
 

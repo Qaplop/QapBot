@@ -946,6 +946,7 @@
       "event_status_draft": "Draft",
       "event_status_signup_open": "Sign-Up Open",
       "event_status_finalized": "Finalized",
+      "event_status_war": "War running",
       "event_status_announced": "Announced",
       "event_status_cancelled": "Cancelled",
       "no_clans_configured": "No clans configured yet.",
@@ -1016,18 +1017,19 @@
       "remind_pending_error_not_open": "⚠️ Enrollment hasn't been started yet for this season.",
       "still_missing_block_title": "⚠️ Still Missing (not yet in their assigned clan)",
       "still_missing_locked": "CWL started — roster locked",
-      "button_start_cwl": "Start CWL",
-      "button_confirm_start_cwl": "Yes, announce the roster",
-      "start_cwl_confirm_body": "\ud83d\udce3 Announce the CWL roster for season **{season}** to every assigned player? Everyone already in their assigned clan is told when their CWL starts; everyone who still has to move gets their clan, the deadline and a direct join link.",
-      "start_cwl_processing": "\u23f3 Announcing the roster, this can take a few seconds\u2026",
-      "start_cwl_summary": "\u2705 Done.\nAnnounced (accounts): {contacted}\nAnnounced (Discord users): {contacted_users}\nSkipped (DM guard): {skipped_dm_guard}\nSkipped (no linked account): {skipped_unlinked}\nSkipped (clan managed by another guild): {skipped_not_owner}{dm_issues}",
-      "start_cwl_cancelled": "\u274c Cancelled \u2014 nothing was announced.",
-      "start_cwl_unlinked_line": "\n\u26a0\ufe0f No linked Discord account, please tell them yourself: {names}",
-      "start_cwl_error_no_database": "\u26a0\ufe0f Database not ready \u2014 try again shortly.",
-      "start_cwl_error_no_event": "\u26a0\ufe0f No CWL event found for this season anymore \u2014 it may have been deleted.",
-      "start_cwl_error_not_open": "\u26a0\ufe0f Enrollment hasn't been started yet for this season.",
-      "start_cwl_error_nobody_to_notify": "\u26a0\ufe0f Nobody to announce to \u2014 no player is assigned to a participating clan yet.",
-      "start_cwl_error_missing_start_times": "\u26a0\ufe0f These clans still have no CWL start time, so nothing was announced: **{clans}**\nSet it per clan in \"Configure Participating Clans\", then try again."
+      "delete_blocked_war_started": "\u26d4 This season can no longer be deleted \u2014 CWL has already started in-game for: **{clans}**.\nTheir rosters are locked by the game and deleting the season would destroy records of a war that is actually being played.",
+      "button_announce_rosters": "Announce Rosters",
+      "button_confirm_announce_rosters": "Yes, announce the rosters",
+      "announce_rosters_confirm_body": "\ud83d\udce3 Announce the CWL roster for season **{season}** to every assigned player? Everyone already in their assigned clan is told when their CWL starts; everyone who still has to move gets their clan, the deadline and a direct join link.",
+      "announce_rosters_processing": "\u23f3 Announcing the roster, this can take a few seconds\u2026",
+      "announce_rosters_summary": "\u2705 Done.\nAnnounced (accounts): {contacted}\nAnnounced (Discord users): {contacted_users}\nSkipped (DM guard): {skipped_dm_guard}\nSkipped (no linked account): {skipped_unlinked}\nSkipped (clan managed by another guild): {skipped_not_owner}{dm_issues}",
+      "announce_rosters_cancelled": "\u274c Cancelled \u2014 nothing was announced.",
+      "announce_rosters_unlinked_line": "\n\u26a0\ufe0f No linked Discord account, please tell them yourself: {names}",
+      "announce_rosters_error_no_database": "\u26a0\ufe0f Database not ready \u2014 try again shortly.",
+      "announce_rosters_error_no_event": "\u26a0\ufe0f No CWL event found for this season anymore \u2014 it may have been deleted.",
+      "announce_rosters_error_not_open": "\u26a0\ufe0f Enrollment hasn't been started yet for this season.",
+      "announce_rosters_error_nobody_to_notify": "\u26a0\ufe0f Nobody to announce to \u2014 no player is assigned to a participating clan yet.",
+      "announce_rosters_error_missing_start_times": "\u26a0\ufe0f These clans still have no CWL start time, so nothing was announced: **{clans}**\nSet it per clan in \"Configure Participating Clans\", then try again."
     },
     "player_hub": {
       "title": "🛡️ Your CWL Preferences",
@@ -1086,6 +1088,13 @@
       "signup_closed": "⚠️ Sign-up isn't open for this season anymore.",
       "db_unavailable": "⚠️ Database not ready — try again shortly."
     },
+    "phase": {
+      "step_setup": "Setup",
+      "step_enrollment": "Enrollment",
+      "step_preparation": "Preparation",
+      "step_war": "War",
+      "step_war_progress": "{label} ({started}/{total} started)"
+    },
     "start": {
       "dm_intro": "\ud83d\udce3 Hi **{display_name}**, the CWL roster for season **{season}** is set \u2014 here is where you play ({count} account(s)):",
       "dm_line_green": "\n\u2705 **{player_name}** \u2014 you're already in **{clan_name}**. Your CWL starts {start_full} ({start_rel}). Nothing to do, just stay put.",
@@ -1093,6 +1102,7 @@
       "dm_unknown_clan": "no clan"
     },
     "alarm": {
+      "dm_missed_lock": "\u26a0\ufe0f **{player_name}** \u2014 CWL has started for **{clan_name}** ({season}) and you were not in the clan in time, so you are not in their roster this season.\n\nYou are back in the pool \u2014 your lead may still place you in another clan.",
       "dm_header_stage1": "\u23f0 **{player_name}** \u2014 reminder: you haven't moved to your CWL clan yet.",
       "dm_header_stage2": "\ud83d\udea8 **{player_name}** \u2014 URGENT: CWL is about to start and you're still not in your assigned clan!",
       "coordinator_body": "\ud83d\udea8 CWL **{season}** \u2014 **{clan_name}** starts {start_rel} and {count} assigned player(s) still haven't joined:\n{names}"

@@ -146,7 +146,13 @@ async def _resolve_admin_or_leader(guild_id: int, discord_user_id: int) -> bool:
         return True
     if coleader_role_id and int(coleader_role_id) in member_role_ids:
         return True
-    return False
+
+    # Third access tier (2026-08-30, project owner's spec): a standing CWL Coordinator of a clan
+    # participating in this season. Checked LAST because it's the only tier needing DB reads —
+    # admin and role checks are in-memory, so the common case never pays for this.
+    from qapbot.QBdiscocmdshelper_cwl import is_cwl_coordinator_for_current_season
+
+    return await asyncio.to_thread(is_cwl_coordinator_for_current_season, guild_id, discord_user_id)
 
 
 # Enrollment-board version counter + notification primitive (2026-08-17,
@@ -2321,6 +2327,44 @@ def _prepare_and_save_clan_config_sync(db: Any, guild_id: int, season: str, clan
         }
         for idx, c in enumerate(clans_in)
     ]
+    # Locked-clan freeze (2026-08-30, project owner's spec: "As soon as a clan started their cwl
+    # season in-game it can no longer be removed from the clan roster"). A clan whose CWL is
+    # already running in-game has its settings forced back to what's stored, exactly like the
+    # shared-clan guard right below does for a non-owner guild — the frontend renders these rows
+    # read-only, and this is the server-side half that makes it real rather than cosmetic.
+    # Silently overriding (rather than 4xx-ing the whole save) is deliberate and matches that
+    # existing guard: one frozen clan must not block an admin's legitimate edits to every other
+    # clan in the same save.
+    locked_rows = {c["clan_tag"]: c for c in existing_rows if c.get("locked_at")}
+    for config in clan_configs:
+        locked = locked_rows.get(config["clan_tag"])
+        if locked is None:
+            continue
+        config["participating"] = bool(locked.get("participating", 1))
+        config["roster_size"] = locked["roster_size"]
+        config["cwl_start_at"] = locked["cwl_start_at"]
+        logging.info(
+            f"[CWL-FREEZE] guild {guild_id} event {event_id}: {config['clan_tag']} has started CWL "
+            f"in-game — submitted changes ignored, stored settings kept"
+        )
+    # A locked clan omitted from the payload entirely would lose its row (set_cwl_event_clans_sync
+    # deletes anything not sent), which would silently un-freeze it. Re-append it instead.
+    sent_tags = {c["clan_tag"] for c in clan_configs}
+    for clan_tag, row in locked_rows.items():
+        if clan_tag in sent_tags:
+            continue
+        clan_configs.append({
+            "clan_tag": clan_tag,
+            "target_league_rank": row["target_league_rank"],
+            "roster_size": row["roster_size"],
+            "tier_order": row["tier_order"],
+            "cwl_start_at": row["cwl_start_at"],
+            "participating": bool(row.get("participating", 1)),
+        })
+        logging.warning(
+            f"[CWL-FREEZE] guild {guild_id} event {event_id}: {clan_tag} was omitted from a save "
+            f"but has already started CWL — row restored"
+        )
     # Cross-guild shared-clan settings guard (2026-08-15 follow-up, project owner's spec) — a
     # clan already shared with another guild has exactly ONE canonical roster_size/cwl_start_at/
     # target_league_rank: the OWNER's. A non-owner guild's own form must never be able to persist

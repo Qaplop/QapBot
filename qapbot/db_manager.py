@@ -2345,6 +2345,39 @@ class WarHistoryDB:
             "CREATE INDEX IF NOT EXISTS idx_cwl_shared_clan_players_shared_clan ON cwl_shared_clan_players(shared_clan_id)"
         )
 
+        # The roster a clan was actually locked into when its CWL started in-game (2026-08-30,
+        # plans/cwl-phase-model-and-war-phase.md). Snapshotted ONCE per clan per season, at the
+        # moment lock is first detected, because it cannot be reconstructed afterwards:
+        # user_players.current_clan_tag is live data that drifts as people leave, so "was this
+        # player in the clan when it started?" has no answer later unless it was written down then.
+        #
+        # Two consumers, both of which need exactly this set and not live membership:
+        #   - the no-show reconciliation (an assigned player who never transferred in is dropped
+        #     to the unassigned pool, since they physically cannot play for that clan), and
+        #   - the one permitted exception to the roster freeze: a player who WAS in the clan at
+        #     lock time is still eligible and may be dragged into it even during War phase.
+        #
+        # Keyed by (cwl_season, clan_tag), never by event_id — a roster lock is a fact about the
+        # clan in the real world, shared by every guild that configured it, exactly like
+        # cwl_shared_clans. Deliberately no FK on clan_tag: this is a historical record of what
+        # happened and must survive the clan later being purged from `clans`.
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS cwl_locked_clan_members (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                cwl_season  TEXT    NOT NULL,
+                clan_tag    TEXT    NOT NULL,
+                player_tag  TEXT    NOT NULL,
+                player_name TEXT,
+                source      TEXT    NOT NULL,  -- league_group (authoritative) | live_membership (fallback)
+                created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+                UNIQUE (cwl_season, clan_tag, player_tag)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cwl_locked_clan_members_clan "
+            "ON cwl_locked_clan_members(cwl_season, clan_tag)"
+        )
+
         # Global, cross-guild CWL player status (2026-08-18, CWL_ENROLLMENT_PLAYER_POOL_REDESIGN_
         # PLAN.md, rule h, project owner's spec: "a normalized data model") — one row per
         # real-world player per CWL season, independent of which guild(s)/clan(s) currently pool
@@ -4334,12 +4367,31 @@ class WarHistoryDB:
         with self._sync_conn() as conn:
             try:
                 with self._sync_write_lock:
+                    # Carry forward the columns this method's callers do NOT own (2026-08-30).
+                    # `locked_at` is written exclusively by the switch sweep when a clan's CWL
+                    # actually starts in-game, and `created_at` records when the row first
+                    # appeared — neither is part of "the admin's clan configuration", so a
+                    # DELETE + INSERT that dropped them would silently UN-FREEZE every locked clan
+                    # on the next ordinary save of the config screen (and bounce the guild's phase
+                    # indicator back out of War). Preserved here rather than at the call sites so a
+                    # caller cannot forget: this method's contract is "replace the configuration",
+                    # not "reset facts the configuration doesn't own".
+                    # dict(row), not the raw sqlite3.Row — Row supports named indexing but has no
+                    # .get(), and these lookups need a default for a clan that has no prior row.
+                    preserved = {
+                        row["clan_tag"]: dict(row)
+                        for row in conn.execute(
+                            "SELECT clan_tag, locked_at, created_at FROM cwl_event_clans WHERE event_id = ?",
+                            (event_id,),
+                        ).fetchall()
+                    }
                     conn.execute("DELETE FROM cwl_event_clans WHERE event_id = ?", (event_id,))
                     conn.executemany(
                         """
                         INSERT INTO cwl_event_clans
-                            (event_id, clan_tag, target_league_rank, roster_size, tier_order, cwl_start_at, participating)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                            (event_id, clan_tag, target_league_rank, roster_size, tier_order, cwl_start_at,
+                             participating, locked_at, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
                         """,
                         [
                             (
@@ -4350,6 +4402,8 @@ class WarHistoryDB:
                                 cfg.get("tier_order", 0),
                                 cfg.get("cwl_start_at"),
                                 1 if cfg.get("participating", True) else 0,
+                                preserved.get(cfg["clan_tag"], {}).get("locked_at"),
+                                preserved.get(cfg["clan_tag"], {}).get("created_at"),
                             )
                             for cfg in clan_configs
                         ],
@@ -5957,11 +6011,16 @@ class WarHistoryDB:
                 conn.rollback()
                 return 0
 
-    def get_announced_cwl_events_sync(self) -> List[Dict[str, Any]]:
-        """Every event currently in 'announced' — i.e. "Start CWL" has run and Phase 6's switch
-        monitoring applies. Fleet-wide (all guilds) since the monitoring sweep runs once per cycle
-        for the whole bot, not per guild. Kept trivially small in practice: at most one row per
-        guild per active CWL month."""
+    def get_active_cwl_events_sync(self) -> List[Dict[str, Any]]:
+        """Every event in 'announced' OR 'war' — i.e. rosters have been announced and the switch
+        monitoring sweep applies. Fleet-wide (all guilds) since that sweep runs once per cycle for
+        the whole bot, not per guild. Kept trivially small in practice: at most one row per guild
+        per active CWL month.
+
+        'war' MUST be included (2026-08-30): a guild enters war status the moment its FIRST clan
+        starts CWL in-game, while every other participating clan may still be waiting for players
+        to transfer in. Scoping this to 'announced' alone would switch monitoring off for the whole
+        guild at exactly the point the no-show reconciliation matters most."""
         import sqlite3
 
         if not self.db_path:
@@ -5970,12 +6029,89 @@ class WarHistoryDB:
         with self._sync_conn() as conn:
             try:
                 rows = conn.execute(
-                    "SELECT * FROM cwl_events WHERE status = 'announced'"
+                    "SELECT * FROM cwl_events WHERE status IN ('announced', 'war')"
                 ).fetchall()
                 return [dict(row) for row in rows]
             except sqlite3.Error as e:
-                logging.error(f"[DB-QUERY-SYNC] get_announced_cwl_events_sync failed: {e}")
+                logging.error(f"[DB-QUERY-SYNC] get_active_cwl_events_sync failed: {e}")
                 return []
+
+    def store_cwl_locked_clan_members_sync(
+        self, cwl_season: str, clan_tag: str, members: List[Dict[str, Any]], source: str,
+    ) -> int:
+        """Persist the roster a clan was locked into (see the table's CREATE TABLE comment).
+
+        Write-once by construction: `INSERT OR IGNORE`, so a later cycle re-observing the same lock
+        can never overwrite or extend the original snapshot with membership that has drifted since.
+        Returns the number of rows actually inserted (0 on a re-run)."""
+        import sqlite3
+
+        if not self.db_path or not members:
+            return 0
+
+        with self._sync_conn() as conn:
+            try:
+                with self._sync_write_lock:
+                    cursor = conn.executemany(
+                        "INSERT OR IGNORE INTO cwl_locked_clan_members "
+                        "(cwl_season, clan_tag, player_tag, player_name, source) VALUES (?, ?, ?, ?, ?)",
+                        [
+                            (cwl_season, clan_tag, m["player_tag"], m.get("player_name"), source)
+                            for m in members
+                        ],
+                    )
+                    if self._should_commit():
+                        conn.commit()
+                return cursor.rowcount or 0
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-WRITE-SYNC] store_cwl_locked_clan_members_sync failed for {clan_tag} {cwl_season}: {e}"
+                )
+                conn.rollback()
+                return 0
+
+    def get_cwl_locked_clan_member_tags_sync(self, cwl_season: str, clan_tag: str) -> Set[str]:
+        """The player_tags eligible to play for this clan this season — i.e. who was actually in it
+        when its CWL roster locked. Empty set when the clan isn't locked (or the snapshot failed),
+        which every caller must read as "no freeze applies", never as "nobody is eligible"."""
+        import sqlite3
+
+        if not self.db_path:
+            return set()
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT player_tag FROM cwl_locked_clan_members WHERE cwl_season = ? AND clan_tag = ?",
+                    (cwl_season, clan_tag),
+                ).fetchall()
+                return {row["player_tag"] for row in rows}
+            except sqlite3.Error as e:
+                logging.error(
+                    f"[DB-QUERY-SYNC] get_cwl_locked_clan_member_tags_sync failed for {clan_tag} {cwl_season}: {e}"
+                )
+                return set()
+
+    def get_locked_cwl_clan_tags_sync(self, event_id: int) -> Set[str]:
+        """Which of an event's participating clans have already started CWL in-game — the set every
+        freeze guard is expressed against. One query rather than a scan of the caller's clan list,
+        since the board's assign endpoint checks this on every single drag."""
+        import sqlite3
+
+        if not self.db_path:
+            return set()
+
+        with self._sync_conn() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT clan_tag FROM cwl_event_clans "
+                    "WHERE event_id = ? AND participating = 1 AND locked_at IS NOT NULL",
+                    (event_id,),
+                ).fetchall()
+                return {row["clan_tag"] for row in rows}
+            except sqlite3.Error as e:
+                logging.error(f"[DB-QUERY-SYNC] get_locked_cwl_clan_tags_sync failed for event {event_id}: {e}")
+                return set()
 
     # ------------------------------------------------------------------
     # Cross-guild shared CWL clans (2026-08-15) — see cwl_shared_clans'

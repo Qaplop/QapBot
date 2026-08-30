@@ -946,6 +946,7 @@
       "event_status_draft": "Entwurf",
       "event_status_signup_open": "Anmeldung offen",
       "event_status_finalized": "Finalisiert",
+      "event_status_war": "Krieg läuft",
       "event_status_announced": "Angekündigt",
       "event_status_cancelled": "Abgebrochen",
       "no_clans_configured": "Noch keine Clans konfiguriert.",
@@ -1016,18 +1017,19 @@
       "remind_pending_error_not_open": "⚠️ Die Anmeldephase für diese Saison wurde noch nicht gestartet.",
       "still_missing_block_title": "⚠️ Fehlen noch (nicht im zugewiesenen Clan)",
       "still_missing_locked": "CWL gestartet — Aufstellung gesperrt",
-      "button_start_cwl": "CWL starten",
-      "button_confirm_start_cwl": "Ja, Aufstellung bekannt geben",
-      "start_cwl_confirm_body": "\ud83d\udce3 Soll die CWL-Aufstellung f\u00fcr Saison **{season}** an alle zugewiesenen Spieler gesendet werden? Wer bereits im zugewiesenen Clan ist, erf\u00e4hrt, wann seine CWL startet; wer noch wechseln muss, bekommt Clan, Zeitpunkt und einen direkten Beitrittslink.",
-      "start_cwl_processing": "\u23f3 Aufstellung wird bekannt gegeben, dies kann einige Sekunden dauern\u2026",
-      "start_cwl_summary": "\u2705 Fertig.\nBenachrichtigt (Accounts): {contacted}\nBenachrichtigt (Discord-Nutzer): {contacted_users}\n\u00dcbersprungen (DM-Schutz): {skipped_dm_guard}\n\u00dcbersprungen (kein verkn\u00fcpfter Account): {skipped_unlinked}\n\u00dcbersprungen (Clan wird von einer anderen Gilde verwaltet): {skipped_not_owner}{dm_issues}",
-      "start_cwl_cancelled": "\u274c Abgebrochen \u2014 es wurde nichts bekannt gegeben.",
-      "start_cwl_unlinked_line": "\n\u26a0\ufe0f Kein verkn\u00fcpfter Discord-Account, bitte selbst Bescheid geben: {names}",
-      "start_cwl_error_no_database": "\u26a0\ufe0f Datenbank nicht bereit \u2014 bitte gleich erneut versuchen.",
-      "start_cwl_error_no_event": "\u26a0\ufe0f F\u00fcr diese Saison wurde kein CWL-Event mehr gefunden \u2014 es wurde m\u00f6glicherweise gel\u00f6scht.",
-      "start_cwl_error_not_open": "\u26a0\ufe0f Die Anmeldephase f\u00fcr diese Saison wurde noch nicht gestartet.",
-      "start_cwl_error_nobody_to_notify": "\u26a0\ufe0f Niemand zu benachrichtigen \u2014 es ist noch kein Spieler einem teilnehmenden Clan zugewiesen.",
-      "start_cwl_error_missing_start_times": "\u26a0\ufe0f F\u00fcr diese Clans ist noch keine CWL-Startzeit gesetzt, daher wurde nichts bekannt gegeben: **{clans}**\nSetze sie pro Clan unter \"Teilnehmende Clans konfigurieren\" und versuche es erneut."
+      "delete_blocked_war_started": "\u26d4 Diese Saison kann nicht mehr gel\u00f6scht werden \u2014 die CWL hat im Spiel bereits begonnen f\u00fcr: **{clans}**.\nDeren Aufstellungen sind im Spiel gesperrt und ein L\u00f6schen w\u00fcrde Daten eines laufenden Krieges vernichten.",
+      "button_announce_rosters": "Aufstellung bekannt geben",
+      "button_confirm_announce_rosters": "Ja, Aufstellung bekannt geben",
+      "announce_rosters_confirm_body": "\ud83d\udce3 Soll die CWL-Aufstellung f\u00fcr Saison **{season}** an alle zugewiesenen Spieler gesendet werden? Wer bereits im zugewiesenen Clan ist, erf\u00e4hrt, wann seine CWL startet; wer noch wechseln muss, bekommt Clan, Zeitpunkt und einen direkten Beitrittslink.",
+      "announce_rosters_processing": "\u23f3 Aufstellung wird bekannt gegeben, dies kann einige Sekunden dauern\u2026",
+      "announce_rosters_summary": "\u2705 Fertig.\nBenachrichtigt (Accounts): {contacted}\nBenachrichtigt (Discord-Nutzer): {contacted_users}\n\u00dcbersprungen (DM-Schutz): {skipped_dm_guard}\n\u00dcbersprungen (kein verkn\u00fcpfter Account): {skipped_unlinked}\n\u00dcbersprungen (Clan wird von einer anderen Gilde verwaltet): {skipped_not_owner}{dm_issues}",
+      "announce_rosters_cancelled": "\u274c Abgebrochen \u2014 es wurde nichts bekannt gegeben.",
+      "announce_rosters_unlinked_line": "\n\u26a0\ufe0f Kein verkn\u00fcpfter Discord-Account, bitte selbst Bescheid geben: {names}",
+      "announce_rosters_error_no_database": "\u26a0\ufe0f Datenbank nicht bereit \u2014 bitte gleich erneut versuchen.",
+      "announce_rosters_error_no_event": "\u26a0\ufe0f F\u00fcr diese Saison wurde kein CWL-Event mehr gefunden \u2014 es wurde m\u00f6glicherweise gel\u00f6scht.",
+      "announce_rosters_error_not_open": "\u26a0\ufe0f Die Anmeldephase f\u00fcr diese Saison wurde noch nicht gestartet.",
+      "announce_rosters_error_nobody_to_notify": "\u26a0\ufe0f Niemand zu benachrichtigen \u2014 es ist noch kein Spieler einem teilnehmenden Clan zugewiesen.",
+      "announce_rosters_error_missing_start_times": "\u26a0\ufe0f F\u00fcr diese Clans ist noch keine CWL-Startzeit gesetzt, daher wurde nichts bekannt gegeben: **{clans}**\nSetze sie pro Clan unter \"Teilnehmende Clans konfigurieren\" und versuche es erneut."
     },
     "player_hub": {
       "title": "🛡️ Deine CWL-Einstellungen",
@@ -1086,6 +1088,13 @@
       "signup_closed": "⚠️ Die Anmeldung ist für diese Saison nicht mehr offen.",
       "db_unavailable": "⚠️ Datenbank nicht bereit — bitte gleich erneut versuchen."
     },
+    "phase": {
+      "step_setup": "Einrichtung",
+      "step_enrollment": "Anmeldung",
+      "step_preparation": "Vorbereitung",
+      "step_war": "Krieg",
+      "step_war_progress": "{label} ({started}/{total} gestartet)"
+    },
     "start": {
       "dm_intro": "\ud83d\udce3 Hallo **{display_name}**, die CWL-Aufstellung f\u00fcr Saison **{season}** steht \u2014 hier spielst du ({count} Account(s)):",
       "dm_line_green": "\n\u2705 **{player_name}** \u2014 du bist bereits in **{clan_name}**. Deine CWL startet {start_full} ({start_rel}). Du musst nichts tun, bleib einfach dort.",
@@ -1093,6 +1102,7 @@
       "dm_unknown_clan": "keinem Clan"
     },
     "alarm": {
+      "dm_missed_lock": "\u26a0\ufe0f **{player_name}** \u2014 die CWL von **{clan_name}** ({season}) hat begonnen und du warst nicht rechtzeitig im Clan, daher bist du diese Saison nicht in deren Aufstellung.\n\nDu bist zur\u00fcck im Pool \u2014 deine Leitung kann dich noch einem anderen Clan zuweisen.",
       "dm_header_stage1": "\u23f0 **{player_name}** \u2014 Erinnerung: du bist noch nicht in deinen CWL-Clan gewechselt.",
       "dm_header_stage2": "\ud83d\udea8 **{player_name}** \u2014 DRINGEND: die CWL startet gleich und du bist immer noch nicht in deinem zugewiesenen Clan!",
       "coordinator_body": "\ud83d\udea8 CWL **{season}** \u2014 **{clan_name}** startet {start_rel} und {count} zugewiesene Spieler sind noch nicht beigetreten:\n{names}"
