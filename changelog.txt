@@ -29,6 +29,19 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   (confirmed/declined/auto_confirmed), matching the board's own rule exactly. qapbot/QBdiscocmdshelper_cwl.py.
   1 new test. Full suite: 2852 passed, 4 deselected.
 
+2026-08-30 (33)
+- Deployed: activity/server (Worker, version f54e977f) and activity/client (Pages, 7c4945f8) to
+  DEV. Both halves were required this time -- the Worker gained /cwl/enrollment/send-updates, and
+  a stale Worker would have failed the board's new "Send Roster Updates" button silently with
+  "not found" while the client looked perfectly fine. PROD deliberately untouched.
+- Added: dedicated tests for the clan add/remove paths during Preparation phase -- removal
+  tombstoning (announced players become pending, never-announced ones are left alone) and the
+  combined late-add DM (one message carrying roster details AND confirm/opt-out buttons for a
+  player nobody has asked yet; roster half only, no buttons, for someone who already answered this
+  season). 2886 tests pass.
+  NOTE: the bot itself still needs a restart on DEV to pick up yesterday's and today's Python
+  changes -- the two Activity halves above are live now, the bot side is not.
+
 2026-08-30 (32)
 - Added: the CWL four-phase model -- Setup / Enrollment / Preparation / War -- with a step
   indicator at the top of the CWL Management message (done / current / upcoming, as
