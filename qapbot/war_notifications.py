@@ -1461,6 +1461,28 @@ async def _send_channel_war_notification(clan_tag: str, war_data: Dict[str, Any]
                 mention_content = t('ui_components.basic_config.war_channel_notification_custodians_line',
                                      guild_id=guild_id_int, mentions=mentions)
 
+            # CWL Coordinator @mention line (tracker #0087/#0088, project owner's spec: integrate the
+            # requested coordinator reminder into THIS existing channel notification rather than
+            # building a separate coordinator DM reminder). Same shape as the custodian line above —
+            # cwl_clan_coordinators is keyed by clan_tag exactly like clan_custodians.
+            #
+            # CWL wars only: coordinators are a CWL-specific role, and the donation nudge below
+            # ("before the next war day") is meaningless for a regular war, which has no next day.
+            #
+            # The donation half of #0087/#0088 is a plain memory-aid sentence with no data behind it,
+            # deliberately: the CoC API does not expose whether a war member's clan castle has been
+            # filled, and nothing in this codebase tracks donations at all, so a real check isn't
+            # possible — see plans/tracker-0085-0086-0087-cwl-coordinator-role.md.
+            if war_data.get("is_cwl"):
+                coordinator_ids = guild_config.get("cwl_clan_coordinators", {}).get(clan_tag, [])
+                if coordinator_ids:
+                    coordinator_mentions = " ".join(f"<@{uid}>" for uid in coordinator_ids)
+                    coordinator_line = t('ui_components.basic_config.war_channel_notification_coordinators_line',
+                                         guild_id=guild_id_int, mentions=coordinator_mentions)
+                    mention_content = (
+                        f"{mention_content}\n{coordinator_line}" if mention_content else coordinator_line
+                    )
+
             # Send to channel
             if isinstance(channel, (discord.TextChannel, discord.Thread)):
                 await channel.send(

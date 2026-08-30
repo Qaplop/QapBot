@@ -342,7 +342,11 @@ The `get_clan_attack_history_sync()` method in `db_manager.py` aggregates `SUM(s
   `welcome_message_enabled` (BOOLEAN DEFAULT 0), `welcome_message_mode` (TEXT DEFAULT 'clan_link'),
   `welcome_apply_channel_id` (TEXT), `welcome_clan_tag` (TEXT, legacy single-clan column —
   superseded by `guild_welcome_clans`/`guild_welcome_families` below; kept as a read-only
-  fallback in `get_guild_config()` for guilds not yet re-saved under the new multi-select UI)
+  fallback in `get_guild_config()` for guilds not yet re-saved under the new multi-select UI),
+  `cwl_coordinator_role_id` (TEXT, tracker #0086 — an **existing** guild role the admin links to
+  CWL coordinator status. The bot never creates or deletes it, unlike the `coc_role_*` family;
+  `guild_role_manager.sync_cwl_coordinator_role()` only reconciles its membership against the
+  union of `cwl_clan_coordinators` across every clan. NULL = not linked = never synced)
 - `guild_member_families` - Junction: guilds ↔ families
 - `guild_member_clans` - Junction: guilds ↔ clans
 - `guild_welcome_families` - Junction: guilds ↔ families selected (as a whole) for the welcome

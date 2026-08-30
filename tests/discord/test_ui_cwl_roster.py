@@ -250,8 +250,8 @@ def test_clan_management_view_cwl_settings_mode_constructs_without_row_conflict(
     )
 
     # mode select + refresh + channel/hub-toggle/player-hub-toggle/retention/
-    # include-all-accounts-toggle buttons
-    assert len(view.children) == 7
+    # include-all-accounts-toggle/coordinator-role buttons
+    assert len(view.children) == 8
 
 
 @pytest.mark.discord
@@ -4315,3 +4315,126 @@ def test_build_content_places_table_before_info_text(db):
     table_index = content.index("No active CWL season")
     info_index = content.index("THE INFO TEXT MARKER")
     assert table_index < info_index
+
+
+# ---------------------------------------------------------------------------
+# Tracker #0085 — "Notify CWL Coordinators" button + its pending-change tracking
+# ---------------------------------------------------------------------------
+
+@pytest.mark.discord
+def test_notify_button_starts_disabled_and_enables_after_a_change_is_recorded():
+    """The button is the fix for "coordinators are never told they're coordinators", so it must
+    only be clickable when there is actually something to tell them about — same
+    disabled-when-nothing-to-do convention the Clear button already follows."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    guild = MagicMock()
+    guild.id = 8501
+    CACHE.server_config["8501"] = {}
+
+    view = CwlCoordinatorConfigurationView(
+        guild=guild, clan_tags=["#CLAN1"], current_coordinator_ids_by_clan={"#CLAN1": []},
+    )
+    notify = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_coordinator_notify")
+    assert notify.disabled is True
+
+    view._record_pending_notification("#CLAN1", [], ["111"])
+    view._rebuild_view()
+
+    notify = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_coordinator_notify")
+    assert notify.disabled is False
+
+
+@pytest.mark.discord
+def test_pending_notification_records_added_and_removed_separately():
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    guild = MagicMock()
+    guild.id = 8502
+    CACHE.server_config["8502"] = {}
+    view = CwlCoordinatorConfigurationView(
+        guild=guild, clan_tags=["#CLAN1"], current_coordinator_ids_by_clan={},
+    )
+
+    view._record_pending_notification("#CLAN1", ["111", "222"], ["222", "333"])
+
+    assert view._pending_notifications["#CLAN1"]["added"] == ["333"]
+    assert view._pending_notifications["#CLAN1"]["removed"] == ["111"]
+
+
+@pytest.mark.discord
+def test_pending_notification_cancels_out_a_save_undo_round_trip():
+    """Removing someone and putting them straight back must leave NOTHING queued — otherwise that
+    person gets DMed a contradictory "you were removed" / "you are now a coordinator" pair for a
+    change that never effectively happened."""
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    guild = MagicMock()
+    guild.id = 8503
+    CACHE.server_config["8503"] = {}
+    view = CwlCoordinatorConfigurationView(
+        guild=guild, clan_tags=["#CLAN1"], current_coordinator_ids_by_clan={},
+    )
+
+    view._record_pending_notification("#CLAN1", ["111"], [])       # removed
+    view._record_pending_notification("#CLAN1", [], ["111"])       # ...then added straight back
+
+    assert view._pending_notifications == {}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_notify_dms_added_and_removed_then_clears_pending(mock_interaction, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+    import qapbot.QBdiscocmdshelper_cwl as cwl_helper
+
+    CACHE.server_config[str(mock_interaction.guild.id)] = {}
+    monkeypatch.setattr(cwl_helper, "_dm_guard_blocks", lambda _uid: False)
+
+    sent: List[tuple] = []
+
+    async def fake_dm(user_id, content, *args, **kwargs):
+        sent.append((user_id, content))
+        return (True, "sent")
+
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", fake_dm)
+
+    view = CwlCoordinatorConfigurationView(
+        guild=mock_interaction.guild, clan_tags=["#CLAN1"],
+        current_coordinator_ids_by_clan={"#CLAN1": []},
+    )
+    view._record_pending_notification("#CLAN1", ["999"], ["111"])
+
+    mock_interaction.edit_original_response = AsyncMock()
+    mock_interaction.followup.send = AsyncMock()
+
+    await view._on_notify(mock_interaction)
+
+    assert {uid for uid, _ in sent} == {"111", "999"}
+    # Drained, so a second click can't re-send the same batch.
+    assert view._pending_notifications == {}
+
+
+@pytest.mark.discord
+@pytest.mark.asyncio
+async def test_notify_with_nothing_pending_does_not_dm_anyone(mock_interaction, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    from qapbot.ui_cwl_roster import CwlCoordinatorConfigurationView
+
+    CACHE.server_config[str(mock_interaction.guild.id)] = {}
+    dm_mock = AsyncMock(return_value=(True, "sent"))
+    monkeypatch.setattr(CACHE, "send_user_dm_detailed", dm_mock)
+
+    view = CwlCoordinatorConfigurationView(
+        guild=mock_interaction.guild, clan_tags=["#CLAN1"],
+        current_coordinator_ids_by_clan={"#CLAN1": ["111"]},
+    )
+
+    await view._on_notify(mock_interaction)
+
+    dm_mock.assert_not_awaited()
+    mock_interaction.response.send_message.assert_awaited_once()

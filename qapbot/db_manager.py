@@ -2077,6 +2077,7 @@ class WarHistoryDB:
                 cwl_retention_months INTEGER NOT NULL DEFAULT 0,
                 cwl_selected_season TEXT,
                 cwl_enrollment_include_all_linked_accounts BOOLEAN NOT NULL DEFAULT 0,
+                cwl_coordinator_role_id TEXT,
                 timezone_name TEXT NOT NULL DEFAULT 'UTC',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -2656,6 +2657,9 @@ class WarHistoryDB:
         await self._add_column_if_missing("guild_config", "cwl_retention_months", "INTEGER NOT NULL DEFAULT 0")
         await self._add_column_if_missing("guild_config", "cwl_selected_season", "TEXT")
         await self._add_column_if_missing("guild_config", "cwl_enrollment_include_all_linked_accounts", "BOOLEAN NOT NULL DEFAULT 0")
+        # Tracker #0086: an EXISTING guild role the admin links to CWL coordinator status
+        # (never a bot-created role, unlike coc_role_*) — see sync_cwl_coordinator_role().
+        await self._add_column_if_missing("guild_config", "cwl_coordinator_role_id", "TEXT")
         await self._add_column_if_missing("guild_config", "timezone_name", "TEXT NOT NULL DEFAULT 'UTC'")
         await self._add_column_if_missing("cwl_event_clans", "participating", "INTEGER NOT NULL DEFAULT 1")
         # One-shot dedup for the 30-minutes-before roster status report to a clan's CWL
@@ -10032,6 +10036,7 @@ class WarHistoryDB:
             "cwl_retention_months": row["cwl_retention_months"] if row["cwl_retention_months"] is not None else 0,
             "cwl_selected_season": row["cwl_selected_season"],
             "cwl_enrollment_include_all_linked_accounts": bool(row["cwl_enrollment_include_all_linked_accounts"]) if row["cwl_enrollment_include_all_linked_accounts"] is not None else False,
+            "cwl_coordinator_role_id": row["cwl_coordinator_role_id"],
             "timezone_name": row["timezone_name"] if row["timezone_name"] is not None else "UTC",
         }
     
@@ -10076,8 +10081,8 @@ class WarHistoryDB:
                  cwl_player_hub_channel_id, cwl_player_hub_message_id, cwl_player_hub_message_enabled, cwl_player_hub_message_last_bump_iso,
                  cwl_management_channel_id, cwl_management_message_id, cwl_management_message_enabled,
                  cwl_management_message_last_bump_iso, cwl_retention_months, cwl_selected_season,
-                 cwl_enrollment_include_all_linked_accounts, timezone_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cwl_enrollment_include_all_linked_accounts, cwl_coordinator_role_id, timezone_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     language = excluded.language,
                     newbie_role_id = excluded.newbie_role_id,
@@ -10111,6 +10116,7 @@ class WarHistoryDB:
                     cwl_retention_months = excluded.cwl_retention_months,
                     cwl_selected_season = excluded.cwl_selected_season,
                     cwl_enrollment_include_all_linked_accounts = excluded.cwl_enrollment_include_all_linked_accounts,
+                    cwl_coordinator_role_id = excluded.cwl_coordinator_role_id,
                     timezone_name = excluded.timezone_name
             """, (
                 guild_id,
@@ -10146,6 +10152,7 @@ class WarHistoryDB:
                 config.get("cwl_retention_months", 0),
                 config.get("cwl_selected_season"),
                 1 if config.get("cwl_enrollment_include_all_linked_accounts", False) else 0,
+                config.get("cwl_coordinator_role_id"),
                 config.get("timezone_name", "UTC"),
             ))
             

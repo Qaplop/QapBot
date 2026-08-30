@@ -631,6 +631,7 @@
       "war_channel_notification_players_field": "📋 Players",
       "war_channel_notification_footer": "Players with pending attacks",
       "war_channel_notification_custodians_line": "⚠️ {mentions} — attacks are still pending, please check in!",
+      "war_channel_notification_coordinators_line": "🛡️ CWL Coordinators {mentions} — please remind whoever still has to attack, and check the donations before the next war day starts.",
       "config_language_block": "🌐 **Server Language: {language_name}**",
       "config_registration_block_title": "🎉 Registration Message",
       "config_registration_status": "Status: {status}",
@@ -727,7 +728,23 @@
       "updated_message": "**CWL Coordinators — {clan}**\n\n⚠️ Not saved yet — currently selected: {names}\n\nClick 'Save Configuration' to apply. If a dropdown was still open, that click only closed it — click 'Save Configuration' again.",
       "saved_state_message": "**CWL Coordinators — {clan}**\n\n✅ Saved — currently: {names}\n\nSelect a clan or change the coordinators to update.",
       "saved_message": "✅ CWL coordinators saved for {clan}: {names}",
-      "saved_message_was_clamped": "⚠️ More than {limit} were selected when you clicked Save — only the first {limit} were actually saved for {clan}: {names}"
+      "saved_message_was_clamped": "⚠️ More than {limit} were selected when you clicked Save — only the first {limit} were actually saved for {clan}: {names}",
+      "button_notify": "📣 Notify CWL Coordinators",
+      "notify_nothing_pending": "Nothing to notify about — save a coordinator change first.",
+      "notify_processing": "⏳ Notifying coordinators about the changes…",
+      "notify_summary": "✅ Done.\nNotified: {contacted}\nCould not be reached (DMs closed or blocked): {blocked}",
+      "notify_dm_added": "🛡️ **You are now a CWL Coordinator for {clan}** on **{guild}**.\n\nAs coordinator you start the CWL in-game for this clan and are responsible for it throughout the season — so you need to be Leader or Co-Leader in the game.\n\nYou will be mentioned in the war notifications when someone still has attacks pending.",
+      "notify_dm_removed": "🛡️ You are no longer a CWL Coordinator for **{clan}** on **{guild}**."
+    },
+    "cwl_coordinator_role_configuration": {
+      "header": "**CWL Coordinator Role**\n\nLink an existing Discord role to CWL Coordinator status. Everyone configured as a coordinator for any clan gets this role; anyone who stops being a coordinator loses it again.\n\nThe bot never creates or deletes this role — pick one you already have (for example the one gating your coordinator channels).\n\nCurrently: {role}",
+      "placeholder_role_select": "Select the CWL coordinator role...",
+      "button_clear": "❌ Clear",
+      "button_save": "✅ Save",
+      "not_set": "❌ Not set",
+      "saved": "✅ CWL coordinator role saved: {role}\nRole members synced: +{added} / -{removed}",
+      "cleared": "✅ CWL coordinator role cleared — the role is no longer kept in sync. Nobody was stripped of it.",
+      "error_no_database": "⚠️ Database not ready — try again shortly."
     },
     "notification_settings": {
       "button_back_to_first": "⬅️ Back to first page",
@@ -929,6 +946,7 @@
       "retention_modal_title": "Set Data Retention",
       "button_configure_channels": "Configure Channels",
       "button_configure_retention": "Configure Data Retention",
+      "button_configure_coordinator_role": "Configure Coordinator Role",
       "button_activate_hub": "Activate CWL Management Hub Message",
       "button_deactivate_hub": "Deactivate CWL Management Hub Message",
       "button_activate_player_hub": "Activate Player CWL Settings Hub Message",
@@ -961,7 +979,7 @@
       "button_configure_clans": "Configure Participating Clans",
       "button_manage_coordinators": "Manage CWL Coordinators",
       "coordinators_no_clans": "⚠️ No clans configured for this guild yet — add one via Clan Family Management first.",
-      "coordinators_header": "**CWL Coordinators**\n\nSelect a clan, then up to 2 Discord users to serve as its CWL Coordinators. Standing per-clan config, independent of any one season — set once, carries forward automatically every CWL month.\n\n💡 If a dropdown is still open, clicking 'Save Configuration' only closes it — it won't save yet. Click 'Save Configuration' again once the dropdown is closed.",
+      "coordinators_header": "**CWL Coordinators**\n\nA clan's CWL Coordinator is the person who **starts the CWL in-game** for that clan and is responsible for it all season, so they must be a **Leader or Co-Leader in the game**, not just on Discord.\n\nSelect a clan, then up to 2 Discord users to serve as its CWL Coordinators. Standing per-clan config, independent of any one season — set once, carries forward automatically every CWL month.\n\n💡 If a dropdown is still open, clicking 'Save Configuration' only closes it — it won't save yet. Click 'Save Configuration' again once the dropdown is closed.",
       "table_header_coordinators": "Coordinators",
       "coordinators_table_none": "—",
       "coordinators_table_no_season": "*No active CWL season — nothing to show here yet.*",
@@ -1040,7 +1058,7 @@
       "help_overview_title": "\ud83c\udfc6 CWL Workflow \u2014 Overview",
       "help_overview_description": "**1\ufe0f\u20e3 Setup** \u2014 Configure participating clans (roster size, CWL start time) and optionally assign standing CWL Coordinators. Add or select a season, then Start Enrollment when ready.\n\n**2\ufe0f\u20e3 Enrollment** \u2014 Members get a sign-up DM to confirm/decline. Assign confirmed players to each clan's roster (Manage Teams). Notify late joiners and remind pending members as needed.\n\n**3\ufe0f\u20e3 Preparation** \u2014 Start Preparation DMs every assigned player their clan, tier and start time. Rosters aren't locked yet \u2014 last-minute changes are still possible (use Send Roster Updates to notify anyone whose clan changed) right up until a clan's war actually starts, which is when that clan's roster locks.\n\n**4\ufe0f\u20e3 War** \u2014 Wars run in-game on each clan's own schedule; no action needed here. Delete Season is blocked for good once any clan's war has started, even after everything wraps up \u2014 just move on to Setup for the next season.",
       "help_details_title": "\ud83c\udfc6 CWL Workflow \u2014 Details",
-      "help_details_description": "**1\ufe0f\u20e3 Setup**\n\u2022 *Add New Season* \u2014 create the season (draft) to start configuring it.\n\u2022 *Configure Participating Clans* \u2014 pick which clans take part, and set each one's roster size and CWL start time. The CWL league tier itself is determined by Clash of Clans, not set here.\n\u2022 *Manage CWL Coordinators* \u2014 assign up to 2 standing coordinators per clan; this carries over automatically every season.\n\u2022 *Start Enrollment* \u2014 moves on to the Enrollment phase once clans are configured.\n\n**2\ufe0f\u20e3 Enrollment**\n\u2022 Every resolved pool member gets a confirm/opt-out sign-up DM (or is auto-confirmed based on their own standing CWL preferences).\n\u2022 *Notify New Pool Members* \u2014 DM anyone who joined the pool after Enrollment opened and hasn't been contacted yet.\n\u2022 *Remind Pending* \u2014 nudge members who still haven't responded.\n\u2022 *Manage Teams* \u2014 assign confirmed members to each clan's roster, up to its roster size.\n\n**3\ufe0f\u20e3 Preparation**\n\u2022 *Start Preparation* \u2014 DMs each assigned player their clan, tier and CWL start time. This doesn't lock anything yet \u2014 rosters stay editable right up until a clan's war actually starts, which is when that clan's roster locks. Warns first if any roster is still underfilled or any clan has no coordinator set \u2014 you can still continue.\n\u2022 *Send Roster Updates* \u2014 re-notify only the players whose clan actually changed since the last announcement.\n\u2022 Coordinators can still be assigned at any point via *Manage CWL Coordinators*.\n\n**4\ufe0f\u20e3 War**\n\u2022 Wars are fought in Clash of Clans on each clan's own schedule \u2014 nothing to do here beyond monitoring.\n\u2022 *Delete Season* is blocked for good the moment any clan's war has started \u2014 that never lifts, even once the season is over. Move on to the next season's *Setup* instead.",
+      "help_details_description": "**1\ufe0f\u20e3 Setup**\n\u2022 *Add New Season* \u2014 create the season (draft) to start configuring it.\n\u2022 *Configure Participating Clans* \u2014 pick which clans take part, and set each one's roster size and CWL start time. The CWL league tier itself is determined by Clash of Clans, not set here.\n\u2022 *Manage CWL Coordinators* \u2014 assign up to 2 standing coordinators per clan; this carries over automatically every season. A coordinator is the person who starts the CWL in-game for that clan and is responsible for it all season, so they must be a Leader or Co-Leader in the game. Use *Notify CWL Coordinators* after changing them so they actually find out.\n\u2022 *Start Enrollment* \u2014 moves on to the Enrollment phase once clans are configured.\n\n**2\ufe0f\u20e3 Enrollment**\n\u2022 Every resolved pool member gets a confirm/opt-out sign-up DM (or is auto-confirmed based on their own standing CWL preferences).\n\u2022 *Notify New Pool Members* \u2014 DM anyone who joined the pool after Enrollment opened and hasn't been contacted yet.\n\u2022 *Remind Pending* \u2014 nudge members who still haven't responded.\n\u2022 *Manage Teams* \u2014 assign confirmed members to each clan's roster, up to its roster size.\n\n**3\ufe0f\u20e3 Preparation**\n\u2022 *Start Preparation* \u2014 DMs each assigned player their clan, tier and CWL start time. This doesn't lock anything yet \u2014 rosters stay editable right up until a clan's war actually starts, which is when that clan's roster locks. Warns first if any roster is still underfilled or any clan has no coordinator set \u2014 you can still continue.\n\u2022 *Send Roster Updates* \u2014 re-notify only the players whose clan actually changed since the last announcement.\n\u2022 Coordinators can still be assigned at any point via *Manage CWL Coordinators*.\n\n**4\ufe0f\u20e3 War**\n\u2022 Wars are fought in Clash of Clans on each clan's own schedule \u2014 nothing to do here beyond monitoring.\n\u2022 *Delete Season* is blocked for good the moment any clan's war has started \u2014 that never lifts, even once the season is over. Move on to the next season's *Setup* instead.",
       "help_button_show_details": "\ud83d\udcd6 Show Details",
       "help_button_show_overview": "\u25c0 Back to Overview"
     },

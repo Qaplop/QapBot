@@ -1,6 +1,29 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-30 (35)
+- Added (tracker #0085): the CWL Coordinator role is now explained where it is configured and in
+  the CWL help -- a coordinator starts the CWL in-game for that clan and is responsible for it all
+  season, so they must be Leader/Co-Leader in the game. Plus a "Notify CWL Coordinators" button on
+  the Manage CWL Coordinators screen that DMs everyone whose coordinator status changed since the
+  last press (added ones get the explanation, removed ones a short notice); a save/undo round-trip
+  cancels out and queues nothing.
+- Added (tracker #0086, #0088): an EXISTING guild role can be linked to CWL coordinator status via
+  a new "Configure Coordinator Role" button on CWL Settings. The bot never creates or deletes that
+  role, only syncs its membership to the union of cwl_clan_coordinators across all clans (so losing
+  one clan doesn't strip the role while still coordinating another). New guild_config column
+  cwl_coordinator_role_id.
+- Added (tracker #0087, #0088): CWL coordinators are now @-mentioned in the existing channel war
+  notification, CWL wars only, with a reminder to chase pending attacks and check donations before
+  the next war day. The donation half is a plain memory-aid line with no data behind it -- the CoC
+  API does not expose war clan-castle fill state and nothing here tracks donations.
+- Files: qapbot/db_manager.py, qapbot/guild_role_manager.py, qapbot/ui_cwl_roster.py,
+  qapbot/war_notifications.py, qapbot/translations/en.json + de.json,
+  plans/tracker-0085-0086-0087-cwl-coordinator-role.md.
+- Tests: 12 added (5 in tests/discord/test_ui_cwl_roster.py, 7 in the new
+  tests/unit/test_cwl_coordinator_role_and_mentions.py), 1 count assertion updated.
+  Full suite: 2906 passed, 4 deselected.
+
 2026-08-29 (33)
 - Fixed (tracker #0076, live bug report): the "Start CWL" announcement DM's amber (move-clans)
   line carried its clashofclans.com join link as a bare URL in plain message content, which makes

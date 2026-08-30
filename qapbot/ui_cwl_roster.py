@@ -122,6 +122,38 @@ def add_cwl_settings_components(view: discord.ui.View, guild_id: int) -> None:
     include_all_accounts_button.callback = _make_cwl_settings_toggle_include_all_accounts_callback(view)  # type: ignore[assignment]
     view.add_item(include_all_accounts_button)  # type: ignore[arg-type]
 
+    # Tracker #0086/#0088: link an EXISTING guild role to CWL coordinator status. Lives here on the
+    # CWL settings screen rather than in the general Role Configuration screen (ui_clan_management)
+    # deliberately — that screen manages roles the bot creates and owns (CoC/clan roles), while
+    # this one only ever mirrors membership onto a role the admin already has.
+    coordinator_role_button: discord.ui.Button[Any] = discord.ui.Button(
+        label=t('cwl.settings.button_configure_coordinator_role', guild_id=guild_id),
+        style=discord.ButtonStyle.secondary,
+        custom_id="cwl_settings_coordinator_role",
+        row=3,
+    )
+    coordinator_role_button.callback = _make_cwl_settings_coordinator_role_callback(view)  # type: ignore[assignment]
+    view.add_item(coordinator_role_button)  # type: ignore[arg-type]
+
+
+def _make_cwl_settings_coordinator_role_callback(view: discord.ui.View):
+    async def callback(interaction: discord.Interaction) -> None:
+        if not await _check_cwl_admin_permission(interaction):
+            return
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        if not interaction.guild:
+            return
+        config = CACHE.server_config.get(str(interaction.guild.id), {})
+        role_id = config.get("cwl_coordinator_role_id")
+        current_role = interaction.guild.get_role(int(role_id)) if role_id else None
+
+        role_view = CwlCoordinatorRoleConfigurationView(
+            guild=interaction.guild, parent_view=view, current_role=current_role
+        )
+        await interaction.followup.send(role_view.build_content(), view=role_view, ephemeral=True)
+
+    return callback
+
 
 def _make_cwl_settings_channels_callback(view: discord.ui.View):
     async def callback(interaction: discord.Interaction) -> None:
@@ -1155,6 +1187,12 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
             tag: list(ids) for tag, ids in current_coordinator_ids_by_clan.items()
         }
         self.clan_tag = clan_tags[0]
+        # Tracker #0085: coordinator changes that have been SAVED but not yet announced to the
+        # people affected, keyed by clan_tag -> {"added": [...], "removed": [...]}. Accumulated by
+        # _on_save (which is the only moment the previous persisted state is still knowable — it
+        # advances saved_coordinators_by_clan immediately afterwards) and drained by the Notify
+        # button. Kept per-clan because the DM has to name the clan someone gained or lost.
+        self._pending_notifications: Dict[str, Dict[str, List[str]]] = {}
         self._rebuild_counter = 0
         # Serializing lock (2026-08-29, two live bug reports against this same mechanism):
         #
@@ -1182,6 +1220,7 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
         self._add_user_select()
         self._add_clear_button()
         self._add_save_button()
+        self._add_notify_button()
 
     @property
     def coordinator_ids(self) -> List[str]:
@@ -1256,6 +1295,47 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
         save_button.callback = self._on_save  # type: ignore[assignment]
         self.add_item(save_button)  # type: ignore[arg-type]
 
+    def _add_notify_button(self) -> None:
+        """Tracker #0085 ("add a button 'Notify the CWL coordinators about changes' when
+        coordinators are added or removed") — the fix for the reported complaint that a coordinator
+        is never actually told they are one. Disabled until a save has produced something to
+        announce, same convention the Clear button already follows for "nothing to act on"."""
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+
+        notify_button = discord.ui.Button(
+            label=t('ui_components.cwl_coordinator_configuration.button_notify', guild_id=guild_id),
+            style=discord.ButtonStyle.primary,
+            custom_id="cwl_coordinator_notify",
+            row=3,
+            disabled=(not self._pending_notifications),
+        )
+        notify_button.callback = self._on_notify  # type: ignore[assignment]
+        self.add_item(notify_button)  # type: ignore[arg-type]
+
+    def _record_pending_notification(self, clan_tag: str, before: List[str], after: List[str]) -> None:
+        """Fold one clan's save into _pending_notifications.
+
+        A save/undo round-trip must leave NOTHING pending: re-adding someone currently sitting in
+        `removed` cancels that entry rather than also queueing an `added` one (and vice versa), so
+        an admin who removes a coordinator and puts them straight back doesn't DM them a
+        contradictory "you were removed" / "you were added" pair for a change that never
+        effectively happened.
+        """
+        entry = self._pending_notifications.setdefault(clan_tag, {"added": [], "removed": []})
+        for uid in set(after) - set(before):
+            if uid in entry["removed"]:
+                entry["removed"].remove(uid)
+            elif uid not in entry["added"]:
+                entry["added"].append(uid)
+        for uid in set(before) - set(after):
+            if uid in entry["added"]:
+                entry["added"].remove(uid)
+            elif uid not in entry["removed"]:
+                entry["removed"].append(uid)
+        if not entry["added"] and not entry["removed"]:
+            self._pending_notifications.pop(clan_tag, None)
+
     def _rebuild_view(self) -> None:
         self._rebuild_counter += 1
         self.clear_items()
@@ -1263,6 +1343,7 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
         self._add_user_select()
         self._add_clear_button()
         self._add_save_button()
+        self._add_notify_button()
 
     def _current_clan_label(self) -> str:
         return f"{CACHE.get_clan_name(self.clan_tag, self.clan_tag)} ({self.clan_tag})"
@@ -1409,6 +1490,11 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
                 self.coordinators_by_clan[self.clan_tag] = self.coordinator_ids[:CWL_COORDINATOR_LIMIT]
 
             guild_id = str(self.guild.id)
+            # Tracker #0085: capture the delta BEFORE the writes below, while the previously
+            # persisted selection for this clan is still knowable — saved_coordinators_by_clan is
+            # advanced to the new state a few lines further down.
+            previous_ids = list(self.saved_coordinators_by_clan.get(self.clan_tag, []))
+
             await CACHE.db_manager.save_cwl_clan_coordinators(guild_id, self.clan_tag, self.coordinator_ids)
 
             if guild_id not in CACHE.server_config:
@@ -1426,6 +1512,20 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
             else:
                 self.saved_coordinators_by_clan.pop(self.clan_tag, None)
 
+            self._record_pending_notification(self.clan_tag, previous_ids, list(self.coordinator_ids))
+
+            # Tracker #0086: the linked coordinator role mirrors cwl_clan_coordinators, so it has to
+            # be re-synced here — this save is one of only two places that config ever changes.
+            # No-ops when no role is linked. Never allowed to fail the save itself: the coordinator
+            # config is already persisted by this point, and a missing Manage Roles permission must
+            # not read as "saving the coordinators failed".
+            try:
+                from qapbot.guild_role_manager import sync_cwl_coordinator_role
+
+                await sync_cwl_coordinator_role(self.guild)
+            except Exception as exc:  # pragma: no cover - defensive
+                logging.error(f"[CWL] Coordinator role sync failed for guild {guild_id}: {exc}", exc_info=True)
+
             # Clear the "⚠️ Not saved yet" warning from the working message itself now that this
             # clan's selection actually matches what's persisted (2026-08-29 live bug report: the
             # warning was staying up even after a successful Save, since _on_save previously only
@@ -1435,6 +1535,11 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
                 user_id=user_id, guild_id=guild_id_for_t,
                 clan=self._current_clan_label(), names=self._current_names_text(),
             )
+            # Rebuilt, not just re-sent (tracker #0085): the Notify button's disabled state is
+            # decided at construction time, so without this the button stays greyed out until some
+            # other interaction happens to rebuild the view — i.e. exactly after the save that just
+            # gave it something to announce.
+            self._rebuild_view()
             await interaction.edit_original_response(content=self.build_content(status), view=self)
 
             saved_key = (
@@ -1450,6 +1555,74 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
             )
             await interaction.followup.send(msg, ephemeral=True)
 
+    async def _on_notify(self, interaction: discord.Interaction) -> None:
+        """Tracker #0085: DM everyone whose coordinator status changed since the last time this was
+        pressed — added coordinators get the role explanation (the actual fix for "woran sehen die
+        Koordinatoren, dass sie Koordinatoren sind"), removed ones get a short notice.
+
+        Explicit button rather than an automatic DM on every Save, per the ticket's own wording:
+        an admin reshuffling several clans in one sitting would otherwise spam each save's DMs
+        separately, and would have no way to correct a mis-click before anyone was told.
+
+        Uses send_user_dm_detailed + _dm_guard_blocks, the same pair
+        send_cwl_coordinator_start_reminders() (QBdiscocmdshelper_cwl.py) already uses for
+        coordinator DMs, so the guild's DM guard and per-user language resolution behave
+        identically in both paths.
+        """
+        from qapbot.i18n import t
+        from qapbot.QBdiscocmdshelper_cwl import _dm_guard_blocks
+
+        guild_id_for_t = interaction.guild.id if interaction.guild else None
+        if not self._pending_notifications:
+            await interaction.response.send_message(
+                t('ui_components.cwl_coordinator_configuration.notify_nothing_pending', guild_id=guild_id_for_t),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        async with self._lock:
+            # Drained up front so a second click can't re-send the same batch while this one is
+            # still working through its DMs (Pitfall 41's double-click class, applied to state
+            # rather than to the buttons — the DMs here are the irreversible part).
+            pending = self._pending_notifications
+            self._pending_notifications = {}
+            self._rebuild_view()
+
+            guild_name = self.guild.name if self.guild else ""
+            contacted = 0
+            blocked = 0
+            for clan_tag, entry in pending.items():
+                clan_name = CACHE.get_clan_name(clan_tag, clan_tag)
+                for key, message_key in (
+                    ("added", 'ui_components.cwl_coordinator_configuration.notify_dm_added'),
+                    ("removed", 'ui_components.cwl_coordinator_configuration.notify_dm_removed'),
+                ):
+                    for uid in entry[key]:
+                        if _dm_guard_blocks(str(uid)):
+                            blocked += 1
+                            continue
+                        sent, _outcome = await CACHE.send_user_dm_detailed(
+                            str(uid),
+                            t(message_key, user_id=str(uid), guild_id=guild_id_for_t,
+                              clan=clan_name, guild=guild_name),
+                        )
+                        if sent:
+                            contacted += 1
+                        else:
+                            blocked += 1
+
+            await interaction.edit_original_response(content=self.build_content(
+                t('ui_components.cwl_coordinator_configuration.saved_state_message',
+                  user_id=str(interaction.user.id), guild_id=guild_id_for_t,
+                  clan=self._current_clan_label(), names=self._current_names_text())
+            ), view=self)
+            await interaction.followup.send(
+                t('ui_components.cwl_coordinator_configuration.notify_summary',
+                  guild_id=guild_id_for_t, contacted=contacted, blocked=blocked),
+                ephemeral=True,
+            )
+
     async def _refresh_message(self, interaction: discord.Interaction) -> None:
         from qapbot.i18n import t
         user_id = str(interaction.user.id)
@@ -1460,6 +1633,136 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
             clan=self._current_clan_label(), names=self._current_names_text(),
         )
         await interaction.edit_original_response(content=self.build_content(msg), view=self)
+
+
+class CwlCoordinatorRoleConfigurationView(discord.ui.View):
+    """Tracker #0086 (and #0088's "wir haben bereits eine Koordinatoren-Rolle") — links an
+    EXISTING guild role to CWL coordinator status, so a server whose coordinator channels are
+    already gated behind their own role gets that role kept in sync automatically.
+
+    Deliberately a *link*, never a create/delete: the bot neither makes this role nor removes it
+    when unlinked, unlike the coc_role_*/clan-role families guild_role_manager owns outright. That
+    is the whole point of the ticket — the role already exists and carries permissions this bot
+    knows nothing about, so its lifecycle stays the admin's.
+
+    Modelled on ui_clan_management.RoleConfigurationView's newbie/member RoleSelect shape, which is
+    the existing precedent for "pick a role that already exists" (as opposed to that screen's
+    bot-owned roles).
+    """
+
+    def __init__(
+        self,
+        guild: discord.Guild,
+        parent_view: discord.ui.View,
+        current_role: Optional[discord.Role] = None,
+        timeout: int = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.parent_view = parent_view
+        self.role: Optional[discord.Role] = current_role
+        self._build_items()
+
+    def _build_items(self) -> None:
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+
+        role_select: discord.ui.RoleSelect[Any] = discord.ui.RoleSelect(
+            placeholder=t('ui_components.cwl_coordinator_role_configuration.placeholder_role_select', guild_id=guild_id),
+            min_values=1,
+            max_values=1,
+            custom_id="cwl_coordinator_role_select",
+            row=0,
+        )
+        role_select.callback = self._on_role_select  # type: ignore[assignment]
+        self.add_item(role_select)  # type: ignore[arg-type]
+
+        clear_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('ui_components.cwl_coordinator_role_configuration.button_clear', guild_id=guild_id),
+            style=discord.ButtonStyle.secondary,
+            custom_id="cwl_coordinator_role_clear",
+            row=1,
+            disabled=(self.role is None),
+        )
+        clear_button.callback = self._on_clear  # type: ignore[assignment]
+        self.add_item(clear_button)  # type: ignore[arg-type]
+
+        save_button: discord.ui.Button[Any] = discord.ui.Button(
+            label=t('ui_components.cwl_coordinator_role_configuration.button_save', guild_id=guild_id),
+            style=discord.ButtonStyle.success,
+            custom_id="cwl_coordinator_role_save",
+            row=1,
+        )
+        save_button.callback = self._on_save  # type: ignore[assignment]
+        self.add_item(save_button)  # type: ignore[arg-type]
+
+    def _rebuild_view(self) -> None:
+        self.clear_items()
+        self._build_items()
+
+    def build_content(self) -> str:
+        from qapbot.i18n import t
+        guild_id = self.guild.id if self.guild else None
+        role_display = (
+            self.role.mention if self.role
+            else t('ui_components.cwl_coordinator_role_configuration.not_set', guild_id=guild_id)
+        )
+        return t(
+            'ui_components.cwl_coordinator_role_configuration.header',
+            guild_id=guild_id, role=role_display,
+        )
+
+    async def _on_role_select(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        values = interaction.data.get('values', [])  # type: ignore[union-attr]
+        if values:
+            self.role = self.guild.get_role(int(values[0]))
+        self._rebuild_view()
+        await interaction.edit_original_response(content=self.build_content(), view=self)
+
+    async def _on_clear(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=False, ephemeral=False)
+        self.role = None
+        self._rebuild_view()
+        await interaction.edit_original_response(content=self.build_content(), view=self)
+
+    async def _on_save(self, interaction: discord.Interaction) -> None:
+        """Persist the link and immediately reconcile who holds the role.
+
+        Clearing the link does NOT strip the role from anyone (see the 'cleared' string): the role
+        pre-existed this feature and may well carry channel permissions the admin still wants those
+        people to have — unlinking means "stop syncing", not "revoke".
+        """
+        from qapbot.i18n import t
+        from qapbot.guild_role_manager import sync_cwl_coordinator_role
+
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        guild_id = str(self.guild.id)
+        guild_id_for_t = self.guild.id
+
+        db = CACHE.db_manager
+        if db is None:
+            await interaction.followup.send(
+                t('ui_components.cwl_coordinator_role_configuration.error_no_database', guild_id=guild_id_for_t),
+                ephemeral=True,
+            )
+            return
+
+        config = CACHE.server_config.setdefault(guild_id, {})
+        config["cwl_coordinator_role_id"] = str(self.role.id) if self.role else None
+        await db.save_guild_config(guild_id, config)
+
+        if self.role is None:
+            msg = t('ui_components.cwl_coordinator_role_configuration.cleared', guild_id=guild_id_for_t)
+        else:
+            added, removed = await sync_cwl_coordinator_role(self.guild)
+            msg = t(
+                'ui_components.cwl_coordinator_role_configuration.saved',
+                guild_id=guild_id_for_t, role=self.role.mention, added=added, removed=removed,
+            )
+
+        await interaction.edit_original_response(content=self.build_content(), view=self)
+        await interaction.followup.send(msg, ephemeral=True)
 
 
 class CwlDeleteSeasonConfirmView(discord.ui.View):
