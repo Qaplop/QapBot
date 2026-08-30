@@ -2359,3 +2359,36 @@ instead of a flag that drops — same call-site shape (`async with self._lock:` 
 no data loss. When in doubt, prefer the lock: queuing a redundant event is harmless, but dropping
 a non-redundant one is a silent correctness bug that live testing may not catch for a while (this
 one shipped, passed its own regression tests, and only surfaced on the NEXT live click sequence).
+
+---
+
+## Pitfall 52: a plain `"\n"` added to widen the gap around a line in an embed description silently disappears — Discord trims leading/trailing whitespace-only lines from the rendered description
+
+**Symptom (tracker #0081, live bug report, 2026-08-30):** the CWL Management step indicator was
+given a leading blank line (`f"\n{indicator}\n\n{season_header}"`) so it would read as its own row
+below the "CWL Management" title instead of sitting glued directly under it. Every test passed
+(nothing asserts the embed's literal rendered spacing), the code was correct Python, and the line
+was genuinely present in `embed.description` right up until Discord rendered it — the gap simply
+never appeared on screen. The trailing blank line between the indicator and the season header
+(already `\n\n`, unchanged) rendered fine the whole time; only the LEADING one vanished.
+
+**Root cause:** Discord trims leading and trailing whitespace from an embed's `description` field
+before rendering — this includes a leading line that contains nothing but a newline. A `\n` at the
+very start of the string is whitespace with nothing non-whitespace before it, so it gets stripped
+along with it; the same `\n\n` in the MIDDLE of the string survives because it's bounded by real
+content on both sides. This is invisible from the Python side entirely — `embed.description` holds
+exactly what was assigned, the object never mutates it — so nothing short of actually looking at
+the rendered message in Discord reveals the loss.
+
+**Fix:** prefixed a zero-width space (U+200B, `​`) before the leading newline:
+`f"​\n{indicator}\n\n{season_header}"`. U+200B is not whitescape by Discord's trim, so the
+line it occupies survives, while the character itself renders as nothing visible — the net effect
+is a real blank line with no stray glyph.
+
+**How to apply:** any time a blank line is added at the very START (or END) of an embed
+`description`/field VALUE specifically to create visual spacing — not one already sandwiched
+between two lines of real content — prefix (or suffix) it with `​` rather than a bare
+newline. A blank line already surrounded by non-whitespace content on both sides does not need
+this. Since no automated test can catch this (the string is correct; only Discord's renderer
+strips it), the only way to actually confirm the fix worked is looking at the message in Discord
+itself, not at the constructed string in a test or a debugger.

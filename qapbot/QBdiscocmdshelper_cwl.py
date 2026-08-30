@@ -439,21 +439,27 @@ async def format_clan_management_cwl_management(
     # cares about participating/locked_at, and doing it here keeps it independent of display order.
     phase_info = resolve_cwl_phase(event, all_clans)
     indicator = render_cwl_step_indicator(phase_info, guild_id_int)
-    season_header = t(
-        'cwl.management.season_header',
-        guild_id=guild_id_int,
-        season=event["cwl_season"],
-        status=t(f'cwl.management.event_status_{event["status"]}', guild_id=guild_id_int),
-    )
-    # A blank line on both sides (tracker #0081, live-testing feedback: "so that it visually peaks
-    # out for the user") — the title touches the description directly with no gap of its own, so
-    # without a leading blank line the indicator reads as glued to "CWL Management" instead of
-    # standing out as its own row above the season header. A plain leading "\n" doesn't survive
-    # Discord's embed rendering, which trims leading/trailing whitespace (including newlines) from
-    # the description — confirmed live, 2026-08-30: the gap was simply gone. A zero-width space
+    # No status suffix here (tracker #0081 follow-up, 2026-08-30, project owner's spec: "with the
+    # step indicator the status after 'Season 2026-09' got redundant and we also have naming
+    # drift. Simply remove it") — the step indicator above already shows exactly this, in the
+    # step-name vocabulary (Setup/Enrollment/Preparation/War) rather than the raw event_status_*
+    # wording ("Sign-Up Open", "War running"), so the two were saying the same thing in two
+    # different vocabularies. event["status"] itself is unaffected — the phase indicator's own
+    # resolve_cwl_phase() call above still reads it directly.
+    season_header = t('cwl.management.season_header', guild_id=guild_id_int, season=event["cwl_season"])
+    # A blank line before, TWO blank lines after (tracker #0081, project owner's ticket text: "an
+    # empty line infront and directly after the step indicator", clarified 2026-08-30 to mean a
+    # second blank line on the after side specifically) — the title touches the description
+    # directly with no gap of its own, so without a leading blank line the indicator reads as
+    # glued to "CWL Management"; the extra line after gives it more room to stand out from the
+    # season header below than a single line does. A plain leading "\n" doesn't survive Discord's
+    # embed rendering, which trims leading/trailing whitespace (including newlines) from the
+    # description — confirmed live, 2026-08-30: the gap was simply gone. A zero-width space
     # (U+200B) makes that first line non-whitespace so Discord keeps it, while rendering as nothing
-    # visible itself.
-    embed.description = f"​\n{indicator}\n\n{season_header}" if indicator else season_header
+    # visible itself. The two blank lines AFTER the indicator don't need the same treatment — they
+    # sit between two lines of real content (the indicator, then the season header), not at the
+    # very start/end of the description, so Discord's trim never touches them.
+    embed.description = f"​\n{indicator}\n\n\n{season_header}" if indicator else season_header
 
     if not clans:
         clans_block = t('cwl.management.no_clans_configured', guild_id=guild_id_int)
