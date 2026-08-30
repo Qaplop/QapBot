@@ -22,8 +22,8 @@ Two companion plans carry implementation detail this document summarizes rather 
 
 All CWL tables live in the **hot DB only** (`qapbot/db_manager.py`'s schema-creation block,
 alongside `clans`/`clan_families`) — no history-DB mirroring. This is short-lived per-season
-operational data; deletion (via a configurable retention policy, currently the one unfinished
-piece — see §11) is the intended lifecycle mechanism, not archival.
+operational data; deletion (via the per-guild retention policy, §11) is the intended lifecycle
+mechanism, not archival.
 
 ### `cwl_events` — one row per guild × season
 ```
@@ -547,8 +547,13 @@ destroy state another guild still keeps. They are therefore swept **referentiall
 season's rows go only once no `cwl_events` row anywhere still references that season. A guild set
 to "keep indefinitely" keeps its event, which keeps the shared rows alive for everyone.
 
-**Docs**: this file. No separate `qapbot/docs/CWL_ROSTER_PLANNING.md` was ever written — this
-remains the single design record, alongside the two companion plans listed at the top.
+**Docs**: this file, which is the single design record alongside the two companion plans listed at
+the top. It lived at the repo root until 2026-08-30 and moved to `qapbot/docs/` once the feature
+was complete — it is reference documentation for a shipped system, not a build record, so it
+belongs with the other deep-dive docs rather than in `plans/implemented/`. The `_PLAN` suffix is
+kept only because its three CWL siblings here carry it too (`CWL_CLAN_CONFIG_ACTIVITY_PLAN.md`,
+`CWL_ROUND_TRACKING_PLAN.md`, `CWL_PROD_PERFORMANCE_FIX_PLAN.md`); renaming just this one would
+break that local convention and churn ~80 references for cosmetics.
 
 ---
 

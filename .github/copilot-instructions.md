@@ -302,6 +302,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 📖 **../qapbot/docs/CLAN_AND_WAR_CYCLE_ARCHITECTURE.md**: DB schema for clans/CWL, the Phase-1 update-cycle pipeline, coc_client init, hot/history DB split mechanics  
 📖 **../qapbot/docs/CLAN_WAR_TRACKING.md**: Clan war tracking logic — track_war_updates tiers, league promotion/demotion handling  
 📖 **../qapbot/docs/CWL_ROUND_TRACKING_PLAN.md**: CWL round-number tracking design (implemented) — `cwl_league_rounds`/`cwl_league_groups` schema and population  
+📖 **../qapbot/docs/CWL_ROSTER_PLANNING_PLAN.md**: the whole CWL roster workflow (shipped) — four-phase model, `cwl_*` roster schema, permission tiers, Activity board, coordinators, retention purge  
 📖 **../qapbot/docs/COC_GAME_MECHANICS.md**: CWL round schedule, regular war states, passive/inactive tracking, warlog visibility  
 📖 **../qapbot/docs/ARCHIVE_SCAN_PERFORMANCE_ANALYSIS.md**: Archive-directory rescan cost analysis — dated investigation, revisit trigger noted inside  
 📖 **../qapbot/docs/TEST_CONCEPT.md**: Test tier design (smoke/integration/discord/live/e2e), fixture strategy, coverage targets, CI pipeline — see also "Run tests with" above for the one-line version  

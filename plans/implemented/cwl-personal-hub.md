@@ -2,7 +2,7 @@
 
 ## Context
 
-`CWL_ROSTER_PLANNING_PLAN.md` (project root) designed a "Personal CWL Hub" — a per-guild
+`qapbot/docs/CWL_ROSTER_PLANNING_PLAN.md` designed a "Personal CWL Hub" — a per-guild
 anchored Discord message where members view their CWL status and set personal preferences — as
 **Phase 2 Slice 3**. Code verification confirmed the rest of that plan (admin-side season setup,
 template DM carry-over, the Activity-based assignment board) shipped and was heavily live-tested,

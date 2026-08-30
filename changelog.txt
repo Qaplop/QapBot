@@ -1,6 +1,23 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-08-30 (38)
+- Changed: CWL_ROSTER_PLANNING_PLAN.md moved from the repo root to qapbot/docs/. The feature is
+  fully shipped and the file self-describes as reference documentation for the current
+  implementation ("not its history"), so it belongs with the other architecture deep-dives rather
+  than in plans/implemented/, which is the archive of build records. It is also referenced ~87
+  times across 32 files incl. activity/*.ts and DATABASE_ARCHITECTURE.md -- reference density
+  typical of a living doc, not an archived plan. Only one reference was path-qualified
+  ("project root", plans/implemented/cwl-personal-hub.md); the rest are bare-name mentions that
+  stay valid. Listed in copilot-instructions.md's deep-dive doc index.
+- The _PLAN suffix is kept deliberately: its three CWL siblings in qapbot/docs/ all carry it, so
+  renaming only this one would break that local convention for cosmetics.
+- Fixed: a leftover "currently the one unfinished piece" reference to the retention policy in the
+  same doc's section 1, stale since the purge shipped earlier today.
+- Files: qapbot/docs/CWL_ROSTER_PLANNING_PLAN.md (moved), .github/copilot-instructions.md,
+  plans/implemented/cwl-personal-hub.md.
+- Docs-only, no code change. Full suite: 2914 passed, 4 deselected.
+
 2026-08-30 (37)
 - Added: CWL retention purge -- guild_config.cwl_retention_months finally has a consumer. The
   column, its settings UI and its readout on the CWL Settings screen all shipped long ago, but
