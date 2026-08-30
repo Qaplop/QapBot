@@ -1935,16 +1935,23 @@ def _make_cwl_management_announce_rosters_callback(view: discord.ui.View):
         event = db.get_cwl_event_sync(str(interaction.guild.id), season) if db is not None else None
         if event is None:
             return
-        from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_underfilled_clans_sync
+        from qapbot.QBdiscocmdshelper_cwl import (
+            resolve_cwl_underfilled_clans_sync,
+            resolve_cwl_clans_missing_coordinator_sync,
+        )
 
         underfilled = await asyncio.to_thread(
             resolve_cwl_underfilled_clans_sync, interaction.guild.id, event["id"], event["cwl_season"]
+        )
+        missing_coordinators = await asyncio.to_thread(
+            resolve_cwl_clans_missing_coordinator_sync, interaction.guild.id, event["id"]
         )
         confirm_view = CwlAnnounceRostersConfirmView(
             parent_view=view,
             guild_id=interaction.guild.id,
             season=event["cwl_season"],
             underfilled=underfilled,
+            missing_coordinators=missing_coordinators,
         )
         await interaction.followup.send(
             confirm_view._build_content(),  # type: ignore[attr-defined]
@@ -2154,17 +2161,24 @@ class CwlAnnounceRostersConfirmView(discord.ui.View):
     `underfilled` (2026-08-30, spec item 6) is the list of participating clans still short of their
     roster_size, resolved by the CALLER and passed in — same discipline as
     CwlDeleteSeasonConfirmView's shared_clan_info: the preview an admin reads and the state they
-    confirm against must be the same snapshot, never two separate reads."""
+    confirm against must be the same snapshot, never two separate reads.
+
+    `missing_coordinators` (tracker #0084) is the list of participating clans with no standing CWL
+    Coordinator configured — an optional completeness check, not a gate: coordinators can still be
+    set after Preparation starts, so this only warns, same as the underfilled-roster warning beside
+    it."""
 
     def __init__(
         self, parent_view: discord.ui.View, guild_id: int, season: str,
-        underfilled: Optional[List[Dict[str, Any]]] = None, timeout: int = 60,
+        underfilled: Optional[List[Dict[str, Any]]] = None,
+        missing_coordinators: Optional[List[Dict[str, Any]]] = None, timeout: int = 60,
     ):
         super().__init__(timeout=timeout)
         self.parent_view = parent_view
         self.guild_id = guild_id
         self.season = season
         self.underfilled = underfilled or []
+        self.missing_coordinators = missing_coordinators or []
 
         from qapbot.i18n import t
 
@@ -2204,6 +2218,16 @@ class CwlAnnounceRostersConfirmView(discord.ui.View):
                     f"• **{c['clan_name']}**: {c['assigned']}/{c['roster_size']}"
                     for c in self.underfilled
                 ),
+            )
+        # Coordinator-completeness warning (tracker #0084). Same treatment as the underfilled-
+        # roster warning above: folded into this dialog rather than a separate preceding step,
+        # computed by the caller in __init__ so the admin can't be shown one set of clans and have
+        # a different set apply when they confirm.
+        if self.missing_coordinators:
+            content += t(
+                'cwl.management.announce_rosters_missing_coordinator_warning',
+                guild_id=self.guild_id,
+                clans="\n".join(f"• **{c['clan_name']}**" for c in self.missing_coordinators),
             )
         return content
 

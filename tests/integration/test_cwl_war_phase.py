@@ -721,6 +721,43 @@ async def test_underfilled_clans_are_reported_and_full_ones_are_not(db):
 
 
 # ---------------------------------------------------------------------------
+# Coordinator completeness check (tracker #0084)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_clans_missing_coordinator_are_reported_and_covered_ones_are_not(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_clans_missing_coordinator_sync
+
+    guild_id = "331"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [
+        {"clan_tag": "#CLAN1"},
+        {"clan_tag": "#CLAN2"},
+    ])
+    CACHE.server_config[guild_id]["cwl_clan_coordinators"] = {"#CLAN1": ["coord-1"], "#CLAN2": []}
+
+    missing = resolve_cwl_clans_missing_coordinator_sync(int(guild_id), event_id)
+
+    assert [c["clan_tag"] for c in missing] == ["#CLAN2"]
+
+
+@pytest.mark.asyncio
+async def test_no_missing_coordinator_when_all_participating_clans_covered(db):
+    from qapbot.cache_manager import CACHE
+    from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_clans_missing_coordinator_sync
+
+    guild_id = "332"
+    await _seed(db, guild_id)
+    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1"}])
+    CACHE.server_config[guild_id]["cwl_clan_coordinators"] = {"#CLAN1": ["coord-1"]}
+
+    missing = resolve_cwl_clans_missing_coordinator_sync(int(guild_id), event_id)
+
+    assert missing == []
+
+
+# ---------------------------------------------------------------------------
 # Coordinator board access
 # ---------------------------------------------------------------------------
 

@@ -3759,6 +3759,37 @@ def resolve_cwl_underfilled_clans_sync(guild_id: int, event_id: int, season: str
     ]
 
 
+def resolve_cwl_clans_missing_coordinator_sync(guild_id: int, event_id: int) -> List[Dict[str, Any]]:
+    """Participating clans with no standing CWL Coordinator configured (tracker #0084: "check
+    before start of preparation phase ... if for all participating clans there is at least one cwl
+    coordinator defined. If not point this out to the user and ask him if he wants to continue
+    anyway"). Purely a completeness nudge, same spirit as resolve_cwl_underfilled_clans_sync
+    (spec item 6) beside it — coordinators can still be set after Preparation starts, so this never
+    blocks the transition, only warns about it.
+
+    Reads cwl_clan_coordinators the same way is_cwl_coordinator_for_current_season does: standing
+    per-clan config, keyed by clan_tag, carried forward across seasons rather than reset per event.
+
+    Returns [{"clan_tag", "clan_name"}] for clans with an empty or absent coordinator list."""
+    db = CACHE.db_manager
+    if db is None:
+        return []
+    participating = [
+        c for c in db.get_cwl_event_clans_sync(event_id) if c.get("participating", 1)
+    ]
+    if not participating:
+        return []
+    by_clan = CACHE.server_config.get(str(guild_id), {}).get("cwl_clan_coordinators") or {}
+    return [
+        {
+            "clan_tag": clan["clan_tag"],
+            "clan_name": CACHE.get_clan_name(clan["clan_tag"], clan["clan_tag"]),
+        }
+        for clan in participating
+        if not by_clan.get(clan["clan_tag"])
+    ]
+
+
 def count_cwl_pending_roster_updates(guild_id: int, season: str) -> int:
     """Total pending update DMs for the guild's selected season — the number every one of the
     three triggers (board button, close-DM, Hub button) keys off, so they can never disagree about
