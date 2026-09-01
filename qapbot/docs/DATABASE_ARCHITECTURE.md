@@ -1938,6 +1938,65 @@ it is not worth startup work.
   `tests/unit/test_is_history_migration_due.py`,
   `tests/unit/test_run_nightly_maintenance_routine.py`.
 
+### 2026-09-01 (e): Nightly VACUUM Would Have Fired Every Night — Trigger Made Proportional (Complete ✅)
+
+Caught on the DEV verification run of entry (b), before it ever reached PROD. The operator
+noticed update cycles firing during the migration on DEV and asked what that would mean on
+PROD; the cycles turned out to be a DEV artefact, but the question surfaced a real one.
+
+**The DEV run itself was clean.** With `HISTORY_RETENTION_DAYS=45` forcing 17 days of work:
+1,766,946 rows walked at 2,750-5,074 rows/s, per-day progress with ETA, marker advancing after
+each completed day. It was then interrupted with Ctrl+C *mid-day-17*, which tested the resume
+path for free: 400,000 rows of that day in history, 179,465 still in hot, **0 duplicated in
+both**, 0 rows left behind from the 16 completed days, and the marker correctly still at
+`2026-07-17` rather than advanced past an incomplete day.
+
+**The DEV cycles were not the problem.** `NO_DEV_MODE_UPDATES=true` takes a branch that
+`continue`s before reaching the `db_maintenance_idle_event` gate, so those cycles never
+consulted it. On PROD that gate holds the next cycle until the whole nightly routine finishes —
+pre-existing, intended, and fine.
+
+**The real finding: the VACUUM trigger.** `nightly_db_maintenance()` ran VACUUM when
+`freelist_count > 500` pages — 8 MB at a 16 KB page size. That was correct while the
+hot->history migration deleted a month of rows once a month: the free list sat near zero the
+rest of the time. The rolling migration deletes ~1.2M rows **every** night, freeing ~1.1 GB of
+pages every night, so an 8 MB trigger fires unconditionally.
+
+Cost on PROD, per night: ~7.5 min of EXCLUSIVE lock and hard `db_maintenance_mode` Discord
+block (measured 452 s on 2026-09-01), plus `VACUUM INTO` rewriting the entire 24-40 GB file to
+a new one on NAS-attached SSD. A small nightly re-run of exactly the outage class entries
+(a)-(b) exist to remove.
+
+**And it would reclaim nothing.** In steady state the migration deletes ~1.2M rows/day and the
+update cycle inserts ~1.2M rows/day, and SQLite reuses free-list pages for new inserts — so the
+file does not grow. The free list is **churn, not waste**. VACUUM earns its cost only after a
+genuine one-off shrink (a retention change, a catch-up run), which a proportional threshold
+still catches while daily churn never reaches it.
+
+**Fix**: `CONFIG.vacuum_freelist_fraction` (default 0.15) with `CONFIG.vacuum_min_freelist_pages`
+(500) as an absolute floor for small/fresh DBs:
+
+```python
+_vacuum_threshold = max(vacuum_min_freelist_pages, int(page_count * vacuum_freelist_fraction))
+_do_vacuum = freelist > _vacuum_threshold or _page_size_migration
+```
+
+On the real 24.0 GB PROD copy that is a 3.61 GB threshold against 1.64 GB of actual free list —
+so VACUUM correctly does **not** fire, where the flat rule would have. `VACUUM_FREELIST_FRACTION=0`
+restores the old always-VACUUM behaviour.
+
+A skipped VACUUM now logs why, at INFO, with the actual and threshold sizes — because a VACUUM
+that silently stops happening is precisely the failure mode a proportional threshold introduces.
+
+**Guarded** by `tests/unit/test_vacuum_freelist_threshold.py`, which pins BOTH directions: one
+night's churn must not trigger, two nights' must not trigger, a 6 GB one-off shrink must, the
+fraction must stay in a defensible 5-30% band, small DBs must fall back to the floor, and a
+structural check that the production expression still matches the one the tests restate.
+Verified it fails at 0.001 (nightly-VACUUM regression) and at 0.5 (never compacts).
+
+- Files: `qapbot/config.py`, `qapbot/db_manager.py`, `README.md`, `.env.example`,
+  `tests/unit/test_vacuum_freelist_threshold.py`.
+
 ### Future Phases
 **Not currently planned:**
 - Phase 4: Temp war stats (JSON → DB)

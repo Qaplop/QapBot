@@ -11937,8 +11937,30 @@ class WarHistoryDB:
                     _TARGET_PAGE_SIZE = 16384
                     _freelist_early = conn.execute("PRAGMA freelist_count").fetchone()[0]
                     _page_size_early = conn.execute("PRAGMA page_size").fetchone()[0]
+                    _page_count_early = conn.execute("PRAGMA page_count").fetchone()[0]
                     _page_size_migration = _page_size_early < _TARGET_PAGE_SIZE
-                    _do_vacuum = _freelist_early > 500 or _page_size_migration
+                    # Proportional threshold, not a flat 500 pages — see
+                    # CONFIG.vacuum_freelist_fraction for why the flat one became a nightly
+                    # 7.5-minute Discord block once the migration started deleting daily.
+                    from qapbot.config import CONFIG as _VAC_CONFIG
+                    _vacuum_threshold = max(
+                        _VAC_CONFIG.vacuum_min_freelist_pages,
+                        int(_page_count_early * _VAC_CONFIG.vacuum_freelist_fraction),
+                    )
+                    _do_vacuum = _freelist_early > _vacuum_threshold or _page_size_migration
+                    if not _do_vacuum:
+                        # Logged even in the common "nothing to do" case: a VACUUM that stops
+                        # happening is otherwise completely silent, and the failure mode of
+                        # this threshold is an unbounded free list nobody notices.
+                        logging.info(
+                            "[DB-MAINT] VACUUM not needed — free list %.2f GB (%.1f%% of file), "
+                            "threshold %.2f GB (%.0f%%). Free pages are reused by new inserts, "
+                            "so routine daily churn does not need reclaiming.",
+                            _freelist_early * _page_size_early / 2**30,
+                            100.0 * _freelist_early / max(1, _page_count_early),
+                            _vacuum_threshold * _page_size_early / 2**30,
+                            100.0 * _VAC_CONFIG.vacuum_freelist_fraction,
+                        )
 
                     # 1. WAL checkpoint (TRUNCATE)
                     t_step = _time.monotonic()

@@ -1,6 +1,42 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-01 (7)
+- Fixed: the nightly VACUUM trigger would have fired every single night once the rolling
+  migration started deleting daily. Caught on the DEV verification run before it reached PROD.
+  The trigger was a flat `freelist_count > 500` pages (8 MB at a 16 KB page size), which was
+  right while the migration deleted a month of rows once a month -- the free list sat near zero
+  the rest of the time. The rolling migration frees ~1.1 GB of pages EVERY night, so an 8 MB
+  trigger fires unconditionally: ~7.5 min of EXCLUSIVE lock and hard db_maintenance_mode Discord
+  block per night (measured 452s on PROD 2026-09-01), plus VACUUM INTO rewriting the whole
+  24-40 GB file to a new one on NAS-attached SSD. A small nightly re-run of the exact outage
+  class today's redesign exists to remove.
+  It would also reclaim nothing: in steady state the migration deletes ~1.2M rows/day and the
+  update cycle inserts ~1.2M rows/day, and SQLite reuses free-list pages for new inserts, so the
+  file does not grow. The free list is churn, not waste.
+- Added: CONFIG.vacuum_freelist_fraction (0.15, env VACUUM_FREELIST_FRACTION) and
+  CONFIG.vacuum_min_freelist_pages (500, env VACUUM_MIN_FREELIST_PAGES) as an absolute floor for
+  small/fresh DBs. Trigger is now
+  `freelist > max(min_pages, page_count * fraction)`. On the real 24.0 GB PROD copy that is a
+  3.61 GB threshold against 1.64 GB of actual free list, so VACUUM correctly does not fire where
+  the flat rule would have. VACUUM_FREELIST_FRACTION=0 restores the old behaviour.
+- Added: a skipped VACUUM now logs why at INFO with actual vs threshold sizes -- a VACUUM that
+  silently stops happening is exactly the failure mode a proportional threshold introduces.
+- Added: tests/unit/test_vacuum_freelist_threshold.py pins BOTH failure directions (too low ->
+  nightly VACUUM; too high -> never compacts), plus a structural check that the production
+  expression still matches the one the tests restate. Verified it fails at 0.001 and at 0.5.
+- DEV verification of the migration itself (HISTORY_RETENTION_DAYS=45, 17 days of work):
+  1,766,946 rows at 2,750-5,074 rows/s with per-day ETA logging. Interrupted with Ctrl+C
+  mid-day-17, which tested resume for free -- 400,000 rows of that day in history, 179,465 still
+  in hot, 0 duplicated in both, 0 left behind from the 16 completed days, and the marker
+  correctly still at 2026-07-17 rather than advanced past an incomplete day.
+- Note: the update cycles seen running during the DEV migration were a DEV artefact --
+  NO_DEV_MODE_UPDATES=true takes a branch that `continue`s before the db_maintenance_idle_event
+  gate. On PROD that gate holds the next cycle until the nightly routine finishes, as intended.
+- Files: qapbot/config.py, qapbot/db_manager.py, README.md, .env.example,
+  qapbot/docs/DATABASE_ARCHITECTURE.md (new entry 2026-09-01 (e)),
+  tests/unit/test_vacuum_freelist_threshold.py. 2967 tests pass.
+
 2026-09-01 (6)
 - Removed: CONFIG.history_migration_enabled and the HISTORY_MIGRATION_ENABLED env var.
   It was this morning's stopgap, back when the migration was a multi-hour blocking campaign

@@ -135,6 +135,30 @@ class BotConfig:
     # Database settings
     db_path: str = "data/qapbot.db"        # SQLite database file path (hot: current + previous calendar month)
     history_db_path: str = "data/qapbot_history.db"  # SQLite history database (ATTACHed as schema 'history'; everything older than db_path's window)
+    # Fraction of the hot DB that must be free-list before nightly maintenance runs VACUUM,
+    # with vacuum_min_freelist_pages as an absolute floor for small/fresh DBs.
+    #
+    # Was a flat `freelist_count > 500` pages (8 MB at a 16 KB page size). That was right while
+    # the hot->history migration deleted a month of rows once a month: the free list sat near
+    # zero the rest of the time, so the trigger only fired when there was genuinely something
+    # to reclaim.
+    #
+    # The 2026-09-01 rolling migration broke that assumption. Deleting ~1.2M rows EVERY night
+    # frees ~1.1 GB of pages every night, so an 8 MB trigger fires unconditionally — turning an
+    # occasional VACUUM into a nightly one. On PROD that is ~7.5 min of EXCLUSIVE lock and hard
+    # Discord block (db_maintenance_mode), plus VACUUM INTO rewriting the whole 24-40 GB file to
+    # a new one, on NAS-attached SSD, every single night.
+    #
+    # And it would be reclaiming nothing: in steady state the migration deletes ~1.2M rows/day
+    # and the update cycle inserts ~1.2M rows/day, and SQLite reuses free-list pages for new
+    # inserts. The free list is CHURN, not waste — the file does not grow. VACUUM earns its cost
+    # only after a genuine one-off shrink (a retention change, or a catch-up run), which a
+    # proportional threshold still catches while daily churn never reaches it.
+    #
+    # 0.15 of a 24 GB file is ~3.6 GB, against ~1.1 GB of nightly churn: roughly 3x headroom.
+    # Set to 0 to force the old always-vacuum behaviour (the floor then decides).
+    vacuum_freelist_fraction: float = 0.15
+    vacuum_min_freelist_pages: int = 500
     # Rolling hot-DB retention, in days (2026-09-01 redesign). The nightly migration walks the
     # cutoff toward `today - history_retention_days`, so roughly one day of aged-out rows moves
     # per night instead of a whole month landing on the 1st (which on 2026-09-01 meant ~38M rows
@@ -358,6 +382,14 @@ def load_config() -> BotConfig:
     db_path = os.getenv("DB_PATH", os.path.join(data_dir, "qapbot.db"))
     history_db_path = os.getenv("HISTORY_DB_PATH", os.path.join(data_dir, "qapbot_history.db"))
     try:
+        vacuum_freelist_fraction = float(os.getenv("VACUUM_FREELIST_FRACTION", "0.15"))
+    except ValueError:
+        vacuum_freelist_fraction = 0.15
+    try:
+        vacuum_min_freelist_pages = int(os.getenv("VACUUM_MIN_FREELIST_PAGES", "500"))
+    except ValueError:
+        vacuum_min_freelist_pages = 500
+    try:
         history_retention_days = int(os.getenv("HISTORY_RETENTION_DAYS", "75"))
     except ValueError:
         history_retention_days = 75
@@ -424,6 +456,8 @@ def load_config() -> BotConfig:
         investigate_dir=investigate_dir,
         db_path=db_path,
         history_db_path=history_db_path,
+        vacuum_freelist_fraction=vacuum_freelist_fraction,
+        vacuum_min_freelist_pages=vacuum_min_freelist_pages,
         history_retention_days=history_retention_days,
         history_migration_nightly_row_budget=history_migration_nightly_row_budget,
         history_migration_time_budget_minutes=history_migration_time_budget_minutes,
