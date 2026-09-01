@@ -135,6 +135,22 @@ class BotConfig:
     # Database settings
     db_path: str = "data/qapbot.db"        # SQLite database file path (hot: current + previous calendar month)
     history_db_path: str = "data/qapbot_history.db"  # SQLite history database (ATTACHed as schema 'history'; everything older than db_path's window)
+    # Master kill-switch for every AUTOMATIC hot->history migration path: the 03:00 UTC
+    # nightly step, the opportunistic per-cycle chunk, and /admin "Execute Nightly
+    # Maintenance". Enforced in exactly one place — QapBot.py's is_monthly_migration_due(),
+    # which all three consult — so there is no path that can slip past it.
+    # Deliberately does NOT gate qapbot/scripts/run_history_migration_now.py: that script
+    # calls monthly_history_migration()/fast_bulk_history_migration() directly and is the
+    # supported way to advance the backlog under operator supervision while this is off.
+    #
+    # TEMPORARY DEFAULT — set to False on 2026-09-01 after the September migration ran for
+    # 14+ hours across 114 chunks (0 completed) with Discord commands blocked 68% of that
+    # time. A month of aged-out data is now ~38M war_attacks rows, roughly an order of
+    # magnitude past what the per-cycle chunking design assumed ("likely complete within the
+    # first cycle or two"), so the automatic paths cannot be left armed until that design is
+    # reworked. Flip back to True (in code, or via HISTORY_MIGRATION_ENABLED=true) as part of
+    # that rework — not before.
+    history_migration_enabled: bool = False
     # Cap on the scheduled nightly window's monthly_history_migration() run (QapBot.py's
     # 03:00 UTC path only — NOT the manual run_history_migration_now.py CLI, which takes its
     # own --time-budget-minutes, and not the per-cycle chunk below). Added 2026-08-01: a
@@ -339,6 +355,9 @@ def load_config() -> BotConfig:
     # Database configuration
     db_path = os.getenv("DB_PATH", os.path.join(data_dir, "qapbot.db"))
     history_db_path = os.getenv("HISTORY_DB_PATH", os.path.join(data_dir, "qapbot_history.db"))
+    # Defaults to "false" to match BotConfig.history_migration_enabled's temporary default —
+    # see that field's comment for why every automatic migration path is currently disarmed.
+    history_migration_enabled = os.getenv("HISTORY_MIGRATION_ENABLED", "false").lower() in ("true", "1", "yes")
     try:
         history_migration_time_budget_minutes = float(os.getenv("HISTORY_MIGRATION_TIME_BUDGET_MINUTES", "90"))
     except ValueError:
@@ -406,6 +425,7 @@ def load_config() -> BotConfig:
         investigate_dir=investigate_dir,
         db_path=db_path,
         history_db_path=history_db_path,
+        history_migration_enabled=history_migration_enabled,
         history_migration_time_budget_minutes=history_migration_time_budget_minutes,
         history_migration_cycle_chunk_minutes=history_migration_cycle_chunk_minutes,
         history_migration_admin_budget_minutes=history_migration_admin_budget_minutes,

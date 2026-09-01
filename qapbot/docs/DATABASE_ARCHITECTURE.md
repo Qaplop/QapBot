@@ -1647,6 +1647,77 @@ re-check) rather than trusting them long-term.
   test_player_name_search_fts.py`, plus the Step 9 tests and one guest-search delegation test).
   2046 tests pass.
 
+### 2026-09-01: Automatic Hot->History Migration DISARMED — Per-Cycle Chunking Blocked Discord For 14h (Stopgap ⚠️)
+- **Symptom**: on the 1st of September the monthly migration fired at 02:03 and was still running
+  at 16:11 — 114 per-cycle chunks, **zero** of them completing. `QBcore.db_maintenance_mode` was
+  True for **9.6 h of a 14.1 h span (68% duty cycle)**, median availability window between blocks
+  132 s, with one unbroken 98-minute block at 05:01-06:40 (the 90-minute nightly budget plus a
+  452 s VACUUM). Users hit "Database optimization is in progress" on commands as trivial as
+  `/ping`. 24,150,000 `war_attacks` rows moved; 13.65 M still below the cutoff and `war_summary`
+  (1.52 M) not started when the day's log ended.
+- **Root cause — the capacity assumption in the 2026-08-01 "fourth same-day follow-up" entry above
+  was wrong by an order of magnitude.** That entry accepted the "mostly blocked" trade-off on the
+  prediction that "for routine future months ... this will likely complete within the first cycle
+  or two, making the 'mostly blocked' state last minutes, not days." A routine month is now
+  **~38 M `war_attacks` rows** (Apr 25.8 M, May 21.4 M, Jun 30.3 M, Jul 37.8 M; 450,613 clans
+  tracked, `history.war_attacks` at 102.75 M rows). The data is legitimate — 15 or 30 rows/war
+  across 1.79 M wars in two months — the bot simply grew ~5x past the design point. "Mostly
+  blocked" is therefore not a transitional state; it is the steady state on the 1st of every month.
+- **Contributing — the fixed 4-minute chunk no longer fits the idle window.**
+  `history_migration_cycle_chunk_minutes` (240 s) was calibrated when cycles took under a minute.
+  On 2026-09-01 the median cycle was 130 s, leaving a 170 s sleep window: **every one of the 114
+  chunks overran**, the `db_maintenance_idle_event` gate fired on 114 of 138 cycles, and the cycle
+  period stretched 300 s -> 384 s. That is a feedback loop — longer period means more clans due per
+  cycle (779 -> 1233), which lengthens PHASE-1, which shrinks the idle window further. The config
+  comment already said "keep below the typical idle window", but the value is a constant that is
+  never compared against the actual `_effective_sleep`.
+- **Contributing — throughput ceiling of ~600-1100 rows/s**, exactly as
+  `fast_bulk_history_migration()`'s docstring already documents: each row costs ~6 B-tree updates
+  inserting into a 102.75 M-row `history.war_attacks` plus ~6 removing it from a 51.8 M-row
+  `main.war_attacks`, i.e. ~60,000 random B-tree operations per 5000-row batch.
+- **Stopgap applied (this entry)**: new `CONFIG.history_migration_enabled` (env
+  `HISTORY_MIGRATION_ENABLED`), **defaulting to False**, checked at the top of
+  `is_monthly_migration_due()`. All three automatic consumers — the 03:00 UTC nightly step, the
+  opportunistic per-cycle chunk, and `/admin` Execute Nightly Maintenance — gate on that one
+  function, so a single check disarms every automatic path. The rest of nightly maintenance
+  (archive move, CWL purge, WAL checkpoint, VACUUM/REINDEX, ANALYZE) is untouched and still runs.
+  The check deliberately does **not** write `CACHE.last_history_migration`: claiming a month that
+  was never migrated is precisely the stale-stamp failure documented in the 2026-08-01 operational
+  note above. `qapbot/scripts/run_history_migration_now.py` bypasses the flag by design and remains
+  the supported way to advance the backlog under operator supervision.
+- **This is a stopgap, not the fix.** Known work still open, roughly in payoff order:
+  1. The batched migration does not need to block interactions at all. It holds no exclusive lock —
+     5000-row transactions on the async writer connection, while user commands read through the
+     separate 8-connection sync pool in WAL mode. It inherited `db_maintenance_mode` from
+     `nightly_db_maintenance()`, which genuinely needs it (VACUUM takes EXCLUSIVE and drains the
+     pool). Split the flag: a hard block for VACUUM/REINDEX, an advisory one for migration.
+  2. Derive the chunk budget from the measured idle window instead of a constant.
+  3. Raise throughput: drop only `history.war_attacks`' secondary indexes for the run (main's must
+     stay for live queries); use the keyset-range form from `_bulk_move_chunk` instead of
+     `id IN (5000 params)`; raise `batch_size` (ceiling 32766 — SQLite's bound-parameter limit);
+     add an index on `war_attacks(date)` (the batch SELECT is currently a full `SCAN war_attacks`,
+     and 16.1 M August rows sit below the highest remaining July id).
+  4. Remove the once-a-month cliff entirely — advance the cutoff daily (~1.2 M rows/night, which
+     fits one idle window) rather than 38 M on the 1st. Longer term, month-partitioned history
+     files would let each month's rows land in a fresh index-free table built once by
+     `CREATE INDEX`, and make retention purges a file delete.
+  5. Log interactions rejected by the maintenance guard. There is currently **no** log line when
+     the guard turns a user away (only `logging.debug` if the reply itself fails), so a 14-hour
+     outage produced zero `[MAINTENANCE-GUARD]` entries in a 596k-line log and surfaced only as
+     user complaints.
+- **Note on `--fast` for the remaining backlog**: `fast_bulk_history_migration()` is the wrong tool
+  once most of history is already migrated. It drops and rebuilds the secondary indexes on **both**
+  schemas, so clearing the final 13.65 M rows would rebuild indexes across ~154 M rows. It also
+  runs that rebuild with `wal_autocheckpoint=0` still in effect (`db_manager.py` sets it at the top
+  of the try block and only restores it *after* `_rebuild_war_attacks_secondary_indexes()` in the
+  finally block), so the largest write burst of the run accumulates entirely in the WAL —
+  an estimated ~28 GB for these table sizes. And because the rebuild lives in a `finally`, a
+  SIGKILL or dropped SSH session leaves `main.war_attacks` with no secondary indexes at all.
+  Prefer the normal batched path with `--batch-size 20000` for a supervised catch-up run.
+- Files: `qapbot/config.py` (`history_migration_enabled` + env var), `QapBot.py`
+  (`is_monthly_migration_due()`), `README.md`, this doc. 3 new tests in
+  `tests/unit/test_is_monthly_migration_due.py` (`TestKillSwitch`).
+
 ### Future Phases
 **Not currently planned:**
 - Phase 4: Temp war stats (JSON → DB)

@@ -243,6 +243,47 @@ client = coc.Client(throttle_limit=10)
 
 **Recommendation:** Keep `key_count` and `throttle_limit` aligned with the official per-key limit (10 req/sec/key). Reduce `key_count` only if encountering key provisioning/account limits.
 
+## coc.py payload-shape breakage (`apply_coc_library_patches`)
+
+The vendored `coc.py` parses API payloads eagerly inside object construction, so a payload
+shape the library did not anticipate fails the **whole** fetch, not just the field involved.
+Two mechanisms exist for that, and they solve different halves of the problem.
+
+### 1. Compatibility shims — `apply_coc_library_patches()` (`qapbot/coc_health.py`)
+
+Called from `startup_login()` before the client is created; idempotent, because
+`startup_login()` is also registered as `coc_retry()`'s reconnect callback.
+
+Current shim: `coc.Clan._from_data` tolerating `clanCapital` without `districts`.
+`coc.py` 4.0.0 guards on `clanCapital` being truthy and then indexes `["districts"]`
+unconditionally. From 2026-08-31 the CoC API began returning a non-empty `clanCapital`
+with no `districts` key, raising `KeyError: 'districts'` during `Clan` construction (a
+generator expression evaluates its outermost iterable eagerly). The shim normalises the
+payload to `districts: []` before the original parser runs, landing on the same empty list
+the library's own `else` branch produces. Clan Capital data is not persisted by QapBot, so
+this is lossless here.
+
+Observed cost before the shim (2026-09-01 PROD): 438 distinct clans, 42,871 failed
+`get_clan()` calls in one day, ~65 s added to every PHASE-1 (median PHASE-1 31.8 s -> 90.4 s),
+and no war tracking at all for those 438 clans while it lasted.
+
+Running total is exposed as `get_coc_stats()["capital_districts_fixups"]`; the shim itself
+logs only the first occurrence, since it fires once per affected clan per cycle.
+
+### 2. Parse-error fast-fail — `coc_retry()`
+
+`ValueError` and `KeyError` from the library are **never retried** — they mean the response
+could not be parsed (unknown enum value, or a key the library indexes unconditionally that
+the API stopped sending), and a retry produces the identical error. Without this, each
+affected clan costs 3 HTTP requests plus 1s+2s of backoff in one of only 20 concurrency
+slots. This is the generic guard; a shim above is the actual fix for any specific key.
+
+**When the CoC API changes shape again**: expect the symptom as a flood of one repeated
+`[COC-API-ERROR] ... failed after 1 attempt (parse error, no retry)` signature plus
+`failed=N (WarDataFetchError=N)` in `[CYCLE-SUMMARY]`. Add a shim to
+`apply_coc_library_patches()` rather than patching `venv/`, which is not version-controlled
+and is lost on every reinstall.
+
 ## CoC API Maintenance Handling
 
 CoC server maintenance is a **global outage** lasting 10–30+ minutes. Retrying individual

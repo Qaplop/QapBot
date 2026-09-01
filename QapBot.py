@@ -580,6 +580,12 @@ async def startup_login() -> None:
     Example:
         await startup_login()  # Must be called before any CoC API operations
     """
+    # Compatibility shims for the vendored coc.py library — applied before any
+    # Clan object can be constructed, and idempotent because this function is also
+    # registered as coc_retry()'s reconnect callback below.
+    from qapbot.coc_health import apply_coc_library_patches
+    apply_coc_library_patches()
+
     if QBcore.coc_client is None:
         if CONFIG.no_coc_api:
             # NO_COC_API mode: skip CoC client creation entirely
@@ -2241,6 +2247,12 @@ async def run_nightly_maintenance_routine(
         )
 
 
+# One-shot latch so the "automatic migration is disabled" notice below appears once per
+# process instead of on every ~5-minute cycle. Module-level (not a CACHE field) because it
+# is pure log de-duplication with no bearing on bot state.
+_migration_disabled_logged: bool = False
+
+
 async def is_monthly_migration_due(ignore_in_process_claim: bool = False) -> bool:
     """
     Check whether the monthly hot->history DB migration is due (not yet
@@ -2269,9 +2281,34 @@ async def is_monthly_migration_due(ignore_in_process_claim: bool = False) -> boo
     behavior so they don't loop unsupervised — only a human explicitly asking
     for another run bypasses that.
 
+    Regardless of either mode, returns False whenever
+    ``CONFIG.history_migration_enabled`` is off (added 2026-09-01, default off —
+    see that config field). This is the single enforcement point for that
+    kill-switch: the 03:00 UTC nightly step, the opportunistic per-cycle chunk
+    and ``/admin`` Execute Nightly Maintenance all gate on this function, so
+    disarming it here disarms every automatic path at once. The manual
+    ``qapbot/scripts/run_history_migration_now.py`` CLI bypasses this function
+    entirely and is unaffected — by design, so an operator can still advance the
+    backlog under supervision.
+
     Returns:
         True if the caller should run db_manager.monthly_history_migration() now.
     """
+    if not CONFIG.history_migration_enabled:
+        # Checked before anything else, and deliberately without touching
+        # CACHE.last_history_migration: claiming here would write a "done this month"
+        # marker for a run that never happened, which is exactly the failure mode the
+        # 2026-08-01 stale-stamp incident documented (see DATABASE_ARCHITECTURE.md).
+        global _migration_disabled_logged
+        if not _migration_disabled_logged:
+            _migration_disabled_logged = True
+            logging.info(
+                "[HIST-MIGRATE] Automatic hot->history migration is DISABLED "
+                "(CONFIG.history_migration_enabled=False) — nightly step, per-cycle chunk and "
+                "/admin migration are all skipped. Advance the backlog manually with "
+                "qapbot/scripts/run_history_migration_now.py. Logged once per process."
+            )
+        return False
     if CACHE.db_manager is None:
         return False
     _now_utc = datetime.now(timezone.utc)

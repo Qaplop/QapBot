@@ -73,6 +73,93 @@ _maintenance_detected: bool = False
 # Cleared at the start of each update cycle via clear_dns_detection().
 _dns_failure_detected: bool = False
 
+# Count of clan payloads repaired by apply_coc_library_patches()'s clanCapital
+# shim (see that function).  Lifetime counter, surfaced via get_coc_stats() so a
+# renewed spike is visible without grepping the log — the shim itself only logs
+# the first occurrence, since it fires once per affected clan per cycle.
+_capital_districts_fixups: int = 0
+
+
+def apply_coc_library_patches() -> None:
+    """
+    Apply QapBot's compatibility shims to the vendored ``coc.py`` library.
+
+    Idempotent — safe to call repeatedly (``startup_login()`` doubles as the
+    CoC-client reconnect callback, so it can run many times per process).
+
+    Currently one shim:
+
+    ``coc.Clan._from_data`` — tolerate ``clanCapital`` without ``districts``.
+        ``coc.py`` 4.0.0 (``coc/clans.py``, in ``Clan._from_data``) does::
+
+            if data_get("clanCapital"):
+                self._iter_capital_districts = (... for cddata in data_get("clanCapital")["districts"])
+
+        i.e. it guards on ``clanCapital`` being truthy but then indexes
+        ``["districts"]`` unconditionally.  From 2026-08-31 15:40 the CoC API
+        started returning a non-empty ``clanCapital`` object with no
+        ``districts`` key for some clans, so that subscript raises ``KeyError:
+        'districts'``.  It raises during ``Clan`` construction (a generator
+        expression evaluates its outermost iterable eagerly), so the *entire*
+        clan fetch fails — not just the capital part.
+
+        Impact before this shim (2026-09-01 PROD logs): 438 distinct clans,
+        42,871 failed ``get_clan()`` calls in one day, each burning 3 HTTP
+        requests plus 3s of retry backoff in one of only 20 concurrency slots
+        (~65s added to every PHASE-1, roughly tripling it) — and those 438
+        clans got no war tracking at all for the duration.
+
+        The fix normalises the payload to ``districts: []`` before the original
+        parser sees it, which lands ``capital_districts`` on the same empty list
+        the library's own ``else`` branch produces.  Clan Capital data is not
+        used by QapBot (no DB table stores it), so an empty district list is a
+        complete, lossless outcome here — the clan's war data, which is what the
+        bot actually needs, parses normally.
+
+        Patching ``Clan`` alone is sufficient: no other class in ``coc.py``
+        subclasses it (``RankedClan``/``PlayerClan``/``WarClan``/
+        ``ClanWarLeagueClan`` all derive from ``BaseClan``), and none of them
+        touch ``clanCapital``.
+    """
+    global _capital_districts_fixups
+
+    if getattr(coc.Clan, "_qapbot_capital_districts_patched", False):
+        return
+
+    _original_from_data = coc.Clan._from_data
+
+    def _from_data_tolerating_missing_districts(self: Any, data: Dict[str, Any]) -> None:
+        global _capital_districts_fixups
+        capital = data.get("clanCapital")
+        # Mutated in place rather than copied: this runs on every clan fetch, and
+        # coc.py's own _from_data already mutates the payload in place (it writes
+        # `builderBaseRank` into each memberList entry), so this is consistent with
+        # how the library treats the dict it is handed.
+        if isinstance(capital, dict) and not isinstance(capital.get("districts"), list):
+            capital["districts"] = []
+            _capital_districts_fixups += 1
+            if _capital_districts_fixups == 1:
+                logging.info(
+                    "[COC-COMPAT] CoC API returned a clanCapital object without a 'districts' "
+                    "key (clan %s) — normalising to an empty district list. This would otherwise "
+                    "raise KeyError: 'districts' inside coc.py and fail the whole clan fetch. "
+                    "Only logged once; running total is in get_coc_stats()['capital_districts_fixups'].",
+                    data.get("tag", "<unknown>"),
+                )
+            else:
+                logging.debug(
+                    "[COC-COMPAT] clanCapital without 'districts' for clan %s (fixup #%d)",
+                    data.get("tag", "<unknown>"), _capital_districts_fixups,
+                )
+        return _original_from_data(self, data)
+
+    coc.Clan._from_data = _from_data_tolerating_missing_districts
+    # Marker is a plain class attribute — Clan defines __slots__, which restricts
+    # *instance* attributes only, so this is legal and makes the call idempotent.
+    coc.Clan._qapbot_capital_districts_patched = True
+    logging.info("[COC-COMPAT] Applied coc.py compatibility shims (clanCapital.districts tolerance).")
+
+
 def set_reconnect_callback(callback: Callable[[], Any]) -> None:
     """Register an async callable that re-authenticates the CoC client."""
     global _reconnect_callback
@@ -123,8 +210,12 @@ def get_coc_stats() -> Dict[str, Any]:
         - cycle_total_calls: API calls in current cycle
         - total_sleep_time: Total seconds slept due to rate limits
         - cycle_sleep_time: Seconds slept in current cycle
+        - capital_districts_fixups: Clan payloads repaired by the clanCapital
+          compatibility shim (see apply_coc_library_patches)
     """
-    return _stats.copy()
+    _snapshot = _stats.copy()
+    _snapshot['capital_districts_fixups'] = _capital_districts_fixups
+    return _snapshot
 
 async def coc_retry(
     operation: Callable[[], T],
@@ -322,10 +413,18 @@ async def coc_retry(
             # Generic exception handling
             _stats['api_errors'] += 1
 
-            # ValueError means the coc.py library could not parse the API response
-            # (e.g. an unknown enum value like a new BattleModifier).  Retrying
-            # will produce the exact same error every time — fast-fail immediately.
-            if isinstance(e, ValueError):
+            # ValueError/KeyError mean the coc.py library could not parse the API
+            # response (e.g. an unknown enum value like a new BattleModifier, or a
+            # key the library indexes unconditionally that the API stopped sending).
+            # Retrying will produce the exact same error every time — fast-fail
+            # immediately.
+            # KeyError added 2026-09-01: `KeyError: 'districts'` (clanCapital without
+            # a districts key — see apply_coc_library_patches() for the actual fix)
+            # produced 42,871 failures in one day, each retried 3x with 1s+2s backoff
+            # for no possible benefit, adding ~65s to every PHASE-1. The shim above
+            # fixes that specific key; this makes the *next* payload-shape change cost
+            # one failed call instead of three plus 3s of a concurrency slot.
+            if isinstance(e, (ValueError, KeyError)):
                 logging.error(
                     f"[COC-API-ERROR] {operation_name} failed after 1 attempt "
                     f"(parse error, no retry): {type(e).__name__}: {e}"
