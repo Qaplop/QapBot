@@ -112,10 +112,87 @@ bot: QapBot = QapBot(
 )
 tree = bot.tree  # For slash command registration
 
+# --- Rejected-interaction accounting (2026-09-01) -----------------------------------------
+# Before this, the maintenance guards logged NOTHING when they turned a user away — only a
+# logging.debug if the reply itself failed. A 14-hour outage on 2026-09-01 therefore produced
+# zero [MAINTENANCE-GUARD] lines in a 596k-line log, and surfaced only as user complaints the
+# next day. These counters make "the bot is refusing people right now" visible in the log at
+# the time it is happening.
+#
+# Rate-limited deliberately: 438 clans' worth of users hammering commands during a block would
+# otherwise bury the log. First rejection of an episode logs at INFO with full detail, then
+# every 25th, and the rest at DEBUG. An "episode" ends after 5 minutes of no rejections, so a
+# later, separate block re-logs at INFO instead of silently continuing an old count.
+_guard_reject_reason: Optional[str] = None
+_guard_reject_count: int = 0
+_guard_reject_last_ts: float = 0.0
+_GUARD_REJECT_EPISODE_GAP_S: float = 300.0
+_GUARD_REJECT_LOG_EVERY: int = 25
+
+
+def record_interaction_rejection(reason: str, command_label: str) -> None:
+    """Count and (rate-limited) log an interaction the maintenance guards refused.
+
+    Args:
+        reason: short stable key for the block cause, e.g. "db_maintenance" or
+            "maintenance_mode" — a change of reason starts a new episode.
+        command_label: what the user tried to run, for the log line.
+    """
+    global _guard_reject_reason, _guard_reject_count, _guard_reject_last_ts
+    import logging
+    import time as _time
+
+    now = _time.monotonic()
+    new_episode = (
+        reason != _guard_reject_reason
+        or (now - _guard_reject_last_ts) > _GUARD_REJECT_EPISODE_GAP_S
+    )
+    _guard_reject_last_ts = now
+    if new_episode:
+        _guard_reject_reason = reason
+        _guard_reject_count = 1
+        logging.info(
+            "[MAINTENANCE-GUARD] Refusing Discord interactions — reason=%s, first refused: %s. "
+            "Further refusals in this episode are logged every %d.",
+            reason, command_label, _GUARD_REJECT_LOG_EVERY,
+        )
+        return
+
+    _guard_reject_count += 1
+    if _guard_reject_count % _GUARD_REJECT_LOG_EVERY == 0:
+        logging.info(
+            "[MAINTENANCE-GUARD] Still refusing interactions — reason=%s, %d refused so far "
+            "this episode (latest: %s)",
+            reason, _guard_reject_count, command_label,
+        )
+    else:
+        logging.debug(
+            "[MAINTENANCE-GUARD] Refused %s (reason=%s, #%d)",
+            command_label, reason, _guard_reject_count,
+        )
+
+
+def interaction_command_label(interaction: discord.Interaction) -> str:
+    """Best-effort human label for what the user tried to invoke."""
+    try:
+        if interaction.command is not None:
+            return f"/{interaction.command.name}"
+        cid = (interaction.data or {}).get("custom_id")
+        if cid:
+            return f"component:{cid}"
+    except Exception:
+        pass
+    return "<unknown>"
+
+
 async def _maintenance_interaction_check(interaction: discord.Interaction) -> bool:
     """
     Global guard: block all slash commands while maintenance mode is active.
     Only /admin with action=MAINTENANCE_END is allowed through.
+
+    NOTE: deliberately does NOT consult QBcore.db_migration_active — the batched
+    hot->history migration holds no exclusive lock and must never refuse a user.
+    See db_migration_active's docstring.
 
     Registered via direct assignment (bot.tree.interaction_check = ...) because
     CommandTree.interaction_check is NOT a decorator factory — using @tree.interaction_check
@@ -129,6 +206,7 @@ async def _maintenance_interaction_check(interaction: discord.Interaction) -> bo
         from qapbot.i18n import t as _t
         guild_id = interaction.guild.id if interaction.guild else None
         msg = _t('commands.errors.startup_in_progress', guild_id=guild_id)
+        record_interaction_rejection("startup_in_progress", interaction_command_label(interaction))
         try:
             await interaction.response.send_message(msg, ephemeral=True)
         except Exception as _send_ex:
@@ -148,6 +226,7 @@ async def _maintenance_interaction_check(interaction: discord.Interaction) -> bo
         from qapbot.i18n import t as _t
         guild_id = interaction.guild.id if interaction.guild else None
         msg = _t('commands.errors.db_maintenance_active', guild_id=guild_id)
+        record_interaction_rejection("db_maintenance", interaction_command_label(interaction))
         try:
             await interaction.response.send_message(msg, ephemeral=True)
         except Exception as _send_ex:
@@ -165,6 +244,7 @@ async def _maintenance_interaction_check(interaction: discord.Interaction) -> bo
     from qapbot.i18n import t as _t
     guild_id = interaction.guild.id if interaction.guild else None
     msg = _t('commands.errors.maintenance_mode_active', guild_id=guild_id)
+    record_interaction_rejection("maintenance_mode", interaction_command_label(interaction))
     try:
         await interaction.response.send_message(msg, ephemeral=True)
     except Exception as _send_ex:
@@ -493,9 +573,32 @@ restarts fresh after /admin MAINTENANCE_END.
 
 db_maintenance_mode: bool = False
 """
-True while nightly DB maintenance (or /admin Optimize DB) is running.
+True while an EXCLUSIVE-lock DB operation is running: nightly maintenance
+(VACUUM/REINDEX/ANALYZE, incl. /admin Optimize DB), first-run schema/index builds inside
+initialize_database(), and fast_bulk_history_migration() (which drops main.war_attacks'
+own query indexes).
 All slash commands are blocked with a short "DB optimization in progress" message.
-Set/cleared by nightly_db_maintenance() in db_manager.py.
+
+This is the HARD block, and it is correct only for operations that genuinely lock readers
+out — they drain the sync connection pool and/or hold an EXCLUSIVE lock. Do NOT set it for
+ordinary batched writes; see db_migration_active below.
+"""
+
+db_migration_active: bool = False
+"""
+True while the batched hot->history migration walk is running.
+
+ADVISORY ONLY — observability, /status, and the shutdown watchdog's grace period. It must
+never block a Discord interaction, and _maintenance_interaction_check() /
+check_maintenance_block() deliberately do not consult it.
+
+Why this is separate from db_maintenance_mode (2026-09-01): the batched migration holds no
+exclusive lock. It runs short transactions on the async writer connection while every user
+command reads through the separate 8-connection sync pool in WAL mode, and WAL readers never
+block on a writer. The migration originally set db_maintenance_mode purely because it was
+copied from nightly_db_maintenance(), which genuinely needs it — the result was 9.6 hours of
+refused commands across a 14-hour span on 2026-09-01, for a run that never needed to refuse
+a single one.
 """
 
 maintenance_pending: bool = False

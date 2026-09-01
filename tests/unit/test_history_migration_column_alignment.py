@@ -8,7 +8,7 @@ code used a bare `SELECT *`, which matches columns by position, not name — so 
 landed its trailing ~11/~15 columns in the wrong destination column, with no error, for the
 entire lifetime of the history DB.
 
-The fix (`_explicit_column_list()`, used by both `_migrate_table_batch_by_date` and
+The fix (`_explicit_column_list()`, used by both `_migrate_date_window_batched` and
 `_migrate_cwl_table_by_season`) reads column names from `main`'s own schema and lists them
 explicitly on both sides of `INSERT ... SELECT`. This test proves that fix actually survives a
 genuine column-order divergence between the two schemas — a `SELECT *` implementation would fail
@@ -75,7 +75,7 @@ class TestHistoryMigrationSurvivesColumnDrift:
             )
             await db._conn.commit()
 
-            result = await db.monthly_history_migration(batch_size=10)
+            result = await db.run_history_migration(batch_size=10)
             assert "ERROR" not in result
 
             cur = await db._conn.execute(

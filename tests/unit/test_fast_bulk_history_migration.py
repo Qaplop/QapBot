@@ -1,6 +1,6 @@
 """
 Tests for WarHistoryDB.fast_bulk_history_migration(), added 2026-08-01 after the
-normal batched monthly_history_migration() path proved far slower than raw disk
+normal batched run_history_migration() path proved far slower than raw disk
 I/O should allow (~900-1000 rows/sec on SSD for what was only ~10 GB of data) —
 root-caused to per-row secondary-index maintenance (6 B-tree updates per row on
 each side of the move). See qapbot/docs/DATABASE_ARCHITECTURE.md's Migration
@@ -142,7 +142,7 @@ class TestFastBulkHistoryMigration:
             assert _SECONDARY_INDEX_NAMES <= await _index_names(db, "history")
 
             # Failed run must not be marked done.
-            stamp = await db.get_bot_metadata("last_history_migration")
+            stamp = await db.get_bot_metadata(db.HISTORY_MIGRATION_CUTOFF_KEY)
             assert stamp is None
         finally:
             if db.conn:

@@ -682,7 +682,7 @@ differing only in the 3rd decimal. Looked at first like the automatic collector 
 double-firing; it wasn't — the *logger* was registered twice.
 
 Root cause: `QBdiscordcmds.py` has a module-level `from QapBot import GLOBAL_GUILD_ID,
-run_nightly_maintenance_routine, is_monthly_migration_due`. `QapBot.py` is run as `python
+run_nightly_maintenance_routine, is_history_migration_due`. `QapBot.py` is run as `python
 QapBot.py`, so Python loads it into `sys.modules['__main__']` — there is no `sys.modules['QapBot']`
 entry. When execution reaches (directly or transitively) an import of `QBdiscordcmds`, that
 module's `from QapBot import ...` line doesn't find a `'QapBot'` key in `sys.modules`, so Python
@@ -713,7 +713,7 @@ if not any(getattr(cb, "__name__", None) == "_log_slow_gc" for cb in gc.callback
 ```
 
 Not fixed (deliberately, out of scope for the immediate bug): the circular import itself.
-`GLOBAL_GUILD_ID`/`run_nightly_maintenance_routine`/`is_monthly_migration_due` would need to move
+`GLOBAL_GUILD_ID`/`run_nightly_maintenance_routine`/`is_history_migration_due` would need to move
 to a neutral module (e.g. `QBcore.py` or a new small module) both files can import from, breaking
 the `QapBot.py` → `QBdiscordcmds.py` → `QapBot.py` cycle — a real fix, but a bigger one that needs
 its own review of every consumer.
@@ -2439,3 +2439,50 @@ to a length-constrained API payload, not as prose. A structural test is the righ
 the same reason Cardinal Rule 14 gives for `row[N]`: the code is correct until someone edits a
 string, so a behavioural test can never catch it in advance. Watch especially for docs/accuracy
 passes that append clarifying words to user-facing labels — that is exactly how this one landed.
+
+## Pitfall 54: a "block all commands" flag copied from an operation that needs it, onto one that doesn't — the copy is invisible in review because both look like "DB work in progress"
+
+**Symptom** (PROD, 2026-09-01): the monthly hot->history migration held
+`QBcore.db_maintenance_mode` for **9.6 hours of a 14.1-hour span** (68% duty cycle, median
+132 s of availability between blocks). Every slash command, button and modal was refused —
+including `/ping`, which touches no database at all. Users reported "the bot is down"; the
+operator found out from complaints, a day later.
+
+**Root cause:** `monthly_history_migration()` set `db_maintenance_mode = True` for its whole
+run. It had no reason to. The batched migration runs **short transactions on the async writer
+connection**, while every user command reads through a **separate 8-connection sync pool in
+WAL mode** — and in WAL, readers never block on a writer. The flag was inherited wholesale
+from `nightly_db_maintenance()`, which genuinely does need it: VACUUM takes an `EXCLUSIVE`
+lock and drains the pool, so concurrent access really would fail.
+
+**Why nobody caught it:** both operations read as "a long DB maintenance job", so the flag
+looked correct at every review. The distinction that actually matters is invisible in the
+call site and only recoverable by asking *what lock does this take, and which connections do
+readers use* — a question about two other files.
+
+**Fix:** split the state by what it guarantees, not by what it feels like.
+
+```python
+db_maintenance_mode: bool   # HARD block: EXCLUSIVE lock and/or drained pool.
+                            # VACUUM/REINDEX, first-run index builds, fast bulk migration.
+db_migration_active: bool   # ADVISORY: observability + shutdown grace only.
+                            # NEVER consulted by an interaction guard.
+```
+
+Both guard entry points (`QBcore._maintenance_interaction_check` for slash commands,
+`qapbot.ui_common.check_maintenance_block` for components) deliberately do **not** consult the
+advisory flag, and `tests/unit/test_migration_does_not_block_interactions.py` pins that from
+both sides — because if either one starts consulting it again, the outage returns and nothing
+else in the suite would notice.
+
+**Second half of the lesson: a guard that refuses users must say so in the log.** These guards
+logged *nothing* on refusal — only a `logging.debug` if the reply itself failed. A 14-hour
+outage therefore produced **zero** `[MAINTENANCE-GUARD]` lines in a 596k-line log. There was
+no way to see it happening, and no forensic trail afterwards. Refusals are now logged at INFO,
+rate-limited (first per episode, then every 25th) so a busy block cannot bury the log.
+
+**How to apply:** before setting any flag that degrades or blocks user-facing behaviour, state
+in the code comment *which* concurrency guarantee forces it — the specific lock, or the
+specific resource being torn down. If that sentence cannot be written, the flag is probably
+being copied rather than needed. And any code path that turns a user away must leave a log
+line at INFO; "it's temporary" is exactly when you most need to know it happened.

@@ -121,12 +121,12 @@ def apply_coc_library_patches() -> None:
         ``ClanWarLeagueClan`` all derive from ``BaseClan``), and none of them
         touch ``clanCapital``.
     """
-    global _capital_districts_fixups
-
     if getattr(coc.Clan, "_qapbot_capital_districts_patched", False):
         return
 
-    _original_from_data = coc.Clan._from_data
+    # Reaching into coc.Clan's internals is the entire point of a compatibility shim, so
+    # the protected-access findings here are suppressed narrowly rather than project-wide.
+    _original_from_data = coc.Clan._from_data  # pyright: ignore[reportPrivateUsage]
 
     def _from_data_tolerating_missing_districts(self: Any, data: Dict[str, Any]) -> None:
         global _capital_districts_fixups
@@ -153,10 +153,11 @@ def apply_coc_library_patches() -> None:
                 )
         return _original_from_data(self, data)
 
-    coc.Clan._from_data = _from_data_tolerating_missing_districts
+    coc.Clan._from_data = _from_data_tolerating_missing_districts  # pyright: ignore[reportPrivateUsage]
     # Marker is a plain class attribute — Clan defines __slots__, which restricts
     # *instance* attributes only, so this is legal and makes the call idempotent.
-    coc.Clan._qapbot_capital_districts_patched = True
+    # pyright flags it because the attribute is (by design) not declared on Clan.
+    coc.Clan._qapbot_capital_districts_patched = True  # pyright: ignore[reportAttributeAccessIssue]
     logging.info("[COC-COMPAT] Applied coc.py compatibility shims (clanCapital.districts tolerance).")
 
 

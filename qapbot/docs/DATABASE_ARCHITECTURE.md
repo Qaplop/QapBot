@@ -67,12 +67,16 @@ apply the main connection's pragmas.
 
 **Retention model**: `main` (the hot DB) always holds the current calendar
 month plus the immediately preceding one in full; everything strictly older
-is migrated to `history` once a month by `nightly_db_maintenance()`
-(cutoff computed by `_history_cutoff()`). Only the 4 time-series tables are
+is migrated to `history` a little each night by the nightly maintenance routine
+(cutoff computed by `_history_cutoff()` — rolling, see the 2026-09-01 entry in Migration
+History). Only the 4 time-series tables are
 mirrored on both schemas: `war_attacks`, `war_summary`, `cwl_league_groups`,
 `cwl_league_rounds` — all other maindata tables (clans, users, guild_config,
-etc.) stay hot-only. Migration is batched (`_migrate_table_batch_by_date()`)
-rather than one giant transaction, to avoid holding the write lock for long.
+etc.) stay hot-only. Migration walks one calendar day at a time
+(`run_history_migration()` -> `_migrate_date_window_batched()`), batched within each day
+rather than one giant transaction, so the write lock is never held for long. It sets
+`QBcore.db_migration_active` (advisory) and deliberately NOT `db_maintenance_mode` — it
+holds no exclusive lock, so it must not refuse Discord interactions.
 
 A second, unrelated retention rule covers the CWL roster tables, which are
 hot-only and never mirrored to `history`: `purge_expired_cwl_events()` deletes
@@ -1441,7 +1445,7 @@ re-check) rather than trusting them long-term.
   so a future incident with a similar shape (persisted "done" state written before a fix, not
   cleared after) is recognized faster.
 
-### 2026-08-01 (fourth same-day follow-up): Opportunistic Per-Cycle Migration Chunking
+### 2026-08-01 (fourth same-day follow-up): Opportunistic Per-Cycle Migration Chunking (SUPERSEDED — removed 2026-09-01 ⚠️)
 - **Why**: operator proposal — the update cycle already sleeps for the unused remainder of
   `SLEEP_INTERVAL` after each cycle (~4-4.5 min idle out of a 5-min default interval, cycles
   typically taking under a minute). Rather than only advancing the migration in one large chunk a
@@ -1477,7 +1481,7 @@ re-check) rather than trusting them long-term.
   as the entry above for no new dedicated test — `periodic_main()`'s loop isn't unit-tested
   end-to-end).
 
-### 2026-08-01 (fifth same-day follow-up): `/admin` Migration Budget Decoupled From the Scheduled Nightly One
+### 2026-08-01 (fifth same-day follow-up): `/admin` Migration Budget Decoupled From the Scheduled Nightly One (SUPERSEDED — re-coupled 2026-09-01, see entry (d) ⚠️)
 - **Why**: operator noticed `run_nightly_maintenance_routine()` is shared verbatim between the
   scheduled 03:00 UTC task and the `/admin` "Execute Nightly Maintenance" command — both were using
   the same `CONFIG.history_migration_time_budget_minutes` (90 min) for the migration step. That's
@@ -1647,7 +1651,7 @@ re-check) rather than trusting them long-term.
   test_player_name_search_fts.py`, plus the Step 9 tests and one guest-search delegation test).
   2046 tests pass.
 
-### 2026-09-01: Automatic Hot->History Migration DISARMED — Per-Cycle Chunking Blocked Discord For 14h (Stopgap ⚠️)
+### 2026-09-01 (a): Automatic Hot->History Migration DISARMED — Per-Cycle Chunking Blocked Discord For 14h (Stopgap — superseded same day by (b) below ⚠️)
 - **Symptom**: on the 1st of September the monthly migration fired at 02:03 and was still running
   at 16:11 — 114 per-cycle chunks, **zero** of them completing. `QBcore.db_maintenance_mode` was
   True for **9.6 h of a 14.1 h span (68% duty cycle)**, median availability window between blocks
@@ -1717,6 +1721,222 @@ re-check) rather than trusting them long-term.
 - Files: `qapbot/config.py` (`history_migration_enabled` + env var), `QapBot.py`
   (`is_monthly_migration_due()`), `README.md`, this doc. 3 new tests in
   `tests/unit/test_is_monthly_migration_due.py` (`TestKillSwitch`).
+
+### 2026-09-01 (b): Rolling Nightly Migration — The Redesign the Stopgap Above Was Holding Open (Complete ✅)
+
+Implements all six fixes from entry (a) in one pass, at the operator's request. Plan of
+record: `plans/implemented/history-migration-redesign.md`.
+
+**1. The migration no longer blocks Discord interactions.** New `QBcore.db_migration_active`
+(advisory) replaces `db_maintenance_mode` for the batched walk. The walk holds no exclusive
+lock — short transactions on the async writer connection, while every user command reads
+through the separate 8-connection sync pool in WAL mode, where readers never block on a
+writer. It only ever set `db_maintenance_mode` because it was copied from
+`nightly_db_maintenance()`, which genuinely needs it (EXCLUSIVE lock + drained pool). That
+copy-paste cost 9.6 hours of refused commands on 2026-09-01 for a run that never needed to
+refuse one. `db_maintenance_mode` is unchanged for VACUUM/REINDEX, schema+index builds, and
+`fast_bulk_history_migration()` (which drops `main`'s own query indexes).
+Guarded by `tests/unit/test_migration_does_not_block_interactions.py` — if either guard
+entry point starts consulting the advisory flag again, the outage class returns and nothing
+else in the suite would notice.
+
+**2. Per-cycle chunking deleted outright**, not resized. `CONFIG.history_migration_cycle_chunk_minutes`
+and the `elif` branch in `periodic_main()` are gone. With ~1.2M rows/night there is nothing
+left for an opportunistic chunk to do, and keeping it would preserve a permanent interaction
+with the cycle timing loop for a backlog that no longer exists.
+
+**3. Rolling cutoff.** `_history_cutoff()` now returns
+`min(today - CONFIG.history_retention_days, first day of the previous calendar month)`,
+default 60 days. **The floor is load-bearing**: the documented contract is "hot always holds
+the current + the immediately preceding calendar month", whose oldest retained row can be
+**61** days old (day 31 of a 31-day month after a 31-day month — e.g. 2026-08-31, where
+2026-07-01 is 61 days back). Plain `today - 60` breaks that contract on 8 dates every 4
+years. With the floor it cannot, for any retention value, which is what makes the constant
+freely tunable. `tests/unit/test_history_retention_cutoff.py` asserts the invariant over a
+4-year sweep, asserts the floor actually binds somewhere (so the sweep is not passing on the
+rolling term alone), and pins the 61-day worst case that justifies the floor existing.
+
+**4. Day-by-day walk with a row budget.** `run_history_migration()` replaces
+`monthly_history_migration()`: it walks the cutoff one calendar day at a time toward the
+target, persisting the reached cutoff to `bot_metadata` after each **completed** day, so an
+interruption resumes at day granularity with no rescan. Bounded by
+`history_migration_nightly_row_budget` (primary, default 3M — sized so a full CWL day of
+~2.2M finishes in one night) and `history_migration_time_budget_minutes` (secondary hard
+stop, lowered 90 -> 30 since it no longer gates availability).
+- **Bounded by rows, not days**, because daily volume is wildly non-uniform: the 2026-09-01
+  hot DB ranged from 37 rows (2026-07-15) to 2,191,245 (2026-08-05). "N days per night"
+  would have been meaningless.
+- **Empty days are skipped** via an indexed `MIN()` probe (`_oldest_migratable_date(since=)`),
+  making the walk O(days-with-data) rather than O(calendar-days). Without it a single stray
+  ancient row — a bad backfill, a war file with a broken date — would make every nightly run
+  crawl day by day from that row to today for nothing.
+- **New `bot_metadata` key** `history_migration_cutoff_reached` (a date), deliberately not a
+  reuse of `last_history_migration` (an ISO timestamp compared by year/month). The old key
+  answered "did the monthly job run this month", a question the walk no longer asks; a new
+  key means no type-punning under a running system and no ambiguity about which writer wrote
+  a value. The legacy key is now dead data.
+
+**5. `is_monthly_migration_due()` -> `is_history_migration_due()`.** The two modes
+(`ignore_in_process_claim`), the `day == 1` gate and the in-memory claim all existed only to
+stop a *monthly* job re-firing within its month. The question is now just
+`reached_cutoff < target_cutoff`, derived fresh from persisted state and naturally
+idempotent. (The `CONFIG.history_migration_enabled` kill-switch it briefly also enforced was
+removed the same day — see entry (d).)
+
+**6. Throughput.** `_migrate_date_window_batched()` replaces `_migrate_table_batch_by_date()`:
+- Date **window** instead of "everything below a cutoff", served by the new `idx_wa_date` /
+  `idx_ws_date` — the old query planned a full `SCAN war_attacks` (confirmed via
+  `EXPLAIN QUERY PLAN`).
+- **Keyset id bound** instead of `id IN (?,?,...)`: no 5000-parameter bind, no 5000 rowid
+  seeks per statement, and the 32766-parameter ceiling that forced `batch_size=5000` is gone.
+  Default batch size raised to 20000, chosen by transaction duration (~1-2s), which is the
+  correct knob — a faster engine moving more rows per transaction holds the write lock
+  *longer*, not shorter.
+- `_explicit_column_list()` hoisted out of the batch loop (~4,800 needless `PRAGMA table_info`
+  calls on 2026-09-01).
+- Progress logging with rows/sec and ETA. A run that will take hours now says so in its first
+  lines.
+
+**7. Rejected-interaction accounting.** The guards previously logged *nothing* when refusing a
+user — a 14-hour outage produced zero `[MAINTENANCE-GUARD]` lines in a 596k-line log, and
+surfaced only as user complaints the next day. Now rate-limited INFO logging (first refusal
+of an episode, then every 25th), from both the slash-command guard and the component guard.
+
+**The `date` indexes are `main`-only, and that asymmetry is deliberate.** The migration queries
+`main` by date and only ever INSERTs into `history`; there are no history date-only filters in
+the codebase. Building `idx_wa_date` on `history.war_attacks` (~103M rows) would cost 15-40 min,
+buy nothing, and — combined with the `main` build — overrun `initialize_database()`'s 1800s
+watchdog and fail startup. Cardinal Rule 1 is about **column** parity (positional `SELECT *`
+corruption across schemas); an index-set difference cannot corrupt data. The index is also
+deliberately absent from `_WAR_ATTACKS_SECONDARY_INDEX_DDL`, which is the "drop for a bulk move,
+rebuild after" set — `_bulk_move_chunk()` filters on `date`, so this index should survive a bulk
+move rather than be dropped for it.
+
+**Where the index build runs**: inline in `_create_schema()`, i.e. inside
+`initialize_database()` (on_ready Step 1.5), before CoC login and before `periodic_main()`.
+This is the settled pattern from the 2026-07-30 "Startup Ordering Fix (Final)" entry above, and
+it is safe for the reason that entry gives — sequencing, not cleverness: no other code path can
+write to the DB at that point. The two superseded attempts recorded there (fire-and-forget
+background task; deferral to nightly maintenance) should not be re-derived. One-time cost:
+~5-15 min on ~52M rows with commands blocked, and the first update cycle starts that much late
+(delayed, not lost — war files persist and the next cycle catches up).
+
+**Two latent `fast_bulk_history_migration()` defects fixed** while in the area, because it is the
+documented recovery tool:
+- The index rebuild ran with `wal_autocheckpoint=0` still in effect (set at the top of the try
+  block, restored *after* the rebuild in the finally). The largest write burst of the whole
+  method — 10 `CREATE INDEX` statements across a ~103M-row and a ~52M-row table, an estimated
+  ~28 GB of pages — therefore accumulated entirely in the WAL with no checkpoint between any of
+  them. Same shape as the 2026-08-01 disk-full incident. The restore now happens *before* the
+  rebuild; ordering is the entire fix.
+- Its `war_summary` call site used the deleted `_migrate_table_batch_by_date()`; it now calls
+  `_migrate_date_window_batched()` with an open lower bound, since the fast path deliberately
+  clears everything below the cutoff in one campaign rather than walking days.
+
+**Migration note for the deploy**: there is no backlog. Measured on the 2026-09-01 16:10
+snapshot, rows below a 60-day cutoff were **30** for `war_attacks` and **0** for `war_summary`,
+`cwl_league_groups` and `cwl_league_rounds`. The 2026-09-01 run was chasing the *calendar-month*
+cutoff (2026-08-01), which on the 1st of a month demands hot shed everything older than ~31
+days — that is the cliff this removes. Hot now settles at a steady size instead of sawtoothing
+down to ~37M on the 1st; see entry (c) below for the final window and its disk figure.
+
+- Files: `qapbot/config.py`, `QBcore.py`, `qapbot/ui_common.py`, `qapbot/db_manager.py`,
+  `QapBot.py`, `QBdiscordcmds.py`, `qapbot/scripts/run_history_migration_now.py`, `README.md`.
+  New tests: `test_history_retention_cutoff.py`, `test_migration_does_not_block_interactions.py`,
+  `test_history_migration_budgets.py` (replaces `test_history_migration_time_budget.py`),
+  `test_is_history_migration_due.py` (replaces `test_is_monthly_migration_due.py`).
+
+### 2026-09-01 (c): Retention Window Retuned 60 -> 75 Days So Migration Load Never Lands On A CWL Season (Complete ✅)
+
+Operator observation on entry (b), and it was right: with a 60-day window, data written
+during a CWL season migrates **exactly two months later, during the next CWL season** —
+stacking the two heaviest jobs the bot has onto the same nights.
+
+`history_retention_days` is not just a disk knob. A row dated `D` migrates `N` days later,
+so `N` decides **which days of the month carry the heavy migration**. CWL runs days 1-10 and
+produces ~2x the normal daily volume (2026-08-03..08 held 2.0-2.3M rows/day against a ~1.2M
+baseline), so the phase relationship matters as much as the size.
+
+Measured over two years of dates:
+
+| N | max cutoff jump | frozen days | CWL-data migration days inside a CWL window |
+|---|---|---|---|
+| 45 | 17 | 356 | 23 of 23 |
+| 50 | 12 | 236 | 27 of 27 |
+| 60 | 2 | 4 | **227 of 235** |
+| 70 | 1 | 0 | 4 of 240 |
+| **75** | **1** | **0** | **0 of 240** |
+| 80 | 1 | 0 | 8 of 240 |
+
+**Shortening it makes things dramatically worse, which is counter-intuitive and is the
+reason this entry exists.** The operator's first instinct was 50 days — moving CWL data a few
+days *before* the next season. But below 61 the calendar floor starts binding (the contract's
+oldest retained row can be 61 days old, see entry (b) §3), so the cutoff **freezes** for
+roughly a third of all days and then **jumps up to 12 days at once** — and those jumps land
+on the 1st of the month. A 12-day jump spanning a full CWL week is ~24M rows in one night, on
+the 1st: precisely the cliff this redesign removed.
+
+`N` in **71..78** is the only band that is simultaneously smooth (floor never binds, cutoff
+advances exactly 1 day/night, 0 frozen days) and CWL-clean (no CWL-dated row ever migrates
+during a CWL season). 74/75 sit at its centre with 4 days of margin on both sides. At 75, CWL
+data from month M migrates around days 15-24 of month M+2 — the quiet stretch between seasons.
+
+- **Cost**: hot settles at ~92M rows / ~40 GB instead of ~74M / ~34 GB. Accepted.
+- **Guarded**: `tests/unit/test_history_retention_cutoff.py` now asserts both properties
+  against whatever `CONFIG.history_retention_days` actually is, and separately pins that 50
+  and 60 still reproduce their respective failures — so if a future edit "optimises" the
+  constant for disk, the build says why it must not. Verified the guard fails at 50 and 60
+  and passes at 75.
+- Files: `qapbot/config.py`, `README.md`, `tests/unit/test_history_retention_cutoff.py`.
+
+### 2026-09-01 (d): Migration Kill-Switch and the Separate `/admin` Budget Both Removed (Complete ✅)
+
+Cleanup pass over entries (b)/(c), on the operator's reading — and they were right on both.
+
+**`CONFIG.history_migration_enabled` deleted.** It was introduced hours earlier as the
+stopgap in entry (a), when the migration was a multi-hour blocking campaign that had to be
+stoppable *right now*. After the redesign it guards nothing: the walk is non-blocking,
+budgeted, resumable and moves ~1.2M rows a night. There is no state in which you would want
+it permanently off — and that is exactly what makes it a hazard rather than a safety net,
+because its "off" position silently stops hot-DB retention with nothing to alarm on. A
+switch that must never be used, but whose wrong setting is invisible, is worse than no
+switch. Removed from `config.py`, `QapBot.is_history_migration_due()`, `README.md` and the
+tests.
+- If one is ever genuinely needed, `HISTORY_MIGRATION_NIGHTLY_ROW_BUDGET=0` already is one:
+  the walk's budget check is `rows_moved >= row_budget`, so a zero budget breaks on the
+  first iteration and the run is an immediate no-op. No dedicated flag required.
+
+**`/admin` Execute Nightly Maintenance now runs the identical routine.**
+`CONFIG.history_migration_admin_budget_minutes` (env `HISTORY_MIGRATION_ADMIN_BUDGET_MINUTES`,
+1 min) and `run_nightly_maintenance_routine()`'s `migration_time_budget_seconds` override are
+both gone. That override existed (2026-08-01, fifth same-day follow-up above) because
+migration was a long campaign an interactive command should only nibble at; with a small
+nightly job it only made the two callers diverge for no benefit. `/admin` now means "do
+tonight's maintenance now", with the same due-check, the same budgets and the same steps.
+- The interactive-token risk the short budget hedged against is unchanged and still handled
+  where it always was: the caller catches a failed followup and logs the result instead. A
+  long VACUUM could already blow the ~15 min token on its own, so the hedge was never
+  complete anyway.
+- `tests/unit/test_run_nightly_maintenance_routine.py` pins this two ways: a behavioural test
+  that the migration step receives the CONFIG budgets, and a **structural** one asserting the
+  routine's signature is exactly `(db_mgr, run_migration)` — re-adding a per-caller budget
+  parameter is how the two paths drifted apart the first time, and only the signature can
+  catch that before it happens.
+
+**Also removed**: a dead `global _capital_districts_fixups` in
+`apply_coc_library_patches()` (the outer function never assigns it — only the closure does,
+which has its own declaration).
+
+**Left in place deliberately**: `bot_metadata["last_history_migration"]`, the old monthly
+timestamp. Nothing reads or writes it any more, so it cannot mislead code — only a human
+inspecting the table. Clear it with
+`DELETE FROM bot_metadata WHERE key = 'last_history_migration';` if you want the table tidy;
+it is not worth startup work.
+
+- Files: `qapbot/config.py`, `QapBot.py`, `QBdiscordcmds.py`, `qapbot/coc_health.py`,
+  `qapbot/scripts/run_history_migration_now.py`, `README.md`,
+  `tests/unit/test_is_history_migration_due.py`,
+  `tests/unit/test_run_nightly_maintenance_routine.py`.
 
 ### Future Phases
 **Not currently planned:**

@@ -135,49 +135,51 @@ class BotConfig:
     # Database settings
     db_path: str = "data/qapbot.db"        # SQLite database file path (hot: current + previous calendar month)
     history_db_path: str = "data/qapbot_history.db"  # SQLite history database (ATTACHed as schema 'history'; everything older than db_path's window)
-    # Master kill-switch for every AUTOMATIC hot->history migration path: the 03:00 UTC
-    # nightly step, the opportunistic per-cycle chunk, and /admin "Execute Nightly
-    # Maintenance". Enforced in exactly one place — QapBot.py's is_monthly_migration_due(),
-    # which all three consult — so there is no path that can slip past it.
-    # Deliberately does NOT gate qapbot/scripts/run_history_migration_now.py: that script
-    # calls monthly_history_migration()/fast_bulk_history_migration() directly and is the
-    # supported way to advance the backlog under operator supervision while this is off.
+    # Rolling hot-DB retention, in days (2026-09-01 redesign). The nightly migration walks the
+    # cutoff toward `today - history_retention_days`, so roughly one day of aged-out rows moves
+    # per night instead of a whole month landing on the 1st (which on 2026-09-01 meant ~38M rows
+    # and 114 never-completing chunks).
     #
-    # TEMPORARY DEFAULT — set to False on 2026-09-01 after the September migration ran for
-    # 14+ hours across 114 chunks (0 completed) with Discord commands blocked 68% of that
-    # time. A month of aged-out data is now ~38M war_attacks rows, roughly an order of
-    # magnitude past what the per-cycle chunking design assumed ("likely complete within the
-    # first cycle or two"), so the automatic paths cannot be left armed until that design is
-    # reworked. Flip back to True (in code, or via HISTORY_MIGRATION_ENABLED=true) as part of
-    # that rework — not before.
-    history_migration_enabled: bool = False
-    # Cap on the scheduled nightly window's monthly_history_migration() run (QapBot.py's
-    # 03:00 UTC path only — NOT the manual run_history_migration_now.py CLI, which takes its
-    # own --time-budget-minutes, and not the per-cycle chunk below). Added 2026-08-01: a
-    # first-ever run against a large backlog can take 10+ hours; without a cap, the automatic
-    # path would block Discord commands for the whole thing in one sitting. A capped run
-    # reports PARTIAL (not done), so is_monthly_migration_due() keeps retrying.
-    history_migration_time_budget_minutes: float = 90.0
-    # Opportunistic per-cycle migration chunk (added 2026-08-01, same incident): rather than
-    # only advancing the migration once/night, spend up to this many minutes of the otherwise-
-    # idle sleep window (between update cycles, ~4-4.5 min of a 5-min SLEEP_INTERVAL by
-    # default) on migration whenever it's still due. Self-limiting — once
-    # is_monthly_migration_due() reports done, this does nothing, so it costs nothing during
-    # routine months where each month's backlog is small enough to finish in one or two cycles.
-    # During an active large backlog it dominates the idle window (Discord commands blocked
-    # most of the time, not just briefly) in exchange for finishing far faster than
-    # once-a-night chunking alone. Set to 0 to disable (falls back to the once-a-night
-    # scheduled-window chunk only). Keep below the typical idle window (SLEEP_INTERVAL minus
-    # typical cycle duration) so the gate at the end of the sleep-wait rarely actually blocks.
-    history_migration_cycle_chunk_minutes: float = 4.0
-    # Cap on Step 0.5's migration run specifically for the /admin "Execute Nightly Maintenance"
-    # command (added 2026-08-01) — deliberately much shorter than
-    # history_migration_time_budget_minutes. /admin is an interactive, user-awaited command
-    # (Discord interaction token expires after ~15 min); migration progress isn't its purpose
-    # (the per-cycle chunk above already carries the bulk of it) — this just takes a quick
-    # nibble so the command stays fast and focused on the actual maintenance steps
-    # (WAL checkpoint / VACUUM / REINDEX / ANALYZE).
-    history_migration_admin_budget_minutes: float = 1.0
+    # The effective cutoff is min(today - N, first day of the previous calendar month) — see
+    # WarHistoryDB._history_cutoff(). The floor matters: the documented contract is "hot always
+    # holds the current + the immediately preceding calendar month", whose oldest retained row
+    # can be 61 days old (day 31 of a 31-day month following a 31-day month, e.g. 2026-08-31,
+    # where 2026-07-01 is 61 days back). A plain rolling window shorter than 61 would migrate
+    # that day out and break the contract; the floor stops it, so any value is contract-safe.
+    #
+    # WHY 75 AND NOT SOMETHING SMALLER — this value is load-bearing, do not "optimise" it for
+    # disk without re-running the analysis (qapbot/docs/DATABASE_ARCHITECTURE.md, 2026-09-01 (c)):
+    #
+    #   * CWL runs days 1-10 of each month and produces ~2x the normal daily war volume
+    #     (2026-08-03..08 held 2.0-2.3M rows/day against a ~1.2M baseline). Data dated day D
+    #     migrates N days later, so N decides WHICH days of the month carry the heavy migration.
+    #   * At N=60 every single CWL-data migration day lands inside a CWL window — the two
+    #     heaviest jobs the bot has, stacked on the same nights. Measured: 227 of 235 over two
+    #     years.
+    #   * Going SHORTER makes it far worse, not better. Below 61 the calendar floor starts
+    #     binding: at N=50 the cutoff freezes for ~1/3 of all days and then jumps up to 12 days
+    #     at once — and those jumps land on the 1st of the month, i.e. a ~24M-row night during
+    #     CWL. That is exactly the cliff this whole redesign removed.
+    #   * N in 71..78 is the only band that is BOTH smooth (floor never binds, cutoff advances
+    #     1 day/night, 0 frozen days) AND has zero CWL-data migration days inside a CWL window.
+    #     74/75 sit at its centre with 4 days of margin on each side. CWL data from month M then
+    #     migrates around days 15-24 of month M+2, in the quiet stretch between seasons.
+    #
+    # Cost of the extra 15 days over N=60: hot settles at ~92M rows / ~40 GB instead of ~74M /
+    # ~34 GB.
+    history_retention_days: int = 75
+    # Per-night row budget for the migration walk. Sized so a full CWL day (~2.2M rows on PROD;
+    # CWL weeks run ~2x the ~1.2M/day baseline) completes in one night with headroom rather than
+    # spilling into the next. Bounded by rows, not days, because daily volume is wildly
+    # non-uniform — the 2026-09-01 hot DB ranged from 37 rows (2026-07-15) to 2,191,245
+    # (2026-08-05), so a "N days per night" budget would be meaningless.
+    history_migration_nightly_row_budget: int = 3_000_000
+    # Secondary hard stop for a single migration run, in minutes. The row budget above is the
+    # primary bound; this exists so a pathologically slow disk cannot leave the walk running
+    # indefinitely. Lowered 90 -> 30 on 2026-09-01: the migration no longer blocks Discord
+    # commands (it sets QBcore.db_migration_active, not db_maintenance_mode), so this no longer
+    # gates availability — it now only bounds how long the write lock is contended.
+    history_migration_time_budget_minutes: float = 30.0
     
     # DEV-only: Skip CoC API connection entirely (for testing without valid API token)
     no_coc_api: bool = False
@@ -355,21 +357,18 @@ def load_config() -> BotConfig:
     # Database configuration
     db_path = os.getenv("DB_PATH", os.path.join(data_dir, "qapbot.db"))
     history_db_path = os.getenv("HISTORY_DB_PATH", os.path.join(data_dir, "qapbot_history.db"))
-    # Defaults to "false" to match BotConfig.history_migration_enabled's temporary default —
-    # see that field's comment for why every automatic migration path is currently disarmed.
-    history_migration_enabled = os.getenv("HISTORY_MIGRATION_ENABLED", "false").lower() in ("true", "1", "yes")
     try:
-        history_migration_time_budget_minutes = float(os.getenv("HISTORY_MIGRATION_TIME_BUDGET_MINUTES", "90"))
+        history_retention_days = int(os.getenv("HISTORY_RETENTION_DAYS", "75"))
     except ValueError:
-        history_migration_time_budget_minutes = 90.0
+        history_retention_days = 75
     try:
-        history_migration_cycle_chunk_minutes = float(os.getenv("HISTORY_MIGRATION_CYCLE_CHUNK_MINUTES", "4"))
+        history_migration_nightly_row_budget = int(os.getenv("HISTORY_MIGRATION_NIGHTLY_ROW_BUDGET", "3000000"))
     except ValueError:
-        history_migration_cycle_chunk_minutes = 4.0
+        history_migration_nightly_row_budget = 3_000_000
     try:
-        history_migration_admin_budget_minutes = float(os.getenv("HISTORY_MIGRATION_ADMIN_BUDGET_MINUTES", "1"))
+        history_migration_time_budget_minutes = float(os.getenv("HISTORY_MIGRATION_TIME_BUDGET_MINUTES", "30"))
     except ValueError:
-        history_migration_admin_budget_minutes = 1.0
+        history_migration_time_budget_minutes = 30.0
 
     # DEV-only: Skip CoC API connection (for testing without valid API token)
     no_coc_api = os.getenv("NO_COC_API", "false").lower() in ("true", "1", "yes")
@@ -425,10 +424,9 @@ def load_config() -> BotConfig:
         investigate_dir=investigate_dir,
         db_path=db_path,
         history_db_path=history_db_path,
-        history_migration_enabled=history_migration_enabled,
+        history_retention_days=history_retention_days,
+        history_migration_nightly_row_budget=history_migration_nightly_row_budget,
         history_migration_time_budget_minutes=history_migration_time_budget_minutes,
-        history_migration_cycle_chunk_minutes=history_migration_cycle_chunk_minutes,
-        history_migration_admin_budget_minutes=history_migration_admin_budget_minutes,
         is_dev_mode=is_dev_mode,
         discord_guild_id=discord_guild_id,
         dev_playerregistration_channel_id=dev_playerregistration_channel_id,

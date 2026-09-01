@@ -36,8 +36,8 @@ import time as _time
 from contextlib import contextmanager
 
 # Separate, independently-patchable reference to time.monotonic used ONLY by the
-# migration time-budget code below (_migrate_table_batch_by_date /
-# _migrate_cwl_table_by_season / monthly_history_migration). Deliberately NOT
+# migration time-budget code below (_migrate_date_window_batched /
+# _migrate_cwl_table_by_season / run_history_migration). Deliberately NOT
 # `_time.monotonic` directly: `_time` IS the real `time` module object (same
 # identity, not a copy), so patching `_time.monotonic` in a test also silently
 # hijacks asyncio's own event-loop clock (`base_events.py`'s `_run_once()` calls
@@ -49,6 +49,7 @@ _monotonic = _time.monotonic
 from typing import List, Dict, Any, Optional, Tuple, Set, TYPE_CHECKING, Callable, Awaitable, cast, Iterable
 
 if TYPE_CHECKING:
+    import datetime
     import aiosqlite
 else:
     try:
@@ -1439,6 +1440,34 @@ class WarHistoryDB:
             "CREATE INDEX IF NOT EXISTS idx_wa_player_tag_date ON war_attacks(player_tag, date)",
         )
 
+        # idx_wa_date — date ONLY, and deliberately on `main` only (2026-09-01 redesign).
+        #
+        # Why it exists: the nightly hot->history migration selects by date window
+        # (`WHERE date >= ? AND date < ?`). Without this index that plan is a full
+        # `SCAN war_attacks` — verified via EXPLAIN QUERY PLAN — over a table that now holds
+        # ~52M rows and will settle around ~75M under 60-day retention. idx_wa_clan_date
+        # (clan_tag, date) cannot serve a date-only range because clan_tag is the leading
+        # column. It was survivable while the migration walked whole months from the low end
+        # of the id range; it is not survivable for a thin nightly date slice, because
+        # backfill inserts old-date rows at HIGH ids, so an id-ordered scan reaches them last.
+        #
+        # Why NOT on `history`: the migration only ever INSERTs into history and never selects
+        # from it by date; there are no history date-only filters anywhere in the codebase.
+        # Building it there would cost 15-40 min for ~103M rows, buy nothing, and — combined
+        # with this build — overrun initialize_database()'s 1800s watchdog and fail startup.
+        # The resulting main/history index-set asymmetry is safe: Cardinal Rule 1 is about
+        # COLUMN parity (positional SELECT * corruption across schemas); an index difference
+        # cannot corrupt data. See also _WAR_ATTACKS_SECONDARY_INDEX_DDL, which deliberately
+        # does NOT list this index.
+        #
+        # First build is ~5-15 min on ~52M rows; same safety argument as
+        # idx_wa_player_tag_date above (initialize_database() runs before any concurrent
+        # writer exists). Every restart after the first is a cheap IF-NOT-EXISTS check.
+        await self._create_index_if_missing(
+            "", "idx_wa_date", "war_attacks",
+            "CREATE INDEX IF NOT EXISTS idx_wa_date ON war_attacks(date)",
+        )
+
         # ── war_summary: one row per war per actively tracked clan ──
         logging.info("[DB-SCHEMA] Verifying war_summary table + indexes...")
         await self._conn.execute("""
@@ -1486,6 +1515,13 @@ class WarHistoryDB:
         await self._create_index_if_missing(
             "", "idx_ws_war_id", "war_summary",
             "CREATE INDEX IF NOT EXISTS idx_ws_war_id ON war_summary(war_id)",
+        )
+        # idx_ws_date — same rationale as idx_wa_date on war_attacks above (date-only range
+        # for the nightly migration window; idx_ws_clan_date can't serve it). `main` only.
+        # ~3M rows, so this one builds in seconds.
+        await self._create_index_if_missing(
+            "", "idx_ws_date", "war_summary",
+            "CREATE INDEX IF NOT EXISTS idx_ws_date ON war_summary(date)",
         )
 
         # ── cwl_league_groups: 8-clan group membership per season ──────
@@ -4296,7 +4332,7 @@ class WarHistoryDB:
                 return False
 
     @staticmethod
-    def _cwl_retention_cutoff_season(months: int, now: Optional["datetime"] = None) -> str:
+    def _cwl_retention_cutoff_season(months: int, now: Optional["datetime.datetime"] = None) -> str:
         """The oldest cwl_season a guild with `months` retention still keeps, as 'YYYY-MM'.
 
         Seasons are compared as plain strings throughout this feature — 'YYYY-MM' is
@@ -9013,7 +9049,7 @@ class WarHistoryDB:
         share one league (see cache_manager._process_league_group_response).
         Only checks the hot ("main") schema: a CWL season currently being
         discovered for the first time can never already be old enough to have
-        been swept into the history schema by monthly_history_migration.
+        been swept into the history schema by run_history_migration.
         """
         await self._ensure_connection()
         cursor = await self._conn.execute(
@@ -10949,32 +10985,58 @@ class WarHistoryDB:
         except Exception as e:
             logging.warning(f"[DB-WRITE-SYNC] delete_notification_state_sync({war_key}) failed: {e}")
 
-    # ─── Hot/History DB Monthly Migration ──────────────────────────────────
+    # ─── Hot/History DB Rolling Migration ──────────────────────────────────
     @staticmethod
-    def _history_cutoff() -> Tuple[str, str]:
-        """Compute the hot/history migration cutoff for "today".
+    def _first_of_previous_month(today: "datetime.date") -> "datetime.date":
+        """First day of the calendar month before ``today``'s month."""
+        first_of_this_month = today.replace(day=1)
+        if first_of_this_month.month == 1:
+            return first_of_this_month.replace(year=first_of_this_month.year - 1, month=12)
+        return first_of_this_month.replace(month=first_of_this_month.month - 1)
 
-        Retention model: the hot DB (``main``) always holds the current
-        calendar month + the immediately preceding calendar month in full.
-        Everything strictly older is migrated to ``history`` once a month.
+    @staticmethod
+    def _history_cutoff(today: "Optional[datetime.date]" = None) -> Tuple[str, str]:
+        """Compute the hot/history migration target cutoff for ``today``.
+
+        Retention model (2026-09-01 redesign): rolling, not monthly. The hot DB
+        (``main``) holds roughly the last ``CONFIG.history_retention_days`` days,
+        and the nightly migration walks the cutoff forward a little each night
+        instead of a whole month landing on the 1st.
+
+        The returned cutoff is::
+
+            min(today - history_retention_days, first day of the previous calendar month)
+
+        **The floor is not decoration.** The documented, long-standing contract is
+        "hot always holds the current + the immediately preceding calendar month".
+        The oldest row that contract must retain can be 61 days old — day 31 of a
+        31-day month following a 31-day month (e.g. 2026-08-31, where 2026-07-01 is
+        61 days back). A plain ``today - 60`` migrates that day out and breaks the
+        contract on 8 dates every 4 years. Clamping to the calendar floor makes any
+        retention value contract-safe, so the constant is freely tunable and the
+        rolling rule only ever changes *when* rows move, never *what* hot guarantees.
+
+        Args:
+            today: override for "today" — tests only; defaults to ``date.today()``.
 
         Returns:
-            (cutoff_date, cutoff_month) — ``cutoff_date`` is the first day of
-            the previous calendar month as ``YYYY-MM-DD`` (rows with
-            ``date < cutoff_date`` are migrated); ``cutoff_month`` is the same
-            value as ``YYYY-MM`` (used for CWL-season comparisons, which have
-            no ``date`` column).
+            (cutoff_date, cutoff_month) — ``cutoff_date`` as ``YYYY-MM-DD`` (rows
+            with ``date < cutoff_date`` are migrated); ``cutoff_month`` is that same
+            date's ``YYYY-MM`` prefix, used for CWL-season comparisons (those tables
+            have no ``date`` column).
         """
         import datetime as _dt
-        first_of_this_month = _dt.date.today().replace(day=1)
-        if first_of_this_month.month == 1:
-            cutoff = first_of_this_month.replace(year=first_of_this_month.year - 1, month=12)
-        else:
-            cutoff = first_of_this_month.replace(month=first_of_this_month.month - 1)
+        # Local import: db_manager is otherwise config-free (paths come in via
+        # initialize()), and a module-level import would add a config dependency to
+        # every consumer of this module, including the standalone scripts.
+        from qapbot.config import CONFIG as _CONFIG
+        _today = today if today is not None else _dt.date.today()
+        rolling = _today - _dt.timedelta(days=max(1, _CONFIG.history_retention_days))
+        cutoff = min(rolling, WarHistoryDB._first_of_previous_month(_today))
         return cutoff.isoformat(), cutoff.strftime("%Y-%m")
 
     # Batches between periodic mid-migration WAL checkpoints (see
-    # _migrate_table_batch_by_date). 20 batches * 5000 rows/batch = 100K rows
+    # _migrate_date_window_batched). 20 batches * 20000 rows/batch = 400K rows
     # of slack between checkpoints — bounds WAL growth to a small, safe amount
     # even across a multi-hour migration, without checkpointing so often that
     # it reintroduces per-batch random-I/O stalls.
@@ -11006,89 +11068,138 @@ class WarHistoryDB:
         rows = await cur.fetchall()
         return ", ".join(row["name"] for row in rows)
 
-    async def _migrate_table_batch_by_date(
+    async def _window_has_rows(self, table: str, window_start: str, window_end: str) -> bool:
+        """Does ``main.<table>`` still hold any row in ``[window_start, window_end)``?
+
+        Only called when a budget or deadline stops a window mid-flight, to answer the
+        one question the budget check itself cannot: was the window already empty when
+        we ran out of budget? Without it, a window whose final batch happened to exhaust
+        the budget exactly is reported INCOMPLETE even though every row moved — so the
+        caller refuses to advance its day marker, and a row budget that lines up with a
+        day's size stalls the walk permanently on that day. Indexed by
+        idx_wa_date/idx_ws_date; one LIMIT 1 probe per stop, not per batch.
+        """
+        cur = await self._conn.execute(
+            f"SELECT 1 FROM main.{table} WHERE date >= ? AND date < ? LIMIT 1",
+            (window_start, window_end),
+        )
+        return await cur.fetchone() is not None
+
+    async def _migrate_date_window_batched(
         self,
         table: str,
-        cutoff_date: str,
+        window_start: str,
+        window_end: str,
         batch_size: int,
         checkpoint_every_batches: Optional[int] = None,
         deadline: Optional[float] = None,
+        row_budget: Optional[int] = None,
     ) -> Tuple[int, bool]:
-        """Move rows with ``date < cutoff_date`` from ``main.<table>`` to ``history.<table>``.
+        """Move ``window_start <= date < window_end`` from ``main.<table>`` to ``history.<table>``.
 
-        Batched in chunks of ``batch_size`` rows (by ``id``) so no single
-        transaction holds the write lock for long — this is the same lesson
-        learned from the 44-minute nightly VACUUM incident that started this
-        redesign: never do one giant transaction over the whole table.
+        Replaces ``_migrate_table_batch_by_date()`` (2026-09-01). Three changes,
+        each fixing a measured problem from the 2026-09-01 incident:
 
-        Assumes the table has an ``id INTEGER PRIMARY KEY AUTOINCREMENT``
-        column (true for ``war_attacks`` and ``war_summary``) and a ``date``
-        column holding an ISO-ish, lexicographically-sortable string.
+        1. **Date WINDOW, not "everything below a cutoff".** The caller walks day by
+           day, so each call moves a bounded, well-understood slice. Combined with
+           ``idx_wa_date``/``idx_ws_date`` (``main`` only) this is an index range scan
+           instead of the full ``SCAN war_attacks`` the old query planned — verified
+           via EXPLAIN QUERY PLAN. That mattered little while whole months were moved
+           from the low end of the id range, and matters a lot for a thin nightly
+           slice, because backfill inserts old-date rows at HIGH ids so an id-ordered
+           scan reaches them last.
 
-        Every ``checkpoint_every_batches`` batches (default
-        ``_MIGRATION_CHECKPOINT_INTERVAL_BATCHES``), runs a ``PASSIVE`` WAL
-        checkpoint (unqualified — covers both ``main`` and ``history``, same
-        as ``nightly_db_maintenance()``). Without this, the caller's
-        ``wal_autocheckpoint=0`` (set for the whole migration) means the WAL
-        never shrinks for the entire run — on 2026-08-01 a first-ever
-        migration of 8M+ rows ran for ~4h45m uncheckpointed and grew both WAL
-        files to fill the disk (287 GB + 103 GB), aborting the migration and
-        then failing every other DB write for the rest of the night. A
-        periodic PASSIVE checkpoint (non-blocking, safe to run
-        mid-transaction-series) keeps the WAL bounded regardless of total
-        migration size.
+        2. **Keyset id bound, not ``id IN (?,?,...)``.** The old form bound up to
+           ``batch_size`` parameters and did that many rowid seeks per statement. It
+           also put a hard ceiling on batch size: SQLite's bound-parameter limit is
+           32766. This uses the ``_bulk_move_chunk()`` shape — one ``OFFSET`` probe for
+           the batch's upper id, then two range statements — so batch size is limited
+           only by how long a transaction should hold the write lock.
 
-        If ``deadline`` (a ``time.monotonic()`` timestamp) is given, stops
-        cleanly after whichever batch is in flight when the deadline passes —
-        added after that same incident's recovery turned out to need ~10+
-        hours for the full backlog, which nobody can block a live bot on.
-        Safe to stop here: each batch is its own committed transaction, so
-        there's nothing to roll back or resume from except "keep calling this
-        again with the same cutoff_date".
+        3. **Row budget.** Lets the caller stop mid-window on a bounded amount of work
+           rather than only on a deadline, which is what makes the nightly walk
+           predictable (see ``run_history_migration``).
+
+        Each batch is its own committed transaction, so interrupting is always safe:
+        re-running with the same window simply picks up whatever is still there.
+
+        Args:
+            table: ``war_attacks`` or ``war_summary`` — needs ``id INTEGER PRIMARY KEY``
+                and a lexicographically-sortable ISO ``date`` column.
+            window_start: inclusive lower bound (``YYYY-MM-DD``).
+            window_end: exclusive upper bound (``YYYY-MM-DD``).
+            batch_size: rows per transaction.
+            checkpoint_every_batches: override for ``_MIGRATION_CHECKPOINT_INTERVAL_BATCHES``.
+            deadline: ``time.monotonic()`` timestamp to stop cleanly at.
+            row_budget: stop cleanly once this many rows have moved in this call.
 
         Returns:
-            ``(total_moved, completed)`` — ``completed`` is False iff the
-            deadline was hit before every matching row was moved (i.e. more
-            rows still exist below ``cutoff_date`` and the caller should not
-            treat this table as done).
+            ``(moved, completed)`` — ``completed`` is False iff a budget/deadline
+            stopped the call before the window was emptied.
         """
         interval = checkpoint_every_batches or self._MIGRATION_CHECKPOINT_INTERVAL_BATCHES
+        # Hoisted out of the loop: this runs PRAGMA table_info, and the old code called it
+        # once per batch — ~4,800 pointless round-trips on 2026-09-01. The schema cannot
+        # change underneath a single migration run.
+        columns = await self._explicit_column_list(table)
         total_moved = 0
         batches_since_checkpoint = 0
         while True:
-            if deadline is not None and _monotonic() >= deadline:
-                logging.info(f"[HIST-MIGRATE] {table}: time budget reached — stopping early (total {total_moved} this run)")
-                return total_moved, False
+            _out_of_time = deadline is not None and _monotonic() >= deadline
+            _out_of_rows = row_budget is not None and total_moved >= row_budget
+            if _out_of_time or _out_of_rows:
+                # "Complete" is decided by what is actually left, not by which bound
+                # tripped — see _window_has_rows() for why the difference matters.
+                return total_moved, not await self._window_has_rows(table, window_start, window_end)
+
+            # Upper id bound for this batch. OFFSET probe rather than collecting ids:
+            # keeps the following statements as index range scans with 3 bound params.
             cur = await self._conn.execute(
-                f"SELECT id FROM main.{table} WHERE date < ? ORDER BY id LIMIT ?",
-                (cutoff_date, batch_size),
+                f"SELECT id FROM main.{table} WHERE date >= ? AND date < ? "
+                f"ORDER BY id LIMIT 1 OFFSET ?",
+                (window_start, window_end, max(0, batch_size - 1)),
             )
-            rows = await cur.fetchall()
-            if not rows:
-                break
-            ids = [r["id"] for r in rows]
-            placeholders = ",".join("?" * len(ids))
-            columns = await self._explicit_column_list(table)
+            boundary_row = await cur.fetchone()
+            boundary_id: Optional[int] = boundary_row["id"] if boundary_row else None
+
             await self._write_lock.acquire()
             try:
                 await self._conn.execute("BEGIN")
-                await self._conn.execute(
-                    f"INSERT OR IGNORE INTO history.{table} ({columns}) "
-                    f"SELECT {columns} FROM main.{table} WHERE id IN ({placeholders})",
-                    ids,
-                )
-                await self._conn.execute(
-                    f"DELETE FROM main.{table} WHERE id IN ({placeholders})",
-                    ids,
-                )
+                if boundary_id is not None:
+                    await self._conn.execute(
+                        f"INSERT OR IGNORE INTO history.{table} ({columns}) "
+                        f"SELECT {columns} FROM main.{table} "
+                        f"WHERE date >= ? AND date < ? AND id <= ?",
+                        (window_start, window_end, boundary_id),
+                    )
+                    del_cur = await self._conn.execute(
+                        f"DELETE FROM main.{table} WHERE date >= ? AND date < ? AND id <= ?",
+                        (window_start, window_end, boundary_id),
+                    )
+                else:
+                    await self._conn.execute(
+                        f"INSERT OR IGNORE INTO history.{table} ({columns}) "
+                        f"SELECT {columns} FROM main.{table} WHERE date >= ? AND date < ?",
+                        (window_start, window_end),
+                    )
+                    del_cur = await self._conn.execute(
+                        f"DELETE FROM main.{table} WHERE date >= ? AND date < ?",
+                        (window_start, window_end),
+                    )
+                moved = del_cur.rowcount if del_cur.rowcount and del_cur.rowcount > 0 else 0
                 await self._conn.commit()
             except Exception:
                 await self._conn.rollback()
                 raise
             finally:
                 self._write_lock.release()
-            total_moved += len(ids)
-            logging.info(f"[HIST-MIGRATE] {table}: moved batch of {len(ids)} rows (total {total_moved})")
+
+            total_moved += moved
+            if moved:
+                logging.debug(
+                    "[HIST-MIGRATE] %s: moved %d row(s) from %s (window total %d)",
+                    table, moved, window_start, total_moved,
+                )
             batches_since_checkpoint += 1
             if batches_since_checkpoint >= interval:
                 batches_since_checkpoint = 0
@@ -11096,7 +11207,12 @@ class WarHistoryDB:
                     await self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 except Exception as _ckpt_ex:
                     logging.warning(f"[HIST-MIGRATE] Periodic mid-migration checkpoint failed: {_ckpt_ex}")
-        return total_moved, True
+
+            # boundary_id None means this batch took the whole remaining window.
+            # moved == 0 means the window is empty (or every row was an INSERT OR IGNORE
+            # duplicate already deleted) — either way there is nothing left to do here.
+            if boundary_id is None or moved == 0:
+                return total_moved, True
 
     async def _migrate_cwl_table_by_season(
         self, table: str, cutoff_month: str, deadline: Optional[float] = None
@@ -11114,7 +11230,7 @@ class WarHistoryDB:
         Batched per distinct season value (each season naturally has few
         rows — one per clan/war — so no additional row-count chunking needed).
 
-        See ``_migrate_table_batch_by_date`` for the ``deadline`` contract —
+        See ``_migrate_date_window_batched`` for the ``deadline`` contract —
         checked between seasons (each season's own transaction always runs to
         completion once started).
 
@@ -11157,133 +11273,290 @@ class WarHistoryDB:
             logging.info(f"[HIST-MIGRATE] {table}: moved {total_moved} row(s) across {len(old_seasons)} season(s)")
         return total_moved, completed
 
-    async def monthly_history_migration(
-        self,
-        batch_size: int = 5000,
-        checkpoint_every_batches: Optional[int] = None,
-        time_budget_seconds: Optional[float] = None,
-    ) -> str:
+    # bot_metadata key holding the migration cutoff actually REACHED (a YYYY-MM-DD date).
+    # Deliberately a NEW key rather than reusing "last_history_migration" (an ISO timestamp
+    # compared by year/month): the old key answered "did the monthly job run this month",
+    # a question the rolling walk no longer asks. Leaving it untouched means no type-punning
+    # under a running system, and no ambiguity about which writer wrote a given value. The
+    # legacy key is now dead data; a missing new key simply means "start from the oldest
+    # data present", which is the correct behaviour for a first run.
+    HISTORY_MIGRATION_CUTOFF_KEY = "history_migration_cutoff_reached"
+
+    async def get_history_migration_cutoff_reached(self) -> Optional[str]:
+        """Return the cutoff date (``YYYY-MM-DD``) the migration has walked to, if any."""
+        raw = await self.get_bot_metadata(self.HISTORY_MIGRATION_CUTOFF_KEY)
+        if not raw:
+            return None
+        try:
+            import datetime as _dt
+            return _dt.date.fromisoformat(raw.strip()[:10]).isoformat()
+        except (ValueError, AttributeError):
+            logging.warning(
+                "[HIST-MIGRATE] Ignoring unparseable %s=%r - treating as 'no cutoff reached'",
+                self.HISTORY_MIGRATION_CUTOFF_KEY, raw,
+            )
+            return None
+
+    async def _oldest_migratable_date(
+        self, cutoff_date: str, since: Optional[str] = None
+    ) -> Optional[str]:
+        """Oldest ``date`` in ``main`` within ``[since, cutoff_date)``, across both date tables.
+
+        Two jobs:
+
+        - Pick the walk's starting day (``since=None``) on a first run, or after the
+          marker was cleared.
+        - Skip empty days *during* the walk. Without this the walk is O(calendar days)
+          rather than O(days-with-data), so one stray very old row — a bad backfill, a
+          war file with a broken date — would make every single nightly run crawl day by
+          day from that row to today for nothing. With it, the walk only ever visits days
+          that actually hold rows. Index-backed by idx_wa_date/idx_ws_date on ``main``.
+
+        Returns None when nothing remains in the range — which during the walk means
+        "caught up", and on a first run means there was never anything to do.
         """
-        Migrate data older than the hot-DB retention window from ``main.*`` to
-        ``history.*`` (ATTACHed database). Runs once a month (on/after the
-        1st, via QapBot.py's nightly maintenance scheduler) until it reports a
-        fully-completed run for the current month — NOT nightly-forever, since
-        the retention window only advances monthly, but see ``time_budget_seconds``
-        below for why "once a month" doesn't mean "in one sitting".
+        oldest: Optional[str] = None
+        for table in ("war_attacks", "war_summary"):
+            if since is None:
+                cur = await self._conn.execute(
+                    f"SELECT MIN(date) AS d FROM main.{table} WHERE date < ?", (cutoff_date,)
+                )
+            else:
+                cur = await self._conn.execute(
+                    f"SELECT MIN(date) AS d FROM main.{table} WHERE date >= ? AND date < ?",
+                    (since, cutoff_date),
+                )
+            row = await cur.fetchone()
+            value = row["d"] if row else None
+            if value and (oldest is None or value < oldest):
+                oldest = value
+        return oldest[:10] if oldest else None
 
-        Retention model: ``main`` always holds the current calendar month +
-        the immediately preceding calendar month in full; this migrates
-        everything older out to ``history``.
+    async def has_history_migration_work(self) -> bool:
+        """Is there anything left for the nightly hot->history walk to move?
 
-        Tables migrated:
-          - ``war_attacks`` / ``war_summary`` — keyed on the ``date`` column.
-          - ``cwl_league_groups`` / ``cwl_league_rounds`` — no ``date`` column;
-            keyed on ``cwl_season`` (normalised to ``YYYY-MM``).
-
-        Batched writes (see ``_migrate_table_batch_by_date``) avoid long
-        single-transaction stalls. Discord commands are blocked via
-        ``QBcore.db_maintenance_mode`` for the duration, matching
-        ``nightly_db_maintenance()``'s behaviour.
-
-        Does NOT run VACUUM — the pre-existing nightly VACUUM trigger
-        (``freelist_count > 500``) picks up the freed space left in ``main``
-        by the DELETEs on its next run. History-DB compaction is handled
-        separately (see architecture doc) since ``history`` only receives
-        bulk writes once a month.
-
-        Args:
-            batch_size: rows per batch/transaction (see ``_migrate_table_batch_by_date``).
-            checkpoint_every_batches: override for
-                ``_MIGRATION_CHECKPOINT_INTERVAL_BATCHES`` — mainly useful for
-                a one-off recovery run where a much bigger interval is safe
-                (ample free disk) and reduces checkpoint overhead.
-            time_budget_seconds: if set, stops cleanly (not an error) once this
-                many seconds have elapsed, leaving whatever wasn't reached for
-                the next call — added 2026-08-01 after a first-ever run against
-                an 8M+-row backlog needed ~10+ hours, far too long to block a
-                live bot on in one sitting. The migration is naturally
-                resumable (each call re-selects whatever's still below the
-                cutoff), so a time-budgeted call is just "do as much as you
-                can in this window, pick back up next time" — the ``bot_metadata``
-                "done" marker is only written when a run finishes the full
-                backlog with no deadline cutoff (see the ``finally`` block).
+        Public counterpart to the internals ``QapBot.is_history_migration_due()`` used to
+        reach into directly (``_history_cutoff`` + ``_oldest_migratable_date``). Keeping the
+        question on this side means the caller does not need to know that "due" is a
+        comparison between a persisted marker and a derived cutoff, nor that a missing
+        marker has to fall back to probing for real rows.
 
         Returns:
-            A one-line summary string suitable for logging. Starts with
-            "[HIST-MIGRATE] PARTIAL" (not an error) when the time budget was
-            hit before finishing.
+            True when the reached cutoff is still behind the target, or — with no marker
+            yet (first run after deploy, or it was cleared) — when rows below the target
+            actually exist. A fresh or fully-migrated DB returns False rather than
+            reporting work forever.
+        """
+        target_cutoff, _ = self._history_cutoff()
+        reached = await self.get_history_migration_cutoff_reached()
+        if reached is None:
+            return await self._oldest_migratable_date(target_cutoff) is not None
+        return reached < target_cutoff
+
+    async def run_history_migration(
+        self,
+        batch_size: int = 20000,
+        checkpoint_every_batches: Optional[int] = None,
+        time_budget_seconds: Optional[float] = None,
+        row_budget: Optional[int] = None,
+    ) -> str:
+        """Walk the hot->history cutoff forward one day at a time, under a budget.
+
+        Replaces ``monthly_history_migration()`` (2026-09-01 redesign). The old version
+        moved "everything below the first of last month" in one campaign, which on the
+        1st of a month meant ~38M rows - 114 chunks, none completing, Discord blocked
+        68% of a 14-hour span. This moves roughly one day's worth per night instead, so
+        the work is spread ~30x thinner and never accumulates a cliff.
+
+        Behaviour:
+
+        - Target cutoff comes from ``_history_cutoff()`` (rolling, calendar-floored).
+        - Starts from the last reached cutoff in ``bot_metadata``, or - on a first run -
+          the oldest migratable row actually present.
+        - Migrates one calendar day per iteration via ``_migrate_date_window_batched()``,
+          persisting the reached cutoff after each **completed** day, so an interruption
+          resumes at day granularity with no rescan.
+        - Stops cleanly on the row budget or the time budget, whichever binds first.
+        - CWL tables (season-keyed, no ``date`` column) advance once at the end, only
+          when the walk actually reached the target, so all four tables stay consistent.
+
+        **Sets ``QBcore.db_migration_active``, NOT ``db_maintenance_mode``** - this is the
+        change that ends the outage class this redesign exists for. The walk holds no
+        exclusive lock: short transactions on the async writer connection, while every
+        user command reads through the separate sync pool in WAL mode, where readers
+        never block on a writer. Only ``nightly_db_maintenance()`` (EXCLUSIVE lock,
+        drained pool) and ``fast_bulk_history_migration()`` (drops main's own query
+        indexes) still take the hard block.
+
+        Args:
+            batch_size: rows per transaction. 20000 targets ~1-2s per commit; the old
+                5000 was forced by the ``id IN (...)`` form's 32766-parameter ceiling,
+                which ``_migrate_date_window_batched()`` no longer has.
+            checkpoint_every_batches: override for ``_MIGRATION_CHECKPOINT_INTERVAL_BATCHES``.
+            time_budget_seconds: secondary hard stop.
+            row_budget: primary bound - stop once this many rows have moved.
+
+        Returns:
+            A one-line summary string suitable for logging.
         """
         if not self.db_path:
-            return "[HIST-MIGRATE] Skipped — no db_path configured"
+            return "[HIST-MIGRATE] Skipped - no db_path configured"
+
+        import datetime as _dt
 
         cutoff_date, cutoff_month = self._history_cutoff()
-        logging.info(
-            f"[HIST-MIGRATE] Starting monthly migration — cutoff_date={cutoff_date} "
-            f"(hot DB retains {cutoff_month} and later)"
-        )
 
         _qbcore = None
         try:
             import QBcore as _qbcore  # type: ignore[no-redef]
-            _qbcore.db_maintenance_mode = True
-            logging.info("[HIST-MIGRATE] db_maintenance_mode=True — Discord commands blocked")
+            _qbcore.db_migration_active = True
         except ImportError:
             pass
 
         t_start = _monotonic()
         deadline = (t_start + time_budget_seconds) if time_budget_seconds else None
-        moved: Dict[str, int] = {}
-        fully_completed = False
+        moved: Dict[str, int] = {"war_attacks": 0, "war_summary": 0}
+        reached: Optional[str] = None
+        days_done = 0
+        stopped_early = False
         result = "[HIST-MIGRATE] ERROR: unknown"
+
         try:
             await self._ensure_connection()
 
-            # Suppress WAL auto-checkpoint on BOTH schemas for the whole migration —
-            # this is a long bulk-write burst (thousands of small batch commits),
-            # and a mid-burst checkpoint would add random-I/O stalls (same reason
-            # _flush_pending_war_writes() does this). Restored + a single passive
-            # checkpoint runs in the finally block below, win or lose.
+            start_from = await self.get_history_migration_cutoff_reached()
+            if start_from is None:
+                start_from = await self._oldest_migratable_date(cutoff_date)
+            if start_from is None or start_from >= cutoff_date:
+                # Steady state: nothing has aged out since the last run.
+                await self.set_bot_metadata(self.HISTORY_MIGRATION_CUTOFF_KEY, cutoff_date)
+                result = (
+                    f"[HIST-MIGRATE] Nothing to migrate - hot DB already at target "
+                    f"cutoff {cutoff_date}"
+                )
+                logging.info(result)
+                return result
+
+            day = _dt.date.fromisoformat(start_from)
+            target = _dt.date.fromisoformat(cutoff_date)
+            total_days = (target - day).days
+            logging.info(
+                "[HIST-MIGRATE] Starting walk - from %s to target cutoff %s (%d day(s)), "
+                "row_budget=%s, time_budget=%s",
+                day.isoformat(), cutoff_date, total_days,
+                f"{row_budget:,}" if row_budget else "none",
+                f"{time_budget_seconds:.0f}s" if time_budget_seconds else "none",
+            )
+
+            # Suppress WAL auto-checkpoint on BOTH schemas for the burst; restored with a
+            # passive checkpoint in the finally block below, win or lose. Same reason
+            # _flush_pending_war_writes() does it: a mid-burst checkpoint adds random-I/O
+            # stalls across thousands of small commits.
             await self._conn.execute("PRAGMA wal_autocheckpoint=0")
             await self._conn.execute("PRAGMA history.wal_autocheckpoint=0")
 
-            moved["war_attacks"], _wa_done = await self._migrate_table_batch_by_date(
-                "war_attacks", cutoff_date, batch_size, checkpoint_every_batches, deadline
-            )
-            moved["war_summary"], _ws_done = (0, True)
-            _cg_done = _cr_done = True
-            if _wa_done:
-                moved["war_summary"], _ws_done = await self._migrate_table_batch_by_date(
-                    "war_summary", cutoff_date, batch_size, checkpoint_every_batches, deadline
+            while day < target:
+                if deadline is not None and _monotonic() >= deadline:
+                    stopped_early = True
+                    break
+                rows_so_far = moved["war_attacks"] + moved["war_summary"]
+                if row_budget is not None and rows_so_far >= row_budget:
+                    stopped_early = True
+                    break
+
+                # Jump straight to the next day that actually holds rows. Keeps the walk
+                # O(days-with-data): a gap of empty days (bot offline, a quiet stretch, or
+                # one stray ancient row far below everything else) costs one indexed MIN()
+                # probe rather than one full iteration per calendar day.
+                next_with_data = await self._oldest_migratable_date(
+                    cutoff_date, since=day.isoformat()
                 )
-            if _wa_done and _ws_done:
-                moved["cwl_league_groups"], _cg_done = await self._migrate_cwl_table_by_season(
-                    "cwl_league_groups", cutoff_month, deadline
+                if next_with_data is None:
+                    day = target
+                    break
+                day = max(day, _dt.date.fromisoformat(next_with_data))
+                if day >= target:
+                    day = target
+                    break
+
+                window_start = day.isoformat()
+                window_end = (day + _dt.timedelta(days=1)).isoformat()
+                remaining_budget = (
+                    None if row_budget is None else max(1, row_budget - rows_so_far)
                 )
-            if _wa_done and _ws_done and _cg_done:
-                moved["cwl_league_rounds"], _cr_done = await self._migrate_cwl_table_by_season(
-                    "cwl_league_rounds", cutoff_month, deadline
+
+                day_complete = True
+                for table in ("war_attacks", "war_summary"):
+                    t_moved, t_done = await self._migrate_date_window_batched(
+                        table, window_start, window_end, batch_size,
+                        checkpoint_every_batches, deadline, remaining_budget,
+                    )
+                    moved[table] += t_moved
+                    if remaining_budget is not None:
+                        remaining_budget = max(1, remaining_budget - t_moved)
+                    if not t_done:
+                        day_complete = False
+                        break
+
+                if not day_complete:
+                    # Budget/deadline hit mid-day. Do NOT advance the marker - the day is
+                    # only partly moved and must be re-entered from its start next run.
+                    stopped_early = True
+                    break
+
+                day += _dt.timedelta(days=1)
+                days_done += 1
+                reached = day.isoformat()
+                await self.set_bot_metadata(self.HISTORY_MIGRATION_CUTOFF_KEY, reached)
+                _elapsed = _monotonic() - t_start
+                _rows = moved["war_attacks"] + moved["war_summary"]
+                _rate = _rows / _elapsed if _elapsed > 0 else 0.0
+                _days_left = (target - day).days
+                _eta = ""
+                if _rate > 0 and _days_left > 0 and days_done > 0:
+                    _eta = f", ETA ~{(_days_left * (_rows / days_done) / _rate) / 60:.0f} min"
+                logging.info(
+                    "[HIST-MIGRATE] Day %s done - %s rows total in %.0fs (%.0f rows/s), "
+                    "%d of %d day(s), cutoff now %s%s",
+                    window_start, f"{_rows:,}", _elapsed, _rate,
+                    days_done, total_days, reached, _eta,
                 )
-            fully_completed = _wa_done and _ws_done and _cg_done and _cr_done
+
+            # day >= target covers both "walked every day" and "the lookahead found nothing
+            # left below the cutoff", which are the same outcome.
+            fully_caught_up = not stopped_early and day >= target
+            if fully_caught_up:
+                for cwl_table in ("cwl_league_groups", "cwl_league_rounds"):
+                    c_moved, _ = await self._migrate_cwl_table_by_season(
+                        cwl_table, cutoff_month, deadline
+                    )
+                    if c_moved:
+                        moved[cwl_table] = c_moved
+                await self.set_bot_metadata(self.HISTORY_MIGRATION_CUTOFF_KEY, cutoff_date)
+                reached = cutoff_date
 
             elapsed = _monotonic() - t_start
-            summary = ", ".join(f"{k}={v}" for k, v in moved.items())
-            if fully_completed:
-                result = f"[HIST-MIGRATE] cutoff={cutoff_date} — {summary} rows moved — done in {elapsed:.1f}s"
+            summary = ", ".join(f"{k}={v:,}" for k, v in moved.items() if v) or "nothing"
+            if fully_caught_up:
+                result = (
+                    f"[HIST-MIGRATE] Caught up to cutoff {cutoff_date} - {summary} "
+                    f"rows moved across {days_done} day(s) in {elapsed:.1f}s"
+                )
             else:
                 result = (
-                    f"[HIST-MIGRATE] PARTIAL — time budget reached, cutoff={cutoff_date} — "
-                    f"{summary} rows moved this run in {elapsed:.1f}s — more remain, re-run to continue"
+                    f"[HIST-MIGRATE] PARTIAL - budget reached at cutoff {reached or start_from} "
+                    f"(target {cutoff_date}) - {summary} rows moved across {days_done} day(s) "
+                    f"in {elapsed:.1f}s - resumes next run"
                 )
             logging.info(result)
         except Exception as e:
             result = f"[HIST-MIGRATE] ERROR: {e}"
-            logging.error(result)
+            logging.error(result, exc_info=True)
         finally:
             try:
-                # ALWAYS restore autocheckpoint + merge the WAL back into both DB
-                # files — if this were skipped after an exception, wal_autocheckpoint
-                # would stay 0 for the rest of the process lifetime, causing
-                # unbounded WAL growth on subsequent unrelated writes.
+                # ALWAYS restore autocheckpoint + merge both WALs back. Skipping this after
+                # an exception would leave wal_autocheckpoint=0 for the rest of the process
+                # lifetime, growing the WAL without bound on every later unrelated write.
                 await self._conn.execute("PRAGMA wal_autocheckpoint=1000")
                 await self._conn.execute("PRAGMA history.wal_autocheckpoint=1000")
                 await self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
@@ -11291,29 +11564,7 @@ class WarHistoryDB:
             except Exception as _ckpt_ex:
                 logging.warning(f"[HIST-MIGRATE] Could not restore autocheckpoint/checkpoint: {_ckpt_ex}")
             if _qbcore is not None:
-                _qbcore.db_maintenance_mode = False
-                logging.info("[HIST-MIGRATE] db_maintenance_mode=False — Discord commands unblocked")
-
-        # Only stamp "done for this month" on an actual FULL completion — gated on the
-        # real fully_completed boolean, not on string-sniffing `result` (a PARTIAL
-        # time-budget stop is deliberately not an "ERROR" string, so a prefix check
-        # alone would wrongly mark it done — this must be the boolean).
-        # Persisting this unconditionally (the pre-2026-08-01-incident behaviour)
-        # marked a run that errored out partway (e.g. mid-migration disk-full) as
-        # fully complete — is_monthly_migration_due() then skipped retrying for the
-        # rest of the month, silently stranding whatever hadn't been moved yet with
-        # no automatic retry. The migration itself is naturally resumable (each batch
-        # re-selects remaining rows below the cutoff), so simply not claiming success
-        # lets the next due check (or a manual re-run) pick up exactly where it left off.
-        if fully_completed:
-            try:
-                import datetime as _dt2
-                await self.set_bot_metadata(
-                    "last_history_migration",
-                    _dt2.datetime.now(_dt2.timezone.utc).isoformat(),
-                )
-            except Exception as _meta_ex:
-                logging.warning(f"[HIST-MIGRATE] Could not persist migration timestamp: {_meta_ex}")
+                _qbcore.db_migration_active = False
 
         return result
 
@@ -11376,7 +11627,7 @@ class WarHistoryDB:
 
         # Explicit column list, not `SELECT *` — see _explicit_column_list()'s docstring
         # (2026-08-14 hot/history column-order-drift incident). This call site predates that
-        # fix and wasn't covered by it (only _migrate_table_batch_by_date/
+        # fix and wasn't covered by it (only _migrate_date_window_batched/
         # _migrate_cwl_table_by_season were fixed at the time) — found 2026-08-16 while
         # auditing every main/history query for the same class of bug.
         columns = await self._explicit_column_list(table)
@@ -11415,7 +11666,7 @@ class WarHistoryDB:
 
     async def fast_bulk_history_migration(self, chunk_size: int = 1_000_000) -> str:
         """
-        One-off FAST alternative to ``monthly_history_migration()`` for clearing a
+        One-off FAST alternative to ``run_history_migration()`` for clearing a
         large backlog quickly (added 2026-08-01, same incident as everything else
         this method's siblings document). NOT for routine/automatic use — the only
         intended caller is ``qapbot/scripts/run_history_migration_now.py --fast``,
@@ -11441,12 +11692,21 @@ class WarHistoryDB:
         Safety:
           - REQUIRES the bot to be stopped — dropping ``main.war_attacks``'
             indexes, even briefly, would badly degrade any concurrent live query
-            against it. The 5000-row batched ``monthly_history_migration()``
+            against it. The batched ``run_history_migration()``
             path never touches ``main``'s indexes for exactly this reason and
             remains the right choice for anything running alongside a live bot.
           - Indexes are ALWAYS rebuilt in the ``finally`` block, even if the
             migration itself errors out partway — a subsequent bot start should
             never see ``main.war_attacks`` missing its query indexes.
+            A ``finally`` does NOT cover SIGKILL/OOM/a dropped SSH session, though,
+            so a hard kill between the DROP and the rebuild leaves those indexes
+            gone. The backstop is already in place and needs no extra machinery:
+            every index in ``_WAR_ATTACKS_SECONDARY_INDEX_DDL`` is also issued by
+            ``_create_schema()``/``_create_history_schema()`` as
+            ``CREATE INDEX IF NOT EXISTS``, which run inside
+            ``QapBot.initialize_database()`` before anything else can touch the DB —
+            so the next start rebuilds whatever is missing. Expect that start to be
+            slow (a full rebuild on a multi-million-row table), not broken.
           - Each chunk is still its own committed transaction (same
             resumability guarantee as the batched path — safe to interrupt and
             re-run; already-migrated rows simply won't match `date < cutoff`
@@ -11524,7 +11784,11 @@ class WarHistoryDB:
 
             # war_summary/CWL tables: far smaller volume, the existing batched
             # methods are plenty fast already — no index-dropping needed.
-            moved["war_summary"], _ = await self._migrate_table_batch_by_date("war_summary", cutoff_date, 5000)
+            # "0000-01-01" is an open lower bound: unlike the nightly walk, the fast path
+            # deliberately clears EVERYTHING below the cutoff in one campaign.
+            moved["war_summary"], _ = await self._migrate_date_window_batched(
+                "war_summary", "0000-01-01", cutoff_date, 20000
+            )
             moved["cwl_league_groups"], _ = await self._migrate_cwl_table_by_season("cwl_league_groups", cutoff_month)
             moved["cwl_league_rounds"], _ = await self._migrate_cwl_table_by_season("cwl_league_rounds", cutoff_month)
 
@@ -11536,9 +11800,15 @@ class WarHistoryDB:
             result = f"[HIST-MIGRATE-FAST] ERROR: {e}"
             logging.error(result)
         finally:
-            logging.info("[HIST-MIGRATE-FAST] Rebuilding dropped indexes...")
-            await self._rebuild_war_attacks_secondary_indexes()
-            logging.info("[HIST-MIGRATE-FAST] Index rebuild complete.")
+            # Restore autocheckpoint + drain the WAL BEFORE rebuilding indexes (fixed
+            # 2026-09-01). Rebuilding 5 secondary indexes across a ~103M-row
+            # history.war_attacks plus a ~52M-row main.war_attacks is by far the largest
+            # write burst of this whole method — an estimated ~28 GB of pages at current
+            # table sizes. With wal_autocheckpoint still 0 (set at the top of the try
+            # block) every one of those pages accumulated in the WAL with no checkpoint
+            # between any of the ten CREATE INDEX statements, which is the same shape as
+            # the 2026-08-01 disk-full incident (287 GB + 103 GB WAL) that this method's
+            # own docstring documents. Ordering is the entire fix.
             try:
                 await self._conn.execute("PRAGMA wal_autocheckpoint=1000")
                 await self._conn.execute("PRAGMA history.wal_autocheckpoint=1000")
@@ -11546,19 +11816,25 @@ class WarHistoryDB:
                 await self._conn.execute("PRAGMA history.wal_checkpoint(PASSIVE)")
             except Exception as _ckpt_ex:
                 logging.warning(f"[HIST-MIGRATE-FAST] Could not restore autocheckpoint/checkpoint: {_ckpt_ex}")
+            logging.info("[HIST-MIGRATE-FAST] Rebuilding dropped indexes...")
+            await self._rebuild_war_attacks_secondary_indexes()
+            logging.info("[HIST-MIGRATE-FAST] Index rebuild complete.")
             if _qbcore is not None:
                 _qbcore.db_maintenance_mode = False
                 logging.info("[HIST-MIGRATE-FAST] db_maintenance_mode=False — Discord commands unblocked")
 
         if not result.startswith("[HIST-MIGRATE-FAST] ERROR"):
             try:
-                import datetime as _dt2
-                await self.set_bot_metadata(
-                    "last_history_migration",
-                    _dt2.datetime.now(_dt2.timezone.utc).isoformat(),
-                )
+                # Stamp the SAME marker the nightly walk reads (2026-09-01) — this method
+                # clears everything below the cutoff in one campaign, so the walk is by
+                # definition caught up to it. Writing the old "last_history_migration"
+                # timestamp here instead would leave the walk's marker stale, making the
+                # next nightly run re-probe every day from wherever it last stopped. Not
+                # incorrect (the lookahead finds nothing and jumps to the target), just
+                # pointless work and a confusing pair of markers disagreeing about state.
+                await self.set_bot_metadata(self.HISTORY_MIGRATION_CUTOFF_KEY, cutoff_date)
             except Exception as _meta_ex:
-                logging.warning(f"[HIST-MIGRATE-FAST] Could not persist migration timestamp: {_meta_ex}")
+                logging.warning(f"[HIST-MIGRATE-FAST] Could not persist migration cutoff: {_meta_ex}")
 
         return result
 
@@ -11677,12 +11953,14 @@ class WarHistoryDB:
                     page_size = _page_size_early
 
                     major_indexes = [
-                        # war_attacks (5): idx_wa_clan_tag / idx_wa_war_id dropped 2026-04-25;
-                        # idx_wa_player_tag_date added 2026-07-30 (leaderboard scope="all")
+                        # war_attacks (6): idx_wa_clan_tag / idx_wa_war_id dropped 2026-04-25;
+                        # idx_wa_player_tag_date added 2026-07-30 (leaderboard scope="all");
+                        # idx_wa_date added 2026-09-01 (nightly migration date window)
                         "idx_wa_player_tag", "idx_wa_war_clan", "idx_wa_clan_date", "idx_wa_zero_attacks",
-                        "idx_wa_player_tag_date",
-                        # war_summary (4)
+                        "idx_wa_player_tag_date", "idx_wa_date",
+                        # war_summary (5): idx_ws_date added 2026-09-01 (same reason)
                         "idx_ws_clan_tag", "idx_ws_clan_date", "idx_ws_cwl_season", "idx_ws_war_id",
+                        "idx_ws_date",
                         # clans (2)
                         "idx_clans_has_subs", "idx_clans_last_war_update",
                     ]

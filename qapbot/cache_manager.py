@@ -253,7 +253,6 @@ class CacheManager:
         # push_refresh_to_open_cwl_settings_session()'s own docstring.
         self.cwl_settings_open_view: Dict[str, Any] = {}
         self.last_db_maintenance: Optional[datetime] = None  # UTC timestamp of last nightly DB maintenance run
-        self.last_history_migration: Optional[datetime] = None  # UTC timestamp of last monthly hot->history DB migration
         # Cross-cycle datetime parse cache for the clan categorization loop.
         # Maps clan_tag -> (raw_iso_string, parsed_datetime). Avoids 12K fromisoformat()
         # calls per cycle by only re-parsing when the stored ISO string changes.

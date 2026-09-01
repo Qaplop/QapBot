@@ -127,7 +127,7 @@ def _log_slow_gc(phase: str, info: dict) -> None:  # type: ignore[type-arg]
 if not any(getattr(_cb, "__name__", None) == "_log_slow_gc" for _cb in gc.callbacks):
     # Name-based (not identity-based) dedup guard: QBdiscordcmds.py does
     # `from QapBot import GLOBAL_GUILD_ID, run_nightly_maintenance_routine,
-    # is_monthly_migration_due` at module level. Since this file runs as
+    # is_history_migration_due` at module level. Since this file runs as
     # `__main__`, that import makes Python load it a SECOND time under the
     # module name "QapBot" (sys.modules has no entry for "QapBot", only
     # "__main__", so it doesn't recognize this as already-loaded) — re-running
@@ -336,17 +336,24 @@ async def _close_bot_after_signal() -> None:
     generous (30 min) watchdog, so once it actually finishes — success or failure —
     db_maintenance_mode clears and the normal 60 s fallback countdown resumes.
 
+    2026-09-01: db_migration_active pauses the budget for the same reason. The nightly
+    hot->history walk no longer sets db_maintenance_mode (it holds no exclusive lock and
+    must not block Discord), but it IS a long uninterruptible DB operation — so without
+    this it would once again let the 60 s force-close fire mid-run and race asyncio's
+    task cancellation against the aiosqlite worker, which is exactly the crash the
+    db_maintenance_mode pause above was added to prevent.
+
     IMPORTANT: Always call bot.close() after cleanup so bot.run() / asyncio.run()
     can actually return.  In maintenance mode cleaned_up=True immediately (resources
     were closed by do_maintenance_shutdown), but bot.close() was never called —
     without it bot.start() blocks forever on the Discord WebSocket, preventing exit.
     """
     _waited = 0.0
-    while _waited < 60.0:  # 60 s budget, paused while db_maintenance_mode is True
+    while _waited < 60.0:  # 60 s budget, paused during DB maintenance/migration
         await asyncio.sleep(0.1)
         if QBcore.cleaned_up or QBcore.bot.is_closed():
             break  # resources clean — fall through to close the Discord connection
-        if not QBcore.db_maintenance_mode:
+        if not QBcore.db_maintenance_mode and not QBcore.db_migration_active:
             _waited += 0.1
     else:
         # Fallback: periodic_main did not finish within 60 s of actual idle time
@@ -2131,34 +2138,30 @@ async def _warm_global_db_stats_cache(force_refresh: bool = False) -> None:
         logging.warning(f"[DB-STATS-WARM] Failed to warm global DB statistics cache: {_exc}")
 
 
-async def run_nightly_maintenance_routine(
-    db_mgr: Any, run_migration: bool, migration_time_budget_seconds: Optional[float] = None
-) -> str:
+async def run_nightly_maintenance_routine(db_mgr: Any, run_migration: bool) -> str:
     """
     Full nightly maintenance routine: Step 0 (archive file move) + Step 0.5
     (optional monthly hot->history migration) + Steps 1-3 (WAL checkpoint,
     REINDEX/VACUUM, ANALYZE).
 
-    Shared by the 03:00 UTC scheduled nightly task and the
-    /admin Execute Nightly Maintenance command, so both always run the exact
-    same sequence — no risk of the admin-triggered run silently skipping the
-    archive move or monthly migration steps.
+    Shared by the 03:00 UTC scheduled nightly task and the /admin Execute Nightly
+    Maintenance command, which run the **identical** sequence with the identical
+    budgets — /admin is "do tonight's maintenance now", nothing more.
+
+    2026-09-01: the separate, much shorter migration budget /admin used to pass
+    (``CONFIG.history_migration_admin_budget_minutes``, 1 min) was removed along with the
+    parameter that carried it. It existed because migration used to be a long blocking
+    campaign you might want to nudge without hanging an interactive command; it is now a
+    small, non-blocking, resumable nightly job, so a different budget only made the two
+    paths diverge for no benefit. The interactive-token risk it hedged against is still
+    handled where it always was — the caller catches a failed followup and logs the result
+    instead (a long VACUUM could already blow the ~15 min token on its own).
 
     Args:
         db_mgr: CACHE.db_manager (must not be None).
-        run_migration: Whether Step 0.5 (monthly_history_migration) should run
-            this call. Callers decide this (e.g. day-of-month gate for the
-            scheduled task; same gate re-checked for the admin command).
-        migration_time_budget_seconds: How long Step 0.5 may run for, if
-            run_migration is True. Defaults to
-            CONFIG.history_migration_time_budget_minutes * 60 (the scheduled
-            nightly task's budget) when not given. Added 2026-08-01 so the
-            /admin command — an interactive, user-awaited call, unlike the
-            fire-and-forget scheduled task — can pass a much shorter budget:
-            migration isn't /admin's purpose (the opportunistic per-cycle
-            chunking already carries the bulk of migration progress), and a
-            long migration wait risks the Discord interaction token expiring
-            (~15 min) before the reply can be sent.
+        run_migration: Whether Step 0.5 (run_history_migration) should run this
+            call. Both callers derive it the same way, from
+            is_history_migration_due().
 
     Returns:
         The nightly_db_maintenance() result string (for display to the caller).
@@ -2174,17 +2177,16 @@ async def run_nightly_maintenance_routine(
         # before the VACUUM/REINDEX pass below so the freed space from the
         # migration DELETEs is picked up by nightly_db_maintenance()'s
         # freelist-based VACUUM trigger in the same run.
-        # The budget caps how long this can block Discord commands in one
-        # sitting (2026-08-01: an uncapped first-ever run against a large
-        # backlog took 10+ hours). A capped run reports PARTIAL, not done, so
-        # is_monthly_migration_due() keeps retrying later.
+        # Bounded by BOTH a row budget (primary — CONFIG.history_migration_nightly_row_budget)
+        # and a time budget (secondary hard stop). A bounded run reports PARTIAL and persists
+        # the cutoff it reached, so the next night resumes from there. Since 2026-09-01 this
+        # step no longer blocks Discord commands at all — run_history_migration() sets
+        # QBcore.db_migration_active, not db_maintenance_mode.
         if run_migration:
-            _budget = (
-                migration_time_budget_seconds
-                if migration_time_budget_seconds is not None
-                else CONFIG.history_migration_time_budget_minutes * 60
+            await db_mgr.run_history_migration(
+                time_budget_seconds=CONFIG.history_migration_time_budget_minutes * 60,
+                row_budget=CONFIG.history_migration_nightly_row_budget,
             )
-            await db_mgr.monthly_history_migration(time_budget_seconds=_budget)
         # Step 0.6: purge CWL seasons past each guild's configured retention
         # (guild_config.cwl_retention_months). Placed here for the same reason
         # as the migration step above — before the VACUUM/REINDEX pass, so the
@@ -2247,104 +2249,31 @@ async def run_nightly_maintenance_routine(
         )
 
 
-# One-shot latch so the "automatic migration is disabled" notice below appears once per
-# process instead of on every ~5-minute cycle. Module-level (not a CACHE field) because it
-# is pure log de-duplication with no bearing on bot state.
-_migration_disabled_logged: bool = False
-
-
-async def is_monthly_migration_due(ignore_in_process_claim: bool = False) -> bool:
+async def is_history_migration_due() -> bool:
     """
-    Check whether the monthly hot->history DB migration is due (not yet
-    fully completed for the current calendar month), hydrating
-    CACHE.last_history_migration from bot_metadata on first use.
+    Check whether the rolling hot->history migration has work to do.
 
-    Default behavior (``ignore_in_process_claim=False``, used by the scheduled
-    03:00 UTC nightly task and the standalone safety-net path in
-    ``periodic_main()``): gated on ``day == 1`` AND immediately CLAIMS it by
-    setting ``CACHE.last_history_migration`` to now the moment it returns
-    True — the caller is expected to actually run ``monthly_history_migration()``
-    right after. This prevents those two automatic paths from double-running
-    the migration if both happen to check within the same window, and stops
-    them from re-firing every cycle for the rest of the month once claimed.
+    Replaces ``is_monthly_migration_due()`` (2026-09-01 redesign). That function had
+    two modes, a ``day == 1`` gate, and an in-memory "claim" — all of which existed
+    only to stop a MONTHLY job from re-firing within the month it had already run.
+    A nightly walk needs none of it: the question is simply "is the cutoff we have
+    actually reached still behind the cutoff we want", which is derived fresh from
+    persisted state every time and is naturally idempotent.
 
-    ``ignore_in_process_claim=True`` (added 2026-08-01, used by the manual
-    ``/admin`` Execute Nightly Maintenance command): bypasses BOTH the
-    ``day == 1`` gate and the in-memory claim, re-deriving purely from
-    persisted ``bot_metadata``. Needed because the time-budgeted/chunked
-    migration (see ``monthly_history_migration``'s ``time_budget_seconds``)
-    can legitimately take several separate runs across multiple days to
-    finish a large backlog — an operator explicitly invoking ``/admin``
-    should always be able to trigger "one more chunk" regardless of what
-    already auto-fired earlier in this same bot process, or what day it is.
-    The automatic paths deliberately keep the once-per-process-per-month
-    behavior so they don't loop unsupervised — only a human explicitly asking
-    for another run bypasses that.
-
-    Regardless of either mode, returns False whenever
-    ``CONFIG.history_migration_enabled`` is off (added 2026-09-01, default off —
-    see that config field). This is the single enforcement point for that
-    kill-switch: the 03:00 UTC nightly step, the opportunistic per-cycle chunk
-    and ``/admin`` Execute Nightly Maintenance all gate on this function, so
-    disarming it here disarms every automatic path at once. The manual
-    ``qapbot/scripts/run_history_migration_now.py`` CLI bypasses this function
-    entirely and is unaffected — by design, so an operator can still advance the
-    backlog under supervision.
+    There is deliberately no on/off switch. A short, non-blocking, budgeted, resumable
+    nightly job has no state in which you would want it permanently disabled — and an "off"
+    setting would silently stop hot-DB retention with nothing to alarm on, so the flag would
+    be a footgun rather than a safety net (the 2026-09-01 stopgap
+    ``history_migration_enabled`` was removed once the redesign made it pointless). To stop
+    the walk without a code change, set ``HISTORY_MIGRATION_NIGHTLY_ROW_BUDGET=0`` — a zero
+    budget makes it an immediate no-op.
 
     Returns:
-        True if the caller should run db_manager.monthly_history_migration() now.
+        True if the caller should run ``db_manager.run_history_migration()`` now.
     """
-    if not CONFIG.history_migration_enabled:
-        # Checked before anything else, and deliberately without touching
-        # CACHE.last_history_migration: claiming here would write a "done this month"
-        # marker for a run that never happened, which is exactly the failure mode the
-        # 2026-08-01 stale-stamp incident documented (see DATABASE_ARCHITECTURE.md).
-        global _migration_disabled_logged
-        if not _migration_disabled_logged:
-            _migration_disabled_logged = True
-            logging.info(
-                "[HIST-MIGRATE] Automatic hot->history migration is DISABLED "
-                "(CONFIG.history_migration_enabled=False) — nightly step, per-cycle chunk and "
-                "/admin migration are all skipped. Advance the backlog manually with "
-                "qapbot/scripts/run_history_migration_now.py. Logged once per process."
-            )
-        return False
     if CACHE.db_manager is None:
         return False
-    _now_utc = datetime.now(timezone.utc)
-
-    if ignore_in_process_claim:
-        _stored_mig = await CACHE.db_manager.get_bot_metadata("last_history_migration")
-        _last_done: Optional[datetime] = None
-        if _stored_mig:
-            try:
-                _last_done = datetime.fromisoformat(_stored_mig)
-            except ValueError:
-                pass
-        return (
-            _last_done is None
-            or _last_done.year != _now_utc.year
-            or _last_done.month != _now_utc.month
-        )
-
-    if CACHE.last_history_migration is None:
-        _stored_mig = await CACHE.db_manager.get_bot_metadata("last_history_migration")
-        if _stored_mig:
-            try:
-                CACHE.last_history_migration = datetime.fromisoformat(_stored_mig)
-            except ValueError:
-                pass
-    _due = (
-        _now_utc.day == 1
-        and (
-            CACHE.last_history_migration is None
-            or CACHE.last_history_migration.year != _now_utc.year
-            or CACHE.last_history_migration.month != _now_utc.month
-        )
-    )
-    if _due:
-        CACHE.last_history_migration = _now_utc
-    return _due
+    return await CACHE.db_manager.has_history_migration_work()
 
 
 async def periodic_main() -> None:
@@ -2645,7 +2574,7 @@ async def periodic_main() -> None:
                 async def _deferred_optimize_task() -> None:
                     QBcore.db_maintenance_idle_event.clear()
                     try:
-                        _run_migration_opt = await is_monthly_migration_due()
+                        _run_migration_opt = await is_history_migration_due()
                         _result = await run_nightly_maintenance_routine(_opt_db_mgr, _run_migration_opt)
                         if _opt_interaction is not None:
                             try:
@@ -2755,21 +2684,16 @@ async def periodic_main() -> None:
                         or CACHE.last_db_maintenance.date() != _now_utc.date()
                     )
                 )
-                # --- Monthly hot->history DB migration ---
-                # Historically ran only on day == 1 of the month, once per bot-process
-                # lifetime (via is_monthly_migration_due()'s in-memory claim). Changed
-                # 2026-08-01 (same incident as the WAL-growth/time-budget fixes above):
-                # a large backlog can take several separate time-budgeted runs to finish,
-                # and a bot left running continuously (no restart) would otherwise only
-                # ever fire the migration once, then silently never again until next
-                # month's day 1. _migration_due here uses ignore_in_process_claim=True —
-                # re-derives fresh from bot_metadata every cycle, no day-of-month
-                # restriction. Two consumers below with different cadences: the
-                # `if _maint_due` branch is itself throttled to once/night (hour==3 AND
-                # >20h since last run); the `elif` branch (opportunistic per-cycle chunk)
-                # is NOT further throttled here — it fires every cycle the migration is
-                # still due, bounded per-firing by history_migration_cycle_chunk_minutes.
-                _migration_due = await is_monthly_migration_due(ignore_in_process_claim=True)
+                # --- Rolling hot->history DB migration (2026-09-01 redesign) ---
+                # Now has exactly ONE automatic consumer: the `if _maint_due` branch below,
+                # i.e. the nightly maintenance window, throttled to once per night. The
+                # opportunistic per-cycle chunk that used to live here as an `elif` was
+                # deleted — it fired every cycle a backlog remained and, on 2026-09-01,
+                # blocked Discord commands for 68% of a 14-hour span across 114 chunks that
+                # never completed. There is no longer a backlog for it to clear: the walk
+                # advances the cutoff ~1 day/night, so a night's work is ~1.2M rows rather
+                # than a month's ~38M landing on the 1st.
+                _migration_due = await is_history_migration_due()
                 if _maint_due and CACHE.db_manager is not None:
                     # Pre-set timestamp so a later cycle in the same 03:xx window does not
                     # re-trigger while the background task is still running.
@@ -2788,39 +2712,6 @@ async def periodic_main() -> None:
                             QBcore.db_maintenance_idle_event.set()  # signal: maintenance done
 
                     QBcore.spawn_tracked("nightly-db-maintenance", _nightly_maintenance_task())
-                elif (
-                    _migration_due
-                    and CACHE.db_manager is not None
-                    and CONFIG.history_migration_cycle_chunk_minutes > 0
-                ):
-                    # Opportunistic per-cycle migration chunk — added 2026-08-01, same
-                    # incident as everything else above. Rather than only advancing the
-                    # migration once/night (or relying on a rare "the nightly window didn't
-                    # fire" safety net), spend up to history_migration_cycle_chunk_minutes of
-                    # the sleep phase's otherwise-idle time on migration whenever it's still
-                    # due — reuses the exact same asyncio.create_task() +
-                    # db_maintenance_idle_event gate machinery the sleep-wait below already
-                    # has, so the next cycle simply waits if this chunk runs long, same as it
-                    # already does for nightly maintenance. Uses the same
-                    # ignore_in_process_claim=True check as the block above (re-derives fresh
-                    # from bot_metadata every cycle, no day-of-month restriction), so this
-                    # supersedes the old once-per-process "safety net" entirely — it's now a
-                    # strict superset (fires on any day, any time, every cycle, not just as a
-                    # rare fallback). Self-limiting: once is_monthly_migration_due() reports
-                    # done, this branch's condition is simply False and costs nothing.
-                    _db_mgr2 = CACHE.db_manager
-
-                    async def _cycle_migration_chunk_task() -> None:
-                        QBcore.db_maintenance_idle_event.clear()
-                        try:
-                            await _db_mgr2.monthly_history_migration(
-                                time_budget_seconds=CONFIG.history_migration_cycle_chunk_minutes * 60
-                            )
-                        finally:
-                            QBcore.db_maintenance_idle_event.set()
-
-                    QBcore.spawn_tracked("cycle-migration-chunk", _cycle_migration_chunk_task())
-
                 # Subtract cycle duration from the configured interval so the
                 # wall-clock period between cycle starts stays constant.
                 # Floor at 30s so a very long cycle never completely eliminates the

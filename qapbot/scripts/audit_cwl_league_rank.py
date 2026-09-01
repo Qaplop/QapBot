@@ -117,7 +117,7 @@ Usage:
     python -m qapbot.scripts.audit_cwl_league_rank reconstruct --season 2026-07 --fresh-after 2026-07-12 --yes
 
 Reads/writes CONFIG.db_path (main, "hot" DB) and CONFIG.history_db_path (older
-seasons swept out by monthly_history_migration) — same split the live bot uses.
+seasons swept out by run_history_migration) — same split the live bot uses.
 """
 import argparse
 import asyncio

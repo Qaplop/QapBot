@@ -54,7 +54,7 @@ literally zero bytes written, not "doesn't rename the originals"):
 BATCHED, CHECKPOINTED, AND RESUMABLE (--build/--apply only): the copy into `<table>_repaired` is
 done in batches of `--batch-size` rows (default 20,000), each its own committed transaction, with
 a `PRAGMA wal_checkpoint(PASSIVE)` every `--checkpoint-every-batches` batches (default 20) — the
-same pattern `_migrate_table_batch_by_date` in `db_manager.py` already uses for the live monthly
+same pattern `_migrate_date_window_batched` in `db_manager.py` already uses for the live nightly
 migration, and for the same reason (that function's own docstring: an earlier uncheckpointed
 multi-hour run once filled the disk). Progress is logged every batch.
 

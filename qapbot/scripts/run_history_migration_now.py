@@ -1,19 +1,18 @@
 """
-Manually trigger the monthly hot->history DB migration immediately, bypassing
-the day == 1 gate in QapBot.py's is_monthly_migration_due().
+Manually advance the rolling hot->history DB migration immediately, without waiting
+for the nightly maintenance window.
 
-Normally `WarHistoryDB.monthly_history_migration()` only runs automatically
-once a month (day 1 of the calendar month, 03:00 UTC window) — see
-`QapBot.py`'s `is_monthly_migration_due()` / `run_nightly_maintenance_routine()`.
-This script lets an operator (re-)run it on demand, e.g. to resume a run that
-errored out partway (disk full, crash, etc.) without waiting for day 1 of next
-month, and without needing day == 1 to still be true.
+`WarHistoryDB.run_history_migration()` normally runs once per night as Step 0.5 of
+`run_nightly_maintenance_routine()`, gated by `QapBot.py`'s `is_history_migration_due()`
+("is the cutoff we reached still behind the cutoff we want"). This script calls the method
+DIRECTLY, so it runs regardless of that gate and regardless of the configured budgets —
+use it to advance the backlog on demand, under supervision.
 
-The migration is naturally resumable/idempotent: each batch re-selects
-whatever rows are still below the retention cutoff (see
-`_migrate_table_batch_by_date` / `_migrate_cwl_table_by_season`), so re-running
-this after a partial failure picks up exactly where the previous run stopped —
-no special "resume" flag needed.
+How the walk works (2026-09-01 redesign): the target cutoff is
+`min(today - CONFIG.history_retention_days, first day of the previous calendar month)`, and
+the migration walks one calendar day at a time toward it, persisting the cutoff it reached
+in `bot_metadata` after each COMPLETED day. So it is naturally resumable at day granularity
+— interrupt it whenever, re-run, and it continues from where it stopped with no rescan.
 
 IMPORTANT:
   - The bot should be STOPPED before running this against a live database
@@ -33,16 +32,15 @@ IMPORTANT:
     the nightly scheduler (`run_nightly_maintenance_routine()`: migration
     first, then WAL checkpoint -> VACUUM/REINDEX -> ANALYZE).
 
-CHUNKING A LARGE BACKLOG (added 2026-08-01): a first-ever run against a large
-backlog can take many hours — far too long to keep a live bot's Discord
-commands blocked in one sitting. Use --time-budget-minutes to stop cleanly
-after N minutes (result starts with "[HIST-MIGRATE] PARTIAL", not an error —
-NOT marked done, so the next invocation just picks up where this one left
-off; no special resume flag needed). Combine with --batch-size and
---checkpoint-every-batches to trade checkpoint overhead for throughput when
-you have ample free disk space (e.g. a one-off recovery run) — bigger values
-move data faster but let more uncheckpointed WAL accumulate between
-checkpoints.
+BOUNDING A RUN: --row-budget is the primary bound (the nightly path passes
+CONFIG.history_migration_nightly_row_budget), --time-budget-minutes a secondary hard
+stop. Either produces a "[HIST-MIGRATE] PARTIAL" result — not an error — with the reached
+cutoff persisted, so the next invocation continues from there. Combine with --batch-size
+and --checkpoint-every-batches to trade checkpoint overhead for throughput when you have
+ample free disk space; bigger values move data faster but let more uncheckpointed WAL
+accumulate between checkpoints. Note --batch-size is no longer capped by SQLite's
+32766-parameter limit (the engine uses keyset id ranges, not `id IN (...)`), so pick it by
+how long a single transaction should hold the write lock — ~20000 targets 1-2s.
 
 FAST MODE (added 2026-08-01, same incident): even with a bigger --batch-size,
 the normal path still maintains all of war_attacks' 5 secondary indexes on
@@ -61,15 +59,16 @@ path regardless of --fast.
     would badly degrade any concurrent live query against it.
   - Dropped indexes are always rebuilt before the script exits, even if the
     migration itself errors out partway.
-  - --time-budget-minutes / --batch-size / --checkpoint-every-batches are
-    ignored in --fast mode (it has its own chunk-size-based safety valve,
+  - --row-budget / --time-budget-minutes / --batch-size / --checkpoint-every-batches
+    are ignored in --fast mode (it has its own chunk-size-based safety valve,
     not a time budget — it's meant to run once, to completion).
 
 Usage:
     python qapbot/scripts/run_history_migration_now.py                # prompts for confirmation
     python qapbot/scripts/run_history_migration_now.py --yes          # skip confirmation
     python qapbot/scripts/run_history_migration_now.py --db /path/to/qapbot.db --history-db /path/to/qapbot_history.db --yes
-    python qapbot/scripts/run_history_migration_now.py --time-budget-minutes 90 --batch-size 20000 --yes
+    python qapbot/scripts/run_history_migration_now.py --row-budget 500000 --yes
+    python qapbot/scripts/run_history_migration_now.py --time-budget-minutes 30 --batch-size 20000 --yes
     python qapbot/scripts/run_history_migration_now.py --fast --yes   # bot MUST be stopped
 """
 import argparse
@@ -87,7 +86,7 @@ from qapbot.db_manager import WarHistoryDB  # noqa: E402
 def _configure_logging(log_file: str | None) -> None:
     """Standalone script — nothing else in this process configures a logging
     handler, so without this, every logging.info() call inside
-    monthly_history_migration()/fast_bulk_history_migration() (the per-batch/
+    run_history_migration()/fast_bulk_history_migration() (the per-batch/
     per-chunk progress lines) is silently dropped and the run appears to hang
     with zero output for however long it takes. Same format QapBot.py's own
     logging uses.
@@ -120,6 +119,7 @@ async def _run(
     time_budget_minutes: float | None,
     fast: bool,
     fast_chunk_size: int,
+    row_budget: int | None = None,
 ) -> None:
     print(f"Hot DB     : {db_path}")
     print(f"History DB : {history_db_path}")
@@ -141,12 +141,15 @@ async def _run(
                 print(f"Checkpoint every: {checkpoint_every_batches} batches")
             if time_budget_minutes:
                 print(f"Time budget: {time_budget_minutes} minutes")
+            if row_budget:
+                print(f"Row budget : {row_budget:,} rows")
             print()
-            print("Running monthly_history_migration() (batched hot->history move)...")
-            result = await db.monthly_history_migration(
+            print("Running run_history_migration() (rolling day-by-day hot->history walk)...")
+            result = await db.run_history_migration(
                 batch_size=batch_size,
                 checkpoint_every_batches=checkpoint_every_batches,
                 time_budget_seconds=(time_budget_minutes * 60) if time_budget_minutes else None,
+                row_budget=row_budget,
             )
             print()
             print(result)
@@ -178,6 +181,11 @@ def main() -> None:
                               "just re-run this same command later to continue). Use this to chunk a large "
                               "backlog into windows that don't block the live bot for hours at a time. "
                               "Ignored in --fast mode.")
+    parser.add_argument("--row-budget", type=int, default=None,
+                         help="Stop cleanly once this many rows have moved, leaving the rest for a "
+                              "follow-up run (the automatic nightly path uses "
+                              "CONFIG.history_migration_nightly_row_budget). Primary bound; combine "
+                              "with --time-budget-minutes as a secondary hard stop. Ignored in --fast mode.")
     parser.add_argument("--fast", action="store_true",
                          help="Temporarily drop war_attacks' secondary indexes on both schemas, move data "
                               "in large single-commit chunks, then rebuild the indexes — an order of "
@@ -218,7 +226,7 @@ def main() -> None:
 
     asyncio.run(_run(
         args.db, args.history_db, args.batch_size, args.checkpoint_every_batches,
-        args.time_budget_minutes, args.fast, args.fast_chunk_size,
+        args.time_budget_minutes, args.fast, args.fast_chunk_size, args.row_budget,
     ))
 
 

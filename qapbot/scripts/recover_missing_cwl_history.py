@@ -36,7 +36,7 @@ Hot/history DB split (2026-07): this script writes unqualified (i.e. to the
 regardless of how old the recovered war is: any row inserted into ``main``
 that's older than the hot retention window (current + previous calendar
 month) is automatically swept into ``history`` by the next monthly migration
-run (``WarHistoryDB.monthly_history_migration()``) — no special-casing needed
+run (``WarHistoryDB.run_history_migration()``) — no special-casing needed
 here. All bot-facing reads already UNION main+history, so recovered rows are
 visible immediately either way.
 """

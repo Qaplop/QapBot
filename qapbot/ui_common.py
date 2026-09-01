@@ -21,6 +21,10 @@ async def check_maintenance_block(interaction: discord.Interaction) -> bool:
 
     Returns True if the interaction was blocked (caller should abort).
     Returns False if the bot is operating normally (caller should continue).
+
+    NOTE: deliberately does NOT consult QBcore.db_migration_active — the batched
+    hot->history migration holds no exclusive lock and must never refuse a user.
+    See that flag's docstring in QBcore.py.
     """
     import QBcore as _qbcore
 
@@ -32,8 +36,13 @@ async def check_maintenance_block(interaction: discord.Interaction) -> bool:
 
     if _qbcore.db_maintenance_mode and not _qbcore.maintenance_mode:
         msg = _t('commands.errors.db_maintenance_active', guild_id=guild_id)
+        _reason = "db_maintenance"
     else:
         msg = _t('commands.errors.maintenance_mode_active', guild_id=guild_id)
+        _reason = "maintenance_mode"
+    # Same forensic trail the slash-command guard now keeps — component interactions
+    # (buttons/selects/modals) are refused here and were previously just as invisible.
+    _qbcore.record_interaction_rejection(_reason, _qbcore.interaction_command_label(interaction))
 
     try:
         if not interaction.response.is_done():

@@ -2,7 +2,7 @@
 column-order-drift incident (Cardinal Rule 1, .github/copilot-instructions.md; full writeup in
 qapbot/docs/DATABASE_ARCHITECTURE.md's "Hot/History DB Split" section).
 
-The 2026-08-14 fix (`_explicit_column_list()`, `WarHistoryDB._migrate_table_batch_by_date`)
+The 2026-08-14 fix (`_explicit_column_list()`, `WarHistoryDB._migrate_date_window_batched`)
 only covered the *write* path (the monthly hot->history migration). On 2026-08-16, while
 investigating why the "Manage Enrollment" hover pop-up showed a player's Skill Score but not
 their Attacks/Missed-Attacks/Attack-Defense-Ratio, the same class of bug was found on the

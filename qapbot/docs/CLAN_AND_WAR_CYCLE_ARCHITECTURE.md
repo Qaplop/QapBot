@@ -444,7 +444,8 @@ unsplit — `player_name_index` in particular continues to be upserted on every 
 which physical DB the underlying attack rows land in.
 
 **Monthly migration** (day 1 of the month, inside the existing nightly maintenance window,
-`WarHistoryDB.monthly_history_migration()`): cutoff = start of `current_month − 1`. For
+`WarHistoryDB.run_history_migration()`): cutoff = `min(today − CONFIG.history_retention_days,
+start of `current_month − 1`)` — rolling since 2026-09-01, walked one day per night. For
 date-keyed tables: batched `INSERT INTO history.X SELECT * FROM main.X WHERE id IN (...)` /
 `DELETE FROM main.X WHERE id IN (...)` in chunks of 5000 rows (never one giant transaction — see
 the 44-minute VACUUM lesson above). For CWL tables: one transaction per affected season (each
@@ -526,7 +527,7 @@ ClashPerk embeds, not DB backup).
 ### Helper reference
 
 - `WarHistoryDB._history_cutoff()` — computes the monthly migration cutoff.
-- `WarHistoryDB.monthly_history_migration()` — orchestrates the monthly migration. Every
+- `WarHistoryDB.run_history_migration()` — orchestrates the nightly rolling migration. Every
   `_MIGRATION_CHECKPOINT_INTERVAL_BATCHES` (20, overridable via `checkpoint_every_batches`) batches,
   `_migrate_table_batch_by_date()` runs an unqualified `PRAGMA wal_checkpoint(PASSIVE)` to bound WAL
   growth during the run — see the 2026-08-01 incident in `DATABASE_ARCHITECTURE.md`'s Migration
@@ -540,12 +541,12 @@ ClashPerk embeds, not DB backup).
   `WarHistoryDB.nightly_db_maintenance()` on demand (WAL checkpoint → VACUUM/REINDEX → ANALYZE).
   **Correction (2026-08-01): this does NOT run the monthly migration** — `nightly_db_maintenance()`
   has no migration step; only `QapBot.run_nightly_maintenance_routine()` (Step 0.5, day==1-gated)
-  calls `monthly_history_migration()` before it. A previous version of this doc claimed the two
+  calls `run_history_migration()` before it. A previous version of this doc claimed the two
   were combined here — they weren't; that claim was never re-verified against the code after an
   earlier refactor split them apart, and nothing caught the drift until the 2026-08-01 incident
   needed a way to force-run the migration standalone. Re-added
   `qapbot/scripts/run_history_migration_now.py` (previously deleted, per the note this replaces)
-  for exactly that: force-running `monthly_history_migration()` on demand, bypassing the day==1
+  for exactly that: force-running `run_history_migration()` on demand, bypassing the
   gate, e.g. to resume a run that errored out partway. Run this first, then
   `run_db_maintenance_now.py` to reclaim the freed space — same order
   `run_nightly_maintenance_routine()` uses.
