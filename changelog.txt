@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-01 (3)
+- Fixed: bot could not start at all -- global command sync was rejected with
+  `400 Invalid Form Body / In 9.options.0.choices.17.name: Must be between 1 and 100 in
+  length`, and setup_hook treats that as fatal. Commit 1d85c7a (docs audit) had added
+  "+ CWL purge " to the /admin OPTIMIZE_DB choice name, taking it from 90 to 102 chars.
+  Discord rejects the ENTIRE command tree for one out-of-range field. Latent for two
+  commits because it only fails against the live API at startup, and the bot had not been
+  restarted since. Shortened "Run archive move" -> "Archive move" (98 chars).
+- Added: tests/discord/test_command_payload_limits.py -- structural guard walking every
+  app command reachable from QBdiscordcmds (groups and subcommands included, discovered by
+  namespace scan so new commands are covered automatically) and asserting Discord's limits
+  on command/option/choice names, descriptions, and choice counts. Verified it reproduces
+  the exact failure (same command, option, choice index and length) before the fix.
+  A behavioural test cannot catch this class of bug -- the code is correct until someone
+  edits a string -- so the guard is structural, same reasoning as Cardinal Rule 14's.
+- Files: QBdiscordcmds.py, qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md.
+  8 new tests. 2930 tests pass.
+
 2026-09-01 (2)
 - Fixed: `KeyError: 'districts'` failing every fetch of 438 clans since 2026-08-31 15:40.
   coc.py 4.0.0's `Clan._from_data` guards on `clanCapital` being truthy but then indexes

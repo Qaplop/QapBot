@@ -2392,3 +2392,50 @@ newline. A blank line already surrounded by non-whitespace content on both sides
 this. Since no automated test can catch this (the string is correct; only Discord's renderer
 strips it), the only way to actually confirm the fix worked is looking at the message in Discord
 itself, not at the constructed string in a test or a debugger.
+
+## Pitfall 53: one over-length slash-command string does not degrade that one field — Discord rejects the ENTIRE command tree, so the bot cannot start at all
+
+**Symptom** (PROD, 2026-09-01): the bot logged in, prepared its commands, then died during
+`setup_hook()`:
+
+```
+[SETUP_HOOK] 13 commands, 3 command groups, and 2 context menus prepared
+[SETUP_HOOK] Registering commands globally (global mode)
+[ERROR] global_command_sync failed: 400 Bad Request (error code: 50035): Invalid Form Body
+In 9.options.0.choices.17.name: Must be between 1 and 100 in length. (not retrying - client error)
+Cleanup complete. Goodbye!
+```
+
+**Root cause:** an `/admin` action choice name had grown to 102 characters. Two commits earlier, a
+docs-accuracy pass had inserted `+ CWL purge ` into
+`"Execute Nightly Maintenance - Run archive move + DB ANALYZE/REINDEX/VACUUM now (bot admin)"`,
+taking it from 90 to 102. Discord's application-command endpoint validates the whole payload and
+rejects all of it on any single out-of-range field, so a 2-character overrun on one dropdown label
+costs every command the bot has.
+
+**Why it stayed hidden for two commits:** nothing validates these lengths locally. `discord.py`'s
+builders accept any string; the limit is enforced only by Discord, only at sync time, only at
+startup. The bot had not been restarted since the edit, so the change looked completely safe — the
+next unrelated restart is what surfaced it, which also makes the error trivially easy to blame on
+whatever was deployed at that moment rather than on the actual cause.
+
+**Reading the error:** the path is positional against the sync payload.
+`9.options.0.choices.17.name` = `COMMANDS[9]` in `QapBot.py`'s `setup_hook()` list (`/admin`),
+its first option (`action`), the 18th choice (0-based). Counting that list is how you find the
+offender in seconds instead of eyeballing every string.
+
+**The limits** (application-command docs): command/subcommand/option NAME 1-32; choice NAME 1-100;
+command/option DESCRIPTION 1-100; max 25 statically declared choices per option (past that the
+option needs autocomplete).
+
+**Fix:** shortened the label to 98 chars, and added `tests/discord/test_command_payload_limits.py`
+— a structural guard that walks every app command reachable from `QBdiscordcmds` (groups and
+subcommands included, found by namespace scan so new commands are covered with nothing to keep in
+sync) and asserts all of the above. It was verified to reproduce the exact failure — same command,
+option, choice index and length — before the fix was applied.
+
+**How to apply:** treat any edit to a slash-command name, description, or choice label as a change
+to a length-constrained API payload, not as prose. A structural test is the right guard here for
+the same reason Cardinal Rule 14 gives for `row[N]`: the code is correct until someone edits a
+string, so a behavioural test can never catch it in advance. Watch especially for docs/accuracy
+passes that append clarifying words to user-facing labels — that is exactly how this one landed.
