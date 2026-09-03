@@ -165,6 +165,41 @@ if "Dragon Duke" not in coc.HERO_ORDER:
     except ValueError:
         coc.HERO_ORDER.append("Dragon Duke")
 
+
+class WallClockBatchThrottler(BatchThrottler):
+    """BatchThrottler whose rate window is wall-clock, not CPU time.
+
+    Upstream coc.py 4.0.0 measures its sliding window with ``time.process_time()``
+    (see coc/http.py), which counts CPU seconds consumed by *this process* — not
+    elapsed time. For an I/O-bound bot the CPU clock advances far slower than the
+    wall clock, so the effective ceiling is not "rate_limit requests per second"
+    but "rate_limit requests per second of CPU burned".
+
+    Measured 2026-09-03 on a pure-I/O workload, rate_limit=100:
+        upstream BatchThrottler : 2.6 req/s @ 20 concurrent, 5.5 @ 50
+        this class              : 75.9 req/s @ 20 concurrent, 112.1 @ 50
+    In the live bot (which does burn CPU on JSON/DB work) upstream landed at
+    ~35 req/s against a configured 100, and raising _FETCH_CONCURRENCY 20 -> 50
+    changed throughput not at all (25.6 -> 23.4 clans/s) — it only added queueing
+    latency, because every request was waiting on this gate rather than the
+    semaphore. Switching to time.monotonic() makes throttle_limit mean what the
+    call site already assumed it meant.
+
+    Not upstreamed yet; revisit on the next coc.py bump in case it is fixed there.
+    """
+
+    async def __aenter__(self) -> "WallClockBatchThrottler":
+        while True:
+            now = time.monotonic()
+            while self._task_logs and now - self._task_logs[0] > self.per:
+                self._task_logs.popleft()
+            if len(self._task_logs) < self.rate_limit:
+                break
+            await asyncio.sleep(self.retry_interval)
+        self._task_logs.append(time.monotonic())
+        return self
+
+
 import discord  # Added for Discord exception handling
 from discord.ext import commands  # Added for Bot/commands support
 from datetime import datetime, timezone, timedelta
@@ -604,7 +639,13 @@ async def startup_login() -> None:
             # rate_limit=10 requests per 1.0 second (official CoC API limit)
             # QBcore.coc_client = coc.Client(throttle_limit=30) # Old single-threaded throttler
 
-            QBcore.coc_client = coc.Client(key_count=10, throttler=coc.BatchThrottler, throttle_limit=100) # throttle_limit can be up to 100 (10 keys * 10 req/sec)
+            # 2026-09-03: WallClockBatchThrottler instead of coc.BatchThrottler — upstream
+            # gates on CPU time, which silently capped us near 35 req/s (see the class
+            # docstring). 80, not the full 100 (10 keys * 10 req/sec), because that ceiling
+            # is shared with every other caller — /status, leaderboards, CWL discovery — and
+            # exceeding the real CoC limit blocks requests for 30-60s. 20% margin absorbs
+            # those bursts. Raise toward 100 only with the api_fail: buckets watched.
+            QBcore.coc_client = coc.Client(key_count=10, throttler=WallClockBatchThrottler, throttle_limit=80)
 
 
             # Store in CACHE for centralized access

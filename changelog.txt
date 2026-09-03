@@ -1,6 +1,31 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-03 (3)
+- Fixed: CoC API throughput silently capped at ~35 req/s against a configured 100, which
+  is why entry (2)'s concurrency raise produced no speedup (QapBot.py).
+  Root cause: coc.py 4.0.0's BatchThrottler measures its sliding rate window with
+  time.process_time() -- CPU seconds burned by this process, not elapsed time (coc/http.py).
+  For an I/O-bound bot the CPU clock advances far slower than the wall clock, so
+  throttle_limit=100 actually meant "100 requests per second of CPU consumed". Measured on
+  a pure-I/O workload at rate_limit=100: upstream gave 2.6 req/s at 20 concurrent and
+  5.5 at 50, against an ideal 100. In the live bot (which does burn CPU on JSON/DB work)
+  it landed at ~35 req/s. That also explains entry (2): raising _FETCH_CONCURRENCY 20 -> 50
+  left throughput unchanged (25.6 -> 23.4 clans/s measured from PROD log timestamps) while
+  per-clan latency rose 0.78s -> 2.14s -- every request was queueing on the throttler, not
+  the semaphore. Verified the semaphore itself was working (51/71/61 clans admitted in the
+  first 0.5s at cc=50 vs 20/21/31 at cc=20).
+  Fix: WallClockBatchThrottler, a BatchThrottler subclass using time.monotonic() for the
+  window, and throttle_limit 100 -> 80. 80 rather than the full 10 keys x 10 req/sec
+  because that ceiling is shared with /status, leaderboards and CWL discovery, and
+  exceeding the real CoC limit blocks requests for 30-60s; 20% margin absorbs those bursts.
+  Measured after the fix: 78.4 req/s at 20 concurrent, 87.2 at 50 (target 80).
+  _FETCH_CONCURRENCY stays at 50 -- it only becomes useful now that the gate behind it is
+  real. Revisit on the next coc.py bump in case upstream fixes the clock.
+  Expected: Phase 1 ~97s -> ~40s, cycle ~130s -> ~70s. Watch the api_fail: buckets
+  (Network / RateLimit) in [CYCLE-SUMMARY]; revert throttle_limit toward 60 if they move.
+  File: QapBot.py. 2971 tests pass.
+
 2026-09-03 (2)
 - Changed: Phase-1 fetch concurrency 20 -> 50 (QapBot.py).
   With the orphaned-CWL battle-day gate in place (entry 1), Phase 1 became the dominant
