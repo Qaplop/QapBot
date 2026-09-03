@@ -1,6 +1,30 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-03 (4)
+- Changed: reverted _FETCH_CONCURRENCY 50 -> 20, and documented why the whole API-side
+  tuning direction was a dead end (QapBot.py, qapbot/docs/PERFORMANCE_TUNING.md new).
+  Both (2) and (3) were deployed to the server-machine and measured from log timestamps:
+  concurrency 20 -> 50 moved throughput 25.6 -> 23.4 clans/s (i.e. not at all) while
+  per-clan latency went 0.78s -> 2.14s, and the wall-clock throttler at 80 req/s never
+  got above a ~53 req/s peak. ms/clan across ten cycles spanning both changes: median
+  31.7, range 24-66 — invariant.
+  Root cause: the update cycle is CPU-bound on the server-machine (2-core low-power x86,
+  no SMT), not API-bound. Little's Law settles it — the fetch semaphore was 100%
+  saturated at BOTH settings (25.6*0.78 = 20.0 in flight, 23.4*2.14 = 50.1), so the extra
+  latency from more concurrency was spent queueing on the GIL and the to_thread pool
+  inside the process, never on the network. Independent calibration: [CATEGORIZE-TIMING]
+  does zero API work and takes a rock-steady 7.2-7.8s for ~458k clans every cycle.
+  The (3) throttler fix is KEPT — coc.BatchThrottler really does gate on time.process_time
+  (CPU seconds) rather than wall-clock, so throttle_limit never meant req/s; that is worth
+  having correct, it just was not the binding constraint and buys no cycle time today.
+  Real remaining wins are all "remove per-clan CPU work", not "add parallelism": a
+  content dirty-check in save_war_object (~2,700 unconditional JSON writes/cycle),
+  incrementalising the categorize scan (~35 min/day of pure CPU), and an explicit
+  set_default_executor (to_thread is capped at min(32, cpu_count+4) = 6 threads on a
+  2-core box, shared by 33+ call sites that are disk-blocked, not CPU-blocked).
+  Files: QapBot.py, qapbot/docs/PERFORMANCE_TUNING.md. 2971 tests pass.
+
 2026-09-03 (3)
 - Fixed: CoC API throughput silently capped at ~35 req/s against a configured 100, which
   is why entry (2)'s concurrency raise produced no speedup (QapBot.py).
