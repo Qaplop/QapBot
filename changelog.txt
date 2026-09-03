@@ -1,6 +1,22 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-03 (2)
+- Changed: Phase-1 fetch concurrency 20 -> 50 (QapBot.py).
+  With the orphaned-CWL battle-day gate in place (entry 1), Phase 1 became the dominant
+  cost of the update cycle: 97s of a 131.8s cycle (74%) for 2,877 clans. Measured on the
+  post-fix PROD cycles that is ~30 clans/s (~0.67s per call) and 3,736 CoC API calls in
+  97s = ~38 req/s -- against a configured ceiling of throttle_limit=100 (key_count=10 x
+  10 req/sec per key, QapBot.py startup_login). So the semaphore, not the throttler, was
+  the binding constraint, and ~60% of the provisioned API budget sat unused. At 50 the
+  expected steady state is ~76 clans/s = ~100 req/s, i.e. saturating the BatchThrottler
+  rather than exceeding it -- the throttler still enforces the real ceiling, so this
+  cannot overshoot into 429s. Zero HTTP 429s were observed across a full CWL day at 20
+  (the "429" strings in the log are millisecond timestamps, not status codes).
+  Expected: Phase 1 ~97s -> ~40s, cycle ~132s -> ~75-85s. Revert to 20 if SSL /
+  connection-pressure errors show up in the api_fail: buckets.
+  File: QapBot.py. 2971 tests pass.
+
 2026-09-03 (1)
 - Fixed: CWL update cycles degrading from ~40s to 250-526s over 41h, with the orphan pass
   reporting 0/2,156 successful for 24 hours straight (QBhelperfunctions.py).

@@ -1224,7 +1224,14 @@ async def main() -> None:
     # Without this, asyncio.gather launches ALL clans simultaneously (potentially
     # thousands of tasks), creating hundreds of concurrent outgoing connections.
     # 50 balances throughput vs API/SSL connection pressure. ==> 20 for more safety margin.
-    _FETCH_CONCURRENCY = 20
+    # 2026-09-03: back to 50. Once the orphaned-CWL battle-day gate landed, Phase 1 became
+    # the dominant cost of the cycle — 97s of a 131.8s cycle (74%) for 2,877 clans, i.e.
+    # ~30 clans/s at concurrency 20 (~0.67s per call). No CoC rate limiting was observed at
+    # 20 across a full CWL day (zero HTTP 429; the only "429" matches in the log are
+    # millisecond timestamps), so the safety margin was buying nothing measurable. If SSL
+    # or connection-pressure errors reappear in [PHASE-1] / api_fail: buckets, step this
+    # back down — 20 is the known-safe value, this is the known-fast one.
+    _FETCH_CONCURRENCY = 50
     _fetch_semaphore = asyncio.Semaphore(_FETCH_CONCURRENCY)
 
     # Pre-group inactive clans into chunks of 10.  Each clan carries a reference
