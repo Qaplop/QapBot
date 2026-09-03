@@ -7836,6 +7836,10 @@ async def process_orphaned_cwl_wars(
     Orphan Detection:
     - CWL war with state != "war_ended"
     - AND (file is NOT the newest file for that clan OR clan in failed_clans)
+    - AND the war's battle day is over (end_time more than 1h in the past).
+      The last condition matters because CWL rounds overlap — round N+1's file
+      appears while round N is still being fought, so "not the newest file" on
+      its own flags plenty of wars that cannot possibly be finalized yet.
     
     Args:
         failed_clans: Set of clan tags where API fetch returned None/failed
@@ -7900,6 +7904,8 @@ async def process_orphaned_cwl_wars(
           temp/ directory tree, which grows to tens of thousands of files)
         - Uses filename timestamp instead of os.path.getmtime (eliminates stat() syscalls)
         - For single-file clans, uses end_time + 1h instead of "newer file exists" signal
+        - For multi-file clans, requires end_time + 1h *in addition to* that signal
+          (see _orphan_ready) so wars still inside their battle day are not re-fetched
         """
         def _extract_ts(fp: str) -> str:
             """Extract YYYYMMDDHHMM timestamp from filename, or '0' if malformed."""
@@ -7937,6 +7943,56 @@ async def process_orphaned_cwl_wars(
                 return datetime(y, mo, d, h, mi, sec, tzinfo=_tz.utc)
             except Exception:
                 return None
+
+        def _orphan_ready(wf: str) -> bool:
+            """True when *wf*'s war ended more than 1h ago (so it can be finalized).
+
+            Used for non-newest files of multi-file clans.  Two tiers, mirroring the
+            single-file branch:
+
+            - Tier 1 (zero I/O): the filename timestamp is the war's *start*, and a CWL
+              battle day is 24h, so anything younger than 25h cannot yet be a war that
+              ended over an hour ago.  On PROD this alone filters ~89% of non-newest
+              files without touching disk or the API.
+            - Tier 2 (one JSON read): confirm against the recorded end_time, which is the
+              only value that accounts for CoC extending a war by a maintenance outage.
+
+            NOTE: CACHE.temp_war_metadata is deliberately *not* consulted — it is keyed by
+            clan tag and only ever holds that clan's newest war, so for an older round it
+            describes a different war entirely.
+
+            An unreadable file or an unparseable end_time returns True, preserving the
+            pre-fix behaviour so a file we cannot interpret is still handed to the orphan
+            fetcher rather than being stranded in temp/ forever.
+            """
+            _fn_ts = _extract_ts(wf)
+            if _fn_ts != "0":
+                try:
+                    _fn_dt = datetime(
+                        int(_fn_ts[0:4]), int(_fn_ts[4:6]), int(_fn_ts[6:8]),
+                        int(_fn_ts[8:10]), int(_fn_ts[10:12]), tzinfo=_tz.utc,
+                    )
+                    if now_utc - _fn_dt < timedelta(hours=25):
+                        return False
+                except ValueError:
+                    pass
+            try:
+                with open(wf, 'r', encoding='utf-8') as _fh:
+                    _wo = json.load(_fh)
+            except Exception:
+                return True
+            if _wo.get('state') == 'war_ended':
+                # Already final — manage_war_files() finalizes it directly, no API needed.
+                return False
+            _end_dt = _parse_ts_from_str(str(_wo.get('end_time', '') or ''))
+            if _end_dt is None:
+                _start_dt = _parse_ts_from_str(str(_wo.get('start_time', '') or ''))
+                if _start_dt is not None:
+                    _end_dt = _start_dt + timedelta(hours=24)
+            if _end_dt is None:
+                return True
+            return now_utc >= _end_dt + timedelta(hours=1)
+
         _single_file_count = 0
         for ct, file_paths in _fbclan.items():
             ct_hash = f"#{ct}"
@@ -8026,8 +8082,22 @@ async def process_orphaned_cwl_wars(
                 # Format: {CLAN}_{OPP}_{TS}_{WAR_TAG}_war_data.json
                 # 3-part filenames are regular (non-CWL) wars — not CWL orphans, skip.
                 _fn_stem = fn.replace('_war_data.json', '').split('_', 3)
-                if len(_fn_stem) == 4:
-                    orphans.append((f"#{_fn_stem[3]}", ct_hash, wf, fn, "pre-ended"))
+                if len(_fn_stem) != 4:
+                    continue
+                # "Not the newest file" alone does NOT mean the war is over.
+                # CWL rounds overlap: round N+1's preparation file is written while
+                # round N is still inside its 24h battle day, which demotes round N's
+                # file to non-newest many hours before that war actually ends.  Without
+                # a time gate here, every such still-being-fought war is re-fetched via
+                # get_league_war() *and* rewritten by save_war_object() on every cycle
+                # until it finally ends — then deferred again, because the API correctly
+                # keeps reporting it as inWar.  Measured on PROD 2026-09-03: 1,719 of
+                # 2,063 non-newest entries (83%) were wars still in progress, and the
+                # orphan pass logged 0/2,156 successful for 24h straight while the pool
+                # grew linearly.  Apply the same gate the single-file branch uses.
+                if not _orphan_ready(wf):
+                    continue
+                orphans.append((f"#{_fn_stem[3]}", ct_hash, wf, fn, "pre-ended"))
         return orphans
 
     if failed_clans is None:

@@ -161,11 +161,25 @@ For each matching war file (excluding current war file, if any):
 **Log**: `[LATE-CHECK] War {war_id} already in history - checking for late attacks` (DEBUG)
 
 ### Rule 8: Orphaned CWL War (In Progress)
-**Condition**: Different opponent + CWL + State NOT war_ended  
+**Condition**: Different opponent + CWL + State NOT war_ended + **battle day over** (end_time more than 1h in the past)  
 **Action**: SKIP finalization in manage_war_files(); handled by process_orphaned_cwl_wars() which fetches final data via API, updates JSON, then triggers finalization  
 **Reason**: CWL wars can be re-fetched by war_tag; this path recovers complete final results when the bot was offline  
 **API Call**: CACHE.get_league_war(war_tag) (parallel in process_orphaned_cwl_wars)  
 **Logs**: `[CWL-ORPHAN-SKIP] ... will be fetched via get_league_war() in process_orphaned_cwl_wars()` and `[ORPHANED-CWL] ...`
+
+> **The battle-day condition is not optional — it is the whole cost control on this path.**
+> CWL rounds overlap: round N+1's preparation file is written while round N is still inside
+> its 24h battle day, so "different opponent / not the newest file" on its own flags wars
+> that *cannot* be finalized yet. `_scan_orphans` applies the gate in two tiers — the
+> filename timestamp (war start; a battle day is 24h, so anything younger than 25h is
+> skipped with zero I/O) and then the recorded `end_time`, which is the only value that
+> accounts for CoC extending a war by a maintenance outage. Note that
+> `CACHE.temp_war_metadata` must **not** be used for this: it is keyed by clan tag and only
+> holds that clan's newest war, so for an older round it describes a different war.
+> Without the gate, PROD 2026-09-03 had 1,719 of 2,063 non-newest entries (83%) be wars
+> still being fought, re-fetched *and* rewritten via `save_war_object()` every cycle; the
+> orphan pass logged `0/2,156 successful` for 24 hours straight while update cycles grew
+> from ~40 s to 250-526 s. See changelog 2026-09-03.
 
 ### Rule 9: Orphaned CWL War (Already Ended)
 **Condition**: Different opponent + CWL + State = war_ended  

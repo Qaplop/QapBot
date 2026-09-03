@@ -1,6 +1,31 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-03 (1)
+- Fixed: CWL update cycles degrading from ~40s to 250-526s over 41h, with the orphan pass
+  reporting 0/2,156 successful for 24 hours straight (QBhelperfunctions.py).
+  Root cause: `_scan_orphans()` flagged EVERY non-newest 4-part CWL temp file of a
+  multi-file clan as an orphan with no state and no time check -- the function's own
+  docstring described a `state != war_ended` condition that was only ever implemented in
+  the single-file branch. CWL rounds overlap, so round N+1's preparation file is written
+  while round N is still inside its 24h battle day; that demotes round N to "not newest"
+  hours before its war can possibly end. Measured on PROD: 1,719 of 2,063 non-newest
+  entries (83%) were wars still being fought. Each cost one get_league_war(), one
+  get_league_group() (their war_tag is never in cwl_league_rounds -- verified 0/400), and
+  a full save_war_object() JSON rewrite per cycle, then returned "still inWar, deferring"
+  -- every cycle for up to 24h until the war actually ended. That waste is also what drove
+  Phase-1 to 2,457 clans (stuck in_war metadata makes a clan war-critical, which is exempt
+  from BOTH the re-check jitter and _MAX_INACTIVE_PER_CYCLE) and RSS to 8.8 GB.
+  Fix: new `_orphan_ready()` applies the same gate the single-file branch already used, in
+  two tiers -- filename timestamp (zero I/O, catches ~89%) then recorded end_time + 1h, so
+  maintenance-extended wars are still handled correctly. Deliberately does not consult
+  CACHE.temp_war_metadata: it is keyed by clan tag and holds only the newest war, so for an
+  older round it describes a different war. Unreadable file / unparseable end_time keeps
+  the old behaviour (treat as orphan) so nothing is stranded in temp/.
+  Verified against the live temp/ tree: orphan pool 2,063 -> 224 per cycle (-89%).
+  Files: QBhelperfunctions.py, qapbot/docs/WAR_FILE_MANAGEMENT_RULES.md,
+  tests/unit/test_orphaned_cwl_battle_day_gate.py (new, 4 cases). 2971 tests pass.
+
 2026-09-01 (7)
 - Fixed: the nightly VACUUM trigger would have fired every single night once the rolling
   migration started deleting daily. Caught on the DEV verification run before it reached PROD.
