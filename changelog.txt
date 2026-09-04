@@ -1,6 +1,31 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-04 (22)
+- Verified on PROD (2 build-14 cycles, unprofiled): release_war_object() works. freed= dropped
+  472,450 -> 103,687 (-78%), gc_collect 1.976s -> 1.135s (-43%), [LOOP-LAG] max 1.94s -> 0.93s
+  (-52%), p95 0.031s, over_500ms 1 per 300s. The (19) falsifier ("if freed= stays ~500,000 the
+  sever is not reaching the objects") did NOT fire.
+- Remaining garbage identified: ~103,687 objects / 155 per coc.Clan graph = ~669 clan graphs
+  per cycle, from coc_clan_cache. coc.Clan is cyclic for the same reason ClanWar is —
+  ClanMember.clan back-references the Clan. Measured 155 sweep-only objects per clan graph.
+  NOT yet fixed: unlike war objects, cached clans are handed to callers and live up to 600s, so
+  severing has to happen on eviction/expiry/replace and could break a caller still holding one.
+  That needs its lifetime traced first, exactly as the war path was.
+- Also observed: cost per object rose 4.2us -> 10.9us as garbage fell, i.e. the sweep has a
+  large component that scales with what is LIVE in the young generation, not with garbage. Two
+  data points per build is too few to fit properly, but it means severing the remaining clan
+  graphs would likely land gc_collect near ~0.9s rather than near zero. Getting under the 500ms
+  watchdog threshold would additionally require shrinking the live young-gen population.
+- Fixed: build 14 still logged its own per-cycle collect as "[GC-AUTO] Automatic gen-1". The
+  _gc_deliberate flag from (18) did not reach the callback; the exact cause was NOT reproducible
+  locally (the same flag-across-to_thread pattern works in isolation) and is most likely this
+  file being loaded twice under two module names, a hazard already documented on the
+  gc.callbacks dedup guard. Rather than chase it, the label now reads `not gc.isenabled()` as
+  the authoritative signal — while automatic collection is off, ANY collection is by definition
+  ours — which no module-identity confusion can affect. The flag is kept only for the
+  GC_AUTOMATIC=1 case where both kinds can occur.
+
 2026-09-04 (21)
 - Fixed: pyright error in (19)'s Phase-3 call site — the isinstance(war_data, dict) guard was
   dead code. war_data is already narrowed to dict there (the None / _NOT_IN_WAR cases took the

@@ -129,10 +129,20 @@ def _log_slow_gc(phase: str, info: dict) -> None:  # type: ignore[type-arg]
         # startup gc.freeze() + nightly re-freeze), not an actionable error on its own.
         # [GC-AUTO] means CPython chose the moment and is what the GC policy is meant to
         # eliminate; [GC-SCHEDULED] means we chose it and is expected.
+        # `not gc.isenabled()` is the authoritative half: while automatic collection is off,
+        # ANY collection is by definition one we asked for. The _gc_deliberate flag only adds
+        # the GC_AUTOMATIC=1 case, where both kinds can occur. Build 14 shipped with the flag
+        # alone and still logged "[GC-AUTO] Automatic" for its own per-cycle collect; the cause
+        # was not reproducible locally (the same flag-across-to_thread pattern works in
+        # isolation) and is most likely this file being loaded twice under two module names —
+        # see the dedup comment on gc.callbacks.append() below, where the same hazard is
+        # already documented. Rather than chase it, this reads process-global truth that no
+        # module-identity confusion can affect.
+        _deliberate = _gc_deliberate or not gc.isenabled()
         logging.info(
             "[%s] %s gen-%d collection paused the process for %.3fs (collected=%d, uncollectable=%d)",
-            "GC-SCHEDULED" if _gc_deliberate else "GC-AUTO",
-            "Deliberate" if _gc_deliberate else "Automatic",
+            "GC-SCHEDULED" if _deliberate else "GC-AUTO",
+            "Deliberate" if _deliberate else "Automatic",
             gen, elapsed, info.get("collected", 0), info.get("uncollectable", 0),
         )
 
