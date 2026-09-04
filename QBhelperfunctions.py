@@ -7609,6 +7609,85 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
 
 
 
+def release_war_object(war: Any) -> int:
+    """Break coc.py's internal back-references so refcounting frees the war graph at once.
+
+    coc.py's war graph is cyclic by construction — `WarClan._war`, `ClanWarMember.war`/`.clan`,
+    `WarAttack.war`/`.member` and `ClanWarMember._best_opponent_attacker` all point back into
+    the graph. Nothing there is reachable-but-unreferenced, so **refcounting can never free a
+    war**: every one of them survives until a garbage-collection sweep walks it.
+
+    That is the entire GC bill. PROD measured ~195 such objects per clan x ~2,600 clans =
+    508,769 objects per cycle, costing a 2.0s stop-the-world pause at ~240K objects/s — which
+    is what made Discord unresponsive mid-cycle (see qapbot/docs/PERFORMANCE_TUNING.md).
+
+    Severing the back-references makes the graph acyclic, so it dies the moment the last
+    reference drops and never reaches the collector at all. Measured on real `coc.ClanWar`
+    objects: sweep-only garbage **2,640 -> 0**, and build+drop got *faster* (2.2ms -> 1.2ms
+    per 20 wars) because immediate refcount release beats deferred collection.
+
+    Only materialised state is touched: coc.py builds members and attacks lazily, so a war
+    whose members were never iterated has no cycle to break beyond `_war`, and this must not
+    force that construction just to tear it down. Hence the `_cs_members` / `_attacks` checks
+    rather than the public `.members` / `.attacks` properties.
+
+    SAFETY CONTRACT — call this only after the LAST use of the war graph. It deliberately
+    leaves `ClanWar`'s own scalar fields (`state`, `end_time`, `start_time`, `team_size`, ...)
+    and `.clan`/`.opponent` intact, so the post-Phase-3 backdate check that reads
+    `war_obj.end_time` keeps working. What it destroys is *navigation*: after this,
+    `member.war`, `member.clan`, `attack.war` and `attack.member` are None, and anything that
+    walks from a member or attack back up to the war will fail. If you add a consumer that
+    does that, move the call — do not weaken it. `tests/unit/test_release_war_object.py`
+    pins both halves of this contract.
+
+    Never raises: a torn-down object is not worth failing a cycle over, and coc.py's internals
+    can change under us.
+
+    Returns the number of references severed (0 if there was nothing to do).
+    """
+    if war is None:
+        return 0
+    severed = 0
+    try:
+        for side in (getattr(war, "clan", None), getattr(war, "opponent", None)):
+            if side is None:
+                continue
+            # Cached lists of WarAttack built by .attacks/.defenses, if they were ever asked for.
+            for cached in ("_cs_attacks", "_cs_defenses"):
+                for attack in (getattr(side, cached, None) or ()):
+                    try:
+                        attack.war = None
+                        attack.member = None
+                        severed += 2
+                    except Exception:
+                        pass
+            # Materialised members only — see the docstring on why not `.members`.
+            for member in (getattr(side, "_cs_members", None) or ()):
+                for attack in (getattr(member, "_attacks", None) or ()):
+                    try:
+                        attack.war = None
+                        attack.member = None
+                        severed += 2
+                    except Exception:
+                        pass
+                try:
+                    member.war = None
+                    member.clan = None
+                    # Holds another ClanWarMember, so it closes a member<->member cycle.
+                    member._best_opponent_attacker = None
+                    severed += 3
+                except Exception:
+                    pass
+            try:
+                side._war = None
+                severed += 1
+            except Exception:
+                pass
+    except Exception as exc:  # pragma: no cover - defensive; never fail a cycle for this
+        logging.debug(f"[GC-RELEASE] release_war_object() gave up on {type(war).__name__}: {exc}")
+    return severed
+
+
 def process_clan_war_data(clan_tag: str, war_data: Dict[str, Any], war_files_prescan: Optional[List[str]] = None, archive_set: Optional[Set[str]] = None) -> bool:
     """
     Process war data after API calls (Phase 2 - Sequential Processing).

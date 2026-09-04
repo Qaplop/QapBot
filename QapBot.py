@@ -233,7 +233,7 @@ from qapbot.coc_health import reset_cycle_stats, get_coc_stats, clear_maintenanc
 from QBhelperfunctions import (
     generate_leaderboard_text, generate_cwlinfo_embeds, generate_cwlinfo_comp_embeds, post_discord_content_with_tracking,
     post_leaderboard_to_discord, calculate_content_hash,
-    fetch_clan_war_data, process_clan_war_data,
+    fetch_clan_war_data, process_clan_war_data, release_war_object,
     generate_cwl_group_image, update_cwl_group_stats,
     resolve_subscription_period, coc_clan_profile_url,
 )
@@ -1871,12 +1871,22 @@ async def main() -> None:
             # Process war data (file operations) - offloaded to thread to keep
             # the event loop responsive during sync file I/O.
             _safe_tag = clan_tag.lstrip('#').upper()
-            process_success = await asyncio.to_thread(
-                _with_war_batch, process_clan_war_data, clan_tag, war_data,
-                _temp_files_by_clan.get(_safe_tag, []),
-                _archive_filenames
-            )
-            
+            try:
+                process_success = await asyncio.to_thread(
+                    _with_war_batch, process_clan_war_data, clan_tag, war_data,
+                    _temp_files_by_clan.get(_safe_tag, []),
+                    _archive_filenames
+                )
+            finally:
+                # process_clan_war_data() is the last thing that NAVIGATES the war graph, so
+                # break coc.py's back-references here and let refcounting free it immediately
+                # instead of leaving ~195 objects per clan for a stop-the-world sweep (that
+                # was 508,769 objects and a 2.0s pause per cycle — see release_war_object()).
+                # In a finally so the early `continue` below and any exception are covered too;
+                # the graph is garbage either way. The backdate check further down still reads
+                # war_obj.end_time, which this deliberately preserves.
+                release_war_object(war_data.get('war_obj') if isinstance(war_data, dict) else None)
+
             if not process_success:
                 failed_count += 1
                 continue

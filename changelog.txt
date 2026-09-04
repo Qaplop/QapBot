@@ -1,6 +1,43 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-04 (19)
+- Fixed properly: the per-cycle GC pause is now removed rather than rescheduled. (17) moved
+  collection onto our schedule, which cut stalls from 6/cycle to 1 — but that one still cost
+  2.0s (508,769 objects at ~240K/s; the 0.1s dev extrapolation was wrong by 70x, the same
+  memory-latency wall already documented for the categorize loop, not a CPU-clock gap).
+- Root cause: coc.py's war graph is cyclic by construction — WarClan._war, ClanWarMember.war
+  and .clan, WarAttack.war and .member, ClanWarMember._best_opponent_attacker all point back
+  into the graph. Nothing in a war is reachable-but-unreferenced, so refcounting can NEVER
+  free one; every war survives until a stop-the-world sweep walks it. ~195 objects per clan
+  x ~2,600 clans = exactly the 508,769 observed.
+- Added: release_war_object() (QBhelperfunctions.py) severs those back-references once the
+  graph's last consumer is done, so it becomes acyclic and dies on the last reference drop,
+  never reaching the collector. Measured on real coc.ClanWar objects: sweep-only garbage
+  2,640 -> 0, and build+drop got FASTER (2.2ms -> 1.2ms per 20 wars) — immediate refcount
+  release beats deferred collection.
+- Called from Phase 3 in a finally around process_clan_war_data(), the last thing that
+  NAVIGATES the graph. Traced the full lifetime first: built in fetch_clan_war_data(),
+  returned inside {'war_obj': ...}, read for .end_time by the backdate check, consumed by
+  Phase 3. Exactly two consumers, both verified. The finally covers the early-return and
+  exception paths too.
+- Safety contract, pinned by tests: scalars (state, end_time, start_time, team_size) and
+  .clan/.opponent survive — the backdate check needs end_time. What dies is NAVIGATION:
+  member.war, member.clan, attack.war, attack.member become None. If you add a consumer that
+  walks upward from a member or attack, MOVE the call; do not weaken it. Only materialised
+  state is touched (_cs_members/_attacks, never the lazy public properties), so an
+  untraversed war is not built just to be torn down.
+- Added: tests/unit/test_release_war_object.py (10 cases), using REAL coc.ClanWar objects
+  rather than mocks on purpose — the question under test is which references coc.py actually
+  holds, and a mock would confirm whatever we assumed while a coc.py upgrade silently brought
+  the pause back. One test asserts the graph IS still cyclic, so if coc.py ever drops its
+  back-references we find out and can retire this.
+- Lesson (PERFORMANCE_TUNING.md): when a GC pause is the problem, "when should collection
+  run?" is the second-best question. Ask "why is this garbage collectable-only at all?" first.
+- Expected on PROD: [CYCLE-CLEANUP] freed= drops from ~500,000 toward near zero and its
+  gc_collect time with it; no [GC-SCHEDULED] line should appear at all (that logger only fires
+  above 0.5s). Falsifier: if freed= stays ~500,000, the sever is not reaching the objects.
+
 2026-09-04 (18)
 - Fixed (cosmetic, but it mattered): the GC pause logger labelled our own deliberate collects
   as "[GC-AUTO] Automatic gen-N ...". gc.callbacks fires for explicit collections too, so since
