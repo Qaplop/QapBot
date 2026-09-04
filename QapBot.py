@@ -1971,8 +1971,14 @@ async def main() -> None:
                     if war_state_str == 'inwar':
                         logging.debug(f"[INACTIVE-BACKDATE-CHECK] {clan_tag}: War state matches, attempting to parse end_time...")
                         try:
-                            war_obj = war_data.get('war_obj')
-                            raw_end = getattr(war_obj, 'end_time', None) if war_obj else None
+                            # §3 Step 4 (tracker-0009): prefer the end_time Phase 1 carries in
+                            # the dict, so this no longer needs the coc object at all. Falls back
+                            # to the object while Stage 2 still carries both — remove the
+                            # fallback with the object itself at Stage 3.
+                            raw_end = war_data.get('end_time') or None
+                            if not raw_end:
+                                war_obj = war_data.get('war_obj')
+                                raw_end = getattr(war_obj, 'end_time', None) if war_obj else None
                             logging.debug(f"[INACTIVE-BACKDATE-CHECK] {clan_tag}: raw_end='{raw_end}'")
                             if raw_end:
                                 m = _DT_RE.search(str(raw_end))

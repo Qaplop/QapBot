@@ -1,6 +1,41 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (1)
+- tracker-0009 Stage 2 (shadow mode) implemented. Phase 1 now carries war_payload and end_time
+  alongside war_obj; process_clan_war_data() computes the temp-war stats BOTH ways, compares, and
+  logs [PAYLOAD-PARITY] on divergence — while still writing the coc-object result. The payload is
+  NOT authoritative, so corruption is impossible by construction. That is the point: §5.1's
+  failure mode is a silent 0 reaching war history, which a code revert cannot undo.
+- The payload is built at the RETURN statement of fetch_clan_war_data(), not at either
+  save_war_object() call. §5.3's CWL fallback can replace coc_war_obj and re-save, so only the
+  final object is correct to serialise; building at the return makes that automatic instead of a
+  thing to remember. The clan/opponent swap mirrors save_war_object()'s and is duplicated — both
+  sites must move together if it is ever factored out.
+- Added: stats_from_war_payload() (the candidate replacement member loop, key names taken from a
+  REAL temp file per §3 Step 3, not from §2's table) and _compare_shadow_stats(). Float
+  comparison is epsilon-based so 1e-9 drift on Total_Dest_Pct cannot spam a warning every cycle.
+  The shadow block is wrapped so a failure there can never affect the authoritative path.
+- §3 Step 4 done early: QapBot.py's smart-backdating reads war_data['end_time'], falling back to
+  the coc object only while Stage 2 carries both. The fallback goes at Stage 3.
+- §5.4 respected: war_payload can legitimately be None (save_skip_no_clan) and Phase 3 just skips
+  the comparison rather than treating it as an error.
+- Offline replay deliberately proves nothing about the field that matters: 6,000 replayed wars
+  gave 0 diffs, because reconstruction feeds our computed bestOpponentAttack back in as the API's
+  field, so coc.py returns exactly what we computed. That circularity is unavoidable offline —
+  Defensive_Stars has both values only on live data, which is precisely why shadow mode exists.
+- How to read the first PROD logs (also in the plan): Defensive_Stars differences are EXPECTED
+  and their DIRECTION is the signal. Payload higher than coc = the intended improvement
+  (find_best_opponent_attack caught a late CWL attack the API field missed). Payload lower, or
+  ANY other field differing, = a real problem, since Stage 1 proved those equal over 54,192 wars.
+  No [PAYLOAD-PARITY] lines at all is also suspicious — check the payload is non-None.
+- Added: tests/unit/test_shadow_stats_parity.py (17 cases). Half pin that the payload reader hits
+  the right keys (including the legitimate-zero cases, so a silent 0 is distinguishable from a
+  real 0); half pin that the comparator actually DETECTS divergence in every compared field — a
+  comparator that cannot fail would make shadow mode worthless while looking green.
+- Tests: 3049 pass. QBhelperfunctions.py and QapBot.py are pyright-clean.
+- NEEDS PROD DEPLOY (build 19) to collect the [PAYLOAD-PARITY] evidence that gates Stage 3.
+
 2026-09-04 (26)
 - tracker-0009 Stage 1 COMPLETE. §3 Step 1 done: module-level build_war_payload(coc_war_obj,
   my_clan, enemy_clan) extracted from CacheManager.save_war_object() in cache_manager.py, placed

@@ -376,22 +376,51 @@ no `war_ended`, because those move to archive. Harmless for this harness (the te
 only runs for those two states), but it means the `war_ended` path is unexercised here and must
 be covered by Stage 2's gate, which already requires one `war_ended` finalisation.
 
-### Stage 2 — shadow mode on PROD — **STATUS: not started — NEXT**
+### Stage 2 — shadow mode on PROD — **STATUS: IMPLEMENTED (build 19), awaiting PROD data**
 
-Implement §3 steps 2-4, but **do not make the payload authoritative yet**:
+Implemented 2026-09-05. The payload is built and compared but is **not authoritative** — the
+coc-object result is still what gets written, so corruption is impossible by construction.
 
-- build the payload AND keep the coc object,
-- compute the Phase-3 stats **both** ways,
-- compare; log `[PAYLOAD-PARITY]` with clan tag and differing key on any mismatch,
-- **use the coc-object result.**
+**What shipped**
 
-Corruption is impossible by construction here, because the new path is not authoritative. Costs
-extra CPU for a few cycles — that is what the headroom buys. Note this stage does **not** yet
-reduce retention, so the ~1.2s live-object GC win (§9's CORRECTION) does not arrive until
-Stage 3.
+- `fetch_clan_war_data()` returns `war_payload` and `end_time` alongside `war_obj`. The payload
+  is built **at the return statement**, not at either `save_war_object()` call — §5.3's CWL
+  fallback can replace `coc_war_obj` and re-save, so only the final object is correct to
+  serialise. Building at the return makes that automatic rather than a thing to remember.
+  The clan/opponent swap mirrors `save_war_object()`'s; it is duplicated, and both sites must
+  move together if it is ever factored out.
+- `stats_from_war_payload()` (QBhelperfunctions.py) — the candidate replacement member loop.
+  Key names taken from a real temp file per §3 Step 3, not from §2's table.
+- `_compare_shadow_stats()` — reports divergence; float comparison is epsilon-based so 1e-9
+  drift on `Total_Dest_Pct` cannot spam a warning every cycle.
+- `process_clan_war_data()` runs the comparison and logs
+  `[PAYLOAD-PARITY] <clan> N field(s) differ ...`. Wrapped so a shadow failure can never affect
+  the authoritative path.
+- §3 Step 4 done early: QapBot.py's smart-backdating now reads `war_data['end_time']`, falling
+  back to the coc object only while Stage 2 carries both. Remove the fallback at Stage 3.
+- §5.4 respected: `war_payload` can be `None` (the `save_skip_no_clan` case) and Phase 3 simply
+  skips the comparison.
 
-**Gate to Stage 3:** zero `[PAYLOAD-PARITY]` mismatches across at least one full CWL day,
-including at least one `war_ended` finalisation and one CWL fallback (§5.3) occurrence.
+**Offline replay proves nothing about the field that matters.** 6,000 replayed wars produced
+0 diffs — as expected and as designed, because reconstruction feeds our computed
+`bestOpponentAttack` back in as the API's field, so coc.py returns exactly what we computed.
+The circularity is unavoidable offline. `Defensive_Stars` has both values only on live data.
+
+**How to read the first PROD logs**
+
+`Defensive_Stars` differences are *expected*, and their direction is the whole signal:
+
+| observation | meaning |
+|---|---|
+| payload **higher** than coc | the intended improvement — `find_best_opponent_attack()` caught a late CWL attack the API's `bestOpponentAttack` field missed |
+| payload **lower** than coc | **a real problem** — investigate before Stage 3 |
+| any OTHER field differs | **a real problem** — Stage 1 proved those equal over 54,192 wars, so a difference means the live path differs from the replayed one |
+| no `[PAYLOAD-PARITY]` lines at all | also suspicious — check the payload is non-None and the state gate is being reached |
+
+**Gate to Stage 3:** at least one full CWL day with no non-`Defensive_Stars` mismatch, including
+at least one `war_ended` finalisation and one §5.3 CWL fallback, plus a decision on whether the
+`Defensive_Stars` change is the improvement it looks like. Stage 1's corpus contained no
+`war_ended` files (they move to archive), so that path is still unexercised.
 
 ### Stage 3 — flip to payload-only — **STATUS: not started**
 

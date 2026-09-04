@@ -7591,10 +7591,40 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
             except Exception as _inv_ex:
                 logging.warning(f"[INVESTIGATE-WRITE] Could not write investigate file for {clan_tag}: {_inv_ex}")
 
+        # Stage 2 (shadow mode) of plans/tracker-0009-phase1-war-payload-retention.md §3 Step 2.
+        # Build the payload HERE, at the return, rather than at either save_war_object() call
+        # above: §5.3's CWL fallback can REPLACE coc_war_obj and re-save after the first call, so
+        # only the final object is the right one to serialise. Building at the return makes that
+        # automatic instead of a thing to remember.
+        #
+        # The clan/opponent swap mirrors save_war_object()'s exactly — our tracked clan must
+        # always land in "clan" regardless of which side the API called that. Duplicated rather
+        # than shared because save_war_object() applies it before a lot of unrelated work; if it
+        # is ever factored out, both sites must move together.
+        #
+        # §5.4: this can legitimately be None (the save_skip_no_clan case). Phase 3 must tolerate
+        # that exactly as it tolerates a failed fetch — do not make it an error.
+        _pl_my = getattr(coc_war_obj, 'clan', None)  # type: ignore[arg-type]
+        _pl_opp = getattr(coc_war_obj, 'opponent', None)  # type: ignore[arg-type]
+        if _pl_opp is not None and getattr(_pl_opp, 'tag', None) == clan_tag:
+            _pl_my, _pl_opp = _pl_opp, _pl_my
+        _war_payload = None
+        if _pl_my is not None and _pl_opp is not None:
+            try:
+                from qapbot.cache_manager import build_war_payload
+                _war_payload = build_war_payload(coc_war_obj, _pl_my, _pl_opp)
+            except Exception as _pl_ex:
+                # Never fail a fetch over the shadow payload — it is not authoritative yet.
+                logging.warning(f"[PAYLOAD-PARITY] {clan_tag}: build_war_payload failed: {_pl_ex}")
+
         # Return war data for Phase 2 processing
         return {
             'clan_tag': clan_tag,
             'war_obj': coc_war_obj,
+            'war_payload': _war_payload,
+            # Carried explicitly so QapBot.py's smart-backdating never needs the coc object
+            # (§3 Step 4). Same string form the payload stores, so the existing _DT_RE parse works.
+            'end_time': str(getattr(coc_war_obj, 'end_time', '')),  # type: ignore[arg-type]
             'opponent_tag': opponent_tag,
             'state': state
         }
@@ -7607,6 +7637,84 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
 
 
 
+
+
+def stats_from_war_payload(payload: Dict[str, Any], attacks_per_member: int) -> Dict[str, Dict[str, Any]]:
+    """Build `temp_war_stats` rows from the war payload dict instead of the `coc.ClanWar`.
+
+    The candidate replacement for `process_clan_war_data()`'s member loop — Stage 2 of
+    `plans/tracker-0009-phase1-war-payload-retention.md`. It is NOT authoritative yet: shadow
+    mode compares it against the coc-object result and logs `[PAYLOAD-PARITY]` on divergence.
+
+    Only `WarID` and `Date` are omitted, because those come from the caller's war-identity logic
+    rather than from the war object.
+
+    Key names are taken from a REAL temp file, not from §2's table, per §3 Step 3 — the payload
+    mixes conventions (`townhall`, `map_position` beside `bestOpponentAttack`, `opponentAttacks`)
+    and that inconsistency is exactly where a silent-zero bug hides.
+
+    `Defensive_Stars` here is deliberately NOT coc.py's `m.best_opponent_attack.stars`. That
+    resolves the API's own `bestOpponentAttack.attackerTag`; the payload's field is computed by
+    `find_best_opponent_attack()` scanning every opponent attack, specifically to catch late CWL
+    attacks the API field misses. The two are expected to differ, and measuring by how much is
+    the reason shadow mode exists.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for m in ((payload.get("clan") or {}).get("members") or []):
+        tag_m = m.get("tag") or ""
+        name_m = m.get("name") or ""
+        if not name_m or not tag_m:
+            continue
+        atk = [a for a in (m.get("attacks") or []) if a]
+        best = m.get("bestOpponentAttack") or {}
+        out[tag_m] = {
+            "Player": name_m,
+            "PlayerID": tag_m,
+            "TH_lvl": m.get("townhall") or 0,
+            "Stars": sum(a.get("stars") or 0 for a in atk),
+            "Attacks": len(atk),
+            # INVARIANT mirrored from the coc path: always 0 for preparation/in_war, because
+            # players can still use their remaining attacks before the war ends.
+            "Missed_Attacks": 0,
+            "Max_Attacks": attacks_per_member,
+            "Defensive_Stars": best.get("stars") or 0,
+            "Total_Dest_Pct": sum(float(a.get("destruction") or 0.0) for a in atk),
+        }
+    return out
+
+
+def _compare_shadow_stats(
+    clan_tag: str,
+    authoritative: Dict[str, Any],
+    payload: Dict[str, Any],
+    attacks_per_member: int,
+) -> List[str]:
+    """Return human-readable differences between the coc-object and payload stat rows.
+
+    Used only by Stage 2 shadow mode. Returns [] when the two agree. `WarID`/`Date` are not
+    compared — `stats_from_war_payload()` does not produce them.
+    """
+    shadow = stats_from_war_payload(payload, attacks_per_member)
+    diffs: List[str] = []
+
+    missing = set(authoritative) - set(shadow)
+    extra = set(shadow) - set(authoritative)
+    if missing:
+        diffs.append(f"payload missing {len(missing)} member(s) e.g. {sorted(missing)[:2]}")
+    if extra:
+        diffs.append(f"payload has {len(extra)} extra member(s) e.g. {sorted(extra)[:2]}")
+
+    for tag in sorted(set(authoritative) & set(shadow)):
+        a, b = authoritative[tag], shadow[tag]
+        for field in ("Player", "PlayerID", "TH_lvl", "Stars", "Attacks",
+                      "Missed_Attacks", "Max_Attacks", "Defensive_Stars", "Total_Dest_Pct"):
+            av, bv = a.get(field), b.get(field)
+            if isinstance(av, float) or isinstance(bv, float):
+                if abs(float(av or 0) - float(bv or 0)) < 1e-6:
+                    continue
+            if av != bv:
+                diffs.append(f"{tag}.{field} coc={av!r} payload={bv!r}")
+    return diffs
 
 
 def release_war_object(war: Any) -> int:
@@ -7844,6 +7952,33 @@ def process_clan_war_data(clan_tag: str, war_data: Dict[str, Any], war_files_pre
                         "Defensive_Stars": defensive_stars,
                         "Total_Dest_Pct": total_dest_pct,
                     }
+            # --- Stage 2 shadow comparison (tracker-0009 §10) --------------------------------
+            # Compute the SAME stats from the payload and report divergence, but keep using the
+            # coc-object result above. Corruption is impossible while this stays non-authoritative,
+            # which is the whole point: §5.1's failure mode is a silent 0 reaching war history,
+            # and a revert cannot undo that.
+            #
+            # Stage 1 proved parity over 54,192 real wars for every field EXCEPT Defensive_Stars,
+            # which no corpus replay can check (the API's own bestOpponentAttack is not retained
+            # on disk). So Defensive_Stars is the field this exists to measure — expect it to
+            # differ, and read a difference as information, not as a bug:
+            #   coc.py's m.best_opponent_attack -> the API's own bestOpponentAttack.attackerTag
+            #   payload's bestOpponentAttack    -> our find_best_opponent_attack(), which scans
+            #                                      all opponent attacks to catch LATE CWL attacks
+            # A payload value HIGHER than coc's is the intended improvement showing up. Lower, or
+            # a difference in any other field, is a real problem.
+            _shadow = war_data.get('war_payload')
+            if _shadow:
+                try:
+                    _diffs = _compare_shadow_stats(clan_tag, temp_stats_to_save, _shadow, attacks_per_member)
+                    if _diffs:
+                        logging.warning(
+                            "[PAYLOAD-PARITY] %s: %d field(s) differ between coc-object and payload — %s",
+                            clan_tag, len(_diffs), "; ".join(_diffs[:6]),
+                        )
+                except Exception as _sh_ex:
+                    # A shadow check must never affect the authoritative path.
+                    logging.warning(f"[PAYLOAD-PARITY] {clan_tag}: shadow comparison failed: {_sh_ex}")
             CACHE.set_temp_war_stats(clan_tag, temp_stats_to_save)
         else:
             # War ended or not in war - clear temp stats to prevent stale data in currentwar leaderboards
