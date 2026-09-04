@@ -1,6 +1,18 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-04 (21)
+- Fixed: pyright error in (19)'s Phase-3 call site — the isinstance(war_data, dict) guard was
+  dead code. war_data is already narrowed to dict there (the None / _NOT_IN_WAR cases took the
+  `continue` above) and release_war_object() no-ops on None anyway. Removed, with a comment
+  saying why so it does not get re-added defensively.
+- Fixed: 4 pyright errors in (17)'s tests/unit/test_gc_policy.py from heterogeneous dict
+  inference; annotated explicitly. Both files I touched are now pyright-clean.
+- Corrected: test_gc_policy.py's docstring still called the war-graph garbage "unavoidable" —
+  the same falsified claim (20) removed from PERFORMANCE_TUNING.md, left behind in a second
+  place. Now states what is actually true: the graph is cyclic AS COC.PY HANDS IT TO US, which
+  release_war_object() then fixes, and this policy stays load-bearing underneath it.
+
 2026-09-04 (20)
 - Docs hygiene after the GC work — three defects found by re-reading rather than assuming:
   (a) PERFORMANCE_TUNING.md carried the cold-cycle SQLite storm section TWICE, and the second

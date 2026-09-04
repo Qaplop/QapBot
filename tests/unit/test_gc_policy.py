@@ -4,15 +4,21 @@ Every Discord-responsiveness stall this bot has had is an automatic gen-2 sweep:
 build 11, 11 of 11 `[LOOP-LAG]` stalls matched a `[GC-AUTO]` pause within the watchdog's
 100ms probe resolution, several past Discord's 3s interaction ACK deadline.
 
-The garbage itself is unavoidable — coc.py's war graph is cyclic by construction
-(`WarAttack.war` and `WarClan._war` point back at the `ClanWar`), so ~2,050 wars x ~150
-objects per cycle can only ever be freed by a sweep, never by refcounting. The policy is
-therefore about WHICH sweep runs WHEN:
+coc.py's war graph is cyclic by construction (`WarClan._war`, `ClanWarMember.war`/`.clan`,
+`WarAttack.war`/`.member`), so refcounting cannot free a war *as coc.py hands it to us* — it
+survives until a sweep walks it. The policy is therefore about WHICH sweep runs WHEN:
 
   - automatic collection off, so nothing fires mid-cycle or during the sleep window
   - a young-generation collect per cycle, which reclaims that whole population cheaply
     because nothing has been promoted
   - the one full sweep per day in the nightly maintenance window, where commands are blocked
+
+NOTE this is only half the story. An earlier version of this docstring called the garbage
+"unavoidable"; that was wrong. `release_war_object()` severs those back-references after the
+graph's last consumer so wars never reach the collector at all — see
+`test_release_war_object.py`, which is what actually removed the pause. This policy remains
+load-bearing underneath it: the young-gen collect is only sufficient *because* automatic
+collection is off, and it still catches whatever cyclic garbage the rest of the process makes.
 
 These tests pin the properties that make that safe. They are deliberately about GC
 *semantics* rather than about QapBot's startup path, which cannot be imported in a unit test.
@@ -20,6 +26,7 @@ These tests pin the properties that make that safe. They are deliberately about 
 from __future__ import annotations
 
 import gc
+from typing import Any, Dict, List
 
 import pytest
 
@@ -27,9 +34,9 @@ import pytest
 def _war_graph(wars: int = 40, members: int = 20) -> None:
     """Build and drop coc.py-shaped war graphs: cyclic, so refcounting cannot free them."""
     for _ in range(wars):
-        war = {"tag": "w", "members": []}
+        war: Dict[str, Any] = {"tag": "w", "members": []}
         for j in range(members):
-            m = {"tag": j, "war": war, "attacks": []}
+            m: Dict[str, Any] = {"tag": j, "war": war, "attacks": []}
             m["attacks"].append({"attacker": m, "war": war})  # back-refs, exactly like coc.py
             war["members"].append(m)
 
@@ -99,7 +106,7 @@ class TestFreezeProtectsTheStaticCaches:
         """Why the startup freeze exists: it takes the big static caches out of every sweep."""
         gc.disable()
         gc.collect()
-        static = [{"n": i, "ref": None} for i in range(500)]
+        static: List[Dict[str, Any]] = [{"n": i, "ref": None} for i in range(500)]
         for d in static:
             d["ref"] = static  # make it cyclic so it would otherwise be sweep-visible
         gc.collect()

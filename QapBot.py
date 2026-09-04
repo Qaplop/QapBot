@@ -1885,7 +1885,9 @@ async def main() -> None:
                 # In a finally so the early `continue` below and any exception are covered too;
                 # the graph is garbage either way. The backdate check further down still reads
                 # war_obj.end_time, which this deliberately preserves.
-                release_war_object(war_data.get('war_obj') if isinstance(war_data, dict) else None)
+                # No isinstance guard: the None / _NOT_IN_WAR cases already took the `continue`
+                # above, so war_data is a dict here — and release_war_object() no-ops on None.
+                release_war_object(war_data.get('war_obj'))
 
             if not process_success:
                 failed_count += 1
