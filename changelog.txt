@@ -1,6 +1,35 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-04 (26)
+- tracker-0009 Stage 1 COMPLETE. §3 Step 1 done: module-level build_war_payload(coc_war_obj,
+  my_clan, enemy_clan) extracted from CacheManager.save_war_object() in cache_manager.py, placed
+  before the class; save_war_object() now calls it. Free variables were exactly those three
+  parameters, verified by AST rather than by eye.
+- Behaviour-neutrality is PROVED, not asserted: the extracted 160-line body is
+  CHARACTER-IDENTICAL to the pre-extraction block, only re-indented — checked by diffing against
+  HEAD. Behavioural half added too: TestBuildWarPayloadRoundTrip rebuilds every real war's
+  payload from a reconstructed coc.ClanWar, 54,192 / 54,192 match.
+- pyright caught a missing `return payload`. The extracted block ended in an assignment, so the
+  function silently returned None — every payload would have been None. No existing test would
+  have distinguished that from a broken temp file. Run pyright on the file after any move of
+  this kind; it earned its keep here.
+- previousBestOpponentAttack is excluded from the round-trip comparison, deliberately. coc.py
+  derives it as the max over defenses EXCLUDING whatever best_opponent_attack returns;
+  reconstruction has to feed our computed bestOpponentAttack in as the API's field (the API's own
+  value is not retained on disk), so a different attack is excluded and a different "previous
+  best" results — 76 of 54,192 wars, a fixture limitation not a defect. Same circularity that
+  puts Defensive_Stars out of Stage 1's reach. Consumed only by scripts/recover_cwl_war.py,
+  never by temp stats or leaderboards.
+- Note for future edits: cache_manager.py carries a UTF-8 BOM. Read/write it with utf-8-sig, and
+  never ast.parse() its contents read as plain utf-8 — the failure is a misleading "invalid
+  non-printable character U+FEFF" pointing at an unrelated line. A first extraction attempt was
+  reverted for a different reason (the function was inserted at the block's old indentation
+  inside the method, and the call was never inserted) — git checkout of the single file restored
+  it cleanly since it was committed.
+- Stage 1 gate MET; Stage 2 (shadow mode) may begin, carrying Defensive_Stars and the state
+  spelling as its primary targets. Plan updated with per-stage status.
+
 2026-09-04 (25)
 - Started tracker-0009 (Phase-1 war-payload retention) under a staged, evidence-gated plan that
   replaces its "do not start before 2026-09-11" date gate. Rationale in §10 of the plan: the

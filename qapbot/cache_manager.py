@@ -81,6 +81,208 @@ def _de_n(v: int) -> str:
     return f"{v:,}".replace(",", ".")
 
 
+def build_war_payload(coc_war_obj: Any, my_clan: Any, enemy_clan: Any) -> Dict[str, Any]:
+    """Build the serialisable war payload dict that gets written to the temp war file.
+
+    Extracted **verbatim** from ``CacheManager.save_war_object()`` (2026-09-04) as Step 1 of
+    ``plans/tracker-0009-phase1-war-payload-retention.md`` §3. Behaviour-neutral by
+    construction: the six helper closures, the league-group extraction and the payload literal
+    are the same code, moved and dedented. Nothing was rewritten, so the temp files it produces
+    are byte-identical.
+
+    It is module-level so Phase 1 can build the payload and return *it* instead of retaining the
+    ~155-object cyclic ``coc.ClanWar`` graph across the Phase-1/2 boundary (§4) — the live
+    population that ~1.2s of the per-cycle GC pause is spent walking (§9 CORRECTION).
+
+    Do NOT source the payload from ``CACHE.temp_war_objects`` instead of calling this: §3 Step 2
+    explains why that silently yields ``None`` for exactly the ``war_ended`` clans Phase 3 still
+    has work to do for.
+
+    Two traps recorded by Stage 1's parity harness, both live here:
+
+    * ``payload["state"]`` is our OWN normalisation (``in_war``), not coc.py's ``WarState``
+      spelling (``inWar``). Anything reading state back out must map it, or
+      ``process_clan_war_data()``'s ``state in ('preparation','in_war')`` gate silently skips
+      every in-war clan.
+    * ``payload["bestOpponentAttack"]`` is computed by ``find_best_opponent_attack()`` scanning
+      all opponent attacks, and is deliberately NOT coc.py's ``m.best_opponent_attack`` (which
+      is the API's own field and misses late CWL attacks). They are different values; §2's table
+      wrongly equates them.
+
+    Args:
+        coc_war_obj: the ``coc.ClanWar``.
+        my_clan: our tracked clan's ``WarClan`` — already swapped into position by the caller,
+            so it is always the tracked side regardless of which side the API called "clan".
+        enemy_clan: the opposing ``WarClan``.
+
+    Returns:
+        The payload dict. Callers must tolerate the shape being empty-ish if the war object is
+        malformed; ``save_war_object()`` already guards ``my_clan``/``enemy_clan`` before calling.
+    """
+    def simple_attack(a):  # type: ignore[no-untyped-def]
+        # Defensive: handle WarAttack objects and dicts
+        if not a:
+            return None
+        if hasattr(a, "attacker_tag") or hasattr(a, "defender_tag"):  # type: ignore[arg-type]
+            return {
+                "attackerTag": getattr(a, "attacker_tag", ""),  # type: ignore[arg-type]
+                "defenderTag": getattr(a, "defender_tag", ""),  # type: ignore[arg-type]
+                "stars": getattr(a, "stars", 0),  # type: ignore[arg-type]
+                "destruction": getattr(a, "destruction", 0),  # type: ignore[arg-type]
+                "order": getattr(a, "order", 0),  # type: ignore[arg-type]
+                "duration": getattr(a, "duration", None),  # type: ignore[arg-type]
+                "fresh": getattr(a, "fresh", None)  # type: ignore[arg-type]
+            }
+        elif isinstance(a, dict):
+            return {
+                "attackerTag": a.get("attacker_tag", ""),  # type: ignore[union-attr]
+                "defenderTag": a.get("defender_tag", ""),  # type: ignore[union-attr]
+                "stars": a.get("stars", 0),  # type: ignore[union-attr]
+                "destruction": a.get("destruction", 0),  # type: ignore[union-attr]
+                "order": a.get("order", 0),  # type: ignore[union-attr]
+                "duration": a.get("duration", None),  # type: ignore[union-attr]
+                "fresh": a.get("fresh", None)  # type: ignore[union-attr]
+            }
+        else:
+            return str(a)  # type: ignore[arg-type]
+
+    def find_best_opponent_attack(member_tag, opponent_members):  # type: ignore[no-untyped-def]
+        """Find the best (highest stars) opponent attack against a member."""
+        best_attack = None
+        best_stars = -1
+
+        for opp_member in opponent_members:  # type: ignore[attr-defined]
+            for attack in (getattr(opp_member, "attacks", []) or []):  # type: ignore[arg-type]
+                # attacker_tag = getattr(attack, "attacker_tag", None)  # Unused variable
+                defender_tag = getattr(attack, "defender_tag", None)
+                stars = getattr(attack, "stars", 0)
+
+                if defender_tag == member_tag:
+                    if stars > best_stars:
+                        best_stars = stars
+                        best_attack = attack
+
+        return simple_attack(best_attack) if best_attack else None  # type: ignore[return-value]
+
+    def calculate_defensive_stars(member_tag, opponent_members):  # type: ignore[no-untyped-def]
+        """Calculate defensive stars for a member by counting ALL opponent attacks."""
+        defensive_stars = 0
+        for opp_member in opponent_members:  # type: ignore[attr-defined]
+            for attack in (getattr(opp_member, "attacks", []) or []):  # type: ignore[arg-type]
+                defender_tag = getattr(attack, "defender_tag", None)
+                stars = getattr(attack, "stars", 0)
+
+                if defender_tag == member_tag:
+                    defensive_stars += stars
+        return defensive_stars
+
+    def simple_member(m, opponent_members):  # type: ignore[no-untyped-def]
+        if not m:
+            return None
+        attacks_list = getattr(m, "attacks", [])  # type: ignore[arg-type]
+        member_tag = getattr(m, "tag", "")  # type: ignore[arg-type]
+
+        # Calculate defensive stats by iterating through opponent attacks
+        # This ensures we capture ALL attacks including late attacks in CWL
+        best_opp_attack = find_best_opponent_attack(member_tag, opponent_members)  # type: ignore[arg-type]
+        total_defensive_stars = calculate_defensive_stars(member_tag, opponent_members)  # type: ignore[arg-type]
+
+        # Safely get previous_best_opponent_attack with exception handling
+        previous_best_attack = None
+        try:
+            previous_best_attack = getattr(m, "previous_best_opponent_attack", None)  # type: ignore[arg-type]
+        except ValueError:
+            # Handle case where coc.py throws ValueError: max() iterable argument is empty
+            previous_best_attack = None
+
+        return {  # type: ignore[return-value]
+            "tag": member_tag,
+            "name": getattr(m, "name", ""),  # type: ignore[arg-type]
+            "townhall": getattr(m, "town_hall", getattr(m, "townhallLevel", 0)),  # type: ignore[arg-type]
+            "map_position": getattr(m, "map_position", 0),  # type: ignore[arg-type]
+            "role": getattr(m, "role", None),  # type: ignore[arg-type]
+            "donated": getattr(m, "donated", None),  # type: ignore[arg-type]
+            "received": getattr(m, "received", None),  # type: ignore[arg-type]
+            "attacks": [simple_attack(a) for a in attacks_list if a is not None],
+            "opponentAttacks": total_defensive_stars,
+            "bestOpponentAttack": best_opp_attack,
+            "previousBestOpponentAttack": simple_attack(previous_best_attack)
+        }
+
+    def simple_badge(badge):  # type: ignore[no-untyped-def]
+        """Handle Badge objects by extracting serializable data."""
+        if badge is None:
+            return None
+        if hasattr(badge, 'name') or hasattr(badge, 'url'):  # type: ignore[arg-type]
+            return {
+                "name": getattr(badge, "name", ""),  # type: ignore[arg-type]
+                "url": getattr(badge, "url", ""),  # type: ignore[arg-type]
+                "small": getattr(badge, "small", ""),  # type: ignore[arg-type]
+                "medium": getattr(badge, "medium", ""),  # type: ignore[arg-type]
+                "large": getattr(badge, "large", "")  # type: ignore[arg-type]
+            }
+        else:
+            return str(badge)  # type: ignore[arg-type]
+
+    def simple_clan(c, opponent_members):  # type: ignore[no-untyped-def]
+        """Serialize clan with proper defensive stars calculation."""
+        if not c:
+            return None
+        badge_data = simple_badge(getattr(c, "badge", None))  # type: ignore[arg-type]
+        members_list = getattr(c, "members", [])  # type: ignore[arg-type]
+
+        return {  # type: ignore[return-value]
+            "tag": getattr(c, "tag", ""),  # type: ignore[arg-type]
+            "name": getattr(c, "name", ""),  # type: ignore[arg-type]
+            "level": getattr(c, "level", getattr(c, "clanLevel", 0)),  # type: ignore[arg-type]
+            "badge": badge_data,
+            "stars": getattr(c, "stars", 0),  # type: ignore[arg-type]
+            "destruction": getattr(c, "destruction", getattr(c, "destructionPercentage", 0)),  # type: ignore[arg-type]
+            "attack_wins": getattr(c, "attack_wins", None),  # type: ignore[arg-type]
+            "attacks_used": getattr(c, "attacks_used", None),  # type: ignore[arg-type]
+            "wins": getattr(c, "wins", None),  # type: ignore[arg-type]
+            "members": [simple_member(m, opponent_members) for m in members_list if m is not None]  # type: ignore[arg-type, misc]
+        }
+
+    # Extract league group information if available
+    league_group = getattr(coc_war_obj, "league_group", None)  # type: ignore[arg-type]
+    league_group_data = None
+    if league_group:
+        league_group_data = {  # type: ignore[var-annotated]
+            "tag": getattr(league_group, "tag", ""),  # type: ignore[arg-type]
+            "state": str(getattr(league_group, "state", "")),  # type: ignore[arg-type]
+            # Normalise season so mid-month CWLs that span Mon–Wed share one key.
+            "season": normalize_cwl_season(str(getattr(league_group, "season", "") or ""))  # type: ignore[arg-type]
+        }
+
+    # Extract member lists for cross-clan defensive star calculation
+    # After swap above, my_clan/enemy_clan are already in correct positions
+    # my_clan = our tracked clan, enemy_clan = opponent
+    clan_obj = my_clan
+    opponent_obj = enemy_clan
+    clan_members = getattr(clan_obj, "members", []) if clan_obj else []
+    opponent_members = getattr(opponent_obj, "members", []) if opponent_obj else []
+
+    war_state_obj = getattr(coc_war_obj, "state", None)  # type: ignore[arg-type]
+    payload: Dict[str, Any] = {  # type: ignore[var-annotated]
+        "state": str(war_state_obj.name if war_state_obj and hasattr(war_state_obj, "name") else "unknown"),
+        "team_size": getattr(coc_war_obj, "team_size", 0),  # type: ignore[arg-type]
+        "attacks_per_member": getattr(coc_war_obj, "attacks_per_member", 0),  # type: ignore[arg-type]
+        "type": str(getattr(coc_war_obj, "type", None)) if getattr(coc_war_obj, "type", None) else None,  # type: ignore[arg-type]
+        "is_cwl": getattr(coc_war_obj, "is_cwl", None),  # type: ignore[arg-type]
+        "war_tag": getattr(coc_war_obj, "war_tag", None),  # type: ignore[arg-type]
+        "start_time": str(getattr(coc_war_obj, "start_time", "")),  # type: ignore[arg-type]
+        "end_time": str(getattr(coc_war_obj, "end_time", "")),  # type: ignore[arg-type]
+        "preparation_start_time": str(getattr(coc_war_obj, "preparation_start_time", "")),  # type: ignore[arg-type]
+        "league_group": league_group_data,
+        "clan": simple_clan(clan_obj, opponent_members),  # type: ignore[arg-type]
+        "opponent": simple_clan(opponent_obj, clan_members),  # type: ignore[arg-type]
+        "attacks": [simple_attack(a) for a in getattr(coc_war_obj, "attacks", []) if a is not None]  # type: ignore[arg-type, misc]
+    }
+
+    return payload
+
+
 class CacheManager:
     """
     Centralized cache manager providing single-source-of-truth for all QapBot runtime and persistent data.
@@ -2883,166 +3085,10 @@ class CacheManager:
         target_file = temp_file
         
         try:
-            def simple_attack(a):  # type: ignore[no-untyped-def]
-                # Defensive: handle WarAttack objects and dicts
-                if not a:
-                    return None
-                if hasattr(a, "attacker_tag") or hasattr(a, "defender_tag"):  # type: ignore[arg-type]
-                    return {
-                        "attackerTag": getattr(a, "attacker_tag", ""),  # type: ignore[arg-type]
-                        "defenderTag": getattr(a, "defender_tag", ""),  # type: ignore[arg-type]
-                        "stars": getattr(a, "stars", 0),  # type: ignore[arg-type]
-                        "destruction": getattr(a, "destruction", 0),  # type: ignore[arg-type]
-                        "order": getattr(a, "order", 0),  # type: ignore[arg-type]
-                        "duration": getattr(a, "duration", None),  # type: ignore[arg-type]
-                        "fresh": getattr(a, "fresh", None)  # type: ignore[arg-type]
-                    }
-                elif isinstance(a, dict):
-                    return {
-                        "attackerTag": a.get("attacker_tag", ""),  # type: ignore[union-attr]
-                        "defenderTag": a.get("defender_tag", ""),  # type: ignore[union-attr]
-                        "stars": a.get("stars", 0),  # type: ignore[union-attr]
-                        "destruction": a.get("destruction", 0),  # type: ignore[union-attr]
-                        "order": a.get("order", 0),  # type: ignore[union-attr]
-                        "duration": a.get("duration", None),  # type: ignore[union-attr]
-                        "fresh": a.get("fresh", None)  # type: ignore[union-attr]
-                    }
-                else:
-                    return str(a)  # type: ignore[arg-type]
-
-            def find_best_opponent_attack(member_tag, opponent_members):  # type: ignore[no-untyped-def]
-                """Find the best (highest stars) opponent attack against a member."""
-                best_attack = None
-                best_stars = -1
-                
-                for opp_member in opponent_members:  # type: ignore[attr-defined]
-                    for attack in (getattr(opp_member, "attacks", []) or []):  # type: ignore[arg-type]
-                        # attacker_tag = getattr(attack, "attacker_tag", None)  # Unused variable
-                        defender_tag = getattr(attack, "defender_tag", None)
-                        stars = getattr(attack, "stars", 0)
-                        
-                        if defender_tag == member_tag:
-                            if stars > best_stars:
-                                best_stars = stars
-                                best_attack = attack
-                
-                return simple_attack(best_attack) if best_attack else None  # type: ignore[return-value]
-            
-            def calculate_defensive_stars(member_tag, opponent_members):  # type: ignore[no-untyped-def]
-                """Calculate defensive stars for a member by counting ALL opponent attacks."""
-                defensive_stars = 0
-                for opp_member in opponent_members:  # type: ignore[attr-defined]
-                    for attack in (getattr(opp_member, "attacks", []) or []):  # type: ignore[arg-type]
-                        defender_tag = getattr(attack, "defender_tag", None)
-                        stars = getattr(attack, "stars", 0)
-                        
-                        if defender_tag == member_tag:
-                            defensive_stars += stars
-                return defensive_stars
-
-            def simple_member(m, opponent_members):  # type: ignore[no-untyped-def]
-                if not m:
-                    return None
-                attacks_list = getattr(m, "attacks", [])  # type: ignore[arg-type]
-                member_tag = getattr(m, "tag", "")  # type: ignore[arg-type]
-                
-                # Calculate defensive stats by iterating through opponent attacks
-                # This ensures we capture ALL attacks including late attacks in CWL
-                best_opp_attack = find_best_opponent_attack(member_tag, opponent_members)  # type: ignore[arg-type]
-                total_defensive_stars = calculate_defensive_stars(member_tag, opponent_members)  # type: ignore[arg-type]
-                
-                # Safely get previous_best_opponent_attack with exception handling
-                previous_best_attack = None
-                try:
-                    previous_best_attack = getattr(m, "previous_best_opponent_attack", None)  # type: ignore[arg-type]
-                except ValueError:
-                    # Handle case where coc.py throws ValueError: max() iterable argument is empty
-                    previous_best_attack = None
-                
-                return {  # type: ignore[return-value]
-                    "tag": member_tag,
-                    "name": getattr(m, "name", ""),  # type: ignore[arg-type]
-                    "townhall": getattr(m, "town_hall", getattr(m, "townhallLevel", 0)),  # type: ignore[arg-type]
-                    "map_position": getattr(m, "map_position", 0),  # type: ignore[arg-type]
-                    "role": getattr(m, "role", None),  # type: ignore[arg-type]
-                    "donated": getattr(m, "donated", None),  # type: ignore[arg-type]
-                    "received": getattr(m, "received", None),  # type: ignore[arg-type]
-                    "attacks": [simple_attack(a) for a in attacks_list if a is not None],
-                    "opponentAttacks": total_defensive_stars,
-                    "bestOpponentAttack": best_opp_attack,
-                    "previousBestOpponentAttack": simple_attack(previous_best_attack)
-                }
-
-            def simple_badge(badge):  # type: ignore[no-untyped-def]
-                """Handle Badge objects by extracting serializable data."""
-                if badge is None:
-                    return None
-                if hasattr(badge, 'name') or hasattr(badge, 'url'):  # type: ignore[arg-type]
-                    return {
-                        "name": getattr(badge, "name", ""),  # type: ignore[arg-type]
-                        "url": getattr(badge, "url", ""),  # type: ignore[arg-type]
-                        "small": getattr(badge, "small", ""),  # type: ignore[arg-type]
-                        "medium": getattr(badge, "medium", ""),  # type: ignore[arg-type]
-                        "large": getattr(badge, "large", "")  # type: ignore[arg-type]
-                    }
-                else:
-                    return str(badge)  # type: ignore[arg-type]
-
-            def simple_clan(c, opponent_members):  # type: ignore[no-untyped-def]
-                """Serialize clan with proper defensive stars calculation."""
-                if not c:
-                    return None
-                badge_data = simple_badge(getattr(c, "badge", None))  # type: ignore[arg-type]
-                members_list = getattr(c, "members", [])  # type: ignore[arg-type]
-                
-                return {  # type: ignore[return-value]
-                    "tag": getattr(c, "tag", ""),  # type: ignore[arg-type]
-                    "name": getattr(c, "name", ""),  # type: ignore[arg-type]
-                    "level": getattr(c, "level", getattr(c, "clanLevel", 0)),  # type: ignore[arg-type]
-                    "badge": badge_data,
-                    "stars": getattr(c, "stars", 0),  # type: ignore[arg-type]
-                    "destruction": getattr(c, "destruction", getattr(c, "destructionPercentage", 0)),  # type: ignore[arg-type]
-                    "attack_wins": getattr(c, "attack_wins", None),  # type: ignore[arg-type]
-                    "attacks_used": getattr(c, "attacks_used", None),  # type: ignore[arg-type]
-                    "wins": getattr(c, "wins", None),  # type: ignore[arg-type]
-                    "members": [simple_member(m, opponent_members) for m in members_list if m is not None]  # type: ignore[arg-type, misc]
-                }
-
-            # Extract league group information if available
-            league_group = getattr(coc_war_obj, "league_group", None)  # type: ignore[arg-type]
-            league_group_data = None
-            if league_group:
-                league_group_data = {  # type: ignore[var-annotated]
-                    "tag": getattr(league_group, "tag", ""),  # type: ignore[arg-type]
-                    "state": str(getattr(league_group, "state", "")),  # type: ignore[arg-type]
-                    # Normalise season so mid-month CWLs that span Mon–Wed share one key.
-                    "season": normalize_cwl_season(str(getattr(league_group, "season", "") or ""))  # type: ignore[arg-type]
-                }
-
-            # Extract member lists for cross-clan defensive star calculation
-            # After swap above, my_clan/enemy_clan are already in correct positions
-            # my_clan = our tracked clan, enemy_clan = opponent
-            clan_obj = my_clan
-            opponent_obj = enemy_clan
-            clan_members = getattr(clan_obj, "members", []) if clan_obj else []
-            opponent_members = getattr(opponent_obj, "members", []) if opponent_obj else []
-
-            war_state_obj = getattr(coc_war_obj, "state", None)  # type: ignore[arg-type]
-            payload = {  # type: ignore[var-annotated]
-                "state": str(war_state_obj.name if war_state_obj and hasattr(war_state_obj, "name") else "unknown"),
-                "team_size": getattr(coc_war_obj, "team_size", 0),  # type: ignore[arg-type]
-                "attacks_per_member": getattr(coc_war_obj, "attacks_per_member", 0),  # type: ignore[arg-type]
-                "type": str(getattr(coc_war_obj, "type", None)) if getattr(coc_war_obj, "type", None) else None,  # type: ignore[arg-type]
-                "is_cwl": getattr(coc_war_obj, "is_cwl", None),  # type: ignore[arg-type]
-                "war_tag": getattr(coc_war_obj, "war_tag", None),  # type: ignore[arg-type]
-                "start_time": str(getattr(coc_war_obj, "start_time", "")),  # type: ignore[arg-type]
-                "end_time": str(getattr(coc_war_obj, "end_time", "")),  # type: ignore[arg-type]
-                "preparation_start_time": str(getattr(coc_war_obj, "preparation_start_time", "")),  # type: ignore[arg-type]
-                "league_group": league_group_data,
-                "clan": simple_clan(clan_obj, opponent_members),  # type: ignore[arg-type]
-                "opponent": simple_clan(opponent_obj, clan_members),  # type: ignore[arg-type]
-                "attacks": [simple_attack(a) for a in getattr(coc_war_obj, "attacks", []) if a is not None]  # type: ignore[arg-type, misc]
-            }
+            # Payload construction lives in the module-level build_war_payload() so Phase 1
+            # can carry the payload instead of the heavy coc.ClanWar graph — see
+            # plans/tracker-0009-phase1-war-payload-retention.md §3.
+            payload = build_war_payload(coc_war_obj, my_clan, enemy_clan)  # type: ignore[arg-type]
             
             # Write to target file (temp or archive, based on earlier determination).
             # Atomic write-to-tmp + os.replace() (same pattern as

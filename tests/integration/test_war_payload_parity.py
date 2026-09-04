@@ -80,8 +80,13 @@ def _api_side(side: Dict[str, Any]) -> Dict[str, Any]:
             "bestOpponentAttack": m.get("bestOpponentAttack") or {},
             "opponentAttacks": m.get("opponentAttacks") or 0,
         })
+    badge = side.get("badge") or {}
     return {
         "tag": side.get("tag"), "name": side.get("name"),
+        # Carried so build_war_payload()'s simple_badge() round-trips; without it the rebuilt
+        # payload differs on `badge` alone and the comparison reports a false positive.
+        "badgeUrls": {"small": badge.get("small") or "", "medium": badge.get("medium") or "",
+                      "large": badge.get("large") or ""},
         "clanLevel": side.get("level") or 1,
         "attacks": side.get("attacks_used") or 0,
         "stars": side.get("stars") or 0,
@@ -328,3 +333,62 @@ class TestRealCorpusParity:
             f"paths. §5.1: a mismatch here is a silent-zero bug in waiting, not noise.\n"
             + "\n".join(f"  {n}: {p}" for n, p in failures[:10])
         )
+
+
+@pytest.mark.integration
+class TestBuildWarPayloadRoundTrip:
+    """`build_war_payload()` (§3 Step 1) must reproduce the payload a real temp file holds.
+
+    Behaviour-neutrality of the extraction itself was proved textually — the 160-line body is
+    character-identical to the pre-extraction block, only re-indented. This adds the behavioural
+    half: rebuild each real war's payload from a reconstructed `coc.ClanWar` and compare.
+
+    `previousBestOpponentAttack` is excluded, and the reason is worth knowing before anyone
+    "fixes" it. coc.py derives it as `max(defenses, key=lambda a: a != self.best_opponent_attack
+    and ...)` — i.e. it EXCLUDES whatever `best_opponent_attack` returns. Reconstruction has to
+    feed our computed `bestOpponentAttack` in as the API's field (the API's own value is not
+    retained on disk), so a different attack gets excluded and a different "previous best" comes
+    out. 76 of 54,192 wars differ on that field alone for this reason — a fixture limitation, not
+    a defect. It is also consumed only by `qapbot/scripts/recover_cwl_war.py`, never by the
+    temp-stats path or leaderboards.
+    """
+
+    _VOLATILE = re.compile(r" seconds_until=-?\d+")
+
+    @classmethod
+    def _norm(cls, o: Any) -> Any:
+        """Strip coc.Timestamp's live countdown — Pitfall 55: it changes between writes."""
+        if isinstance(o, str):
+            return cls._VOLATILE.sub("", o)
+        if isinstance(o, dict):
+            return {k: cls._norm(v) for k, v in o.items() if k != "previousBestOpponentAttack"}
+        if isinstance(o, list):
+            return [cls._norm(v) for v in o]
+        return o
+
+    def test_rebuilds_real_payloads(self, client: Any) -> None:
+        from qapbot.cache_manager import build_war_payload
+
+        files = _corpus(int(os.getenv("PARITY_LIMIT", "2000")))
+        if not files:
+            pytest.skip(f"no temp-war corpus at {CORPUS} (DEV-only)")
+
+        checked = 0
+        bad: List[str] = []
+        for f in files:
+            try:
+                orig = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not (orig.get("clan") or {}).get("members"):
+                continue
+            war = reconstruct_war(orig, client)
+            rebuilt = build_war_payload(war, war.clan, war.opponent)
+            checked += 1
+            for key in ("clan", "opponent", "attacks", "team_size", "attacks_per_member"):
+                if self._norm(rebuilt.get(key)) != self._norm(orig.get(key)):
+                    bad.append(f"{f.name}: {key}")
+                    break
+
+        assert checked > 0
+        assert not bad, f"{len(bad)} of {checked} rebuilt payloads differ: {bad[:5]}"

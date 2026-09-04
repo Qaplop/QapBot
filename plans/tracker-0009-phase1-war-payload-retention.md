@@ -309,13 +309,13 @@ Two things resolve it:
 
 So: proceed now, but each stage is gated on evidence from the previous one, not on a date.
 
-### Stage 1 — evidence, zero PROD risk — **STATUS: harness DONE, extraction OPEN**
+### Stage 1 — evidence, zero PROD risk — **STATUS: COMPLETE (2026-09-04)**
 
 - [x] **Parity harness** over the DEV temp-file corpus (**54,192 files** — the §5.1 estimate of
       ~31k was low). Runs the coc-object path and the payload path over the same real files and
       asserts the produced `temp_war_stats` are equal. §6 says write this first; it is the test
       that actually justifies the change, and it is far stronger evidence than any calendar.
-- [ ] **Step 1 of §3** — extract `build_war_payload()` from `save_war_object()`. Behaviour-
+- [x] **Step 1 of §3** — extract `build_war_payload()` from `save_war_object()`. Behaviour-
       neutral; verify byte-identical temp files before going further.
 
 **Gate to Stage 2:** parity exact over the whole corpus. Any mismatch class must be understood
@@ -376,19 +376,7 @@ no `war_ended`, because those move to archive. Harmless for this harness (the te
 only runs for those two states), but it means the `war_ended` path is unexercised here and must
 be covered by Stage 2's gate, which already requires one `war_ended` finalisation.
 
-#### Still open in Stage 1
-
-- [ ] **Step 1 of §3 — extract `build_war_payload()`.** Not done. First attempt was reverted:
-      the payload literal depends on six nested closures (`simple_attack`,
-      `find_best_opponent_attack`, `calculate_defensive_stars`, `simple_member`, `simple_badge`,
-      `simple_clan`) plus `league_group_data`, `clan_obj`/`opponent_obj` and the member lists, so
-      it is a ~160-line move, not a few lines. Extract them **together, verbatim**, into a
-      module-level `build_war_payload(coc_war_obj, my_clan, enemy_clan)` placed *outside* the
-      class, and have `save_war_object()` call it. `cache_manager.py` **has a UTF-8 BOM** — read
-      and write it with `utf-8-sig`/explicit byte handling, and never `ast.parse()` a BOM-bearing
-      string (it raises a misleading "invalid non-printable character").
-
-### Stage 2 — shadow mode on PROD — **STATUS: not started**
+### Stage 2 — shadow mode on PROD — **STATUS: not started — NEXT**
 
 Implement §3 steps 2-4, but **do not make the payload authoritative yet**:
 
