@@ -133,6 +133,10 @@ CLAN_TAG_REFERENCING_TABLES: Tuple[Tuple[str, str, str, str], ...] = (
 # int.from_bytes() overhead) — asyncio.to_thread() kept it from freezing the event loop, but it
 # was still far slower than necessary. The lookup approach replaces those 6.6M hash calls with a
 # single bulk `SELECT player_tag, rowid FROM player_name_search` (done entirely in SQLite/C).
+# Max tags per IN() list in _ensure_clans_exist(). Kept well under SQLITE_MAX_VARIABLE_NUMBER,
+# which is only 999 on older SQLite builds (the Synology system SQLite among them).
+_ENSURE_CLANS_CHUNK = 400
+
 PLAYER_NAME_FTS_ROWID_SCHEME_KEY = "player_name_fts_rowid_scheme"
 PLAYER_NAME_FTS_ROWID_SCHEME_VALUE = "player_name_search_rowid_v2"
 
@@ -3247,49 +3251,97 @@ class WarHistoryDB:
     async def _ensure_clan_exists(self, clan_tag: str) -> None:
         """
         Ensure clan exists in database before saving child records.
-        
+
         If clan doesn't exist in database, saves it from CACHE.clan_name_cache.
         Validates clan_tag format to skip malformed data (e.g., user IDs, channel IDs).
         Valid tags: Start with # and are exactly 9-10 characters total.
-        
+
+        Single-tag convenience wrapper over `_ensure_clans_exist()`; see there for the logic.
+        When ensuring MANY tags at once, call `_ensure_clans_exist()` directly — see its
+        docstring for why calling this one in a loop was a measured performance bug.
+
         Args:
             clan_tag: Clan tag to ensure exists
         """
+        await self._ensure_clans_exist((clan_tag,))
+
+    async def _ensure_clans_exist(self, clan_tags: Iterable[str]) -> None:
+        """Bulk `_ensure_clan_exists()`: identical semantics, 2 queries total instead of 2 per tag.
+
+        WHY THIS EXISTS (2026-09-04 profiling of PROD Phase-1, build 10):
+        `_save_user_impl()` called the single-tag version once per player of the user being
+        saved.  The "UNASSIGNED" pseudo-user holds every unlinked player the bot has ever seen
+        — 5,794 of the 6,076 `user_players` rows on PROD — so discovering ONE new unlinked
+        player during a clan poll re-checked all 5,794 clan tags, one `await` at a time.  Each
+        await is a full event-loop round-trip (queue → sqlite thread → call_soon_threadsafe →
+        self-pipe write → epoll wake), so a single cold Phase-1 issued ~418,000 of them and
+        spun the loop 840,029 times (a warm one: 7,565).  That was the dominant cost of the
+        287.7s cold cycle, and a prime suspect for the multi-second `[LOOP-LAG]` stalls that
+        make Discord interactions unresponsive mid-cycle.
+
+        Deliberately NOT solved with a "known clan tags" memo: `clans` rows can be deleted, so
+        a stale positive would skip a needed insert and surface as an FK violation later.  This
+        reads live state on every call — same correctness as the per-tag path, ~5,800x fewer
+        round-trips — so there is no cache to invalidate.
+
+        Args:
+            clan_tags: Clan tags to ensure exist.  Duplicates and invalid tags are fine.
+        """
         await self._ensure_connection()
         assert self.conn is not None  # _ensure_connection() guarantees this
-        
-        # Validate clan_tag format (skip malformed data like channel IDs, user IDs).
+
+        # Validate + de-duplicate up front (same format rule as before the bulk rewrite).
         # CoC clan tags: '#' + 3-9 alphanumeric chars = 4-10 chars total.
         # Use a generous range (5-12) to tolerate edge cases without silently skipping real tags.
-        if not clan_tag or not clan_tag.startswith('#') or len(clan_tag) < 5 or len(clan_tag) > 12:
-            logging.debug(f"[DB-WRITE] Skipping invalid clan_tag format: {clan_tag!r} (len={len(clan_tag) if clan_tag else 0})")
+        candidates: Set[str] = set()
+        for clan_tag in clan_tags:
+            if not clan_tag or not clan_tag.startswith('#') or len(clan_tag) < 5 or len(clan_tag) > 12:
+                logging.debug(f"[DB-WRITE] Skipping invalid clan_tag format: {clan_tag!r} (len={len(clan_tag) if clan_tag else 0})")
+                continue
+            candidates.add(clan_tag)
+
+        if not candidates:
             return
 
-        # Skip family tags: subscriptions.clan_tag can store family tags (intentional design),
-        # but family tags must NOT be inserted into the clans table — they are not real CoC clans
-        # and cannot be polled via the CoC API. Inserting them would cause PHASE-1 to poll them
-        # every cycle, producing constant NotFound 404 errors.
-        cursor = await self._conn.execute(
-            "SELECT 1 FROM clan_families WHERE family_tag = ? LIMIT 1",
-            (clan_tag,)
-        )
-        if await cursor.fetchone():
-            logging.debug(f"[DB-WRITE] Skipping _ensure_clan_exists for {clan_tag!r}: it is a family tag, not a real CoC clan")
+        # Chunked so the IN() list can never exceed SQLITE_MAX_VARIABLE_NUMBER, which is 999 on
+        # older SQLite builds (the Synology system SQLite among them) and only 32766 on newer.
+        ordered = sorted(candidates)
+        missing: List[str] = []
+        for start in range(0, len(ordered), _ENSURE_CLANS_CHUNK):
+            chunk = ordered[start:start + _ENSURE_CLANS_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+
+            # Skip family tags: subscriptions.clan_tag can store family tags (intentional design),
+            # but family tags must NOT be inserted into the clans table — they are not real CoC
+            # clans and cannot be polled via the CoC API. Inserting them would cause PHASE-1 to
+            # poll them every cycle, producing constant NotFound 404 errors.
+            cursor = await self._conn.execute(
+                f"SELECT family_tag FROM clan_families WHERE family_tag IN ({placeholders})",
+                chunk,
+            )
+            families = {row[0] for row in await cursor.fetchall()}
+
+            cursor = await self._conn.execute(
+                f"SELECT clan_tag FROM clans WHERE clan_tag IN ({placeholders})",
+                chunk,
+            )
+            present = {row[0] for row in await cursor.fetchall()}
+
+            for clan_tag in chunk:
+                if clan_tag in families:
+                    logging.debug(f"[DB-WRITE] Skipping _ensure_clan_exists for {clan_tag!r}: it is a family tag, not a real CoC clan")
+                elif clan_tag not in present:
+                    missing.append(clan_tag)
+
+        if not missing:
             return
 
         from qapbot.cache_manager import CACHE
-        
-        # Check if clan already exists in database
-        cursor = await self._conn.execute(
-            "SELECT 1 FROM clans WHERE clan_tag = ? LIMIT 1",
-            (clan_tag,)
-        )
-        exists = await cursor.fetchone()
-        
-        if not exists:
+
+        for clan_tag in missing:
             # Clan not in database, get from cache and save it
             clan_data = CACHE.clan_name_cache.get(clan_tag)
-            
+
             if clan_data:
                 # Save full clan data from cache
                 await self._save_clan_unlocked(
@@ -9916,13 +9968,22 @@ class WarHistoryDB:
             seen_tags.add(tag)
             deduped_players.append(player)
 
-        for player in deduped_players:
-            await self._conn.execute("""
-                INSERT INTO user_players
-                (discord_id, player_tag, player_name, verified, th_level, current_clan_tag, is_primary,
-                 cwl_permanent_optout, cwl_default_preferred_league_rank)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
+        if not deduped_players:
+            return
+
+        # executemany, NOT a loop of execute(): each await is a full event-loop round-trip, and
+        # for discord_id="UNASSIGNED" this list is the whole unlinked-player pool (5,794 rows on
+        # PROD). See _ensure_clans_exist()'s docstring for the profiling that found this.
+        # Atomicity is unchanged — the caller wraps this in BEGIN and rolls the whole thing back
+        # on failure, so a batch that fails on one row behaves exactly as the per-row loop did
+        # (including the "FOREIGN KEY" retry with null_clan_tags=True).
+        await self._conn.executemany("""
+            INSERT INTO user_players
+            (discord_id, player_tag, player_name, verified, th_level, current_clan_tag, is_primary,
+             cwl_permanent_optout, cwl_default_preferred_league_rank)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            (
                 discord_id,
                 player["player_tag"],
                 player["player_name"],
@@ -9936,7 +9997,9 @@ class WarHistoryDB:
                 # save_user() call for one player silently zeroes every OTHER player's preferences.
                 1 if player.get("cwl_permanent_optout", False) else 0,
                 player.get("cwl_default_preferred_league_rank"),
-            ))
+            )
+            for player in deduped_players
+        ])
 
     async def _save_user_impl(self, discord_id: str, user_data: Dict[str, Any]) -> None:
         """Inner implementation of save_user (retry-wrapped by caller)."""
@@ -9953,11 +10016,15 @@ class WarHistoryDB:
         # (FK constraint on user_players.current_clan_tag -> clans.clan_tag)
         await self._write_lock.acquire()
         try:
-            for player in user_data.get("players", []):
-                clan_tag = player.get("current_clan_tag")
-                if clan_tag:
-                    await self._ensure_clan_exists(clan_tag)
-            
+            # Bulk, NOT a loop over _ensure_clan_exists(): for discord_id="UNASSIGNED" this list
+            # is the entire unlinked-player pool (5,794 rows on PROD), and the per-tag version
+            # costs two event-loop round-trips each. See _ensure_clans_exist()'s docstring.
+            await self._ensure_clans_exist(
+                player.get("current_clan_tag")
+                for player in user_data.get("players", [])
+                if player.get("current_clan_tag")
+            )
+
             await self._conn.execute("BEGIN")
 
             await self._upsert_users_row(discord_id, user_data)

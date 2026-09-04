@@ -9,3 +9,6 @@ pytest-cov==7.1.0
 python-dotenv==1.2.3
 tzdata==2026.3
 wcwidth==0.8.2
+# Fast JSON serialization for the hot temp-war-file write path (cache_manager.save_war_object).
+# Already present transitively via coc.py; declared here so it is a first-class dependency.
+orjson>=3.12.0

@@ -1,6 +1,88 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-04 (16)
+- Measured (build 11, unprofiled, matched load): the (15) round-trip fix bought NO measurable
+  cycle time. Cold Phase-1 68.5s -> 66.0s at 2061 vs 2050 clans — inside noise. The fix stays
+  (it removes real work and stops the cost scaling with a pool that only grows), but it is NOT
+  a speed-up and must not be cited as one. Docs corrected accordingly; (15)'s "dominant cost of
+  the cold cycle" claim was wrong.
+- Why it was wrong: cProfile's overhead is proportional to CALL COUNT, so it skews the
+  *distribution*, not only the absolute seconds. This bug was almost pure call count (418,000
+  round-trips x several frames each), so it floated to the top of the profile on that basis
+  alone. A profile ranks suspects; only two unprofiled cycles at matched load confirm one.
+  Written up in PERFORMANCE_TUNING.md ("The trap") and as a scope correction on Pitfall 56.
+- Also beware the reverse: that same cold cycle went 190.9s -> 150.0s, which is NOT the fix —
+  the older cycle's post-Phase-3 tail did 19 extra CoC API calls and twice the [ROLE-SYNC] work.
+- FOUND: Discord unresponsiveness during update cycles is gen-2 GC, all of it. 11 of 11
+  [LOOP-LAG] stalls match a [GC-AUTO] pause to within the watchdog's 100ms probe resolution;
+  p95 between collections is 0.046s. Not GIL contention, not blocking I/O, not our cycle code —
+  so no amount of to_thread-ing or yielding can touch it. Longstanding, not a regression:
+  [GC-AUTO] maxima are 2.70s (build 2), 5.27s (4), 5.82s (9), 2.44s (11), several of them past
+  Discord's 3s interaction ACK deadline.
+- Not yet fixed. The existing mitigations (startup gc.freeze of 620,316 objects, gen-2 threshold
+  20, nightly unfreeze/collect/freeze) miss it on timescale: these pauses appeared 7 minutes
+  after a restart, and the growth that makes sweeps expensive happens inside a single cycle.
+  The lever is scheduling, not speed — the per-cycle gc.collect(1) costs 0.000s and the bot then
+  sleeps 171-199s, while automatic gen-2 fires 6x mid-cycle at 0.5-2.4s each. See
+  PERFORMANCE_TUNING.md ("Discord unresponsiveness during cycles is gen-2 GC").
+- No BOT_BUILD bump: documentation and changelog only, no .py changes (still build 11).
+
+2026-09-04 (15)
+- Fixed: the dominant cost of a cold update cycle — a ~418,000-round-trip SQLite storm on the
+  event loop during Phase-1. `_save_user_impl()` called `_ensure_clan_exists()` once per player
+  of the user being saved (2 queries each), and `_replace_user_players_rows()` issued one
+  `await execute()` INSERT per player. The "UNASSIGNED" pseudo-user holds every unlinked player
+  the bot has ever seen — 5,794 of 6,076 `user_players` rows on PROD — so discovering ONE new
+  unlinked player during a clan poll rewrote the whole pool at ~11,600 event-loop round-trips
+  a time. Measured: 17,383 -> 13 round-trips for a 5,794-player save (1337x), identical rows.
+- Added: `_ensure_clans_exist()` (db_manager.py) — bulk form of `_ensure_clan_exists()`, chunked
+  `WHERE ... IN (?,?,...)` at 400 tags (SQLITE_MAX_VARIABLE_NUMBER is only 999 on the Synology
+  system SQLite). Deliberately a live bulk query, NOT a "known clan tags" memo: `clans` rows can
+  be deleted, and a stale positive would skip a needed insert and surface later as an FK
+  violation. `_ensure_clan_exists()` is kept as a single-tag wrapper — it has many callers.
+- Changed: `_replace_user_players_rows()` now uses `executemany()`. Atomicity is unchanged — the
+  caller wraps it in BEGIN, so a batch failing on one row rolls back exactly as the per-row loop
+  did, including the "FOREIGN KEY" retry with `null_clan_tags=True`. The 2026-08-21 duplicate
+  player_tag guard is preserved and covered by a test.
+- Added: tests/integration/test_ensure_clans_bulk.py (10 cases). These assert the ROUND-TRIP
+  COUNT, not just the resulting rows: every correctness test passed throughout the period the
+  storm was happening, so only a count assertion can fail if a per-item `await` is reintroduced.
+- Docs: found by the build-10 cProfile pass. See qapbot/docs/PERFORMANCE_TUNING.md ("Profiling
+  Phase-1") for how to read a loop-thread profile — the `epoll.poll` CALL COUNT is the tell
+  (840,029 on the cold cycle vs 7,565 warm) — and COPILOT_PITFALLS_COOKBOOK.md Pitfall 56 for
+  the general rule. Not repeated here on purpose.
+- Note: PROFILE_PHASE1 should be set to at least 2. The cold and warm cycles are different
+  bottlenecks, not the same one with a colder cache; profiling only one leads to the wrong fix.
+- Still open (deliberately separate, so the effects stay separable): `simple_member()` in
+  cache_manager.py is O(n^2) and costs 33% of a warm Phase-1 — see PERFORMANCE_TUNING.md.
+
+2026-09-04 (14)
+- Added: event-loop lag watchdog (QapBot.py). Probes every 100ms and reports any stall as
+  a WARNING, plus a 5-minute INFO summary with max/p95 so 'responsiveness is fine' is
+  evidence rather than an absence of complaints. This is the direct measurement of the
+  long-standing 'Discord commands feel dead during update cycles' symptom: Discord drops
+  an interaction that is not acknowledged within 3s, and log-gap analysis found 42 in-cycle
+  gaps of 3-10s plus 7 over 10s. Log gaps OVERSTATE blocking though (a yielding loop that
+  does not log looks identical), which is why a real probe was needed.
+  Verified: fires on a 1.2s synchronous block, stays silent for the same 1.2s of work in
+  asyncio.to_thread — which is exactly the distinction that tells us how to fix each stall.
+- Added: opt-in cProfile pass over Phase 1 via PROFILE_PHASE1=<n> (QapBot.py), self-
+  disarming after n runs. Writes data/logs/phase1_profile_<ts>.{prof,txt} and logs the top
+  offenders by tottime. Needed because Phase 1 burns ~44-49s CPU/cycle at cores_busy up to
+  1.01 and the obvious suspects are already excluded: coc.py parses responses with orjson,
+  and our own serialization measures 0.13s/cycle. Scope note: cProfile instruments the
+  calling thread only, i.e. the event loop — to_thread work is deliberately out of scope.
+- Changed: temp-war-file serialization stdlib json -> orjson (qapbot/cache_manager.py).
+  5.8x faster per call (69us -> 12us on a real 17 KB payload) and byte-identical: verified
+  against 400 real temp files, 400/400 identical, zero errors. Honest scale: ~0.13s ->
+  ~0.02s per cycle, i.e. ~0.1s of ~110s. Taken because it is free and safe, NOT because it
+  moves cycle time. orjson was already present transitively via coc.py; now declared in
+  requirements.txt so this module does not depend on another package's transitive tree.
+- Docs: PROFILE_PHASE1 and TO_THREAD_WORKERS documented in .env.example.
+  Files: QapBot.py, qapbot/cache_manager.py, requirements.txt, .env.example.
+  Build 10. 2994 tests pass.
+
 2026-09-04 (13)
 - Measured (build 9): the _FETCH_CONCURRENCY 20 -> 50 retry from (12) WORKED, and both
   falsifier conditions were met.

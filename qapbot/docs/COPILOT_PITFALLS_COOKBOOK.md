@@ -2530,3 +2530,65 @@ default*.
   not by reading the code.
 - The same suspicion applies to any other serialised field whose value is computed at
   render time rather than stored.
+
+---
+
+## Pitfall 56: `await` inside a loop over a data-sized collection — each one is a full event-loop round-trip, so an O(n) loop becomes an O(n) *stall*
+
+> **Scope correction (measured 2026-09-04, same day):** this pattern is real and worth
+> fixing, but at PROD's scale removing it bought **no measurable cycle time** — Phase-1 went
+> 68.5s → 66.0s at matched load, inside noise. It looked like the dominant cost only because
+> cProfile's overhead is proportional to call count and this bug was almost pure call count.
+> Fix it for correctness and to stop the cost scaling with a growing pool; do not sell it as
+> a speed-up. See `PERFORMANCE_TUNING.md`, "The trap". The Discord unresponsiveness in the
+> symptom below turned out to be **gen-2 GC**, not this — same document.
+
+**Symptom:** the event loop spins hundreds of thousands of times per cycle while CPU looks
+only moderately busy, because the time goes into scheduling overhead rather than work.
+
+**What happened (2026-09-04, PROD build 10 cProfile):** `_save_user_impl()` did
+
+```python
+for player in user_data.get("players", []):      # ← scales with the DATA, not the request
+    if player.get("current_clan_tag"):
+        await self._ensure_clan_exists(clan_tag)  # 2 SQLite queries each
+```
+
+and `_replace_user_players_rows()` did one `await self._conn.execute(INSERT ...)` per
+player. Both are correct, readable, and were fine when written.
+
+Then the `"UNASSIGNED"` pseudo-user — the pool holding *every unlinked player the bot has
+ever seen* — grew to **5,794 of the 6,076 `user_players` rows**. Because the pool is saved
+as a single "user", discovering **one** new unlinked player during a clan poll rewrote the
+whole pool: ~11,600 round-trips per save. One cold Phase-1 issued **~418,000** of them and
+spun the loop **840,029 times** (a warm Phase-1: 7,565). Measured fix: **17,383 → 13**
+round-trips for a 5,794-player save, a **1337x** reduction, same rows written.
+
+**Why it is invisible in review:** nothing about `await x` in a loop looks expensive, and
+every correctness test passed the entire time the storm was happening. The cost is not in
+the statement — it is in the *round-trip* each `await` forces: queue → sqlite thread →
+`call_soon_threadsafe` → self-pipe write → epoll wake → loop resume. Six context switches
+to run one trivial `SELECT 1`.
+
+**How to apply:**
+
+- Before writing `await` inside a `for`, ask **what bounds the iteration count** — a request
+  parameter (fine) or a table/pool that grows with usage (not fine). Anything in the second
+  category needs a batched form.
+- Batch the reads: replace N single-row `SELECT`s with one chunked `... WHERE col IN (?,?,…)`.
+  Chunk at ≤400 — `SQLITE_MAX_VARIABLE_NUMBER` is only 999 on older builds, the Synology
+  system SQLite among them.
+- Batch the writes: `executemany()` is one round-trip for the whole batch, and inside a
+  `BEGIN` it has identical atomicity and identical rollback/retry behaviour to the per-row
+  loop.
+- **Prefer a bulk query over a memo cache.** The tempting fix here was a "known clan tags"
+  set, but `clans` rows can be deleted, so a stale positive would skip a needed insert and
+  surface later as an FK violation. Re-reading live state in one batched query is the same
+  correctness as the per-row path with none of the invalidation risk — see
+  `_ensure_clans_exist()` in `db_manager.py`.
+- **Assert the round-trip count in a regression test, not just the resulting rows.** Only a
+  count assertion can fail when someone reintroduces a per-item `await`; see
+  `tests/integration/test_ensure_clans_bulk.py` for the counting-connection-wrapper pattern.
+- To find these: cProfile the event-loop thread and look at the **`epoll.poll` call count**,
+  not the time. Loop iterations two orders of magnitude above normal mean round-trip
+  amplification somewhere. See `PERFORMANCE_TUNING.md`.

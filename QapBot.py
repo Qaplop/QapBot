@@ -1543,9 +1543,26 @@ async def main() -> None:
     #   <<1.0                              -> mostly waiting on disk/network, NOT CPU-bound
     # Added 2026-09-03 because two API-side "optimisations" were deployed on the strength of
     # inference rather than measurement and both did nothing.  Measure, then tune.
+    # Optional cProfile pass over Phase 1 (PROFILE_PHASE1=<n> profiles the next n cycles).
+    # WHY: Phase 1 burns ~44-49s of CPU per cycle at cores_busy up to 1.01, and the obvious
+    # suspects are already ruled out — coc.py parses API responses with orjson, and our own
+    # temp-file serialization measures 0.13s/cycle. Where the rest goes is unknown, and this
+    # session has repeatedly shown that guessing it wrong is expensive.
+    # cProfile only instruments the calling thread, which here is the event loop — exactly
+    # the GIL-bound work in question. asyncio.to_thread work will NOT appear; that is the
+    # correct scope, not a gap.
+    _p1_prof = None
+    if _phase1_profile_remaining > 0:
+        import cProfile
+        _p1_prof = cProfile.Profile()
+        _p1_prof.enable()
+
     _p1_w0, _p1_c0 = time.monotonic(), time.process_time()
     fetch_tasks = [fetch_single_clan(clan_tag, is_active) for clan_tag, is_active in clans_to_update]
     fetch_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+    if _p1_prof is not None:
+        _p1_prof.disable()
+        _dump_phase1_profile(_p1_prof, len(clans_to_update))
     _p1_w = max(time.monotonic() - _p1_w0, 1e-6)
     _p1_c = time.process_time() - _p1_c0
     logging.info(
@@ -2523,6 +2540,128 @@ async def is_history_migration_due() -> bool:
     if CACHE.db_manager is None:
         return False
     return await CACHE.db_manager.has_history_migration_work()
+
+
+# ── Phase-1 CPU profiling (opt-in, off unless PROFILE_PHASE1 is set) ─────────────
+# Set PROFILE_PHASE1=<n> in .env to profile the next n Phase-1 passes, then it disarms
+# itself.  Deliberately opt-in and self-limiting: cProfile roughly doubles the cost of the
+# code it instruments, so leaving it on would distort the very number being measured and
+# slow real cycles on a machine that has none to spare.
+try:
+    _phase1_profile_remaining: int = max(0, int(os.getenv("PROFILE_PHASE1", "0") or 0))
+except ValueError:
+    _phase1_profile_remaining = 0
+
+
+def _dump_phase1_profile(prof: Any, clan_count: int) -> None:
+    """Write one Phase-1 cProfile pass to data/logs/ and log the top offenders.
+
+    Emits both a .prof (for snakeviz / pstats offline) and a .txt top-40 by cumulative and
+    by tottime.  tottime is the column that answers "where does the CPU actually go",
+    since cumulative is dominated by the async plumbing that merely awaits everything else.
+    """
+    global _phase1_profile_remaining
+    _phase1_profile_remaining -= 1
+    try:
+        import io as _io
+        import pstats as _pstats
+        _stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _base = os.path.join(LOGS_DIR, f"phase1_profile_{_stamp}")
+        prof.dump_stats(_base + ".prof")
+        _buf = _io.StringIO()
+        _st = _pstats.Stats(prof, stream=_buf)
+        _buf.write(f"Phase-1 cProfile — {clan_count} clans — {_stamp}\n")
+        _buf.write("NOTE: event-loop thread only; asyncio.to_thread work is out of scope.\n")
+        _buf.write("\n===== TOP 40 BY tottime (self time — where the CPU actually goes) =====\n")
+        _st.sort_stats("tottime").print_stats(40)
+        _buf.write("\n===== TOP 40 BY cumtime =====\n")
+        _st.sort_stats("cumulative").print_stats(40)
+        with open(_base + ".txt", "w", encoding="utf-8") as _fh:
+            _fh.write(_buf.getvalue())
+        # Surface the headline directly in the main log so it is visible without SSH.
+        _top = _pstats.Stats(prof)
+        _top.sort_stats("tottime")
+        _rows = sorted(_top.stats.items(), key=lambda kv: kv[1][2], reverse=True)[:8]  # type: ignore[attr-defined]
+        _total = sum(v[2] for v in _top.stats.values())  # type: ignore[attr-defined]
+        logging.info(
+            "[PHASE1-PROFILE] Wrote %s.{prof,txt} — %d clans, %.1fs self-time total. "
+            "Top by tottime:", _base, clan_count, _total,
+        )
+        for (_fn, _ln, _name), _v in _rows:
+            logging.info(
+                "[PHASE1-PROFILE]   %6.2fs (%4.1f%%) %s:%s(%s)",
+                _v[2], 100.0 * _v[2] / max(_total, 1e-9), os.path.basename(_fn), _ln, _name,
+            )
+        logging.info("[PHASE1-PROFILE] %d profile run(s) remaining", _phase1_profile_remaining)
+    except Exception as _px:
+        logging.warning("[PHASE1-PROFILE] Could not write profile: %s", _px)
+
+
+async def event_loop_lag_watchdog(
+    interval: float = 0.1, warn_threshold: float = 0.5
+) -> None:
+    """Measure and report event-loop stalls — the thing users feel as an unresponsive bot.
+
+    Sleeps *interval* in a loop and compares elapsed wall time against it.  Any excess is
+    time the loop could not schedule this task, i.e. time a Discord interaction, heartbeat
+    or gateway message ALSO could not be serviced.  This is the direct measurement of
+    responsiveness; the update cycle's own phase timings cannot show it, because a phase
+    that blocks for 8s and a phase that yields politely for 8s look identical in them.
+
+    Why it matters concretely: Discord requires an interaction to be acknowledged within
+    3 seconds.  A stall longer than that does not make a command slow, it makes it FAIL.
+    Sustained stalls beyond ~60s risk the gateway dropping the connection entirely.
+
+    Reporting is deliberately asymmetric:
+      * every stall over *warn_threshold* is logged at WARNING with the offender's duration
+      * a periodic INFO summary carries max/p95 even when nothing crossed the threshold,
+        so "responsiveness is fine" is evidence rather than an absence of complaints
+
+    Note this measures the LOOP, not the process: work correctly pushed to
+    ``asyncio.to_thread`` does not stall the loop even while it burns CPU, because CPython
+    rotates the GIL every ``sys.getswitchinterval()`` (5 ms by default).  That is exactly
+    why moving a blocking call into a thread fixes responsiveness without touching cores.
+    """
+    _SUMMARY_EVERY = 300.0  # seconds of wall time between INFO summaries
+    _stalls: list[float] = []
+    _worst = 0.0
+    _worst_n = 0
+    _last_summary = time.monotonic()
+    logging.info(
+        "[LOOP-LAG] Watchdog started (probe=%.0fms, warn>%.0fms, summary every %.0fs)",
+        interval * 1000, warn_threshold * 1000, _SUMMARY_EVERY,
+    )
+    while not QBcore.shutdown_event.is_set():
+        _t0 = time.monotonic()
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        _lag = (time.monotonic() - _t0) - interval
+        if _lag > 0:
+            _stalls.append(_lag)
+            if _lag > _worst:
+                _worst = _lag
+            if _lag > warn_threshold:
+                _worst_n += 1
+                logging.warning(
+                    "[LOOP-LAG] Event loop stalled %.2fs — Discord interactions were "
+                    "unservable for that long (ACK deadline is 3s)", _lag,
+                )
+        _now = time.monotonic()
+        if _now - _last_summary >= _SUMMARY_EVERY:
+            if _stalls:
+                _s = sorted(_stalls)
+                _p95 = _s[min(len(_s) - 1, int(0.95 * len(_s)))]
+                logging.info(
+                    "[LOOP-LAG] Last %.0fs: max=%.2fs p95=%.3fs samples=%d over_%.0fms=%d",
+                    _now - _last_summary, _worst, _p95, len(_s),
+                    warn_threshold * 1000, _worst_n,
+                )
+            _stalls.clear()
+            _worst = 0.0
+            _worst_n = 0
+            _last_summary = _now
 
 
 async def periodic_main() -> None:
@@ -3627,6 +3766,10 @@ async def _run_startup_initialization() -> None:
             QBcore.bot.loop.create_task(periodic_main())
             QBcore.bot.periodic_task_started = True
             logging.info("✅ Periodic main task started successfully")
+            # Responsiveness instrumentation — see event_loop_lag_watchdog().  Started
+            # alongside the cycle task because the stalls it exists to catch are caused BY
+            # the cycle.  Its own cost is one 100ms timer wakeup, i.e. nothing.
+            QBcore.bot.loop.create_task(event_loop_lag_watchdog())
         except Exception as e:
             # Fatal, same as a Step-3 cache-load failure: without periodic_main() the bot can
             # never fetch war data or run any update cycle, so there is nothing to recover into —

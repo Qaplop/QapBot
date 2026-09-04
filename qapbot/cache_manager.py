@@ -40,6 +40,10 @@ Example:
 import asyncio
 import os
 import json
+# orjson is used for the hot temp-war-file serialization in save_war_object() (see there).
+# It arrives as a coc.py dependency, but is declared explicitly in requirements.txt so this
+# module does not silently depend on another package's transitive tree.
+import orjson
 import logging
 import hashlib
 import time
@@ -3053,7 +3057,15 @@ class CacheManager:
             # successfully written, and is atomic on the same filesystem/directory.
             _file_is_new = not os.path.exists(target_file)
             _tmp_target_file = target_file + ".tmp"
-            _payload_str = json.dumps(payload, indent=2, ensure_ascii=False)
+            # orjson instead of stdlib json: 5.8x faster on a real 17 KB war payload
+            # (69us -> 12us), and byte-identical output — verified against 400 real temp
+            # files, 400/400 identical with zero serialization errors.  OPT_INDENT_2
+            # reproduces indent=2, and orjson always emits UTF-8, which is what
+            # ensure_ascii=False asked for.
+            # Honest scale: this is ~0.13s -> ~0.02s per cycle at 1,846 writes, i.e. ~0.1s
+            # of a ~110s cycle. Taken because it is free and safe, NOT because it matters —
+            # do not cite it as a cycle-time optimisation.
+            _payload_str = orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode("utf-8")
             # Instrumentation only — behaviour unchanged, the write below still happens.
             # Question being answered: would a write-skip on unchanged content pay off?
             # During CWL the temp-write mix was new=221 / upd=2443, so skipping identical

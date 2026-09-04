@@ -226,3 +226,158 @@ whose own configuration is what the experiment is measuring.**
 
 **Generalised:** before adding or tuning a cache, find the *caller's own* dedup window. A
 cache only earns its memory when something asks the same question twice inside its TTL.
+
+---
+
+## Profiling Phase-1 (2026-09-04, build 10): profile the COLD cycle and the WARM cycle — they are different bottlenecks
+
+`PROFILE_PHASE1=<n>` wraps Phase-1's `asyncio.gather` in `cProfile` for the next *n* cycles,
+then self-disarms. Set it to **at least 2**. The first cycle after a restart and the steady
+state are not the same workload with a colder cache — they are two unrelated problems, and
+profiling only one leads to the wrong fix.
+
+| | Cycle 1 (cold) | Cycle 2 (warm) |
+|---|---|---|
+| Wall (profiled) | 287.7s | 113.7s |
+| `epoll.poll` calls | **840,029** | 7,565 |
+| Largest item in the profile | ~418,000 SQLite round-trips | `simple_member()` O(n²), 33% of Phase-1 |
+
+> **Read that last row as "largest in the profile", NOT "largest in reality".** Fixing the
+> 418,000 round-trips bought **nothing** measurable — see "The trap" below. Keep that in mind
+> for the `simple_member()` row too: it has not been verified against an unprofiled cycle
+> either.
+
+### The trap: cProfile's overhead is proportional to CALL COUNT, so it skews the *distribution*, not just the totals
+
+Everyone knows to distrust profiled absolute seconds. The subtler error — made here, on
+2026-09-04 — is then trusting the **distribution** and concluding "this is the dominant
+cost". It carries exactly the same bias: cProfile charges ~1 µs per call, so code that is
+*cheap per call but enormous in call count* is inflated far more than everything around it,
+and floats to the top of the profile on that basis alone.
+
+The SQLite storm was almost pure call count: 418,000 round-trips, several Python frames
+each. Under cProfile it looked like the dominant cost of the cold cycle. Unprofiled, at
+**matched load** (2,061 vs 2,050 clans), removing it moved Phase-1 from **68.5s to 66.0s**
+— about 3.6%, inside cycle-to-cycle noise.
+
+**How to avoid it:** a profile ranks *suspects*, it never confirms one. Before claiming any
+profiled hotspot is a real bottleneck, confirm it against **two unprofiled cycles at matched
+load** — the same clan count, and comparable `Temp writes` / `Finalization` counts from
+`[CYCLE-SUMMARY]`. And beware the reverse trap when reading a whole-cycle delta: the cold
+cycle in that same comparison went 190.9s → 150.0s, which looks like a huge win and is not
+one — the older cycle's post-Phase-3 tail simply did 19 extra CoC API calls and twice the
+`[ROLE-SYNC]` work. Attribute a delta to a phase before attributing it to a change.
+
+### Fixed (correctness/robustness, NOT a speed-up): the cold-cycle SQLite storm
+
+`persist_user("UNASSIGNED")` rewrote the entire 5,794-row unlinked-player pool on every
+newly-discovered player — ~11,600 event-loop round-trips per save, ~36 saves per cold
+Phase-1. Fixed by bulk-querying (`_ensure_clans_exist()`) and `executemany()`:
+**17,383 → 13 round-trips**, 1337x, identical writes.
+
+Worth keeping — it removes real work and stops the cost scaling with a pool that only grows
+— but **do not cite it as a cycle-time optimisation.** It measured as no improvement.
+
+
+### Reading a cProfile of the event-loop thread
+
+Four things will mislead you if you don't correct for them:
+
+1. **cProfile inflates wall time**, worst for high-call-count code (cycle 1 measured
+   100.8 ms/clan vs ~29 unprofiled). Trust the *distribution*, never the absolute seconds,
+   and never compare a profiled cycle against an unprofiled one.
+2. **Each coroutine resumption counts as a call.** `ncalls` on any `async def` is inflated by
+   its await count. Anchor real counts on C-level non-coroutines — `put_nowait`,
+   `call_soon_threadsafe` — then cross-check the arithmetic closes.
+3. **It captures the whole loop thread**, not just the code you wrapped. Anything else running
+   on the loop in that window appears too.
+4. **`asyncio.to_thread` work is out of scope entirely** — cProfile instruments the calling
+   thread only. That is the right scope for GIL-bound work, not a gap.
+
+### `epoll.poll` count is the highest-signal number in the file
+
+Not its time — its **call count**. It equals the number of loop iterations. Two orders of
+magnitude above normal means round-trip amplification: something is `await`ing per item over
+a data-sized collection. That single number found the storm below; see
+`COPILOT_PITFALLS_COOKBOOK.md` Pitfall 56 for the full pattern and the fix.
+
+### Fixed: the cold-cycle SQLite storm
+
+`persist_user("UNASSIGNED")` rewrote the entire 5,794-row unlinked-player pool on every
+newly-discovered player — ~11,600 event-loop round-trips per save, ~36 saves per cold
+Phase-1. Fixed by bulk-querying (`_ensure_clans_exist()`) and `executemany()`:
+**17,383 → 13 round-trips**, 1337x, identical writes.
+
+This also reframes what the CoC clan cache is *for*: its main value is not saving API calls,
+it is **suppressing this storm** by keeping `_fetch_and_cache()` → `_update_clan_metadata()`
+from running. See the cache-sizing discussion above and tracker #0094.
+
+### Known, not yet fixed: `simple_member()` is O(n²) with an expensive constant
+
+`cache_manager.py`'s `simple_member()` is **27.97s cumulative of a warm Phase-1's 83.5s
+(33%)**. For each war member, both `find_best_opponent_attack()` and
+`calculate_defensive_stars()` rescan *every* opponent's *every* attack — two full O(n²)
+passes. Worse, `getattr(opp_member, "attacks", [])` hits a coc.py **property that rebuilds
+its list on every access**: **2,795,399 calls** in one cycle, and most of the 9.77M `getattr`
+calls (5.78s self time).
+
+The fix is one pass building a `defender_tag → (total_stars, best_attack)` index before the
+member loop, collapsing both scans to O(n) and evaluating `.attacks` once per opponent
+instead of 2n times. Deliberately left as a separate change so its effect stays separable
+from the storm fix.
+
+## Discord unresponsiveness during cycles is gen-2 GC. All of it.
+
+**Settled 2026-09-04 (build 11, unprofiled).** Across two cycles the `[LOOP-LAG]` watchdog
+recorded 11 stalls over 500ms. Every one of them is a gen-2 garbage collection, matching to
+within the watchdog's own 100ms probe resolution:
+
+| `[GC-AUTO]` pause | `[LOOP-LAG]` stall |
+|---|---|
+| 0.536s | 0.54s |
+| 0.660s | 0.69s |
+| 0.731s | 0.74s |
+| 0.881s | 0.96s |
+| 0.983s | 1.05s |
+| 1.198s | 1.25s |
+| 1.700s | 1.74s |
+| 1.297s | 1.27s |
+| 1.550s | 1.57s |
+| 1.814s | 1.91s |
+| 2.441s | 2.42s |
+
+**11 of 11.** That is identity, not correlation. `p95 = 0.046s` — between collections the
+loop is fine. So the longstanding "bot goes unresponsive during update cycles" complaint is
+**not** GIL contention, **not** blocking I/O, and **not** any of our own cycle code. It is
+the collector, and no amount of `to_thread`-ing or yielding will touch it (GC holds the GIL;
+see Pitfall 16).
+
+This is longstanding, not a regression — `[GC-AUTO]` maxima per build: build 2 2.70s,
+build 4 5.27s, build 9 5.82s, build 10 5.53s, build 11 2.44s. Several exceed Discord's **3s
+interaction ACK deadline** outright.
+
+### Why the existing mitigations don't cover it
+
+The design already anticipates this: `gc.set_threshold(700, 10, 20)` and a startup
+`gc.freeze()` (620,316 objects on PROD), plus a nightly `unfreeze → full collect → freeze`.
+The gap is *timescale*. The nightly re-freeze exists because "every cycle promotes newly
+created long-lived CACHE growth into gen-2, which the one-time startup freeze does NOT
+cover" (Issue 3, 2026-08-08) — but the pauses above appeared **7 minutes after a restart**,
+within the first two cycles. The growth that makes sweeps expensive happens *inside a
+cycle*; a once-a-day release valve is ~24h too slow for it.
+
+### The shape of the fix
+
+Two numbers frame it. The per-cycle scoped `gc.collect(1)` in `_post_cycle_cleanup` costs
+**0.000s**, while automatic gen-2 sweeps cost **0.5–2.4s each, 6 per cold cycle, mid-cycle**.
+And the bot then **sleeps 171–199s** between cycles.
+
+So the collector is doing its expensive work at precisely the worst moment, and the cheap
+moment goes unused. The lever is to move gen-2 onto *our* schedule — into the sleep window —
+rather than to make it faster. Note that most sweeps reclaim almost nothing (1,350–3,918
+objects for a 0.5–1.8s pause): they are walking a large live heap, so the win comes from
+reducing *what is walked* (freezing) and *when it is walked* (scheduling), not from
+allocating less.
+
+Not yet implemented — needs measurement against `CWL_PROD_PERFORMANCE_FIX_PLAN.md` P2
+Step 10, which already moved the gen-2 multiplier 10 → 20.
