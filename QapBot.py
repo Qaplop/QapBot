@@ -146,6 +146,54 @@ def _log_slow_gc(phase: str, info: dict) -> None:  # type: ignore[type-arg]
             gen, elapsed, info.get("collected", 0), info.get("uncollectable", 0),
         )
 
+# Split the per-cycle collection into slices small enough to be invisible. (2026-09-04)
+#
+# WHY: even after release_war_object() removed 78% of the garbage, the single end-of-cycle
+# gc.collect(1) still cost 1.135s on PROD — because a sweep's cost tracks what it WALKS, and
+# most of that is the live young generation, not the garbage found. Collecting more often, in
+# smaller slices, shrinks the young generation each pass. Measured at cycle shape: max pause
+# 5.8x lower at every-500, with total GC time slightly LOWER than one big collect (dead objects
+# stop being re-walked by later passes). 1.135s / ~5 lands ~0.2s — under the [LOOP-LAG] warn
+# threshold and 15x under Discord's 3s ACK deadline, i.e. genuinely invisible.
+#
+# This is what makes the remaining coc.Clan garbage a non-problem WITHOUT lifetime tracking:
+# cached clans are handed to callers and live up to 600s, so severing their back-references the
+# way release_war_object() does for wars would risk breaking a caller still holding one. Making
+# the collection invisible needs no ownership analysis at all.
+#
+# Why mid-cycle collection is safe here when automatic collection was not: the problem with the
+# automatic collector was the *generation depth* (gen-2 sweeps walking the whole heap), not the
+# timing. gen-0 is shallow, and the in-flight population is semaphore-bounded (~50 clans), so
+# each pass walks almost nothing live. Measured: no gen-2 backlog growth across cycles, so
+# promoted survivors do not accumulate.
+#
+# every-100 measured WORSE than every-500 (per-call overhead dominates) — do not lower this
+# without re-measuring. GC_CHUNK_EVERY=0 disables chunking.
+_CHUNK_COLLECT_EVERY: int = max(0, int(os.getenv("GC_CHUNK_EVERY", "500") or 500))
+_chunk_collect_counter: int = 0
+
+def maybe_chunk_collect() -> None:
+    """Collect gen-0 every `_CHUNK_COLLECT_EVERY` clans. No-op when chunking is disabled.
+
+    Cheap enough to call per clan: the common path is an increment and a modulo. Never raises —
+    a failed teardown must not fail a cycle. Slow slices still surface via the [GC-SCHEDULED]
+    logger, which only fires above 0.5s, so an alarm here means the slice size needs revisiting.
+    """
+    global _chunk_collect_counter, _gc_deliberate
+    if not _CHUNK_COLLECT_EVERY:
+        return
+    _chunk_collect_counter += 1
+    if _chunk_collect_counter % _CHUNK_COLLECT_EVERY:
+        return
+    _gc_deliberate = True
+    try:
+        gc.collect(0)
+    except Exception as _chunk_ex:  # pragma: no cover - defensive
+        logging.debug(f"[GC-CHUNK] slice collection skipped: {_chunk_ex}")
+    finally:
+        _gc_deliberate = False
+
+
 if not any(getattr(_cb, "__name__", None) == "_log_slow_gc" for _cb in gc.callbacks):
     # Name-based (not identity-based) dedup guard: QBdiscordcmds.py does
     # `from QapBot import GLOBAL_GUILD_ID, run_nightly_maintenance_routine,
@@ -1523,6 +1571,7 @@ async def main() -> None:
                                 )
                 
                 war_data = await fetch_clan_war_data(clan_tag)
+                maybe_chunk_collect()
                 if war_data is None:
                     CACHE.record_cycle_stat("api_no_war")
                     return (clan_tag, is_active, _NOT_IN_WAR)  # sentinel: confirmed no active war
@@ -1898,6 +1947,9 @@ async def main() -> None:
                 # No isinstance guard: the None / _NOT_IN_WAR cases already took the `continue`
                 # above, so war_data is a dict here — and release_war_object() no-ops on None.
                 release_war_object(war_data.get('war_obj'))
+                # Phase 3 is where the war graphs actually die, so slice the collection here
+                # too — same counter, so the every-500 spacing spans both phases.
+                maybe_chunk_collect()
 
             if not process_success:
                 failed_count += 1

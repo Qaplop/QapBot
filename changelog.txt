@@ -1,6 +1,37 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-04 (23)
+- Added: maybe_chunk_collect() — the per-cycle collection is now sliced into generation-0
+  passes every 500 clans (GC_CHUNK_EVERY, 0 = off), called from Phase 1 and Phase 3 on one
+  shared counter. Measured at cycle shape: max pause 5.8x lower than one end-of-cycle collect,
+  with slightly LESS total GC time (dead objects stop being re-walked by later passes).
+  Scaling PROD's measured 1.135s by ~5 lands ~0.2s — under the [LOOP-LAG] warn threshold and
+  15x under Discord's 3s ACK deadline.
+- Why slicing instead of severing the remaining garbage: it is ~669 coc.Clan graphs per cycle
+  (103,687 objects / 155 each), cyclic via ClanMember.clan. But cached clans are HANDED TO
+  CALLERS and live up to 600s — release_war_object() was only safe because a war's lifetime
+  traced to exactly two consumers, and a cached clan's does not. A severed object still held by
+  a caller is precisely the bug that surfaces far from its cause. Slicing needs no ownership
+  analysis at all. (qaplop's proposal; it is the better trade here.)
+- Interval is TUNED, not arbitrary: every-100 measured WORSE than every-500 because per-call
+  overhead dominates once slices get small. Re-measure before lowering it.
+- Correction to an earlier claim of mine: I had rejected mid-cycle collection outright, arguing
+  it would walk live in-flight objects and promote them, reproducing the automatic collector's
+  problem. That was wrong. The automatic collector's problem was generation DEPTH (gen-2 sweeps
+  walking the whole heap), not timing; gen-0 is shallow and the in-flight population is
+  semaphore-bounded (~50 clans), so each slice walks almost nothing live. Measured: no gen-2
+  backlog growth across cycles. Documented in PERFORMANCE_TUNING.md so the reversal reads as a
+  measured correction rather than a contradiction.
+- Note on dev-measured GC numbers generally: PROD is Linux on a Celeron, dev is Windows on a
+  fast CPU. The 0.018s -> 2.050s miss in (17) was attributed to memory latency, but allocator
+  and platform differences plausibly contribute too. Treat any dev-measured GC TIMING as
+  indicative only; object COUNTS (155 per clan graph, 132 per war) are structural and do carry.
+- Still unexplained: why build 14's _gc_deliberate flag did not reach the pause logger. Verified
+  the flag WAS in build 14's deployed code (git show 9a85b96). Not reproducible on dev — which
+  may itself be the platform difference. (22)'s gc.isenabled() label is immune to either cause,
+  so this is left as a known-unknown rather than chased further.
+
 2026-09-04 (22)
 - Verified on PROD (2 build-14 cycles, unprofiled): release_war_object() works. freed= dropped
   472,450 -> 103,687 (-78%), gc_collect 1.976s -> 1.135s (-43%), [LOOP-LAG] max 1.94s -> 0.93s

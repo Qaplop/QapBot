@@ -456,6 +456,50 @@ passing after a coc.py upgrade added a back-reference while the pause silently r
 run?" is usually the second-best one. Ask "why is this garbage collectable-only at all?"
 first — an object graph that refcounting can free costs nothing to release, at any time.
 
+### Slicing the collection (build 17): make the remaining pause invisible instead of chasing it
+
+Build 14 verified on PROD: `freed=` 472,450 -> 103,687 (**-78%**), `gc_collect` 1.976s ->
+1.135s, `[LOOP-LAG]` max 1.94s -> 0.93s, p95 0.031s. Good, but not invisible.
+
+Two facts decided what came next:
+
+1. **The remaining garbage is `coc.Clan`, not `ClanWar`.** 103,687 / **155 objects per clan
+   graph** = ~669 clan graphs per cycle, from `coc_clan_cache`. `coc.Clan` is cyclic for the
+   same reason `ClanWar` is — `ClanMember.clan` back-references the clan.
+2. **Severing them would be dangerous.** Unlike war objects, cached clans are *handed to
+   callers* and live up to 600s. `release_war_object()` was safe only because a war's lifetime
+   was traceable to two consumers. A cached clan's is not, and a severed object still held by a
+   caller is exactly the kind of bug that surfaces far from its cause.
+
+So the fix is not to remove the remaining garbage but to make collecting it invisible. Cost
+per object rose 4.2us -> 10.9us as garbage fell, which says the sweep is dominated by what it
+**walks** (the live young generation), not by what it frees. Collecting more often, in smaller
+slices, shrinks the young generation each pass:
+
+| slice interval | collects | max pause | total GC |
+|---|---|---|---|
+| one collect at cycle end | 1 | 0.0102s | 0.0102s |
+| every 1000 | 3 | 0.0034s | 0.0091s |
+| **every 500** | **6** | **0.0018s (5.8x lower)** | **0.0093s** |
+| every 300 | 9 | 0.0027s | 0.0096s |
+| every 100 | 27 | 0.0058s | 0.0117s |
+
+Total GC time goes *down* slightly — dead objects stop being re-walked by later passes. And
+**every-100 is worse than every-500**: per-call overhead dominates once slices get too small.
+The interval is tuned, not arbitrary; re-measure before changing it (`GC_CHUNK_EVERY`).
+
+`maybe_chunk_collect()` is called per clan from Phase 1 and Phase 3, on one shared counter.
+Scaling PROD's 1.135s by ~5 lands **~0.2s** — under the `[LOOP-LAG]` warn threshold and 15x
+under Discord's ACK deadline.
+
+**Why mid-cycle collection is safe here when the automatic collector was not.** This looks like
+a reversal, and is not: the automatic collector's problem was **generation depth**, not timing.
+Its gen-2 sweeps walked the entire heap. `gc.collect(0)` is shallow, and the in-flight
+population is semaphore-bounded (~50 clans), so each slice walks almost nothing live. Measured:
+no gen-2 backlog growth across cycles, so promoted survivors do not accumulate. An earlier
+version of this analysis rejected mid-cycle collection outright on the promotion argument —
+that was wrong, and measurement is what corrected it.
+
 ### Also fixed: `gc.set_threshold(700, 10, 20)` was inoperative-to-harmful on Python 3.14
 
 That call (2026-08-17) was written against Python <=3.11, whose default really was

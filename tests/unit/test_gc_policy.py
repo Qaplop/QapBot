@@ -155,3 +155,105 @@ class TestEscapeHatch:
 
         assert not gc.isenabled()
         assert gc.collect(1) > 0
+
+
+class TestChunkedCollection:
+    """`maybe_chunk_collect()` slices the per-cycle collection so no single pause is visible.
+
+    Even after `release_war_object()` removed 78% of the garbage, one end-of-cycle
+    `gc.collect(1)` still cost 1.135s on PROD: a sweep's cost tracks what it WALKS, and most of
+    that is the live young generation rather than the garbage found. Measured at cycle shape,
+    slicing every 500 units gives a **5.8x lower max pause** with *slightly less* total GC time
+    (dead objects stop being re-walked by later passes). every-100 measured worse than
+    every-500, so the interval is a tuned value, not an arbitrary one.
+
+    This is also what makes the remaining `coc.Clan` garbage a non-problem without lifetime
+    tracking: cached clans are handed to callers and live up to 600s, so severing their
+    back-references would risk breaking a holder. Making collection invisible needs no
+    ownership analysis at all.
+    """
+
+    def test_collects_once_per_interval_and_only_gen0(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import QapBot
+
+        seen: List[Any] = []
+        monkeypatch.setattr(QapBot, "_CHUNK_COLLECT_EVERY", 5)
+        monkeypatch.setattr(QapBot, "_chunk_collect_counter", 0)
+        monkeypatch.setattr(QapBot.gc, "collect", lambda *a, **k: seen.append(a[0] if a else None) or 0)
+
+        for _ in range(12):
+            QapBot.maybe_chunk_collect()
+
+        assert len(seen) == 2, f"expected 2 slices in 12 calls at interval 5, got {len(seen)}"
+        assert set(seen) == {0}, "slices must be generation-0 only — a deeper sweep is the pause we are avoiding"
+
+    def test_disabled_by_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """GC_CHUNK_EVERY=0 must fully disable slicing, for A/B and for debugging."""
+        import QapBot
+
+        seen: List[Any] = []
+        monkeypatch.setattr(QapBot, "_CHUNK_COLLECT_EVERY", 0)
+        monkeypatch.setattr(QapBot, "_chunk_collect_counter", 0)
+        monkeypatch.setattr(QapBot.gc, "collect", lambda *a, **k: seen.append(1) or 0)
+
+        for _ in range(50):
+            QapBot.maybe_chunk_collect()
+
+        assert seen == []
+
+    def test_never_raises_into_a_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A failed teardown must not fail an update cycle."""
+        import QapBot
+
+        def _boom(*_a: Any, **_k: Any) -> int:
+            raise RuntimeError("gc exploded")
+
+        monkeypatch.setattr(QapBot, "_CHUNK_COLLECT_EVERY", 1)
+        monkeypatch.setattr(QapBot, "_chunk_collect_counter", 0)
+        monkeypatch.setattr(QapBot.gc, "collect", _boom)
+
+        QapBot.maybe_chunk_collect()  # must not propagate
+
+    def test_deliberate_flag_is_always_cleared(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A stuck flag would mislabel every later automatic pause as [GC-SCHEDULED] — the one
+        signal that tells us the GC policy has lapsed."""
+        import QapBot
+
+        def _boom(*_a: Any, **_k: Any) -> int:
+            raise RuntimeError("gc exploded")
+
+        monkeypatch.setattr(QapBot, "_CHUNK_COLLECT_EVERY", 1)
+        monkeypatch.setattr(QapBot, "_chunk_collect_counter", 0)
+        monkeypatch.setattr(QapBot.gc, "collect", _boom)
+
+        QapBot.maybe_chunk_collect()
+
+        assert QapBot._gc_deliberate is False
+
+    def test_slicing_lowers_the_worst_pause(self, isolated_gc) -> None:
+        """The actual claim, measured rather than asserted structurally."""
+        import time
+
+        gc.disable()
+        gc.collect()
+
+        def run(interval: int | None) -> float:
+            pauses = []
+            live: List[Any] = []
+            for i in range(1200):
+                _war_graph(wars=1, members=8)
+                live.append(object())
+                if len(live) > 50:
+                    live.pop(0)
+                if interval and i % interval == interval - 1:
+                    t = time.perf_counter(); gc.collect(0); pauses.append(time.perf_counter() - t)
+            t = time.perf_counter(); gc.collect(1); pauses.append(time.perf_counter() - t)
+            return max(pauses)
+
+        one_big = min(run(None) for _ in range(3))
+        sliced = min(run(300) for _ in range(3))
+
+        assert sliced < one_big, (
+            f"slicing did not lower the worst pause ({sliced:.4f}s vs {one_big:.4f}s) — "
+            "re-tune _CHUNK_COLLECT_EVERY before trusting it on PROD"
+        )
