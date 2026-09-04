@@ -500,6 +500,34 @@ no gen-2 backlog growth across cycles, so promoted survivors do not accumulate. 
 version of this analysis rejected mid-cycle collection outright on the promotion argument —
 that was wrong, and measurement is what corrected it.
 
+### Build 17 result: the remaining pause is walking LIVE objects, and neither fix touches it
+
+Slicing cut end-of-cycle garbage 76% (`freed=` 103,687 -> 24,996) and the pause did not move
+(`gc_collect` 1.135s -> 1.292s, `[LOOP-LAG]` max 0.93s -> 1.22s; load differed ~20%, so per
+clan it is 0.597 -> 0.565 ms — roughly neutral. Two cycles each, do not over-read).
+
+The arithmetic settles where the time goes: at the ~240K objects/s this box measures, freeing
+25K objects should cost ~0.10s. It costs ~1.29s. **~1.2s of the pause is walking LIVE
+young-generation objects.**
+
+That is a floor neither of today's fixes can lower. `release_war_object()` acts after Phase 3;
+slicing removes only dead objects. The live population is the ~2,300 `coc.ClanWar` objects held
+in `fetch_results` from the gather until each one's turn in Phase 3 — exactly what
+`plans/tracker-0009-phase1-war-payload-retention.md` removes. **That plan is now the next real
+lever on Discord responsiveness**, not just on memory. (Date-gated: not before 2026-09-11.)
+
+**Method warning — dev simulation has mispredicted this box twice, both times optimistically:**
+
+| Predicted (dev) | Actual (PROD) |
+|---|---|
+| per-cycle collect 0.018s | **2.050s** (70x) |
+| slicing cuts max pause 5.8x | **no improvement** |
+
+PROD is Linux on a Celeron with single-channel DDR3L; dev is Windows on a fast desktop.
+Allocator, memory latency and platform all differ. Object **counts** measured on dev transfer
+(155 per clan graph, 132 per war — structural). **Timings do not.** Treat a dev-measured GC
+duration as a hypothesis until PROD confirms it.
+
 ### Also fixed: `gc.set_threshold(700, 10, 20)` was inoperative-to-harmful on Python 3.14
 
 That call (2026-08-17) was written against Python <=3.11, whose default really was

@@ -1,6 +1,30 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-04 (24)
+- Build 17 measured on PROD: the [GC-SCHEDULED] label fix works, and slicing cut end-of-cycle
+  garbage 76% (freed= 103,687 -> 24,996). But the PAUSE did not move: gc_collect 1.135s ->
+  1.292s, [LOOP-LAG] max 0.93s -> 1.22s. Load differed ~20% between samples, so per clan it is
+  0.597 -> 0.565 ms — roughly neutral, not the regression the raw numbers suggest. Two cycles
+  each; do not over-read in either direction.
+- What that proves: at the ~240K objects/s this box measures, freeing 25K objects should cost
+  ~0.10s; it costs ~1.29s. So ~1.2s of the remaining pause is walking LIVE young-generation
+  objects, not freeing garbage. Neither release_war_object() (acts after Phase 3) nor slicing
+  (removes only dead objects) can lower that floor.
+- Consequence: tracker-0009-phase1-war-payload-retention.md is now the next real lever on
+  Discord responsiveness, not only on memory. The live population IS the ~2,300 coc.ClanWar
+  objects held in fetch_results between the gather and Phase 3, which that plan removes. This
+  CORRECTS the note I added to that plan earlier today saying "do not re-justify this plan on
+  GC grounds" — the opposite is true, and it is now the stronger of its two justifications.
+  Plan and PERFORMANCE_TUNING.md both updated. Still date-gated: not before 2026-09-11.
+- Method warning recorded in both docs: dev simulation has now mispredicted this box twice, both
+  times optimistically (0.018s vs 2.050s actual; "5.8x lower max pause" vs no improvement).
+  Object COUNTS measured on dev transfer (structural); TIMINGS do not. PROD is Linux/Celeron/
+  single-channel DDR3L, dev is Windows on a fast desktop — qaplop's platform point, now with
+  evidence behind it.
+- No code change: chunking is kept (per-clan neutral, and it does cut end-of-cycle garbage), and
+  GC_CHUNK_EVERY=0 can A/B it without a deploy.
+
 2026-09-04 (23)
 - Added: maybe_chunk_collect() — the per-cycle collection is now sliced into generation-0
   passes every 500 clans (GC_CHUNK_EVERY, 0 = off), called from Phase 1 and Phase 3 on one

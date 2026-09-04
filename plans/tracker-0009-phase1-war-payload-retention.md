@@ -205,8 +205,8 @@ which happens to share a root cause (coc.py's cyclic war graph).
   §2's note stands.
 - **The graph's shape is now measured, not assumed:** 132 sweep-only objects for a 15v15 war,
   ~195/clan on PROD average. Supports §2's "3-4x heavier" framing.
-- **The GC cost of these objects is already gone**, so do not re-justify this plan on GC
-  grounds. Its remaining case is peak RSS and the `_MAX_INACTIVE_PER_CYCLE` cap.
+- **The GC cost of these objects as *garbage* is gone.** But see the CORRECTION below — their
+  cost as *live retained objects* is not, and that is the dominant remaining pause.
 
 ### A merge conflict this plan does not anticipate
 
@@ -238,3 +238,41 @@ memory-safety one. Re-scope the ticket accordingly before starting.
 ### Status unchanged
 
 Still **do not start before 2026-09-11** — the 2026-09 CWL season is running as of this note.
+
+### CORRECTION (build 17 PROD data, same day): this plan IS justified on GC grounds after all
+
+The note above originally said "do not re-justify this plan on GC grounds". **That was wrong**,
+and the build-17 measurement is what corrected it.
+
+Slicing the collection (build 17) cut end-of-cycle garbage by 76% — `freed=` 103,687 -> 24,996 —
+and the pause did **not** move: `gc_collect` 1.135s -> 1.292s, `[LOOP-LAG]` max 0.93s -> 1.22s.
+(Load differed ~20% between the samples, so per clan it is 0.597 -> 0.565 ms — roughly neutral,
+not the regression the raw numbers suggest. Two cycles each; do not over-read either way.)
+
+The arithmetic is the point. At the ~240K objects/s this box measures, freeing 25K objects
+should cost ~0.10s. It costs ~1.29s. **So ~1.2s of the remaining pause is walking LIVE
+young-generation objects, not freeing garbage.**
+
+That is precisely what this plan removes. Every `coc.ClanWar` held in `fetch_results` between
+the gather (QapBot.py L1633) and its turn in Phase 3 (L1855) is a live object the end-of-cycle
+collect must walk. Neither `release_war_object()` (which acts after Phase 3) nor slicing (which
+removes only dead objects) touches it. Cutting retention from ~120-170 KB to ~40 KB per clan
+cuts that walk in the same proportion.
+
+So this plan now has two independent justifications: peak RSS / `_MAX_INACTIVE_PER_CYCLE`
+(§4, §9), and **the ~1.2s live-object walk that is the current floor on Discord
+responsiveness**. The second is the stronger one.
+
+### Method note: stop trusting dev simulation for GC timing on this box
+
+Dev-side simulation has now mispredicted PROD twice, both times optimistically:
+
+| Predicted (dev) | Actual (PROD) |
+|---|---|
+| per-cycle collect 0.018s | **2.050s** (70x) |
+| slicing cuts max pause 5.8x | **no improvement** |
+
+PROD is Linux on a Celeron with single-channel DDR3L; dev is Windows on a fast desktop CPU.
+Allocator behaviour, memory latency and platform all differ. **Object counts** measured on dev
+are structural and do transfer (155 per clan graph, 132 per war). **Timings do not.** Before
+acting on any dev-measured GC duration, either verify it on PROD or state it as a hypothesis.
