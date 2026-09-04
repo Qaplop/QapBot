@@ -1,6 +1,14 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-04 (18)
+- Fixed (cosmetic, but it mattered): the GC pause logger labelled our own deliberate collects
+  as "[GC-AUTO] Automatic gen-N ...". gc.callbacks fires for explicit collections too, so since
+  automatic collection was disabled in (17) the log was reporting the exact behaviour the GC
+  policy exists to prevent. Deliberate collects (per-cycle, nightly, startup freeze) now log as
+  [GC-SCHEDULED]; [GC-AUTO] now means only what it says — CPython picked the moment — so any
+  future [GC-AUTO] line is a real signal that the policy is not in effect.
+
 2026-09-04 (17)
 - Fixed (the longstanding one): Discord responsiveness during update cycles. Automatic GC is
   now disabled at startup; collection runs on our schedule instead — a young-generation

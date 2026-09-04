@@ -107,6 +107,14 @@ import gc
 import time as _gc_time
 _gc_pause_start: dict[int, float] = {}
 
+# Set while THIS code calls gc.collect() on purpose, so the callback below can tell a
+# scheduled collection from one CPython started on its own. gc.callbacks fires for both, and
+# since 2026-09-04 the automatic collector is disabled — so without this every deliberate
+# per-cycle/nightly collect was logged as "[GC-AUTO] Automatic ...", i.e. the log claimed the
+# exact behaviour the GC policy exists to prevent. Plain bool, not a lock: collections hold the
+# GIL and never overlap.
+_gc_deliberate: bool = False
+
 def _log_slow_gc(phase: str, info: dict) -> None:  # type: ignore[type-arg]
     gen = info.get("generation", -1)
     if phase == "start":
@@ -119,8 +127,12 @@ def _log_slow_gc(phase: str, info: dict) -> None:  # type: ignore[type-arg]
     if elapsed >= 0.5:  # gen-0 collections are frequent and normally sub-ms; only the rare slow ones matter
         # INFO, not WARNING: expected/monitored background behavior (mitigated by the
         # startup gc.freeze() + nightly re-freeze), not an actionable error on its own.
+        # [GC-AUTO] means CPython chose the moment and is what the GC policy is meant to
+        # eliminate; [GC-SCHEDULED] means we chose it and is expected.
         logging.info(
-            "[GC-AUTO] Automatic gen-%d collection paused the process for %.3fs (collected=%d, uncollectable=%d)",
+            "[%s] %s gen-%d collection paused the process for %.3fs (collected=%d, uncollectable=%d)",
+            "GC-SCHEDULED" if _gc_deliberate else "GC-AUTO",
+            "Deliberate" if _gc_deliberate else "Automatic",
             gen, elapsed, info.get("collected", 0), info.get("uncollectable", 0),
         )
 
@@ -2499,10 +2511,15 @@ async def run_nightly_maintenance_routine(db_mgr: Any, run_migration: bool) -> s
         # *task* schedulable while it runs (Pitfall 16) — best-effort, never fails maintenance.
         try:
             def _nightly_gc_refresh() -> tuple[int, float]:
+                global _gc_deliberate
                 _gc_t0 = time.perf_counter()
-                gc.unfreeze()
-                collected = gc.collect()
-                gc.freeze()
+                _gc_deliberate = True
+                try:
+                    gc.unfreeze()
+                    collected = gc.collect()
+                    gc.freeze()
+                finally:
+                    _gc_deliberate = False
                 return collected, time.perf_counter() - _gc_t0
             _gc_collected, _gc_elapsed = await asyncio.to_thread(_nightly_gc_refresh)
             logging.info(
@@ -2855,7 +2872,12 @@ async def periodic_main() -> None:
                 # all of it without walking the long-lived heap. Measured identical in cost to
                 # collect(0) while also catching objects promoted by the previous cycle's call.
                 # The full sweep happens nightly, where a multi-second pause is acceptable.
-                _gc_collected = _gc.collect(1)
+                global _gc_deliberate
+                _gc_deliberate = True
+                try:
+                    _gc_collected = _gc.collect(1)
+                finally:
+                    _gc_deliberate = False
                 _t2 = time.perf_counter()
                 # Return fragmented free arenas to the OS (Linux/glibc only).
                 # Python's pymalloc never releases arenas until fully empty, so
@@ -3747,8 +3769,13 @@ async def _run_startup_initialization() -> None:
             # discord.py's heartbeat task schedulable while they run — not because
             # that makes them non-blocking.
             def _freeze_startup_heap() -> int:
-                gc.collect()
-                gc.freeze()
+                global _gc_deliberate
+                _gc_deliberate = True
+                try:
+                    gc.collect()
+                    gc.freeze()
+                finally:
+                    _gc_deliberate = False
                 return gc.get_freeze_count()
             _frozen_count = await asyncio.to_thread(_freeze_startup_heap)
             logging.info(f"[GC-FREEZE] Froze {_frozen_count:,} startup object(s) into the permanent generation")
