@@ -1,6 +1,49 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-04 (25)
+- Started tracker-0009 (Phase-1 war-payload retention) under a staged, evidence-gated plan that
+  replaces its "do not start before 2026-09-11" date gate. Rationale in §10 of the plan: the
+  headroom argument (cycle mean 111s / max 144s against a 300s budget) de-risks cycle time, but
+  the gate's real danger is §5.1 silent stat corruption, which a code revert cannot undo. Two
+  things resolve it — CWL running means §5.3's CWL-only fallback path is under live test NOW
+  rather than lurking until October, and the headroom pays for Stage 2 shadow mode, which makes
+  corruption impossible by construction. Stages and gates are recorded in the plan so the work
+  is resumable across sessions.
+- Added: tests/integration/test_war_payload_parity.py — Stage 1's parity harness.
+  **54,192 / 54,192 real temp wars, ZERO mismatches** on Player, PlayerID, TH_lvl, Stars,
+  Attacks, Max_Attacks, Total_Dest_Pct. Reconstructs a coc.ClanWar from each payload and runs
+  both extraction paths over it. PARITY_LIMIT caps the file count (default 4000) so the normal
+  suite stays fast; the corpus class skips where the corpus is absent.
+- FINDING: §2's table is WRONG about Defensive_Stars, and it is the riskiest field in the
+  migration. coc.py's m.best_opponent_attack resolves _best_opponent_attacker, which comes
+  straight from the CoC API's own bestOpponentAttack.attackerTag. The payload's
+  bestOpponentAttack is computed by OUR find_best_opponent_attack(), which scans every opponent
+  attack precisely because the API field misses late CWL attacks. Deliberately different — so
+  switching would CHANGE behaviour, not preserve it. And no corpus replay can check it: temp
+  files do not retain the API's value, so reconstruction feeds ours back in and the comparison
+  goes circular. Deferred to Stage 2 shadow mode on live data.
+- FINDING: §5.2's state-normalisation risk confirmed on the harness's first run — the payload
+  stores 'in_war', coc.py's WarState only accepts 'inWar'. Matters beyond the harness:
+  process_clan_war_data() gates its temp-stats block on state in ('preparation','in_war'), so
+  reading state from the payload without mapping would silently skip the block for every in_war
+  clan — §5.1's exact failure mode.
+- FINDING: a green parity run only proves READER correctness. The harness reconstructs the coc
+  object from the payload, so both sides read the same keys and corrupting the DATA is invisible
+  (both go to 0 and agree). That is the right scope — the data is fixed on disk and the risk is
+  a mistyped key in the new reader — but it is now stated explicitly. The harness's first
+  self-test corrupted data and passed for the wrong reason; it now injects a faulty READER, and
+  a second test asserts a silent 0 in every numeric field is caught.
+- Corpus coverage note: the 54,192 files are in_war (49,463) and preparation (4,729) only — no
+  war_ended, since those move to archive. Harmless here (the stats block only runs for those two
+  states) but the war_ended path is unexercised, and Stage 2's gate already requires one.
+- NOT done: §3 Step 1 (extract build_war_payload). First attempt reverted — the payload literal
+  depends on six nested closures plus league_group/member-list locals, so it is a ~160-line
+  verbatim move, not a small edit. Also recorded in the plan: cache_manager.py HAS a UTF-8 BOM,
+  so never ast.parse() its contents read as plain utf-8 (misleading "invalid non-printable
+  character U+FEFF").
+- No code change to the bot: harness and docs only, so no BOT_BUILD bump. Nothing to deploy.
+
 2026-09-04 (24)
 - Build 17 measured on PROD: the [GC-SCHEDULED] label fix works, and slicing cut end-of-cycle
   garbage 76% (freed= 103,687 -> 24,996). But the PAUSE did not move: gc_collect 1.135s ->

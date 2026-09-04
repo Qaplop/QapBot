@@ -1,6 +1,8 @@
 # Tracker #0009 follow-up — stop Phase 1 retaining `coc.ClanWar` objects
 
-**Status:** deferred, not started.
+**Status:** IN PROGRESS — staged execution, see §10 at the bottom for stage status and gates.
+**~~Do not start before 2026-09-11~~** (superseded by §10)
+Original gate rationale kept below for the reasoning it records:
 **Do not start before 2026-09-11** — the 2026-09 CWL season runs 1st-10th September, and this
 touches the update cycle's hottest path (`fetch_clan_war_data` → `process_clan_war_data`, the
 war-file lifecycle). Refactoring that immediately before a CWL season is the wrong trade; CWL is
@@ -276,3 +278,149 @@ PROD is Linux on a Celeron with single-channel DDR3L; dev is Windows on a fast d
 Allocator behaviour, memory latency and platform all differ. **Object counts** measured on dev
 are structural and do transfer (155 per clan graph, 132 per war). **Timings do not.** Before
 acting on any dev-measured GC duration, either verify it on PROD or state it as a hypothesis.
+
+---
+
+## 10. AGREED EXECUTION PLAN (2026-09-04) — staged, resumable
+
+**This supersedes the "do not start before 2026-09-11" gate at the top of this file.** Read this
+section first if you are picking the work up mid-flight; each stage records its own status.
+
+### Why the date gate was replaced with an evidence gate
+
+qaplop's argument for starting now: recent GC work keeps the CWL cycle at **mean 111s, max 144s
+against a 300s budget** — ~156s of headroom at peak, so a performance regression cannot breach
+the SLA.
+
+That is true but addresses the wrong axis. The gate's real danger is §5.1: **silent stat
+corruption**, which a code revert does not undo once zero-star rows reach war history. Headroom
+protects cycle time, not data.
+
+Two things resolve it:
+
+1. **The season cuts both ways, which the original gate did not account for.** §5.3's
+   `_find_active_cwl_war_for_clan()` replace-and-resave path *only runs during CWL*. Shipping
+   after 2026-09-10 means it is not exercised again until October — a bug there would lurk for a
+   month and then fire unobserved during the next season. Doing this while CWL runs puts the
+   riskiest path under live test immediately.
+2. **Spend the headroom on verification instead of speed.** Shadow mode (Stage 2) makes
+   corruption impossible by construction, and the spare 156s is what pays for running both code
+   paths at once.
+
+So: proceed now, but each stage is gated on evidence from the previous one, not on a date.
+
+### Stage 1 — evidence, zero PROD risk — **STATUS: harness DONE, extraction OPEN**
+
+- [x] **Parity harness** over the DEV temp-file corpus (**54,192 files** — the §5.1 estimate of
+      ~31k was low). Runs the coc-object path and the payload path over the same real files and
+      asserts the produced `temp_war_stats` are equal. §6 says write this first; it is the test
+      that actually justifies the change, and it is far stronger evidence than any calendar.
+- [ ] **Step 1 of §3** — extract `build_war_payload()` from `save_war_object()`. Behaviour-
+      neutral; verify byte-identical temp files before going further.
+
+**Gate to Stage 2:** parity exact over the whole corpus. Any mismatch class must be understood
+and fixed, not waived — §5.1's failure mode is a silent 0, so "only 3 files differ" is a finding,
+not noise.
+
+### Stage 1 results (2026-09-04) — harness DONE, extraction still open
+
+**Parity harness: `tests/integration/test_war_payload_parity.py`. Result: 54,192 / 54,192 real
+temp wars, ZERO mismatches** on `Player`, `PlayerID`, `TH_lvl`, `Stars`, `Attacks`,
+`Max_Attacks`, `Total_Dest_Pct`. It reconstructs a `coc.ClanWar` from each payload and runs both
+extraction paths over it. Runs in ~31s; `PARITY_LIMIT` caps the file count (default 4000 so the
+normal suite stays fast), and the whole class skips where the corpus is absent.
+
+That is Stage 1's gate MET **for the fields it can cover**. Three findings change the plan:
+
+#### FINDING 1 — §2's table is wrong about `Defensive_Stars`, and it is the riskiest field
+
+§2 lists `m.best_opponent_attack.stars` -> `bestOpponentAttack` as a pure key mapping. It is not:
+
+* `process_clan_war_data()` reads coc.py's `m.best_opponent_attack`, which resolves
+  `_best_opponent_attacker` — populated straight from **the CoC API's own**
+  `bestOpponentAttack.attackerTag` field.
+* the payload's `bestOpponentAttack` is computed by **our** `find_best_opponent_attack()`, which
+  scans every opponent attack *specifically because the API field misses late CWL attacks* (see
+  the comment in `simple_member`).
+
+So switching to the payload would **change `Defensive_Stars` behaviour** — probably for the
+better, that is why our function exists, but it is a behaviour change and not a refactor.
+
+**And no corpus replay can validate it.** Temp files do not retain the API's original value, so
+reconstruction feeds our computed value back in and the comparison goes circular. It is
+therefore excluded from the harness by design. **`Defensive_Stars` can only be validated by
+Stage 2 shadow mode**, on live data where the coc object still carries the API field. Treat it
+as the single highest-risk item in the migration.
+
+#### FINDING 2 — §5.2's state-normalisation risk is real, confirmed on the first run
+
+The payload stores its own normalised `state` (`in_war`); coc.py's `WarState` enum only accepts
+the raw API spelling (`inWar`). The harness failed immediately on this until it mapped back.
+
+This matters beyond the harness: `process_clan_war_data()` gates its temp-stats block on
+`state in ('preparation','in_war')`. Anything that starts reading `state` from the payload must
+not assume the coc spelling — get it wrong and the block is silently skipped for every in_war
+clan, which is §5.1's silent-zero failure mode exactly.
+
+#### FINDING 3 — what a green parity run does and does not prove
+
+The harness reconstructs the coc object *from the payload*, so both sides read the same keys.
+Corrupting the **data** is therefore invisible to it: both sides degrade to 0 and agree. It only
+catches a **reader** that mistypes a key — which is the actual migration risk, since the data is
+fixed on disk. The first version of its self-test corrupted the data and passed for the wrong
+reason; it now injects a faulty reader instead, and a second test asserts a silent 0 in *every*
+numeric field is caught. Do not "simplify" those two tests away.
+
+**Corpus coverage note:** the 54,192 files are `in_war` (49,463) and `preparation` (4,729) only —
+no `war_ended`, because those move to archive. Harmless for this harness (the temp-stats block
+only runs for those two states), but it means the `war_ended` path is unexercised here and must
+be covered by Stage 2's gate, which already requires one `war_ended` finalisation.
+
+#### Still open in Stage 1
+
+- [ ] **Step 1 of §3 — extract `build_war_payload()`.** Not done. First attempt was reverted:
+      the payload literal depends on six nested closures (`simple_attack`,
+      `find_best_opponent_attack`, `calculate_defensive_stars`, `simple_member`, `simple_badge`,
+      `simple_clan`) plus `league_group_data`, `clan_obj`/`opponent_obj` and the member lists, so
+      it is a ~160-line move, not a few lines. Extract them **together, verbatim**, into a
+      module-level `build_war_payload(coc_war_obj, my_clan, enemy_clan)` placed *outside* the
+      class, and have `save_war_object()` call it. `cache_manager.py` **has a UTF-8 BOM** — read
+      and write it with `utf-8-sig`/explicit byte handling, and never `ast.parse()` a BOM-bearing
+      string (it raises a misleading "invalid non-printable character").
+
+### Stage 2 — shadow mode on PROD — **STATUS: not started**
+
+Implement §3 steps 2-4, but **do not make the payload authoritative yet**:
+
+- build the payload AND keep the coc object,
+- compute the Phase-3 stats **both** ways,
+- compare; log `[PAYLOAD-PARITY]` with clan tag and differing key on any mismatch,
+- **use the coc-object result.**
+
+Corruption is impossible by construction here, because the new path is not authoritative. Costs
+extra CPU for a few cycles — that is what the headroom buys. Note this stage does **not** yet
+reduce retention, so the ~1.2s live-object GC win (§9's CORRECTION) does not arrive until
+Stage 3.
+
+**Gate to Stage 3:** zero `[PAYLOAD-PARITY]` mismatches across at least one full CWL day,
+including at least one `war_ended` finalisation and one CWL fallback (§5.3) occurrence.
+
+### Stage 3 — flip to payload-only — **STATUS: not started**
+
+- Drop the coc object from the Phase-1 return value; remove the shadow comparison.
+- Delete the `release_war_object()` call at the Phase-3 site (§9 — nothing left to sever there);
+  **keep the function** for the `get_league_war()` CWL paths and as the coc.py canary.
+- Keep `maybe_chunk_collect()` (unrelated; governs `coc_clan_cache` garbage).
+- Measure: `[CYCLE-CLEANUP] gc_collect`, `[LOOP-LAG]` max, and `RSS=` peak against the build-17
+  baseline recorded in §9's CORRECTION (gc_collect ~1.29s, LOOP-LAG max ~1.22s, RSS 1.3-1.7 GB).
+
+**Expected:** gc_collect and LOOP-LAG max both fall substantially, because ~1.2s of the current
+pause is walking exactly the live objects this stage stops retaining.
+
+### Standing constraints
+
+- Opus, not Sonnet (top of file).
+- Do not read the payload back out of `CACHE.temp_war_objects` — §3 step 2 explains why that
+  silently yields `None` for `war_ended` clans.
+- Verify payload key names against a **real temp file**, not against §2's table — the payload
+  mixes snake_case and camelCase and that is where a silent-zero bug hides.
