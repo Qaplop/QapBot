@@ -18,7 +18,7 @@ async def test_coc_cache_fresh_hit_does_not_fetch(monkeypatch: pytest.MonkeyPatc
 
     fetch_called = False
 
-    async def _fetch_and_cache(_tag: str):
+    async def _fetch_and_cache(_tag: str, *, store_result: bool = True):
         nonlocal fetch_called
         fetch_called = True
         return "FETCHED"
@@ -66,7 +66,7 @@ async def test_coc_cache_expired_forces_blocking_fetch(monkeypatch: pytest.Monke
     now = datetime.now(timezone.utc)
     cache.cache["#CLAN"] = {"data": "CACHED", "timestamp": now - timedelta(seconds=30)}
 
-    async def _fetch_and_cache(_tag: str):
+    async def _fetch_and_cache(_tag: str, *, store_result: bool = True):
         return "FETCHED"
 
     monkeypatch.setattr(cache, "_fetch_and_cache", _fetch_and_cache)

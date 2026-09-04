@@ -3738,7 +3738,8 @@ async def status(interaction: discord.Interaction, force_refresh: bool = False):
     
     msg = (
         f"**QapBot Status**\n"
-        f"Version: {QBcore.BOT_VERSION}\n"
+        # build + src answer "which edit is actually running here?" without log access.
+        f"Version: {QBcore.BOT_VERSION} (build {QBcore.BOT_BUILD}, src {QBcore.source_fingerprint()})\n"
         f"Mode: {mode}\n"
         f"Uptime: {str(timedelta(seconds=int(uptime.total_seconds())))}\n"
         f"{os_info}\n"

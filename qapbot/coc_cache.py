@@ -44,7 +44,31 @@ from qapbot.constants import WAR_UPDATE_LEAGUES as _WAR_UPDATE_LEAGUES
 # the waves.  Eviction is FIFO on insertion order, which for a pure TTL cache means
 # "closest to expiry first" — the same policy (and rationale) as _MAX_TEMP_WAR_OBJECTS
 # in cache_manager.py.
-MAX_COC_CLAN_CACHE_ENTRIES = 1500
+# 2026-09-04: raised 1500 -> 20000.
+#
+# WHY THE CAP MUST NOT BIND: smart backdating deliberately schedules a CWL clan to be polled
+# on consecutive cycles around its war boundary (a few minutes before the war ends, then
+# again just after), which is the access pattern this cache was introduced for in the first
+# place.  At 1500 the Phase-1 flood evicted entries within seconds of caching them, so that
+# pattern could never be served — and worse, any hit-rate reading taken at that cap would
+# have described the eviction policy rather than the access pattern.
+#
+# SIZING: occupancy is bounded by the TTL, not by the cap — an entry lives 600s, so at most
+# (600 / cycle_period) cycles' worth of clans are alive at once.  Measured peak is 3,053
+# clans/cycle; at the normal 300s period that is ~6.1K entries, and if cycles shorten to
+# ~180s (the sleep floor lets them) it is ~10.2K.  20000 keeps roughly 2x headroom over that
+# worst case so the cap never becomes the thing under measurement.  Anything from ~12K up is
+# equivalent in practice; below ~10K it can start binding during heavy CWL cycles.
+#
+# MEMORY: entries are 69-90 KB each (see the module docstring — a "lazy" coc.Clan pins its
+# whole raw payload).  Realistic peak occupancy is therefore ~0.44 GB at a 300s period and
+# ~0.73 GB at 180s — NOT 20000 x 90 KB, because the TTL sweeps long before the cap is
+# reached.  Against 10 GB of RAM on the server-machine that is comfortable.
+#
+# This is currently a MEASUREMENT setting.  hit_rate= is now reported per population
+# (protected vs other) on every [COC-CACHE-CLEANUP] line; once those numbers are in, size
+# this to what is demonstrably re-read rather than leaving it at a round number.
+MAX_COC_CLAN_CACHE_ENTRIES = 20000
 
 
 class CoCClanCache:
@@ -89,6 +113,30 @@ class CoCClanCache:
         self.hard_ttl_seconds = hard_ttl_seconds
         self.max_entries = max_entries
         self.evicted_by_cap: int = 0  # lifetime counter, surfaced by get_stats()
+        # Hit/miss accounting.  There was none until 2026-09-04, so this cache's real
+        # effectiveness had never been measured — and measuring it then showed the polling
+        # path cannot hit it at all: fetch_clan_war_data()'s last_checked_via_api gate
+        # blocks a re-request for 12h (30min for role clans), which is strictly longer than
+        # this cache's 600s hard TTL, so a polled clan is ALWAYS expired before it could be
+        # asked for again.  Measured over 12.4h: 56,070 fetches across 55,609 distinct
+        # clans (1.01 each), zero refetch gaps inside the TTL.  Keep these counters so any
+        # future resizing is done on evidence, not on the assumption that a cache helps.
+        self.hits: int = 0          # served fresh, below soft TTL
+        self.stale_hits: int = 0    # served stale + scheduled a background refresh
+        self.misses: int = 0        # absent or past hard TTL -> blocking API fetch
+        # Same three, restricted to protected tags (subscribed / family / CWL group and
+        # their war opponents).  The whole question this cache poses is WHICH population is
+        # re-read: the handful of clans user commands ask about, or the tens of thousands the
+        # poll loop streams.  A single blended hit_rate cannot answer that — it would be
+        # dominated by whichever population is larger.  'other' is derived by subtraction.
+        self.hits_protected: int = 0
+        self.stale_hits_protected: int = 0
+        self.misses_protected: int = 0
+        # Clans exempt from size-cap eviction (TTL still expires them normally).
+        # Populated once per cycle by CacheManager.refresh_protected_clan_tags(); see
+        # _evict_over_cap() for why, and that method for what qualifies.
+        # Empty set = plain FIFO, i.e. the pre-2026-09-04 behaviour.
+        self.protected_tags: Set[str] = set()
         self._refreshing: set[str] = set()  # Clan tags currently being refreshed in background
         # Serializes update_player_info_in_user_accounts() per clan_tag (2026-08-21 incident fix)
         # — this method can be entered concurrently for the SAME clan from two independent call
@@ -112,7 +160,7 @@ class CoCClanCache:
         except Exception:
             pass  # Logging not yet configured during import
     
-    async def get_clan(self, clan_tag: str) -> 'coc.Clan':
+    async def get_clan(self, clan_tag: str, *, store_result: bool = True) -> 'coc.Clan':
         """
         Get clan data from cache or API using stale-while-revalidate.
         
@@ -122,10 +170,26 @@ class CoCClanCache:
         
         Args:
             clan_tag: Normalized clan tag (e.g., "#2C9UR9GJY")
-            
+            store_result: When ``False``, a freshly fetched clan is NOT written to the
+                cache. Reads are unaffected — a fresh entry is still served if one exists,
+                so this never costs an extra API call.
+
+                Use it for the Phase-1 polling path, whose own ``last_checked_via_api``
+                gate (12h, 30min for role clans) is far longer than this cache's 600s TTL:
+                it can never re-read what it stores, and it streams enough distinct clans
+                to fill the cache many times over (measured 2026-09-04: 55,609 distinct
+                clans in 12.4h, 1.01 fetches each, zero refetches inside the TTL). Storing
+                those results costs ~100-130 MB of resident memory and constant eviction
+                churn to serve nobody. Same rationale as ``get_league_war(cache_result=…)``
+                in cache_manager.py.
+
+                Leave it ``True`` for interactive callers (commands, UI, web bridge) —
+                those genuinely do re-ask within the TTL, and they are the reason this
+                cache exists.
+
         Returns:
             coc.Clan object
-            
+
         Raises:
             CacheError: If CoC API client not initialized
             Same exceptions as coc_client.get_clan() if blocking API call fails
@@ -144,6 +208,9 @@ class CoCClanCache:
             
             if age_seconds < self.soft_ttl_seconds:
                 # Fresh — return immediately
+                self.hits += 1
+                if clan_tag in self.protected_tags:
+                    self.hits_protected += 1
                 logging.debug(f"[COC-CACHE-HIT] {clan_tag} (age: {age_seconds:.1f}s)")
                 return cached["data"]
             
@@ -153,6 +220,9 @@ class CoCClanCache:
                     f"[COC-CACHE-STALE] {clan_tag} (age: {age_seconds:.1f}s, "
                     f"soft={self.soft_ttl_seconds}s, hard={self.hard_ttl_seconds}s)"
                 )
+                self.stale_hits += 1
+                if clan_tag in self.protected_tags:
+                    self.stale_hits_protected += 1
                 self._schedule_background_refresh(clan_tag)
                 return cached["data"]
             
@@ -165,9 +235,12 @@ class CoCClanCache:
             logging.debug(f"[COC-CACHE-MISS] {clan_tag}")
         
         # Blocking fetch from API
-        return await self._fetch_and_cache(clan_tag)
+        self.misses += 1
+        if clan_tag in self.protected_tags:
+            self.misses_protected += 1
+        return await self._fetch_and_cache(clan_tag, store_result=store_result)
     
-    async def _fetch_and_cache(self, clan_tag: str) -> 'coc.Clan':
+    async def _fetch_and_cache(self, clan_tag: str, *, store_result: bool = True) -> 'coc.Clan':
         """
         Fetch clan from CoC API, update cache and clan metadata.
         
@@ -192,12 +265,18 @@ class CoCClanCache:
         # Re-insert at the end so insertion order stays "oldest fetch first" even when an
         # existing entry is refreshed — otherwise a refreshed-in-place entry would keep its
         # original (now wrong) position and _evict_over_cap() would drop genuinely newer data.
-        self.cache.pop(clan_tag, None)
-        self.cache[clan_tag] = {
-            "data": clan_obj,  # type: ignore[dict-item]
-            "timestamp": now
-        }
-        self._evict_over_cap()
+        if store_result:
+            self.cache.pop(clan_tag, None)
+            self.cache[clan_tag] = {
+                "data": clan_obj,  # type: ignore[dict-item]
+                "timestamp": now
+            }
+            self._evict_over_cap()
+        else:
+            # Caller has declared this result not worth keeping (see get_clan's docstring).
+            # Drop any existing entry rather than leaving a staler one behind than what we
+            # just fetched and discarded.
+            self.cache.pop(clan_tag, None)
 
         # Update clan_name_cache and player info if cache_manager is available
         if self.cache_manager:
@@ -822,6 +901,25 @@ class CoCClanCache:
         if self.max_entries <= 0 or len(self.cache) <= self.max_entries:
             return 0
         evicted = 0
+        # Pass 1: evict UNPROTECTED entries only, still oldest-inserted first.
+        # The polling loop streams tens of thousands of distinct clans through this cache
+        # per day (measured: 55,609 in 12.4h) and never re-reads any of them, so under a
+        # plain FIFO the handful of clans that user commands DO ask about were flushed out
+        # within seconds of being cached — the cache was busy holding the one population
+        # that never reads it while evicting the one that does.  Protecting them costs
+        # nothing: ~100-150 tags against a 1500 cap.  TTL still expires them normally, so
+        # this changes WHICH entries survive pressure, never how stale an entry may get.
+        if self.protected_tags:
+            for _tag in list(self.cache):
+                if len(self.cache) <= self.max_entries:
+                    break
+                if _tag in self.protected_tags:
+                    continue
+                del self.cache[_tag]
+                evicted += 1
+        # Pass 2: if the cache is somehow still over cap with nothing but protected tags
+        # left, evict those too — the cap exists to bound memory, and a protected entry is
+        # still only a cache entry whose loss costs one API call.
         while len(self.cache) > self.max_entries:
             try:
                 self.cache.pop(next(iter(self.cache)))
@@ -854,7 +952,21 @@ class CoCClanCache:
             del self.cache[clan_tag]
         
         if expired_tags:
-            logging.info(f"[COC-CACHE-CLEANUP] Removed {len(expired_tags)} expired entries")
+            # Reported split by population, because a blended rate answers nothing: the
+            # protected clans (subscribed/family/CWL + opponents) and the tens of thousands
+            # the poll loop streams have completely different access patterns, and the
+            # larger population would swamp the smaller in a single number.
+            _p_served = self.hits_protected + self.stale_hits_protected
+            _p_total = _p_served + self.misses_protected
+            _o_served = (self.hits + self.stale_hits) - _p_served
+            _o_total = (self.hits + self.stale_hits + self.misses) - _p_total
+            logging.info(
+                "[COC-CACHE-CLEANUP] Removed %d expired | size=%d/%d evicted_by_cap=%d | "
+                "protected: %d/%d hit_rate=%.1f%% | other: %d/%d hit_rate=%.1f%%",
+                len(expired_tags), len(self.cache), self.max_entries, self.evicted_by_cap,
+                _p_served, _p_total, 100.0 * _p_served / max(_p_total, 1),
+                _o_served, _o_total, 100.0 * _o_served / max(_o_total, 1),
+            )
         
         return len(expired_tags)
     
@@ -872,6 +984,13 @@ class CoCClanCache:
                 "newest_age_seconds": 0,
                 "max_entries": self.max_entries,
                 "evicted_by_cap": self.evicted_by_cap,
+                "hits": self.hits,
+                "stale_hits": self.stale_hits,
+                "misses": self.misses,
+                "hits_protected": self.hits_protected,
+                "stale_hits_protected": self.stale_hits_protected,
+                "misses_protected": self.misses_protected,
+                "hit_rate": round((self.hits + self.stale_hits) / max(self.hits + self.stale_hits + self.misses, 1), 4),
             }
         
         now = datetime.now(timezone.utc)
@@ -884,6 +1003,13 @@ class CoCClanCache:
             "ttl_seconds": self.hard_ttl_seconds,
             "max_entries": self.max_entries,
             "evicted_by_cap": self.evicted_by_cap,
+            "hits": self.hits,
+            "stale_hits": self.stale_hits,
+            "misses": self.misses,
+            "hits_protected": self.hits_protected,
+            "stale_hits_protected": self.stale_hits_protected,
+            "misses_protected": self.misses_protected,
+            "hit_rate": round((self.hits + self.stale_hits) / max(self.hits + self.stale_hits + self.misses, 1), 4),
         }
     
     def get_memory_usage_mb(self) -> float:

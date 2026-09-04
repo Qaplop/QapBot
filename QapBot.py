@@ -887,6 +887,52 @@ async def post_leaderboards_to_subscribed_channels() -> None:
     else:
         logging.info(f"Discord posting complete: {total_posts} posted/updated, {skipped_posts} skipped (unchanged)")
 
+# ── Passive-refresh candidate cache ──────────────────────────────────────────────
+# Discovering "which passively-tracked clans have not been API-checked in 30 days" is a
+# scan over the ~306K clans that fail the categorize fast-reject, including a
+# datetime.fromisoformat() for each.  It feeds a 30-DAY cutoff, so recomputing it on every
+# ~5-minute cycle is pure waste.  Scan hourly instead and serve each cycle's batch out of
+# this cache, which keeps the per-cycle burn-down rate (_PASSIVE_REFRESH_BATCH_SIZE) exactly
+# as it was — the rate is what matters for the backlog, not the scan frequency.
+# Entries are consumed as they are handed out; the hourly rebuild re-derives the truth, so a
+# clan refreshed in the meantime simply stops being a candidate.
+_passive_scan_cache: list[tuple[str, str]] = []
+_passive_scan_mono: float = 0.0
+_passive_scan_found: int = 1  # last scan's candidate count; 1 = "unknown, scan on first cycle"
+_PASSIVE_SCAN_INTERVAL_S: float = 3600.0
+
+# TRIED AND REVERTED (2026-09-04): a tracked-clan index, so the categorize loop below
+# would walk only the ~150K clans with track_war_updates=True instead of all ~462K.
+# It worked and was correct (zero drift over every cycle it ran), and it saved NOTHING:
+# like-for-like with passive_scan=skipped, the full walk of 462K took 6.526s (n=5) and the
+# indexed walk of 150K took 6.600s (n=5).  Skipping 312K entries is worthless because the
+# fast-reject path is essentially free (one dict.get, a branch, continue) and materialising
+# the index-driven item list costs about what it saves.  It was removed rather than kept
+# because it carried a real correctness surface — six mutation sites that had to report
+# False->True promotions, plus drift detection existing only to catch a clan silently
+# ceasing to be polled — and because the tracked fraction is expected to rise over time,
+# which makes the trade worse, not better.
+# The categorize win came entirely from memoising the per-clan constants below.
+# Don't re-propose the index without first re-measuring the fast-reject cost per clan.
+
+# ── Per-clan memo caches for the categorize loop ─────────────────────────────────
+# Both of these memoize values that are CONSTANT for a clan between cycles, and both were
+# measured (2026-09-04) as the bulk of the ~44 us/clan the loop spends on each of the ~150K
+# tracked clans — 31% and 63% of the modelled per-clan cost respectively, i.e. 94% together.
+#
+# _recheck_offset_cache: compute_recheck_offset_seconds() is crc32(clan_tag) % jitter — a
+# pure function of the tag, recomputed 150K times per cycle for a value that never changes.
+#
+# _backdate_cache: the smart-backdating branch re-parses the war's start/end time out of
+# coc.py's Timestamp repr with a REGEX and re-derives the same ISO string every cycle, for
+# a war whose timestamps do not move.  Keyed on the raw string it parsed, so a war whose
+# timestamps DO change (CoC maintenance extension) misses the cache and recomputes —
+# the backdating behaviour itself is unchanged, only the recomputation is skipped.
+#   clan_tag -> (raw_timestamp_string, backdated_iso, backdated_datetime)
+_recheck_offset_cache: dict[str, int] = {}
+_backdate_cache: dict[str, tuple[str, str, datetime]] = {}
+
+
 async def main() -> None:
     """
     Main synchronization loop that updates clan war info and posts leaderboards.
@@ -932,6 +978,7 @@ async def main() -> None:
 
     logging.info("Starting clan war info updates...")
     _categorize_t0 = time.monotonic()
+    _categorize_c0 = time.process_time()
     now = datetime.now(timezone.utc)
     clans_to_update: list[tuple[str, bool]] = []
 
@@ -961,9 +1008,58 @@ async def main() -> None:
     # Per-clan re-check phase offset (2026-08-29, tracker #0009) — spreads the warless 22h
     # re-checks over a 2h window so they stop re-forming into one huge per-cycle wave.
     # Full rationale in compute_recheck_offset_seconds() at module level.
+    # Evaluated once per cycle instead of per clan.  The backdating branches build their
+    # debug strings with an f-string, which CPython evaluates eagerly even when DEBUG is
+    # suppressed — that was an extra isoformat() for every war-critical clan, every cycle,
+    # for output that gets discarded at INFO level.
+    _dbg_on = logging.getLogger().isEnabledFor(logging.DEBUG)
+
+    def _backdated_for(
+        clan_tag: str, raw_ts: str, offset: timedelta
+    ) -> Optional[tuple[str, datetime]]:
+        """Smart-backdating timestamp for *clan_tag*, memoized on the raw Timestamp string.
+
+        Returns ``(iso_string, backdated_datetime)``, or ``None`` when *raw_ts* cannot be
+        parsed.  The computation is exactly what the two call sites did inline before —
+        target = parsed + offset, backdated = target - INACTIVE_CLAN_UPDATE_INTERVAL_HOURS —
+        so behaviour is unchanged; only the recomputation is skipped.
+
+        Keyed on the timestamp rather than the clan alone, so a war whose timestamps
+        genuinely move (CoC extends wars by the length of a maintenance outage) misses the
+        cache and is recomputed.  Measured at ~63% of this loop's per-clan cost.
+
+        The key is the STABLE PREFIX of the Timestamp repr, not the whole string. coc.py
+        renders it as ``<Timestamp time=datetime.datetime(...) seconds_until=NNNN>`` and
+        recomputes ``seconds_until`` on every ``str()`` call, so the raw string changes
+        every time save_war_object() refreshes this clan's metadata even though the war's
+        actual times have not moved.  Keying on the whole string therefore missed for every
+        clan that had just been polled — precisely the case this memo exists for.
+        ``partition()`` is a C-level substring find, far cheaper than the regex it guards,
+        and degrades to the full string if the repr format ever loses that suffix.
+        """
+        _key = raw_ts.partition(' seconds_until=')[0]
+        _c = _backdate_cache.get(clan_tag)
+        if _c is not None and _c[0] == _key:
+            return (_c[1], _c[2])
+        _base = _parse_dt_from_raw(raw_ts)
+        if _base is None:
+            return None
+        _backdated = _base + offset - timedelta(hours=INACTIVE_CLAN_UPDATE_INTERVAL_HOURS)
+        _iso = _backdated.isoformat()
+        _backdate_cache[clan_tag] = (_key, _iso, _backdated)
+        return (_iso, _backdated)
+
     def _recheck_cutoff_for(clan_tag: str) -> datetime:
-        """Per-clan due-time cutoff: the flat 22h cutoff pushed back by a stable 0-2h offset."""
-        return cutoff_dt - timedelta(seconds=compute_recheck_offset_seconds(clan_tag))
+        """Per-clan due-time cutoff: the flat 22h cutoff pushed back by a stable 0-2h offset.
+
+        The offset is memoized in _recheck_offset_cache: it is crc32(tag) % jitter, so it
+        never changes for a given clan, and recomputing it for ~150K clans every cycle was
+        measured at 31% of this loop's per-clan cost.
+        """
+        _off = _recheck_offset_cache.get(clan_tag)
+        if _off is None:
+            _off = _recheck_offset_cache[clan_tag] = compute_recheck_offset_seconds(clan_tag)
+        return cutoff_dt - timedelta(seconds=_off)
 
     # Categorize clans based on subscription status and last update time.
     #
@@ -981,6 +1077,17 @@ async def main() -> None:
     # interaction handling; ~380K/2000 = ~190 yields/cycle at negligible
     # overhead (asyncio.sleep(0) is a few µs), bounding any single blocking
     # stretch to a small fraction of the original ~4s.
+    #
+    # SUPERSEDED (2026-09-04) — the population shifted, read this before trusting the
+    # paragraph below. The ">99.9% are passively-tracked" premise held in 2026-07 but does
+    # NOT any more: CWL discovery has since promoted a large share, and track_war_updates=1
+    # is now 152,402 of 461,933 (33%). Measured consequence: the fast-rejected majority is
+    # CHEAP (~3.7 us/clan) and the tracked minority is EXPENSIVE (~43.9 us/clan), so the
+    # cost is NOT "pure per-iteration loop overhead" — it is concentrated per-clan
+    # computation in the tracked path. Skipping the rejected 312K entries entirely (the
+    # tracked-clan index) bought only ~1.2s of a 7.8s loop, exactly because they were the
+    # cheap ones. The real wins were memoizing the per-clan constants that path recomputed
+    # every cycle: see _backdated_for() (~63%) and _recheck_cutoff_for() (~31%).
     #
     # MICRO-OPTIMIZATION (2026-07-18): measured >99.9% of the ~380K entries
     # are passively-tracked enemy clans (track_war_updates=False) that get
@@ -1017,6 +1124,23 @@ async def main() -> None:
     # ~420K clans).
     _passive_refresh_candidates: list[tuple[str, str]] = []  # (clan_tag, sort_key)
     _passive_refresh_cutoff = now - timedelta(days=PASSIVE_CLAN_REFRESH_INTERVAL_DAYS)
+    # Rescan when the interval has elapsed, or early when we have drained a cache that
+    # still had work in it (so a real backlog keeps burning down at full rate).
+    # NOTE the `_passive_scan_found > 0` guard: once the backlog reaches zero the scan
+    # legitimately returns an empty list, and keying the rescan off "cache is empty" alone
+    # made the steady state rescan EVERY cycle — the exact opposite of the intent, and how
+    # the first version of this shipped (observed as passive_scan=yes on every cycle).
+    # The early-rescan fires only when the previous scan filled at least a FULL batch —
+    # i.e. we were limited by the batch size, not by the backlog, so there is probably more
+    # waiting.  A scan that returned less than a batch means we drained everything there
+    # was, and new candidates only appear as clans cross a 30-day threshold, which no
+    # amount of rescanning within the hour will accelerate.
+    from QBhelperfunctions import _PASSIVE_REFRESH_BATCH_SIZE  # type: ignore[attr-defined]
+    global _passive_scan_cache, _passive_scan_mono, _passive_scan_found
+    _do_passive_scan = (
+        (time.monotonic() - _passive_scan_mono) >= _PASSIVE_SCAN_INTERVAL_S
+        or (not _passive_scan_cache and _passive_scan_found >= _PASSIVE_REFRESH_BATCH_SIZE)
+    )
 
     _categorize_clan_count = 0
     for clan_tag, clan_data in list(CACHE.clan_name_cache.items()):
@@ -1029,7 +1153,7 @@ async def main() -> None:
             # >99.9% of all entries and never need anything below this.
             _is_deleted = clan_data.get('is_deleted')
             if not clan_data.get('track_war_updates', True) or _is_deleted:
-                if not _is_deleted and not clan_data.get('has_active_subscriptions'):
+                if _do_passive_scan and not _is_deleted and not clan_data.get('has_active_subscriptions'):
                     _last_checked = clan_data.get('last_checked_via_api')
                     if not _last_checked:
                         _passive_refresh_candidates.append((clan_tag, ''))
@@ -1095,36 +1219,42 @@ async def main() -> None:
                 if meta:
                     war_state = meta.get('state', '')
 
+                    # Smart backdating (unchanged behaviour — see _backdated_for()).
+                    # 'preparation' targets 30min AFTER start; 'in_war' targets 8min BEFORE
+                    # end.  Both were previously re-deriving the same ISO string from a
+                    # regex parse every cycle for wars whose timestamps had not moved.
                     if war_state == 'preparation':
-                        start_dt = _parse_dt_from_raw(meta.get('start_time', ''))
-                        if start_dt:
-                            update_target_time = start_dt + timedelta(minutes=30)
-                            backdated_timestamp = update_target_time - timedelta(hours=INACTIVE_CLAN_UPDATE_INTERVAL_HOURS)
-                            _bd_iso = backdated_timestamp.isoformat()
+                        _bd = _backdated_for(clan_tag, str(meta.get('start_time', '') or ''),
+                                             timedelta(minutes=30))
+                        if _bd is not None:
+                            _bd_iso, backdated_timestamp = _bd
                             clan_data['last_war_update'] = _bd_iso
                             _dt_cache[clan_tag] = (_bd_iso, backdated_timestamp)
                             # Dirty-check: only write to DB if the value actually changed.
                             # The in-memory update above is always applied.
                             if _bd_iso != last_update:
                                 _timestamp_batch.append((_bd_iso, clan_tag))
-                            logging.debug(f"[INACTIVE-PREP] {clan_tag} - war in preparation, backdated to update 30min after start ({update_target_time.isoformat()})")
+                            if _dbg_on:
+                                logging.debug(f"[INACTIVE-PREP] {clan_tag} - war in preparation, backdated to update 30min after start ({(backdated_timestamp + timedelta(hours=INACTIVE_CLAN_UPDATE_INTERVAL_HOURS)).isoformat()})")
                             continue
-                        logging.debug(f"[SKIP] {clan_tag} - war in preparation, couldn't parse start time")
+                        if _dbg_on:
+                            logging.debug(f"[SKIP] {clan_tag} - war in preparation, couldn't parse start time")
                     elif war_state in ('in_war', 'inwar'):
-                        end_dt = _parse_dt_from_raw(meta.get('end_time', ''))
-                        if end_dt:
-                            update_target_time = end_dt - timedelta(minutes=8)
-                            backdated_timestamp = update_target_time - timedelta(hours=INACTIVE_CLAN_UPDATE_INTERVAL_HOURS)
-                            _bd_iso = backdated_timestamp.isoformat()
+                        _bd = _backdated_for(clan_tag, str(meta.get('end_time', '') or ''),
+                                             timedelta(minutes=-8))
+                        if _bd is not None:
+                            _bd_iso, backdated_timestamp = _bd
                             clan_data['last_war_update'] = _bd_iso
                             _dt_cache[clan_tag] = (_bd_iso, backdated_timestamp)
                             # Dirty-check: only write to DB if the value actually changed.
                             # The in-memory update above is always applied.
                             if _bd_iso != last_update:
                                 _timestamp_batch.append((_bd_iso, clan_tag))
-                            logging.debug(f"[INACTIVE-INWAR] {clan_tag} - war in progress, backdated to update 8min before end ({update_target_time.isoformat()})")
+                            if _dbg_on:
+                                logging.debug(f"[INACTIVE-INWAR] {clan_tag} - war in progress, backdated to update 8min before end ({(backdated_timestamp + timedelta(hours=INACTIVE_CLAN_UPDATE_INTERVAL_HOURS)).isoformat()})")
                             continue
-                        logging.debug(f"[SKIP] {clan_tag} - war in progress, couldn't parse end time")
+                        if _dbg_on:
+                            logging.debug(f"[SKIP] {clan_tag} - war in progress, couldn't parse end time")
                     elif war_state == 'war_ended':
                         clans_to_update.append((clan_tag, False))
                         logging.debug(f"[INACTIVE-WAR] {clan_tag} - war ended, forcing update despite {hours_since_update:.1f}h")
@@ -1136,9 +1266,35 @@ async def main() -> None:
             logging.warning(f"[PARSE-ERROR] {clan_tag} last_update='{last_update}': {e} - forcing update")
             clans_to_update.append((clan_tag, False))
 
+    # ── Reconcile the tracked-clan index ─────────────────────────────────────────
+    # Refresh / serve the passive-refresh candidate cache (see module-level comment).
+    # On a scan cycle the freshly-built list replaces the cache; every cycle then hands
+    # Phase 1.6 the next batch-sized slice, so the burn-down rate is unchanged whether or
+    # not this cycle rescanned.
+    if _do_passive_scan:
+        _passive_refresh_candidates.sort(key=lambda c: c[1])  # most-overdue / never-checked first
+        _passive_scan_cache = _passive_refresh_candidates
+        _passive_scan_mono = time.monotonic()
+        _passive_scan_found = len(_passive_refresh_candidates)
+    _passive_refresh_candidates = _passive_scan_cache[:_PASSIVE_REFRESH_BATCH_SIZE]
+    _passive_scan_cache = _passive_scan_cache[_PASSIVE_REFRESH_BATCH_SIZE:]
+
+    # CPU accounting: this loop is pure in-memory work with no I/O, so cores_busy should be
+    # ~1.0 if the wall time really is this loop computing.  A materially lower ratio means
+    # most of the elapsed time is the event loop servicing OTHER tasks during this loop's
+    # 229 `await asyncio.sleep(0)` yields — in which case optimising the loop body frees
+    # nothing and the work has to be found elsewhere.  Added 2026-09-04 because a faithful
+    # replay of this loop against the real clan table costs ~0.15 us/clan on a dev box while
+    # the server-machine reports ~15.9 us/clan — a 100x gap that a ~5x slower CPU does not
+    # explain, so the loop body is demonstrably NOT where the 7.3s goes.
+    _cat_w = max(time.monotonic() - _categorize_t0, 1e-6)
+    _cat_c = time.process_time() - _categorize_c0
     logging.info(
-        "[CATEGORIZE-TIMING] Categorized %d clan(s) in %.3fs",
-        _categorize_clan_count, time.monotonic() - _categorize_t0,
+        "[CATEGORIZE-TIMING] Categorized %d clan(s) in %.3fs (cpu=%.3fs cores_busy=%.2f, "
+        "%.2f us/clan, passive_scan=%s)",
+        _categorize_clan_count, _cat_w, _cat_c, _cat_c / _cat_w,
+        1e6 * _cat_w / max(_categorize_clan_count, 1),
+        "yes" if _do_passive_scan else "skipped",
     )
 
     # Flush all backdated timestamp updates in a single DB transaction.
@@ -1238,6 +1394,7 @@ async def main() -> None:
     # Deduplicates against the already-scheduled set; falls back silently on error.
     _cwl_season_prefix = now.strftime("%Y-%m")
     _tracked_active_tags = [ct for ct, _ in active_clans]
+    _group_member_tags: list[str] = []
     if _tracked_active_tags and CACHE.db_manager is not None:
         try:
             _group_member_tags = await CACHE.db_manager.get_active_cwl_group_member_tags(
@@ -1254,6 +1411,18 @@ async def main() -> None:
         except Exception as _cgx:
             logging.warning(f"[CWL-GROUP-EXPAND] Failed to expand group members: {_cgx}")
 
+    # Mark the clans that user-facing commands actually ask about as exempt from
+    # coc_clan_cache size-cap eviction.  Without this the Phase-1 flood (tens of thousands
+    # of distinct clans/day that never re-read the cache) evicts them within seconds of
+    # being cached, so the cache holds only the population that cannot hit it.  Cheap:
+    # derived from subscriptions/families/this cycle's CWL group members, never from a
+    # clan_name_cache scan.  Failure here must not cost a poll cycle.
+    try:
+        _n_protected = CACHE.refresh_protected_clan_tags(_group_member_tags)
+        logging.debug(f"[COC-CACHE-PROTECT] {_n_protected} clan(s) exempt from cap eviction")
+    except Exception as _rpx:
+        logging.warning(f"[COC-CACHE-PROTECT] Could not refresh protected clan tags: {_rpx}")
+
     active_count = len(active_clans)
     inactive_count = len(inactive_clans)
     logging.info(f"War updates: {active_count} active clans, {inactive_count} inactive clans ({INACTIVE_CLAN_UPDATE_INTERVAL_HOURS}h check)")
@@ -1265,17 +1434,29 @@ async def main() -> None:
     # Without this, asyncio.gather launches ALL clans simultaneously (potentially
     # thousands of tasks), creating hundreds of concurrent outgoing connections.
     # 50 balances throughput vs API/SSL connection pressure. ==> 20 for more safety margin.
-    # Keep at 20. Raising this to 50 was tried on PROD 2026-09-03 and measurably did NOT
-    # help: throughput went 25.6 -> 23.4 clans/s while per-clan latency went 0.78s -> 2.14s.
-    # By Little's Law the semaphore was 100% saturated at BOTH settings (25.6*0.78 = 20.0
-    # in flight; 23.4*2.14 = 50.1), so the extra 1.36s/clan was spent queueing *inside the
-    # process*, not on the network — PROD is a 2-core Celeron J3355 NAS, and Phase 1 is
-    # bounded by the GIL/event loop parsing responses plus the to_thread pool doing the
-    # temp-file writes, not by how many requests are allowed in flight. More concurrency
-    # there only buys latency and in-flight memory on a 6 GB box.
-    # Fixing cycle time means removing per-clan CPU work (see PERFORMANCE_TUNING.md),
-    # not opening this valve wider.
-    _FETCH_CONCURRENCY = 20
+    # 2026-09-04: 20 -> 50, RETRYING a change that failed on 2026-09-03.
+    #
+    # That first attempt (25.6 -> 23.4 clans/s, i.e. nothing, while latency went 0.78s ->
+    # 2.14s) was run against a broken rate limiter and a 6-thread to_thread pool: coc.py's
+    # BatchThrottler gated on time.process_time() rather than wall-clock, so the real
+    # request ceiling was unrelated to throttle_limit, and every temp-file write queued
+    # behind min(32, cpu_count+4)=6 threads.  Both are fixed (WallClockBatchThrottler at
+    # 80 req/s; explicit 16-worker executor), so the earlier null result no longer describes
+    # this system and is not evidence against retrying.
+    #
+    # What now says there is headroom: [PHASE-1-CPU] shows cores_busy between 0.43 and 0.89
+    # with ms/clan correlating at -0.87 — the SLOW cycles are the IDLE ones, spending up to
+    # 57% of Phase 1 waiting rather than computing.  Extrapolating each cycle to
+    # cores_busy=1.0 puts the CPU-saturation ceiling near 50 req/s, comfortably under the
+    # 80 req/s throttle, and reaching it on the worst cycles needs ~47 concurrent.
+    #
+    # FALSIFIER: cores_busy on [PHASE-1-CPU] must rise toward 1.0 AND ms/clan must fall.
+    # If concurrency rises while cores_busy stays ~0.43 and ms/clan stays ~70, the wait is
+    # per-request API latency, which no amount of concurrency reaches — revert to 20 and
+    # stop pulling this lever.  Watch api_fail:Network in [CYCLE-SUMMARY] too: the failure
+    # mode for too much concurrency here is SSL/connection pressure, not 429s (the
+    # throttler bounds the request rate independently).
+    _FETCH_CONCURRENCY = 50
     _fetch_semaphore = asyncio.Semaphore(_FETCH_CONCURRENCY)
 
     # Pre-group inactive clans into chunks of 10.  Each clan carries a reference
@@ -1353,8 +1534,25 @@ async def main() -> None:
                 return (clan_tag, is_active, None)
 
     logging.info(f"[PHASE-1] Starting parallel API fetches for {len(clans_to_update)} clans (max {_FETCH_CONCURRENCY} concurrent)...")
+    # CPU accounting for this phase.  time.process_time() sums CPU across every thread of
+    # this process, so cpu/wall is "cores busy on average":
+    #   ~1.0 on the 2-core server-machine  -> one core pinned; that is the GIL ceiling for a
+    #                                         single-threaded event loop, and shows up in
+    #                                         DSM's aggregate CPU meter as only ~50%
+    #   ~2.0                               -> both cores busy (genuinely compute-bound)
+    #   <<1.0                              -> mostly waiting on disk/network, NOT CPU-bound
+    # Added 2026-09-03 because two API-side "optimisations" were deployed on the strength of
+    # inference rather than measurement and both did nothing.  Measure, then tune.
+    _p1_w0, _p1_c0 = time.monotonic(), time.process_time()
     fetch_tasks = [fetch_single_clan(clan_tag, is_active) for clan_tag, is_active in clans_to_update]
     fetch_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+    _p1_w = max(time.monotonic() - _p1_w0, 1e-6)
+    _p1_c = time.process_time() - _p1_c0
+    logging.info(
+        "[PHASE-1-CPU] wall=%.1fs cpu=%.1fs cores_busy=%.2f (of %s) | %d clans, %.1f clans/s, %.1f ms/clan",
+        _p1_w, _p1_c, _p1_c / _p1_w, os.cpu_count(), len(clans_to_update),
+        len(clans_to_update) / _p1_w, 1000.0 * _p1_w / max(len(clans_to_update), 1),
+    )
     logging.info(f"[PHASE-1] All API fetches completed")
     if is_maintenance_detected():
         _maint_n = CACHE.cycle_stats.get("api_fail:Maintenance", 0)
@@ -2429,14 +2627,25 @@ async def periodic_main() -> None:
             continue
 
         try:
+            _cycle_cpu0 = time.process_time()
             await main()
             _cycle_elapsed = (datetime.now(timezone.utc) - _cycle_start).total_seconds()
+            _cycle_cpu = time.process_time() - _cycle_cpu0
             if CACHE.last_cwl_recovery_summary:
                 logging.info(CACHE.last_cwl_recovery_summary)
                 CACHE.last_cwl_recovery_summary = ""
             for _summary_line in CACHE.format_cycle_summary():
                 logging.info(_summary_line)
             logging.info(f"[CYCLE-END] Update cycle completed in {_cycle_elapsed:.1f}s")
+            # Whole-cycle CPU accounting — see the [PHASE-1-CPU] comment for how to read
+            # cores_busy.  Comparing this line against [PHASE-1-CPU] separates the fetch
+            # phase from the Phase-3 write/DB tail: if the tail's implied cores_busy is
+            # low, it is disk-bound (a bigger to_thread pool helps) rather than CPU-bound.
+            logging.info(
+                "[CYCLE-END] [CPU] wall=%.1fs cpu=%.1fs cores_busy=%.2f (of %s)",
+                _cycle_elapsed, _cycle_cpu,
+                _cycle_cpu / max(_cycle_elapsed, 1e-6), os.cpu_count(),
+            )
             # Track cycle runtime stats
             cs = QBcore.cycle_stats
             cs["count"] += 1
@@ -3247,6 +3456,31 @@ async def _run_startup_initialization() -> None:
     all future on_ready() re-entry via the lock/flag check above, wedging the bot until a full
     process restart even after a transient error (e.g. a momentary DB or CoC-API hiccup) recovers.
     """
+    # ── asyncio.to_thread pool sizing ────────────────────────────────────────────
+    # asyncio.to_thread() dispatches to the loop's default executor, which Python sizes
+    # min(32, os.cpu_count() + 4).  On the 2-core server-machine that is SIX threads,
+    # shared by every to_thread call site (30+ in QBhelperfunctions.py alone: temp-file
+    # writes, sync sqlite3 reads).  That heuristic is sized for CPU-bound work; ours is
+    # almost entirely *disk*-blocked, and a blocked thread costs a core nothing.  Sizing
+    # off the workload instead of the core count decouples the two.
+    # Env override: TO_THREAD_WORKERS (0/unset = auto).  Revert by setting it to 6.
+    try:
+        _tt_env = int(os.getenv("TO_THREAD_WORKERS", "0") or 0)
+    except ValueError:
+        _tt_env = 0
+    _tt_workers = _tt_env if _tt_env > 0 else max(16, (os.cpu_count() or 2) + 4)
+    try:
+        import concurrent.futures as _cf
+        asyncio.get_running_loop().set_default_executor(
+            _cf.ThreadPoolExecutor(max_workers=_tt_workers, thread_name_prefix="to_thread")
+        )
+        logging.info(
+            "[STARTUP] to_thread pool: %d workers (cpu_count=%s, Python default would be %d)",
+            _tt_workers, os.cpu_count(), min(32, (os.cpu_count() or 1) + 4),
+        )
+    except Exception as _tt_ex:
+        logging.warning("[STARTUP] Could not resize to_thread pool: %s — using Python default", _tt_ex)
+
     logging.debug("on_ready: Setting initialization_in_progress...")
     QBcore.bot.initialization_in_progress = True
     logging.debug("on_ready: Getting CONFIG.is_dev_mode...")
@@ -4327,7 +4561,12 @@ if __name__ == "__main__":
     """
     # Log startup info once at program entry
     logging.info("QapBot started.")
-    logging.info(f"Version: {QBcore.BOT_VERSION}")
+    # build + source fingerprint identify exactly which edit is running, which BOT_VERSION
+    # alone cannot after a file-copy deploy.  See QBcore.source_fingerprint().
+    logging.info(
+        f"Version: {QBcore.BOT_VERSION}  build {QBcore.BOT_BUILD}  "
+        f"src {QBcore.source_fingerprint()}"
+    )
     logging.info(f"OS: {platform.system()} {platform.release()}")
     logging.info(f"Python: {sys.version.split()[0]}")
     logical_cores = os.cpu_count() or 1

@@ -1,6 +1,339 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-04 (13)
+- Measured (build 9): the _FETCH_CONCURRENCY 20 -> 50 retry from (12) WORKED, and both
+  falsifier conditions were met.
+    cores_busy 0.75 -> 0.86 (+14%, must rise)   ms/clan 43.3 -> 29.1 (-33%, must fall)
+    clans/s    27.0 -> 35.1 (+30%)              cycles at cores_busy>=0.95: 0/5 -> 3/8
+  Zero api_fail:Network, zero errors, failed=0 — the SSL/connection-pressure failure mode
+  did not appear. Three cycles now reach cores_busy ~1.01, i.e. one core fully pinned:
+  that is the GIL ceiling, so further concurrency has little left to buy on those cycles.
+  This retrospectively confirms the 2026-09-03 null result was an artifact of the broken
+  CPU-time throttler plus the 6-thread to_thread pool, not a property of the workload.
+- Measured (build 8): coc_clan_cache hit rate, per population, cap 20000, evicted_by_cap=0:
+    protected 17/36 = 47.2%    other 0/2956 = 0.0%
+  The protected tier is where this cache's whole value is. Acting on it is deferred to
+  tracker #0094: the 0% sample is large and clean, but the 47% rests on only 36 requests
+  (the counter is frozen between cycles, since protected clans sit behind the same
+  12h/30min gate), so store_result and the cap get set from several days of data instead.
+  Note the 20000 cap is unreachable here: occupancy is TTL-bounded at ~640 get_clan/cycle
+  x 2 cycles in the 600s TTL = ~1280 entries; observed size 1279.
+  No code change. 2994 tests pass.
+
+2026-09-04 (12)
+- Changed: _FETCH_CONCURRENCY 20 -> 50 (QapBot.py). Retry of a change that measurably did
+  nothing on 2026-09-03 — but that attempt ran against a broken rate limiter (coc.py's
+  BatchThrottler gated on time.process_time(), not wall-clock) and a 6-thread to_thread
+  pool. Both since fixed, so the earlier null result no longer describes this system.
+  Evidence for headroom, from build 4's [PHASE-1-CPU]: cores_busy 0.43-0.89 with ms/clan
+  correlating at -0.87, i.e. the SLOW cycles are the IDLE ones (up to 57% of Phase 1 spent
+  waiting). Extrapolating to cores_busy=1.0 puts the CPU-saturation ceiling near 50 req/s,
+  under the 80 req/s throttle, needing ~47 concurrent on the worst cycles.
+  Falsifier recorded at the call site: cores_busy must rise toward 1.0 AND ms/clan must
+  fall. If not, the wait is per-request API latency and this lever is closed for good.
+  Watch api_fail:Network — the failure mode here is SSL/connection pressure, not 429s.
+- Measured (build 4, categorize, like-for-like full 462K walk, passive_scan=skipped):
+  6.526s (n=5) -> 4.301s (n=10), -34%, at 9.30 us/clan — achieved WITHOUT the reverted
+  tracked-clan index. The seconds_until key fix from (7) also removed the variance:
+  spread 1.666s -> 0.275s (sd 0.075), so the volatile cache key was indeed its cause.
+  File: QapBot.py. Build 9. 2994 tests pass.
+
+2026-09-04 (11)
+- Reverted: entry (10)'s store_result=False on the Phase-1 path. It removed the very
+  population the entry-8 hit counters exist to measure, so the counters could only ever
+  have confirmed the assumption behind it. qaplop's call, and correct. All clans are stored
+  again; get_clan(store_result=...) stays (documented, tested) but unused until measured
+  data justifies it.
+- Changed: MAX_COC_CLAN_CACHE_ENTRIES 1500 -> 20000 so the cap cannot bind during the
+  measurement (qapbot/coc_cache.py). At 1500 the Phase-1 flood evicted entries within
+  seconds, so a hit rate taken there described the eviction policy, not the access pattern.
+  Sizing: occupancy is TTL-bounded, not cap-bounded — clans_per_cycle x (600s/cycle_period).
+  Measured peak 3,053 clans/cycle gives ~6.1K entries at a 300s period and ~10.2K at 180s,
+  so 20000 leaves ~2x headroom. Real peak memory is therefore ~0.44-0.73 GB (69-90 KB per
+  entry), not 20000 x 90 KB, because the TTL sweeps long before the cap is reached.
+- Added: hit/miss counters are now split by population — protected (subscribed / family /
+  CWL group + their war opponents) vs everything else — and [COC-CACHE-CLEANUP] reports
+  both rates every cycle. A blended rate cannot answer 'which clans are re-read?' when the
+  two populations differ by three orders of magnitude in size.
+- Context from qaplop that motivated the above: smart backdating deliberately schedules a
+  CWL clan on consecutive cycles around its war boundary (just before the war ends, then
+  just after) — that consecutive-cycle pattern is what this cache was introduced for, and
+  a cap that evicts within seconds cannot serve it.
+- Fixed: PERFORMANCE_TUNING.md said the server-machine has 'single-digit GB' of RAM; it has
+  10 GB. Corrected, along with the section conclusion that predated this context.
+  Files: qapbot/coc_cache.py, QBhelperfunctions.py, qapbot/docs/PERFORMANCE_TUNING.md,
+  tests/unit/test_coc_cache_protected_tags.py. Build 8. 2994 tests pass.
+
+2026-09-04 (10)
+- Changed: the Phase-1 polling path no longer STORES its clan fetches in coc_clan_cache
+  (qapbot/coc_cache.py, QBhelperfunctions.py). New get_clan(store_result=...) mirrors the
+  existing get_league_war(cache_result=...) convention and its rationale.
+  The 600s TTL is deliberate (member lists move during CWL prep/start) and is UNCHANGED —
+  qaplop's point. The defect was never the TTL: it is that this path writes ~55K entries a
+  day into a cache it cannot read back, because its own last_checked_via_api gate (12h,
+  30min for role clans) outlives the TTL by design. Protected clans (entry 9) are still
+  stored, so user commands keep a warm cache for exactly the clans they ask about.
+  Reads are deliberately NOT disabled, so this can never cost an extra API call.
+  Expected: cache holds ~120 entries instead of up to 1500 (~110 MB -> ~9 MB), evictions
+  and their [COC-CACHE-CAP] log lines stop entirely, and hit_rate= starts measuring only
+  clans that can actually be re-read.
+  Verified: 300 polling fetches store nothing and evict nothing; a stored protected clan
+  serves the second ask from cache; store_result=False still READS the cache (zero extra
+  API calls); an interactive caller still caches an arbitrary clan.
+  Files: qapbot/coc_cache.py, QBhelperfunctions.py, tests/unit/test_coc_cache_protected_tags.py,
+  tests/integration/test_coc_cache.py (stub signatures). Build 7. 2992 tests pass.
+
+2026-09-04 (9)
+- Changed: coc_clan_cache now exempts the clans user commands actually ask about from
+  size-cap eviction (qapbot/coc_cache.py, qapbot/cache_manager.py, QapBot.py).
+  qaplop's call: the Phase-1 flood (55,609 distinct clans/12.4h, none of which can hit the
+  cache — see entry 8) was evicting the ~120 clans that CAN hit it within seconds of
+  caching them, so the cache held only the population structurally unable to read it.
+  Protected: subscribed clans, guild-family member clans, this season's CWL group members,
+  and the current war opponent of any of those (/currentwar asks about the enemy as often
+  as the friendly clan). Built from subscriptions/clan_families/temp_war_metadata lookups
+  and the CWL group list main() already fetches — never from a clan_name_cache scan.
+  TTL is untouched: this changes WHICH entries survive pressure, never how stale one gets.
+  Eviction falls back to evicting protected entries if the cache is somehow still over cap
+  without them, so the cap always bounds memory. An empty protected set is exactly the old
+  FIFO, so startup, a failed refresh, and the standalone scripts are unaffected.
+  Verified: 122 protected clans survive a 3,000-clan flood at cap 1500; cap(50) with 122
+  protected still bounds to 50; TTL still expires a protected entry.
+  Files: qapbot/coc_cache.py, qapbot/cache_manager.py, QapBot.py,
+  tests/unit/test_coc_cache_protected_tags.py (new, 9 cases). Build 6. 2988 tests pass.
+
+2026-09-04 (8)
+- Added: hit/miss/stale counters to CoCClanCache and a hit_rate= readout on the per-cycle
+  [COC-CACHE-CLEANUP] line (qapbot/coc_cache.py). This cache had NO effectiveness
+  instrumentation at all, so its value had never been measured.
+  Prompted by qaplop noticing constant [COC-CACHE-CAP] evictions. The cap is not the
+  problem: fetch_clan_war_data()'s last_checked_via_api gate blocks a re-request for 12h
+  (30min for role clans), which is strictly longer than this cache's 600s hard TTL, so a
+  polled clan is always expired before it can be asked for again. Measured over 12.4h:
+  56,070 fetches / 55,609 distinct clans = 1.01 each, and ZERO refetch gaps inside the TTL.
+  Full analysis and the sizing decision it feeds: qapbot/docs/PERFORMANCE_TUNING.md
+  section 'A cache whose TTL is shorter than its caller's own gate can never hit'.
+  No sizing change yet — read hit_rate= from a few cycles first.
+  File: qapbot/coc_cache.py, qapbot/docs/PERFORMANCE_TUNING.md. Build 5. 2979 tests pass.
+
+2026-09-04 (7)
+- Fixed: _backdated_for()'s memo key included coc.py's volatile `seconds_until=` countdown,
+  so the cache missed for every clan that had just been polled — exactly the ones it exists
+  to serve. Now keyed on the stable prefix (partition(' seconds_until=')[0]).
+  Why this keeps happening and how to avoid it: COPILOT_PITFALLS_COOKBOOK.md Pitfall 55.
+  File: QapBot.py. Build 4. 2979 tests pass.
+- Measured (build 2, 5 cycles): the (5) memoization holds — categorize mean 4.76s vs a
+  6.600s baseline (-28%, best 4.15s). Two slow cycles (5.5-5.8s) are unexplained; they do
+  NOT correlate with preceding poll volume. Re-measure on build 4 before concluding.
+
+2026-09-04 (6)
+- Reverted: the tracked-clan index from (3), per the measurement in (5) — it saved nothing
+  (6.526s full walk vs 6.600s indexed, like-for-like) while carrying a real correctness
+  surface: six mutation sites that had to report False->True promotions via
+  note_clan_tracked(), plus drift detection whose only job was to catch a clan silently
+  ceasing to be polled. Removed the index, CacheManager.newly_tracked_clans,
+  note_clan_tracked() and all six call sites; the categorize loop iterates
+  clan_name_cache.items() again as before, and scan=full|indexed is gone from
+  [CATEGORIZE-TIMING]. qapbot/coc_cache.py is byte-identical to pre-change.
+  Decision rationale (qaplop): the actively-tracked fraction is expected to RISE over time,
+  so the index skips progressively fewer entries — the trade only gets worse.
+  A TRIED-AND-REVERTED note is left at the old definition site with the measured numbers,
+  so the idea is not re-proposed without first re-measuring the fast-reject cost per clan.
+  KEPT (this is where the categorize win actually came from): the _backdated_for() and
+  _recheck_cutoff_for() memo caches from (5), the passive-scan throttle from (1)/(2), and
+  the CPU instrumentation.
+- Fixed: two files were rewritten with a UTF-8 BOM by a scripted edit (read utf-8-sig,
+  written utf-8-sig, which always ADDS one). QBcore.py and qapbot/coc_cache.py had no BOM;
+  qapbot/cache_manager.py legitimately does. Restored, and all changed files now match
+  HEAD's leading bytes.
+  Files: QapBot.py, qapbot/cache_manager.py, qapbot/coc_cache.py, QBcore.py.
+  Build 3. 2979 tests pass.
+
+2026-09-04 (5)
+- Measured: the tracked-clan index from (3) delivers NOTHING measurable. Correcting the
+  first reading of it, which compared a scan=full cycle that also ran the passive scan
+  against a scan=indexed cycle that skipped it — so the "15% win" attributed to the index
+  was actually the passive-scan throttle from (2). Like-for-like, all passive_scan=skipped:
+    full walk, 462K clans   6.526s (n=5)
+    INDEXED,   150K clans   6.600s (n=5)   -> +0.074s, i.e. net zero to marginally worse
+  Walking 312K fewer entries costs the same, because the fast-reject path is essentially
+  free (dict.get + branch + continue) and building the index-driven item list costs about
+  what it saves. Zero [TRACKED-INDEX] drift warnings across every cycle, so the index is
+  CORRECT — it is just pointless, and it carries a real correctness surface (6 hook sites
+  plus drift detection guarding against a clan silently stopping being polled).
+  Recommend reverting it; kept for now pending that decision.
+  Per-clan cost on the tracked path was 43.9 us vs ~3.7 us for a fast-rejected clan, which
+  is what made the tracked path the right target even though the index was the wrong
+  instrument. Superseded a
+  stale 2026-07-18 comment in QapBot.py that still claimed ">99.9% are passively tracked";
+  CWL discovery has since made it 33% actively tracked, and that stale premise is part of
+  what pointed the optimisation at the wrong half of the loop.
+- Changed: memoized the two per-clan CONSTANTS the tracked path recomputed every cycle,
+  measured as 94% of its per-clan cost (QapBot.py).
+  * _backdated_for() (~63%): the smart-backdating branches re-parsed the war's start/end
+    time out of coc.py's Timestamp repr with a regex and re-derived the same ISO string
+    every cycle, for wars whose timestamps had not moved. Now memoized on the raw
+    Timestamp string, so a war genuinely extended by a CoC maintenance outage still misses
+    and recomputes. Backdating behaviour is UNCHANGED — verified by comparing 8,000
+    memoized results (including repeat hits) against the old inline computation:
+    zero mismatches, identical None handling for unparseable input, and a moved timestamp
+    correctly recomputes.
+  * _recheck_cutoff_for() (~31%): crc32(clan_tag) % jitter is a pure function of the tag,
+    recomputed ~150K times per cycle for a value that never changes. Now cached per clan.
+  * Also hoisted an eager f-string: both backdating branches built a debug message with an
+    isoformat() call on EVERY war-critical clan every cycle, which CPython evaluates even
+    when DEBUG is suppressed and the output is discarded. Now guarded by a once-per-cycle
+    level check.
+  RESULT (build 2, measured): the falsifier did not fire. Categorize 6.600s -> 4.150s,
+  43.94 -> 27.65 us/clan, a 37% cut, on a like-for-like scan=indexed passive_scan=skipped
+  cycle. This memoization is where the whole categorize win came from — not the index.
+  Caveat: one post-deploy cycle so far. Note also that the first cycle after any restart
+  runs with both memo caches cold, so its [CATEGORIZE-TIMING] shows no gain (measured
+  7.905s at 11:56:38) and should not be read as a regression.
+  Files: QapBot.py, QBcore.py. Build 2. 2979 tests pass.
+
+2026-09-04 (4)
+- Added: BOT_BUILD, a monotonic build counter bumped on every code change, plus
+  QBcore.source_fingerprint(), logged together at startup as
+  "Version: X.Y.Z  build N  src <8 hex>" and shown in /status
+  (QBcore.py, QapBot.py, QBdiscordcmds.py).
+  WHY: deployment to the server-machine is a file COPY, not a git operation, so "is it
+  committed?" says nothing about what is running. This session alone got that wrong twice
+  during the CWL performance work -- once analysing a deployed fix as "not deployed", and
+  once attributing cycle timings to the wrong build -- and both times the wrong conclusion
+  survived several steps before being caught.
+  BOT_VERSION is untouched (release number, owner-managed); BOT_BUILD never resets, not
+  even across BOT_VERSION bumps.
+  The fingerprint is the safety net for the obvious failure mode of a hand-maintained
+  counter: it hashes the shipped .py sources (repo-root modules + the qapbot package,
+  path included so a rename counts) and cannot drift, so a forgotten bump still shows up
+  as "same build, different src". It is diagnostics, so it returns "unknown" rather than
+  raising if the tree is unreadable -- it must never be able to stop the bot starting.
+  Measured at 5ms on a dev box, startup only.
+  Routine documented as Cardinal Rule 17 in .github/copilot-instructions.md, wired into
+  the "After Writing Code" checklist and the Changelog Management section so it is the
+  same reflex as the changelog entry rather than a separate thing to remember.
+  Files: QBcore.py, QapBot.py, QBdiscordcmds.py, .github/copilot-instructions.md,
+  tests/unit/test_build_identity.py (new, 8 cases). Build 1. 2979 tests pass.
+
+2026-09-04 (3)
+- Changed: the categorize loop now iterates a cached tracked-clan index instead of all
+  ~458K clan_name_cache entries (QapBot.py, qapbot/cache_manager.py, qapbot/coc_cache.py).
+  Justified by measurement: [CATEGORIZE-TIMING] reports cores_busy=0.99-1.00, so the loop
+  really is one core pinned, and because the cost is dominated by touching scattered dicts
+  through a small cache rather than by the arithmetic, the win is in touching fewer of
+  them. track_war_updates=1 is 152,402 of 458,715 -> a 67% cut in entries walked.
+  Safety design (the risk here is a clan silently never being polled again):
+    * The index is a CACHE, rebuilt from clan_name_cache on the hourly full walk the
+      passive-refresh scan already performs -- so reconciliation costs nothing extra.
+    * Only the False->True direction is dangerous. Those 6 sites now call
+      CACHE.note_clan_tracked(), so a promoted clan is polled on the very next cycle.
+      True->False is left to expire at the next rebuild: it costs one wasted iteration
+      and is never a correctness problem.
+    * Each rebuild diffs ground truth against what the incremental path accumulated and
+      logs [TRACKED-INDEX] drift naming the missing tags -- so a future mutation site that
+      forgets note_clan_tracked() announces itself instead of parking a clan silently.
+  note_clan_tracked() creates its set lazily: it is bookkeeping for a cache whose worst
+  case is a one-hour delay, so it must never raise inside a real promotion path (and 17
+  test fixtures build CacheManager via __new__, skipping __init__).
+  Verified by simulating the full lifecycle -- build, indexed cycles, hooked promotion
+  (polled next cycle), deliberately UNhooked promotion (missed, as expected), hourly
+  rebuild (drift detected, self-healed).
+  [CATEGORIZE-TIMING] now also reports scan=full|indexed.
+  Expected ~6.5s -> ~2.2s. Note the honest scaling: that is 14% of a light 52s cycle but
+  only ~2.6% of a heavy 164s one, where Phase 1 dominates instead.
+- Measured, from a heavy cycle (11:16:48, 3,053 clans, 163.8s): the temp-write identical=
+  counter is still zero at upd=1,958, confirming at full scale that no rewrite is ever
+  byte-identical (coc.py's Timestamp repr embeds a live seconds_until= countdown). The
+  dirty-check idea is dead unless volatile fields are normalised out first.
+  Same cycle: categorize cores_busy=1.00 but Phase 1 cores_busy=0.68 -- ~33s of idle
+  inside its 103.1s, i.e. 20% of the whole cycle. The two phases have opposite characters
+  and Phase 1's idle is now the largest single remaining target.
+  Files: QapBot.py, qapbot/cache_manager.py, qapbot/coc_cache.py. 2971 tests pass.
+
+2026-09-04 (2)
+- Fixed: the passive-refresh scan throttle added in (1) degenerated to scanning every cycle
+  whenever the passive backlog was drained (QapBot.py). The gate was "rescan if the cache
+  is empty", but once the backlog is burned down the scan legitimately returns an EMPTY
+  list — so the cache was empty every cycle and it rescanned every cycle. It throttled
+  correctly whenever a real backlog existed (PROD 11:04 and 11:09 logged
+  passive_scan=skipped after a scan filled the cache), and misbehaved only in the drained
+  steady state (10:13-10:53, passive_scan=yes on ten consecutive cycles).
+  Now: rescan on the hourly interval, or early only when the previous scan filled at least
+  a full _PASSIVE_REFRESH_BATCH_SIZE (i.e. we were limited by the batch, not the backlog,
+  so more is probably waiting). Verified by simulation across backlogs of
+  0 / 200 / 3,500 / 25,000: burn-down still runs at the full 1000/cycle, and the drained
+  steady state drops from 20 scans per 20 cycles to 2.
+  Measured saving, from PROD cycles either side of the transition: categorize
+  7.34s (passive_scan=yes) -> 6.49s (skipped), i.e. ~0.85s, about 12% of the loop.
+  (An earlier dev-box estimate of ~28% / ~2s was too optimistic — noted so the next
+  estimate is calibrated against this.)
+- Measured: [CATEGORIZE-TIMING] now reports cores_busy=0.99-1.00 at 15.6-16.8 us/clan.
+  The categorize loop IS genuinely CPU-bound — one core pinned for its full 7.2-7.7s — so
+  the decision in (1) to hold the tracked-clan-index rewrite was based on a bad profile.
+  That profile timed only fragments (fast-reject, passive block, crc32) and missed the
+  per-clan work for the 152K tracked clans; a faithful full-loop replay costs 0.78 us/clan
+  on a dev box, 5x the fragment figure. The residual dev/PROD gap is consistent with the
+  server-machine being memory-latency-bound walking 458K scattered dicts through a 2 MB
+  cache, which also means the win comes from iterating FEWER entries (the tracked index,
+  458,715 -> 152,402) rather than from optimising the loop body.
+- Measured: the temp-write identical= counter from (1) reads ZERO on every cycle, including
+  cycles with upd=1,518. Cause: the serialized payload embeds coc.py's Timestamp repr,
+  which carries a live `seconds_until=` countdown recomputed at every serialization, so no
+  two writes of the same unchanged war are ever byte-identical. A dirty-check as originally
+  proposed cannot ever fire; it would need to compare with the volatile fields normalised
+  out. Not built — recording the finding so it is not re-proposed as-is.
+  File: QapBot.py. 2971 tests pass.
+
+2026-09-04 (1)
+- Changed: passive-refresh candidate discovery now runs hourly instead of every cycle, and
+  is served from a cache (QapBot.py). The scan walks the ~306K clans that fail the
+  categorize fast-reject, doing a datetime.fromisoformat() for each, purely to feed a
+  30-DAY cutoff -- recomputing that every ~5 min was waste. The per-cycle burn-down rate is
+  unchanged: each cycle still hands Phase 1.6 a full _PASSIVE_REFRESH_BATCH_SIZE slice out
+  of the cache, and the cache rebuilds when it empties or after an hour, whichever is first
+  (simulated over 15 cycles: 1000/cycle served exactly as before, scans 15 -> 4).
+- Added: [CATEGORIZE-TIMING] now logs cpu= and cores_busy=, plus us/clan and whether the
+  passive scan ran this cycle.
+- NOT done, deliberately: the tracked-clan-index rewrite of the categorize loop that entry
+  (4) proposed. Two measurements killed it. (a) track_war_updates=1 covers 152,402 of
+  458,715 clans, so indexing would cut iterations only 67%, not the ~99% assumed. (b) A
+  faithful replay of the loop against the real clan table costs ~0.15 us/clan on a dev box
+  while the server-machine reports ~15.9 us/clan -- a 100x gap that a ~5x slower CPU cannot
+  explain, and the 229 per-cycle `await asyncio.sleep(0)` yields measure 0.3-1.8ms total.
+  So the loop body is ~1% of its own reported wall time and rewriting it would free
+  nothing. The new cores_busy figure will say where the time actually goes before anyone
+  spends effort there.
+- Added: temp-write "identical" counter (qapbot/cache_manager.py) in [CYCLE-SUMMARY] Temp
+  writes -- how many rewrites were byte-identical to disk, i.e. the headroom a write-skip
+  would have. Measurement only; the write still happens.
+  It reads ZERO always, which kills the dirty-check idea outright -- see
+  COPILOT_PITFALLS_COOKBOOK.md Pitfall 55 for why (coc.py Timestamp volatility).
+  Files: QapBot.py, qapbot/cache_manager.py, qapbot/docs/PERFORMANCE_TUNING.md.
+  2971 tests pass.
+
+2026-09-03 (5)
+- Added: per-phase CPU accounting, and sized the asyncio.to_thread pool off the workload
+  instead of the core count (QapBot.py). First of the three improvements from entry (4);
+  the other two (save_war_object dirty-check, incremental categorize) follow separately so
+  each can be measured on its own.
+- Instrumentation: new [PHASE-1-CPU] and [CYCLE-END] [CPU] lines log wall, cpu
+  (time.process_time(), summed over all threads) and cores_busy=cpu/wall. On the 2-core
+  server-machine cores_busy ~1.0 means one core pinned — the GIL ceiling for a
+  single-threaded event loop, which shows in DSM's aggregate meter as only ~50% and is
+  therefore easy to misread as "not CPU-bound"; ~2.0 means genuinely compute-bound; well
+  below 1.0 means we are waiting on disk/network. Added because entries (2) and (3) were
+  both deployed on inference rather than measurement and both did nothing.
+- Changed: to_thread pool 6 -> 16 workers on the server-machine. asyncio.to_thread uses the
+  loop's default executor, sized min(32, cpu_count+4) = 6 on 2 cores, shared by every
+  to_thread call site (30+ in QBhelperfunctions.py: temp-file writes, sync sqlite3 reads).
+  That heuristic assumes CPU-bound work; ours is disk-blocked, and a blocked thread costs a
+  core nothing. Now max(16, cpu_count+4), env override TO_THREAD_WORKERS (set 6 to revert).
+  Falsifier: if the Phase-3 tail (currently 17-36s/cycle) does not drop, the writes are
+  CPU-bound rather than disk-bound and the dirty-check is the only path.
+  File: QapBot.py. 2971 tests pass.
+
 2026-09-03 (4)
 - Changed: reverted _FETCH_CONCURRENCY 50 -> 20, and documented why the whole API-side
   tuning direction was a dead end (QapBot.py, qapbot/docs/PERFORMANCE_TUNING.md new).

@@ -2486,3 +2486,47 @@ in the code comment *which* concurrency guarantee forces it — the specific loc
 specific resource being torn down. If that sentence cannot be written, the flag is probably
 being copied rather than needed. And any code path that turns a user away must leave a log
 line at INFO; "it's temporary" is exactly when you most need to know it happened.
+
+---
+
+## Pitfall 55: coc.py's Timestamp repr embeds a LIVE COUNTDOWN — never compare or key on it as if it were stable
+
+`str()` on a `coc.Timestamp` renders:
+
+```
+<Timestamp time=datetime.datetime(2026, 9, 4, 11, 5, 44) seconds_until=80222>
+```
+
+`seconds_until` is **recomputed at every `str()` call**. The war time it describes has not
+moved; only the countdown has. That string is what lands in the temp war JSON and in
+`CACHE.temp_war_metadata`'s `start_time` / `end_time`, so **any value derived from a war
+object re-serialises differently every single time**, forever.
+
+This bit twice on 2026-09-04, both times costing real analysis before it was spotted:
+
+1. **A content dirty-check that can never fire.** A counter was added to `save_war_object()`
+   to measure how many temp rewrites were byte-identical to what was on disk, to size a
+   possible write-skip. It read **zero on every cycle, including one with `upd=1958`** —
+   because `seconds_until` guarantees no two serialisations of the same unchanged war ever
+   match. The whole optimisation was dead on arrival and the counter was the only reason
+   anyone found out cheaply.
+
+2. **A memo cache that missed exactly when it mattered.** `_backdated_for()` in `QapBot.py`
+   memoised the smart-backdating computation keyed on the raw timestamp string. Every time
+   `save_war_object()` refreshed a clan, its metadata string changed, so the next cycle
+   missed the cache and re-ran the regex parse — for precisely the just-polled clans the
+   memo existed to serve.
+
+**How to apply:** treat anything derived from a `coc.Timestamp` repr as *volatile by
+default*.
+
+- To compare or key on it, strip the countdown first:
+  `raw.partition(' seconds_until=')[0]` — a C-level substring find, cheap enough for a hot
+  loop, and it degrades to the whole string if the suffix ever disappears. Better still,
+  key on the parsed `datetime` when you already have one.
+- Before building anything that assumes "unchanged input produces identical output" over
+  war data — a dirty-check, a content hash, a cache key, a dedupe — **instrument it first
+  and confirm the hit rate is non-zero.** Both bugs above were caught by a cheap counter,
+  not by reading the code.
+- The same suspicion applies to any other serialised field whose value is computed at
+  render time rather than stored.

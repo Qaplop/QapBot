@@ -45,7 +45,7 @@ import hashlib
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone as _dt_timezone
-from typing import Dict, Any, Tuple, List, Literal, Optional, Set, cast, TYPE_CHECKING
+from typing import Dict, Any, Iterable, Tuple, List, Literal, Optional, Set, cast, TYPE_CHECKING
 import discord
 import coc  # type: ignore[import-untyped]
 import re
@@ -267,6 +267,67 @@ class CacheManager:
         # Accumulates from bot start until shutdown.  Read by /status command.
         self.lifetime_stats: Dict[str, int] = {}
 
+    def refresh_protected_clan_tags(self, extra_tags: Optional[Iterable[str]] = None) -> int:
+        """Recompute which clans are exempt from ``coc_clan_cache`` size-cap eviction.
+
+        The polling loop streams tens of thousands of distinct clans through that cache per
+        day and re-reads none of them (its own ``last_checked_via_api`` gate is 12h, far
+        longer than the cache's 600s TTL, so it structurally cannot hit). Under a plain FIFO
+        that traffic flushed out the few clans user-facing commands actually ask about,
+        within seconds of them being cached. This marks that small population so the flood
+        cannot evict it.
+
+        Protected:
+          * subscribed clans — the ones with war/leaderboard subscriptions
+          * clans belonging to a guild family (member clans)
+          * the CURRENT WAR OPPONENT of any of the above — ``/currentwar`` and the war UI
+            ask about the enemy clan as routinely as the friendly one
+          * *extra_tags* — caller-supplied, used for this season's CWL group members
+
+        Deliberately derived from the small structures (``subscriptions``,
+        ``clan_families``, ``temp_war_metadata`` lookups for a handful of tags) and never by
+        scanning ``clan_name_cache``, which is ~458K entries and is exactly the cost the
+        categorize loop already pays once per cycle.
+
+        Args:
+            extra_tags: Additional tags to protect (e.g. active CWL group members).
+
+        Returns:
+            Size of the resulting protected set.
+        """
+        protected: Set[str] = set()
+
+        # getattr throughout: this is best-effort bookkeeping for a cache, so a partially
+        # constructed instance (test fixtures build CacheManager via __new__) must degrade
+        # to "protect nothing" rather than raise into a caller that only wanted a poll cycle.
+        for _guild in (getattr(self, "subscriptions", None) or {}).values():
+            for _channel in _guild.values():
+                for _sub in _channel:
+                    _t = _sub.get("clan_tag") if isinstance(_sub, dict) else None
+                    if _t:
+                        protected.add(str(_t))
+
+        # Guild-family member clans.
+        for _fam in (getattr(self, "clan_families", None) or {}).values():
+            for _t in (_fam.get("clans") or []):
+                if _t:
+                    protected.add(str(_t))
+
+        if extra_tags:
+            protected.update(str(t) for t in extra_tags if t)
+
+        # Current war opponents of everything protected so far. temp_war_metadata is keyed
+        # by clan tag, so this is a handful of dict lookups, not a scan.
+        for _t in list(protected):
+            _opp = ((getattr(self, "temp_war_metadata", None) or {}).get(_t) or {}).get("opponent_tag")
+            if _opp:
+                protected.add(str(_opp))
+
+        _cache = getattr(self, "coc_clan_cache", None)
+        if _cache is not None:
+            _cache.protected_tags = protected
+        return len(protected)
+
     def record_cycle_stat(self, key: str, n: int = 1) -> None:
         """Increment a named counter in both the current cycle's and lifetime stats dicts."""
         self.cycle_stats[key] = self.cycle_stats.get(key, 0) + n
@@ -305,9 +366,13 @@ class CacheManager:
         skip_s   = s.get("save_skip_stale",            0)
         skip_fa  = s.get("save_skip_friendly",         0)
         skip_nc  = s.get("save_skip_no_clan",          0)
+        ident    = s.get("temp_write_identical",       0)
         written_detail = f"written={_de_n(written)} (new={_de_n(new_f)}, upd={_de_n(upd_f)})" if new_f or upd_f else f"written={_de_n(written)}"
         skip_nc_str = f"  skip_no_clan={_de_n(skip_nc)}" if skip_nc else ""
-        tmp_line = f"Temp writes    : {written_detail}  skip_finalized={_de_n(skip_f)}  skip_stale={_de_n(skip_s)}  skip_friendly={_de_n(skip_fa)}{skip_nc_str}"
+        # identical=N is measurement, not an action: how many of those writes rewrote
+        # byte-for-byte what was already on disk, i.e. the headroom a write-skip would have.
+        ident_str = f"  identical={_de_n(ident)}" if ident else ""
+        tmp_line = f"Temp writes    : {written_detail}{ident_str}  skip_finalized={_de_n(skip_f)}  skip_stale={_de_n(skip_s)}  skip_friendly={_de_n(skip_fa)}{skip_nc_str}"
 
         fo_war     = s.get("mwf_finalize_regular_war_ended",  0)
         fo_orphan  = s.get("mwf_finalize_orphan",   0)
@@ -2988,9 +3053,25 @@ class CacheManager:
             # successfully written, and is atomic on the same filesystem/directory.
             _file_is_new = not os.path.exists(target_file)
             _tmp_target_file = target_file + ".tmp"
+            _payload_str = json.dumps(payload, indent=2, ensure_ascii=False)
+            # Instrumentation only — behaviour unchanged, the write below still happens.
+            # Question being answered: would a write-skip on unchanged content pay off?
+            # During CWL the temp-write mix was new=221 / upd=2443, so skipping identical
+            # rewrites could have removed most of a ~2,700-write-per-cycle load; outside
+            # CWL the mix inverts (new=384 / upd=141) and it would buy almost nothing.
+            # Rather than guess, count it. Two-stage and cheap: a differing size proves
+            # differing content with no read at all, so only same-size files are read back.
+            if not _file_is_new:
+                try:
+                    if os.path.getsize(target_file) == len(_payload_str.encode("utf-8")):
+                        with open(target_file, "r", encoding="utf-8") as _f_old:
+                            if _f_old.read() == _payload_str:
+                                self.record_cycle_stat("temp_write_identical")
+                except OSError:
+                    pass
             try:
                 with open(_tmp_target_file, "w", encoding="utf-8") as f:
-                    json.dump(payload, f, indent=2, ensure_ascii=False)
+                    f.write(_payload_str)
                 os.replace(_tmp_target_file, target_file)
             except Exception:
                 try:

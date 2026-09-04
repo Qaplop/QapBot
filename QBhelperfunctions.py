@@ -7319,6 +7319,12 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
         _clan_obj = None
         if should_fetch_from_api:
             try:
+                # NOTE: deliberately stores EVERY clan, including the ~55K/day this path
+                # streams that were assumed never to be re-read.  That assumption was made
+                # in the same breath as adding the hit-rate counters that exist to test it,
+                # which would have guaranteed the counters could only ever confirm it.
+                # get_clan(store_result=False) exists and is tested, but stays unused until
+                # the measured per-population hit rate says the assumption holds.
                 _clan_obj = await CACHE.coc_clan_cache.get_clan(clan_tag)
                 if age:
                     logging.debug(f"[API CALL] get_clan fetch for {clan_tag} - last checked {age.total_seconds()/SECONDS_PER_HOUR:.1f} hours ago")

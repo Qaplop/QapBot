@@ -165,6 +165,31 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
   VS Code window where Claude Code chat is active — edit it in a separate editor/window, or
   use the terminal-only `claude` CLI for sessions touching this repo.
 
+### 17) Bump `BOT_BUILD` on every code change — same reflex as the changelog
+- DO: Increment `BOT_BUILD` in `QBcore.py` by exactly one whenever you change any `.py`
+  file that ships in the bot (repo-root modules or the `qapbot` package). One bump per
+  batch of changes you hand over, not one per file touched.
+- DO: Leave `BOT_VERSION` alone — that's the release number and the project owner manages
+  it. `BOT_BUILD` is a monotonic counter that never resets, including across
+  `BOT_VERSION` bumps.
+- DON'T: Renumber, reuse, or "tidy up" past build numbers, and don't bump for
+  docs/changelog/test-only edits (they don't change what runs on the server-machine).
+- WHY: Deployment here is a **file copy**, not a git operation, so "is it committed?" says
+  nothing about what is actually running. Sessions have repeatedly reasoned from the wrong
+  assumption about which code was live on the server-machine and drawn wrong conclusions
+  from its logs — including twice in the 2026-09-03/04 performance investigation, where a
+  fix was analysed as "not deployed" when it was, and cycle timings were attributed to the
+  wrong build. `BOT_BUILD` makes the running code identifiable from the log line
+  `Version: X.Y.Z  build N  src <fingerprint>` written at startup, and from `/status`.
+- Note the safety net: `QBcore.source_fingerprint()` hashes the shipped `.py` sources and
+  is logged next to the build number. It cannot drift, so **a forgotten bump is still
+  detectable** — same build number with a different `src` means someone edited without
+  bumping. If you see that, trust the fingerprint, not the number.
+- Before analysing a log, check the `Version:` line of the run you are reading. If two runs
+  share a build number but differ in `src`, treat the build number as unreliable for that
+  comparison and say so rather than reasoning past it.
+📖 Where: `QBcore.py` (`BOT_BUILD`, `source_fingerprint()`); startup log in `QapBot.py`.
+
 ---
 
 ## Quick reference (most common)
@@ -261,6 +286,9 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 - Verify cache consistency: Are save/load operations paired?
 - Test error paths: Are failures handled gracefully?
 - Update documentation per Cardinal Rule 15 if the change touches anything documented
+- **Bump `BOT_BUILD` in `QBcore.py` by one** per Cardinal Rule 17, if you changed any `.py`
+  file that ships in the bot. Do this in the same pass as the changelog entry — they are
+  the same reflex, and the build number is what makes the changelog entry findable in a log.
 - **Run tests with:** `.\run_tests.ps1` — NEVER construct a raw pytest command.
   Pass extra filters as trailing args: `.\run_tests.ps1 -k my_test` or `--lf`.
   The script encodes the canonical deselects; calling it directly keeps the
@@ -302,6 +330,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 - **Content**: Short and crisp — a few lines stating what changed (Fixed/Added/Changed) and why, plus the file(s) touched and the test result. Not a multi-paragraph blow-by-blow of every branch/file touched.
 - **Documentation Updates**: See Cardinal Rule 15 — update the relevant doc(s) in the same pass, not as a follow-up.
 - **Tests**: Run `.\run_tests.ps1` (see "After Writing Code" above) and report the real pass count in the entry — never a raw `pytest` count, which misreports deliberately-deselected tests as failures.
+- **Build number**: Bump `BOT_BUILD` (Cardinal Rule 17) in the same pass, and state it in the entry as `Build N.` so a log line can be traced back to exactly this changelog entry.
 
 **Example** (see `changelog.txt` itself for the full live convention):
 ```
@@ -327,6 +356,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 📖 **../qapbot/docs/CWL_ROSTER_PLANNING_PLAN.md**: the whole CWL roster workflow (shipped) — four-phase model, `cwl_*` roster schema, permission tiers, Activity board, coordinators, retention purge  
 📖 **../qapbot/docs/COC_GAME_MECHANICS.md**: CWL round schedule, regular war states, passive/inactive tracking, warlog visibility  
 📖 **../qapbot/docs/ARCHIVE_SCAN_PERFORMANCE_ANALYSIS.md**: Archive-directory rescan cost analysis — dated investigation, revisit trigger noted inside  
+📖 **../qapbot/docs/PERFORMANCE_TUNING.md**: **Read before touching any update-cycle performance knob** — why the cycle is CPU-bound on the server-machine, which knobs measurably do NOTHING (fetch concurrency, throttle limit, a tracked-clan index — all tried, measured, reverted), where the real wins were, and the measurement discipline that separates the two (Little's Law, `cores_busy`, holding flags constant when comparing cycles)  
 📖 **../qapbot/docs/TEST_CONCEPT.md**: Test tier design (smoke/integration/discord/live/e2e), fixture strategy, coverage targets, CI pipeline — see also "Run tests with" above for the one-line version  
 📖 **../qapbot/docs/CWL_CLAN_CONFIG_ACTIVITY_PLAN.md**: CWL Clan-Config Discord Activity — Cloudflare Pages/Workers + `qapbot/web_bridge.py` architecture, auth model, phase-by-phase history (see also Pitfall 25 / `../qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md` for the Activities Entry Point command gotcha)  
 📖 **../qapbot/docs/BUG_FEATURE_TRACKER.md**: Bug/feature tracker — `qapbot/ui_tracker.py` item lifecycle, `/api/tracker/*` bridge endpoints, `qapbot/mcp/tracker_mcp.py` MCP server, runbook (see `../BUG_FEATURE_TRACKER_PLAN.md` for the full design doc)  

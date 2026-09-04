@@ -83,6 +83,54 @@ from qapbot.i18n import t  # type: ignore[attr-defined]
 
 BOT_VERSION: str = "1.3.26"
 
+# Incremented by exactly one on every code change — see the "Build number" section of
+# .github/copilot-instructions.md.  BOT_VERSION answers "which release is this?";
+# BOT_BUILD answers "which edit of it is actually running?", which is the question that
+# matters when reading the server-machine's log after a file-copy deploy.
+BOT_BUILD: int = 9
+
+
+def source_fingerprint() -> str:
+    """Short content hash of the bot's own Python sources.
+
+    BOT_BUILD is maintained by hand and can therefore drift — someone edits a file and
+    forgets to bump it, and the log then claims a build that is not what is running.
+    This cannot drift: two processes reporting the same fingerprint are running byte-identical
+    code, whatever their build numbers say.  Logged next to BOT_BUILD at startup so a
+    mismatch between "same build, different fingerprint" is immediately visible.
+
+    Covers the repo-root modules and the ``qapbot`` package (excluding ``__pycache__``);
+    tests, scripts and the virtualenv are deliberately out of scope since they do not
+    affect the running bot.  Cost is one pass over a few MB at startup only.
+
+    Returns:
+        8 hex characters, or ``"unknown"`` if the sources cannot be read — this is
+        diagnostics and must never prevent the bot from starting.
+    """
+    import hashlib
+    import os as _os
+
+    try:
+        _root = _os.path.dirname(_os.path.abspath(__file__))
+        _files: list[str] = []
+        for _name in _os.listdir(_root):
+            if _name.endswith(".py"):
+                _files.append(_os.path.join(_root, _name))
+        for _dirpath, _dirnames, _filenames in _os.walk(_os.path.join(_root, "qapbot")):
+            _dirnames[:] = [d for d in _dirnames if d != "__pycache__"]
+            _files.extend(
+                _os.path.join(_dirpath, f) for f in _filenames if f.endswith(".py")
+            )
+        _h = hashlib.sha256()
+        for _fp in sorted(_files):
+            # Hash the path too, so a rename alone changes the fingerprint.
+            _h.update(_os.path.relpath(_fp, _root).replace("\\", "/").encode("utf-8"))
+            with open(_fp, "rb") as _fh:
+                _h.update(_fh.read())
+        return _h.hexdigest()[:8]
+    except Exception:
+        return "unknown"
+
 # Discord bot configuration and initialization
 intents: discord.Intents = discord.Intents.default()
 intents.message_content = True  # Enable privileged message content intent for command/message access
