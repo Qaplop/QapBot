@@ -2634,3 +2634,50 @@ longer existed, and the code was doing net harm.
 
 **See also:** `PERFORMANCE_TUNING.md`, "Discord unresponsiveness during cycles is gen-2 GC",
 for the policy that replaced this call and the measurements behind it.
+
+---
+
+## Pitfall 58: a third-party object graph with internal back-references can NEVER be freed by refcounting — every instance waits for a stop-the-world sweep
+
+**Symptom:** stop-the-world GC pauses proportional to throughput, not to anything you retain.
+Memory looks fine, nothing leaks, no cache is oversized — objects you dropped long ago are
+simply still there, waiting for a collector. On a low-power box the pause is seconds.
+
+**What happened (2026-09-04):** coc.py's war graph back-references itself at four levels —
+`WarClan._war`, `ClanWarMember.war`/`.clan`, `WarAttack.war`/`.member`, and
+`ClanWarMember._best_opponent_attacker`. Nothing in a war is reachable-but-unreferenced, so
+**not one war was ever freed by refcounting.** Every fetched war — ~195 objects, ~2,600 per
+cycle, **508,769 objects** — survived until a sweep walked it, costing a 2.0s process-wide
+freeze every cycle. That was the whole of this bot's longstanding "Discord goes unresponsive
+during update cycles" complaint.
+
+The fix was not to schedule collection better. It was `release_war_object()`: sever the
+back-references after the graph's last consumer, making it acyclic so it dies the moment the
+last reference drops and **never reaches the collector at all**. Sweep-only garbage
+**2,640 → 0**, and it got *faster* (2.2ms → 1.2ms per 20 wars) — immediate refcount release
+beats deferred collection.
+
+**How to apply:**
+
+- **Ask the right question first.** Faced with a GC pause, "when should collection run?" is the
+  second-best question and it cost two builds here. Ask **"why is this garbage collectable-only
+  at all?"** An object graph refcounting can free costs nothing to release, at any time — no
+  scheduling policy needed.
+- **Suspect any library that hands you a navigable object graph** — ORMs, API wrappers, parse
+  trees, scene graphs. Convenience back-references (`child.parent`, `attack.war`) are exactly
+  what makes a graph collectable-only. Check with `gc.disable(); build_and_drop(); gc.collect()`
+  — a non-zero return means every instance is waiting for a sweep.
+- **Sever after the LAST consumer, and prove where that is.** Trace the full lifetime before
+  choosing the call site; put it in a `finally` so early returns and exceptions are covered.
+  Preserve the scalar fields callers still read; it is *navigation* you are destroying.
+- **Write the contract down and test both halves** — what survives and what is deliberately
+  destroyed. A future consumer that walks upward must move the call, not weaken it.
+- **Test against the real library objects, never mocks.** The question under test is which
+  references the library actually holds; a mock confirms whatever you assumed, and would keep
+  passing after an upgrade added a back-reference while the pause silently returned. Also
+  assert that the graph *is* still cyclic, so the day the library drops its back-references you
+  find out and can delete the workaround.
+
+**See also:** `PERFORMANCE_TUNING.md` ("The real fix: stop creating garbage that needs
+collecting") for the full measurement trail, and Pitfall 57 for the GC-tuning-across-versions
+trap met on the way to this.

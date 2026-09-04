@@ -278,6 +278,11 @@ Phase-1. Fixed by bulk-querying (`_ensure_clans_exist()`) and `executemany()`:
 Worth keeping — it removes real work and stops the cost scaling with a pool that only grows
 — but **do not cite it as a cycle-time optimisation.** It measured as no improvement.
 
+It does reframe what the CoC clan cache is *for*, though: its main value is not saving API
+calls, it is **suppressing this storm** by keeping `_fetch_and_cache()` →
+`_update_clan_metadata()` from running. See the cache-sizing discussion above and tracker
+#0094.
+
 
 ### Reading a cProfile of the event-loop thread
 
@@ -300,17 +305,6 @@ Not its time — its **call count**. It equals the number of loop iterations. Tw
 magnitude above normal means round-trip amplification: something is `await`ing per item over
 a data-sized collection. That single number found the storm below; see
 `COPILOT_PITFALLS_COOKBOOK.md` Pitfall 56 for the full pattern and the fix.
-
-### Fixed: the cold-cycle SQLite storm
-
-`persist_user("UNASSIGNED")` rewrote the entire 5,794-row unlinked-player pool on every
-newly-discovered player — ~11,600 event-loop round-trips per save, ~36 saves per cold
-Phase-1. Fixed by bulk-querying (`_ensure_clans_exist()`) and `executemany()`:
-**17,383 → 13 round-trips**, 1337x, identical writes.
-
-This also reframes what the CoC clan cache is *for*: its main value is not saving API calls,
-it is **suppressing this storm** by keeping `_fetch_and_cache()` → `_update_clan_metadata()`
-from running. See the cache-sizing discussion above and tracker #0094.
 
 ### Known, not yet fixed: `simple_member()` is O(n²) with an expensive constant
 
@@ -366,28 +360,39 @@ cover" (Issue 3, 2026-08-08) — but the pauses above appeared **7 minutes after
 within the first two cycles. The growth that makes sweeps expensive happens *inside a
 cycle*; a once-a-day release valve is ~24h too slow for it.
 
-### FIXED (2026-09-04, build 12): collection moved onto our schedule
+### Step 1 (build 12): collection moved onto our schedule — necessary, not sufficient
 
-**Why the garbage exists at all — and why it cannot be designed away.** coc.py's war graph is
-cyclic by construction: `WarAttack.war` and `WarClan._war` point back at the `ClanWar`. So
-~2,050 wars x ~150 objects per cycle is *unavoidably* GC-only garbage — refcounting can never
-free it. (This matches PROD's observed `collected=320,701` / `273,627` almost exactly.) The
-lever is which sweep runs when, not whether one runs.
+> **Superseded in part by build 14 — read the next section too.** This step was written on the
+> premise that the garbage "cannot be designed away, so the only lever is which sweep runs
+> when." That premise was **wrong**, and the two numbers below marked *(dev)* are simulation
+> figures that PROD later falsified. Kept because the policy itself still stands and build 14
+> depends on it — but do not quote its cost figures.
+
+coc.py's war graph is cyclic by construction (`WarClan._war`, `ClanWarMember.war`/`.clan`,
+`WarAttack.war`/`.member`), so refcounting cannot free a war *as coc.py hands it to us* —
+matching PROD's observed `collected=320,701` / `273,627`. What this step got wrong was
+concluding that therefore the garbage is unavoidable. It is avoidable: see build 14.
 
 The policy, in three parts:
 
 | When | What | Cost |
 |---|---|---|
 | Startup | `gc.freeze()` the loaded caches, then `gc.disable()` | one-off |
-| **Every cycle** | `gc.collect(1)` in `_post_cycle_cleanup()` | **0.018s**, reclaims ~311K objects |
+| **Every cycle** | `gc.collect(1)` in `_post_cycle_cleanup()` | *(dev est. 0.018s — **PROD measured 2.050s**, see below)* |
 | **Nightly** | `unfreeze -> full gc.collect() -> freeze`, in the maintenance window | the only full sweep the process runs |
 
 The per-cycle collect is young-generation only, and that is sufficient *because* automatic
 collection is off: with nothing being promoted on CPython's schedule, the entire war
 population is still young when the cycle ends, so a young-only collect reclaims all of it
-without ever walking the long-lived heap. Measured at PROD shape over 14 cycles: **RSS flat
-(116 -> 120 MB, no drift)**, 311,448 objects reclaimed every cycle, and the nightly full sweep
-then found just **1,064 objects in 0.001s** — a safety net rather than the main event.
+without ever walking the long-lived heap. Simulated over 14 cycles *(dev)*: RSS flat
+(116 -> 120 MB), 311,448 objects reclaimed per cycle, nightly sweep then finding 1,064 objects.
+
+**On PROD it cost 2.050s, not 0.018s** — 508,769 objects at ~240K objects/s. The estimate was
+70x optimistic because it extrapolated from dev instead of applying this document's own
+finding that the server-machine is memory-latency bound. Stalls did drop from 6 per cycle to
+1, which is real; but a 2s stall once per cycle is still a 2s stall, and the sleep window is
+not a safe place to hide one (the bot is idle then, which is when users interact with it).
+That is what build 14 fixes.
 
 **The sleep window is not a safe place to hide a pause.** An early version of this fix put the
 full collect there, reasoning that no cycle work is waiting. That is wrong: the bot is *idle*

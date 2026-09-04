@@ -1,6 +1,27 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-04 (20)
+- Docs hygiene after the GC work — three defects found by re-reading rather than assuming:
+  (a) PERFORMANCE_TUNING.md carried the cold-cycle SQLite storm section TWICE, and the second
+  copy was the pre-correction version still framing it as a win; removed, keeping the corrected
+  one. (b) The build-12 GC section stated a per-cycle cost of 0.018s — a dev simulation figure
+  PROD later falsified at 2.050s (70x); now labelled (dev) with the real number beside it.
+  (c) That same section asserted the garbage "cannot be designed away" and that "the lever is
+  which sweep runs when, not whether one runs" — build 14 disproved both; the section is now
+  headed "Step 1 ... necessary, not sufficient" and points forward.
+- Added: Pitfall 58 — a third-party object graph with internal back-references can never be
+  freed by refcounting, so every instance waits for a stop-the-world sweep. Carries the general
+  detection recipe (gc.disable(); build_and_drop(); gc.collect() returning non-zero), the
+  sever-after-last-consumer discipline, and why such tests must use real library objects rather
+  than mocks. The headline lesson: faced with a GC pause, "when should collection run?" is the
+  SECOND-best question — ask "why is this garbage collectable-only at all?" first. That cost
+  two builds here.
+- Updated: .github/copilot-instructions.md's PERFORMANCE_TUNING.md pointer now names the GC
+  policy (automatic collection disabled; release_war_object()) so it is discoverable before
+  someone touches either, and mentions matched-load comparison / "a cProfile hotspot is a
+  suspect, not a finding".
+
 2026-09-04 (19)
 - Fixed properly: the per-cycle GC pause is now removed rather than rescheduled. (17) moved
   collection onto our schedule, which cut stalls from 6/cycle to 1 — but that one still cost
