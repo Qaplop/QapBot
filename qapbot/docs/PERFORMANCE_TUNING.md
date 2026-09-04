@@ -366,18 +366,51 @@ cover" (Issue 3, 2026-08-08) — but the pauses above appeared **7 minutes after
 within the first two cycles. The growth that makes sweeps expensive happens *inside a
 cycle*; a once-a-day release valve is ~24h too slow for it.
 
-### The shape of the fix
+### FIXED (2026-09-04, build 12): collection moved onto our schedule
 
-Two numbers frame it. The per-cycle scoped `gc.collect(1)` in `_post_cycle_cleanup` costs
-**0.000s**, while automatic gen-2 sweeps cost **0.5–2.4s each, 6 per cold cycle, mid-cycle**.
-And the bot then **sleeps 171–199s** between cycles.
+**Why the garbage exists at all — and why it cannot be designed away.** coc.py's war graph is
+cyclic by construction: `WarAttack.war` and `WarClan._war` point back at the `ClanWar`. So
+~2,050 wars x ~150 objects per cycle is *unavoidably* GC-only garbage — refcounting can never
+free it. (This matches PROD's observed `collected=320,701` / `273,627` almost exactly.) The
+lever is which sweep runs when, not whether one runs.
 
-So the collector is doing its expensive work at precisely the worst moment, and the cheap
-moment goes unused. The lever is to move gen-2 onto *our* schedule — into the sleep window —
-rather than to make it faster. Note that most sweeps reclaim almost nothing (1,350–3,918
-objects for a 0.5–1.8s pause): they are walking a large live heap, so the win comes from
-reducing *what is walked* (freezing) and *when it is walked* (scheduling), not from
-allocating less.
+The policy, in three parts:
 
-Not yet implemented — needs measurement against `CWL_PROD_PERFORMANCE_FIX_PLAN.md` P2
-Step 10, which already moved the gen-2 multiplier 10 → 20.
+| When | What | Cost |
+|---|---|---|
+| Startup | `gc.freeze()` the loaded caches, then `gc.disable()` | one-off |
+| **Every cycle** | `gc.collect(1)` in `_post_cycle_cleanup()` | **0.018s**, reclaims ~311K objects |
+| **Nightly** | `unfreeze -> full gc.collect() -> freeze`, in the maintenance window | the only full sweep the process runs |
+
+The per-cycle collect is young-generation only, and that is sufficient *because* automatic
+collection is off: with nothing being promoted on CPython's schedule, the entire war
+population is still young when the cycle ends, so a young-only collect reclaims all of it
+without ever walking the long-lived heap. Measured at PROD shape over 14 cycles: **RSS flat
+(116 -> 120 MB, no drift)**, 311,448 objects reclaimed every cycle, and the nightly full sweep
+then found just **1,064 objects in 0.001s** — a safety net rather than the main event.
+
+**The sleep window is not a safe place to hide a pause.** An early version of this fix put the
+full collect there, reasoning that no cycle work is waiting. That is wrong: the bot is *idle*
+during the sleep window, which is exactly when a user is most likely to be interacting with
+it. Only the nightly maintenance window is genuinely free, because `db_maintenance_mode`
+already blocks Discord commands. Relocating a stall is not the same as removing one.
+
+**Freezing is the wrong tool for churn.** `gc.freeze()` is excellent for the large static
+caches — it makes a full collect measurably free (0.056s -> 0.000s over 1M objects), which is
+why the startup freeze exists. It is wrong for the per-cycle war population, which is rebuilt
+every cycle: freezing that would make its garbage permanent, which is the pile-up the policy
+exists to avoid.
+
+Escape hatch: `GC_AUTOMATIC=1` restores CPython scheduling.
+
+### Also fixed: `gc.set_threshold(700, 10, 20)` was inoperative-to-harmful on Python 3.14
+
+That call (2026-08-17) was written against Python <=3.11, whose default really was
+`(700, 10, 10)`. **Python 3.12 raised the gen-0 default to 2000**, so on 3.14 it was silently
+*lowering* gen-0 and tripling how often it ran — 1,214 gen-0 collections vs 425 for the same
+workload — while buying nothing. And 3.13 replaced the three-generation collector with an
+incremental one, so the gen-2 multiplier no longer gates full sweeps either (measured:
+threshold2 of 20 vs 1000 produced the same gen-2 count). Both halves were dead.
+
+**Rule:** never carry a `gc.set_threshold()` call across a Python upgrade without re-measuring.
+The defaults *and* the collector have both changed since 3.11.

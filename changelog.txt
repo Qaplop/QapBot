@@ -1,6 +1,47 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-04 (17)
+- Fixed (the longstanding one): Discord responsiveness during update cycles. Automatic GC is
+  now disabled at startup; collection runs on our schedule instead — a young-generation
+  gc.collect(1) per cycle in [CYCLE-CLEANUP], and the single full sweep in the nightly
+  maintenance window where db_maintenance_mode already blocks commands.
+- Why a young-gen collect is enough: the garbage is unavoidable (coc.py's war graph is cyclic
+  by construction — WarAttack.war and WarClan._war point back at the ClanWar — so ~2,050 wars
+  x ~150 objects per cycle can only ever be freed by a sweep, never by refcounting). But with
+  nothing being promoted on CPython's schedule, that whole population is still YOUNG at cycle
+  end, so a young-only collect reclaims all of it without walking the long-lived heap.
+  Measured at PROD shape: 0.018s and 311,448 objects per cycle, vs the 0.5-2.4s automatic
+  gen-2 sweeps it replaces. Over 14 cycles RSS stayed flat (116 -> 120 MB, no drift) and the
+  nightly full sweep then found only 1,064 objects in 0.001s.
+- Rejected on the way: putting the full sweep in the per-cycle SLEEP window. That only
+  relocates the stall — the bot is idle then, which is exactly when a user is most likely to
+  be interacting with it. Only the nightly window is genuinely free. (Thanks qaplop.)
+- Also rejected: gc.freeze() every cycle. Freezing is right for the big static caches (the
+  startup freeze makes a full collect measurably free, 0.056s -> 0.000s over 1M objects) and
+  wrong for the war population, which is rebuilt each cycle — freezing it would make its
+  garbage permanent, the exact pile-up we are avoiding.
+- Removed: gc.set_threshold(700, 10, 20). Written against Python <=3.11 whose default really
+  was (700, 10, 10); Python 3.12 raised the gen-0 default to 2000, so on PROD's 3.14 it was
+  silently LOWERING gen-0 and tripling how often it ran (1,214 collections vs 425) while
+  buying nothing — and 3.13's incremental collector means the gen-2 multiplier no longer gates
+  full sweeps at all (threshold2 20 vs 1000: identical gen-2 count). Both halves were dead.
+  Never carry a gc.set_threshold() across a Python upgrade without re-measuring — new
+  Pitfall 57.
+- Added: GC_AUTOMATIC=1 escape hatch (.env.example) to restore CPython scheduling for A/B or
+  memory-retention debugging. [CYCLE-CLEANUP] now logs gc_collect freed= so the per-cycle
+  collect can be verified from the log rather than assumed.
+- Added: tests/unit/test_gc_policy.py (7 cases) pinning the properties the policy rests on —
+  that war graphs really are cyclic, that a young collect leaves nothing for the full sweep,
+  that repeated cycles do not accumulate, that freezing hides objects and unfreezing returns
+  them, and that explicit collection still works while automatic is disabled.
+- Docs: PERFORMANCE_TUNING.md ("Discord unresponsiveness during cycles is gen-2 GC") carries
+  the evidence table and the three-part policy; Pitfall 57 carries the version-drift rule.
+- Verification on next PROD run: [LOOP-LAG] stalls should stop appearing during cycles and the
+  sleep window, [GC-AUTO] lines should vanish entirely outside nightly maintenance, and
+  [CYCLE-CLEANUP] gc_collect should show a non-zero freed= at roughly 0.1s. If freed= is ~0
+  while RSS climbs cycle over cycle, the policy is wrong — set GC_AUTOMATIC=1 and tell me.
+
 2026-09-04 (16)
 - Measured (build 11, unprofiled, matched load): the (15) round-trip fix bought NO measurable
   cycle time. Cold Phase-1 68.5s -> 66.0s at 2061 vs 2050 clans — inside noise. The fix stays

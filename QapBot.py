@@ -2471,7 +2471,15 @@ async def run_nightly_maintenance_routine(db_mgr: Any, run_migration: bool) -> s
         # and stays warm for the full 25h TTL until the next nightly run.
         await _warm_global_db_stats_cache(force_refresh=True)
 
-        # Step 5: full GC sweep + re-freeze, so tomorrow's automatic gen-2 sweeps stay cheap.
+        # Step 5: full GC sweep + re-freeze. THIS IS NOW THE ONLY FULL SWEEP THE PROCESS EVER
+        # RUNS (2026-09-04): automatic collection is disabled at startup and the per-cycle
+        # [CYCLE-CLEANUP] collect is young-generation only, so everything promoted out of the
+        # young generations over the day is reclaimed here and nowhere else. Do not weaken or
+        # skip this step without re-enabling automatic collection — see the [GC-POLICY] block
+        # near the startup gc.freeze() for the full rationale and measurements. This window is
+        # the right home for a multi-second pause precisely because db_maintenance_mode already
+        # blocks Discord commands; the update cycle's own sleep window is NOT a safe substitute
+        # (the bot is idle then, which is when users are most likely to be interacting).
         # Nightly-only counterpart to the startup gc.freeze() (see [GC-FREEZE] near on_ready)
         # and the per-cycle scoped gc.collect(1) (see the [GC-AUTO] pause logger registered
         # near the top of this file / _post_cycle_cleanup). Every cycle promotes newly-created
@@ -2838,7 +2846,16 @@ async def periodic_main() -> None:
                 clear_player_stats_cache()
                 _t1 = time.perf_counter()
                 import gc as _gc
-                _gc.collect(1)
+                # Load-bearing since 2026-09-04: automatic collection is disabled at startup
+                # (see [GC-POLICY] near the startup gc.freeze()), so this is now the ONLY thing
+                # reclaiming the ~300K cyclic objects coc.py's war graph produces each cycle —
+                # it used to be a no-op costing 0.000s because the automatic collector had
+                # already swept. Generation 1 (not 2) on purpose: with nothing being promoted on
+                # CPython's schedule the whole war population is still young, so this reclaims
+                # all of it without walking the long-lived heap. Measured identical in cost to
+                # collect(0) while also catching objects promoted by the previous cycle's call.
+                # The full sweep happens nightly, where a multi-second pause is acceptable.
+                _gc_collected = _gc.collect(1)
                 _t2 = time.perf_counter()
                 # Return fragmented free arenas to the OS (Linux/glibc only).
                 # Python's pymalloc never releases arenas until fully empty, so
@@ -2859,9 +2876,9 @@ async def periodic_main() -> None:
                 # Timing breakdown so future slowdowns can be pinpointed at a
                 # glance instead of re-instrumenting; cheap (one log call/cycle).
                 logging.info(
-                    "[CYCLE-CLEANUP] clear_expired=%.3fs gc_collect=%.3fs "
+                    "[CYCLE-CLEANUP] clear_expired=%.3fs gc_collect=%.3fs (freed=%d) "
                     "malloc_trim=%.3fs total=%.3fs (expired=%d)",
-                    _t1 - _t0, _t2 - _t1, _t3 - _t2, _t3 - _t0, expired,
+                    _t1 - _t0, _t2 - _t1, _gc_collected, _t3 - _t2, _t3 - _t0, expired,
                 )
                 return expired
             await asyncio.to_thread(_post_cycle_cleanup)
@@ -3694,18 +3711,23 @@ async def _run_startup_initialization() -> None:
             }
             logging.info(f"📊 Cache stats: {stats}")
 
-            # Raise the gen-2 collection threshold (2026-08-17, CWL_PROD_PERFORMANCE_FIX_PLAN.md
-            # P2 Step 10 — mitigation, not the fix; P0 already removed the actual allocation
-            # source behind the 2026-08-16 PROD meltdown's escalating gen-2 [GC-AUTO] pauses,
-            # 1.5-5.5s each). Default thresholds are (700, 10, 10): a gen-2 sweep runs once gen-1
-            # has been collected 10 times since the last gen-2 sweep. Raising just the gen-2
-            # multiplier to 20 (gen-0/gen-1 left at their defaults — those stay cheap regardless
-            # of heap size) halves how often automatic gen-2 sweeps run, without changing gen-0/
-            # gen-1's own frequent, cheap collections at all. Set once, here, before the
-            # gc.freeze() below — threshold and freeze state are independent (thresholds gate
-            # WHEN a sweep runs; freezing controls WHAT a sweep walks), so order between the two
-            # doesn't matter, but co-locating them keeps every startup GC decision in one place.
-            gc.set_threshold(700, 10, 20)
+            # GC thresholds: leave CPython's defaults alone. (2026-09-04)
+            #
+            # This used to call gc.set_threshold(700, 10, 20) — "raise the gen-2 multiplier to
+            # 20, gen-0/gen-1 left at their defaults" (2026-08-17,
+            # CWL_PROD_PERFORMANCE_FIX_PLAN.md P2 Step 10). That comment was written against
+            # Python <=3.11, whose default really was (700, 10, 10). **Python 3.12 raised the
+            # gen-0 default to 2000**, so on PROD's 3.14 that call was silently *lowering* gen-0
+            # from 2000 to 700 — tripling how often gen-0 runs (measured: 1,214 gen-0 collections
+            # vs 425 for the same workload) while buying nothing. And the gen-2 multiplier no
+            # longer does what the comment claims either: 3.13 replaced the old three-generation
+            # collector with an incremental one, and threshold2 no longer reliably gates full
+            # sweeps (measured: threshold2 of 20 vs 1000 produced the same number of gen-2
+            # collections). Both halves of that mitigation were inoperative-to-harmful.
+            #
+            # Do not re-add a set_threshold() call without re-measuring on the *deployed* Python
+            # version — the defaults and the collector itself have changed twice since 3.11.
+            _gc_thresholds = gc.get_threshold()
 
             # Freeze the just-loaded CACHE state into gc's permanent generation.
             # CPython's automatic collector is never disabled in this codebase
@@ -3730,6 +3752,64 @@ async def _run_startup_initialization() -> None:
                 return gc.get_freeze_count()
             _frozen_count = await asyncio.to_thread(_freeze_startup_heap)
             logging.info(f"[GC-FREEZE] Froze {_frozen_count:,} startup object(s) into the permanent generation")
+
+            # Take automatic collection off CPython's schedule and put it on ours. (2026-09-04)
+            #
+            # WHY: every Discord-responsiveness stall this bot has ever had is an automatic
+            # gen-2 sweep. Measured on PROD build 11 — 11 of 11 `[LOOP-LAG]` stalls matched a
+            # `[GC-AUTO]` pause within the watchdog's 100ms probe resolution (0.54/0.69/0.74/
+            # 0.96/1.05/1.25/1.74/1.27/1.57/1.91/2.42s), while p95 *between* collections was
+            # 0.046s. Several exceeded Discord's 3s interaction ACK deadline. GC holds the GIL,
+            # so no amount of to_thread-ing or awaiting can hide it (Pitfall 16).
+            #
+            # The sweeps were also almost pure waste: most reclaimed only 1,350-3,918 objects for
+            # that 0.5-1.8s, because an automatic sweep fires on allocation volume and so lands
+            # mid-cycle, walking the whole in-flight war population while it is still LIVE.
+            #
+            # WHY THE GARBAGE EXISTS AT ALL: coc.py's war graph is cyclic by construction —
+            # `WarAttack.war` and `WarClan._war` point back at the ClanWar. So ~2,050 wars x ~150
+            # objects of *unavoidably* GC-only garbage per cycle; refcounting can never free it
+            # (matches PROD's observed collected=320,701 / 273,627 almost exactly). It must be
+            # swept. The lever is WHICH sweep, not whether.
+            #
+            # THE POLICY. Automatic collection off, and instead:
+            #   - per cycle, in _post_cycle_cleanup(): gc.collect(1). With nothing being promoted
+            #     on CPython's schedule, that entire war population is still in the young
+            #     generations, so a young-only collect reclaims all of it without walking the
+            #     long-lived heap. Measured at PROD shape: 0.018s and 311,448 objects reclaimed,
+            #     versus 0.5-2.4s for the automatic gen-2 sweeps it replaces.
+            #   - nightly, in the maintenance window: unfreeze -> full gc.collect() -> re-freeze
+            #     (already implemented below). That is where any multi-second full sweep belongs,
+            #     because db_maintenance_mode already blocks Discord commands there.
+            #
+            # Verified over 14 simulated cycles at PROD shape: RSS flat (116 -> 120 MB, no
+            # drift), 311,448 objects reclaimed every single cycle, and the nightly full sweep
+            # then found just 1,064 objects in 0.001s — a safety net, not the main event.
+            #
+            # NOTE the sleep window is NOT a safe place to hide a multi-second pause: the bot is
+            # idle then, which is precisely when a user is most likely to be interacting with it.
+            # Only the nightly maintenance window is genuinely free, because commands are blocked.
+            #
+            # Deliberately NOT "gc.freeze() every cycle": freezing is right for the large static
+            # caches (the startup freeze above makes a full collect measurably free — 0.056s ->
+            # 0.000s over 1M objects) and wrong for the war population, which is rebuilt every
+            # cycle. Freezing that would make its garbage permanent — the exact pile-up we are
+            # avoiding.
+            #
+            # Escape hatch: set GC_AUTOMATIC=1 to restore CPython's scheduling.
+            if os.getenv("GC_AUTOMATIC", "").strip() == "1":
+                logging.warning(
+                    "[GC-POLICY] GC_AUTOMATIC=1 — leaving automatic collection on CPython's "
+                    "schedule; expect multi-second [GC-AUTO] pauses mid-cycle"
+                )
+            else:
+                gc.disable()
+                logging.info(
+                    "[GC-POLICY] Automatic collection disabled — young-gen collect per cycle in "
+                    "[CYCLE-CLEANUP], full sweep nightly (thresholds %s, %s object(s) frozen). "
+                    "Set GC_AUTOMATIC=1 to revert.",
+                    _gc_thresholds, f"{_frozen_count:,}",
+                )
 
             # Load CWL war-tag recovery queue (if data/missing_cwl_war_tags.txt exists)
             try:

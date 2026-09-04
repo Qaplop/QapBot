@@ -2592,3 +2592,45 @@ to run one trivial `SELECT 1`.
 - To find these: cProfile the event-loop thread and look at the **`epoll.poll` call count**,
   not the time. Loop iterations two orders of magnitude above normal mean round-trip
   amplification somewhere. See `PERFORMANCE_TUNING.md`.
+
+---
+
+## Pitfall 57: a `gc.set_threshold()` call silently changes meaning across a Python upgrade — the defaults moved in 3.12 and the collector itself was replaced in 3.13
+
+**Symptom:** a GC tuning call that was measured and correct when written now does nothing, or
+the opposite of what its comment claims. Nothing fails; it just quietly stops being true.
+
+**What happened (2026-09-04):** `QapBot.py` carried
+
+```python
+gc.set_threshold(700, 10, 20)   # "defaults are (700, 10, 10); raise only the gen-2 multiplier"
+```
+
+Accurate when written against Python ≤3.11. By the time PROD ran **3.14**, both halves were
+dead:
+
+- **Python 3.12 raised the gen-0 default from 700 to 2000.** So the call was no longer
+  "leaving gen-0 at its default" — it was *lowering* it, tripling how often gen-0 ran.
+  Measured: **1,214 gen-0 collections vs 425** for the same workload.
+- **Python 3.13 replaced the three-generation collector with an incremental one.** The gen-2
+  multiplier no longer gates full sweeps. Measured: `threshold2` of **20 vs 1000 produced the
+  same number of gen-2 collections**.
+
+So a comment that read as a careful, measured optimisation was describing a runtime that no
+longer existed, and the code was doing net harm.
+
+**How to apply:**
+
+- Treat `gc.set_threshold()`, and any tuning built on generation *counts*, as **version-bound**.
+  Re-measure on the deployed interpreter after every Python upgrade, or delete the call.
+- Never trust a comment's claim about what a language default *is*. Print it:
+  `gc.get_threshold()` takes one line and would have caught this immediately.
+- Prefer levers whose meaning is stable across versions. `gc.disable()` + explicit
+  `gc.collect(...)` at chosen points says exactly what it does on every version; threshold
+  tuning is an indirect request that the runtime is free to reinterpret.
+- The same caution applies to anything keyed on CPython internals that 3.12–3.14 churned:
+  GC generations, `sys.getsizeof` on containers, dict/set ordering assumptions, and the
+  free-threading build's changed refcount semantics.
+
+**See also:** `PERFORMANCE_TUNING.md`, "Discord unresponsiveness during cycles is gen-2 GC",
+for the policy that replaced this call and the measurements behind it.
