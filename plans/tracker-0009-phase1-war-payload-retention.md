@@ -174,3 +174,67 @@ does not drop after `280537a`, the residual is allocator-level (pymalloc arena p
 fragmentation) rather than retention-level, and **this plan will not fix it** — that would need
 its own investigation (arena tuning, `MALLOC_ARENA_MAX`, or periodic process recycling). Check
 the post-`280537a` floor before starting this work, so the effort goes where the memory actually is.
+
+---
+
+## 9. Interaction with the 2026-09-04 GC work (read before starting)
+
+A day of GC work landed after this plan was written (builds 12-17, see
+`qapbot/docs/PERFORMANCE_TUNING.md`). It touches the same object graph, so the overlap needs
+stating precisely — **it is adjacent to this plan, not a partial implementation of it.**
+
+### What that work did NOT do: reduce the peak
+
+`release_war_object()` severs coc.py's back-references so a war graph is freed by refcounting
+instead of waiting for a sweep. But it is called **in the Phase-3 loop**, after
+`process_clan_war_data()`. War objects are still created at `asyncio.gather()` (QapBot.py L1633)
+and still live until their turn in Phase 3 (L1855). **The Phase-1/2 boundary peak this plan
+targets is completely unchanged.** That peak is what §4's 250 MB -> 60 MB claim is about, and it
+is still on the table.
+
+The GC work solved a different problem — stop-the-world pauses making Discord unresponsive —
+which happens to share a root cause (coc.py's cyclic war graph).
+
+### What that work DID do for this plan: de-risk §2, and remove one of its incidental benefits
+
+- **§2's audit is independently confirmed.** Tracing war-object consumers from scratch for the
+  sever work found exactly the same set: `.end_time` (QapBot.py's backdating), and `.clan`,
+  `.opponent`, `.start_time`, `.attacks_per_member` in `process_clan_war_data()`. Two
+  independent audits agreeing is the best evidence this table is complete.
+- **`_opp_clan` is still a dead local** (QBhelperfunctions.py, in `process_clan_war_data`) —
+  §2's note stands.
+- **The graph's shape is now measured, not assumed:** 132 sweep-only objects for a 15v15 war,
+  ~195/clan on PROD average. Supports §2's "3-4x heavier" framing.
+- **The GC cost of these objects is already gone**, so do not re-justify this plan on GC
+  grounds. Its remaining case is peak RSS and the `_MAX_INACTIVE_PER_CYCLE` cap.
+
+### A merge conflict this plan does not anticipate
+
+Step 4 says to replace `war_data.get('war_obj')` with the carried `end_time`. That call site now
+*also* contains `release_war_object(war_data.get('war_obj'))` and a `maybe_chunk_collect()`.
+When step 2 lands, `war_obj` no longer exists, so:
+
+- **delete the `release_war_object()` call** at that site — with no coc object retained there is
+  nothing to sever, which is a clean win, not a regression;
+- **keep `maybe_chunk_collect()`** — it is unrelated to war objects and still governs the
+  remaining `coc.Clan` garbage from `coc_clan_cache`;
+- **keep `release_war_object()` itself.** It is still needed for the CWL paths that build war
+  objects outside this flow (`get_league_war()` call sites in QBhelperfunctions.py), and its
+  tests double as the canary for coc.py dropping its back-references.
+
+### §8's precondition, now measured
+
+§8 says to check the post-`280537a` memory floor first, so the effort goes where the memory
+actually is. **Measured 2026-09-04 across 80 cycles: RSS peak per build 1,777-3,494 MB, minimum
+752 MB** — against the ~5.5 GB floor §8 cites. The floor did drop, so the residual was retention
+rather than allocator-level, and this plan's premise holds.
+
+But it also means **the memory-pressure justification is much weaker than when this was
+written**: a 3.5 GB peak on a 10 GB box is comfortable, not urgent. The remaining real prize is
+§4's last paragraph — making the peak proportional to cheap data so `_MAX_INACTIVE_PER_CYCLE`
+(QapBot.py L1413, currently 1500) can be raised. That is a 22h-SLA/throughput argument, not a
+memory-safety one. Re-scope the ticket accordingly before starting.
+
+### Status unchanged
+
+Still **do not start before 2026-09-11** — the 2026-09 CWL season is running as of this note.
