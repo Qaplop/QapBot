@@ -1,6 +1,23 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (11)
+- Raised _MAX_INACTIVE_PER_CYCLE 3000 -> 5000 (build 26). Applied on PROD first and observed to
+  fit both the cycle-time and the memory budget there; this brings the source in line with what
+  is already running.
+- Worth noting what this actually is: 5000 was the ORIGINAL cap before tracker #0009 lowered it
+  to 1500 on 2026-08-29 as a memory mitigation. Stage 3 removed the cost that justified that cut
+  (fetch_results no longer holds a coc.ClanWar per polled clan), so this is a revert of the
+  mitigation rather than a new tuning decision -- the cap is back where it started, for the
+  reason it was lowered no longer applying.
+- Comment updated to distinguish what is now known from what still is not: "observed safe at
+  5000" is an operational observation (time and memory stayed in budget), NOT a measured cost
+  model. Nobody has measured single-cycle RSS delta against cycle size under the current code,
+  so there is still no number saying where the actual ceiling is -- only evidence that 5000 sits
+  below it. The pre-Stage-3 memory figures remain marked deprecated and must not be used to
+  derive a new number.
+- 3063 tests pass. pyright clean.
+
 2026-09-05 (10)
 - Added an [API-CALL-MIX] line to the end-of-cycle summary (build 25). coc_health has tracked
   cycle_calls_by_op since it was written but NOTHING ever logged it, so the actual per-cycle API

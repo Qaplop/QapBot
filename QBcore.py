@@ -87,7 +87,7 @@ BOT_VERSION: str = "1.3.28"
 # .github/copilot-instructions.md.  BOT_VERSION answers "which release is this?";
 # BOT_BUILD answers "which edit of it is actually running?", which is the question that
 # matters when reading the server-machine's log after a file-copy deploy.
-BOT_BUILD: int = 25
+BOT_BUILD: int = 26
 
 
 def source_fingerprint() -> str:

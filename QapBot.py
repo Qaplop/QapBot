@@ -1399,16 +1399,24 @@ async def main() -> None:
     # backlog (starvation), defeating the schedule.  Active-war clans are extremely
     # rare in the inactive pool (~2 per 5000), so exempting them is near-zero cost.
     #
-    # 2026-09-05 (Stage 3 follow-up): raised 1500 -> 3000. Applied on PROD first and observed
-    # safe there; this repo change brings the source in line with what is already running.
+    # 2026-09-05 (Stage 3 follow-up): raised 1500 -> 3000 -> 5000 over the course of the day, each
+    # step applied on PROD first and observed there before being brought back into the source.
+    # 5000 was observed to fit both the cycle-time and the memory budget on PROD. Note this
+    # returns the cap to its original pre-tracker-#0009 value: the 5000 -> 1500 cut below was
+    # made for a memory cost that Stage 3 has since removed, so this is a revert of that
+    # mitigation rather than a new tuning.
     #
-    # ⚠️ EVERY MEMORY FIGURE BELOW IS DEPRECATED AND UNCONFIRMED FOR THE CURRENT CODE. They were
-    # measured before Stage 3 and describe a cost model that no longer holds: fetch_results held
-    # a coc.ClanWar per polled clan then, and holds only the (much smaller) payload dict now.
-    # Treat them as historical context for why a cap exists at all, NOT as a current bound, and
-    # do not derive a new number from them. A fresh PROD measurement — single-cycle RSS delta
-    # against cycle size, at the 3000 cap — is required before any of this can be called
-    # confirmed again, including the 3000 itself.
+    # ⚠️ EVERY MEMORY FIGURE BELOW IS DEPRECATED FOR THE CURRENT CODE. They were measured before
+    # Stage 3 and describe a cost model that no longer holds: fetch_results held a coc.ClanWar per
+    # polled clan then, and holds only the (much smaller) payload dict now. Treat them as
+    # historical context for why a cap exists at all, NOT as a current bound, and do not derive a
+    # new number from them.
+    #
+    # What "observed safe at 5000" is and is not: it is an operational observation (cycle time and
+    # memory both stayed within budget on PROD), not a measured cost model. Nobody has yet
+    # measured single-cycle RSS delta against cycle size under the current code, so there is still
+    # no number saying where the ceiling actually is — only evidence that 5000 is below it. Do
+    # that measurement before raising further.
     #
     # Historical (pre-Stage-3, 2026-08-29, tracker #0009), retained for context only: the cap was
     # lowered 5000 -> 1500 as a memory bound rather than a runtime one, because every clan polled
@@ -1422,7 +1430,7 @@ async def main() -> None:
     #
     # War-critical clans stay exempt from the cap below regardless, so nothing latency-sensitive
     # is deferred by this.
-    _MAX_INACTIVE_PER_CYCLE = 3000
+    _MAX_INACTIVE_PER_CYCLE = 5000
     _overdue_total = len(inactive_clans)  # snapshot before capping, for CYCLE-SUMMARY
     if len(inactive_clans) > _MAX_INACTIVE_PER_CYCLE:
         # Partition into war-critical (exempt) and generic (cappable) clans.
