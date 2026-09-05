@@ -17,7 +17,7 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   every pre-existing row's guild_id, so tickets filed before this fix (including #0023 itself)
   self-heal on the next restart instead of staying stuck with access_grant_pending=1 forever.
 - qapbot/ui_tracker.py, qapbot/db_manager.py, qapbot/docs/BUG_FEATURE_TRACKER.md,
-  tests/discord/test_ui_tracker_items.py (5 new tests). 3064 tests pass. pyright clean.
+  tests/discord/test_ui_tracker_items.py (5 new tests). 3064 tests pass. pyright clean. Build 27.
 
 2026-09-05 (11)
 - Raised _MAX_INACTIVE_PER_CYCLE 3000 -> 5000 (build 26). Applied on PROD first and observed to
