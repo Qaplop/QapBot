@@ -27,6 +27,7 @@ from qapbot.ui_tracker import (
     TrackerDraftView,
     TrackerItemButton,
     TrackerItemModal,
+    TrackerReplyModal,
     TrackerStatusSelectView,
     TrackerTestMoveDoneButton,
     TrackerTestPassButton,
@@ -37,14 +38,17 @@ from qapbot.ui_tracker import (
     create_tracker_item_for_agent,
     finalize_testcases_move,
     get_thread_messages,
+    grant_access_for_agent,
     handle_tracker_test_reaction,
     handle_tracker_upload_message,
     mark_environment_passed_and_refresh,
     mark_testing_failed,
     post_comment,
     post_test_cases,
+    reply_and_invite_for_agent,
     start_tracker_item,
     _chunk_lines_for_discord,
+    _grant_or_invite_from_interaction,
     _register_upload_window,
     _send_testcases_moved_followup,
     _upload_windows,
@@ -859,31 +863,6 @@ async def test_status_select_second_selection_does_not_reapply(db, monkeypatch, 
     mock_interaction.edit_original_response.assert_awaited_once()
     item = await db.get_tracker_item(item_number)
     assert item["status"] == "triaged"
-
-
-@pytest.mark.asyncio
-async def test_grant_access_second_click_does_not_resend_invite(db, monkeypatch, mock_interaction):
-    """tracker item #0036 follow-up: Grant Access is a persistent DynamicItem button (a fresh
-    Python object per click, no shared view state), so its double-click guard has to be a
-    persisted-state check instead -- a second click must not create a second one-time invite
-    or send the reporter a second DM once access_grant_pending is already set."""
-    fake_user = AsyncMock()
-    _wire_bot(monkeypatch, channel=None, user=fake_user)
-    item_number = await _make_item(db, reporter_id="222")
-    mock_interaction.user.id = int(ADMIN_ID)
-    mock_interaction.guild.get_member = MagicMock(return_value=None)
-    mock_interaction.guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "not found"))
-    mock_interaction.channel.create_invite = AsyncMock(return_value=MagicMock(url="https://discord.gg/abc123"))
-
-    button = TrackerItemButton("grantaccess", item_number)
-    item = await db.get_tracker_item(item_number)
-    await button._handle_grant_access(mock_interaction, item)  # first click: creates the invite
-
-    item_after_first_click = await db.get_tracker_item(item_number)  # a second click re-fetches
-    await button._handle_grant_access(mock_interaction, item_after_first_click)  # simulated re-click
-
-    mock_interaction.channel.create_invite.assert_awaited_once()
-    fake_user.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1984,16 +1963,53 @@ async def test_grant_access_denied_for_non_admin(db, monkeypatch, mock_interacti
     _wire_bot(monkeypatch, channel=None)
     item_number = await _make_item(db, reporter_id="222")
     item = await db.get_tracker_item(item_number)
-    mock_interaction.channel.set_permissions = AsyncMock()
 
     button = TrackerItemButton("grantaccess", item_number)
     await button._handle_grant_access(mock_interaction, item)
 
-    mock_interaction.channel.set_permissions.assert_not_awaited()
+    mock_interaction.response.send_modal.assert_not_awaited()
     mock_interaction.response.send_message.assert_awaited_once()
 
 
-async def test_grant_access_grants_channel_permission_for_admin(db, monkeypatch, mock_interaction):
+async def test_grant_access_no_user_for_agent_filed_item(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db, reporter_id="agent:tester")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+
+    button = TrackerItemButton("grantaccess", item_number)
+    await button._handle_grant_access(mock_interaction, item)
+
+    mock_interaction.response.send_modal.assert_not_awaited()
+    text = mock_interaction.response.send_message.call_args[0][0]
+    assert "no linked discord user" in text.lower()
+
+
+async def test_grant_access_opens_reply_modal_for_admin(db, monkeypatch, mock_interaction):
+    """tracker item #0102: the button's whole job now is just gating + opening the reply modal
+    -- the actual grant/invite logic moved to TrackerReplyModal.on_submit() /
+    _grant_or_invite_from_interaction(), tested separately below, since a modal must be the
+    interaction's first response (Cardinal Rule 10) and can't also run side effects first."""
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db, reporter_id="222")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+
+    button = TrackerItemButton("grantaccess", item_number)
+    await button._handle_grant_access(mock_interaction, item)
+
+    mock_interaction.response.send_modal.assert_awaited_once()
+    modal = mock_interaction.response.send_modal.call_args[0][0]
+    assert isinstance(modal, TrackerReplyModal)
+    assert modal.item["item_number"] == item_number
+    assert modal.admin_id == str(ADMIN_ID)
+
+
+# -- TrackerReplyModal.on_submit / _grant_or_invite_from_interaction (tracker item #0102) ----
+
+async def test_reply_modal_blank_submit_only_grants_access(db, monkeypatch, mock_interaction):
+    """Submitting the modal with no reply text preserves the button's original grant-only
+    behavior -- no comment is posted."""
     _wire_bot(monkeypatch, channel=None)
     item_number = await _make_item(db, reporter_id="222")
     item = await db.get_tracker_item(item_number)
@@ -2003,8 +2019,8 @@ async def test_grant_access_grants_channel_permission_for_admin(db, monkeypatch,
     mock_interaction.guild.get_member = MagicMock(return_value=member)
     mock_interaction.channel.set_permissions = AsyncMock()
 
-    button = TrackerItemButton("grantaccess", item_number)
-    await button._handle_grant_access(mock_interaction, item)
+    modal = TrackerReplyModal(item, str(ADMIN_ID))
+    await modal.on_submit(mock_interaction)
 
     mock_interaction.channel.set_permissions.assert_awaited_once()
     args, kwargs = mock_interaction.channel.set_permissions.call_args
@@ -2013,9 +2029,33 @@ async def test_grant_access_grants_channel_permission_for_admin(db, monkeypatch,
     assert overwrite.view_channel is True
     assert overwrite.read_message_history is True
     assert overwrite.send_messages_in_threads is True
+    mock_interaction.channel.send.assert_not_awaited()  # no reply text -> no comment
 
 
-async def test_grant_access_response_links_to_the_discussion_thread(db, monkeypatch, mock_interaction):
+async def test_reply_modal_with_text_posts_comment_mentioning_reporter_then_grants(db, monkeypatch, mock_interaction):
+    thread = _fake_channel()
+    _wire_bot(monkeypatch, channel=thread)
+    item_number = await _make_item(db, reporter_id="222")
+    await db.update_tracker_item(item_number, thread_id="777")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+    member = MagicMock()
+    member.id = 222
+    mock_interaction.guild.get_member = MagicMock(return_value=member)
+    mock_interaction.channel.set_permissions = AsyncMock()
+
+    modal = TrackerReplyModal(item, str(ADMIN_ID))
+    cast(discord.ui.TextInput, modal.reply_input.component)._value = "Fixed -- please retest!"
+    await modal.on_submit(mock_interaction)
+
+    thread.send.assert_awaited_once()
+    posted = thread.send.call_args[0][0]
+    assert "<@222>" in posted  # the reporter is mentioned, not just the admin author
+    assert "Fixed -- please retest!" in posted
+    mock_interaction.channel.set_permissions.assert_awaited_once()  # still grants access too
+
+
+async def test_reply_modal_response_links_to_the_discussion_thread(db, monkeypatch, mock_interaction):
     _wire_bot(monkeypatch, channel=None)
     item_number = await _make_item(db, reporter_id="222", guild_id="999")
     await db.update_tracker_item(item_number, channel_id="10", message_id="100", thread_id="777")
@@ -2026,14 +2066,14 @@ async def test_grant_access_response_links_to_the_discussion_thread(db, monkeypa
     mock_interaction.guild.get_member = MagicMock(return_value=member)
     mock_interaction.channel.set_permissions = AsyncMock()
 
-    button = TrackerItemButton("grantaccess", item_number)
-    await button._handle_grant_access(mock_interaction, item)
+    modal = TrackerReplyModal(item, str(ADMIN_ID))
+    await modal.on_submit(mock_interaction)
 
-    text = mock_interaction.response.send_message.call_args[0][0]
+    text = mock_interaction.followup.send.call_args[0][0]
     assert "https://discord.com/channels/999/777" in text
 
 
-async def test_grant_access_response_falls_back_to_item_message_link_without_thread(db, monkeypatch, mock_interaction):
+async def test_reply_modal_response_falls_back_to_item_message_link_without_thread(db, monkeypatch, mock_interaction):
     _wire_bot(monkeypatch, channel=None)
     item_number = await _make_item(db, reporter_id="222", guild_id="999")
     await db.update_tracker_item(item_number, channel_id="10", message_id="100")
@@ -2044,27 +2084,14 @@ async def test_grant_access_response_falls_back_to_item_message_link_without_thr
     mock_interaction.guild.get_member = MagicMock(return_value=member)
     mock_interaction.channel.set_permissions = AsyncMock()
 
-    button = TrackerItemButton("grantaccess", item_number)
-    await button._handle_grant_access(mock_interaction, item)
+    modal = TrackerReplyModal(item, str(ADMIN_ID))
+    await modal.on_submit(mock_interaction)
 
-    text = mock_interaction.response.send_message.call_args[0][0]
+    text = mock_interaction.followup.send.call_args[0][0]
     assert "https://discord.com/channels/999/10/100" in text
 
 
-async def test_grant_access_skips_agent_filed_item(db, monkeypatch, mock_interaction):
-    _wire_bot(monkeypatch, channel=None)
-    item_number = await _make_item(db, reporter_id="agent:tester")
-    item = await db.get_tracker_item(item_number)
-    mock_interaction.user.id = int(ADMIN_ID)
-    mock_interaction.channel.set_permissions = AsyncMock()
-
-    button = TrackerItemButton("grantaccess", item_number)
-    await button._handle_grant_access(mock_interaction, item)
-
-    mock_interaction.channel.set_permissions.assert_not_awaited()
-
-
-async def test_grant_access_invites_non_member_reporter(db, monkeypatch, mock_interaction):
+async def test_reply_modal_invites_non_member_reporter(db, monkeypatch, mock_interaction):
     fake_user = AsyncMock()
     _wire_bot(monkeypatch, channel=None, user=fake_user)
     item_number = await _make_item(db, reporter_id="222")
@@ -2075,8 +2102,8 @@ async def test_grant_access_invites_non_member_reporter(db, monkeypatch, mock_in
     mock_interaction.channel.set_permissions = AsyncMock()
     mock_interaction.channel.create_invite = AsyncMock(return_value=MagicMock(url="https://discord.gg/abc123"))
 
-    button = TrackerItemButton("grantaccess", item_number)
-    await button._handle_grant_access(mock_interaction, item)
+    modal = TrackerReplyModal(item, str(ADMIN_ID))
+    await modal.on_submit(mock_interaction)
 
     mock_interaction.channel.create_invite.assert_awaited_once()
     mock_interaction.channel.set_permissions.assert_not_awaited()
@@ -2087,11 +2114,11 @@ async def test_grant_access_invites_non_member_reporter(db, monkeypatch, mock_in
     updated = await db.get_tracker_item(item_number)
     assert updated["access_grant_pending"] == 1
 
-    response_text = mock_interaction.response.send_message.call_args[0][0]
+    response_text = mock_interaction.followup.send.call_args[0][0]
     assert "https://discord.gg/abc123" in response_text
 
 
-async def test_grant_access_invite_dm_failure_still_reports_invite_url(db, monkeypatch, mock_interaction):
+async def test_reply_modal_invite_dm_failure_still_reports_invite_url(db, monkeypatch, mock_interaction):
     fake_user = AsyncMock()
     fake_user.send = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "blocked"))
     _wire_bot(monkeypatch, channel=None, user=fake_user)
@@ -2102,16 +2129,16 @@ async def test_grant_access_invite_dm_failure_still_reports_invite_url(db, monke
     mock_interaction.guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "not found"))
     mock_interaction.channel.create_invite = AsyncMock(return_value=MagicMock(url="https://discord.gg/abc123"))
 
-    button = TrackerItemButton("grantaccess", item_number)
-    await button._handle_grant_access(mock_interaction, item)
+    modal = TrackerReplyModal(item, str(ADMIN_ID))
+    await modal.on_submit(mock_interaction)
 
-    response_text = mock_interaction.response.send_message.call_args[0][0]
+    response_text = mock_interaction.followup.send.call_args[0][0]
     assert "https://discord.gg/abc123" in response_text
     updated = await db.get_tracker_item(item_number)
     assert updated["access_grant_pending"] == 1
 
 
-async def test_grant_access_invite_creation_failure(db, monkeypatch, mock_interaction):
+async def test_reply_modal_invite_creation_failure(db, monkeypatch, mock_interaction):
     fake_user = AsyncMock()
     _wire_bot(monkeypatch, channel=None, user=fake_user)
     item_number = await _make_item(db, reporter_id="222")
@@ -2121,15 +2148,15 @@ async def test_grant_access_invite_creation_failure(db, monkeypatch, mock_intera
     mock_interaction.guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "not found"))
     mock_interaction.channel.create_invite = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "no perms"))
 
-    button = TrackerItemButton("grantaccess", item_number)
-    await button._handle_grant_access(mock_interaction, item)
+    modal = TrackerReplyModal(item, str(ADMIN_ID))
+    await modal.on_submit(mock_interaction)
 
     fake_user.send.assert_not_awaited()
     updated = await db.get_tracker_item(item_number)
     assert updated["access_grant_pending"] == 0
 
 
-async def test_grant_access_member_not_found_when_reporter_user_unresolvable(db, monkeypatch, mock_interaction):
+async def test_reply_modal_member_not_found_when_reporter_user_unresolvable(db, monkeypatch, mock_interaction):
     _wire_bot(monkeypatch, channel=None, user=None)
     item_number = await _make_item(db, reporter_id="222")
     item = await db.get_tracker_item(item_number)
@@ -2138,10 +2165,55 @@ async def test_grant_access_member_not_found_when_reporter_user_unresolvable(db,
     mock_interaction.guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "not found"))
     mock_interaction.channel.create_invite = AsyncMock()
 
-    button = TrackerItemButton("grantaccess", item_number)
-    await button._handle_grant_access(mock_interaction, item)
+    modal = TrackerReplyModal(item, str(ADMIN_ID))
+    await modal.on_submit(mock_interaction)
 
     mock_interaction.channel.create_invite.assert_not_awaited()
+
+
+async def test_reply_modal_comment_post_failure_stops_before_granting(db, monkeypatch, mock_interaction):
+    """A reply that fails to post (e.g. Discord outage) must not silently proceed to grant
+    access anyway -- the admin needs to know their message didn't go through."""
+    thread = _fake_channel()
+    thread.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
+    _wire_bot(monkeypatch, channel=thread)
+    item_number = await _make_item(db, reporter_id="222")
+    await db.update_tracker_item(item_number, thread_id="777")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+    mock_interaction.channel.set_permissions = AsyncMock()
+
+    modal = TrackerReplyModal(item, str(ADMIN_ID))
+    cast(discord.ui.TextInput, modal.reply_input.component)._value = "hello"
+    await modal.on_submit(mock_interaction)
+
+    mock_interaction.channel.set_permissions.assert_not_awaited()
+    text = mock_interaction.followup.send.call_args[0][0]
+    assert "couldn't post your reply" in text.lower()
+
+
+# -- _grant_or_invite_from_interaction double-call guard (tracker item #0036 follow-up) ------
+
+async def test_grant_or_invite_from_interaction_second_call_does_not_resend_invite(db, monkeypatch, mock_interaction):
+    """tracker item #0036 follow-up: a second Grant Access round (button click -> modal submit)
+    must not create a second one-time invite or send the reporter a second DM once
+    access_grant_pending is already set from the first round."""
+    fake_user = AsyncMock()
+    _wire_bot(monkeypatch, channel=None, user=fake_user)
+    item_number = await _make_item(db, reporter_id="222")
+    mock_interaction.guild.get_member = MagicMock(return_value=None)
+    mock_interaction.guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "not found"))
+    mock_interaction.channel.create_invite = AsyncMock(return_value=MagicMock(url="https://discord.gg/abc123"))
+
+    item = await db.get_tracker_item(item_number)
+    await _grant_or_invite_from_interaction(mock_interaction, item)  # first round: creates the invite
+
+    item_after_first_round = await db.get_tracker_item(item_number)  # a second round re-fetches
+    result = await _grant_or_invite_from_interaction(mock_interaction, item_after_first_round)  # simulated re-run
+
+    mock_interaction.channel.create_invite.assert_awaited_once()
+    fake_user.send.assert_awaited_once()
+    assert result["outcome"] == "already_invited"
 
 
 # -- apply_pending_requestor_access (on_member_join) --------------------
@@ -2214,6 +2286,121 @@ async def test_apply_pending_requestor_access_noop_when_tracker_disabled(db, mon
     await apply_pending_requestor_access(member)
 
     channel.set_permissions.assert_not_awaited()
+
+
+# -- grant_access_for_agent / reply_and_invite_for_agent (tracker item #0102) ---------------
+
+async def test_grant_access_for_agent_grants_when_already_member(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_GUILD_ID] = "999"
+
+    channel = _fake_channel()
+    channel.set_permissions = AsyncMock()
+    bot = _wire_bot(monkeypatch, channel=channel)
+    guild = MagicMock()
+    member = MagicMock()
+    member.id = 222
+    guild.get_member = MagicMock(return_value=member)
+    bot.get_guild = MagicMock(return_value=guild)
+
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(item_number, channel_id="10", message_id="100")
+
+    result = await grant_access_for_agent(item_number)
+
+    channel.set_permissions.assert_awaited_once()
+    assert result["outcome"] == "granted"
+    assert result["jump_link"]
+
+
+async def test_grant_access_for_agent_invites_non_member(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_GUILD_ID] = "999"
+
+    fake_user = AsyncMock()
+    channel = _fake_channel()
+    channel.create_invite = AsyncMock(return_value=MagicMock(url="https://discord.gg/xyz"))
+    bot = _wire_bot(monkeypatch, channel=channel, user=fake_user)
+    guild = MagicMock()
+    guild.get_member = MagicMock(return_value=None)
+    guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "not found"))
+    bot.get_guild = MagicMock(return_value=guild)
+
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(item_number, channel_id="10", message_id="100")
+
+    result = await grant_access_for_agent(item_number)
+
+    channel.create_invite.assert_awaited_once()
+    fake_user.send.assert_awaited_once()
+    assert result["outcome"] == "invited"
+    assert result["invite_url"] == "https://discord.gg/xyz"
+    updated = await db.get_tracker_item(item_number)
+    assert updated["access_grant_pending"] == 1
+
+
+async def test_grant_access_for_agent_no_reporter_for_agent_filed_item(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_GUILD_ID] = "999"
+    _wire_bot(monkeypatch, channel=None)
+
+    item_number = await _make_item(db, reporter_id="agent:tester")
+    result = await grant_access_for_agent(item_number)
+
+    assert result["outcome"] == "no_reporter"
+
+
+async def test_grant_access_for_agent_not_configured_without_home_guild(db, monkeypatch):
+    """No tracker_guild_id bot_setting -- e.g. a freshly-started bot before Bot Setup has ever
+    saved -- must degrade to a reported outcome, never raise or silently do nothing."""
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db, reporter_id="222")
+    await db.update_tracker_item(item_number, channel_id="10", message_id="100")
+
+    result = await grant_access_for_agent(item_number)
+
+    assert result["outcome"] == "not_configured"
+
+
+async def test_grant_access_for_agent_raises_for_unknown_item(db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    with pytest.raises(ValueError):
+        await grant_access_for_agent(999999)
+
+
+async def test_reply_and_invite_for_agent_posts_comment_and_grants(db, monkeypatch):
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_GUILD_ID] = "999"
+
+    thread = _fake_channel()
+    channel = _fake_channel()
+    channel.set_permissions = AsyncMock()
+    bot = _wire_bot_multi(monkeypatch, {10: channel, 777: thread})
+    guild = MagicMock()
+    member = MagicMock()
+    member.id = 222
+    guild.get_member = MagicMock(return_value=member)
+    bot.get_guild = MagicMock(return_value=guild)
+
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(item_number, channel_id="10", message_id="100", thread_id="777")
+
+    result = await reply_and_invite_for_agent(item_number, "Fix is live, please retest", "claude")
+
+    thread.send.assert_awaited_once()
+    posted = thread.send.call_args[0][0]
+    assert "<@222>" in posted  # reporter mentioned, not just the "claude" author label
+    assert "Fix is live, please retest" in posted
+    channel.set_permissions.assert_awaited_once()
+    assert result["comment_posted"] is True
+    assert result["access"]["outcome"] == "granted"
+
+
+async def test_reply_and_invite_for_agent_raises_without_thread(db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db, reporter_id="222")
+    with pytest.raises(ValueError):
+        await reply_and_invite_for_agent(item_number, "hi", "claude")
 
 
 async def test_apply_status_change_done_revokes_requestor_access_when_moved(db, monkeypatch):

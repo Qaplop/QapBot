@@ -15,12 +15,16 @@ guaranteed to see the user's shell environment):
     TRACKER_ADMIN_ID       attribution label sent as X-Tracker-Admin (self-asserted, never
                            authentication — see plan §6.4).
 
-Ten tools now, seven of them writes (tracker item #0015 added `tracker_create_item`; a follow-up
-added `tracker_mark_testcase_passed`/`tracker_mark_testcase_failed` so the pass/fail sign-off
-loop, previously Discord-button-only, is agent-drivable too; a second follow-up decoupled the
-item's own `done` transition from the test-case message's archive move — each object now moves
-on its own trigger only — and added `tracker_move_testcases_done` for the manual/forced archive):
-create / status / comment / testcases / mark-passed / mark-failed / move-testcases-done. The
+Eleven tools now, eight of them writes (tracker item #0015 added `tracker_create_item`; a
+follow-up added `tracker_mark_testcase_passed`/`tracker_mark_testcase_failed` so the pass/fail
+sign-off loop, previously Discord-button-only, is agent-drivable too; a second follow-up
+decoupled the item's own `done` transition from the test-case message's archive move — each
+object now moves on its own trigger only — and added `tracker_move_testcases_done` for the
+manual/forced archive; tracker item #0102 added `tracker_reply_and_invite` — the agent-drivable
+equivalent of the Discord "Reply to requestor" button, for replying to a reporter and making
+sure they can actually see/answer it, sharing its grant/invite side effects with that button via
+`ui_tracker.py`'s `_apply_requestor_grant()`/`_invite_requestor_core()`): create / status /
+comment / reply-and-invite / testcases / mark-passed / mark-failed / move-testcases-done. The
 three read tools are list / get-item / get-thread — `tracker_get_thread` (2026-08-22) closed the
 last one-way gap: `tracker_comment` could only ever WRITE into an item's discussion thread, with
 no way for an agent to read a human's replies posted there. Still no filesystem, shell, git, or
@@ -130,6 +134,27 @@ TOOLS: List[Dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {"item_number": {"type": "integer"}, "text": {"type": "string"}},
+            "required": ["item_number", "text"],
+        },
+    },
+    {
+        "name": "tracker_reply_and_invite",
+        "description": (
+            "Reply directly to a tracker item's reporter, addressed to them with an @mention "
+            "so Discord actually notifies them, and make sure they can see and answer it -- the "
+            "agent-drivable equivalent of clicking the Discord \"Reply to requestor\" button. "
+            "Use this (not tracker_comment) whenever the reply is meant for the reporter "
+            "specifically, e.g. asking a clarifying question or telling them a fix is ready to "
+            "retest. If the reporter has already joined the tracker's server, this grants them "
+            "channel access immediately; if not, it DMs them a one-time invite and access is "
+            "applied automatically the moment they join -- no follow-up action needed either way."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_number": {"type": "integer"},
+                "text": {"type": "string", "description": "The message to post, addressed to the reporter."},
+            },
             "required": ["item_number", "text"],
         },
     },
@@ -380,6 +405,11 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> str:
         await client.comment(int(arguments["item_number"]), arguments["text"])
         return f"Comment posted to #{int(arguments['item_number']):04d}'s discussion thread."
 
+    if name == "tracker_reply_and_invite":
+        item_number = int(arguments["item_number"])
+        result = await client.reply_and_invite(item_number, arguments["text"])
+        return f"Posted your reply to #{item_number:04d}. {_describe_access_outcome(result['access'])}"
+
     if name == "tracker_get_thread":
         return await render_thread_markdown(client, int(arguments["item_number"]), arguments.get("limit", 50))
 
@@ -413,6 +443,33 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> str:
         return "\n".join(line for line in lines if line)
 
     raise ValueError(f"unknown tool: {name}")
+
+
+def _describe_access_outcome(access: Dict[str, Any]) -> str:
+    """Plain-language summary of grant_access_for_agent()'s result, for tracker_reply_and_invite's
+    tool response — mirrors what the Discord "Reply to requestor" button's ephemeral messages say
+    to an admin, since this is the same underlying action (ui_tracker.py's
+    _apply_requestor_grant()/_invite_requestor_core())."""
+    outcome = access.get("outcome")
+    if outcome == "granted":
+        return "They're already a member -- granted them access to the channel and thread."
+    if outcome == "invited":
+        return "They haven't joined yet -- sent them a DM invite; access applies automatically once they join."
+    if outcome == "invite_dm_failed":
+        return f"They haven't joined yet, but their DMs are closed -- share this invite with them yourself: {access.get('invite_url')}"
+    if outcome == "already_invited":
+        return "An invite was already sent to them earlier -- access applies automatically once they join."
+    if outcome == "member_not_found":
+        return "Couldn't resolve that reporter as a Discord user at all -- nothing more to do."
+    if outcome == "no_reporter":
+        return "This item has no real Discord reporter to invite (agent-filed)."
+    if outcome == "grant_failed":
+        return "They're a member, but granting channel access failed -- check the bot's permissions there."
+    if outcome == "invite_failed":
+        return "Couldn't create an invite -- check the bot's \"Create Invite\" permission on that channel."
+    if outcome == "not_configured":
+        return "Couldn't resolve the tracker's home guild/channel -- is the tracker configured?"
+    return f"Unexpected outcome: {outcome}"
 
 
 def _testcases_moved_summary(result: Dict[str, Any]) -> str:

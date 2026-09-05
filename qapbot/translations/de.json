@@ -491,7 +491,8 @@
       "item_done_confirm_applied": "✅ #{item_number} als erledigt markiert.",
       "item_done_confirm_cancelled": "Keine Änderungen vorgenommen.",
       "status_changed_note": "🔁 Status durch <@{actor_id}> auf **{status}** geändert.",
-      "comment_posted": "💬 <@{author_id}>: {text}"
+      "comment_posted": "💬 <@{author_id}>: {text}",
+      "comment_post_failed": "⚠️ Deine Antwort konnte nicht gepostet werden — prüfe meine Berechtigungen in diesem Kanal/Thread."
     },
     "clan_management": {
       "mode_registrations_label": "🔗 Registrierungen verwalten",

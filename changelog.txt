@@ -1,6 +1,25 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (13)
+- Added tracker #0102: an agent (no Discord admin identity to click "Reply to requestor" with)
+  had no way to reply to a reporter and make sure they could actually see/answer it. New MCP tool
+  tracker_reply_and_invite / bridge endpoint POST /api/tracker/items/{n}/reply-and-invite posts a
+  reply addressed directly to the reporter (@mention, so Discord notifies them) and then grants
+  them channel access (already a member) or DMs a one-time join invite (not yet), sharing its
+  actual side effects with the Discord button via _apply_requestor_grant()/_invite_requestor_core().
+- Also fixed a real UX gap the same investigation surfaced: the "Reply to requestor" button never
+  actually let an admin type a reply despite its name -- it only ever granted access/sent an
+  invite and handed back a jump link to type into manually. It now opens TrackerReplyModal (reply
+  optional, blank preserves the old grant-only behavior) whose submit posts the reply (mentioning
+  the reporter) then runs the same grant/invite logic, via a new discord.Interaction-based
+  _grant_or_invite_from_interaction() shared with the agent path above.
+- qapbot/ui_tracker.py, qapbot/web_bridge.py, qapbot/mcp/tracker_mcp.py,
+  qapbot/mcp/tracker_bridge_client.py, qapbot/translations/{en,de}.json,
+  qapbot/docs/BUG_FEATURE_TRACKER.md, tests/discord/test_ui_tracker_items.py,
+  tests/unit/test_tracker_mcp.py, tests/integration/test_web_bridge_tracker.py (24 new tests).
+  3082 tests pass. pyright clean. Build 28.
+
 2026-09-05 (12)
 - Fixed tracker #0023: the reporter DM-invite/auto-grant flow silently never applied access once
   the invited reporter joined, because tracker_items.guild_id was stamped with whichever of

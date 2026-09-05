@@ -1405,6 +1405,210 @@ async def apply_pending_requestor_access(member: discord.Member) -> None:
             logging.info(f"[TRACKER] Could not DM {member.id} that pending access for item #{item['item_number']} was applied (closed DMs)")
 
 
+async def _apply_requestor_grant(
+    item: Dict[str, Any], channel: Any, member: discord.Member,
+) -> Dict[str, Any]:
+    """The actual channel-wide overwrite -- the side effect shared by
+    `TrackerItemButton._handle_grant_access()` (a real Discord admin click) and
+    `grant_access_for_agent()` (the MCP/bridge-facing `tracker_reply_and_invite` tool, which has
+    no `discord.Interaction` to resolve *channel*/*member* from). Callers each resolve those two
+    arguments their own way; this is the one place the overwrite itself is applied, so the two
+    surfaces can never grant something subtly different.
+
+    Returns {"outcome": "granted" | "grant_failed", "jump_link": Optional[str]}."""
+    overwrite = discord.PermissionOverwrite(
+        view_channel=True, read_message_history=True, send_messages_in_threads=True,
+    )
+    try:
+        await channel.set_permissions(
+            member, overwrite=overwrite, reason=f"Tracker #{item['item_number']}: grant requestor access to reply"
+        )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        logging.warning(f"[TRACKER] Failed to grant requestor access for item #{item['item_number']}: {e}")
+        return {"outcome": "grant_failed", "jump_link": None}
+    return {"outcome": "granted", "jump_link": _item_jump_link(item)}
+
+
+async def _invite_requestor_core(
+    item: Dict[str, Any], channel: Any, reporter_user: Any,
+) -> Dict[str, Any]:
+    """The actual invite-creation + DM + `access_grant_pending` flag -- the side effect shared
+    by `TrackerItemButton._invite_requestor()` (a real Discord admin click) and
+    `grant_access_for_agent()`. Callers are responsible for the re-click/re-call idempotency
+    guard (checking `item.get("access_grant_pending")` first) and for resolving *reporter_user*
+    -- this only runs once both are already settled.
+
+    Returns {"outcome": "invited" | "invite_failed" | "invite_dm_failed", "invite_url": Optional[str]}."""
+    from qapbot.cache_manager import CACHE
+
+    try:
+        invite = await channel.create_invite(
+            max_age=604800, max_uses=1, unique=True,
+            reason=f"Tracker #{item['item_number']}: invite requestor to reply",
+        )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        logging.warning(f"[TRACKER] Failed to create invite for item #{item['item_number']}: {e}")
+        return {"outcome": "invite_failed", "invite_url": None}
+
+    await CACHE.db_manager.update_tracker_item(item["item_number"], access_grant_pending=1)  # type: ignore[union-attr]
+
+    try:
+        await reporter_user.send(
+            t(
+                'ui_components.tracker.grant_access_invite_dm', user_id=str(reporter_user.id),
+                guild_id=_lang_guild_id(item), item_number=f"{item['item_number']:04d}", invite_url=invite.url,
+            )
+        )
+    except discord.Forbidden:
+        return {"outcome": "invite_dm_failed", "invite_url": invite.url}
+    return {"outcome": "invited", "invite_url": invite.url}
+
+
+async def _grant_or_invite_from_interaction(interaction: discord.Interaction, item: Dict[str, Any]) -> Dict[str, Any]:
+    """The discord.Interaction-based sibling of `grant_access_for_agent()`: resolves the
+    reporter as a member of `interaction.guild`, or -- failing that -- invites them via DM,
+    sharing the same `_apply_requestor_grant()`/`_invite_requestor_core()` side effects. Used by
+    both `TrackerItemButton._handle_grant_access()`'s "no reply text" path (historical, kept for
+    the case Discord itself denies opening the modal) and `TrackerReplyModal.on_submit()`, so a
+    plain grant and a grant-with-reply can never disagree about what actually happens.
+
+    Caller must already have gated on `check_bot_admin_only()` and `item["reporter_id"].isdigit()`
+    -- this assumes both already passed. Returns {"outcome": ..., "invite_url": Optional[str],
+    "jump_link": Optional[str]} -- the same outcome vocabulary as grant_access_for_agent()."""
+    import QBcore
+
+    reporter_id = item["reporter_id"]
+    member = interaction.guild.get_member(int(reporter_id)) if interaction.guild else None
+    if member is None and interaction.guild is not None:
+        try:
+            member = await interaction.guild.fetch_member(int(reporter_id))
+        except discord.NotFound:
+            member = None
+
+    if member is not None:
+        return await _apply_requestor_grant(item, interaction.channel, member)
+
+    if item.get("access_grant_pending"):
+        return {"outcome": "already_invited", "invite_url": None, "jump_link": None}
+
+    reporter_user = QBcore.bot.get_user(int(reporter_id))
+    if reporter_user is None:
+        try:
+            reporter_user = await QBcore.bot.fetch_user(int(reporter_id))
+        except discord.NotFound:
+            reporter_user = None
+    if reporter_user is None:
+        return {"outcome": "member_not_found", "invite_url": None, "jump_link": None}
+
+    return await _invite_requestor_core(item, interaction.channel, reporter_user)
+
+
+def _render_grant_access_message(
+    result: Dict[str, Any], item: Dict[str, Any], user_id: str, guild_id: Optional[int],
+) -> str:
+    """Maps a `_grant_or_invite_from_interaction()` result onto the admin-facing ephemeral
+    message -- shared by `TrackerItemButton._handle_grant_access()` and
+    `TrackerReplyModal.on_submit()` so a button click and a modal submit never describe the same
+    outcome differently."""
+    outcome = result["outcome"]
+    if outcome == "granted":
+        return t(
+            'ui_components.tracker.grant_access_granted', user_id=user_id, guild_id=guild_id,
+            reporter_id=item["reporter_id"], jump_link=result["jump_link"],
+        )
+    if outcome == "invited":
+        return t(
+            'ui_components.tracker.grant_access_invited', user_id=user_id, guild_id=guild_id,
+            invite_url=result["invite_url"],
+        )
+    if outcome == "invite_dm_failed":
+        return t(
+            'ui_components.tracker.grant_access_invite_dm_failed', user_id=user_id, guild_id=guild_id,
+            invite_url=result["invite_url"],
+        )
+    if outcome == "invite_failed":
+        return t('ui_components.tracker.grant_access_invite_failed', user_id=user_id, guild_id=guild_id)
+    if outcome == "already_invited":
+        return t('ui_components.tracker.grant_access_already_invited', user_id=user_id, guild_id=guild_id)
+    if outcome == "member_not_found":
+        return t('ui_components.tracker.grant_access_member_not_found', user_id=user_id, guild_id=guild_id)
+    # "grant_failed" and the (interaction-path-unreachable in practice) "not_configured" both
+    # degrade to the same generic failure copy rather than risking a KeyError on an unmapped key.
+    return t('ui_components.tracker.grant_access_failed', user_id=user_id, guild_id=guild_id)
+
+
+async def grant_access_for_agent(item_number: int) -> Dict[str, Any]:
+    """Agent-facing equivalent of `TrackerItemButton._handle_grant_access()`/`_invite_requestor()`
+    -- used by the bridge's `/reply-and-invite` endpoint and the MCP `tracker_reply_and_invite`
+    tool, for exactly the case that motivated it (tracker item #0102 live test): an agent has no
+    Discord admin identity to click the "Reply to requestor" button with, but still needs to
+    grant an already-joined reporter access, or invite one who hasn't joined yet. Reuses
+    `_apply_requestor_grant()`/`_invite_requestor_core()` for the actual side effects -- only the
+    guild/channel/member RESOLUTION differs here, since there's no `discord.Interaction`: the
+    guild is the tracker's configured home guild (`_tracker_home_guild_id()`) and the channel is
+    resolved from the item's own `channel_id`, rather than read off the interaction.
+
+    Returns {"outcome": "granted" | "grant_failed" | "invited" | "invite_failed" |
+    "invite_dm_failed" | "already_invited" | "member_not_found" | "no_reporter" |
+    "not_configured", "reporter_id": str, "invite_url": Optional[str], "jump_link": Optional[str]}.
+    Raises ValueError if item_number doesn't exist, mirroring this module's other agent-facing
+    functions."""
+    import QBcore
+    from qapbot.cache_manager import CACHE
+
+    item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
+    if item is None:
+        raise ValueError(f"tracker item #{item_number} not found")
+
+    reporter_id = item["reporter_id"]
+    if not reporter_id.isdigit():
+        # Agent-filed item ("agent:<label>") -- nobody to grant access to.
+        return {"outcome": "no_reporter", "reporter_id": reporter_id, "invite_url": None, "jump_link": None}
+
+    home_guild_id = _tracker_home_guild_id()
+    guild = QBcore.bot.get_guild(home_guild_id) if home_guild_id else None
+    channel = None
+    if item.get("channel_id"):
+        channel = QBcore.bot.get_channel(int(item["channel_id"]))
+        if channel is None:
+            try:
+                channel = await QBcore.bot.fetch_channel(int(item["channel_id"]))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                channel = None
+    if guild is None or channel is None:
+        logging.warning(
+            f"[TRACKER] grant_access_for_agent: could not resolve guild/channel for item #{item_number} "
+            f"(home_guild_id={home_guild_id}, channel_id={item.get('channel_id')})"
+        )
+        return {"outcome": "not_configured", "reporter_id": reporter_id, "invite_url": None, "jump_link": None}
+
+    member = guild.get_member(int(reporter_id))
+    if member is None:
+        try:
+            member = await guild.fetch_member(int(reporter_id))
+        except discord.NotFound:
+            member = None
+
+    if member is not None:
+        result = await _apply_requestor_grant(item, channel, member)
+        return {**result, "reporter_id": reporter_id, "invite_url": None}
+
+    if item.get("access_grant_pending"):
+        return {"outcome": "already_invited", "reporter_id": reporter_id, "invite_url": None, "jump_link": None}
+
+    reporter_user = QBcore.bot.get_user(int(reporter_id))
+    if reporter_user is None:
+        try:
+            reporter_user = await QBcore.bot.fetch_user(int(reporter_id))
+        except discord.NotFound:
+            reporter_user = None
+    if reporter_user is None:
+        return {"outcome": "member_not_found", "reporter_id": reporter_id, "invite_url": None, "jump_link": None}
+
+    result = await _invite_requestor_core(item, channel, reporter_user)
+    return {**result, "reporter_id": reporter_id, "jump_link": None}
+
+
 async def apply_status_change(
     item_number: int, new_status: str, note: Optional[str] = None, actor_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -1460,8 +1664,12 @@ async def apply_status_change(
     return item
 
 
-async def post_comment(item_number: int, text: str, author_id: str) -> None:
-    """Post into the item's discussion thread (plan §6.4's `/comment` endpoint)."""
+async def post_comment(item_number: int, text: str, author_id: str, *, mention_reporter: bool = False) -> None:
+    """Post into the item's discussion thread (plan §6.4's `/comment` endpoint). *mention_reporter*
+    (used by `reply_and_invite_for_agent()`) prepends an `<@reporter_id>` mention so Discord
+    actually notifies them the moment they can see the channel -- a plain, unmentioned message
+    doesn't ping anyone (same reasoning as the passive done-confirm prompt's own mention,
+    BUG_FEATURE_TRACKER.md). No-op when the reporter has no real Discord id (agent-filed items)."""
     from qapbot.cache_manager import CACHE
     import QBcore
 
@@ -1473,6 +1681,8 @@ async def post_comment(item_number: int, text: str, author_id: str) -> None:
     if thread is None:
         thread = await QBcore.bot.fetch_channel(int(item["thread_id"]))
     message = t('ui_components.tracker.comment_posted', guild_id=_lang_guild_id(item), author_id=author_id, text=text)
+    if mention_reporter and item["reporter_id"].isdigit():
+        message = f"<@{item['reporter_id']}> {message}"
     # Chunked, not one unguarded send() (2026-08-23, tracker #0028 — same root cause as the
     # test-case message: an over-2000-char comment raised discord.HTTPException, which propagated
     # as an unhandled exception and surfaced to the caller as a bare 500). Reuses
@@ -1480,6 +1690,23 @@ async def post_comment(item_number: int, text: str, author_id: str) -> None:
     # line structure of its own, so the newline is the only safe split point available.
     for chunk in _chunk_lines_for_discord(message.split("\n")):
         await thread.send(chunk)  # type: ignore[union-attr]
+
+
+async def reply_and_invite_for_agent(item_number: int, text: str, author_id: str) -> Dict[str, Any]:
+    """Combined agent-facing action (bridge `/api/tracker/items/{n}/reply-and-invite`, MCP
+    `tracker_reply_and_invite`) for the case that motivated it: an agent testing a fix (or
+    otherwise wanting to ask the reporter something) needs to both leave them a message AND make
+    sure they can actually see and answer it -- a comment alone is useless to a reporter who
+    can't view the channel yet. Posts *text* via `post_comment(..., mention_reporter=True)`, then
+    runs `grant_access_for_agent()` -- the exact same grant/invite logic
+    `TrackerItemButton._handle_grant_access()`'s Discord button uses -- so the two surfaces can
+    never disagree about what "granting access" means, only about how the reporter gets asked.
+
+    Returns {"comment_posted": bool, "access": <grant_access_for_agent() result>}. Raises
+    ValueError if the item doesn't exist or has no discussion thread yet (mirrors post_comment())."""
+    await post_comment(item_number, text, author_id, mention_reporter=True)
+    access = await grant_access_for_agent(item_number)
+    return {"comment_posted": True, "access": access}
 
 
 async def get_thread_messages(item_number: int, limit: int = 50) -> List[Dict[str, Any]]:
@@ -1694,12 +1921,13 @@ class TrackerItemButton(
         )
 
     async def _handle_grant_access(self, interaction: discord.Interaction, item: Dict[str, Any]) -> None:
-        """Admin-only: give the reporter a channel-wide view/read overwrite so they can see this
-        item and its discussion thread, and reply inside threads — the trade-off the user chose
-        over a per-thread-scoped private thread (BUG_FEATURE_TRACKER.md's grant/revoke section).
-        Reverted by _revoke_requestor_access() once the item archives. If the reporter isn't a
-        guild member (the common case — most reporters file via DM and never join), falls back
-        to _invite_requestor() instead of failing outright."""
+        """Admin-only: opens `TrackerReplyModal` so the admin can actually type a reply (the
+        button's own name, taken literally -- tracker item #0102 live bug report: this used to
+        only ever grant access/send an invite and hand back a jump link for the admin to type
+        into themselves, never an actual compose box). The modal's own submit handles the
+        grant/invite side of things (via `_grant_or_invite_from_interaction()`) after optionally
+        posting the reply text -- this method only does the up-front gating, since a modal must
+        be the interaction's very first response (Cardinal Rule 10)."""
         from qapbot.config import CONFIG
         from qapbot.QBdiscocmdshelper import check_bot_admin_only
 
@@ -1718,104 +1946,59 @@ class TrackerItemButton(
             )
             return
 
-        member = interaction.guild.get_member(int(reporter_id)) if interaction.guild else None
-        if member is None and interaction.guild is not None:
-            try:
-                member = await interaction.guild.fetch_member(int(reporter_id))
-            except discord.NotFound:
-                member = None
-        if member is None:
-            await self._invite_requestor(interaction, item, reporter_id)
-            return
+        await interaction.response.send_modal(TrackerReplyModal(item, user_id))
 
-        overwrite = discord.PermissionOverwrite(
-            view_channel=True, read_message_history=True, send_messages_in_threads=True,
-        )
-        try:
-            await interaction.channel.set_permissions(  # type: ignore[union-attr]
-                member, overwrite=overwrite, reason=f"Tracker #{self.item_number}: grant requestor access to reply"
-            )
-        except (discord.Forbidden, discord.HTTPException) as e:
-            logging.warning(f"[TRACKER] Failed to grant requestor access for item #{self.item_number}: {e}")
-            await interaction.response.send_message(
-                t('ui_components.tracker.grant_access_failed', user_id=user_id, guild_id=guild_id), ephemeral=True
-            )
-            return
 
-        await interaction.response.send_message(
-            t(
-                'ui_components.tracker.grant_access_granted', user_id=user_id, guild_id=guild_id,
-                reporter_id=reporter_id, jump_link=_item_jump_link(item),
-            ),
-            ephemeral=True,
-        )
+class TrackerReplyModal(discord.ui.Modal, title="Reply to requestor"):
+    """Opened by the "🔓 Reply to requestor" button (`TrackerItemButton._handle_grant_access()`).
+    Lets the admin type an actual reply -- optional, since an admin who just wants to unlock the
+    channel without saying anything yet still gets exactly the old grant-only behavior by
+    submitting it blank. On submit: posts the reply (if any) addressed directly to the reporter
+    via `post_comment(..., mention_reporter=True)`, then runs the same grant-or-invite logic the
+    plain button used to run inline (`_grant_or_invite_from_interaction()`), so the two things
+    "reply" and "make sure they can see it" always happen together in one step."""
 
-    async def _invite_requestor(self, interaction: discord.Interaction, item: Dict[str, Any], reporter_id: str) -> None:
-        """Reporter isn't a guild member — DM them a single-use invite instead of just failing,
-        and mark access_grant_pending so apply_pending_requestor_access() (on_member_join) can
-        finish the grant automatically once they actually join, with no second click needed."""
-        import QBcore
+    reply_input = discord.ui.Label(
+        text="Your reply (optional — leave blank to just grant/invite without a message)",
+        component=discord.ui.TextInput(style=discord.TextStyle.paragraph, required=False, max_length=2000),
+    )
+
+    def __init__(self, item: Dict[str, Any], admin_id: str):
+        super().__init__()
+        self.item = item
+        self.admin_id = admin_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
         from qapbot.cache_manager import CACHE
 
-        user_id = str(interaction.user.id)
+        await interaction.response.defer(ephemeral=True, thinking=False)
         guild_id = interaction.guild.id if interaction.guild else None
 
-        # A double-click on Grant Access re-invokes this from a fresh callback instance each
-        # time (DynamicItem, no shared view state to guard with like #0036's other fixes) --
-        # re-check the persisted flag so a second click doesn't create a second one-time invite
-        # and DM the reporter again.
-        if item.get("access_grant_pending"):
-            await interaction.response.send_message(
-                t('ui_components.tracker.grant_access_already_invited', user_id=user_id, guild_id=guild_id), ephemeral=True
+        # Re-fetch rather than trusting the item captured when the button was clicked -- an
+        # admin can sit in this modal typing for a while, during which the item's
+        # access_grant_pending flag (checked inside _grant_or_invite_from_interaction()) could
+        # have changed via some other path.
+        item = await CACHE.db_manager.get_tracker_item(self.item["item_number"])  # type: ignore[union-attr]
+        if item is None:
+            await interaction.followup.send(
+                t('ui_components.tracker.grant_access_failed', user_id=self.admin_id, guild_id=guild_id), ephemeral=True
             )
             return
 
-        reporter_user = QBcore.bot.get_user(int(reporter_id))
-        if reporter_user is None:
+        text = (cast(discord.ui.TextInput, self.reply_input.component).value or "").strip()
+        if text:
             try:
-                reporter_user = await QBcore.bot.fetch_user(int(reporter_id))
-            except discord.NotFound:
-                reporter_user = None
-        if reporter_user is None:
-            await interaction.response.send_message(
-                t('ui_components.tracker.grant_access_member_not_found', user_id=user_id, guild_id=guild_id), ephemeral=True
-            )
-            return
-
-        try:
-            invite = await interaction.channel.create_invite(  # type: ignore[union-attr]
-                max_age=604800, max_uses=1, unique=True,
-                reason=f"Tracker #{self.item_number}: invite requestor to reply",
-            )
-        except (discord.Forbidden, discord.HTTPException) as e:
-            logging.warning(f"[TRACKER] Failed to create invite for item #{self.item_number}: {e}")
-            await interaction.response.send_message(
-                t('ui_components.tracker.grant_access_invite_failed', user_id=user_id, guild_id=guild_id), ephemeral=True
-            )
-            return
-
-        await CACHE.db_manager.update_tracker_item(self.item_number, access_grant_pending=1)  # type: ignore[union-attr]
-
-        try:
-            await reporter_user.send(
-                t(
-                    'ui_components.tracker.grant_access_invite_dm', user_id=reporter_id, guild_id=guild_id,
-                    item_number=f"{self.item_number:04d}", invite_url=invite.url,
+                await post_comment(item["item_number"], text, self.admin_id, mention_reporter=True)
+            except discord.HTTPException as e:
+                logging.warning(f"[TRACKER] Failed to post admin reply for item #{item['item_number']}: {e}")
+                await interaction.followup.send(
+                    t('ui_components.tracker.comment_post_failed', user_id=self.admin_id, guild_id=guild_id), ephemeral=True
                 )
-            )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                t(
-                    'ui_components.tracker.grant_access_invite_dm_failed', user_id=user_id, guild_id=guild_id,
-                    invite_url=invite.url,
-                ),
-                ephemeral=True,
-            )
-            return
+                return
 
-        await interaction.response.send_message(
-            t('ui_components.tracker.grant_access_invited', user_id=user_id, guild_id=guild_id, invite_url=invite.url),
-            ephemeral=True,
+        result = await _grant_or_invite_from_interaction(interaction, item)
+        await interaction.followup.send(
+            _render_grant_access_message(result, item, self.admin_id, guild_id), ephemeral=True
         )
 
 

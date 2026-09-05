@@ -108,13 +108,15 @@ def test_tool_names_are_unique():
     assert len(names) == len(set(names))
 
 
-def test_write_tools_are_exactly_seven():
+def test_write_tools_are_exactly_eight():
     """Plan §6.6, extended by tracker item #0015 (create_item), the pass/fail follow-up
-    (mark_testcase_passed/failed), and the decoupling follow-up (move_testcases_done): these
-    seven are the only tools that change tracker state. Everything else is read-only."""
+    (mark_testcase_passed/failed), the decoupling follow-up (move_testcases_done), and tracker
+    item #0102 (reply_and_invite): these eight are the only tools that change tracker state.
+    Everything else is read-only."""
     write_tools = {
-        "tracker_create_item", "tracker_set_status", "tracker_comment", "tracker_add_testcases",
-        "tracker_mark_testcase_passed", "tracker_mark_testcase_failed", "tracker_move_testcases_done",
+        "tracker_create_item", "tracker_set_status", "tracker_comment", "tracker_reply_and_invite",
+        "tracker_add_testcases", "tracker_mark_testcase_passed", "tracker_mark_testcase_failed",
+        "tracker_move_testcases_done",
     }
     read_tools = {"tracker_list_items", "tracker_get_item", "tracker_get_thread"}
     names = {t["name"] for t in tracker_mcp.TOOLS}
@@ -330,6 +332,55 @@ async def test_call_tool_comment(fake_client):
     result = await tracker_mcp.call_tool("tracker_comment", {"item_number": 3, "text": "which clan tag?"})
     assert "#0003" in result
     fake_client.comment.assert_awaited_once_with(3, "which clan tag?")
+
+
+# -- tracker_reply_and_invite (tracker item #0102) -----------------------
+
+@pytest.mark.asyncio
+async def test_call_tool_reply_and_invite_granted(fake_client):
+    fake_client.reply_and_invite = AsyncMock(return_value={
+        "comment_posted": True, "access": {"outcome": "granted", "reporter_id": "222"},
+    })
+    result = await tracker_mcp.call_tool(
+        "tracker_reply_and_invite", {"item_number": 3, "text": "Fixed -- please retest!"}
+    )
+    assert "#0003" in result
+    assert "granted them access" in result
+    fake_client.reply_and_invite.assert_awaited_once_with(3, "Fixed -- please retest!")
+
+
+@pytest.mark.asyncio
+async def test_call_tool_reply_and_invite_invited(fake_client):
+    fake_client.reply_and_invite = AsyncMock(return_value={
+        "comment_posted": True,
+        "access": {"outcome": "invited", "invite_url": "https://discord.gg/abc", "reporter_id": "222"},
+    })
+    result = await tracker_mcp.call_tool("tracker_reply_and_invite", {"item_number": 3, "text": "hi"})
+    assert "DM invite" in result
+    assert "https://discord.gg/abc" not in result  # only surfaced when the DM itself failed
+
+
+@pytest.mark.asyncio
+async def test_call_tool_reply_and_invite_dm_failed_surfaces_url(fake_client):
+    fake_client.reply_and_invite = AsyncMock(return_value={
+        "comment_posted": True,
+        "access": {"outcome": "invite_dm_failed", "invite_url": "https://discord.gg/abc", "reporter_id": "222"},
+    })
+    result = await tracker_mcp.call_tool("tracker_reply_and_invite", {"item_number": 3, "text": "hi"})
+    assert "https://discord.gg/abc" in result
+
+
+def test_describe_access_outcome_covers_every_outcome():
+    """Every outcome grant_access_for_agent() can return must have a human-readable summary --
+    an unmapped one degrading to a generic-but-visible fallback is acceptable, a KeyError/crash
+    is not."""
+    outcomes = [
+        "granted", "invited", "invite_dm_failed", "already_invited", "member_not_found",
+        "no_reporter", "grant_failed", "invite_failed", "not_configured", "something_new",
+    ]
+    for outcome in outcomes:
+        text = tracker_mcp._describe_access_outcome({"outcome": outcome, "invite_url": "https://x"})
+        assert isinstance(text, str) and text
 
 
 @pytest.mark.asyncio

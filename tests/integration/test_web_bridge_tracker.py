@@ -291,6 +291,87 @@ async def test_post_comment_reports_discord_failure_as_json_not_a_bare_500(clien
     assert "error" in body
 
 
+# -- reply-and-invite (tracker item #0102) ---------------------------------
+
+async def test_post_reply_and_invite_requires_thread(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/reply-and-invite", json={"text": "hi"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 404
+
+
+async def test_post_reply_and_invite_requires_text(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, thread_id="777")
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/reply-and-invite", json={"text": "  "},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 400
+
+
+async def test_post_reply_and_invite_posts_and_grants(client, db, monkeypatch):
+    """Agent-facing equivalent of the Discord "Reply to requestor" button + reply modal (tracker
+    item #0102): the reporter is already a member of the tracker's home guild, so this both
+    posts the reply (mentioning them) and grants channel access in one call."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings["tracker_guild_id"] = "999"
+
+    thread = _fake_channel()
+    channel = _fake_channel()
+    channel.set_permissions = AsyncMock()
+    bot = _wire_bot(monkeypatch, channel=None)
+    bot.get_channel = MagicMock(side_effect=lambda cid: {10: channel, 777: thread}.get(int(cid)))
+    guild = MagicMock()
+    member = MagicMock()
+    member.id = 222
+    guild.get_member = MagicMock(return_value=member)
+    bot.get_guild = MagicMock(return_value=guild)
+
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(item_number, channel_id="10", message_id="100", thread_id="777")
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/reply-and-invite",
+        json={"text": "Fixed -- please retest!"},
+        headers={"X-Bridge-Secret": SECRET, "X-Tracker-Admin": "claude"},
+    )
+
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["comment_posted"] is True
+    assert body["access"]["outcome"] == "granted"
+    thread.send.assert_awaited_once()
+    posted = thread.send.call_args[0][0]
+    assert "<@222>" in posted  # reporter mentioned directly, not just the "claude" author label
+    channel.set_permissions.assert_awaited_once()
+
+
+async def test_post_reply_and_invite_reports_discord_failure_as_json(client, db, monkeypatch):
+    """Same reasoning as test_post_comment_reports_discord_failure_as_json_not_a_bare_500 -- the
+    reply half of this endpoint can hit the identical failure mode."""
+    thread = AsyncMock()
+    thread.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(status=503), "service unavailable"))
+    _wire_bot(monkeypatch, channel=thread)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, thread_id="777")
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/reply-and-invite",
+        json={"text": "hello"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+
+    assert resp.status == 502
+    body = await resp.json()
+    assert "error" in body
+
+
 # -- thread history (2026-08-22: tracker_comment could only WRITE into the discussion thread; ---
 # -- this is the read side, previously missing entirely) ----------------------------------------
 

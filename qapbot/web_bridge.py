@@ -3246,6 +3246,37 @@ async def handle_post_tracker_comment(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def handle_post_tracker_reply_and_invite(request: web.Request) -> web.Response:
+    """Agent-facing equivalent of clicking "Reply to requestor" in Discord (tracker item #0102,
+    live test of the #0023 invite fix): posts a comment addressed directly to the reporter, then
+    grants them access if they're already a member or DMs them a join invite if not — reusing
+    ui_tracker.reply_and_invite_for_agent(), which shares its actual grant/invite side effects
+    with the Discord button so the two surfaces can't diverge."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from qapbot.ui_tracker import reply_and_invite_for_agent
+
+    try:
+        item_number = int(request.match_info["item_number"])
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid body"}, status=400)
+    text = (body.get("text") or "").strip()
+    if not text:
+        return web.json_response({"error": "text required"}, status=400)
+
+    try:
+        result = await reply_and_invite_for_agent(item_number, text, _tracker_admin_label(request))
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=404)
+    except discord.HTTPException as e:
+        # Same reasoning as handle_post_tracker_comment above — the comment half of this can hit
+        # the identical over-2000-char/Discord-outage failure mode.
+        logging.error(f"[TRACKER] Discord rejected the reply-and-invite comment for item #{item_number}: {e}")
+        return web.json_response({"error": f"Discord rejected the comment: {e}"}, status=502)
+    return web.json_response({"ok": True, **result})
+
+
 async def handle_get_tracker_thread(request: web.Request) -> web.Response:
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
@@ -3424,6 +3455,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/tracker/items/{item_number}/attachments/{attachment_id}", handle_get_tracker_attachment)
     app.router.add_post("/api/tracker/items/{item_number}/status", handle_post_tracker_status)
     app.router.add_post("/api/tracker/items/{item_number}/comment", handle_post_tracker_comment)
+    app.router.add_post("/api/tracker/items/{item_number}/reply-and-invite", handle_post_tracker_reply_and_invite)
     app.router.add_get("/api/tracker/items/{item_number}/thread", handle_get_tracker_thread)
     app.router.add_post("/api/tracker/items/{item_number}/testcases", handle_post_tracker_testcases)
     app.router.add_post("/api/tracker/items/{item_number}/testcases/pass", handle_post_tracker_testcase_pass)

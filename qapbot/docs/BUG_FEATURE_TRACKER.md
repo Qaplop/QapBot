@@ -19,7 +19,7 @@ CACHE.db_manager (db_manager.py)   ── bot_settings / tracker_items / tracker
 qapbot/web_bridge.py  /api/tracker/*   ── HTTP surface for the agent side, X-Bridge-Secret gated
         │
         ▼
-qapbot/mcp/tracker_mcp.py   ── stdio MCP server, 5 tools, used by Copilot Chat / Claude Code
+qapbot/mcp/tracker_mcp.py   ── stdio MCP server, 11 tools, used by Copilot Chat / Claude Code
 ```
 
 Only PROD ever owns the tracker: `CONFIG.tracker_enabled` is hard-coded to `not is_dev_mode`
@@ -141,16 +141,25 @@ move channels, so the reposted item embed adds a "Discussion thread" jump-link f
 exists (the old thread otherwise becomes unreachable once its parent message is deleted). See
 `_move_item_to_implemented_channel()`.
 
-**Grant/revoke requestor access (2026-08-22, ticket #0021)**: reporters normally can't see the
-reports channel their item was posted in (it isn't open to `@everyone`), so a staff `@mention`
-reply gets no push notification and the reporter can't read the thread. The **"Reply to
-requestor"** button on `TrackerItemButton` (`grantaccess` action, admin-only) gives the reporter
-a member-specific Discord permission overwrite on that channel
-(`view_channel`/`read_message_history`/`send_messages_in_threads`, `_handle_grant_access()`), then
-replies (ephemeral, to the admin who clicked) with a jump link to the item's discussion thread
-(or the item message itself if it has no thread) — the bot never posts the reply/mention itself,
-this only gets the admin's own client to that spot ready to type one, same "no client-navigation
-API, a link is the closest thing" reasoning as the passive-prompt mention above.
+**Grant/revoke requestor access (2026-08-22, ticket #0021; reply modal added 2026-09-05, ticket
+#0102)**: reporters normally can't see the reports channel their item was posted in (it isn't
+open to `@everyone`), so a staff `@mention` reply gets no push notification and the reporter
+can't read the thread. The **"Reply to requestor"** button on `TrackerItemButton` (`grantaccess`
+action, admin-only, `_handle_grant_access()`) opens `TrackerReplyModal` — a text box for an
+actual reply, taken literally from the button's own name (live bug report: it used to only ever
+grant access/send an invite and hand back a jump link for the admin to type into themselves,
+never a compose box). The reply field is optional: submitting it blank preserves the original
+grant-only behavior. On submit, `TrackerReplyModal.on_submit()` posts any reply text via
+`post_comment(..., mention_reporter=True)` — an `<@reporter_id>` mention prepended so Discord
+actually notifies them the moment they can see the channel, not just a plain unmentioned message
+— then gives the reporter a member-specific Discord permission overwrite on that channel
+(`view_channel`/`read_message_history`/`send_messages_in_threads`) via
+`_grant_or_invite_from_interaction()`/`_apply_requestor_grant()`, and finally replies (ephemeral,
+to the admin) with a jump link to the item's discussion thread (or the item message itself if it
+has no thread). A modal must be the interaction's very first response (Cardinal Rule 10), so
+`_handle_grant_access()` itself does only the up-front admin/reporter gating and opening the
+modal — none of the actual grant/invite/reply side effects, which all happen once the modal is
+submitted.
 This is deliberately **channel-wide**, not scoped to just their own message/thread — Discord's
 narrower primitive for that would be a standalone **private thread** with `thread.add_user()`
 (membership on a private thread grants access independent of the parent channel's own view
@@ -166,21 +175,42 @@ reporter still has another open item sitting in that same working channel, check
 so it doesn't cut them off from that other item too.
 
 **DM invite for reporters who aren't guild members (2026-08-22, ticket #0021 follow-up)**: most
-reporters file via DM and never join the server, so `_handle_grant_access()`'s member lookup
-usually fails. Instead of stopping there, `_invite_requestor()` resolves the reporter as a plain
+reporters file via DM and never join the server, so `_grant_or_invite_from_interaction()`'s
+member lookup usually fails. Instead of stopping there, it resolves the reporter as a plain
 `discord.User` (`get_user`/`fetch_user`, same idiom `_dm_reporter_on_status_change()` already
-uses), creates a 7-day single-use invite to that channel (`channel.create_invite()` — needs the
-bot to hold **Create Invite** on the tracker channel(s), or this step fails with
-`grant_access_invite_failed`), DMs it to them, and sets `tracker_items.access_grant_pending = 1`
-on the item as soon as the invite exists (independent of whether the DM itself lands — a closed-DM
-failure still reports the invite URL back to the admin ephemerally so it can be forwarded by
-hand). `apply_pending_requestor_access()`, called from `QapBot.py`'s `on_member_join`, finishes
-the grant automatically once the reporter actually joins — same overwrite `_handle_grant_access()`
-applies, for every still-open item with `access_grant_pending` set for that member, then clears
-the flag and DMs a jump link. It's gated on `CONFIG.tracker_enabled` as its first line, same
-reasoning as `handle_tracker_test_reaction()` above and Pitfall 39: `on_member_join` is a raw
-gateway event, not a component interaction, so it fires on every bot present in the guild —
-including DEV, whose DB is a routine PROD-backup copy that can contain the exact same pending row.
+uses) and calls `_invite_requestor_core()`, which creates a 7-day single-use invite to that
+channel (`channel.create_invite()` — needs the bot to hold **Create Invite** on the tracker
+channel(s), or this step fails with `grant_access_invite_failed`), DMs it to them, and sets
+`tracker_items.access_grant_pending = 1` on the item as soon as the invite exists (independent of
+whether the DM itself lands — a closed-DM failure still reports the invite URL back to the admin
+ephemerally so it can be forwarded by hand). `apply_pending_requestor_access()`, called from
+`QapBot.py`'s `on_member_join`, finishes the grant automatically once the reporter actually joins
+— same overwrite `_apply_requestor_grant()` applies, for every still-open item with
+`access_grant_pending` set for that member, then clears the flag and DMs a jump link. It's gated
+on `CONFIG.tracker_enabled` as its first line, same reasoning as `handle_tracker_test_reaction()`
+above and Pitfall 39: `on_member_join` is a raw gateway event, not a component interaction, so it
+fires on every bot present in the guild — including DEV, whose DB is a routine PROD-backup copy
+that can contain the exact same pending row.
+
+**Four call sites, one grant/invite core (2026-09-05, ticket #0102)**: granting or inviting a
+reporter can now be triggered four ways — the Discord button+modal
+(`TrackerReplyModal.on_submit()` → `_grant_or_invite_from_interaction()`), a joining member
+(`apply_pending_requestor_access()`), or an agent with no Discord identity at all
+(`grant_access_for_agent()`, the bridge `/reply-and-invite` endpoint / MCP
+`tracker_reply_and_invite` tool). All four ultimately call the same two side-effecting
+primitives — `_apply_requestor_grant(item, channel, member)` (the permission overwrite) and
+`_invite_requestor_core(item, channel, reporter_user)` (invite + DM + flag) — so none of them can
+grant or invite something subtly different from the others. Only the *resolution* of
+guild/channel/member differs per caller: the interaction-based callers read `interaction.guild`/
+`interaction.channel`; the guild-less callers (`grant_access_for_agent()`,
+`apply_pending_requestor_access()`) resolve the guild via `_tracker_home_guild_id()` (reads the
+`tracker_guild_id` bot_setting) and the channel via the item's own `channel_id`.
+`reply_and_invite_for_agent()` (the agent equivalent of "reply + make sure they can see it") is
+`post_comment(..., mention_reporter=True)` followed by `grant_access_for_agent()` — the same two
+steps `TrackerReplyModal.on_submit()` runs, just resolved the agent's way. `post_comment()`'s new
+`mention_reporter` kwarg prepends an `<@reporter_id>` mention (no-op for a non-numeric reporter_id
+-- an agent-filed item) rather than adding a whole separate translation key, since the message
+body itself is unchanged either way.
 
 **`tracker_items.guild_id` must always be the tracker's home guild, never the reporting guild
 (2026-09-05 live bug, ticket #0023)**: QapBot serves many Discord guilds, and `/bug`/`/feature`
@@ -385,6 +415,7 @@ GET  /api/tracker/items/{n}/attachments/{aid}
 GET  /api/tracker/items/{n}/thread?limit=
 POST /api/tracker/items/{n}/status     {status, note}
 POST /api/tracker/items/{n}/comment    {text}
+POST /api/tracker/items/{n}/reply-and-invite  {text}
 POST /api/tracker/items/{n}/testcases  {cases: [{environment, description, priority?}]}
 POST /api/tracker/items/{n}/testcases/pass  {environment}
 POST /api/tracker/items/{n}/testcases/fail  {}
@@ -404,10 +435,23 @@ and `.vscode/mcp.json` (VS Code Copilot Chat). Hand-rolled JSON-RPC 2.0 — the 
 package is **not** a project dependency; the wire surface needed (`initialize`, `tools/list`,
 `tools/call`) is small enough that adding a new dependency wasn't worth it.
 
-Ten tools: `tracker_list_items`, `tracker_get_item`, `tracker_get_thread`, `tracker_create_item`,
-`tracker_set_status`, `tracker_comment`, `tracker_add_testcases`, `tracker_mark_testcase_passed`,
-`tracker_mark_testcase_failed`, `tracker_move_testcases_done`. Only the first three are read-only
-— no filesystem/shell/git/deploy tool is exposed here (plan §6.6).
+Eleven tools: `tracker_list_items`, `tracker_get_item`, `tracker_get_thread`, `tracker_create_item`,
+`tracker_set_status`, `tracker_comment`, `tracker_reply_and_invite`, `tracker_add_testcases`,
+`tracker_mark_testcase_passed`, `tracker_mark_testcase_failed`, `tracker_move_testcases_done`.
+Only the first three are read-only — no filesystem/shell/git/deploy tool is exposed here
+(plan §6.6).
+
+`tracker_reply_and_invite` (2026-09-05, ticket #0102) is the agent-drivable equivalent of the
+Discord "Reply to requestor" button + its reply modal: it posts `text` addressed directly to the
+reporter (`<@reporter_id>` mention, so Discord notifies them), then grants them access if
+they're already a member of the tracker's home guild or DMs them a one-time invite if not —
+access applies automatically once they join either way, no follow-up call needed. Use this
+instead of `tracker_comment` whenever the reply is meant for the reporter specifically (a
+clarifying question, "please retest") — `tracker_comment` alone reaches nobody if the reporter
+can't yet see the channel. Backed by `reply_and_invite_for_agent()`/`grant_access_for_agent()` in
+`ui_tracker.py`, which share their actual grant/invite side effects with the Discord button (see
+the "Four call sites, one grant/invite core" note above) via the bridge's
+`POST /api/tracker/items/{n}/reply-and-invite` endpoint.
 
 `tracker_get_thread` (2026-08-22) closes a one-way gap: `tracker_comment` could only ever WRITE
 into an item's Discord discussion thread — there was no way for an agent to read a human's
