@@ -81,7 +81,7 @@ _patch_coc_battle_modifiers()
 from qapbot.constants import SECONDS_PER_HOUR
 from qapbot.i18n import t  # type: ignore[attr-defined]
 
-BOT_VERSION: str = "1.3.27"
+BOT_VERSION: str = "1.3.28"
 
 # Incremented by exactly one on every code change — see the "Build number" section of
 # .github/copilot-instructions.md.  BOT_VERSION answers "which release is this?";
