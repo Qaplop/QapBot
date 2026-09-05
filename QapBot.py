@@ -2326,7 +2326,24 @@ async def main() -> None:
             f"({active_count} active, {inactive_count} inactive). "
             f"CoC API calls: {coc_stats['cycle_total_calls']}"
         )
-    
+
+    # Per-operation call mix. coc_health has tracked this since it was written but nothing ever
+    # logged it, so the actual shape of a cycle's API load has never been observable — during CWL
+    # the question that matters is how much of it is get_league_war() (whose results are cached as
+    # live coc.War graphs) versus get_current_war() (whose object Stage 3 severs immediately).
+    # That ratio is what sizes a possible Stage 4; see plans/tracker-0009-*.md.
+    # Cheap: a dict of a handful of counters, formatted once per cycle.
+    try:
+        _by_op = coc_stats.get('cycle_calls_by_op') or {}
+        if _by_op:
+            logging.info(
+                "[API-CALL-MIX] %s",
+                "  ".join(f"{_op}={_n:,}" for _op, _n in sorted(_by_op.items(), key=lambda kv: -kv[1])),
+            )
+    except Exception as _mix_ex:  # never let a stats line break a cycle
+        logging.debug(f"[API-CALL-MIX] could not format call mix: {_mix_ex}")
+
+
     # Mark finished CWL league groups as cwl_ended=1 (2026-08-22, tracker #0017). That flag is
     # what stops _find_active_cwl_war_for_clan() re-walking a finished group's war tags on every
     # notInWar clan; before this it had no periodic writer at all, so 136,707 polled clans sat at

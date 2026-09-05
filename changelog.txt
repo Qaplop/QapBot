@@ -1,6 +1,37 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (10)
+- Added an [API-CALL-MIX] line to the end-of-cycle summary (build 25). coc_health has tracked
+  cycle_calls_by_op since it was written but NOTHING ever logged it, so the actual per-cycle API
+  call mix has never been observable -- every claim about "get_league_war() dominates during
+  CWL" was inference, not measurement. Logged from the coc_stats snapshot already fetched at
+  that point, sorted by volume, wrapped so a stats line can never break a cycle.
+- Why it matters now: Stage 3 removed retention for exactly ONE object, the coc.ClanWar from
+  get_current_war_from_api() -- the only uncached, exclusively-owned war object in the cycle
+  (single call site, verified by sweep). Every OTHER war object comes from get_league_war(), is
+  cached in _league_war_cache, and is therefore shared and correctly never severed. So Stage 3's
+  benefit stops precisely where CWL, the heaviest period, puts most of its load. This line
+  measures that ratio instead of assuming it.
+- Sketched Stage 4 in plans/tracker-0009-phase1-war-payload-retention.md: converting
+  _league_war_cache to hold payload dicts rather than coc.War objects. Three costs it would
+  remove, not one: ~174k objects held live and walked by every sweep (1000-entry cap x ~174
+  tracked objects per war, created post-startup so gc.freeze() never covers them); unsevered
+  cyclic garbage on every eviction; and -- the part easy to miss -- the per-war-tag
+  asyncio.Locks in process_orphaned_cwl_wars(), which exist ONLY because get_league_war()
+  returns the same instance to both sides of a match and coc.War.attacks/.members are
+  generator-backed ("ValueError: generator already executing"). Plain dicts are concurrency-safe
+  to read, so those locks become unnecessary -- a throughput win at peak CWL load.
+- The dominant consumer does not even want the object: process_orphaned_cwl_wars() (19,214
+  [ORPHANED-CWL] finalisations on PROD today) passes final_war straight to save_war_object(),
+  which immediately calls build_war_payload() on it. Highest volume AND simplest need, so it is
+  the natural first slice.
+- Deliberately NOT started. Stage 4.0 is the gate: read [API-CALL-MIX] over a full CWL day on
+  PROD first. If league-war turns out to be a minority of load even during CWL, the stage closes
+  as "measured, not worth it" -- which is a perfectly good outcome and the whole reason to
+  measure before migrating ~29 call sites.
+- 3063 tests pass. pyright clean.
+
 2026-09-05 (9)
 - Raised _MAX_INACTIVE_PER_CYCLE 1500 -> 3000 (build 24). Applied on PROD first and observed
   safe there; this change brings the repo in line with what is already running, rather than

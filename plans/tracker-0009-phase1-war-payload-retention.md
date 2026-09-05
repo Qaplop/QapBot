@@ -578,3 +578,83 @@ pause is walking exactly the live objects this stage stops retaining.
   silently yields `None` for `war_ended` clans.
 - Verify payload key names against a **real temp file**, not against §2's table — the payload
   mixes snake_case and camelCase and that is where a silent-zero bug hides.
+
+---
+
+## Stage 4 (proposed) — the league-war cache is where the remaining prize is
+
+**STATUS: not started. Evidence-gate first (Stage 4.0 below), then decide scope.**
+
+Stage 3 removed retention for exactly one object: the `coc.ClanWar` from
+`get_current_war_from_api()`. That is the only UNCACHED, exclusively-owned war object in the
+cycle — verified by call-site sweep, it has a single call site. **Every other war object in the
+cycle comes from `get_league_war()`, is cached in `_league_war_cache`, and is therefore shared
+and correctly never severed** (Pitfall 61). So Stage 3's benefit stops precisely where CWL — the
+heaviest workload period — puts most of its load.
+
+**Why the cached coc objects are worse than "just memory":**
+
+1. **Live-set cost.** `_league_war_cache` holds up to `_LEAGUE_WAR_CACHE_MAX_ENTRIES = 1000`
+   entries. At ~174 tracked objects per cached war (measured on synthetic 15v15 data, build 22),
+   that is ~174,000 objects held live and walked by **every** full sweep. They are created after
+   startup so `gc.freeze()` never covers them.
+2. **Garbage on eviction.** Evicted entries are cyclic and nothing severs them (severing at
+   eviction is NOT obviously safe — a caller can still hold a reference to a just-evicted
+   object), so each eviction round hands the collector another batch of graphs to walk.
+3. **It forces serialisation — the part that is easy to miss.** `get_league_war()` returns the
+   *same instance* to both sides of a CWL match, and `coc.War.attacks`/`.members` are
+   generator-backed: two threads iterating them concurrently raise
+   `ValueError: generator already executing`. `process_orphaned_cwl_wars()` therefore maintains
+   per-war-tag `asyncio.Lock`s (`_war_save_locks`) purely to serialise `save_war_object()` calls
+   that would otherwise run in parallel behind its semaphore of 20 — during CWL, at peak load.
+
+**What a payload cache would buy.** If `_league_war_cache` held the serialised payload dict
+instead of the `coc.War`:
+
+- acyclic → refcount-freed, no sweep cost, no ~174k live objects, no sever needed anywhere
+- plain dicts are concurrency-safe to read → **`_war_save_locks` becomes unnecessary**
+  (throughput up at exactly the peak-load moment)
+- the Pitfall 61 sharing hazard stops existing rather than needing a guard
+- the dedup benefit is preserved — the second side of a match still gets a cache hit, so API
+  call volume does not change
+
+**And the dominant consumer does not even want the object.** `process_orphaned_cwl_wars()` —
+19,214 `[ORPHANED-CWL]` finalisations on PROD on 2026-09-05 alone — passes `final_war` straight
+to `save_war_object()`, which immediately calls `build_war_payload()` on it. The coc object
+exists there only to be serialised, then lingers in cache. That makes the highest-volume
+consumer also the simplest to migrate.
+
+**Honest cost.** `get_league_war()` has ~29 call sites and many genuinely navigate the object
+(CWL analysis, round resolution, group expansion). Migrating all of them is a real project, not
+a tweak. It stratifies well, though: the orphan path is both the highest volume and the
+lowest-complexity need.
+
+### Stage 4.0 — size the prize before spending anything (DONE, build 24)
+
+`coc_health` has tracked `cycle_calls_by_op` since it was written, but **nothing ever logged
+it** — so the actual per-cycle call mix has never been observable, and every claim about
+"`get_league_war()` dominates during CWL" was inference, not measurement. Build 24 adds an
+`[API-CALL-MIX]` line to the end-of-cycle summary.
+
+**Gate to Stage 4.1:** read `[API-CALL-MIX]` over a full CWL day on PROD. It answers the only
+question that matters for scoping: what fraction of cycle API load is `get_league_war` versus
+`get_current_war`. If league-war is a small minority even during CWL, this whole stage is not
+worth the migration risk and should be closed as "measured, not worth it" — which is a perfectly
+good outcome and the reason to measure first.
+
+### Stage 4.1+ — sketch only, do not start before 4.0 reports
+
+1. Add a payload-returning path (`get_league_war_payload()` or a `as_payload=True` flag) that
+   caches the dict. Keep the existing object-returning method during migration.
+2. Shadow-compare, exactly as Stage 2 did: build both, diff, log divergence, keep the object
+   authoritative. The corpus harness (`tests/integration/test_war_payload_parity.py`) already
+   proves `build_war_payload()` round-trips real wars.
+3. Migrate `process_orphaned_cwl_wars()` first — dominant volume, only needs serialisation. Then
+   measure again before touching the analysis call sites.
+4. Remove `_war_save_locks` only once no consumer on that path holds a coc object; that removal
+   is the throughput win and should be measured on its own.
+5. Migrate remaining consumers as the numbers justify — several may never be worth it.
+
+**Carry the Stage 1-3 lessons in:** gate on observations the code can actually emit (Pitfall 59),
+stratify verification by code path rather than sampling uniformly (Pitfall 60), and remember that
+a clean structural check says nothing about content correctness (Pitfall 63).
