@@ -1,6 +1,29 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (4)
+- Stage 3 validation EXTENDED to the CWL orphan finalization path, which dominates the workload
+  and which the first comparison never isolated. In the DEV build-20 cycle, 2,196 of the 2,947
+  history rows written (75%) came from [ORPHANED-CWL] finalizations, not from the regular
+  war_ended path. These go through process_orphaned_cwl_wars() -> get_league_war(), a different
+  Phase-2 route than fetch_clan_war_data()/process_clan_war_data(). Diffed 40 orphan-finalized
+  wars against PROD build 19: war_summary 23 cols + war_attacks 20 cols x 810 rows = 16,200
+  field comparisons, ZERO mismatches; defensive_stars non-zero in 763/810 rows.
+- Combined Stage 3 cross-instance evidence: 80 wars, 1,554 attack rows, ~31,000 field
+  comparisons, zero mismatches, across BOTH finalization paths.
+- METHOD NOTE: the first pass sampled war_summary uniformly at random and reported "40 wars"
+  without characterising WHICH code path produced them. Random sampling over a mixed population
+  does not demonstrate per-path coverage — with 75% of rows from one path and 25% from another,
+  an unstratified sample can silently under-represent either, and reporting it as though the
+  population were homogeneous overstates what was checked. Stratify by code path first, then
+  sample within each. Generalised as Pitfall 60.
+- RETRACTION of the correction in 2026-09-05 (3): calling the earlier shadow-mode checkpoint
+  "PROD" was CORRECT. c:\python\QapBot\data holds PROD's log and DB, routinely copied to DEV so
+  that analysis does not need to touch PROD. The one-time direct PROD access (read-only) was
+  granted specifically to compare build 19 and build 20 side by side. The 2026-09-05 (3) bullet
+  claiming the checkpoint measured DEV traffic is withdrawn; that "correction" was an assumption
+  about the environment made without asking, layered on top of the very data it misread.
+
 2026-09-05 (3)
 - tracker-0009 Stage 3 validated by cross-instance A/B, which is the finalisation-path evidence
   shadow mode structurally could not produce. DEV ran one build-20 cycle while PROD was still on
@@ -20,7 +43,9 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   over 21,549 log lines. HYPOTHESIS ONLY: single cold-cache DEV cycle carrying 5,350 API fetches
   vs PROD's steady-state ~2,350, different hardware. Two dev simulations in this plan's history
   mispredicted PROD, both optimistically.
-- Correction to 2026-09-05 (1)/(2): the "~2h24m on PROD build 19" shadow-mode checkpoint was
+- [RETRACTED by 2026-09-05 (4) — this bullet was itself wrong; c:\python\QapBot\data holds PROD
+  log/data routinely copied to DEV for analysis, so the checkpoint WAS PROD data.]
+  Correction to 2026-09-05 (1)/(2): the "~2h24m on PROD build 19" shadow-mode checkpoint was
   actually measured on DEV's log/DB (c:\python\QapBot\data), not PROD's (\NAS_DS218\satashare\
   QapBot\data). The finding stands — 22,032 comparisons, zero divergence, on real CWL-dominated
   traffic — but it was DEV traffic. Naming it PROD was wrong.

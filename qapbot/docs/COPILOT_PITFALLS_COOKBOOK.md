@@ -2734,3 +2734,39 @@ by side for the rest.
 
 **See also:** `plans/tracker-0009-phase1-war-payload-retention.md` §10 for the full staged
 record, and Pitfall 55 for the related trap of comparing values a replay has made circular.
+
+---
+
+## Pitfall 60: a random sample over a mixed population proves nothing per code path — stratify by path first, or you will report coverage you do not have
+
+**Symptom:** a migration is validated by sampling N records at random from the output table and
+diffing them. Everything matches, the number sounds solid, and the result is reported as though
+the population were homogeneous. But the rows were produced by two or more different code paths,
+and nobody checked how the sample split across them.
+
+**What happened (2026-09-05):** validating tracker-0009 Stage 3, 40 wars were sampled at random
+from `war_summary` and compared against a reference instance — 14,880 field comparisons, zero
+mismatches, reported as "40 wars, zero mismatches". The reviewer immediately spotted what the
+sample had not established: **2,196 of the 2,947** rows that cycle wrote (75%) came from
+`[ORPHANED-CWL]` finalisations through `process_orphaned_cwl_wars()` -> `get_league_war()`, a
+different route from the `fetch_clan_war_data()`/`process_clan_war_data()` path the change was
+actually about. The random draw certainly contained some of each, but *which* and *how many* was
+never determined, so neither path had demonstrated coverage. Re-running stratified on the orphan
+path gave another 16,200 clean comparisons — the conclusion held, but the original evidence had
+not earned it.
+
+**How to apply:**
+
+- **Enumerate the code paths that write the table before sampling it.** Grep for the writers.
+  Two paths that produce the same row shape are still two paths.
+- **Stratify, then sample within each stratum.** Report per-path counts, not one aggregate. "40
+  wars" is not a finding; "40 regular + 40 orphan, both clean" is.
+- **Check the mix ratio.** A path holding 75% of the volume can still be the one you care least
+  about, and a path holding 2% can be the risky one. Volume does not rank risk — the diff does.
+- **Say which path a number came from** whenever reporting sample-based evidence, so a reader can
+  see the gap you did not cover.
+- **A clean diff on the wrong population is indistinguishable from a clean diff on the right
+  one** until someone asks. Make the stratification explicit so the question gets asked early.
+
+**See also:** Pitfall 59 for the related failure of treating an unreachable observation as
+evidence — both are cases of a verification that looked rigorous while measuring the wrong thing.

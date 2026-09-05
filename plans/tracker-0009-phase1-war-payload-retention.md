@@ -533,6 +533,19 @@ builds gets you the finalisation-path evidence that in-process differential logg
 settled (all `war_ended`), which is the right condition for diffing finalised history; two
 instances polling mid-war could legitimately differ on a live snapshot.
 
+**Extended to the CWL orphan path — and why the first pass was not enough.** That first sample
+was drawn uniformly at random from `war_summary` and reported as "40 wars", without
+characterising which code path produced them. It turns out **2,196 of the 2,947** rows the cycle
+wrote (75%) came from `[ORPHANED-CWL]` finalisations via `process_orphaned_cwl_wars()` ->
+`get_league_war()` — a different Phase-2 route from
+`fetch_clan_war_data()`/`process_clan_war_data()`. An unstratified sample over a 75/25 mix
+demonstrates neither path's coverage, and reporting it as one number overstated what had been
+checked. Re-ran stratified on the orphan path alone: 40 orphan-finalised wars, 810 attack rows,
+**16,200 field comparisons, zero mismatches**, `defensive_stars` non-zero in 763/810.
+
+Combined: **80 wars, 1,554 attack rows, ~31,000 field comparisons, zero mismatches, across both
+finalisation paths.** Stratify by code path before sampling; see Pitfall 60.
+
 **DEV timing, treat as hypothesis only.** That cycle showed `gc_collect=0.633s (freed=33,865)`
 and `[LOOP-LAG] max=0.56s`, against the build-17 PROD baseline of ~1.29s / ~1.22s. But it was a
 single cold-cache DEV cycle carrying 5,350 API fetches versus PROD's steady-state ~2,350, on
