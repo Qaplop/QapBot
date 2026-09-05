@@ -2860,3 +2860,102 @@ operation: it still joins the WAL index.
 
 **See also:** Cardinal Rule 18 in `.github/copilot-instructions.md`, and Pitfall 61 for the
 adjacent mistake of mutating an object whose ownership was assumed rather than established.
+
+---
+
+## Pitfall 63: `.recover`'s clean `integrity_check` proves the B-tree is sound — it proves nothing about whether the CONTENT is correct
+
+**Symptom:** a corrupted database is repaired with `sqlite3 .recover`, the resulting file passes
+`PRAGMA integrity_check` with `ok`, has zero rows in `lost_and_found`, zero duplicate primary
+keys — every structural signal is clean — and yet specific rows contain wrong or missing data
+that nothing in the recovery process flagged.
+
+**What happened (2026-09-05):** recovering PROD's corrupted `qapbot.db` via `.recover
+--ignore-freelist`, the result passed every structural check described above. It was declared
+fully recovered on that basis. It was not. Two separate, silent failures existed in the `clans`
+table alone:
+
+1. **209 rows with misattributed content.** `clan_tag` values that were war-tag-shaped
+   (`#8RPL2...`) or bare ISO timestamps (`2026-09-04T10:26:33...`) — bytes that plainly belonged
+   to a different table or column, stitched by `.recover`'s best-effort page reconstruction into
+   a structurally-valid `clans` row. `--ignore-freelist` is the likely mechanism: it tells
+   `.recover` to treat potentially-stale freed pages as live data, and a freed page's leftover
+   bytes can coincidentally match another table's schema fingerprint.
+2. **562 rows silently dropped**, present in a same-morning clean backup, absent from `.recover`'s
+   output from the very first moment recovery completed — no error, no `lost_and_found` entry,
+   no signal of any kind. 258 of them had `track_war_updates=1`: real, actively-monitored clans
+   that would have silently stopped being tracked.
+
+`integrity_check` walks the B-tree and confirms pointers, rowid ordering and page references are
+self-consistent. It has no concept of what a `clan_tag` column is supposed to contain, and no way
+to know a page went missing rather than being legitimately empty. Both failure modes are
+therefore invisible to it by construction, not by an edge case it happened to miss.
+
+**How it was actually caught:** not by any recovery-tool output, but by diffing the recovered
+data against an independent clean reference (a backup taken shortly before the corruption) —
+first the `clans` table specifically (prompted by anomalous `[CLAN-DELETED]` log warnings on
+restart), then, once that pattern was found, a full table-by-table row-count and key-set diff
+across the whole schema to check for the same failure elsewhere.
+
+**How to apply:**
+
+- **A clean `.recover` + `integrity_check` is a starting point, never a conclusion.** Budget time
+  to diff against a reference after every recovery, not just when something looks wrong.
+- **Get or make a clean reference BEFORE attempting recovery if at all possible.** The diff that
+  found this was only possible because a same-morning backup existed; without it, both failure
+  modes would still be undetected.
+- **Diff row-by-row (or at minimum key-set by key-set), not just table counts.** A table whose
+  count matches exactly can still have N rows swapped for N different wrong ones — count parity
+  is necessary, not sufficient. Row loss can also hide behind unrelated same-day legitimate
+  growth in the same table.
+- **Watch for corruption that self-reports at runtime.** The 209 misattributed rows only surfaced
+  because application code (`_mark_clan_deleted`, designed for exactly this "bogus value stored
+  as a real one" case) tried to use them and got a 404. That is a lucky catch specific to this
+  schema, not something to rely on — the 562 dropped rows produced no such signal at all and
+  were only found by deliberately looking.
+- **Treat `--ignore-freelist` as a completeness-over-correctness tradeoff**, not a strictly-better
+  flag. It measurably recovered more data (further progress before the process completed
+  cleanly, cf. Pitfall 61's sibling investigation) but is the more plausible source of the
+  misattributed rows specifically.
+
+**See also:** Pitfall 62 for how the source corruption happened; Pitfall 60 for the related
+lesson that a clean-looking check can still be checking the wrong thing.
+
+---
+
+## Pitfall 64: `PRAGMA locking_mode=EXCLUSIVE` is a real fail-safe for one-at-a-time PROD DB access — but an expensive query held under it blocks PROD's own restart
+
+**Symptom:** direct access to PROD's live SQLite file (over the network share, with PROD
+confirmed stopped) is attempted safely via `PRAGMA locking_mode=EXCLUSIVE` — correct in
+principle — but a broad verification query is run under that lock, and PROD cannot reopen its
+own database for as long as the query takes, even though nothing is actually at risk of
+corruption.
+
+**What happened (2026-09-05):** after Pitfall 62's incident, direct exclusive-mode PROD access
+was correctly re-authorised for when PROD is confirmed stopped: the lock request either succeeds
+cleanly (no other accessor) or fails cleanly (`database is locked`) rather than hanging — a
+materially different, genuinely safe mechanism, not a repeat of the original mistake. But the
+first use of it ran `PRAGMA quick_check` against the full 24GB+ live file. The exclusive lock was
+held for the query's entire multi-minute runtime, during which PROD — confirmed stopped and
+waiting to be restarted — could not have reopened its own database even if the user had tried to
+bring it back up. Stopped mid-run once the user flagged the priority ("we need PROD up and
+running"); no corruption resulted, but it was an unforced, avoidable delay to recovery.
+
+**How to apply:**
+
+- **Exclusive-mode access is safe for correctness; it says nothing about how long you may hold
+  it.** The two properties are independent — a safe mechanism used for an expensive operation is
+  still an availability hazard.
+- **Match the query to the actual question.** A plain INSERT's own row-count-before/after output
+  is sufficient proof it worked; a whole-file `quick_check`/`integrity_check` afterward is
+  usually redundant re-verification of something a parameterised write is very unlikely to have
+  broken, dressed up as extra caution.
+- **If whole-file verification is genuinely warranted, run it against a copy, never against
+  PROD's live file under an open exclusive lock.** The copy can be checked for as long as
+  necessary with zero effect on PROD's availability.
+- **When the user says "get PROD back up," that reprioritises immediately** — stop whatever
+  lower-priority verification is running rather than let it finish first, even if it's "almost
+  done" or "safe." Availability of a system the user is actively waiting to restart outranks
+  incremental caution about a change already evidenced as correct.
+
+**See also:** Pitfall 62 and Pitfall 63 for the fuller incident this is a coda to.

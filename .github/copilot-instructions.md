@@ -220,8 +220,28 @@ was at risk and PROD was down until restored.
 - The same applies to `qapbot_history.db` and to any tooling (DB browsers, scripts, IDE
   plugins) pointed at a NAS path.
 
-📖 Where: `\NAS_DS218\satashare\QapBot\data\` (PROD, off-limits to remote SQLite);
-`c:\python\QapBot\data\` (synced PROD copy, safe). See Pitfall 62.
+**Refinement (2026-09-05, same day, after root-causing the incident more precisely): the actual
+failure was contention with PROD's own process while it was live, not SMB access per se.**
+`PRAGMA locking_mode=EXCLUSIVE` set immediately after connecting is an acceptable way to open
+PROD's live DB directly over the share **when PROD is confirmed stopped / DB closed** (e.g.
+maintenance mode). It is a genuine fail-safe: if PROD still has the file open, the exclusive-lock
+request errors out cleanly (`database is locked`) instead of hanging or corrupting anything; if
+PROD is genuinely not holding it, there is only one accessor and no coordination protocol is even
+in play. This has been used successfully post-incident (targeted row inserts and small-table
+row-count audits, both single-digit-second connections).
+
+**The remaining hazard under this refinement is availability, not data safety: keep the exclusive
+connection SHORT.** An expensive operation — `PRAGMA quick_check`/`integrity_check` on the whole
+file is the concrete example — held under an exclusive lock blocks PROD from reopening its own
+database for as long as it runs, even though PROD is confirmed stopped and nothing is at risk of
+corruption. On a 24GB+ file over SMB this can run for minutes. Use narrow, targeted queries
+(`SELECT COUNT(*)`, specific row lookups) instead of whole-file verification passes; if
+whole-file verification is genuinely needed, run it against a **copied** local file, never
+against PROD's live one under an open exclusive lock.
+
+📖 Where: `\NAS_DS218\satashare\QapBot\data\` (PROD — normal remote SQLite connections
+off-limits; exclusive-mode connections only when PROD is confirmed stopped, kept short);
+`c:\python\QapBot\data\` (synced PROD copy, always safe). See Pitfall 62 and Pitfall 63.
 
 ---
 
