@@ -3005,6 +3005,25 @@ class WarHistoryDB:
         # happens (ticket #0021 follow-up, 2026-08-22).
         await self._add_column_if_missing("tracker_items", "access_grant_pending", "INTEGER NOT NULL DEFAULT 0")
 
+        # Backfill (2026-09-05, tracker #0023): tracker_items.guild_id must always be the
+        # tracker's home guild -- the one guild the reports channel and every item's discussion
+        # thread actually live in -- never "whichever of the bot's many served guilds the
+        # reporter happened to run /bug/'feature from", which is what ui_tracker.py's
+        # TrackerDraftView._on_submit() incorrectly stored before this fix. That wrong value
+        # broke two things: _item_jump_link()'s Discord URL named the reporter's own guild
+        # instead of the one the thread_id actually belongs to, and (the reported bug)
+        # apply_pending_requestor_access()'s reporter_id+guild_id lookup could never match a row
+        # once the invited reporter joined, since on_member_join always fires for the tracker's
+        # home guild -- so the auto-grant-on-join step silently never applied. Idempotent and
+        # safe to re-run every startup: a no-op once every row already matches; skipped entirely
+        # if the tracker has never been configured (nothing to backfill to yet).
+        home_guild_id = await self.get_bot_setting("tracker_guild_id")  # ui_tracker.TRACKER_SETTING_GUILD_ID
+        if home_guild_id:
+            await self._conn.execute(
+                "UPDATE tracker_items SET guild_id = ? WHERE guild_id IS NOT ?",
+                (home_guild_id, home_guild_id),
+            )
+
         await self._conn.commit()
         logging.debug("[DB-SCHEMA] Bug/feature tracker tables verified")
 

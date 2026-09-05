@@ -19,6 +19,7 @@ from qapbot.ui_tracker import (
     TRACKER_SETTING_BUG_CHANNEL,
     TRACKER_SETTING_DONE_TESTING_CHANNEL,
     TRACKER_SETTING_ENABLED,
+    TRACKER_SETTING_GUILD_ID,
     TRACKER_SETTING_IMPLEMENTED_CHANNEL,
     TRACKER_SETTING_TEST_CHANNEL,
     ConfirmForceMoveView,
@@ -136,6 +137,37 @@ async def _make_item(db, item_type="bug", **overrides):
     return item_number
 
 
+# -- tracker_items.guild_id backfill (tracker item #0023) -------------------
+
+async def test_tracker_schema_backfills_guild_id_to_tracker_home_guild(db):
+    """Pre-fix rows (created before this fix existed) can hold NULL or some other guild's id in
+    guild_id -- _create_tracker_schema()'s idempotent backfill must correct every row to the
+    tracker's configured home guild once one is set, so apply_pending_requestor_access()'s
+    guild-scoped lookup (keyed on the guild the reporter actually joined, always the tracker's
+    home guild) can match rows filed before the create-time fix landed."""
+    wrong_guild_item = await _make_item(db, reporter_id="1", guild_id="1224425088913248467")
+    null_guild_item = await _make_item(db, reporter_id="2", guild_id=None)
+    already_correct_item = await _make_item(db, reporter_id="3", guild_id="1145641080621109312")
+
+    await db.set_bot_setting("tracker_guild_id", "1145641080621109312")
+    await db._create_tracker_schema()  # idempotent; re-running applies the backfill
+
+    for item_number in (wrong_guild_item, null_guild_item, already_correct_item):
+        item = await db.get_tracker_item(item_number)
+        assert item["guild_id"] == "1145641080621109312"
+
+
+async def test_tracker_schema_backfill_skipped_when_tracker_unconfigured(db):
+    """No tracker_guild_id setting yet (tracker never configured) -> nothing to backfill to;
+    existing guild_id values (including NULL) must be left exactly as they were."""
+    item_number = await _make_item(db, reporter_id="1", guild_id=None)
+
+    await db._create_tracker_schema()
+
+    item = await db.get_tracker_item(item_number)
+    assert item["guild_id"] is None
+
+
 # -- create_tracker_item_for_agent (tracker item #0015) --------------------
 
 async def test_create_tracker_item_for_agent_persists_and_posts(monkeypatch, db):
@@ -184,6 +216,22 @@ async def test_create_tracker_item_for_agent_respects_disabled_flag(monkeypatch,
     CACHE.tracker_settings[TRACKER_SETTING_ENABLED] = "0"
     with pytest.raises(ValueError):
         await create_tracker_item_for_agent(item_type="bug", title="T", description="D")
+
+
+async def test_create_tracker_item_for_agent_persists_tracker_home_guild(monkeypatch, db):
+    """tracker item #0023: the stored guild_id must be the tracker's configured home guild
+    (where the reports channel/discussion thread actually live), not left NULL -- otherwise
+    _item_jump_link()'s Discord URL for an agent-filed item names no guild at all."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_BUG_CHANNEL] = "1"
+    CACHE.tracker_settings[TRACKER_SETTING_GUILD_ID] = "1145641080621109312"
+    _wire_bot(monkeypatch, channel=_fake_channel())
+
+    result = await create_tracker_item_for_agent(
+        item_type="bug", title="T", description="D"
+    )
+
+    assert result["item"]["guild_id"] == "1145641080621109312"
 
 
 async def test_create_tracker_item_for_agent_caps_overlong_title(monkeypatch, db):
@@ -532,6 +580,62 @@ async def test_on_submit_posts_to_the_shared_bug_channel(db, monkeypatch, mock_i
 
     assert draft.submitted is True
     channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_on_submit_persists_tracker_home_guild_not_reporting_guild(db, monkeypatch, mock_interaction):
+    """tracker item #0023 live bug: a reporter can run /bug or /feature from ANY guild the bot
+    serves (or from a DM, where there's no guild at all) -- TrackerDraftView.guild_id only exists
+    to localize the modal's OWN text into that guild's language. The item's persisted guild_id
+    must always be the tracker's configured home guild (where the reports channel and every
+    item's discussion thread actually live), never the reporting guild. Storing the reporting
+    guild instead meant apply_pending_requestor_access()'s guild-scoped lookup could never match
+    the row once the invited reporter joined (on_member_join always fires for the tracker's home
+    guild), so the auto-grant-on-join step silently never applied -- exactly the "invite didn't
+    work" symptom reported."""
+    from qapbot.cache_manager import CACHE
+
+    channel = _fake_channel()
+    _wire_bot(monkeypatch, channel=channel)
+    monkeypatch.setattr(
+        CACHE, "tracker_settings",
+        {TRACKER_SETTING_BUG_CHANNEL: "42", TRACKER_SETTING_GUILD_ID: "1145641080621109312"},
+    )
+
+    # guild_id here is some OTHER guild the bot serves -- not the tracker's home guild above.
+    draft = TrackerDraftView(
+        item_type="bug", title="T", description="D", details="", environment="",
+        reporter_id="111", reporter_name="A", guild_id=1224425088913248467, channel_id=1, user_id="1",
+    )
+    draft.message = AsyncMock()
+
+    await draft._on_submit(mock_interaction)
+
+    items = await db.list_tracker_items(reporter_id="111")
+    assert items[0]["guild_id"] == "1145641080621109312"
+
+
+@pytest.mark.asyncio
+async def test_on_submit_persists_no_guild_when_tracker_home_guild_unconfigured(db, monkeypatch, mock_interaction):
+    """Defensive fallback: if the tracker's home guild somehow isn't configured (shouldn't
+    happen in practice -- Bot Setup's Save always stamps it alongside the reports channel), the
+    item still gets created rather than crashing, with guild_id left NULL like before this fix."""
+    from qapbot.cache_manager import CACHE
+
+    channel = _fake_channel()
+    _wire_bot(monkeypatch, channel=channel)
+    monkeypatch.setattr(CACHE, "tracker_settings", {TRACKER_SETTING_BUG_CHANNEL: "42"})
+
+    draft = TrackerDraftView(
+        item_type="bug", title="T", description="D", details="", environment="",
+        reporter_id="111", reporter_name="A", guild_id=1224425088913248467, channel_id=1, user_id="1",
+    )
+    draft.message = AsyncMock()
+
+    await draft._on_submit(mock_interaction)
+
+    items = await db.list_tracker_items(reporter_id="111")
+    assert items[0]["guild_id"] is None
 
 
 # -- double-click submit guard (tracker item #0026) -------------------------

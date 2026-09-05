@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (12)
+- Fixed tracker #0023: the reporter DM-invite/auto-grant flow silently never applied access once
+  the invited reporter joined, because tracker_items.guild_id was stamped with whichever of
+  QapBot's many served guilds (or DM, i.e. NULL) the reporter happened to run /bug or /feature
+  from, instead of the tracker's own home guild where the reports channel/discussion thread
+  actually live. apply_pending_requestor_access()'s guild-scoped lookup (keyed on the guild the
+  member just joined -- always the tracker's home guild) could never match that wrong value, so
+  the "Reply to requestor" DM-invite left the reporter joined but still unable to see the thread,
+  with no error surfaced anywhere. Same wrong value also broke _item_jump_link()'s Discord URL
+  for any item filed from outside the tracker's home guild.
+- Fix: both creation paths (TrackerDraftView._on_submit(), create_tracker_item_for_agent()) now
+  always persist _tracker_home_guild_id() (reads the tracker_guild_id bot_setting) instead of the
+  reporting context. _create_tracker_schema() also runs a one-time idempotent backfill correcting
+  every pre-existing row's guild_id, so tickets filed before this fix (including #0023 itself)
+  self-heal on the next restart instead of staying stuck with access_grant_pending=1 forever.
+- qapbot/ui_tracker.py, qapbot/db_manager.py, qapbot/docs/BUG_FEATURE_TRACKER.md,
+  tests/discord/test_ui_tracker_items.py (5 new tests). 3064 tests pass. pyright clean.
+
 2026-09-05 (11)
 - Raised _MAX_INACTIVE_PER_CYCLE 3000 -> 5000 (build 26). Applied on PROD first and observed to
   fit both the cycle-time and the memory budget there; this brings the source in line with what

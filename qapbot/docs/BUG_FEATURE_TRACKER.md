@@ -182,6 +182,29 @@ reasoning as `handle_tracker_test_reaction()` above and Pitfall 39: `on_member_j
 gateway event, not a component interaction, so it fires on every bot present in the guild —
 including DEV, whose DB is a routine PROD-backup copy that can contain the exact same pending row.
 
+**`tracker_items.guild_id` must always be the tracker's home guild, never the reporting guild
+(2026-09-05 live bug, ticket #0023)**: QapBot serves many Discord guilds, and `/bug`/`/feature`
+are global commands — invocable from any of them, or via DM. Before this fix, `TrackerDraftView.
+_on_submit()` persisted `interaction.guild.id` (or `None` from a DM) straight into the item's
+`guild_id` column. That value is correct for exactly one thing — localizing the reporting
+modal's own text into whichever guild's language the reporter happened to be sitting in
+(`self.guild_id`, read live at report time, never stored) — and wrong for everything the stored
+column is actually used for afterward: `_item_jump_link()` builds `https://discord.com/channels/
+{guild_id}/{thread_id}`, and the thread only exists in the ONE guild the tracker's reports
+channel lives in (`TRACKER_SETTING_GUILD_ID`, stamped by `BotSetupView._on_save()` alongside the
+channel ids) — naming any other guild there is a dead link. Worse, `apply_pending_requestor_
+access()`'s `list_tracker_items(reporter_id=..., guild_id=str(member.guild.id))` lookup runs
+from `on_member_join`, which always fires for the tracker's home guild (that's the only guild
+the DM'd invite ever points at) — a row stored with the reporter's OWN guild (or NULL, the DM
+case) could never match, so the auto-grant-on-join step silently never fired. A reporter using an
+alt account to test the DM-invite flow would join the server via the invite and still find the
+discussion thread invisible, with no error anywhere. Fixed at both creation sites — `TrackerDraft
+View._on_submit()` and `create_tracker_item_for_agent()` — to always resolve and store
+`_tracker_home_guild_id()` (reads `TRACKER_SETTING_GUILD_ID`) instead of the reporting context.
+`_create_tracker_schema()` also runs a one-time idempotent backfill correcting every existing
+row's `guild_id` to match, so tickets filed before this fix (including #0023 itself) self-heal on
+the next bot restart rather than staying permanently stuck with `access_grant_pending=1`.
+
 ## Discord surface (`qapbot/ui_tracker.py`)
 
 **The posted RECORD is always English; the REPORTING interaction is translated

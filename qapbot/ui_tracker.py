@@ -79,6 +79,26 @@ TRACKER_SETTING_ENABLED = "tracker_enabled"
 # share TRACKER_SETTING_BUG_CHANNEL. A pre-existing bot_settings row under that old key, if any,
 # is simply never read any more; nothing needs to delete it.
 
+
+def _tracker_home_guild_id() -> Optional[int]:
+    """The single guild the tracker is configured for -- Bot Setup's Save button
+    (TrackerBotSetupView._on_save()) stamps TRACKER_SETTING_GUILD_ID alongside the channel ids,
+    so this is set whenever the tracker itself is configured at all.
+
+    Fallback for `guild_id` whenever there's no `interaction.guild` to read it from -- most
+    notably `/bug`/`/feature` run via DM (tracker item #0023: most reporters file this way and
+    never join the server). Leaving guild_id NULL on those items silently breaks two things that
+    both key off it later: `_item_jump_link()` renders a bogus "@me" URL instead of a real guild
+    channel/thread link, and -- the more serious break -- `apply_pending_requestor_access()`'s
+    `list_tracker_items(reporter_id=..., guild_id=str(member.guild.id))` lookup can never match a
+    NULL row, so the auto-grant-on-join step silently never fires for exactly the reporters it
+    was built for, leaving them joined to the server but still unable to see the discussion
+    thread."""
+    from qapbot.cache_manager import CACHE
+    raw = CACHE.tracker_settings.get(TRACKER_SETTING_GUILD_ID)
+    return int(raw) if raw else None
+
+
 # Item/status metadata (plan §4.2)
 ITEM_TYPE_EMOJI = {"bug": "🐞", "feature": "💡"}
 STATUS_VALUES: Tuple[str, ...] = (
@@ -864,13 +884,24 @@ class TrackerDraftView(discord.ui.View):
         from qapbot.cache_manager import CACHE
 
         db = CACHE.db_manager
+        # NOT self.guild_id: that's whichever of the bot's many served guilds the reporter
+        # happened to run /bug or /feature from (kept on the modal only to localize the modal's
+        # own text into that guild's language) -- completely unrelated to where the tracker's
+        # reports channel/thread actually live. Persisting it here (2026-08-22's original bug,
+        # tracker item #0023) meant _item_jump_link() built a jump URL naming the wrong guild for
+        # every report filed from outside the tracker's home guild, and (more seriously)
+        # apply_pending_requestor_access()'s guild-scoped lookup could never match the row once
+        # the reporter joined -- the invite always adds them to the tracker's HOME guild, whose id
+        # never matched what got stored here. _tracker_home_guild_id() is the one guild every
+        # downstream consumer of item['guild_id'] actually means.
+        home_guild_id = _tracker_home_guild_id()
         item_number = await db.create_tracker_item(  # type: ignore[union-attr]
             item_type=self.item_type, title=self.title_text, description=self.description_text,
             reporter_id=self.reporter_id, reporter_name=self.reporter_name,
             details=self.details_text or None,
             environment=(self.environment_text or None) if self.item_type == "bug" else None,
             priority=self.priority_text,
-            guild_id=str(self.guild_id) if self.guild_id else None,
+            guild_id=str(home_guild_id) if home_guild_id else None,
         )
 
         for index, pending in enumerate(self.pending_attachments, start=1):
@@ -921,7 +952,10 @@ async def start_tracker_item(
     own command-param attachments keep ticking toward expiry (plan §2.2)."""
     from qapbot.cache_manager import CACHE
 
-    guild_id = interaction.guild.id if interaction.guild else None
+    # Falls back to the tracker's configured home guild when filed via DM (interaction.guild is
+    # None there) -- see _tracker_home_guild_id()'s docstring for why a NULL guild_id here quietly
+    # breaks the reporter-access-grant flow later.
+    guild_id = interaction.guild.id if interaction.guild else _tracker_home_guild_id()
     user_id = str(interaction.user.id)
 
     # Real translation (_t_localized), not this module's shadowed t(): these two early-return
@@ -986,10 +1020,12 @@ async def create_tracker_item_for_agent(
         title = title[:TRACKER_TITLE_MAX_LENGTH - 1].rstrip() + "…"
 
     db = CACHE.db_manager
+    home_guild_id = _tracker_home_guild_id()
     item_number = await db.create_tracker_item(  # type: ignore[union-attr]
         item_type=item_type, title=title, description=description,
         reporter_id=f"agent:{reporter_name}", reporter_name=reporter_name,
         details=details or None, environment=normalized_environment, priority=normalized_priority,
+        guild_id=str(home_guild_id) if home_guild_id else None,
     )
 
     message, _thread = await _post_tracker_item(item_number, int(channel_id_str))
