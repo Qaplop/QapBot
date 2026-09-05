@@ -146,6 +146,14 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 - DO: When adding a significant feature or doing a significant refactor, add a new doc under `../qapbot/docs/` (or a new section in an existing one) if nothing already covers it.
 - DO: When a plan-mode session (or any ad-hoc planning request) produces an implementation plan for this repo, save the finished plan under `plans/` at the **project root** — never leave it only in a tool-external location a coding agent's plan mode may default to (e.g. `~/.claude/plans/`). Name it `plans/tracker-NNNN-short-slug.md` (zero-padded to 4 digits) when the plan traces back to a bug/feature tracker item, or `plans/short-slug.md` otherwise. The literal next tool call after a plan-mode tool reports the plan approved MUST be writing/copying that file into `plans/` — before reading, editing, or writing any implementation file, even in the same turn. Re-copying is required every time this happens in a session, not just the first — a tool's plan-mode reusing the same private-path filename across repeated invocations does not exempt any later one from this rule.
 - DO: Once that plan is **fully implemented** (code complete, tests passing, changes committed), `git mv` its file from `plans/` into `plans/implemented/` (create the subdirectory if needed) in the same turn you finish the implementation — `plans/` holds only outstanding work; `plans/implemented/` is the archive.
+- DO: A one-off script written for the *user* to run themselves (e.g. because the permission
+  classifier blocks Claude from touching PROD directly, or the change needs manual sign-off —
+  `fix_clans_table.py`, `verify_build26.py` were both examples of this) goes in the **project
+  root**, not a session-scoped scratchpad — the user needs a short, stable path to paste into a
+  terminal, and scratchpad paths are long, session-specific, and gone once the session ends.
+  Delete it once its one-off purpose is served (these are ad-hoc tooling, not a deliverable —
+  confirm it was never `git add`ed before deleting). If it embeds real infrastructure details
+  (a PROD UNC path, hostname, etc.), it must never be committed — see Rule 16.
 - DO: Never mark a bug/feature tracker item `implemented` without also posting at least one manual test case for it (`tracker_add_testcases` MCP tool, or the bridge's `POST /api/tracker/items/{n}/testcases` with `{"cases": [{"environment": "PROD"|"DEV"|"BOTH", "description": "...", "priority": "HIGH"|"MEDIUM"|"LOW"}]}` (priority optional, defaults to MEDIUM — pick per case based on how critical it is to verify) when MCP isn't available in the session) — do this before, or immediately alongside, the status change. This is separate from and in addition to running `.\run_tests.ps1`: pytest verifies the code, the tracker test case is what actually drives `post_test_cases()`'s `implemented → testing` transition and gives whoever deploys it something concrete to sign off on. 📖 Details: `../qapbot/docs/BUG_FEATURE_TRACKER.md` § Runbook.
 - DO: When adding, removing, or changing the behavior/options of a `/` slash command, update its `/help` entry (`help()` in `QBdiscordcmds.py`) in the same change, plus the command list in `../README.md` if it's listed there.
 - DON'T: Leave a doc referencing a file, convention, or location that the change just moved or renamed.
@@ -252,6 +260,16 @@ confirms this specific access first; only then does whether-PROD-is-stopped dete
 mechanism (exclusive-mode direct, or copy-then-query) to use for it. This has been used, with
 confirmation obtained fresh each time, for targeted row inserts and small-table row-count audits
 (single-digit-second connections) post-incident.
+
+**Even under this refinement, a plain `PRAGMA locking_mode=EXCLUSIVE` connection — including a
+read-only one — can still fail with `sqlite3.OperationalError: disk I/O error` over SMB.** WAL
+machinery mmaps the `-shm` sidecar file even to read, and SMB does not support that reliably
+regardless of exclusive-lock state or PROD being stopped. Fix: open with `?mode=ro&immutable=1`
+in the connection URI instead of relying on `locking_mode=EXCLUSIVE` alone —
+`sqlite3.connect(f"file:{DB}?mode=ro&immutable=1", uri=True)`. `immutable=1` tells SQLite to skip
+WAL/locking machinery entirely and treat the file as static, which sidesteps the `-shm` mmap
+problem outright. This is only safe under the same precondition as the rest of this refinement —
+PROD confirmed stopped, so the file genuinely won't change during the connection's lifetime.
 
 **The remaining hazard under this refinement is availability, not data safety: keep the exclusive
 connection SHORT.** An expensive operation — `PRAGMA quick_check`/`integrity_check` on the whole
