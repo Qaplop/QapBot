@@ -354,7 +354,7 @@ def compute_recheck_offset_seconds(
 #    When True, update cycles are skipped entirely in DEV mode.
 #    The bot still sleeps normally between cycles — only main() is bypassed.
 #    Set to False to restore normal update behaviour in dev mode.
-NO_DEV_MODE_UPDATES: bool = True
+NO_DEV_MODE_UPDATES: bool = False
 #
 # 2) _sim_enabled  (QBwarsim.py, line ~750)
 #    When True, Monte Carlo war simulation uses a process pool for parallelism.

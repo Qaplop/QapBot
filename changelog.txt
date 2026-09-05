@@ -1,6 +1,30 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (3)
+- tracker-0009 Stage 3 validated by cross-instance A/B, which is the finalisation-path evidence
+  shadow mode structurally could not produce. DEV ran one build-20 cycle while PROD was still on
+  build 19: build 19 wrote Defensive_Stars from coc.py's m.best_opponent_attack (the API's own
+  field), build 20 writes it from the payload's find_best_opponent_attack() scan. Diffed the two
+  DBs (PROD read-only, one-time, explicitly authorised) over 40 wars finalised in the window and
+  present in both, 38 of them CWL: war_summary 23 columns + war_attacks 20 columns x 744 rows =
+  14,880 field comparisons, ZERO mismatches. defensive_stars was non-zero in 684/744 rows, so
+  the field whose source actually changed was heavily exercised, not trivially zero. id and
+  created_at excluded as instance-local.
+- Technique worth reusing: the shadow block cannot observe a finalisation (it sits in the
+  preparation/in_war branch), but two instances writing history from two different sources CAN
+  be diffed afterwards. A live A/B across builds reaches what in-process differential logging
+  cannot. Recorded in the plan's Stage 3 section.
+- DEV build-20 cycle also showed gc_collect=0.633s (freed=33,865) and [LOOP-LAG] max=0.56s vs
+  the build-17 PROD baseline of ~1.29s/~1.22s, with zero errors and zero [WAR-PAYLOAD] failures
+  over 21,549 log lines. HYPOTHESIS ONLY: single cold-cache DEV cycle carrying 5,350 API fetches
+  vs PROD's steady-state ~2,350, different hardware. Two dev simulations in this plan's history
+  mispredicted PROD, both optimistically.
+- Correction to 2026-09-05 (1)/(2): the "~2h24m on PROD build 19" shadow-mode checkpoint was
+  actually measured on DEV's log/DB (c:\python\QapBot\data), not PROD's (\NAS_DS218\satashare\
+  QapBot\data). The finding stands — 22,032 comparisons, zero divergence, on real CWL-dominated
+  traffic — but it was DEV traffic. Naming it PROD was wrong.
+
 2026-09-05 (2)
 - tracker-0009 Stage 3 (build 20): the payload is now AUTHORITATIVE and the coc.ClanWar is no
   longer returned from Phase 1 at all. fetch_clan_war_data() returns war_payload + end_time only;

@@ -512,7 +512,32 @@ non-Optional. Also fixed the abort's log message, which concatenated adjacent st
 with only the first f-prefixed and therefore logged the literal text `{tag_m}`/`{clan_tag}`.
 
 **Verification.** Full 30,975-file temp corpus through the parity harness, zero mismatches;
-3,040 tests green; pyright clean.
+3,042 tests green (4 deselected); pyright clean.
+
+**Cross-instance validation, 2026-09-05 — the check shadow mode could not do.** DEV ran one
+build-20 cycle while PROD was still on build 19, giving a direct A/B on the same wars from the
+same API: build 19 wrote `Defensive_Stars` from coc.py's `m.best_opponent_attack` (the API's own
+field), build 20 writes it from the payload's `find_best_opponent_attack()` scan. Comparing the
+two databases (PROD read-only, one-time, explicitly authorised) over 40 wars finalised in the
+window and present in both — **38 of them CWL** — across `war_summary` (23 columns) and
+`war_attacks` (20 columns, 744 rows): **14,880 field comparisons, zero mismatches.**
+`defensive_stars` was non-zero in **684 of 744** rows, so the field whose source actually changed
+was heavily exercised rather than trivially zero.
+
+This is precisely the observation the Stage 2 gate asked for and could never obtain: the shadow
+block cannot see a finalisation, but two instances writing history from two different sources
+can be diffed afterwards. Worth reaching for on the next data-path migration — a live A/B across
+builds gets you the finalisation-path evidence that in-process differential logging cannot.
+
+`id` and `created_at` were excluded as instance-local. The comparison relies on the wars being
+settled (all `war_ended`), which is the right condition for diffing finalised history; two
+instances polling mid-war could legitimately differ on a live snapshot.
+
+**DEV timing, treat as hypothesis only.** That cycle showed `gc_collect=0.633s (freed=33,865)`
+and `[LOOP-LAG] max=0.56s`, against the build-17 PROD baseline of ~1.29s / ~1.22s. But it was a
+single cold-cache DEV cycle carrying 5,350 API fetches versus PROD's steady-state ~2,350, on
+different hardware. This plan's own history has two dev simulations that mispredicted PROD, both
+optimistically. The PROD numbers are the ones that count.
 
 **Still to measure on PROD** (build 20): `[CYCLE-CLEANUP] gc_collect`, `[LOOP-LAG]` max and
 `RSS=` peak against the build-17 baseline in §9's CORRECTION (gc_collect ~1.29s, LOOP-LAG max
