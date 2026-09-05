@@ -1474,6 +1474,41 @@ async def test_finalize_testcases_move_moves_every_overflow_message(db, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_post_comment_always_mentions_the_reporter(db, monkeypatch):
+    """tracker item #0091 live bug report: a comment posted via the plain tracker_comment path
+    showed only `<@{author_id}>` -- for an agent-driven comment that's typically a non-numeric
+    label ("Qaplop"), never a real clickable Discord mention -- so the actual reporter was never
+    notified their ticket had moved. post_comment() must always @-mention the real reporter,
+    with no opt-in flag required."""
+    thread = _fake_channel()
+    _wire_bot(monkeypatch, channel=thread)
+    item_number = await _make_item(db, reporter_id="222")
+    await db.update_tracker_item(item_number, thread_id="777")
+
+    await post_comment(item_number, "Implemented together with #0085 -- closed as duplicate.", "Qaplop")
+
+    thread.send.assert_awaited_once()
+    posted = thread.send.call_args[0][0]
+    assert "<@222>" in posted
+    assert "Implemented together with #0085" in posted
+
+
+@pytest.mark.asyncio
+async def test_post_comment_no_mention_for_agent_filed_item(db, monkeypatch):
+    """An agent-filed item's reporter_id ("agent:<label>") has no real Discord user to mention --
+    must not crash trying to build one, and must not emit a broken '<@agent:...>' mention."""
+    thread = _fake_channel()
+    _wire_bot(monkeypatch, channel=thread)
+    item_number = await _make_item(db, reporter_id="agent:claude")
+    await db.update_tracker_item(item_number, thread_id="777")
+
+    await post_comment(item_number, "internal note", "Qaplop")
+
+    posted = thread.send.call_args[0][0]
+    assert "<@agent:claude>" not in posted
+
+
+@pytest.mark.asyncio
 async def test_post_comment_chunks_an_overlong_comment_into_multiple_sends(db, monkeypatch):
     """Same root cause and fix shape as the test-case overflow above, for the discussion-thread
     comment path (post_comment / tracker_comment)."""

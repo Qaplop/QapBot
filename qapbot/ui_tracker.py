@@ -1664,12 +1664,15 @@ async def apply_status_change(
     return item
 
 
-async def post_comment(item_number: int, text: str, author_id: str, *, mention_reporter: bool = False) -> None:
-    """Post into the item's discussion thread (plan §6.4's `/comment` endpoint). *mention_reporter*
-    (used by `reply_and_invite_for_agent()`) prepends an `<@reporter_id>` mention so Discord
-    actually notifies them the moment they can see the channel -- a plain, unmentioned message
-    doesn't ping anyone (same reasoning as the passive done-confirm prompt's own mention,
-    BUG_FEATURE_TRACKER.md). No-op when the reporter has no real Discord id (agent-filed items)."""
+async def post_comment(item_number: int, text: str, author_id: str) -> None:
+    """Post into the item's discussion thread (plan §6.4's `/comment` endpoint). The reporter is
+    always @-mentioned directly (tracker item #0091 live bug report: "shouldn't the ticket
+    creator have been mentioned in this post?" -- a duplicate-closure comment showed only
+    `<@{author_id}>`, and for an agent-driven comment `author_id` is typically a non-numeric
+    label like "Qaplop", not a real Discord snowflake, so it was never a clickable mention at
+    all -- the actual reporter was never notified their ticket had moved). Same reasoning as the
+    passive done-confirm prompt's own mention: a plain, unmentioned message doesn't ping anyone
+    in Discord. No-op prefix when the reporter has no real Discord id (agent-filed items)."""
     from qapbot.cache_manager import CACHE
     import QBcore
 
@@ -1681,7 +1684,7 @@ async def post_comment(item_number: int, text: str, author_id: str, *, mention_r
     if thread is None:
         thread = await QBcore.bot.fetch_channel(int(item["thread_id"]))
     message = t('ui_components.tracker.comment_posted', guild_id=_lang_guild_id(item), author_id=author_id, text=text)
-    if mention_reporter and item["reporter_id"].isdigit():
+    if item["reporter_id"].isdigit():
         message = f"<@{item['reporter_id']}> {message}"
     # Chunked, not one unguarded send() (2026-08-23, tracker #0028 — same root cause as the
     # test-case message: an over-2000-char comment raised discord.HTTPException, which propagated
@@ -1697,14 +1700,15 @@ async def reply_and_invite_for_agent(item_number: int, text: str, author_id: str
     `tracker_reply_and_invite`) for the case that motivated it: an agent testing a fix (or
     otherwise wanting to ask the reporter something) needs to both leave them a message AND make
     sure they can actually see and answer it -- a comment alone is useless to a reporter who
-    can't view the channel yet. Posts *text* via `post_comment(..., mention_reporter=True)`, then
-    runs `grant_access_for_agent()` -- the exact same grant/invite logic
-    `TrackerItemButton._handle_grant_access()`'s Discord button uses -- so the two surfaces can
-    never disagree about what "granting access" means, only about how the reporter gets asked.
+    can't view the channel yet. Posts *text* via `post_comment()` (which always @-mentions the
+    reporter, tracker item #0091), then runs `grant_access_for_agent()` -- the exact same
+    grant/invite logic `TrackerItemButton._handle_grant_access()`'s Discord button uses -- so the
+    two surfaces can never disagree about what "granting access" means, only about how the
+    reporter gets asked.
 
     Returns {"comment_posted": bool, "access": <grant_access_for_agent() result>}. Raises
     ValueError if the item doesn't exist or has no discussion thread yet (mirrors post_comment())."""
-    await post_comment(item_number, text, author_id, mention_reporter=True)
+    await post_comment(item_number, text, author_id)
     access = await grant_access_for_agent(item_number)
     return {"comment_posted": True, "access": access}
 
@@ -1953,8 +1957,8 @@ class TrackerReplyModal(discord.ui.Modal, title="Reply to requestor"):
     """Opened by the "🔓 Reply to requestor" button (`TrackerItemButton._handle_grant_access()`).
     Lets the admin type an actual reply -- optional, since an admin who just wants to unlock the
     channel without saying anything yet still gets exactly the old grant-only behavior by
-    submitting it blank. On submit: posts the reply (if any) addressed directly to the reporter
-    via `post_comment(..., mention_reporter=True)`, then runs the same grant-or-invite logic the
+    submitting it blank. On submit: posts the reply (if any) via `post_comment()` (which always
+    @-mentions the reporter, tracker item #0091), then runs the same grant-or-invite logic the
     plain button used to run inline (`_grant_or_invite_from_interaction()`), so the two things
     "reply" and "make sure they can see it" always happen together in one step."""
 
@@ -1988,7 +1992,7 @@ class TrackerReplyModal(discord.ui.Modal, title="Reply to requestor"):
         text = (cast(discord.ui.TextInput, self.reply_input.component).value or "").strip()
         if text:
             try:
-                await post_comment(item["item_number"], text, self.admin_id, mention_reporter=True)
+                await post_comment(item["item_number"], text, self.admin_id)
             except discord.HTTPException as e:
                 logging.warning(f"[TRACKER] Failed to post admin reply for item #{item['item_number']}: {e}")
                 await interaction.followup.send(

@@ -1,6 +1,18 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (15)
+- Fixed tracker #0091: a tracker comment posted via the plain tracker_comment bridge/MCP path
+  showed only "<@{author_id}>" -- for an agent-driven comment, author_id is typically a
+  non-numeric label (the X-Tracker-Admin value, e.g. "Qaplop") rather than a real Discord
+  snowflake, so it was never a clickable mention at all, and the actual ticket reporter was
+  never notified their ticket had moved (live bug report: "shouldn't the ticket creator have
+  been mentioned in this post?"). post_comment() now always prepends a real <@reporter_id>
+  mention (no-op for a non-numeric reporter_id -- an agent-filed item); dropped the mention_reporter
+  opt-in flag added for tracker #0102 since every call site wanted it on.
+- qapbot/ui_tracker.py, qapbot/docs/BUG_FEATURE_TRACKER.md, tests/discord/test_ui_tracker_items.py
+  (2 new tests). 3086 tests pass. pyright clean. Build 30.
+
 2026-09-05 (14)
 - Fixed tracker #0090: /status crashed with "RuntimeError: dictionary changed size during
   iteration" in CacheManager.get_war_file_stats() (temp_war_metadata). Root cause: Phase 3's

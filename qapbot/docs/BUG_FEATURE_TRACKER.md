@@ -150,9 +150,9 @@ actual reply, taken literally from the button's own name (live bug report: it us
 grant access/send an invite and hand back a jump link for the admin to type into themselves,
 never a compose box). The reply field is optional: submitting it blank preserves the original
 grant-only behavior. On submit, `TrackerReplyModal.on_submit()` posts any reply text via
-`post_comment(..., mention_reporter=True)` — an `<@reporter_id>` mention prepended so Discord
-actually notifies them the moment they can see the channel, not just a plain unmentioned message
-— then gives the reporter a member-specific Discord permission overwrite on that channel
+`post_comment()` — which always @-mentions the reporter (tracker item #0091) so Discord actually
+notifies them the moment they can see the channel, not just a plain unmentioned message —
+then gives the reporter a member-specific Discord permission overwrite on that channel
 (`view_channel`/`read_message_history`/`send_messages_in_threads`) via
 `_grant_or_invite_from_interaction()`/`_apply_requestor_grant()`, and finally replies (ephemeral,
 to the admin) with a jump link to the item's discussion thread (or the item message itself if it
@@ -206,11 +206,19 @@ guild/channel/member differs per caller: the interaction-based callers read `int
 `apply_pending_requestor_access()`) resolve the guild via `_tracker_home_guild_id()` (reads the
 `tracker_guild_id` bot_setting) and the channel via the item's own `channel_id`.
 `reply_and_invite_for_agent()` (the agent equivalent of "reply + make sure they can see it") is
-`post_comment(..., mention_reporter=True)` followed by `grant_access_for_agent()` — the same two
-steps `TrackerReplyModal.on_submit()` runs, just resolved the agent's way. `post_comment()`'s new
-`mention_reporter` kwarg prepends an `<@reporter_id>` mention (no-op for a non-numeric reporter_id
--- an agent-filed item) rather than adding a whole separate translation key, since the message
-body itself is unchanged either way.
+`post_comment()` followed by `grant_access_for_agent()` — the same two steps
+`TrackerReplyModal.on_submit()` runs, just resolved the agent's way.
+
+**`post_comment()` always @-mentions the reporter (2026-09-05, ticket #0091)**: a duplicate-
+closure comment posted via the plain `tracker_comment` bridge/MCP path showed only
+`<@{author_id}>` — for an agent-driven comment, `author_id` is typically a non-numeric label
+(e.g. the `X-Tracker-Admin` value, "Qaplop") rather than a real Discord snowflake, so it was
+never a clickable mention at all, and the actual reporter was never notified their ticket had
+moved (live bug report: "shouldn't the ticket creator have been mentioned in this post?").
+`post_comment()` now prepends an `<@reporter_id>` mention unconditionally (no-op for a
+non-numeric reporter_id — an agent-filed item) rather than taking an opt-in flag, since every
+current call site (the plain `tracker_comment` endpoint, `reply_and_invite_for_agent()`,
+`TrackerReplyModal.on_submit()`) wants it — there was no remaining case that didn't.
 
 **`tracker_items.guild_id` must always be the tracker's home guild, never the reporting guild
 (2026-09-05 live bug, ticket #0023)**: QapBot serves many Discord guilds, and `/bug`/`/feature`
