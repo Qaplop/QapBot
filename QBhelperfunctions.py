@@ -34,7 +34,7 @@ import time
 import coc  # type: ignore[import-untyped]
 import discord
 from datetime import datetime, timedelta, timezone as _tz
-from typing import List, Dict, Any, Optional, Tuple, Union, Set, cast
+from typing import List, Dict, Any, Literal, Optional, Tuple, Union, Set, cast, overload
 from collections import defaultdict
 import hashlib
 from qapbot.cache_manager import CACHE
@@ -7614,13 +7614,19 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
                 from qapbot.cache_manager import build_war_payload
                 _war_payload = build_war_payload(coc_war_obj, _pl_my, _pl_opp)
             except Exception as _pl_ex:
-                # Never fail a fetch over the shadow payload — it is not authoritative yet.
-                logging.warning(f"[PAYLOAD-PARITY] {clan_tag}: build_war_payload failed: {_pl_ex}")
+                # Stage 3: the payload IS the data now, so a failure here costs this clan its
+                # temp stats for the cycle (self-limiting — the next cycle refetches). That is
+                # the same outcome the old code produced when war_obj came back None, so the
+                # blast radius is unchanged; only the log level rises to match the consequence.
+                logging.error(f"[WAR-PAYLOAD] {clan_tag}: build_war_payload failed: {_pl_ex}")
 
-        # Return war data for Phase 2 processing
-        return {
+        # Return war data for Phase 2 processing.
+        # Stage 3 (tracker-0009): the coc.ClanWar is deliberately NOT returned. Retaining it
+        # across Phase 1 -> Phase 3 kept the whole graph LIVE for the length of a cycle, and a
+        # sweep's cost tracks what it walks — measured at ~1.2s of the remaining per-cycle GC
+        # pause. The payload carries everything the later phases read.
+        _result = {
             'clan_tag': clan_tag,
-            'war_obj': coc_war_obj,
             'war_payload': _war_payload,
             # Carried explicitly so QapBot.py's smart-backdating never needs the coc object
             # (§3 Step 4). Same string form the payload stores, so the existing _DT_RE parse works.
@@ -7628,6 +7634,14 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
             'opponent_tag': opponent_tag,
             'state': state
         }
+
+        # The coc.ClanWar's last use is the line above. Sever its back-references HERE rather
+        # than in Phase 3 (where Stage 2 did it): the graph is cyclic, so refcounting alone can
+        # never free it, and this is now the only place that still holds a reference.
+        # Safe because get_current_war_from_api() explicitly does not cache war data
+        # ("always single-use"), so no other holder can be reading this object.
+        release_war_object(coc_war_obj)
+        return _result
 
     except Exception as e:
         raise WarDataFetchError(
@@ -7639,12 +7653,31 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
 
 
 
-def stats_from_war_payload(payload: Dict[str, Any], attacks_per_member: int) -> Dict[str, Dict[str, Any]]:
+@overload
+def stats_from_war_payload(
+    payload: Dict[str, Any],
+    attacks_per_member: int,
+    strict: Literal[False] = False,
+    clan_tag: str = "",
+) -> Dict[str, Dict[str, Any]]: ...
+@overload
+def stats_from_war_payload(
+    payload: Dict[str, Any],
+    attacks_per_member: int,
+    strict: Literal[True],
+    clan_tag: str = "",
+) -> Optional[Dict[str, Dict[str, Any]]]: ...
+def stats_from_war_payload(
+    payload: Dict[str, Any],
+    attacks_per_member: int,
+    strict: bool = False,
+    clan_tag: str = "",
+) -> Optional[Dict[str, Dict[str, Any]]]:
     """Build `temp_war_stats` rows from the war payload dict instead of the `coc.ClanWar`.
 
-    The candidate replacement for `process_clan_war_data()`'s member loop — Stage 2 of
-    `plans/tracker-0009-phase1-war-payload-retention.md`. It is NOT authoritative yet: shadow
-    mode compares it against the coc-object result and logs `[PAYLOAD-PARITY]` on divergence.
+    **Authoritative since Stage 3** of `plans/tracker-0009-phase1-war-payload-retention.md`.
+    Previously the shadow candidate; `process_clan_war_data()` now calls this instead of walking
+    a retained `coc.ClanWar`.
 
     Only `WarID` and `Date` are omitted, because those come from the caller's war-identity logic
     rather than from the war object.
@@ -7656,14 +7689,27 @@ def stats_from_war_payload(payload: Dict[str, Any], attacks_per_member: int) -> 
     `Defensive_Stars` here is deliberately NOT coc.py's `m.best_opponent_attack.stars`. That
     resolves the API's own `bestOpponentAttack.attackerTag`; the payload's field is computed by
     `find_best_opponent_attack()` scanning every opponent attack, specifically to catch late CWL
-    attacks the API field misses. The two are expected to differ, and measuring by how much is
-    the reason shadow mode exists.
+    attacks the API field misses. Shadow mode measured this on live CWL-dominated PROD data —
+    22,032 comparisons, zero divergence — so in practice the API field and our scan agree during
+    `preparation`/`in_war`. The scan can still only help, never hurt: it considers a superset of
+    the attacks the API field is chosen from.
+
+    `strict` exists because the two paths disagreed on ONE thing the shadow comparison could
+    never see: the coc loop aborted the whole clan (`return False`) on a member with no name or
+    tag, while this one skipped the member. A `return False` happens before the shadow block is
+    reached, so no amount of shadow data could have surfaced it. With `strict=True` this returns
+    `None` to let the caller reproduce the abort exactly.
     """
     out: Dict[str, Dict[str, Any]] = {}
     for m in ((payload.get("clan") or {}).get("members") or []):
         tag_m = m.get("tag") or ""
         name_m = m.get("name") or ""
         if not name_m or not tag_m:
+            if strict:
+                logging.error(
+                    f"Error in war data. Player_tag: {tag_m}, Clan_tag: {clan_tag}"
+                )
+                return None
             continue
         atk = [a for a in (m.get("attacks") or []) if a]
         best = m.get("bestOpponentAttack") or {}
@@ -7681,40 +7727,6 @@ def stats_from_war_payload(payload: Dict[str, Any], attacks_per_member: int) -> 
             "Total_Dest_Pct": sum(float(a.get("destruction") or 0.0) for a in atk),
         }
     return out
-
-
-def _compare_shadow_stats(
-    clan_tag: str,
-    authoritative: Dict[str, Any],
-    payload: Dict[str, Any],
-    attacks_per_member: int,
-) -> List[str]:
-    """Return human-readable differences between the coc-object and payload stat rows.
-
-    Used only by Stage 2 shadow mode. Returns [] when the two agree. `WarID`/`Date` are not
-    compared — `stats_from_war_payload()` does not produce them.
-    """
-    shadow = stats_from_war_payload(payload, attacks_per_member)
-    diffs: List[str] = []
-
-    missing = set(authoritative) - set(shadow)
-    extra = set(shadow) - set(authoritative)
-    if missing:
-        diffs.append(f"payload missing {len(missing)} member(s) e.g. {sorted(missing)[:2]}")
-    if extra:
-        diffs.append(f"payload has {len(extra)} extra member(s) e.g. {sorted(extra)[:2]}")
-
-    for tag in sorted(set(authoritative) & set(shadow)):
-        a, b = authoritative[tag], shadow[tag]
-        for field in ("Player", "PlayerID", "TH_lvl", "Stars", "Attacks",
-                      "Missed_Attacks", "Max_Attacks", "Defensive_Stars", "Total_Dest_Pct"):
-            av, bv = a.get(field), b.get(field)
-            if isinstance(av, float) or isinstance(bv, float):
-                if abs(float(av or 0) - float(bv or 0)) < 1e-6:
-                    continue
-            if av != bv:
-                diffs.append(f"{tag}.{field} coc={av!r} payload={bv!r}")
-    return diffs
 
 
 def release_war_object(war: Any) -> int:
@@ -7826,7 +7838,11 @@ def process_clan_war_data(clan_tag: str, war_data: Dict[str, Any], war_files_pre
         blocking the event loop with file I/O and directory scanning.
     """
     try:
-        coc_war_obj = war_data['war_obj']
+        # Stage 3 (tracker-0009): the coc.ClanWar is no longer carried in war_data — every read
+        # below comes from the payload. The `or {}` mirrors the old getattr-on-None behaviour
+        # exactly: when Phase 1 could not build a payload (§5.4's save_skip_no_clan case), each
+        # lookup falls back to the same default `getattr(None, ...)` used to produce.
+        _payload: Dict[str, Any] = war_data.get('war_payload') or {}
         opponent_tag = war_data['opponent_tag']
         state = war_data['state']
         
@@ -7847,10 +7863,13 @@ def process_clan_war_data(clan_tag: str, war_data: Dict[str, Any], war_files_pre
         if _has_temp_files:
             manage_war_files(clan_tag, opponent_tag, war_files_prescan=war_files_prescan, archive_set=archive_set)
 
-        # Extract war metadata for temp stats calculation
-        my_clan = getattr(coc_war_obj, 'clan', None)
-        _opp_clan = getattr(coc_war_obj, 'opponent', None)
-        raw_start = str(getattr(coc_war_obj, 'start_time', ""))
+        # Extract war metadata for temp stats calculation.
+        # `start_time` is byte-identical to the old value: the payload stores
+        # `str(coc_war_obj.start_time)` and this used to compute `str(...)` of the same object,
+        # so the `datetime.datetime(...)` repr the regex below looks for is unchanged.
+        # (`clan` and `opponent` were read here too; `opponent` was already dead, and `clan` is
+        # now read by stats_from_war_payload() itself.)
+        raw_start = str(_payload.get('start_time') or "")
         
         # Parse start time for both compact format (war ID) and ISO format (CSV date)
         start_time_compact = None  # For war ID: YYYYMMDDHHMM
@@ -7914,71 +7933,40 @@ def process_clan_war_data(clan_tag: str, war_data: Dict[str, Any], war_files_pre
         # War ID and formatted start time for current war
         war_id = candidate_new_war_id
         formatted_start = start_dt_iso  # Use ISO format for CSV Date column
-        attacks_per_member = getattr(coc_war_obj, 'attacks_per_member', 2) or 2
+        # `or 2` also absorbs the payload's different default (build_war_payload stores 0 where
+        # this used 2), so the effective value is unchanged.
+        attacks_per_member = _payload.get('attacks_per_member', 2) or 2
 
         # Only create/update temp stats for active wars (preparation or in_war)
         if state in ('preparation','in_war'):
-            temp_stats_to_save: Dict[str, Any] = {}
-            if my_clan and hasattr(my_clan, 'members'):
-                for m in my_clan.members:
-                    tag_m = getattr(m, 'tag', '')
-                    name_m = getattr(m, 'name', '')
-                    if not name_m or not tag_m:
-                        logging.error(f"Error in war data. Player_tag: ""{tag_m}"", Clan_tag: ""{clan_tag}""")
-                        return False
-                    atk_list = list(getattr(m, 'attacks', []) or [])
-                    stars = sum(getattr(a, 'stars', 0) for a in atk_list)
-                    attacks = len(atk_list)
-                    total_dest_pct = sum(float(getattr(a, 'destruction', 0.0) or 0.0) for a in atk_list)
-                    # INVARIANT: Missed_Attacks is ALWAYS 0 for ongoing wars (preparation/in_war states)
-                    # Rationale: Players can still make their unused attacks before war ends
-                    # Final missed attack count is calculated only when war ends and is finalized to history
-                    # This ensures currentwar leaderboards show attacks made, not total attack opportunities
-                    missed_attacks = 0  # Always zero during preparation/in_war
-                    best_opp_attack = getattr(m, 'best_opponent_attack', None)
-                    defensive_stars = 0
-                    if best_opp_attack:
-                        defensive_stars = getattr(best_opp_attack, 'stars', 0)
-                    temp_stats_to_save[tag_m] = {
-                        "WarID": war_id,
-                        "Date": formatted_start,  # Now uses ISO format (YYYY-MM-DDTHH:MM)
-                        "Player": name_m,
-                        "PlayerID": tag_m,
-                        "TH_lvl": getattr(m, 'town_hall', 0),
-                        "Stars": stars,
-                        "Attacks": attacks,
-                        "Missed_Attacks": missed_attacks,
-                        "Max_Attacks": attacks_per_member,
-                        "Defensive_Stars": defensive_stars,
-                        "Total_Dest_Pct": total_dest_pct,
-                    }
-            # --- Stage 2 shadow comparison (tracker-0009 §10) --------------------------------
-            # Compute the SAME stats from the payload and report divergence, but keep using the
-            # coc-object result above. Corruption is impossible while this stays non-authoritative,
-            # which is the whole point: §5.1's failure mode is a silent 0 reaching war history,
-            # and a revert cannot undo that.
+            # Stage 3 (tracker-0009): built from the payload, not from a retained coc.ClanWar.
+            # Parity with the retired coc-object loop was proven over 54,192 replayed wars
+            # (Stage 1) and 22,032 live PROD comparisons on CWL-dominated data (Stage 2), with
+            # zero divergence in any of the nine fields.
             #
-            # Stage 1 proved parity over 54,192 real wars for every field EXCEPT Defensive_Stars,
-            # which no corpus replay can check (the API's own bestOpponentAttack is not retained
-            # on disk). So Defensive_Stars is the field this exists to measure — expect it to
-            # differ, and read a difference as information, not as a bug:
-            #   coc.py's m.best_opponent_attack -> the API's own bestOpponentAttack.attackerTag
-            #   payload's bestOpponentAttack    -> our find_best_opponent_attack(), which scans
-            #                                      all opponent attacks to catch LATE CWL attacks
-            # A payload value HIGHER than coc's is the intended improvement showing up. Lower, or
-            # a difference in any other field, is a real problem.
-            _shadow = war_data.get('war_payload')
-            if _shadow:
-                try:
-                    _diffs = _compare_shadow_stats(clan_tag, temp_stats_to_save, _shadow, attacks_per_member)
-                    if _diffs:
-                        logging.warning(
-                            "[PAYLOAD-PARITY] %s: %d field(s) differ between coc-object and payload — %s",
-                            clan_tag, len(_diffs), "; ".join(_diffs[:6]),
-                        )
-                except Exception as _sh_ex:
-                    # A shadow check must never affect the authoritative path.
-                    logging.warning(f"[PAYLOAD-PARITY] {clan_tag}: shadow comparison failed: {_sh_ex}")
+            # These rows are NOT ephemeral: _merge_entries() folds temp stats into history, so
+            # they become the permanent war_summary / war_attacks rows. That is why this flip
+            # was gated on shadow evidence rather than on the tests alone.
+            #
+            # `strict=True` reproduces the old loop's abort-on-malformed-member behaviour; see
+            # stats_from_war_payload()'s docstring for why the shadow could never have caught
+            # that difference.
+            _rows = stats_from_war_payload(
+                _payload, attacks_per_member, strict=True, clan_tag=clan_tag
+            )
+            if _rows is None:
+                return False
+            # WarID/Date come from the war-identity logic above, not from the war object.
+            temp_stats_to_save: Dict[str, Any] = {
+                _tag: {
+                    "WarID": war_id,
+                    "Date": formatted_start,  # ISO format (YYYY-MM-DDTHH:MM)
+                    **_row,
+                }
+                for _tag, _row in _rows.items()
+            }
+            # (Stage 2's shadow comparison lived here. Removed with Stage 3 — there is only one
+            # path now, so it would be comparing the payload against itself.)
             CACHE.set_temp_war_stats(clan_tag, temp_stats_to_save)
         else:
             # War ended or not in war - clear temp stats to prevent stale data in currentwar leaderboards

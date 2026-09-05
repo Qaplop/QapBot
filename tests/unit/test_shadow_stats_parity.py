@@ -1,25 +1,26 @@
-"""Stage 2 (shadow mode) of plans/tracker-0009-phase1-war-payload-retention.md.
+"""`stats_from_war_payload()` — the AUTHORITATIVE temp-war-stats loop since Stage 3 of
+plans/tracker-0009-phase1-war-payload-retention.md.
 
-Phase 1 now carries `war_payload` alongside `war_obj`. `process_clan_war_data()` computes the
-temp-war stats from the coc object (still authoritative) AND from the payload, compares them,
-and logs `[PAYLOAD-PARITY]` on divergence. Corruption is impossible while the payload is
-non-authoritative, which is the point: §5.1's failure mode is a silent 0 reaching war history,
-and a code revert cannot undo that.
+Phase 1 no longer returns the `coc.ClanWar` at all; `process_clan_war_data()` builds temp stats
+from the payload dict alone. These rows are not ephemeral — `_merge_entries()` folds temp stats
+into history, so they become the permanent `war_summary`/`war_attacks` rows. §5.1's failure mode
+is a silent 0 reaching war history, which a code revert cannot undo.
 
-These tests cover the two halves that must not break:
+What these tests pin:
 
-1. `stats_from_war_payload()` reads the right keys. The payload mixes conventions (`townhall`,
-   `map_position` beside `bestOpponentAttack`, `opponentAttacks`), and §3 Step 3 warns that this
-   is exactly where a silent-zero bug hides.
-2. `_compare_shadow_stats()` actually detects divergence. A comparator that cannot fail would
-   make shadow mode worthless while looking green.
+1. The right keys are read. The payload mixes conventions (`townhall`, `map_position` beside
+   `bestOpponentAttack`, `opponentAttacks`), and §3 Step 3 warns that this is exactly where a
+   silent-zero bug hides.
+2. `strict=True` reproduces the retired coc loop's abort-on-malformed-member behaviour. This is
+   the one difference between the two paths that shadow mode could never have surfaced: the coc
+   loop's `return False` happened *before* the shadow comparison was reached, so no amount of
+   live divergence data could have shown it. It was found by reading both loops side by side
+   during the Stage 3 flip.
 
-WHY OFFLINE PARITY CANNOT SETTLE `Defensive_Stars`: the coc path reads
-`m.best_opponent_attack`, which resolves the API's own `bestOpponentAttack.attackerTag`; the
-payload's field is computed by `find_best_opponent_attack()` scanning every opponent attack, to
-catch late CWL attacks the API field misses. Replaying temp files feeds our computed value back
-in as the API's, so the two agree trivially — measured: 0 diffs over 6,000 replayed wars, which
-proves nothing. Only live PROD data has both values. That is what Stage 2 is for.
+Stage 2's shadow comparator and its tests were removed with the flip — with one path left, it
+could only compare the payload against itself. Cross-path parity is still covered offline by
+tests/integration/test_war_payload_parity.py, which reconstructs a `coc.ClanWar` from a payload
+and runs both extractions (54,192 real wars, zero mismatches).
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ from typing import Any, Dict
 
 import pytest
 
-from QBhelperfunctions import _compare_shadow_stats, stats_from_war_payload
+from QBhelperfunctions import stats_from_war_payload
 
 
 def _payload(members: int = 3) -> Dict[str, Any]:
@@ -48,20 +49,6 @@ def _payload(members: int = 3) -> Dict[str, Any]:
                 for i in range(members)
             ],
         },
-    }
-
-
-def _coc_equivalent(payload: Dict[str, Any], apm: int) -> Dict[str, Dict[str, Any]]:
-    """What the authoritative coc-object path would produce for the same war."""
-    return {
-        m["tag"]: {
-            "Player": m["name"], "PlayerID": m["tag"], "TH_lvl": m["townhall"],
-            "Stars": sum(a["stars"] for a in m["attacks"]),
-            "Attacks": len(m["attacks"]), "Missed_Attacks": 0, "Max_Attacks": apm,
-            "Defensive_Stars": m["bestOpponentAttack"]["stars"],
-            "Total_Dest_Pct": sum(float(a["destruction"]) for a in m["attacks"]),
-        }
-        for m in payload["clan"]["members"]
     }
 
 
@@ -110,49 +97,43 @@ class TestStatsFromPayload:
         assert stats_from_war_payload({"clan": {"members": None}}, 2) == {}
 
 
-class TestShadowComparator:
-    def test_identical_stats_report_nothing(self) -> None:
+class TestStrictMode:
+    """`strict=True` is what `process_clan_war_data()` uses, so it carries the production
+    semantics of the loop this function replaced."""
+
+    def test_strict_returns_none_on_a_member_without_name_or_tag(self) -> None:
+        """The retired coc loop logged an error and `return False`d the whole clan rather than
+        writing partial stats. Skipping the member instead would silently drop a player from
+        history — a quiet data loss, which is exactly what §5.1 warns about."""
         p = _payload()
-        assert _compare_shadow_stats("#AAA", _coc_equivalent(p, 2), p, 2) == []
+        p["clan"]["members"][1]["name"] = ""
 
-    @pytest.mark.parametrize("field", [
-        "Player", "TH_lvl", "Stars", "Attacks", "Max_Attacks", "Defensive_Stars", "Total_Dest_Pct",
-    ])
-    def test_a_divergence_in_any_field_is_detected(self, field: str) -> None:
-        """A comparator that cannot fail makes shadow mode worthless while looking green."""
+        assert stats_from_war_payload(p, 2, strict=True, clan_tag="#AAA") is None
+
+    def test_non_strict_still_skips_so_the_two_modes_really_differ(self) -> None:
+        """Guards against the overloads collapsing into one behaviour."""
         p = _payload()
-        auth = _coc_equivalent(p, 2)
-        auth["#M0"][field] = "sentinel" if field == "Player" else 999
+        p["clan"]["members"][1]["name"] = ""
 
-        diffs = _compare_shadow_stats("#AAA", auth, p, 2)
+        rows = stats_from_war_payload(p, 2)
 
-        assert any(field in d for d in diffs), f"divergence in {field} went unreported: {diffs}"
+        assert set(rows) == {"#M0", "#M2"}
 
-    def test_a_silent_zero_is_detected(self) -> None:
-        """The specific §5.1 shape: the payload path yields 0 where the coc path had a value."""
+    def test_strict_is_identical_to_non_strict_on_well_formed_data(self) -> None:
+        """The abort path must be the ONLY difference — otherwise the flip changed live data."""
         p = _payload()
-        auth = _coc_equivalent(p, 2)
-        for m in p["clan"]["members"]:
-            m["bestOpponentAttack"] = {"stars": 0}
 
-        diffs = _compare_shadow_stats("#AAA", auth, p, 2)
+        assert stats_from_war_payload(p, 2, strict=True, clan_tag="#AAA") == stats_from_war_payload(p, 2)
 
-        assert diffs and all("Defensive_Stars" in d for d in diffs)
-
-    def test_missing_and_extra_members_are_reported(self) -> None:
+    def test_strict_logs_the_offending_tag(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The old message interpolated nothing (adjacent string literals swallowed the
+        f-prefix), so it logged a literal '{tag_m}'. Fixed during the Stage 3 migration — pin it
+        so the diagnostic stays usable."""
         p = _payload()
-        auth = _coc_equivalent(p, 2)
-        auth["#GHOST"] = dict(auth["#M0"])
-        p["clan"]["members"] = p["clan"]["members"][:2]
+        p["clan"]["members"][0]["name"] = ""
 
-        diffs = _compare_shadow_stats("#AAA", auth, p, 2)
+        with caplog.at_level("ERROR"):
+            stats_from_war_payload(p, 2, strict=True, clan_tag="#AAA")
 
-        assert any("missing" in d for d in diffs)
-
-    def test_float_noise_is_not_reported_as_divergence(self) -> None:
-        """Destruction sums are floats; 1e-9 drift must not spam a PROD warning every cycle."""
-        p = _payload()
-        auth = _coc_equivalent(p, 2)
-        auth["#M0"]["Total_Dest_Pct"] += 1e-9
-
-        assert _compare_shadow_stats("#AAA", auth, p, 2) == []
+        assert "#M0" in caplog.text and "#AAA" in caplog.text
+        assert "{tag_m}" not in caplog.text

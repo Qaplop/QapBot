@@ -422,14 +422,113 @@ at least one `war_ended` finalisation and one §5.3 CWL fallback, plus a decisio
 `Defensive_Stars` change is the improvement it looks like. Stage 1's corpus contained no
 `war_ended` files (they move to archive), so that path is still unexercised.
 
-### Stage 3 — flip to payload-only — **STATUS: not started**
+**Checkpoint, 2026-09-05 ~10:15 local, build 19 after ~2h24m on PROD (`src a1b7a105`):**
 
-- Drop the coc object from the Phase-1 return value; remove the shadow comparison.
-- Delete the `release_war_object()` call at the Phase-3 site (§9 — nothing left to sever there);
-  **keep the function** for the `get_league_war()` CWL paths and as the coc.py canary.
-- Keep `maybe_chunk_collect()` (unrelated; governs `coc_clan_cache` garbage).
-- Measure: `[CYCLE-CLEANUP] gc_collect`, `[LOOP-LAG]` max, and `RSS=` peak against the build-17
-  baseline recorded in §9's CORRECTION (gc_collect ~1.29s, LOOP-LAG max ~1.22s, RSS 1.3-1.7 GB).
+- Zero `Traceback`s in the log since the build-19 restart (07:49:29 local).
+- Zero `[PAYLOAD-PARITY]` lines of *any* kind — no `build_war_payload failed`, no `shadow
+  comparison failed`, no field-divergence warnings — across 5,424 `war_summary` finalisations
+  and 99,051 `war_attacks` rows written in that window (both figures cross-checked directly
+  against the DB, not just the log's own counters, and they match the log's cumulative
+  `History: new=` exactly). `defensive_stars` values are all in [0,3], zero anomalies.
+- Per the table above, "no `[PAYLOAD-PARITY]` lines at all" is flagged as suspicious on its own
+  — checked it: the shadow branch is provably running (the DB write counts above only happen
+  downstream of it), so the silence is real zero-divergence, not a skipped code path.
+**CORRECTION, same day — the Stage 3 gate above was partly unsatisfiable. Do not re-apply it.**
+
+My first read of this checkpoint said "keep waiting for a CWL day". That was wrong, and wrong in
+a specific way worth recording: I wrote a gate condition, then treated its non-satisfaction as
+evidence, without ever checking whether the code *can* satisfy it. Two of its three clauses
+cannot be satisfied by any amount of runtime.
+
+1. **"at least one `war_ended` finalisation" — the shadow can never see one.** The comparison
+   block sits inside `if state in ('preparation','in_war'):`. A `war_ended` war takes the `else`
+   branch, which clears temp stats and returns. The shadow is structurally blind to
+   finalisation. Waiting a week would not have produced this line.
+2. **"one §5.3 CWL fallback" — cannot produce a divergence by construction.** The payload is
+   built *at the return statement*, after any fallback has already replaced `coc_war_obj`. Both
+   paths then read the same final object. (Also `[CWL-FALLBACK]` is one of ~4 fallback sites and
+   the only one logging at INFO, so zero lines was never evidence it had not fired.) This is a
+   robustness nicety, not a correctness gate.
+3. **"observe a `Defensive_Stars` divergence" — already measured, at scale, on the right data.**
+   Of the 5,424 wars finalised in the window, **5,136 were CWL** and **5,388 were `war_ended`**;
+   83,164 CWL attack rows carry a non-zero `defensive_stars`, so the field was heavily populated,
+   not trivially zero. 22,032 clan-cycle comparisons, zero divergence. The divergence the table
+   above predicts (a late CWL attack the API's own field missed) would materialise *at
+   finalisation* — exactly where the shadow cannot look. More soak time yields more of the same.
+
+**What the sample actually proves, and it is stronger than I credited.** `_merge_entries()`
+merges temp stats into history rows, so the shadowed values *become* the permanent
+`war_summary`/`war_attacks` rows. The shadow was therefore testing precisely the data Stage 3
+puts at risk — not an ephemeral leaderboard cache, as I briefly assumed.
+
+**The real remaining gap is static, not temporal.** Stage 3 drops `war_obj` from the Phase-1
+return. Its complete consumer surface is three sites:
+
+| site | reads | Stage 3 action |
+|---|---|---|
+| `QBhelperfunctions.py:7829` (`process_clan_war_data`) | `clan`, `opponent`, `attacks_per_member`, `start_time` — that is all four | remap to payload keys (all four exist: `clan`, `opponent`, `attacks_per_member`, `start_time`) |
+| `QapBot.py:1949` | `release_war_object(war_data.get('war_obj'))` | delete the call, keep the function |
+| `QapBot.py:1980-1981` | `war_obj.end_time` backdating fallback | drop the fallback; `war_data['end_time']` already carries it since Stage 2 |
+
+The shadow comparison never covered those four attributes — it only ever compared the 9 stat
+fields — so that is the actual unverified surface, and it is answerable by code audit today.
+
+**Decision: Stage 3 is unblocked.** Gate satisfied as far as it is satisfiable: zero divergence
+over 22,032 comparisons on CWL-dominated live data that demonstrably becomes permanent history,
+zero exceptions, DB cross-checked. Remaining work is the 4-attribute remap above, not more
+waiting.
+
+### Stage 3 — flip to payload-only — **STATUS: IMPLEMENTED (build 20), awaiting PROD data**
+
+Implemented 2026-09-05, same day as the Stage 2 checkpoint above.
+
+**What shipped**
+
+- `fetch_clan_war_data()` returns `war_payload` + `end_time` only — no `war_obj`. Payload-build
+  failure is now `logging.error` (`[WAR-PAYLOAD]`), not a warning: it costs the clan its temp
+  stats for the cycle. Same outcome the old code produced when `war_obj` came back `None`, so
+  the blast radius is unchanged; only the log level rises to match the consequence.
+- `release_war_object()` **moved** to the end of `fetch_clan_war_data()` — the coc object's true
+  last use — rather than being deleted as this section originally planned. Deleting it outright
+  would have left a cyclic graph for the collector to find; severing at the real last use keeps
+  the build-14 win. Safe because `get_current_war_from_api()` explicitly does not cache war data
+  ("always single-use"). The function is kept for the `get_league_war()` CWL paths and as the
+  coc.py canary; only the call site moved.
+- `process_clan_war_data()` reads `_payload` for all four attributes. `start_time` is
+  byte-identical (both sides are `str(coc_war_obj.start_time)`), and `attacks_per_member`'s
+  differing payload default (0 vs 2) is absorbed by the pre-existing `or 2`.
+- QapBot.py: Phase-3 `finally` keeps only `maybe_chunk_collect()`; the backdating fallback and
+  the now-unused `release_war_object` import are gone.
+- Removed `_compare_shadow_stats()` + `TestShadowComparator` (would compare the payload against
+  itself). Dropped a dead `_opp_clan` local.
+
+**The one real difference, and why no amount of Stage 2 data could have found it.** The coc loop
+ABORTED the clan (`logging.error` + `return False`) on a member with no name/tag; the payload
+loop skipped the member. That `return False` executes *before* the shadow block, so the
+comparison was never reached in exactly the case where the two disagreed. It was found by
+reading both loops side by side during the flip. `stats_from_war_payload(strict=True)` now
+returns `None` and the caller reproduces the abort; `@overload` keeps `strict=False`
+non-Optional. Also fixed the abort's log message, which concatenated adjacent string literals
+with only the first f-prefixed and therefore logged the literal text `{tag_m}`/`{clan_tag}`.
+
+**Verification.** Full 30,975-file temp corpus through the parity harness, zero mismatches;
+3,040 tests green; pyright clean.
+
+**Still to measure on PROD** (build 20): `[CYCLE-CLEANUP] gc_collect`, `[LOOP-LAG]` max and
+`RSS=` peak against the build-17 baseline in §9's CORRECTION (gc_collect ~1.29s, LOOP-LAG max
+~1.22s, RSS 1.3-1.7 GB). The predicted win is the ~1.2s spent walking live `ClanWar` objects.
+Treat dev-measured GC timing as a hypothesis only — this plan's own history has two cases where
+a dev simulation mispredicted PROD, both optimistically.
+
+### Method note — the gate-reachability trap
+
+Worth carrying to the next staged migration. Stage 2's gate had three clauses; two of them named
+observations the code **cannot emit**, and their absence was then read as "not enough evidence
+yet". A gate condition is only evidence if it is reachable. Before treating a missing signal as
+a reason to wait, check that some code path can actually produce it — and prefer gates phrased
+against a *reachable* observation (a log line that provably fires, a DB row that provably lands)
+over ones phrased against an event you have merely assumed occurs. The reachability check here
+took three greps; the waiting it would have replaced was open-ended.
 
 **Expected:** gc_collect and LOOP-LAG max both fall substantially, because ~1.2s of the current
 pause is walking exactly the live objects this stage stops retaining.

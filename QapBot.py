@@ -291,7 +291,7 @@ from qapbot.coc_health import reset_cycle_stats, get_coc_stats, clear_maintenanc
 from QBhelperfunctions import (
     generate_leaderboard_text, generate_cwlinfo_embeds, generate_cwlinfo_comp_embeds, post_discord_content_with_tracking,
     post_leaderboard_to_discord, calculate_content_hash,
-    fetch_clan_war_data, process_clan_war_data, release_war_object,
+    fetch_clan_war_data, process_clan_war_data,
     generate_cwl_group_image, update_cwl_group_stats,
     resolve_subscription_period, coc_clan_profile_url,
 )
@@ -1937,18 +1937,13 @@ async def main() -> None:
                     _archive_filenames
                 )
             finally:
-                # process_clan_war_data() is the last thing that NAVIGATES the war graph, so
-                # break coc.py's back-references here and let refcounting free it immediately
-                # instead of leaving ~195 objects per clan for a stop-the-world sweep (that
-                # was 508,769 objects and a 2.0s pause per cycle — see release_war_object()).
-                # In a finally so the early `continue` below and any exception are covered too;
-                # the graph is garbage either way. The backdate check further down still reads
-                # war_obj.end_time, which this deliberately preserves.
-                # No isinstance guard: the None / _NOT_IN_WAR cases already took the `continue`
-                # above, so war_data is a dict here — and release_war_object() no-ops on None.
-                release_war_object(war_data.get('war_obj'))
-                # Phase 3 is where the war graphs actually die, so slice the collection here
-                # too — same counter, so the every-500 spacing spans both phases.
+                # The release_war_object() call that used to live here is gone with Stage 3
+                # (tracker-0009): war_data no longer carries the coc.ClanWar at all, so there is
+                # nothing left to sever. Phase 1 now severs it at its true last use, inside
+                # fetch_clan_war_data(), which also stops the graph being LIVE for the length of
+                # a cycle — the ~1.2s of remaining GC pause that was spent walking these.
+                # Phase 3 still slices the collection here: the payload dicts die here, and the
+                # shared counter keeps the every-500 spacing spanning both phases.
                 maybe_chunk_collect()
 
             if not process_success:
@@ -1971,14 +1966,11 @@ async def main() -> None:
                     if war_state_str == 'inwar':
                         logging.debug(f"[INACTIVE-BACKDATE-CHECK] {clan_tag}: War state matches, attempting to parse end_time...")
                         try:
-                            # §3 Step 4 (tracker-0009): prefer the end_time Phase 1 carries in
-                            # the dict, so this no longer needs the coc object at all. Falls back
-                            # to the object while Stage 2 still carries both — remove the
-                            # fallback with the object itself at Stage 3.
+                            # §3 Step 4 (tracker-0009): Phase 1 carries end_time in the dict, so
+                            # this needs no coc object. Stage 2's fallback to war_obj is gone
+                            # with the object itself. Same string form either way
+                            # (`str(coc_war_obj.end_time)`), so _DT_RE parses it unchanged.
                             raw_end = war_data.get('end_time') or None
-                            if not raw_end:
-                                war_obj = war_data.get('war_obj')
-                                raw_end = getattr(war_obj, 'end_time', None) if war_obj else None
                             logging.debug(f"[INACTIVE-BACKDATE-CHECK] {clan_tag}: raw_end='{raw_end}'")
                             if raw_end:
                                 m = _DT_RE.search(str(raw_end))

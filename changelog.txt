@@ -1,6 +1,47 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (2)
+- tracker-0009 Stage 3 (build 20): the payload is now AUTHORITATIVE and the coc.ClanWar is no
+  longer returned from Phase 1 at all. fetch_clan_war_data() returns war_payload + end_time only;
+  process_clan_war_data() builds temp-war stats via stats_from_war_payload(). Retaining the war
+  graph across Phase 1 -> Phase 3 was keeping it LIVE for the length of a cycle, and a sweep's
+  cost tracks what it WALKS - that was the ~1.2s of per-cycle GC pause build 17 measured.
+- release_war_object() moved from the Phase-3 site to the end of fetch_clan_war_data(), which is
+  now the coc object's true last use. Safe because get_current_war_from_api() explicitly does not
+  cache war data ("always single-use"), so no other holder can be reading it. The function is
+  kept (CWL get_league_war() paths, and as the coc.py back-reference canary); only the call site
+  moved. QapBot.py's Phase-3 finally now just does maybe_chunk_collect().
+- QapBot.py's smart-backdating fallback to war_obj.end_time is gone; war_data['end_time'] has
+  carried it since Stage 2 and is the same string form, so _DT_RE parses it unchanged.
+- FOUND DURING THE FLIP, and shadow mode could never have caught it: the coc loop ABORTED the
+  whole clan (logging.error + return False) on a member with no name/tag, while
+  stats_from_war_payload() skipped the member. A return False happens BEFORE the shadow block is
+  reached, so no amount of live divergence data could have surfaced it - it took reading both
+  loops side by side. stats_from_war_payload() gained strict=True (returns None) so
+  process_clan_war_data() reproduces the abort exactly. Typed via @overload so strict=False
+  keeps a non-Optional return.
+- Fixed while migrating that error path: the old message concatenated adjacent string literals
+  where only the FIRST was f-prefixed, so it logged the LITERAL text {tag_m} and {clan_tag}
+  instead of the values. It now interpolates.
+- Removed: _compare_shadow_stats() and its TestShadowComparator suite. With one path left it
+  could only compare the payload against itself. Cross-path parity is still covered offline by
+  tests/integration/test_war_payload_parity.py, which reconstructs a coc.ClanWar from a payload
+  and runs both extractions.
+- Also dropped a dead _opp_clan local in process_clan_war_data() (assigned, never read).
+- VERIFICATION: full 30,975-file temp corpus through the parity harness, zero mismatches; 3,040
+  unit/integration tests green; pyright clean. Shadow evidence that gated this: ~2h24m on PROD
+  build 19, 22,032 comparisons on CWL-dominated live data (5,136 of 5,424 finalised wars were
+  CWL), zero divergence in any field, zero exceptions, DB row counts cross-checked against the
+  log's own counters.
+- CORRECTION to the Stage 3 gate recorded on 2026-09-05 (1): two of its three clauses were
+  UNSATISFIABLE and I treated their non-satisfaction as evidence. (a) "observe a war_ended
+  finalisation" - the shadow block sits inside `if state in ('preparation','in_war')`, so it can
+  never see one; (b) "observe a 5.3 CWL fallback" - the payload is built at the return, AFTER
+  any fallback has replaced coc_war_obj, so both paths read the same object and a fallback cannot
+  produce a divergence. Lesson recorded in the plan: check that a gate condition is REACHABLE
+  before treating its absence as a signal.
+
 2026-09-05 (1)
 - tracker-0009 Stage 2 (shadow mode) implemented. Phase 1 now carries war_payload and end_time
   alongside war_obj; process_clan_war_data() computes the temp-war stats BOTH ways, compares, and

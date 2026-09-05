@@ -2681,3 +2681,56 @@ beats deferred collection.
 **See also:** `PERFORMANCE_TUNING.md` ("The real fix: stop creating garbage that needs
 collecting") for the full measurement trail, and Pitfall 57 for the GC-tuning-across-versions
 trap met on the way to this.
+
+---
+
+## Pitfall 59: a verification gate is only evidence if the code can actually emit the observation — check reachability before reading silence as "not enough data yet"
+
+**Symptom:** a staged rollout stalls. The gate says "wait until we observe X"; X never appears;
+the absence gets read as *insufficient evidence* and the wait extends indefinitely. Nobody
+checks whether any code path can produce X at all.
+
+**What happened (2026-09-05):** the tracker-0009 Stage 3 gate required, before flipping the war
+payload to authoritative, "at least one `war_ended` finalisation and one CWL fallback observed
+through shadow mode, plus a `Defensive_Stars` divergence to judge". After ~2.5 hours on PROD the
+log had none of them, and that was reported as "keep waiting". All three were dead ends:
+
+- The shadow comparison sits inside `if state in ('preparation','in_war'):`. A `war_ended` war
+  takes the `else` branch. **It can never observe a finalisation** — not in a day, not ever.
+- The payload is built at the `return` of `fetch_clan_war_data()`, *after* any CWL fallback has
+  already replaced `coc_war_obj`. Both paths then read the same object, so **a fallback cannot
+  produce a divergence by construction.**
+- The predicted `Defensive_Stars` divergence (our scan catching a late CWL attack the API's own
+  field missed) would materialise *at finalisation* — again, where the shadow cannot look.
+
+Meanwhile the data that *was* there had been misread: a claim of "no CWL finalisations yet" came
+from eyeballing a log counter whose meaning had never been checked. One query settled it —
+**5,136 of 5,424** finalised wars in the window were CWL and **5,388** were `war_ended`. There
+had been plenty all along.
+
+**How to apply:**
+
+- **Before treating a missing signal as a reason to wait, grep for the code that emits it** and
+  confirm the branch is reachable in the scenario you are waiting for. Here it was three greps
+  against an open-ended wait.
+- **Phrase gates against observations that provably fire** — a log line you can point at, a DB
+  row you can count — not against an event you have merely assumed occurs.
+- **Distinguish "silence because they agree" from "silence because the path is never taken".**
+  They look identical in a log and mean opposite things. Prove which one you have; the DB write
+  counts downstream of the branch did it here.
+- **Check the counter's definition before building an argument on it.** `cwl_skip` and
+  `regular_war_ended` were read as war counts; they are per-clan-encounter counts, and the
+  conclusion drawn from them was simply wrong.
+- **A gate that cannot be satisfied is worse than no gate:** it converts a decision into an
+  indefinite wait while looking rigorous. When a gate goes unmet for a suspiciously long time,
+  suspect the gate before suspecting the system.
+
+**Corollary — silence can also hide a real difference.** Shadow mode ran 22,032 comparisons with
+zero divergence, yet the two paths *did* differ: the old loop aborted the whole clan on a member
+with no name/tag while the new one skipped the member. The abort `return`s **before** the
+comparison runs, so the one case where they disagreed was the one case the comparison never saw.
+Differential testing only covers the region both paths reach — read the two implementations side
+by side for the rest.
+
+**See also:** `plans/tracker-0009-phase1-war-payload-retention.md` §10 for the full staged
+record, and Pitfall 55 for the related trap of comparing values a replay has made circular.

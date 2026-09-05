@@ -412,53 +412,49 @@ class TestManageWarFiles:
 # process_clan_war_data
 # ---------------------------------------------------------------------------
 
-def _make_coc_war(state, opponent_tag, members_data, attacks_per_member=2):
-    """Build a mock coc.War object for process_clan_war_data tests."""
-    war = MagicMock()
-    war.state = state
-    war.attacks_per_member = attacks_per_member
-    war.start_time = "datetime.datetime(2025, 6, 15, 10, 30)"
+def _make_war_payload(state, opponent_tag, members_data, attacks_per_member=2):
+    """Build a war payload dict for process_clan_war_data tests.
 
-    clan = MagicMock()
-    clan.tag = "#MYCLAN"
-    clan.name = "MyClan"
-    members = []
-    for md in members_data:
-        m = MagicMock()
-        m.tag = md["tag"]
-        m.name = md["name"]
-        m.town_hall = md.get("th", 16)
-        atk_list = []
-        for a in md.get("attacks", []):
-            atk = MagicMock()
-            atk.stars = a["stars"]
-            atk_list.append(atk)
-        m.attacks = atk_list or []
-        m.best_opponent_attack = None
-        members.append(m)
-    clan.members = members
-    war.clan = clan
-
-    opp = MagicMock()
-    opp.tag = opponent_tag
-    opp.name = "Enemy"
-    opp.members = []
-    war.opponent = opp
-
-    return war
+    Stage 3 of tracker-0009: Phase 1 no longer returns a `coc.ClanWar`, so these tests feed the
+    payload that replaced it. `start_time` keeps the `datetime.datetime(...)` repr form because
+    the payload stores `str(coc_war_obj.start_time)` and the war-ID regex parses that.
+    """
+    return {
+        "state": state,
+        "attacks_per_member": attacks_per_member,
+        "start_time": "datetime.datetime(2025, 6, 15, 10, 30)",
+        "clan": {
+            "tag": "#MYCLAN",
+            "name": "MyClan",
+            "members": [
+                {
+                    "tag": md["tag"],
+                    "name": md["name"],
+                    "townhall": md.get("th", 16),
+                    "attacks": [
+                        {"stars": a["stars"], "destruction": a.get("destruction", 0.0)}
+                        for a in md.get("attacks", [])
+                    ],
+                    "bestOpponentAttack": None,
+                }
+                for md in members_data
+            ],
+        },
+        "opponent": {"tag": opponent_tag, "name": "Enemy", "members": []},
+    }
 
 
 class TestProcessClanWarData:
     def test_preparation_saves_temp_stats(self):
         from QBhelperfunctions import process_clan_war_data
 
-        coc_war = _make_coc_war("preparation", "#OPP123", [
+        war_payload = _make_war_payload("preparation", "#OPP123", [
             {"tag": "#P1", "name": "Alice", "th": 16},
             {"tag": "#P2", "name": "Bob", "th": 15, "attacks": [{"stars": 3}]},
         ])
 
         war_data = {
-            "war_obj": coc_war,
+            "war_payload": war_payload,
             "opponent_tag": "#OPP123",
             "state": "preparation",
         }
@@ -483,10 +479,10 @@ class TestProcessClanWarData:
     def test_war_ended_clears_temp_stats(self):
         from QBhelperfunctions import process_clan_war_data
 
-        coc_war = _make_coc_war("war_ended", "#OPP", [])
+        war_payload = _make_war_payload("war_ended", "#OPP", [])
 
         war_data = {
-            "war_obj": coc_war,
+            "war_payload": war_payload,
             "opponent_tag": "#OPP",
             "state": "war_ended",
         }
@@ -504,12 +500,12 @@ class TestProcessClanWarData:
     def test_in_war_populates_stats(self):
         from QBhelperfunctions import process_clan_war_data
 
-        coc_war = _make_coc_war("in_war", "#OPP", [
+        war_payload = _make_war_payload("in_war", "#OPP", [
             {"tag": "#P1", "name": "Alice", "attacks": [{"stars": 2}, {"stars": 1}]},
         ])
 
         war_data = {
-            "war_obj": coc_war,
+            "war_payload": war_payload,
             "opponent_tag": "#OPP",
             "state": "in_war",
         }
@@ -530,18 +526,14 @@ class TestProcessClanWarData:
         """If a member has no name, returns False."""
         from QBhelperfunctions import process_clan_war_data
 
-        coc_war = _make_coc_war("preparation", "#OPP", [])
+        war_payload = _make_war_payload("preparation", "#OPP", [])
         # Add a member with empty name
-        m = MagicMock()
-        m.tag = "#P1"
-        m.name = ""  # Empty name
-        m.town_hall = 10
-        m.attacks = []
-        m.best_opponent_attack = None
-        coc_war.clan.members = [m]
+        war_payload["clan"]["members"] = [
+            {"tag": "#P1", "name": "", "townhall": 10, "attacks": [], "bestOpponentAttack": None}
+        ]
 
         war_data = {
-            "war_obj": coc_war,
+            "war_payload": war_payload,
             "opponent_tag": "#OPP",
             "state": "preparation",
         }
@@ -559,12 +551,12 @@ class TestProcessClanWarData:
         """When war ID timestamp shifts, existing temp stats are updated."""
         from QBhelperfunctions import process_clan_war_data
 
-        coc_war = _make_coc_war("in_war", "#OPP", [
+        war_payload = _make_war_payload("in_war", "#OPP", [
             {"tag": "#P1", "name": "Alice"},
         ])
 
         war_data = {
-            "war_obj": coc_war,
+            "war_payload": war_payload,
             "opponent_tag": "#OPP",
             "state": "in_war",
         }
