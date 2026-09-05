@@ -1399,23 +1399,30 @@ async def main() -> None:
     # backlog (starvation), defeating the schedule.  Active-war clans are extremely
     # rare in the inactive pool (~2 per 5000), so exempting them is near-zero cost.
     #
-    # 2026-08-29 (tracker #0009): lowered 5000 -> 1500 as a memory bound, not a runtime one.
-    # Every clan polled in a cycle is held simultaneously — its coc.ClanWar sat in
-    # fetch_results until Phase 3 consumed it (each pinning ~120-170 KB of raw API payload via
-    # coc.py's un-exhausted _iter_members generator), and its coc.Clan sits in coc_clan_cache
-    # (~69-90 KB each, measured).
-    # STALE SINCE STAGE 3 (2026-09-05): fetch_results now holds only the payload dict, not the
-    # coc.ClanWar, so the per-clan half of this memory bound is much smaller than when 1500 was
-    # chosen. The cap has NOT been re-tuned — the number below still reflects the pre-Stage-3
-    # cost model. Re-measure before trusting it as a current bound; raising it is the obvious
-    # lever if a deferred backlog ever needs to drain faster. A 3800-4200-clan wave cost +541 to +700 MB of RSS in a SINGLE
-    # cycle on PROD, and quiet cycles only give back 10-40 MB, so each wave ratcheted the floor
-    # up until the process sat at ~6 GB. Distribution over 963 cycles: median 669, p75 857,
-    # p90 1317, p95 1929, mean 817 — so 1500 clips only the top ~8% of cycles and leaves ~2x
-    # headroom over the mean for the deferred backlog to drain (a 4200-clan wave spills ~2700,
-    # which clears in 3-4 following cycles = ~20 min against a 22h SLA). War-critical clans stay
-    # exempt from the cap below, so nothing latency-sensitive is deferred by this.
-    _MAX_INACTIVE_PER_CYCLE = 1500
+    # 2026-09-05 (Stage 3 follow-up): raised 1500 -> 3000. Applied on PROD first and observed
+    # safe there; this repo change brings the source in line with what is already running.
+    #
+    # ⚠️ EVERY MEMORY FIGURE BELOW IS DEPRECATED AND UNCONFIRMED FOR THE CURRENT CODE. They were
+    # measured before Stage 3 and describe a cost model that no longer holds: fetch_results held
+    # a coc.ClanWar per polled clan then, and holds only the (much smaller) payload dict now.
+    # Treat them as historical context for why a cap exists at all, NOT as a current bound, and
+    # do not derive a new number from them. A fresh PROD measurement — single-cycle RSS delta
+    # against cycle size, at the 3000 cap — is required before any of this can be called
+    # confirmed again, including the 3000 itself.
+    #
+    # Historical (pre-Stage-3, 2026-08-29, tracker #0009), retained for context only: the cap was
+    # lowered 5000 -> 1500 as a memory bound rather than a runtime one, because every clan polled
+    # in a cycle was held simultaneously — its coc.ClanWar in fetch_results until Phase 3
+    # consumed it (each pinning ~120-170 KB of raw API payload via coc.py's un-exhausted
+    # _iter_members generator), plus its coc.Clan in coc_clan_cache (~69-90 KB each). A
+    # 3800-4200-clan wave cost +541 to +700 MB of RSS in a SINGLE cycle on PROD while quiet
+    # cycles gave back only 10-40 MB, so each wave ratcheted the floor up until the process sat
+    # at ~6 GB. Cycle-size distribution over 963 cycles: median 669, p75 857, p90 1317, p95 1929,
+    # mean 817.
+    #
+    # War-critical clans stay exempt from the cap below regardless, so nothing latency-sensitive
+    # is deferred by this.
+    _MAX_INACTIVE_PER_CYCLE = 3000
     _overdue_total = len(inactive_clans)  # snapshot before capping, for CYCLE-SUMMARY
     if len(inactive_clans) > _MAX_INACTIVE_PER_CYCLE:
         # Partition into war-critical (exempt) and generic (cappable) clans.

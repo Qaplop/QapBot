@@ -1,6 +1,25 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (9)
+- Raised _MAX_INACTIVE_PER_CYCLE 1500 -> 3000 (build 24). Applied on PROD first and observed
+  safe there; this change brings the repo in line with what is already running, rather than
+  proposing a new value.
+- Rewrote the surrounding comment block. Every memory figure in it is now explicitly marked
+  DEPRECATED AND UNCONFIRMED for the current code: those numbers were measured pre-Stage-3 and
+  describe a cost model that no longer holds (fetch_results held a coc.ClanWar per polled clan
+  then, holds only the much smaller payload dict now). They are retained as historical context
+  for why a cap exists at all, explicitly NOT as a current bound, with a note not to derive a
+  new number from them. A fresh PROD measurement -- single-cycle RSS delta against cycle size,
+  at the 3000 cap -- is required before any of it, including the 3000 itself, can be treated as
+  confirmed.
+- The block had also been left syntactically coherent but semantically broken by build 23's
+  annotation, which spliced into the middle of a sentence and orphaned its continuation
+  ("...drain faster. A 3800-4200-clan wave cost..."). Rewritten as one coherent block.
+- War-critical clans remain exempt from the cap, unchanged -- nothing latency-sensitive is
+  deferred by this regardless of the number.
+- No test pinned the old value. 3063 tests pass. pyright clean.
+
 2026-09-05 (8)
 - Stage 3 exit-path audit (build 23). Walked every code path in the update cycle to check
   whether Stage 3 actually covers all of them, rather than sampling. Found one real functional
