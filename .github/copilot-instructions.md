@@ -41,6 +41,15 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 - PROD data/archive (eSATA SSD): `${PROD_DATA_DIR}/data` (set via `PROD_DATA_DIR` in your environment)
 - PROD SSD from Windows (UNC): `<PROD_SSD_UNC>` — **⚠️ NEVER access without explicit user confirmation. This is the live production database.**
 - DO: Get explicit user confirmation before any read/write/list/search access under PROD paths.
+- **This gate is per-access, not standing.** Confirmation for one PROD action (e.g. "compare
+  build 19 vs 20") does not carry over to a different one (a later fix, a broader audit, a
+  repeat of the same query tomorrow) — ask again each time, even minutes later, even for
+  something that looks like a strict subset of what was already approved.
+- **This gate is independent of whether an access method is technically safe.** Cardinal Rule 18
+  documents a genuinely safe MECHANISM for direct PROD SQLite access (exclusive-mode locking,
+  when PROD is confirmed stopped). That a mechanism cannot corrupt anything is never, by itself,
+  authorization to use it — this rule (explicit confirmation, every time) still applies on top
+  of it, unconditionally. Do not read Rule 18 as carving out an exception to this rule.
 - DON'T: Hardcode machine-specific absolute paths.
 - WHY: Avoid corrupting prod data.
 📖 Details: ../README.md § Deployment Locations
@@ -192,6 +201,12 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
 
 ### 18) NEVER open the PROD SQLite database over the network share — it corrupts it
 
+**This rule is about which access MECHANISMS are technically safe. It does not grant permission
+to use any of them. Cardinal Rule 5's explicit-user-confirmation-before-every-PROD-access
+requirement is separate, unconditional, and always applies first — read this rule's refinement
+below in that light, not as a standing green light for exclusive-mode access whenever PROD
+happens to be stopped.**
+
 `data/qapbot.db` runs in **WAL mode**. WAL coordinates readers and writers through a
 shared-memory index (`qapbot.db-shm`) plus byte-range file locks. Those primitives **do not work
 across SMB/CIFS** — SQLite's own documentation states WAL "does not work over a network
@@ -222,13 +237,21 @@ was at risk and PROD was down until restored.
 
 **Refinement (2026-09-05, same day, after root-causing the incident more precisely): the actual
 failure was contention with PROD's own process while it was live, not SMB access per se.**
-`PRAGMA locking_mode=EXCLUSIVE` set immediately after connecting is an acceptable way to open
-PROD's live DB directly over the share **when PROD is confirmed stopped / DB closed** (e.g.
+`PRAGMA locking_mode=EXCLUSIVE` set immediately after connecting is a technically safe way to
+open PROD's live DB directly over the share **when PROD is confirmed stopped / DB closed** (e.g.
 maintenance mode). It is a genuine fail-safe: if PROD still has the file open, the exclusive-lock
 request errors out cleanly (`database is locked`) instead of hanging or corrupting anything; if
 PROD is genuinely not holding it, there is only one accessor and no coordination protocol is even
-in play. This has been used successfully post-incident (targeted row inserts and small-table
-row-count audits, both single-digit-second connections).
+in play.
+
+**This describes a mechanism's safety, not a standing authorization.** Cardinal Rule 5's
+per-access explicit-confirmation requirement is unaffected and still applies before EVERY use of
+this, no exceptions — "PROD is confirmed stopped" answers "would this corrupt anything", not
+"am I allowed to do this right now". The two are checked separately, in this order: user
+confirms this specific access first; only then does whether-PROD-is-stopped determine which
+mechanism (exclusive-mode direct, or copy-then-query) to use for it. This has been used, with
+confirmation obtained fresh each time, for targeted row inserts and small-table row-count audits
+(single-digit-second connections) post-incident.
 
 **The remaining hazard under this refinement is availability, not data safety: keep the exclusive
 connection SHORT.** An expensive operation — `PRAGMA quick_check`/`integrity_check` on the whole

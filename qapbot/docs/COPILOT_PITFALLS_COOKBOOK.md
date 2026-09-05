@@ -2854,12 +2854,20 @@ operation: it still joins the WAL index.
 - **When granted narrow permission for a risky action, re-derive the risk yourself.** Permission
   to read production is not a statement that the mechanism is safe; the person granting it is
   usually authorising the *goal*, not vouching for the transport.
+- **The inverse holds too, and matters just as much: a mechanism being technically safe is not
+  itself permission.** Cardinal Rule 5's per-access explicit-confirmation requirement for any
+  PROD access is unconditional and independent of whether the method used could corrupt
+  anything — "this can't hurt PROD" answers a different question from "am I allowed to do this
+  right now", and a later refinement documenting a genuinely safe mechanism (Rule 18's
+  exclusive-mode access, Pitfall 64) must never be read as having settled the second question
+  too. Ask fresh, every time, regardless of how safe the chosen method is.
 - **Prefer the boring path that already exists.** A synced copy of PROD data was sitting on the
   DEV box for exactly this purpose. Reaching past it for freshness bought a few hours of
   currency and cost an outage.
 
-**See also:** Cardinal Rule 18 in `.github/copilot-instructions.md`, and Pitfall 61 for the
-adjacent mistake of mutating an object whose ownership was assumed rather than established.
+**See also:** Cardinal Rule 18 in `.github/copilot-instructions.md`; Pitfall 61 for the adjacent
+mistake of mutating an object whose ownership was assumed rather than established; Pitfall 64 for
+the same permission-vs-mechanism distinction from the other direction.
 
 ---
 
@@ -2932,7 +2940,10 @@ own database for as long as the query takes, even though nothing is actually at 
 corruption.
 
 **What happened (2026-09-05):** after Pitfall 62's incident, direct exclusive-mode PROD access
-was correctly re-authorised for when PROD is confirmed stopped: the lock request either succeeds
+was correctly identified as a technically safe mechanism when PROD is confirmed stopped (Cardinal
+Rule 5's separate, per-access explicit-user-confirmation requirement still applied and was
+obtained fresh for this specific use — that gate is not what this pitfall is about): the lock
+request either succeeds
 cleanly (no other accessor) or fails cleanly (`database is locked`) rather than hanging — a
 materially different, genuinely safe mechanism, not a repeat of the original mistake. But the
 first use of it ran `PRAGMA quick_check` against the full 24GB+ live file. The exclusive lock was
