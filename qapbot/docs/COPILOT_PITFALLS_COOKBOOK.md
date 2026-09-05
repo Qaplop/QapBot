@@ -2816,3 +2816,47 @@ observed window**. Rarity is what made it invisible, not harmless.
 
 **See also:** Pitfall 58 for why severing is worth doing at all, and Pitfall 60 for the sampling
 mistake that led to the audit which found this.
+
+---
+
+## Pitfall 62: "read-only" is not a safety property for a WAL database on a network share — opening it at all is the write
+
+**Symptom:** analysis queries are run against a live production SQLite database over SMB/NFS with
+`mode=ro`, which feels safe because nothing is being written. The production process then dies,
+and the next start reports `database disk image is malformed`.
+
+**What happened (2026-09-05):** PROD's `qapbot.db` (25 GB, WAL mode, 1.74 GB WAL) was queried
+read-only over `\NAS_DS218\satashare\...` while the bot was live on the NAS, to diff DEV against
+PROD. WAL coordinates readers and writers through a shared-memory index (`-shm`) and byte-range
+locks; **neither works across SMB** — SQLite's docs say plainly that WAL "does not work over a
+network filesystem". The remote client and the NAS-local process held incoherent views of that
+index. PROD stopped silently after its 12:28:30 cycle, the WAL was checkpointed under the
+incoherent state, and the database was left corrupt with ~2.5 h of war history at risk.
+
+The reasoning that led there is the interesting part. `mode=ro` was chosen deliberately *as* the
+safety measure, and the danger was framed as "am I writing data?" — a question about intent.
+The actual question was "does opening this file participate in a protocol that requires locking
+this filesystem cannot provide?" A read-only SQLite connection is not a read-only *file*
+operation: it still joins the WAL index.
+
+**How to apply:**
+
+- **`mode=ro` bounds what you intend, not what the driver does.** Reject it as a safety argument
+  for any locking-dependent format on a network share.
+- **The safe boundary is where the process runs, not what it wants.** Run the query locally on
+  the host that owns the file (SSH), or copy the file and open the copy. A byte-for-byte file
+  copy is genuinely read-only; an SQLite `open()` is not.
+- **Check the journal mode before touching a database you did not open locally.** `PRAGMA
+  journal_mode` returning `wal` plus a UNC or mounted-share path is a stop sign. A visible
+  `-wal`/`-shm` pair beside the file says the same thing without opening anything.
+- **Two processes, two hosts, one file is the hazard** — the size of the WAL only sets how much
+  damage a bad checkpoint does.
+- **When granted narrow permission for a risky action, re-derive the risk yourself.** Permission
+  to read production is not a statement that the mechanism is safe; the person granting it is
+  usually authorising the *goal*, not vouching for the transport.
+- **Prefer the boring path that already exists.** A synced copy of PROD data was sitting on the
+  DEV box for exactly this purpose. Reaching past it for freshness bought a few hours of
+  currency and cost an outage.
+
+**See also:** Cardinal Rule 18 in `.github/copilot-instructions.md`, and Pitfall 61 for the
+adjacent mistake of mutating an object whose ownership was assumed rather than established.

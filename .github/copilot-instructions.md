@@ -190,6 +190,39 @@ Token budget note (cl100k_base): keep this file ~≤3000 tokens.
   comparison and say so rather than reasoning past it.
 📖 Where: `QBcore.py` (`BOT_BUILD`, `source_fingerprint()`); startup log in `QapBot.py`.
 
+### 18) NEVER open the PROD SQLite database over the network share — it corrupts it
+
+`data/qapbot.db` runs in **WAL mode**. WAL coordinates readers and writers through a
+shared-memory index (`qapbot.db-shm`) plus byte-range file locks. Those primitives **do not work
+across SMB/CIFS** — SQLite's own documentation states WAL "does not work over a network
+filesystem". A client on the Windows box and the bot process on the NAS therefore hold
+*incoherent* views of the same WAL index.
+
+**`mode=ro` does not make this safe.** A read-only connection still participates in the WAL
+index. It is not a read-only *file* operation.
+
+**This is not theoretical — it happened on 2026-09-05.** Read-only analysis queries were run
+against `\NAS_DS218\satashare\QapBot\data\qapbot.db` over SMB while PROD was live. PROD stopped
+silently after its 12:28:30 cycle; the 1.74 GB WAL was checkpointed under the incoherent state
+and the next start died with `[DB-READ] Failed to load clans from database: database disk image
+is malformed` → `FATAL: Cannot load clan data - terminating`. Roughly 2.5 hours of war history
+was at risk and PROD was down until restored.
+
+**Do instead:**
+
+- Analyse the PROD copy that is routinely synced to DEV at `c:\python\QapBot\data\` — that is
+  what it is for, and it is what "check the PROD log/db" normally means.
+- If genuinely fresh PROD data is needed: run `sqlite3` **locally on the NAS** (SSH), or copy
+  the `.db` file to local disk **as a plain file copy** and open the copy. A file copy is safe;
+  opening the DB over the share is not.
+- Never accept "read-only" as a sufficient safety argument for a WAL database on a network
+  share. The safe boundary is *where the SQLite process runs*, not what it intends to do.
+- The same applies to `qapbot_history.db` and to any tooling (DB browsers, scripts, IDE
+  plugins) pointed at a NAS path.
+
+📖 Where: `\NAS_DS218\satashare\QapBot\data\` (PROD, off-limits to remote SQLite);
+`c:\python\QapBot\data\` (synced PROD copy, safe). See Pitfall 62.
+
 ---
 
 ## Quick reference (most common)
