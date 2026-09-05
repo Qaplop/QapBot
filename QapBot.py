@@ -2582,23 +2582,56 @@ async def run_nightly_maintenance_routine(db_mgr: Any, run_migration: bool) -> s
         # avoid during live cycles. asyncio.to_thread() here only keeps the Discord heartbeat
         # *task* schedulable while it runs (Pitfall 16) — best-effort, never fails maintenance.
         try:
-            def _nightly_gc_refresh() -> tuple[int, float]:
+            def _nightly_gc_refresh() -> tuple[int, float, float]:
                 global _gc_deliberate
                 _gc_t0 = time.perf_counter()
                 _gc_deliberate = True
                 try:
                     gc.unfreeze()
                     collected = gc.collect()
+                    _gc_t1 = time.perf_counter()
+                    # Second back-to-back sweep. The first one both FINDS garbage and WALKS the
+                    # live set; this one has no garbage left to find, so its duration is the
+                    # pure cost of walking what is still alive. That is the number the CWL-cache
+                    # attribution below is a fraction of — without it we would be scaling a
+                    # total that includes work the caches are not responsible for.
+                    gc.collect()
+                    _live_walk = time.perf_counter() - _gc_t1
                     gc.freeze()
                 finally:
                     _gc_deliberate = False
-                return collected, time.perf_counter() - _gc_t0
-            _gc_collected, _gc_elapsed = await asyncio.to_thread(_nightly_gc_refresh)
+                return collected, time.perf_counter() - _gc_t0, _live_walk
+            _gc_collected, _gc_elapsed, _gc_live_walk = await asyncio.to_thread(_nightly_gc_refresh)
             logging.info(
-                "[NIGHTLY-MAINTENANCE] GC refresh: collected=%d unreachable object(s) in %.3fs, "
-                "re-froze %d object(s) into the permanent generation",
-                _gc_collected, _gc_elapsed, gc.get_freeze_count(),
+                "[NIGHTLY-MAINTENANCE] GC refresh: collected=%d unreachable object(s) in %.3fs "
+                "(live-set walk %.3fs), re-froze %d object(s) into the permanent generation",
+                _gc_collected, _gc_elapsed, _gc_live_walk, gc.get_freeze_count(),
             )
+
+            # tracker-0009 follow-up: what Stage 3 did NOT remove. The CWL caches hold
+            # coc.ClanWar / ClanWarLeagueGroup graphs created after startup, so gc.freeze()
+            # never covers them and every full sweep walks them. Measure it here rather than
+            # guess: this is the only full sweep in the process, commands are already blocked,
+            # and the walk is far too expensive for a live cycle. Sampled so a full cache
+            # (1000 wars) cannot stretch the maintenance window.
+            try:
+                _fp = await asyncio.to_thread(CACHE.measure_cwl_cache_gc_footprint, 120)
+                _held = _fp["war_objects"] + _fp["group_objects"]
+                logging.info(
+                    "[GC-ATTRIBUTION] CWL caches hold %s tracked object(s) live "
+                    "(%s league wars -> %s, %s league groups -> %s)%s = %.1f%% of %s live "
+                    "tracked objects; at that share they account for ~%.3fs of the %.3fs "
+                    "live-set walk. Freeing them entirely is the ceiling on what evicting or "
+                    "shrinking these caches could save per full sweep.",
+                    f"{_held:,}",
+                    f"{_fp['war_entries']:,}", f"{_fp['war_objects']:,}",
+                    f"{_fp['group_entries']:,}", f"{_fp['group_objects']:,}",
+                    " [sampled+extrapolated]" if _fp["sampled"] else "",
+                    _fp["pct_of_live"], f"{_fp['total_tracked']:,}",
+                    _gc_live_walk * _fp["pct_of_live"] / 100.0, _gc_live_walk,
+                )
+            except Exception as _attr_ex:
+                logging.warning(f"[GC-ATTRIBUTION] measurement failed (non-fatal): {_attr_ex}")
         except Exception as _gc_ex:
             logging.warning(f"[NIGHTLY-MAINTENANCE] GC refresh failed (non-fatal): {_gc_ex}")
 

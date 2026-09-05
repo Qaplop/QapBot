@@ -1,6 +1,43 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (6)
+- MEASUREMENT (build 22) for the GC exposure tracker-0009 Stage 3 did not remove. Stage 3
+  stopped Phase 1 retaining a coc.ClanWar across the cycle; what remains is _league_war_cache
+  (cap 1000) and _league_group_cache (cap 200), which hold coc.py graphs created AFTER startup,
+  so gc.freeze() never covers them and every full sweep walks them. Evicted entries are cyclic
+  and nothing severs them (severing is unsafe - they are shared, see Pitfall 61). Instrumented
+  rather than guessed at, because the obvious fixes (shrink the caps, evict harder) trade API
+  calls for GC time and that trade needs a number.
+- CacheManager.measure_cwl_cache_gc_footprint(sample=N): counts GC-TRACKED objects reachable
+  from both CWL caches. Counts tracked objects, not bytes, because a sweep's cost tracks the
+  container objects it must walk - an untracked str or int is free to it. (Deliberately a
+  different question from coc_cache.get_memory_usage_mb(), which measures bytes for the memory
+  report.) Uses the same gc.get_referents() walk and the same seeded-roots boundary that
+  walker proved necessary, so it cannot wander into coc.Client and charge the session,
+  throttler and CacheManager once per entry.
+- Runs in the NIGHTLY maintenance window only - the walk is far too expensive for a live cycle,
+  and that window already holds the process's only full sweep with commands blocked. Sampled
+  (120 entries) so a full 1000-war cache cannot stretch maintenance.
+- The nightly sweep now also times a SECOND back-to-back gc.collect(). The first both finds
+  garbage and walks the live set; the second has no garbage left to find, so its duration is
+  the pure live-set walk cost. That is the total the CWL attribution is a fraction of - without
+  it we would be scaling a number that includes work these caches are not responsible for.
+  Logged as [NIGHTLY-MAINTENANCE] ... (live-set walk Xs) and [GC-ATTRIBUTION].
+- Per-cycle, [CWL-CACHE-EVICT] now appends "~N object(s) now cyclic garbage awaiting a sweep",
+  converting the eviction COUNT the line already had into the number that predicts GC cost,
+  using objects-per-entry from the last nightly measurement. Costs nothing on the hot path, and
+  prints NOTHING until a measurement has actually run rather than inventing a constant.
+- FIRST DATA POINT (dev, synthetic, 200 realistic 15v15 war_ended CWL wars): 174 tracked
+  objects per cached war, so ~174,000 objects held live at the 1000 cap. But the marginal
+  live-set sweep cost measured only ~1.5ms for 200 wars, extrapolating to ~8ms at the cap -
+  which would make this a NON-issue, not the follow-up it looked like. Do not act on that
+  number: it is dev hardware, and PROD's memory-latency wall has already mispredicted twice in
+  this plan, both optimistically (a 0.018s dev estimate came back as 2.050s on PROD). The
+  percentage figure from a synthetic process is meaningless too, since total live objects there
+  is tiny. The nightly [GC-ATTRIBUTION] line on PROD is the number that decides whether
+  anything more is worth doing here.
+
 2026-09-05 (5)
 - BUG FIX (build 21), found by auditing every war-finalization and CoC-API path in the update
   cycle: release_war_object() could sever a CACHED, SHARED coc.ClanWar. fetch_clan_war_data()

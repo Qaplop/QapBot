@@ -47,6 +47,8 @@ import orjson
 import logging
 import hashlib
 import time
+import gc as _gc
+import types as _types_mod
 from collections import deque
 from datetime import datetime, timedelta, timezone as _dt_timezone
 from typing import Dict, Any, Iterable, Tuple, List, Literal, Optional, Set, cast, TYPE_CHECKING
@@ -3891,7 +3893,7 @@ class CacheManager:
         if _war_exp or _grp_exp:
             logging.info(
                 f"[CWL-CACHE-EVICT] Purged {len(_war_exp)} league-war "
-                f"and {len(_grp_exp)} league-group stale entries"
+                f"and {len(_grp_exp)} league-group stale entries{self._evicted_objects_note(len(_war_exp), len(_grp_exp))}"
             )
 
         # Hard size caps — evict oldest entries when over limit.
@@ -3905,6 +3907,7 @@ class CacheManager:
             logging.info(
                 f"[CWL-CACHE-EVICT] Size cap: evicted {_war_over} league-war entries "
                 f"(limit={self._LEAGUE_WAR_CACHE_MAX_ENTRIES})"
+                f"{self._evicted_objects_note(_war_over, 0)}"
             )
 
         _grp_over = len(self._league_group_cache) - self._LEAGUE_GROUP_CACHE_MAX_ENTRIES
@@ -3915,7 +3918,137 @@ class CacheManager:
             logging.info(
                 f"[CWL-CACHE-EVICT] Size cap: evicted {_grp_over} league-group entries "
                 f"(limit={self._LEAGUE_GROUP_CACHE_MAX_ENTRIES})"
+                f"{self._evicted_objects_note(0, _grp_over)}"
             )
+
+    # Objects-per-entry from the most recent measure_cwl_cache_gc_footprint() call, so the
+    # per-cycle eviction log can report orphaned-object counts without paying for a graph walk
+    # on the hot path. None until the first nightly measurement has run.
+    _cwl_objs_per_war: Optional[float] = None
+    _cwl_objs_per_group: Optional[float] = None
+
+    def _evicted_objects_note(self, wars: int, groups: int) -> str:
+        """Render "~N object(s) now cyclic garbage" for an eviction log line.
+
+        Evicting a cached league war drops the only reference to a coc.ClanWar graph that is
+        cyclic by construction (Pitfall 58), so nothing severs it and it survives until a sweep
+        walks it. This turns the eviction COUNT — which the log already had — into the number
+        that actually predicts GC cost, using the objects-per-entry measured by the last
+        measure_cwl_cache_gc_footprint() run. Costs nothing on the hot path.
+
+        Returns "" until that measurement has run at least once, rather than guessing.
+        """
+        try:
+            _pw, _pg = self._cwl_objs_per_war, self._cwl_objs_per_group
+            _n = (wars * _pw if (wars and _pw) else 0) + (groups * _pg if (groups and _pg) else 0)
+            if _n <= 0:
+                return ""
+            return f" — ~{int(_n):,} object(s) now cyclic garbage awaiting a sweep"
+        except Exception:
+            return ""
+
+    def measure_cwl_cache_gc_footprint(self, sample: int = 0) -> Dict[str, Any]:
+        """Count the GC-TRACKED objects the CWL caches hold live.
+
+        Answers the open question left by tracker-0009 Stage 3: `_league_war_cache` (cap 1000)
+        and `_league_group_cache` (cap 200) hold `coc.ClanWar` / `coc.ClanWarLeagueGroup` graphs
+        that are created AFTER startup, so `gc.freeze()` never covers them and **every full
+        sweep walks them**. Stage 3 removed the Phase-1->Phase-3 retention; this is what is left.
+
+        Counts *tracked* objects rather than bytes, because a sweep's cost tracks the number of
+        container objects it must walk — an untracked `str` or `int` costs it nothing. This is
+        deliberately a different question from `coc_cache.get_memory_usage_mb()`, which measures
+        bytes for the memory report.
+
+        EXPENSIVE — a full `gc.get_referents()` walk. Call it from the nightly maintenance
+        window (commands already blocked), never from a live cycle. `sample` caps how many
+        entries are walked; the result is then extrapolated and `sampled=True` is set, which is
+        the safe way to run it when the caches are near their caps.
+
+        Never raises: a measurement must not be able to break maintenance.
+        """
+        _out: Dict[str, Any] = {
+            "war_entries": len(self._league_war_cache),
+            "group_entries": len(self._league_group_cache),
+            "war_objects": 0, "group_objects": 0,
+            "total_tracked": 0, "pct_of_live": 0.0, "sampled": False,
+        }
+        try:
+            _LEAF = (str, bytes, bytearray, int, float, bool, complex, type(None), datetime)
+            # Same boundary rule as coc_cache.get_memory_usage_mb(): recursing into a class or
+            # module reaches its __dict__ and from there effectively the whole process, and
+            # every coc.py model back-references coc.Client.
+            _NO_RECURSE = (
+                type, _types_mod.ModuleType, _types_mod.FunctionType,
+                _types_mod.BuiltinFunctionType, _types_mod.MethodType, _types_mod.CodeType,
+                coc.Client,
+            )
+
+            def _count(value: Any, seen: set, depth: int = 0) -> int:
+                if depth > 12:
+                    return 0
+                _id = id(value)
+                if _id in seen:
+                    return 0
+                seen.add(_id)
+                # Only tracked objects are walked by a sweep — untracked ones are free.
+                n = 1 if _gc.is_tracked(value) else 0
+                if isinstance(value, _LEAF):
+                    return n
+                if isinstance(value, dict):
+                    for k, v in value.items():
+                        n += _count(k, seen, depth + 1) + _count(v, seen, depth + 1)
+                elif isinstance(value, (list, tuple, set, frozenset)):
+                    for item in value:
+                        n += _count(item, seen, depth + 1)
+                elif not isinstance(value, _NO_RECURSE):
+                    try:
+                        refs = _gc.get_referents(value)
+                    except Exception:
+                        refs = []
+                    for r in refs:
+                        n += _count(r, seen, depth + 1)
+                return n
+
+            # Roots every cached war references but which are NOT part of this cache's
+            # footprint. Seeding them as "already seen" stops the walk at the boundary and
+            # keeps the shared graph from being charged once per entry.
+            _roots: set = {id(self), id(self._league_war_cache), id(self._league_group_cache)}
+            _client = getattr(self, "coc_client", None)
+            if _client is not None:
+                _roots.add(id(_client))
+
+            def _walk(cache: Dict[str, Any]) -> tuple:
+                items = list(cache.values())
+                _n = len(items)
+                if not _n:
+                    return 0, False
+                _limited = bool(sample) and _n > sample
+                _use = items[:sample] if _limited else items
+                _tot = 0
+                for _entry in _use:
+                    _seen: set = set(_roots)
+                    _tot += _count(_entry[0], _seen)
+                if _limited:
+                    _tot = int(_tot * (_n / len(_use)))
+                return _tot, _limited
+
+            _out["war_objects"], _s1 = _walk(self._league_war_cache)
+            _out["group_objects"], _s2 = _walk(self._league_group_cache)
+            _out["sampled"] = _s1 or _s2
+
+            if _out["war_entries"]:
+                type(self)._cwl_objs_per_war = _out["war_objects"] / _out["war_entries"]
+            if _out["group_entries"]:
+                type(self)._cwl_objs_per_group = _out["group_objects"] / _out["group_entries"]
+
+            _out["total_tracked"] = len(_gc.get_objects())
+            _held = _out["war_objects"] + _out["group_objects"]
+            if _out["total_tracked"]:
+                _out["pct_of_live"] = 100.0 * _held / _out["total_tracked"]
+        except Exception as _ex:
+            logging.warning(f"[GC-ATTRIBUTION] CWL cache footprint measurement failed: {_ex}")
+        return _out
 
 def count_archive_files_sync(archive_dir: str) -> int:
     """
