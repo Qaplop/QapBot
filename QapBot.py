@@ -1400,10 +1400,15 @@ async def main() -> None:
     # rare in the inactive pool (~2 per 5000), so exempting them is near-zero cost.
     #
     # 2026-08-29 (tracker #0009): lowered 5000 -> 1500 as a memory bound, not a runtime one.
-    # Every clan polled in a cycle is held simultaneously — its coc.ClanWar sits in
-    # fetch_results until Phase 3 consumes it (each pinning ~120-170 KB of raw API payload via
+    # Every clan polled in a cycle is held simultaneously — its coc.ClanWar sat in
+    # fetch_results until Phase 3 consumed it (each pinning ~120-170 KB of raw API payload via
     # coc.py's un-exhausted _iter_members generator), and its coc.Clan sits in coc_clan_cache
-    # (~69-90 KB each, measured). A 3800-4200-clan wave cost +541 to +700 MB of RSS in a SINGLE
+    # (~69-90 KB each, measured).
+    # STALE SINCE STAGE 3 (2026-09-05): fetch_results now holds only the payload dict, not the
+    # coc.ClanWar, so the per-clan half of this memory bound is much smaller than when 1500 was
+    # chosen. The cap has NOT been re-tuned — the number below still reflects the pre-Stage-3
+    # cost model. Re-measure before trusting it as a current bound; raising it is the obvious
+    # lever if a deferred backlog ever needs to drain faster. A 3800-4200-clan wave cost +541 to +700 MB of RSS in a SINGLE
     # cycle on PROD, and quiet cycles only give back 10-40 MB, so each wave ratcheted the floor
     # up until the process sat at ~6 GB. Distribution over 963 cycles: median 669, p75 857,
     # p90 1317, p95 1929, mean 817 — so 1500 clips only the top ~8% of cycles and leaves ~2x
@@ -1860,9 +1865,10 @@ async def main() -> None:
             await asyncio.sleep(0)
 
         # ── Memory hygiene: drop the list's reference to this result as soon as it is in
-        # hand (2026-08-29, tracker #0009). Each result holds a coc.ClanWar whose
-        # un-exhausted _iter_members generator pins the whole raw API payload (~120-170 KB
-        # measured), and fetch_results is only deleted much further down — after Phase 3B,
+        # hand (2026-08-29, tracker #0009). Each result holds a war payload dict (pre-Stage-3:
+        # a coc.ClanWar whose un-exhausted _iter_members generator pinned the whole raw API
+        # payload, ~120-170 KB measured — smaller now, but still worth releasing early), and
+        # fetch_results is only deleted much further down — after Phase 3B,
         # notifications, leaderboards and role sync. Clearing the slot here means at most ONE
         # war payload (the `result` local, rebound next iteration) outlives its own iteration,
         # instead of the entire cycle's worth staying resident to the end of the cycle.
@@ -2275,9 +2281,10 @@ async def main() -> None:
         logging.warning(f"[POST-CYCLE-SCAN] Could not refresh temp_total_file_count: {_rescan_ex}")
 
     # ── Memory hygiene: release heavy objects no longer needed ────────
-    # fetch_results holds coc.War objects (each with 30-100 ClanWarMember
-    # sub-objects) that would otherwise stay alive through notifications,
-    # leaderboard posting, and role-sync below.
+    # fetch_results holds war payload dicts that would otherwise stay alive through
+    # notifications, leaderboard posting, and role-sync below. (Pre-Stage-3 these were
+    # coc.War objects with 30-100 ClanWarMember sub-objects each; the del is cheaper now
+    # but still worth doing.)
     del fetch_results, fetch_tasks, _temp_files_by_clan, _archive_filenames
     del _war_batch_appends, _war_batch_updates, _war_batch_file_moves, _phase3_ts_batch
 

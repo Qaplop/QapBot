@@ -225,10 +225,74 @@ class TestCachedWarsAreNeverSevered:
         src = inspect.getsource(H.fetch_clan_war_data)
 
         assert "_war_obj_is_shared" in src, "provenance flag gone from fetch_clan_war_data()"
-        assert re.search(r"if not _war_obj_is_shared:\s*\n\s*release_war_object\(", src), (
+        # The sever later moved into a `finally` (covering every exit path, not just the success
+        # return) and gained a None check. What must not change is that it stays GUARDED by the
+        # provenance flag — severing a cached league war is the bug this pins.
+        assert re.search(r"not _war_obj_is_shared:\s*\n\s*release_war_object\(", src), (
             "release_war_object() is no longer guarded by the provenance check"
         )
         assert src.count("_war_obj_is_shared = True") == 4, (
             "a CWL fallback reassigns coc_war_obj without marking it shared — "
             "that path would sever a cached league war"
         )
+
+
+class TestSeverCoversEveryExitPath:
+    """Stage 3 originally severed only immediately before `return _result`, silently missing
+    every other way out of `fetch_clan_war_data()`.
+
+    Two real gaps existed, found by auditing exit paths rather than by any failure:
+
+    1. The `state == 'not_in_war'` branches `return None` while holding a REAL coc.ClanWar —
+       coc.py sometimes hands back a war object with empty clan/opponent instead of None.
+    2. Any exception raised after a successful fetch (payload build, metadata extraction,
+       save_war_object) propagated as WarDataFetchError with the graph never severed.
+
+    Both leak a cyclic graph that nothing reclaims until a sweep walks it — precisely the cost
+    release_war_object() exists to avoid. The fix moved the sever into a `finally`, so it is now
+    a property of the function rather than of one branch. These tests pin that structurally:
+    the surrounding function needs live API objects to execute, and a missed sever raises
+    nothing — it just quietly costs GC time later.
+    """
+
+    def test_sever_lives_in_a_finally_not_before_the_return(self) -> None:
+        import inspect
+        import re
+        import QBhelperfunctions as H
+
+        src = inspect.getsource(H.fetch_clan_war_data)
+
+        assert re.search(r"finally:.*?release_war_object\(", src, re.S), (
+            "release_war_object() is no longer reached from a finally — exit paths other than "
+            "the success return will leak an unsevered cyclic war graph again"
+        )
+        # it must not ALSO sit inline before the success return (that was the pre-fix shape)
+        assert not re.search(r"if not _war_obj_is_shared:\s*\n\s*release_war_object\(\s*coc_war_obj\s*\)\s*\n\s*return _result", src), (
+            "the pre-fix inline sever before `return _result` is back; it covers only one path"
+        )
+
+    def test_ownership_guard_survived_the_move(self) -> None:
+        """The finally must still refuse to sever a CACHED league war (Pitfall 61)."""
+        import inspect
+        import QBhelperfunctions as H
+
+        src = inspect.getsource(H.fetch_clan_war_data)
+
+        assert "_war_obj_is_shared" in src
+        assert src.count("_war_obj_is_shared = True") == 4, (
+            "a CWL fallback reassigns coc_war_obj without marking it shared — the finally "
+            "would then sever a cached league war on the way out"
+        )
+
+    def test_flags_are_hoisted_above_the_try(self) -> None:
+        """The finally references both names; if they initialise inside the try, an exception
+        before that point makes the finally itself raise NameError."""
+        import inspect
+        import QBhelperfunctions as H
+
+        src = inspect.getsource(H.fetch_clan_war_data)
+        body = src[src.index('"""', src.index('"""') + 3) + 3:]
+        pre_try = body[: body.index("\n    try:")]
+
+        assert "coc_war_obj = None" in pre_try, "coc_war_obj not initialised before the try"
+        assert "_war_obj_is_shared = False" in pre_try, "_war_obj_is_shared not initialised before the try"

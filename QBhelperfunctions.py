@@ -7250,11 +7250,22 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
         Dict with war data if successful, None if no war/error:
         {
             'clan_tag': str,
-            'war_obj': coc.War object,
+            'war_payload': dict | None,   # the serialised war (build_war_payload); None on
+                                          # the §5.4 save_skip_no_clan case
+            'end_time': str,              # str(coc_war_obj.end_time) — carried so callers
+                                          # never need the coc object (§3 Step 4)
             'opponent_tag': str,
             'state': str
         }
+
+        Stage 3 (tracker-0009) removed 'war_obj' from this contract deliberately: retaining the
+        coc.ClanWar across Phase 1 -> Phase 3 kept the whole graph live for a cycle's length.
+        Everything downstream reads 'war_payload' instead.
     """
+    # Hoisted above the try so the finally below can always reference them, including when an
+    # exception fires before the fetch itself. See that finally for why it exists.
+    coc_war_obj = None
+    _war_obj_is_shared = False
     try:
         # === PHASE 1: PARALLEL API CALLS + LIGHTWEIGHT PROCESSING ===
         # Fetch clan data (optional - every 2 days)
@@ -7662,8 +7673,6 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
         # cached objects are bounded and evicted by evict_stale_cwl_caches(), so leaving them
         # to the collector is the correct trade: a shorter GC pause is not worth a silent
         # wrong-data bug in CWL leaderboards.
-        if not _war_obj_is_shared:
-            release_war_object(coc_war_obj)
         return _result
 
     except Exception as e:
@@ -7671,6 +7680,28 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
             f"Exception fetching war data for {clan_tag}: {type(e).__name__}: {e}",
             context={"clan_tag": clan_tag, "error_type": type(e).__name__}
         )
+    finally:
+        # Sever the war graph on EVERY exit path, not just the success one.
+        #
+        # Stage 3 originally severed immediately before `return _result`, which silently missed
+        # every other way out of this function — found by auditing the exit paths rather than by
+        # any failure. The `state == 'not_in_war'` branches in particular return None while
+        # holding a REAL coc.ClanWar (coc.py sometimes hands back a war object with empty
+        # clan/opponent instead of None), and any exception after a successful fetch left the
+        # graph unsevered too. Those objects are cyclic, so nothing reclaims them until a sweep
+        # walks them — exactly the cost release_war_object() exists to avoid.
+        #
+        # ONLY when we exclusively own it. A §5.3 CWL fallback replaces coc_war_obj with a
+        # CACHED league war that ~29 other call sites share; severing that would corrupt the
+        # cache entry for every later reader (build 14 shipped this call unguarded; the bug
+        # never fired only because the fallback is rare). The cached objects are bounded and
+        # evicted by evict_stale_cwl_caches(), so leaving them to the collector is the correct
+        # trade: a shorter GC pause is not worth a silent wrong-data bug in CWL leaderboards.
+        #
+        # Safe here despite running after `return _result` is evaluated: _result carries only
+        # the payload dict and already-materialised strings, never the object itself.
+        if coc_war_obj is not None and not _war_obj_is_shared:
+            release_war_object(coc_war_obj)
 
 
 
@@ -7842,7 +7873,9 @@ def process_clan_war_data(clan_tag: str, war_data: Dict[str, Any], war_files_pre
     Args:
         clan_tag: Clan tag (e.g., '#2C9UR9GJY')
         war_data: Dict returned from fetch_clan_war_data() containing:
-            - war_obj: coc.War object
+            - war_payload: the serialised war dict (may be None — §5.4); this is the sole
+              source of war content since Stage 3 removed 'war_obj'
+            - end_time: str form of the war's end time
             - opponent_tag: Opponent clan tag
             - state: War state string
         war_files_prescan: Optional pre-scanned list of war file paths for this clan.

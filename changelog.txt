@@ -1,6 +1,51 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (8)
+- Stage 3 exit-path audit (build 23). Walked every code path in the update cycle to check
+  whether Stage 3 actually covers all of them, rather than sampling. Found one real functional
+  gap and four stale comments; the payload contract itself is intact.
+- BUG FIX: release_war_object() only ran immediately before `return _result`, so it silently
+  missed every OTHER exit from fetch_clan_war_data(). Two live leak paths: (a) the
+  `state == 'not_in_war'` branches return None while holding a REAL coc.ClanWar (coc.py
+  sometimes returns a war object with empty clan/opponent instead of None) -- these fire
+  regularly, they are part of the per-cycle no_war count; (b) any exception after a successful
+  fetch propagates as WarDataFetchError with the graph unsevered. Both leave a cyclic graph
+  nothing reclaims until a sweep walks it -- exactly the cost release_war_object() exists to
+  avoid. Fixed by moving the sever into a `finally` on the function's existing outer try, so it
+  is now a property of the function rather than of one branch. coc_war_obj/_war_obj_is_shared
+  hoisted above the try so the finally can always reference them (an exception before the fetch
+  would otherwise make the finally itself raise NameError).
+- The build-21 ownership guard is preserved inside the finally: a §5.3 CWL fallback swaps in a
+  CACHED league war shared by ~29 call sites, and severing that would corrupt the cache entry
+  for every later reader. Safe to run after `return _result` is evaluated because _result holds
+  only the payload dict and already-materialised strings, never the object.
+- Verified the exit-path analysis is complete: get_current_war_from_api() (the only UNCACHED,
+  owned war-object source) has exactly one call site in the whole cycle. Every other war object
+  in the cycle comes from get_league_war() and is cached/shared -- correctly never severed. The
+  codebase states this itself at QBhelperfunctions.py:8349 ("get_league_war() returns the same
+  cached coc.War instance for both sides"), independently confirming the build-21 fix.
+- Verified the war_data dict contract producer-to-consumer: fetch emits clan_tag, war_payload,
+  end_time, opponent_tag, state; every consumer reads only those. An apparent mismatch
+  (war_tag/type/league_group/is_cwl read but not produced) was a false alarm -- those reads are
+  in build_war_summary(), whose parameter is also named war_data but receives the JSON payload.
+- Stale comments corrected, all describing the pre-Stage-3 world and all now actively
+  misleading: QapBot.py's del-fetch_results memory-hygiene comment and the Phase-3 slot-clearing
+  comment both claimed fetch_results holds coc.War objects (it holds payload dicts now);
+  fetch_clan_war_data()'s and process_clan_war_data()'s docstrings both still documented
+  'war_obj: coc.War object' as part of the contract Stage 3 removed.
+- FLAGGED, NOT CHANGED: _MAX_INACTIVE_PER_CYCLE = 1500 was chosen as a MEMORY bound justified by
+  each polled clan's coc.ClanWar sitting in fetch_results. Stage 3 removed that retention, so
+  the per-clan half of that cost model no longer holds and the cap has not been re-tuned. Left
+  alone deliberately (needs measurement, and PROD is mid-backlog-drain), but the comment now
+  says so instead of implying the old number is still justified -- raising it is the obvious
+  lever if a deferred backlog ever needs to drain faster.
+- Tests: 3 new in tests/unit/test_release_war_object.py::TestSeverCoversEveryExitPath (sever
+  reached from a finally, not inline before the return; ownership guard survived the move with
+  all 4 fallback markers intact; both flags hoisted above the try). The build-21 structural test
+  correctly FAILED on the refactor and was updated to the new shape rather than deleted.
+  3063 tests pass. pyright clean.
+
 2026-09-05 (7)
 - Build 22 data-integrity re-verification after 9 DEV cycles, stratified by code path per
   Pitfall 60. ~180 wars / ~62,000 field comparisons against PROD build 19:
