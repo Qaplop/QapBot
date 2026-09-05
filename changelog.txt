@@ -1,6 +1,42 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (7)
+- Build 22 data-integrity re-verification after 9 DEV cycles, stratified by code path per
+  Pitfall 60. ~180 wars / ~62,000 field comparisons against PROD build 19:
+    ARCHIVE-DIFFERS (late-updated) : 85 wars, 1,500 attack rows, 30,000 fields - 0 mismatches
+    orphan-CWL                     : 40 wars,   765 attack rows, 15,300 fields - 0 mismatches
+    regular (non-orphan)           : 40 wars,   666 attack rows, 13,320 fields - 1 mismatch*
+    orphan-REGULAR                 : 15 wars,   175 attack rows,  3,500 fields - see below
+  (*the same war as the orphan-REGULAR case below, not a second phenomenon.)
+- LOG: 49,587 lines, ZERO errors, ZERO tracebacks, ZERO [WAR-PAYLOAD] failures, ZERO "Error in
+  war data" strict aborts. One WARNING, a [LOOP-LAG] stall (timing, not integrity).
+- The build-21 cached-war guard is still UNEXERCISED: [CWL-FALLBACK] and
+  [CWL-NOTINWAR-FALLBACK] both fired 0 times in 9 cycles. Consistent with every prior window;
+  this is why that bug needed a test rather than a log line.
+- [CWL-CACHE-EVICT] correctly printed NO object-count suffix - the nightly measurement has not
+  run yet, and the design is to stay silent rather than invent a constant. Verified in situ.
+- EDGE CASE 1, investigated and cleared: archive_differs jumped from 0/cycle (build 19) to
+  9.4/cycle (build 22), which looked like Stage 3 changing computed values. It is not. Per-cycle
+  it decays 60 -> 12 -> 0 -> 0 -> 9 -> 0 -> 4 -> 0 -> 0: restart backlog draining, then ordinary
+  late-attack updates. Build 19's zero was a mid-run steady state whose backlog had already
+  drained. Decisive evidence: all 85 of those wars are byte-identical to PROD across 30,000
+  field comparisons.
+- EDGE CASE 2, investigated and cleared: the orphan-REGULAR stratum
+  ([FINALIZE-ORPHAN-REGULAR], "state=in_war, can't refetch from API") shows real differences -
+  DEV state='in_war' where PROD reached 'war_ended', and lower attack counts. All are DEV
+  observation gaps, not computation errors, and the invariant proves it: DEV's attack count is
+  ALWAYS <= PROD's, never greater. DEV runs intermittently and missed those wars entirely;
+  PROD ran throughout. The worst case (PRRCLVPJ_202609040922, DEV 0 stars / 0 attacks vs PROD
+  30 / 18) was traced to its archived source file, which contains 0 attacks and 0 stars: DEV
+  finalized exactly what it held. This path cannot refetch by definition, so build 19 given the
+  same empty file would write the same zeros - Stage 3 is not implicated.
+- Worth knowing but NOT a live problem: that path will write an all-zero war record into
+  permanent history when its temp file is empty. Checked on PROD - of 140,138 rows written
+  since 2026-09-04, 66 (0.05%) were finalized while still in_war and ZERO were empty. So it
+  needs an instance to miss a war's entire duration, which is normal for DEV and has not
+  happened on PROD. Recorded rather than fixed.
+
 2026-09-05 (6)
 - MEASUREMENT (build 22) for the GC exposure tracker-0009 Stage 3 did not remove. Stage 3
   stopped Phase 1 retaining a coc.ClanWar across the cycle; what remains is _league_war_cache
