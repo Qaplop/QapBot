@@ -2363,7 +2363,15 @@ class CacheManager:
         in_war = 0
         war_ended = 0
         cwl_known = 0
-        for m in self.temp_war_metadata.values():
+        # list(...values()) snapshot, not a live view (tracker item #0090, live bug report:
+        # RuntimeError: dictionary changed size during iteration): Phase 3's per-clan war
+        # processing runs process_clan_war_data()/manage_war_files() via asyncio.to_thread(),
+        # a REAL worker thread that can insert/pop temp_war_metadata entries concurrently with
+        # this synchronous method running on the event-loop thread -- unlike two coroutines on
+        # the same event loop (which can't interleave without an await), two genuine OS threads
+        # can race at the bytecode level. Same snapshot idiom QapBot.py's own cycle code already
+        # uses for clan_name_cache for the identical reason.
+        for m in list(self.temp_war_metadata.values()):
             state = m.get("state", "")
             if state == "preparation":
                 prep += 1

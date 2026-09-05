@@ -71,6 +71,56 @@ class TestGetClanName:
 
 
 # ---------------------------------------------------------------------------
+# get_war_file_stats (tracker item #0090)
+# ---------------------------------------------------------------------------
+
+class TestGetWarFileStats:
+    """tracker item #0090, live bug report: /status crashed with `RuntimeError: dictionary
+    changed size during iteration` inside get_war_file_stats(). Root cause: Phase 3's per-clan
+    war processing runs process_clan_war_data()/manage_war_files() via asyncio.to_thread() -- a
+    REAL worker thread that can insert/pop temp_war_metadata entries while this method runs on
+    the event-loop thread. Two coroutines on the same event loop can't interleave without an
+    await, but two genuine OS threads can race at the bytecode level. Fixed by snapshotting with
+    list(...values()) before iterating (the same idiom QapBot.py's cycle code already uses for
+    clan_name_cache) -- these tests reproduce the underlying "mutate while iterating" hazard
+    deterministically (no real threads needed: mutating a dict's size while its live .values()
+    view is being iterated raises regardless of what triggers the mutation), by having one
+    entry's own .get() call insert a new key -- standing in for a genuinely concurrent insert."""
+
+    @pytest.mark.smoke
+    def test_counts_by_state_and_cwl(self, cache) -> None:
+        cache.temp_war_metadata = {
+            "#A": {"state": "preparation", "is_cwl": False},
+            "#B": {"state": "in_war", "is_cwl": True},
+            "#C": {"state": "war_ended", "is_cwl": False},
+        }
+        cache.temp_total_file_count = 0
+        stats = cache.get_war_file_stats()
+        assert stats["prep"] == 1
+        assert stats["in_war"] == 1
+        assert stats["war_ended"] == 1
+        assert stats["cwl_known"] == 1
+
+    def test_tolerates_dict_mutated_during_iteration(self, cache) -> None:
+        temp_war_metadata: dict = {}
+
+        class _MutatingEntry(dict):
+            """Standing in for a genuinely concurrent asyncio.to_thread() worker inserting a
+            new clan's metadata mid-loop."""
+            def get(self, *args, **kwargs):
+                temp_war_metadata.setdefault("#NEW", {"state": "in_war"})
+                return super().get(*args, **kwargs)
+
+        temp_war_metadata["#EXISTING"] = _MutatingEntry({"state": "preparation"})
+        cache.temp_war_metadata = temp_war_metadata
+        cache.temp_total_file_count = 0
+
+        stats = cache.get_war_file_stats()  # must not raise RuntimeError
+
+        assert stats["prep"] == 1  # only the pre-snapshot entry is counted
+
+
+# ---------------------------------------------------------------------------
 # _calculate_subscription_status
 # ---------------------------------------------------------------------------
 

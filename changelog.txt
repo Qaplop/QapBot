@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (14)
+- Fixed tracker #0090: /status crashed with "RuntimeError: dictionary changed size during
+  iteration" in CacheManager.get_war_file_stats() (temp_war_metadata). Root cause: Phase 3's
+  per-clan war processing runs process_clan_war_data()/manage_war_files() via
+  asyncio.to_thread() -- a real worker thread that can insert/pop temp_war_metadata AND
+  clan_name_cache entries concurrently with /status's synchronous loops running on the event-loop
+  thread. Two coroutines on the same event loop can't interleave without an await, but two real
+  OS threads can race at the bytecode level. Snapshotted both loops before iterating
+  (list(...values()) in cache_manager.py; dict(...).values() in QBdiscordcmds.py, since this
+  module's own /list command shadows the builtin `list` name for the whole file -- see new
+  Pitfall 65, COPILOT_PITFALLS_COOKBOOK.md). New regression test deterministically reproduces
+  the "mutate while iterating" hazard without needing real threads.
+- qapbot/cache_manager.py, QBdiscordcmds.py, qapbot/docs/COPILOT_PITFALLS_COOKBOOK.md,
+  tests/unit/test_cache_manager_sync.py. 3084 tests pass. pyright clean. Build 29.
+
 2026-09-05 (13)
 - Added tracker #0102: an agent (no Discord admin identity to click "Reply to requestor" with)
   had no way to reply to a reporter and make sure they could actually see/answer it. New MCP tool

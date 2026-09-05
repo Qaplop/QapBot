@@ -3704,7 +3704,14 @@ async def status(interaction: discord.Interaction, force_refresh: bool = False):
     untracked_clans = 0
     private_log_clans = 0
     
-    for clan_data in CACHE.clan_name_cache.values():
+    # dict(...) snapshot, not a live view (tracker item #0090 sibling risk: the RuntimeError:
+    # dictionary changed size during iteration that crashed this same command was
+    # get_war_file_stats() below hitting the identical pattern on temp_war_metadata --
+    # clan_name_cache is mutated the same way, via manage_war_files()'s asyncio.to_thread()
+    # worker, so this loop is exactly as exposed). NOT list(...) -- this module defines a
+    # `/list` slash command (`async def list(...)` below), which rebinds the module-global
+    # name `list` to that Command object for the rest of the file, shadowing the builtin.
+    for clan_data in dict(CACHE.clan_name_cache).values():
         if isinstance(clan_data, dict):  # type: ignore[misc]
             if clan_data.get('has_active_subscriptions', False):  # type: ignore[misc]
                 active_clans += 1

@@ -2970,3 +2970,48 @@ running"); no corruption resulted, but it was an unforced, avoidable delay to re
   incremental caution about a change already evidenced as correct.
 
 **See also:** Pitfall 62 and Pitfall 63 for the fuller incident this is a coda to.
+
+## Pitfall 65: `QBdiscordcmds.py` has a slash command literally named `list` — the bare builtin name is shadowed for the whole file
+
+**Symptom:** code anywhere in `QBdiscordcmds.py` that calls `list(...)` expecting the builtin
+(e.g. `list(some_dict.values())` to snapshot it before iterating) silently gets Discord's `/list`
+`app_commands.Command` object instead — a real bug, not just a lint nag, and pyright catches it
+as `reportCallIssue: Object of type "Command[...]" is not callable`.
+
+**What happened (2026-09-05, tracker item #0090):** fixing a live `RuntimeError: dictionary
+changed size during iteration` crash in `/status` meant adding a `list(CACHE.clan_name_cache.
+values())` snapshot — the same idiom `QapBot.py` already uses for the identical hazard. Tests
+passed (nothing in the test suite actually invokes `status()` far enough to exercise that line
+with the real module-global `list`), but running pyright on the file caught it before commit:
+`async def list(...)` (`QBdiscordcmds.py`, the `/list` command implementation) is decorated with
+`@app_commands.command(name="list")`, which rebinds the module-level name `list` to that
+`Command` instance. Python resolves a bare global name at CALL time, not definition time — since
+the whole module finishes executing (including that rebinding) before any command handler is
+ever invoked by a real interaction, `list(...)` anywhere in this file, regardless of where it's
+textually written relative to the `/list` command, refers to that `Command` object, not the
+builtin. `grep`-ing the file confirmed no other code was already (mis)using the bare name, so this
+wasn't a preexisting bug being reproduced — it would have been a brand new one.
+
+**How to apply:**
+
+- **Never write a bare `list(...)` call in `QBdiscordcmds.py`.** Use `dict(some_dict).values()`
+  (or `.keys()`/`.items()`) instead when you need a snapshot before iterating a shared dict — a
+  dict-copy constructor call, not the shadowed name, with the same single-atomic-C-call
+  protection against a concurrent mutator. A list comprehension (`[v for v in d.values()]`) is
+  NOT an equivalent fix for this hazard specifically: it iterates via the same `__next__()`
+  protocol as a plain `for` loop and is exactly as vulnerable to "changed size during iteration"
+  as the code it would be replacing — the whole point of `list(d.values())` is CPython's
+  view-to-list fast path, a single C call that doesn't yield the GIL mid-copy, which a Python-level
+  loop (comprehension or not) never gets.
+- **This generalizes**: any module that defines a Discord command (or any other top-level
+  assignment) whose name collides with a builtin shadows that builtin for the ENTIRE file, not just
+  code after the definition. Before adding a `list(`/`dict(`/`type(`/`id(`/`min(`/`max(`-style
+  builtin call to a command-handler module you haven't touched before, grep the file for
+  `name="<builtin>"` or `def <builtin>(` first — pyright's `reportCallIssue` on the builtin call
+  is the reliable tell if you miss it, so treat that specific error as "shadowed builtin," not a
+  false positive to silence.
+- **Why this was still worth writing down even though it never shipped:** this is exactly the
+  class of bug that passes a full green test run and looks correct on read-through (the diff LOOKS
+  like the established, trusted `QapBot.py:1216` pattern), and would only have surfaced live in
+  PROD the next time `/status` ran with a mutating `clan_name_cache` mid-call. Running pyright on
+  every touched file before calling a fix done — not just the test suite — is what caught it here.
