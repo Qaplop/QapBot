@@ -412,7 +412,7 @@ class TestManageWarFiles:
 # process_clan_war_data
 # ---------------------------------------------------------------------------
 
-def _make_war_payload(state, opponent_tag, members_data, attacks_per_member=2):
+def _make_war_payload(state, opponent_tag, members_data, attacks_per_member=2) -> Dict[str, Any]:
     """Build a war payload dict for process_clan_war_data tests.
 
     Stage 3 of tracker-0009: Phase 1 no longer returns a `coc.ClanWar`, so these tests feed the
