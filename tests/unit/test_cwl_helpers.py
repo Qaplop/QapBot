@@ -218,7 +218,7 @@ class TestFetchClanWarDataNotInWarCwlFallback:
     @pytest.mark.asyncio
     async def test_regular_war_in_metadata_suppresses_fallback(self, monkeypatch):
         """Regular war in temp_war_metadata → CWL check skipped (mutual exclusivity)."""
-        cache, db = self._make_cache(cwl_ended=False)
+        cache, _ = self._make_cache(cwl_ended=False)
         # Simulate an active regular (non-CWL) war in temp_war_metadata
         cache.temp_war_metadata = {"#CLAN4": {"state": "inWar", "is_cwl": False}}
         monkeypatch.setattr("QBhelperfunctions.CACHE", cache)

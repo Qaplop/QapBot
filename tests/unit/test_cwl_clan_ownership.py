@@ -5,6 +5,7 @@ ensure_cwl_clan_sharing() in qapbot/QBdiscocmdshelper_cwl.py.
 from __future__ import annotations
 
 import os
+from typing import Tuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,20 +27,20 @@ async def db(tmp_path):
 
 
 async def _seed_guild_and_clan(db: WarHistoryDB, guild_id: str, clan_tag: str = "#CLAN1") -> None:
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
+    await db._conn.commit()
 
 
 async def _seed_user_player(
     db: WarHistoryDB, discord_id: str, player_tag: str, verified: bool = True
 ) -> None:
-    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
-    await db.conn.execute(
+    await db._conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
+    await db._conn.execute(
         "INSERT INTO user_players (discord_id, player_tag, player_name, verified) VALUES (?, ?, ?, ?)",
         (discord_id, player_tag, "Player", 1 if verified else 0),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
 
 def _make_role(name: str) -> MagicMock:
@@ -104,7 +105,7 @@ async def test_leader_outranks_coleader_across_guilds(db, monkeypatch):
 
     monkeypatch.setattr(QBcore, "bot", _make_bot({100: {"111"}, 200: {"222"}}))
 
-    owner_guild_id, method, owner_event_id = await resolve_cwl_clan_owner("#CLAN1", "2026-09", [100, 200])
+    owner_guild_id, method, _ = await resolve_cwl_clan_owner("#CLAN1", "2026-09", [100, 200])
 
     # Leader (unverified) still beats Co-Leader (verified) — rank is primary, verified only
     # breaks ties within the same rank tier.
@@ -265,7 +266,7 @@ async def test_resolves_owner_event_id_for_the_winning_guild(db, monkeypatch):
     monkeypatch.setattr(CACHE, "coc_clan_cache", fake_coc_cache)
     monkeypatch.setattr(QBcore, "bot", _make_bot({100: {"111"}}))
 
-    owner_guild_id, method, owner_event_id = await resolve_cwl_clan_owner("#CLAN1", "2026-09", [100])
+    owner_guild_id, _, owner_event_id = await resolve_cwl_clan_owner("#CLAN1", "2026-09", [100])
 
     assert owner_guild_id == "100"
     assert owner_event_id == event_id
@@ -483,14 +484,16 @@ async def test_prune_or_detach_deletes_shared_record_when_last_guild_leaves(db, 
 # evict_guild_from_shared_clan — owner-only eviction (2026-08-15)
 # ---------------------------------------------------------------------------
 
-async def _seed_two_shared_guilds(db: WarHistoryDB, owner_guild_id: str, target_guild_id: str, clan_tag: str = "#CLAN1"):
+async def _seed_two_shared_guilds(db: WarHistoryDB, owner_guild_id: str, target_guild_id: str, clan_tag: str = "#CLAN1") -> Tuple[int, int, int]:
     await _seed_guild_and_clan(db, owner_guild_id, clan_tag)
     await _seed_guild_and_clan(db, target_guild_id, clan_tag)
     owner_event_id = db.create_cwl_event_sync(owner_guild_id, "2026-09", "111")
     target_event_id = db.create_cwl_event_sync(target_guild_id, "2026-09", "222")
+    assert owner_event_id is not None and target_event_id is not None, "seed fixture: event creation failed"
     db.set_cwl_event_clans_sync(owner_event_id, [{"clan_tag": clan_tag, "participating": True}])
     db.set_cwl_event_clans_sync(target_event_id, [{"clan_tag": clan_tag, "participating": True}])
     shared_clan_id = db.create_cwl_shared_clan_sync(clan_tag, "2026-09", owner_guild_id, owner_event_id, "unresolved_first_claimer")
+    assert shared_clan_id is not None, "seed fixture: shared-clan creation failed"
     db.add_guild_to_shared_clan_sync(shared_clan_id, owner_guild_id, owner_event_id)
     db.add_guild_to_shared_clan_sync(shared_clan_id, target_guild_id, target_event_id)
     return shared_clan_id, owner_event_id, target_event_id
@@ -595,7 +598,7 @@ async def test_sync_shared_roster_never_overwrites_an_existing_local_signup(db, 
     from qapbot.QBdiscocmdshelper_cwl import sync_cwl_shared_clan_roster_to_local_pools
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "100", "200")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "100", "200")
     db.upsert_cwl_signup_sync(
         target_event_id, "#P1", "RealName", "111", "th16", "template_confirm", "declined", responded_at="2026-08-14T10:00Z"
     )
@@ -619,26 +622,26 @@ async def test_sync_shared_roster_never_overwrites_an_existing_local_signup(db, 
 # ---------------------------------------------------------------------------
 
 async def _seed_current_clan_member(db: WarHistoryDB, discord_id: str, player_tag: str, clan_tag: str) -> None:
-    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
-    await db.conn.execute(
+    await db._conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
+    await db._conn.execute(
         "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) VALUES (?, ?, ?, 1, ?)",
         (discord_id, player_tag, "Player", clan_tag),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
 
 async def _seed_real_cwl_attack(db: WarHistoryDB, war_id: str, clan_tag: str, player_tag: str, player_name: str) -> None:
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
         "VALUES (?, ?, '#OPP', 1, '2026-08', '2026-08-01T10:00')",
         (war_id, clan_tag),
     )
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars, attack_order) "
         "VALUES (?, ?, '2026-08-01T10:00', ?, ?, 15, 1, 2, 1)",
         (war_id, clan_tag, player_name, player_tag),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
 
 @pytest.mark.discord
@@ -767,7 +770,7 @@ async def test_detach_on_deactivation_removes_non_owner_guild_leaves_record_inta
     from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "100", "200")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "100", "200")
 
     # Guild 200 (not the owner) turns the clan off.
     await detach_guild_from_shared_clan_on_deactivation(200, target_event_id, "2026-09", "#CLAN1")
@@ -850,7 +853,7 @@ async def test_detach_on_deactivation_is_a_no_op_when_guild_not_actually_attache
     from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "100", "200")
+    shared_clan_id, _, _ = await _seed_two_shared_guilds(db, "100", "200")
 
     # Guild 300 is unrelated to this shared clan entirely — defensive no-op, must not touch it.
     await detach_guild_from_shared_clan_on_deactivation(300, 999, "2026-09", "#CLAN1")
@@ -866,7 +869,7 @@ async def test_detach_on_deactivation_is_a_no_op_when_guild_not_actually_attache
 # entirely once the clan's real owning guild reassigns them elsewhere.
 # ---------------------------------------------------------------------------
 
-async def _seed_cross_assigned_real_member(db: WarHistoryDB, target_event_id: str, discord_id: str, player_tag: str) -> None:
+async def _seed_cross_assigned_real_member(db: WarHistoryDB, target_event_id: int, discord_id: str, player_tag: str) -> None:
     """#CLAN1 is shared (see _seed_two_shared_guilds); this player is a REAL current member of
     #CLAN1, cross-assigned by the target guild into its own private clan #PRIVATE (which must
     already be participating in target_event_id)."""
@@ -883,7 +886,7 @@ async def test_detach_converts_cross_assigned_real_member_into_a_guest_player(db
     monkeypatch.setattr(CACHE, "db_manager", db)
     # Owner = 200 (so guild 100, the one cross-assigning and detaching, is never the owner —
     # keeps this test focused purely on the conversion, not the repoint branch).
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     await _seed_guild_and_clan(db, "100", "#PRIVATE")
     db.set_cwl_event_clans_sync(target_event_id, [
         {"clan_tag": "#CLAN1", "participating": True}, {"clan_tag": "#PRIVATE", "participating": True},
@@ -918,7 +921,7 @@ async def test_detach_does_not_convert_a_real_members_own_family_assignment(db, 
     from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    _, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     await _seed_current_clan_member(db, "77", "#REALMEMBER", "#CLAN1")  # never assigned anywhere
 
     await detach_guild_from_shared_clan_on_deactivation(100, target_event_id, "2026-09", "#CLAN1")
@@ -936,7 +939,7 @@ async def test_purge_orphaned_shared_clan_guests_removes_foreign_placement_entir
     )
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     await _seed_guild_and_clan(db, "100", "#PRIVATE")
     db.set_cwl_event_clans_sync(target_event_id, [
         {"clan_tag": "#CLAN1", "participating": True}, {"clan_tag": "#PRIVATE", "participating": True},
@@ -963,7 +966,7 @@ async def test_purge_orphaned_shared_clan_guests_is_a_no_op_for_a_never_cross_as
     from qapbot.QBdiscocmdshelper_cwl import purge_orphaned_shared_clan_guests_sync
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     db.upsert_cwl_signup_sync(target_event_id, "#UNRELATED", "Someone", "1", None, "admin_added", "confirmed")
 
     # Must not raise, and must never touch an unrelated player's own genuine signup.
@@ -986,7 +989,7 @@ async def test_detach_mirrors_confirmed_shared_roster_into_local_orphaned_assign
     from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     # #STUCK was drag-assigned INTO the shared clan itself from guild 100's own board — lives
     # only in cwl_shared_clan_players (handle_post_cwl_enrollment_assign's shared-destination
     # branch never touches cwl_assignments), confirmed, added by guild 100.
@@ -1022,7 +1025,7 @@ async def test_detach_does_not_mirror_a_non_confirmed_shared_roster_player(db, m
     from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     db.set_cwl_shared_clan_player_status_sync(shared_clan_id, "#PENDING_PLAYER", "Pending", "77", "pending", "auto_seeded", "100")
 
     await detach_guild_from_shared_clan_on_deactivation(100, target_event_id, "2026-09", "#CLAN1")
@@ -1052,7 +1055,7 @@ async def test_detach_does_not_mirror_a_real_members_own_deliberate_self_assignm
     from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     # #BASEMENT is a genuine CURRENT member of #CLAN1 itself (the shared clan), deliberately
     # drag-assigned into its own column.
     await _seed_current_clan_member(db, "77", "#BASEMENT", "#CLAN1")
@@ -1084,7 +1087,7 @@ async def test_detach_does_not_mirror_an_auto_seeded_or_auto_assigned_confirmed_
     from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     db.set_cwl_shared_clan_player_assignment_sync(shared_clan_id, "#AUTO_PLAYER", "Auto", "77", True, "auto_assigned", "100")
 
     await detach_guild_from_shared_clan_on_deactivation(100, target_event_id, "2026-09", "#CLAN1")
@@ -1114,7 +1117,7 @@ async def test_detach_no_longer_deletes_a_players_existing_local_mirror(db, monk
     from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     db.set_cwl_shared_clan_player_assignment_sync(shared_clan_id, "#AUTO_PLAYER", "Auto", "77", True, "auto_assigned", "100")
     # Existing local mirror, as if sync_cwl_shared_clan_roster_to_local_pools() already wrote it
     # while the clan was still active/participating.
@@ -1142,7 +1145,7 @@ async def test_detach_never_deletes_a_genuine_local_signup_sharing_a_shared_rost
     from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": ["#FAMILY_CLAN"], "member_families": []}})
     monkeypatch.setattr(CACHE, "clan_families", {})
     await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#FAMILY_CLAN', 'Family Clan')")
@@ -1169,7 +1172,7 @@ async def test_orphaned_assignment_gets_purged_when_owning_guild_reassigns_elsew
     from qapbot.QBdiscocmdshelper_cwl import detach_guild_from_shared_clan_on_deactivation, purge_orphaned_shared_clan_guests_sync
 
     monkeypatch.setattr(CACHE, "db_manager", db)
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     db.set_cwl_shared_clan_player_assignment_sync(shared_clan_id, "#STUCK", "Stuck", "77", True, "admin_override", "100")
     await detach_guild_from_shared_clan_on_deactivation(100, target_event_id, "2026-09", "#CLAN1")
     assert db.get_cwl_signup_sync(target_event_id, "#STUCK") is not None  # confirm the premise
@@ -1198,7 +1201,7 @@ async def test_remove_guest_clan_purges_local_pool_even_when_clan_is_shared(db, 
     monkeypatch.setattr(CACHE, "db_manager", db)
     monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": [], "member_families": []}})
     monkeypatch.setattr(CACHE, "clan_families", {})
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "100", "200")
+    _, owner_event_id, _ = await _seed_two_shared_guilds(db, "100", "200")
 
     # A real current member of the shared clan, with a genuine LOCAL signup/assignment on the
     # owner guild's own board — never registered in cwl_shared_clan_players at all (the exact gap
@@ -1234,7 +1237,7 @@ async def test_remove_guest_clan_still_preserves_a_deliberate_admin_override_pla
     monkeypatch.setattr(CACHE, "db_manager", db)
     monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": [], "member_families": []}})
     monkeypatch.setattr(CACHE, "clan_families", {})
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     # #STUCK was drag-assigned INTO the shared clan itself from guild 100's own board — a genuine
     # deliberate placement, exactly like the mere-Uncheck sibling test's setup.
     db.set_cwl_shared_clan_player_assignment_sync(shared_clan_id, "#STUCK", "Stuck", "77", True, "admin_override", "100")
@@ -1267,7 +1270,7 @@ async def test_remove_guest_clan_preserves_a_member_drag_assigned_into_a_family_
     monkeypatch.setattr(CACHE, "db_manager", db)
     monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": ["#FAMILY_CLAN"], "member_families": []}})
     monkeypatch.setattr(CACHE, "clan_families", {})
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    _, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#FAMILY_CLAN', 'Family Clan')")
     await db.conn.commit()
     # #DRAGGED is a real CURRENT member of #CLAN1 (the shared clan about to be removed)...
@@ -1305,7 +1308,7 @@ async def test_remove_guest_clan_purges_local_mirror_for_a_player_who_since_left
     monkeypatch.setattr(CACHE, "db_manager", db)
     monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": [], "member_families": []}})
     monkeypatch.setattr(CACHE, "clan_families", {})
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    shared_clan_id, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     # #FORMER_MEMBER was a genuine participant of #CLAN1 (tracked on the SHARED roster, not this
     # guild's local tables) while #CLAN1 was active on guild 100's board.
     db.set_cwl_shared_clan_player_status_sync(
@@ -1350,7 +1353,7 @@ async def test_remove_shared_guest_clan_clears_stale_pointer_for_a_real_family_m
     monkeypatch.setattr(CACHE, "db_manager", db)
     monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": ["#FAMILY_CLAN"], "member_families": []}})
     monkeypatch.setattr(CACHE, "clan_families", {})
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    _, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#FAMILY_CLAN', 'Family Clan')")
     await db.conn.commit()
     await _seed_current_clan_member(db, "77", "#QCREW_MEMBER", "#FAMILY_CLAN")
@@ -1502,7 +1505,7 @@ async def test_shared_guest_clan_remove_purges_own_member_deliberately_placed_in
     monkeypatch.setattr(CACHE, "db_manager", db)
     monkeypatch.setattr(CACHE, "server_config", {"100": {"member_clans": [], "member_families": []}})
     monkeypatch.setattr(CACHE, "clan_families", {})
-    shared_clan_id, owner_event_id, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
+    _, _, target_event_id = await _seed_two_shared_guilds(db, "200", "100")
     # A genuine CURRENT member of #CLAN1 (the shared clan itself), deliberately drag-assigned
     # into its own column from guild 100's own board — mirrors what a real admin drag actually
     # produces (assignment_source="admin_override", locked=True — see web_bridge.py:

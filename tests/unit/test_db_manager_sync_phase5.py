@@ -41,16 +41,6 @@ def _make_db(tmp_path):
     return dm, db_path
 
 
-def _insert_war(db_path, clan_tag, war_id, date_str, player_tag="#P1"):
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        "INSERT INTO war_history (clan_tag, war_id, date, player_tag, player_name, th_level, map_position, stars, destruction, attacks_used) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (clan_tag, war_id, date_str, player_tag, "Player1", 16, 1, 3, 100.0, 2),
-    )
-    conn.commit()
-    conn.close()
-
-
 # ===========================================================================
 # check_integrity_sync
 # ===========================================================================

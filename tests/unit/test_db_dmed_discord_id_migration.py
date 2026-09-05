@@ -17,7 +17,7 @@ CWL_SNAPSHOT_TABLES = ("cwl_signups", "cwl_shared_clan_players", "cwl_player_sea
 
 
 async def _columns(db: WarHistoryDB, table: str) -> set:
-    cursor = await db.conn.execute(f"PRAGMA table_info({table})")
+    cursor = await db._conn.execute(f"PRAGMA table_info({table})")
     return {row[1] async for row in cursor}
 
 
@@ -55,7 +55,7 @@ class TestFreshDatabase:
         db = WarHistoryDB()
         await db.initialize(str(tmp_path / "fresh3.db"))
         try:
-            cursor = await db.conn.execute(
+            cursor = await db._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='cwl_signups'"
             )
             names = {row[0] async for row in cursor}
@@ -73,13 +73,13 @@ class TestLegacyDatabase:
         await db.initialize(str(db_path))
         try:
             for table in CWL_SNAPSHOT_TABLES:
-                await db.conn.execute(
+                await db._conn.execute(
                     f"ALTER TABLE {table} RENAME COLUMN dmed_discord_id TO discord_id"
                 )
-            await db.conn.execute(
+            await db._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_cwl_signups_discord ON cwl_signups(discord_id)"
             )
-            await db.conn.commit()
+            await db._conn.commit()
         finally:
             await db.close()
 
@@ -93,12 +93,12 @@ class TestLegacyDatabase:
         await db.initialize(str(db_path))
         # initialize() already migrated, so rewind once more and insert legacy-style.
         try:
-            await db.conn.execute("ALTER TABLE cwl_player_season_status RENAME COLUMN dmed_discord_id TO discord_id")
-            await db.conn.execute(
+            await db._conn.execute("ALTER TABLE cwl_player_season_status RENAME COLUMN dmed_discord_id TO discord_id")
+            await db._conn.execute(
                 "INSERT INTO cwl_player_season_status (player_tag, cwl_season, player_name, discord_id, status) "
                 "VALUES ('#LEGACY', '2026-09', 'Legacy', '4242', 'confirmed')"
             )
-            await db.conn.commit()
+            await db._conn.commit()
         finally:
             await db.close()
 
@@ -139,7 +139,7 @@ class TestLegacyDatabase:
         db = WarHistoryDB()
         await db.initialize(str(db_path))
         try:
-            cursor = await db.conn.execute(
+            cursor = await db._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='cwl_signups'"
             )
             names = {row[0] async for row in cursor}
@@ -155,8 +155,8 @@ class TestLegacyDatabase:
         db = WarHistoryDB()
         await db.initialize(str(db_path))
         try:
-            await db.conn.execute("ALTER TABLE cwl_signups ADD COLUMN discord_id TEXT")
-            await db.conn.commit()
+            await db._conn.execute("ALTER TABLE cwl_signups ADD COLUMN discord_id TEXT")
+            await db._conn.commit()
         finally:
             await db.close()
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -80,7 +81,7 @@ def test_channel_select_prefilled_with_current_channel():
 
     view = _make_view(guild=guild, current_channel_ids={"bug": "111"})
 
-    bug_select = next(item for item in view.children if getattr(item, "custom_id", None) == "tracker_setup_channel_bug")
+    bug_select = cast(discord.ui.ChannelSelect, next(item for item in view.children if getattr(item, "custom_id", None) == "tracker_setup_channel_bug"))
     assert [dv.id for dv in bug_select.default_values] == [bug_channel.id]
 
     slot_custom_ids = {

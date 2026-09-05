@@ -165,7 +165,7 @@ async def test_notification_settings_user_select_pagination_actions(monkeypatch:
     view = ui.NotificationSettingsView(
         scope="user",
         clan_tag="#C1",
-        sent_message=sent_message,
+        sent_message=sent_message,  # type: ignore[arg-type]  # duck-typed: only needs .edit()
         guild_clans=["#C1"],
         users_in_clan=users_in_clan,
         guild=interaction.guild,
@@ -209,7 +209,7 @@ async def test_notification_settings_user_select_prefills_from_cache(monkeypatch
     view = ui.NotificationSettingsView(
         scope="user",
         clan_tag="#C1",
-        sent_message=sent_message,
+        sent_message=sent_message,  # type: ignore[arg-type]  # duck-typed: only needs .edit()
         guild_clans=["#C1"],
         users_in_clan=users_in_clan,
         guild=interaction.guild,
@@ -248,7 +248,7 @@ async def test_notification_settings_apply_clan_scope_no_affected_users(monkeypa
     view = ui.NotificationSettingsView(
         scope="clan",
         clan_tag="#C1",
-        sent_message=sent_message,
+        sent_message=sent_message,  # type: ignore[arg-type]  # duck-typed: only needs .edit()
         guild_clans=["#C1"],
         guild=interaction.guild,
     )
@@ -302,7 +302,7 @@ async def test_notification_settings_apply_user_scope_updates_and_refreshes(monk
     view = ui.NotificationSettingsView(
         scope="user",
         clan_tag="#C1",
-        sent_message=sent_message,
+        sent_message=sent_message,  # type: ignore[arg-type]  # duck-typed: only needs .edit()
         guild_clans=["#C1"],
         users_in_clan=users_in_clan,
         guild=interaction.guild,

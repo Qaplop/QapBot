@@ -62,3 +62,33 @@ reportUnknownParameterType = "none"
 reportUnknownLambdaType = "none"
 reportMissingParameterType = "none"
 reportMissingTypeArgument = "none"
+
+# reportPrivateUsage is relaxed project-wide for the same "tried scoping to tests/, pyright
+# breaks import resolution" reason as the reportUnknown* family above (confirmed again here:
+# a `[[tool.pyright.executionEnvironments]]` block scoped to root = "tests" pushed the error
+# count from 676 to 2382 by losing venvPath/venv resolution for every file under that root).
+# tests/ dominates this rule almost entirely (284 of 297 project-wide hits, 2026-09-05 audit):
+# UI/callback tests call a View's private `_on_*` button handler or a module's `_helper`
+# directly to simulate a click/invocation without a full Discord dispatch harness — the
+# deliberate, standard pattern this test suite uses throughout, not a bug. The handful of
+# legitimate cross-module reuses in application code (e.g. web_bridge.py and ui_cwl_roster.py
+# calling ui_cwl_roster.py's/QBdiscocmdshelper_cwl.py's `_send_cwl_enrollment_dm_batch` and
+# similar helpers on purpose, so two code paths can't drift apart) are each suppressed
+# individually at the call site with `# pyright: ignore[reportPrivateUsage]` plus a one-line
+# reason instead, so an accidental encapsulation break in new application code still gets
+# caught — this project-wide relaxation exists for the test-suite pattern, not to blanket-hide
+# the rule everywhere.
+reportPrivateUsage = "none"
+
+# reportUnusedFunction is relaxed project-wide for the same reason, a different framework this
+# time: a pytest fixture (`@pytest.fixture`, autouse or not) and a discord.py event handler
+# (`@client.event`) are both invoked by the framework through runtime name-based dispatch —
+# pytest resolves a fixture by matching a test function's parameter name against the fixture
+# registry; discord.py looks up `on_ready`/etc. by attribute name on the client — neither is a
+# call site pyright's static analysis can see, so it reads as dead code. A 2026-09-05 audit of
+# every reportUnusedFunction hit in tests/ found 19 fixtures/event-handlers (real framework
+# usage, not a bug) and 7 genuinely-dead helper functions (removed that day, not suppressed).
+# Production code gets the same "real dead code, not framework dispatch" treatment when this
+# comes up again — this relaxation just stops the framework-dispatch half from being reported
+# as if it were.
+reportUnusedFunction = "none"

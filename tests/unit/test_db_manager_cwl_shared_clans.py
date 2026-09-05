@@ -22,9 +22,9 @@ async def db(tmp_path):
 
 
 async def _seed_guild_and_clan(db: WarHistoryDB, guild_id: str, clan_tag: str = "#CLAN1") -> None:
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
+    await db._conn.commit()
 
 
 class TestFindCwlClanParticipationAcrossGuilds:
@@ -268,25 +268,27 @@ class TestCwlSharedClanPlayersAssignedMigration:
         try:
             await _seed_guild_and_clan(manager, "100", "#CLAN1")
             event_a = manager.create_cwl_event_sync("100", "2026-09", "d1")
+            assert event_a is not None
             shared_clan_id = manager.create_cwl_shared_clan_sync(
                 "#CLAN1", "2026-09", "100", event_a, "unresolved_first_claimer"
             )
+            assert shared_clan_id is not None
             # Simulate a pre-migration DB: drop the new column and write rows the OLD way, where
             # status='confirmed' alone meant "placed," and status='pending' meant "not placed."
-            await manager.conn.execute("ALTER TABLE cwl_shared_clan_players DROP COLUMN assigned")
-            await manager.conn.execute(
+            await manager._conn.execute("ALTER TABLE cwl_shared_clan_players DROP COLUMN assigned")
+            await manager._conn.execute(
                 "INSERT INTO cwl_shared_clan_players "
                 "(shared_clan_id, player_tag, player_name, dmed_discord_id, status, source, added_by_guild_id) "
                 "VALUES (?, '#PLACED', 'Placed', 'd1', 'confirmed', 'admin_override', '100')",
                 (shared_clan_id,),
             )
-            await manager.conn.execute(
+            await manager._conn.execute(
                 "INSERT INTO cwl_shared_clan_players "
                 "(shared_clan_id, player_tag, player_name, dmed_discord_id, status, source, added_by_guild_id) "
                 "VALUES (?, '#NOT_PLACED', 'NotPlaced', 'd2', 'pending', 'auto_seeded', '100')",
                 (shared_clan_id,),
             )
-            await manager.conn.commit()
+            await manager._conn.commit()
         finally:
             await manager.close()
 

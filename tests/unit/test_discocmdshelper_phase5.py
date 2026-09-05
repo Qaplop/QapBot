@@ -674,7 +674,7 @@ class TestFormatClanManagementRolesPruning:
         with patch("qapbot.cache_manager.CACHE", cache), patch("qapbot.QBdiscocmdshelper.CACHE", cache):
             embed, _, _, _ = await _format_clan_management_roles(guild)
 
-        clan_roles_field_value = embed.fields[-1].value
+        clan_roles_field_value = embed.fields[-1].value or ""
         assert "ORPHANED12" not in clan_roles_field_value
         assert covered_role.mention in clan_roles_field_value
         assert "#ORPHANED12" not in cache.server_config["1"]["clan_roles"]
@@ -776,9 +776,7 @@ class TestFormatClanManagementNotificationsLopsidedUser:
         with patch("qapbot.cache_manager.CACHE", cache), patch("qapbot.QBdiscocmdshelper.CACHE", cache):
             main_embed, unlinked_embed, _, _ = await _format_clan_management_notifications(clan_tag, guild)
 
-        all_embeds = []
-        if main_embed is not None:
-            all_embeds.append(main_embed)
+        all_embeds = [main_embed]
         if isinstance(unlinked_embed, list):
             all_embeds.extend(unlinked_embed)
         elif unlinked_embed is not None:

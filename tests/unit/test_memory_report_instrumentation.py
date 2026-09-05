@@ -12,8 +12,6 @@ from __future__ import annotations
 from typing import Any, Dict
 from unittest.mock import MagicMock
 
-import pytest
-
 from qapbot.QBdiscocmdshelper_admin_command import (
     _build_cache_summary,
     _estimate_dict_size_mb,
@@ -340,7 +338,7 @@ class TestSlotsAndGeneratorWalking:
         cached clan — measured as a 44% over-report before coc.Client was excluded."""
         import asyncio as _asyncio
 
-        import coc as _coc
+        import coc as _coc  # type: ignore[import-untyped]
 
         try:
             _asyncio.get_event_loop()

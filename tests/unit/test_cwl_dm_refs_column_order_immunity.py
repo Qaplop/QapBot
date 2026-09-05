@@ -63,6 +63,7 @@ async def _seed_event_and_dm(db: WarHistoryDB, guild_id: str = "500", season: st
     await db._conn.commit()
 
     event_id = db.create_cwl_event_sync(guild_id, season, "creator")
+    assert event_id is not None
     db.mark_cwl_player_dm_sent_sync(
         PLAYER_TAG, season, "PlayerOne", DMED_DISCORD_ID, event_id, int(guild_id),
         "2026-09-01T09:00Z", message_id=MESSAGE_ID, channel_id=CHANNEL_ID,

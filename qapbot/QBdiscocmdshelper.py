@@ -4396,7 +4396,7 @@ async def _format_clan_management_notifications(clan_tag: str, guild: discord.Gu
         # bug this fix removes. The real ping, with allowed_mentions=..., stays in
         # war_notifications.py where it belongs.
         names_display = ", ".join(
-            (guild.get_member(int(uid)).display_name if guild.get_member(int(uid)) else uid)
+            (member.display_name if (member := guild.get_member(int(uid))) else uid)
             for uid in custodian_ids
         )
     else:

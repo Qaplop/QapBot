@@ -513,8 +513,8 @@ def main() -> None:
     # text on the way in, and raising UnicodeEncodeError (killing the server mid-session) on the
     # way out (tracker item #0027). Force UTF-8 independent of locale/host; errors="replace" on
     # stdin so one malformed byte degrades instead of taking down the read loop.
-    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
-    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
     try:
         asyncio.run(run_stdio_server())
     except KeyboardInterrupt:

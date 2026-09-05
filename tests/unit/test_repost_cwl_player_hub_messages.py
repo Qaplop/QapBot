@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -27,7 +28,7 @@ import QBcore  # noqa: E402
 from qapbot.cache_manager import CACHE  # noqa: E402
 
 
-def _fake_channel(*, guild_name: str = "TestGuild", last_message_id: int = None):
+def _fake_channel(*, guild_name: str = "TestGuild", last_message_id: Optional[int] = None):
     """A MagicMock(spec=discord.TextChannel) so repost_anchored_message()'s isinstance() checks
     pass, with send()/fetch_message()/history() wired to plausible async behavior."""
     channel = MagicMock(spec=discord.TextChannel)

@@ -5,6 +5,7 @@ test-case sign-off loop (including the 👍-reaction shortcut), and the upload-w
 from __future__ import annotations
 
 import os
+from typing import Dict, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -234,6 +235,7 @@ async def test_build_tracker_embed_includes_status_and_environment(db):
     item_number = await _make_item(db, item_type="bug", environment="PROD")
     item = await db.get_tracker_item(item_number)
     embed = build_tracker_embed(item)
+    assert embed.title is not None and embed.description is not None
     assert f"#{item_number:04d}" in embed.title
     assert "Open" in embed.title
     assert "PROD" in embed.description
@@ -244,6 +246,7 @@ async def test_build_tracker_embed_includes_priority(db):
     item_number = await _make_item(db, item_type="bug", priority="HIGH")
     item = await db.get_tracker_item(item_number)
     embed = build_tracker_embed(item)
+    assert embed.title is not None and embed.description is not None
     assert "🔴" in embed.title
     assert "High" in embed.description
 
@@ -263,6 +266,7 @@ async def test_build_tracker_embed_stays_english_regardless_of_guild_language(db
 
     embed = build_tracker_embed(item)
 
+    assert embed.title is not None and embed.description is not None
     assert "Implemented" in embed.title
     assert "Umgesetzt" not in embed.title
     assert "Gemeldet" not in embed.description  # would be the German "reported_by" phrasing
@@ -331,6 +335,7 @@ async def test_build_tracker_embed_defaults_priority_when_missing(db):
     item = dict(item)
     item["priority"] = None
     embed = build_tracker_embed(item)
+    assert embed.title is not None
     assert "🟡" in embed.title
 
 
@@ -340,6 +345,7 @@ async def test_build_tracker_embed_truncates_long_description(db):
     item_number = await _make_item(db, description=long_desc)
     item = await db.get_tracker_item(item_number)
     embed = build_tracker_embed(item)
+    assert embed.description is not None
     assert len(embed.description) < 2000
     assert "full text in thread" in embed.description
 
@@ -375,8 +381,10 @@ def test_modal_clamps_overlong_initial_title_on_edit():
         initial_description="D",
     )
 
-    assert len(modal.title_input.component.default) <= TRACKER_TITLE_MAX_LENGTH
-    assert modal.initial_title == modal.title_input.component.default  # on_submit's change-check stays consistent
+    title_component = cast(discord.ui.TextInput, modal.title_input.component)
+    assert title_component.default is not None
+    assert len(title_component.default) <= TRACKER_TITLE_MAX_LENGTH
+    assert modal.initial_title == title_component.default  # on_submit's change-check stays consistent
 
 
 def test_modal_environment_and_priority_are_radio_groups_not_dropdowns():
@@ -396,7 +404,7 @@ def test_modal_keeps_priority_field_for_both_bug_and_feature():
 
 def test_modal_priority_defaults_to_medium():
     modal = TrackerItemModal("bug", guild_id=None, user_id="1")
-    options = modal.priority_select.component.options
+    options = cast(discord.ui.RadioGroup, modal.priority_select.component).options
     default_values = [o.value for o in options if o.default]
     assert default_values == ["MEDIUM"]
     assert {o.value for o in options} == set(PRIORITY_VALUES)
@@ -404,7 +412,7 @@ def test_modal_priority_defaults_to_medium():
 
 def test_modal_priority_honors_initial_value_on_edit():
     modal = TrackerItemModal("bug", guild_id=None, user_id="1", initial_priority="HIGH")
-    options = modal.priority_select.component.options
+    options = cast(discord.ui.RadioGroup, modal.priority_select.component).options
     default_values = [o.value for o in options if o.default]
     assert default_values == ["HIGH"]
 
@@ -422,9 +430,9 @@ def _edit_modal(item, new_title=None, new_description=None, new_details=None):
         initial_title=item["title"], initial_description=item["description"],
         initial_details=item.get("details") or "",
     )
-    modal.title_input.component._value = new_title if new_title is not None else item["title"]
-    modal.description_input.component._value = new_description if new_description is not None else item["description"]
-    modal.details_input.component._value = new_details if new_details is not None else (item.get("details") or "")
+    cast(discord.ui.TextInput, modal.title_input.component)._value = new_title if new_title is not None else item["title"]
+    cast(discord.ui.TextInput, modal.description_input.component)._value = new_description if new_description is not None else item["description"]
+    cast(discord.ui.TextInput, modal.details_input.component)._value = new_details if new_details is not None else (item.get("details") or "")
     return modal
 
 

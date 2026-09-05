@@ -9,7 +9,6 @@ update_war_records_sync, clan CRUD, and filter-by-month/year in get_clan_history
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
 
 import pytest
 
@@ -25,33 +24,6 @@ async def db(tmp_path: Path) -> WarHistoryDB:  # type: ignore[misc]
         yield manager  # type: ignore[misc]
     finally:
         await manager.close()
-
-
-def _record(
-    *,
-    war_id: str = "W1",
-    date: str = "2026-01-15T12:00:00",
-    tag: str = "#P1",
-    name: str = "Alice",
-    th: int = 15,
-    stars: int = 5,
-    attacks: int = 2,
-    missed: int = 0,
-    max_attacks: int = 2,
-    defensive_stars: int = 1,
-) -> Dict[str, Any]:
-    return {
-        "WarID": war_id,
-        "Date": date,
-        "Player": name,
-        "PlayerID": tag,
-        "TH_lvl": th,
-        "Stars": stars,
-        "Attacks": attacks,
-        "Missed_Attacks": missed,
-        "Max_Attacks": max_attacks,
-        "Defensive_Stars": defensive_stars,
-    }
 
 
 # ---------------------------------------------------------------------------

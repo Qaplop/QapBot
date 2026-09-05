@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -121,6 +122,7 @@ def test_step_indicator_marks_done_current_and_upcoming():
     info = resolve_cwl_phase({"status": "announced"}, [{"participating": 1, "locked_at": None}])
     rendered = render_cwl_step_indicator(info, 1)
 
+    assert rendered is not None
     assert "✅ Setup" in rendered
     assert "✅ Enrollment" in rendered
     assert "🔵 **Preparation**" in rendered   # current step: marker + bold
@@ -140,6 +142,7 @@ def test_step_indicator_war_shows_how_many_clans_actually_started():
     ]
     rendered = render_cwl_step_indicator(resolve_cwl_phase({"status": "war"}, clans), 1)
 
+    assert rendered is not None
     assert "🔵 **War (1/3 started)**" in rendered
 
 
@@ -290,6 +293,7 @@ async def test_no_show_is_dropped_to_the_pool_and_dmed(db, monkeypatch):
     assert result["dropped"] == 1 and result["dm_sent"] == 1
     remaining = {a["player_tag"] for a in db.get_cwl_assignments_sync(event_id)}
     assert remaining == {"#MOVED"}, "only the no-show is dropped"
+    assert sent.await_args is not None
     assert "NoShow" in sent.await_args.args[1]
 
 
@@ -385,17 +389,17 @@ async def test_delete_button_disabled_once_a_clan_started(db):
 
     guild_id = "310"
     await _seed(db, guild_id)
-    event_id = await _event(db, guild_id, [{"clan_tag": "#CLAN1", "cwl_start_at": f"{SEASON}-01T08:00Z"}])
+    await _event(db, guild_id, [{"clan_tag": "#CLAN1", "cwl_start_at": f"{SEASON}-01T08:00Z"}])
 
     view = discord.ui.View(timeout=300)
     add_cwl_management_components(view, int(guild_id))
-    delete = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_delete_season")
+    delete = cast(discord.ui.Button, next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_management_delete_season"))
     assert delete.disabled is False
 
     db.mark_cwl_event_clan_locked_sync("#CLAN1", SEASON)
     view2 = discord.ui.View(timeout=300)
     add_cwl_management_components(view2, int(guild_id))
-    delete2 = next(c for c in view2.children if getattr(c, "custom_id", None) == "cwl_management_delete_season")
+    delete2 = cast(discord.ui.Button, next(c for c in view2.children if getattr(c, "custom_id", None) == "cwl_management_delete_season"))
     assert delete2.disabled is True
 
 
@@ -567,6 +571,7 @@ async def test_send_roster_updates_dms_once_and_clears_pending(db, monkeypatch):
     result = await send_cwl_roster_updates(int(guild_id), SEASON)
 
     assert result["ok"] and result["moved"] == 1 and result["contacted_users"] == 1
+    assert sent.await_args is not None
     body = sent.await_args.args[1]
     assert "Mover" in body
     # Draining it must actually clear the pending state, or the Hub button would never go away.
@@ -594,6 +599,7 @@ async def test_one_user_with_two_changed_accounts_gets_one_dm(db, monkeypatch):
     assert result["moved"] == 1 and result["dropped"] == 1
     assert result["contacted_users"] == 1
     assert sent.await_count == 1, "one person, one DM — never one per account"
+    assert sent.await_args is not None
     body = sent.await_args.args[1]
     assert "Main" in body and "Alt" in body
 
@@ -661,6 +667,7 @@ async def test_late_added_never_contacted_player_gets_one_combined_dm(db, monkey
 
     assert result["new"] == 1
     assert sent.await_count == 1, "one message, not an enrollment DM plus an assignment DM"
+    assert sent.await_args is not None
     assert sent.await_args.kwargs.get("view") is not None, "confirm/opt-out buttons must be attached"
     body = sent.await_args.args[1]
     assert "Latecomer" in body, "the roster half of the combined message"
@@ -689,6 +696,7 @@ async def test_already_enrolled_player_gets_no_confirm_buttons(db, monkeypatch):
     await send_cwl_roster_updates(int(guild_id), SEASON)
 
     assert sent.await_count == 1
+    assert sent.await_args is not None
     assert sent.await_args.kwargs.get("view") is None
 
 
@@ -771,8 +779,8 @@ async def test_coordinator_of_a_participating_clan_gets_board_access(db):
     await _event(db, guild_id, [{"clan_tag": "#CLAN1"}, {"clan_tag": "#CLAN2"}])
     CACHE.server_config[guild_id]["cwl_clan_coordinators"] = {"#CLAN1": ["coord-1"]}
 
-    assert is_cwl_coordinator_for_current_season(int(guild_id), "coord-1") is True
-    assert is_cwl_coordinator_for_current_season(int(guild_id), "nobody") is False
+    assert is_cwl_coordinator_for_current_season(int(guild_id), "coord-1") is True  # type: ignore[arg-type]  # readable placeholder id; function compares via str()
+    assert is_cwl_coordinator_for_current_season(int(guild_id), "nobody") is False  # type: ignore[arg-type]  # readable placeholder id; function compares via str()
 
 
 @pytest.mark.asyncio
@@ -788,4 +796,4 @@ async def test_coordinator_of_a_sitting_out_clan_gets_no_access(db):
                                 {"clan_tag": "#CLAN2", "participating": False}])
     CACHE.server_config[guild_id]["cwl_clan_coordinators"] = {"#CLAN2": ["coord-2"]}
 
-    assert is_cwl_coordinator_for_current_season(int(guild_id), "coord-2") is False
+    assert is_cwl_coordinator_for_current_season(int(guild_id), "coord-2") is False  # type: ignore[arg-type]  # readable placeholder id; function compares via str()

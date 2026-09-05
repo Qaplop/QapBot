@@ -6,7 +6,7 @@ Leader/Co-Leader Discord role (one shared pair of roles per guild, not per-clan)
 from __future__ import annotations
 
 import os
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import discord
 import pytest

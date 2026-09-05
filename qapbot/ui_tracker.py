@@ -31,7 +31,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, cast
 
 import discord
 
@@ -444,7 +444,7 @@ async def _persist_attachment(item_number: int, index: int, pending: Dict[str, A
         return full_path
 
     full_path = await asyncio.to_thread(_write)
-    await CACHE.db_manager.add_tracker_attachment(
+    await CACHE.db_manager.add_tracker_attachment(  # type: ignore[union-attr]
         item_number,
         filename=filename,
         original_name=pending["original_name"],
@@ -461,7 +461,7 @@ async def _build_discord_files(item_number: int) -> List[discord.File]:
     the item message — the on-disk copy under CONFIG.tracker_data_dir is never lost."""
     from qapbot.cache_manager import CACHE
 
-    attachments = await CACHE.db_manager.get_tracker_attachments(item_number)
+    attachments = await CACHE.db_manager.get_tracker_attachments(item_number)  # type: ignore[union-attr]
     files: List[discord.File] = []
     total = 0
     for att in attachments:
@@ -622,9 +622,9 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         self.initial_details = initial_details
         self.predownload_task: Optional['asyncio.Task[List[Dict[str, Any]]]'] = None
         self._localize()
-        self.title_input.component.default = initial_title
-        self.description_input.component.default = initial_description
-        self.details_input.component.default = initial_details
+        cast(discord.ui.TextInput, self.title_input.component).default = initial_title
+        cast(discord.ui.TextInput, self.description_input.component).default = initial_description
+        cast(discord.ui.TextInput, self.details_input.component).default = initial_details
         self._set_priority_options(initial_priority)
         if item_type == "bug":
             self._set_environment_options(initial_environment)
@@ -651,7 +651,7 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
         # Real translation, same reasoning as _localize() above -- these are the modal's own
         # radio-button labels, not the posted record.
         current = _normalize_environment(initial_environment)
-        self.environment_select.component.options = [
+        cast(discord.ui.RadioGroup, self.environment_select.component).options = [
             discord.RadioGroupOption(
                 label=_t_localized(_ENVIRONMENT_LABEL_KEYS[value], user_id=self.user_id, guild_id=self.guild_id),
                 value=value, default=(value == current),
@@ -662,7 +662,7 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
     def _set_priority_options(self, initial_priority: str) -> None:
         # Real translation, same reasoning as _localize() above.
         current = _normalize_priority(initial_priority)
-        self.priority_select.component.options = [
+        cast(discord.ui.RadioGroup, self.priority_select.component).options = [
             discord.RadioGroupOption(
                 label=_t_localized(_PRIORITY_LABEL_KEYS[value], user_id=self.user_id, guild_id=self.guild_id),
                 value=value, default=(value == current),
@@ -673,11 +673,11 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         from qapbot.cache_manager import CACHE
 
-        title_val = self.title_input.component.value.strip()
-        description_val = self.description_input.component.value.strip()
-        details_val = (self.details_input.component.value or "").strip()
-        environment_val = self.environment_select.component.value if self.item_type == "bug" else ""
-        priority_val = _normalize_priority(self.priority_select.component.value)
+        title_val = cast(discord.ui.TextInput, self.title_input.component).value.strip()
+        description_val = cast(discord.ui.TextInput, self.description_input.component).value.strip()
+        details_val = (cast(discord.ui.TextInput, self.details_input.component).value or "").strip()
+        environment_val = (cast(discord.ui.RadioGroup, self.environment_select.component).value or "") if self.item_type == "bug" else ""
+        priority_val = _normalize_priority(cast(discord.ui.RadioGroup, self.priority_select.component).value)
 
         if self.item_number is not None:
             # Editing an already-posted item (Edit button, plan §2.3).
@@ -687,7 +687,7 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
                 or description_val != self.initial_description
                 or details_val != self.initial_details
             )
-            await CACHE.db_manager.update_tracker_item(
+            await CACHE.db_manager.update_tracker_item(  # type: ignore[union-attr]
                 self.item_number,
                 title=title_val, description=description_val,
                 details=details_val or None,
@@ -695,7 +695,7 @@ class TrackerItemModal(discord.ui.Modal, title="Report an item"):
                 priority=priority_val,
                 last_edited_by=str(interaction.user.id), last_edited_at=_now_iso(),
             )
-            item = await CACHE.db_manager.get_tracker_item(self.item_number)
+            item = await CACHE.db_manager.get_tracker_item(self.item_number)  # type: ignore[union-attr]
             if item is not None:
                 await _refresh_item_message(item)
                 # Only a title/description/details change re-posts the thread's "full text"
@@ -856,14 +856,15 @@ class TrackerDraftView(discord.ui.View):
         # this check-and-set is atomic within the event loop since nothing yields first.
         self.submitted = True
         for child in self.children:
-            child.disabled = True
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
         # Editing the message AS the interaction response (not defer-then-edit) is the
         # fastest way to make the buttons visibly vanish (tracker item #0026).
         await interaction.response.edit_message(view=self)
         from qapbot.cache_manager import CACHE
 
         db = CACHE.db_manager
-        item_number = await db.create_tracker_item(
+        item_number = await db.create_tracker_item(  # type: ignore[union-attr]
             item_type=self.item_type, title=self.title_text, description=self.description_text,
             reporter_id=self.reporter_id, reporter_name=self.reporter_name,
             details=self.details_text or None,
@@ -985,14 +986,14 @@ async def create_tracker_item_for_agent(
         title = title[:TRACKER_TITLE_MAX_LENGTH - 1].rstrip() + "…"
 
     db = CACHE.db_manager
-    item_number = await db.create_tracker_item(
+    item_number = await db.create_tracker_item(  # type: ignore[union-attr]
         item_type=item_type, title=title, description=description,
         reporter_id=f"agent:{reporter_name}", reporter_name=reporter_name,
         details=details or None, environment=normalized_environment, priority=normalized_priority,
     )
 
     message, _thread = await _post_tracker_item(item_number, int(channel_id_str))
-    item = await db.get_tracker_item(item_number)
+    item = await db.get_tracker_item(item_number)  # type: ignore[union-attr]
     assert item is not None
     return {"item": item, "jump_url": message.jump_url if message else None}
 
@@ -1055,7 +1056,7 @@ async def _post_tracker_item(item_number: int, channel_id: int) -> Tuple[Optiona
     from qapbot.cache_manager import CACHE
     import QBcore
 
-    item = await CACHE.db_manager.get_tracker_item(item_number)
+    item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
     if item is None:
         return None, None
 
@@ -1076,7 +1077,7 @@ async def _post_tracker_item(item_number: int, channel_id: int) -> Tuple[Optiona
         logging.error(f"[TRACKER] Failed to post item #{item_number}: {e}")
         return None, None
 
-    await CACHE.db_manager.set_tracker_item_message(item_number, channel_id=str(channel_id), message_id=str(message.id))
+    await CACHE.db_manager.set_tracker_item_message(item_number, channel_id=str(channel_id), message_id=str(message.id))  # type: ignore[union-attr]
 
     thread = None
     try:
@@ -1085,7 +1086,7 @@ async def _post_tracker_item(item_number: int, channel_id: int) -> Tuple[Optiona
         # posted unconditionally rather than only when the embed actually truncated, since
         # that keeps this simple and is never wrong either way.
         await _post_full_text_to_thread(thread, item)
-        await CACHE.db_manager.update_tracker_item(item_number, thread_id=str(thread.id))
+        await CACHE.db_manager.update_tracker_item(item_number, thread_id=str(thread.id))  # type: ignore[union-attr]
     except Exception as e:
         logging.warning(f"[TRACKER] Failed to create discussion thread for item #{item_number}: {e}")
 
@@ -1226,7 +1227,7 @@ async def _move_item_to_implemented_channel(item: Dict[str, Any]) -> bool:
 
     # update_tracker_item(), not set_tracker_item_message() — the latter always overwrites
     # thread_id (defaulting to None) and would wipe the jump link above's target.
-    await CACHE.db_manager.update_tracker_item(item_number, channel_id=str(new_channel.id), message_id=str(new_message.id))
+    await CACHE.db_manager.update_tracker_item(item_number, channel_id=str(new_channel.id), message_id=str(new_message.id))  # type: ignore[union-attr]
     return True
 
 
@@ -1278,7 +1279,7 @@ async def _revoke_requestor_access(item: Dict[str, Any], channel_id: str) -> Non
     if not reporter_id.isdigit():
         return
 
-    others = await CACHE.db_manager.list_tracker_items(reporter_id=reporter_id, guild_id=item.get("guild_id"))
+    others = await CACHE.db_manager.list_tracker_items(reporter_id=reporter_id, guild_id=item.get("guild_id"))  # type: ignore[union-attr]
     still_open = any(
         o["item_number"] != item["item_number"] and o.get("channel_id") == channel_id
         and o["status"] not in ("done", "rejected", "duplicate")
@@ -1328,7 +1329,7 @@ async def apply_pending_requestor_access(member: discord.Member) -> None:
         return
     from qapbot.cache_manager import CACHE
 
-    items = await CACHE.db_manager.list_tracker_items(reporter_id=str(member.id), guild_id=str(member.guild.id))
+    items = await CACHE.db_manager.list_tracker_items(reporter_id=str(member.id), guild_id=str(member.guild.id))  # type: ignore[union-attr]
     pending = [
         i for i in items
         if i.get("access_grant_pending") and i["status"] not in ("done", "rejected", "duplicate") and i.get("channel_id")
@@ -1356,7 +1357,7 @@ async def apply_pending_requestor_access(member: discord.Member) -> None:
             logging.warning(f"[TRACKER] Failed to apply pending requestor access for item #{item['item_number']}: {e}")
             continue
 
-        await CACHE.db_manager.update_tracker_item(item["item_number"], access_grant_pending=0)
+        await CACHE.db_manager.update_tracker_item(item["item_number"], access_grant_pending=0)  # type: ignore[union-attr]
         try:
             await member.send(
                 t(
@@ -1377,7 +1378,7 @@ async def apply_status_change(
     from qapbot.cache_manager import CACHE
 
     db = CACHE.db_manager
-    item = await db.get_tracker_item(item_number)
+    item = await db.get_tracker_item(item_number)  # type: ignore[union-attr]
     if item is None:
         raise ValueError(f"tracker item #{item_number} not found")
 
@@ -1391,8 +1392,8 @@ async def apply_status_change(
             fields["implemented_note"] = note
     elif new_status in ("done", "rejected", "duplicate"):
         fields["closed_at"] = _now_iso()
-    await db.update_tracker_item(item_number, **fields)
-    item = await db.get_tracker_item(item_number)
+    await db.update_tracker_item(item_number, **fields)  # type: ignore[union-attr]
+    item = await db.get_tracker_item(item_number)  # type: ignore[union-attr]
     assert item is not None
 
     if new_status in ("done", "rejected", "duplicate"):
@@ -1411,7 +1412,7 @@ async def apply_status_change(
             implemented_channel_id = CACHE.tracker_settings.get(TRACKER_SETTING_IMPLEMENTED_CHANNEL)
             already_archived = bool(implemented_channel_id) and item.get("channel_id") == implemented_channel_id
             await _refresh_item_message(item, archived=already_archived)
-        item = await db.get_tracker_item(item_number)
+        item = await db.get_tracker_item(item_number)  # type: ignore[union-attr]
         assert item is not None
         if moved and original_channel_id:
             await _revoke_requestor_access(item, original_channel_id)
@@ -1428,7 +1429,7 @@ async def post_comment(item_number: int, text: str, author_id: str) -> None:
     from qapbot.cache_manager import CACHE
     import QBcore
 
-    item = await CACHE.db_manager.get_tracker_item(item_number)
+    item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
     if item is None or not item.get("thread_id"):
         raise ValueError(f"tracker item #{item_number} has no discussion thread")
 
@@ -1461,7 +1462,7 @@ async def get_thread_messages(item_number: int, limit: int = 50) -> List[Dict[st
     from qapbot.cache_manager import CACHE
     import QBcore
 
-    item = await CACHE.db_manager.get_tracker_item(item_number)
+    item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
     if item is None:
         raise ValueError(f"tracker item #{item_number} not found")
     if not item.get("thread_id"):
@@ -1568,7 +1569,7 @@ class TrackerItemButton(
     async def callback(self, interaction: discord.Interaction) -> None:
         from qapbot.cache_manager import CACHE
 
-        item = await CACHE.db_manager.get_tracker_item(self.item_number)
+        item = await CACHE.db_manager.get_tracker_item(self.item_number)  # type: ignore[union-attr]
         user_id = str(interaction.user.id)
         guild_id = interaction.guild.id if interaction.guild else None
         if item is None:
@@ -1613,7 +1614,7 @@ class TrackerItemButton(
 
         async def _on_files(pending: List[Dict[str, Any]]) -> None:
             from qapbot.cache_manager import CACHE
-            existing = await CACHE.db_manager.get_tracker_attachments(item_number)
+            existing = await CACHE.db_manager.get_tracker_attachments(item_number)  # type: ignore[union-attr]
             room = MAX_ATTACHMENTS_PER_ITEM - len(existing)
             total = sum(a["size_bytes"] for a in existing)
             next_index = len(existing) + 1
@@ -1623,7 +1624,7 @@ class TrackerItemButton(
                 await _persist_attachment(item_number, next_index, p)
                 total += p["size_bytes"]
                 next_index += 1
-            refreshed = await CACHE.db_manager.get_tracker_item(item_number)
+            refreshed = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
             if refreshed is not None:
                 await _refresh_item_message(refreshed)
 
@@ -1757,7 +1758,7 @@ class TrackerItemButton(
             )
             return
 
-        await CACHE.db_manager.update_tracker_item(self.item_number, access_grant_pending=1)
+        await CACHE.db_manager.update_tracker_item(self.item_number, access_grant_pending=1)  # type: ignore[union-attr]
 
         try:
             await reporter_user.send(
@@ -1876,10 +1877,6 @@ def _format_testcase_lines(item: Dict[str, Any], testcases: List[Dict[str, Any]]
         lines.append("")
     lines.append(t('ui_components.tracker.testcase_signoff_hint', guild_id=guild_id))
     return lines
-
-
-def _format_testcase_message(item: Dict[str, Any], testcases: List[Dict[str, Any]]) -> str:
-    return "\n".join(_format_testcase_lines(item, testcases))
 
 
 # Discord's hard per-message content cap (not configurable, not a guess).
@@ -2054,12 +2051,12 @@ async def post_test_cases(item_number: int, cases: List[Dict[str, str]], actor_i
     import QBcore
 
     db = CACHE.db_manager
-    item = await db.get_tracker_item(item_number)
+    item = await db.get_tracker_item(item_number)  # type: ignore[union-attr]
     if item is None:
         raise ValueError(f"tracker item #{item_number} not found")
 
-    await db.set_tracker_testcases(item_number, cases)
-    testcases = await db.get_tracker_testcases(item_number)
+    await db.set_tracker_testcases(item_number, cases)  # type: ignore[union-attr]
+    testcases = await db.get_tracker_testcases(item_number)  # type: ignore[union-attr]
 
     channel_id_str = item.get("test_channel_id") or CACHE.tracker_settings.get(TRACKER_SETTING_TEST_CHANNEL)
     if channel_id_str and channel_id_str == CACHE.tracker_settings.get(TRACKER_SETTING_DONE_TESTING_CHANNEL):
@@ -2093,8 +2090,8 @@ async def post_test_cases(item_number: int, cases: List[Dict[str, str]], actor_i
     if actor_id:
         fields["last_edited_by"] = actor_id
         fields["last_edited_at"] = _now_iso()
-    await db.update_tracker_item(item_number, **fields)
-    item = await db.get_tracker_item(item_number)
+    await db.update_tracker_item(item_number, **fields)  # type: ignore[union-attr]
+    item = await db.get_tracker_item(item_number)  # type: ignore[union-attr]
     assert item is not None
     await _refresh_item_message(item)
     return item
@@ -2123,7 +2120,7 @@ async def _move_test_message_to_done_testing_channel(item: Dict[str, Any]) -> bo
             logging.error(f"[TRACKER] Could not resolve Done Testing channel for item #{item_number}: {e}")
             return False
 
-    testcases = await CACHE.db_manager.get_tracker_testcases(item_number)
+    testcases = await CACHE.db_manager.get_tracker_testcases(item_number)  # type: ignore[union-attr]
     # Chunked the same way as the live channel (2026-08-23, tracker #0028) — no view= on any
     # chunk here, matching the pre-existing "nothing left to sign off" contract. Posts to
     # new_channel while the OLD tracked message(s) live in the source channel, so this can't
@@ -2141,17 +2138,18 @@ async def _move_test_message_to_done_testing_channel(item: Dict[str, Any]) -> bo
         *_parse_testcase_overflow_ids(item.get("test_overflow_message_ids")),
         *([item["test_message_id"]] if item.get("test_message_id") else []),
     ]
-    try:
-        # This try/except is for resolving old_channel itself (fetch_channel can raise); per-
-        # message delete failures are already swallowed inside _delete_testcase_messages, since
-        # a message already gone is exactly what "moving after a previous partial failure" looks
-        # like and must not block the rest of the move.
-        old_channel = QBcore.bot.get_channel(int(old_channel_id)) or await QBcore.bot.fetch_channel(int(old_channel_id))
-        await _delete_testcase_messages(old_channel, old_message_ids)  # type: ignore[arg-type]
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-        logging.warning(f"[TRACKER] Failed to delete original test-case message(s) for item #{item_number} after move: {e}")
+    if old_channel_id is not None:
+        try:
+            # This try/except is for resolving old_channel itself (fetch_channel can raise); per-
+            # message delete failures are already swallowed inside _delete_testcase_messages, since
+            # a message already gone is exactly what "moving after a previous partial failure" looks
+            # like and must not block the rest of the move.
+            old_channel = QBcore.bot.get_channel(int(old_channel_id)) or await QBcore.bot.fetch_channel(int(old_channel_id))
+            await _delete_testcase_messages(old_channel, old_message_ids)  # type: ignore[arg-type]
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            logging.warning(f"[TRACKER] Failed to delete original test-case message(s) for item #{item_number} after move: {e}")
 
-    await CACHE.db_manager.update_tracker_item(
+    await CACHE.db_manager.update_tracker_item(  # type: ignore[union-attr]
         item_number,
         test_channel_id=str(new_channel.id),
         test_message_id=sent_ids[-1],
@@ -2173,7 +2171,7 @@ async def _refresh_testcase_message(item_number: int) -> None:
     import QBcore
 
     db = CACHE.db_manager
-    item = await db.get_tracker_item(item_number)
+    item = await db.get_tracker_item(item_number)  # type: ignore[union-attr]
     if item is None or not item.get("test_channel_id") or not item.get("test_message_id"):
         return
     channel = QBcore.bot.get_channel(int(item["test_channel_id"]))
@@ -2182,7 +2180,7 @@ async def _refresh_testcase_message(item_number: int) -> None:
             channel = await QBcore.bot.fetch_channel(int(item["test_channel_id"]))
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return
-    testcases = await db.get_tracker_testcases(item_number)
+    testcases = await db.get_tracker_testcases(item_number)  # type: ignore[union-attr]
     archived = item["test_channel_id"] == CACHE.tracker_settings.get(TRACKER_SETTING_DONE_TESTING_CHANNEL)
     view = None if archived else build_tracker_testcase_view(item_number, testcases)
     try:
@@ -2196,7 +2194,7 @@ async def _refresh_testcase_message(item_number: int) -> None:
     # shrank past the 2000-char boundary since the last refresh) genuinely changes the tracked
     # id(s), and the next refresh/repost must see the new ones rather than retrying deleted
     # message ids forever (2026-08-23, tracker #0028).
-    await db.update_tracker_item(
+    await db.update_tracker_item(  # type: ignore[union-attr]
         item_number,
         test_channel_id=str(channel.id),
         test_message_id=new_test_message_id,
@@ -2211,7 +2209,7 @@ async def move_testcases_to_done_channel(item_number: int) -> bool:
     don't need to fetch the item themselves first."""
     from qapbot.cache_manager import CACHE
 
-    item = await CACHE.db_manager.get_tracker_item(item_number)
+    item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
     if item is None:
         return False
     return await _move_test_message_to_done_testing_channel(item)
@@ -2223,7 +2221,7 @@ async def get_linked_item_if_eligible_for_done(item_number: int) -> Optional[Dic
     check shared by every completion path (tracker item #0015 follow-up, 2026-08-22)."""
     from qapbot.cache_manager import CACHE
 
-    item = await CACHE.db_manager.get_tracker_item(item_number)
+    item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
     if item is None or item["status"] in ("done", "rejected", "duplicate"):
         return None
     return item
@@ -2250,13 +2248,13 @@ async def mark_environment_passed_and_refresh(item_number: int, environment: str
     from qapbot.cache_manager import CACHE
 
     db = CACHE.db_manager
-    before = await db.get_tracker_testcases(item_number)
+    before = await db.get_tracker_testcases(item_number)  # type: ignore[union-attr]
     was_fully_passed = bool(before) and all(c["passed"] for c in before)
 
-    await db.mark_tracker_environment_passed(item_number, environment, actor_id)
+    await db.mark_tracker_environment_passed(item_number, environment, actor_id)  # type: ignore[union-attr]
     await _refresh_testcase_message(item_number)
 
-    after = await db.get_tracker_testcases(item_number)
+    after = await db.get_tracker_testcases(item_number)  # type: ignore[union-attr]
     now_fully_passed = bool(after) and all(c["passed"] for c in after)
 
     # 2026-08-23 live bug report: a tester's Pass click that turned out to be a no-op (every case
@@ -2635,7 +2633,7 @@ class TrackerTestMoveDoneButton(
             )
             return
 
-        testcases = await CACHE.db_manager.get_tracker_testcases(self.item_number)
+        testcases = await CACHE.db_manager.get_tracker_testcases(self.item_number)  # type: ignore[union-attr]
         unchecked = [c for c in testcases if not c["passed"]]
         if unchecked:
             await interaction.response.send_message(
@@ -2676,7 +2674,7 @@ async def handle_tracker_test_reaction(payload: discord.RawReactionActionEvent) 
 
     if not CONFIG.tracker_enabled:
         return
-    if payload.emoji.name != "👍" or payload.user_id is None:
+    if payload.emoji.name != "👍":
         return
     from qapbot.cache_manager import CACHE
 

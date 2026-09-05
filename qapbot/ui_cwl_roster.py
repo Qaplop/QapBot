@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -180,7 +181,7 @@ def _make_cwl_settings_channels_callback(view: discord.ui.View):
 
         channel_config_view = ChannelConfigurationView(
             guild=interaction.guild,
-            clan_management_view=view,  # duck-typed: only needs .refresh_cwl_view()
+            clan_management_view=view,  # type: ignore[arg-type]  # duck-typed: only needs .refresh_cwl_view()
             original_interaction=interaction,
             current_channels=current_channels,
             slots=CWL_CONFIG_CHANNEL_SLOTS,
@@ -219,6 +220,7 @@ def _make_cwl_settings_toggle_callback(view: discord.ui.View):
             await interaction.response.defer(thinking=False, ephemeral=False)
             if not interaction.guild:
                 return
+            guild_id_int = interaction.guild.id
             from qapbot.i18n import t
 
             guild_id_str = str(guild_id_int)
@@ -280,6 +282,7 @@ def _make_cwl_settings_toggle_player_hub_callback(view: discord.ui.View):
             await interaction.response.defer(thinking=False, ephemeral=False)
             if not interaction.guild:
                 return
+            guild_id_int = interaction.guild.id
             from qapbot.i18n import t
 
             guild_id_str = str(guild_id_int)
@@ -985,6 +988,8 @@ class CwlCarryOverPromptView(discord.ui.View):
     async def _finish(self, interaction: discord.Interaction, apply_carry_over: bool) -> None:
         if not await _check_cwl_admin_permission(interaction):
             return
+        if not interaction.guild:
+            return
         await self._create_season(interaction.user.id, apply_carry_over)
         # Refresh the screen that originally hosted "Add New Season" (self.parent_view) — same
         # regression fix and same reasoning as _make_cwl_management_add_season_callback's own
@@ -1495,7 +1500,7 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
             # advanced to the new state a few lines further down.
             previous_ids = list(self.saved_coordinators_by_clan.get(self.clan_tag, []))
 
-            await CACHE.db_manager.save_cwl_clan_coordinators(guild_id, self.clan_tag, self.coordinator_ids)
+            await CACHE.db_manager.save_cwl_clan_coordinators(guild_id, self.clan_tag, self.coordinator_ids)  # type: ignore[union-attr]
 
             if guild_id not in CACHE.server_config:
                 CACHE.server_config[guild_id] = {}
@@ -1570,7 +1575,7 @@ class CwlCoordinatorConfigurationView(discord.ui.View):
         identically in both paths.
         """
         from qapbot.i18n import t
-        from qapbot.QBdiscocmdshelper_cwl import _dm_guard_blocks
+        from qapbot.QBdiscocmdshelper_cwl import _dm_guard_blocks  # pyright: ignore[reportPrivateUsage]  # deliberately shared, see docstring above
 
         guild_id_for_t = interaction.guild.id if interaction.guild else None
         if not self._pending_notifications:
@@ -3237,7 +3242,7 @@ async def refresh_cwl_management_hub_message(guild_id: int, mode: Optional[str] 
 
     view = CwlManagementHubView()
     view.clear_items()
-    view._add_toggle_buttons(resolved_mode)
+    view._add_toggle_buttons(resolved_mode)  # pyright: ignore[reportPrivateUsage]
     if resolved_mode == "cwl_settings":
         add_cwl_settings_components(view, guild_id)
     else:

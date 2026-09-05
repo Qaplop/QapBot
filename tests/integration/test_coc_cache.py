@@ -11,7 +11,7 @@ async def test_coc_cache_fresh_hit_does_not_fetch(monkeypatch: pytest.MonkeyPatc
     from qapbot.coc_cache import CoCClanCache
 
     cache = CoCClanCache(soft_ttl_seconds=100, hard_ttl_seconds=200)
-    cache.cache_manager = object()  # minimal truthy placeholder
+    cache.cache_manager = object()  # minimal truthy placeholder  # type: ignore[assignment]
 
     now = datetime.now(timezone.utc)
     cache.cache["#CLAN"] = {"data": "CACHED", "timestamp": now - timedelta(seconds=10)}
@@ -25,7 +25,7 @@ async def test_coc_cache_fresh_hit_does_not_fetch(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(cache, "_fetch_and_cache", _fetch_and_cache)
     # Also avoid the 'client not initialized' check by providing a minimal coc_client
-    cache.cache_manager = type("M", (), {"coc_client": object()})()
+    cache.cache_manager = type("M", (), {"coc_client": object()})()  # type: ignore[assignment]
 
     out = await cache.get_clan("#CLAN")
     assert out == "CACHED"
@@ -38,7 +38,7 @@ async def test_coc_cache_stale_schedules_background_refresh(monkeypatch: pytest.
     from qapbot.coc_cache import CoCClanCache
 
     cache = CoCClanCache(soft_ttl_seconds=5, hard_ttl_seconds=50)
-    cache.cache_manager = type("M", (), {"coc_client": object()})()
+    cache.cache_manager = type("M", (), {"coc_client": object()})()  # type: ignore[assignment]
 
     now = datetime.now(timezone.utc)
     cache.cache["#CLAN"] = {"data": "CACHED", "timestamp": now - timedelta(seconds=10)}
@@ -61,7 +61,7 @@ async def test_coc_cache_expired_forces_blocking_fetch(monkeypatch: pytest.Monke
     from qapbot.coc_cache import CoCClanCache
 
     cache = CoCClanCache(soft_ttl_seconds=5, hard_ttl_seconds=8)
-    cache.cache_manager = type("M", (), {"coc_client": object()})()
+    cache.cache_manager = type("M", (), {"coc_client": object()})()  # type: ignore[assignment]
 
     now = datetime.now(timezone.utc)
     cache.cache["#CLAN"] = {"data": "CACHED", "timestamp": now - timedelta(seconds=30)}

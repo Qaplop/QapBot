@@ -28,10 +28,11 @@ async def db(tmp_path):
 
 
 async def _seed(db: WarHistoryDB, guild_id: str, clan_tag: str) -> int:
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
+    await db._conn.commit()
     event_id = db.create_cwl_event_sync(guild_id, "2026-09", "admin1")
+    assert event_id is not None
     db.set_cwl_event_clans_sync(event_id, [{"clan_tag": clan_tag, "participating": True}])
     return event_id
 
@@ -40,10 +41,10 @@ async def _link(
     db: WarHistoryDB, discord_id: str, player_tag: str, clan_tag=None,
     cwl_permanent_optout: bool = False, cwl_permanent_optin: bool = False,
 ) -> None:
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id)
     )
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO user_players "
         "(discord_id, player_tag, player_name, verified, current_clan_tag, "
         " cwl_permanent_optout, cwl_permanent_optin) "
@@ -53,7 +54,7 @@ async def _link(
             1 if cwl_permanent_optout else 0, 1 if cwl_permanent_optin else 0,
         ),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
 
 class TestNewSignupsAdoptTheGlobalResponse:
@@ -612,8 +613,8 @@ class TestDmBatchRechecksLinkBeforeSending:
         await _link(db, "owner1", "#RACED")
         CACHE.db_manager = db
         # Simulates an admin unlinking the account between pool resolution and the send loop.
-        await db.conn.execute("DELETE FROM user_players WHERE player_tag = ?", ("#RACED",))
-        await db.conn.commit()
+        await db._conn.execute("DELETE FROM user_players WHERE player_tag = ?", ("#RACED",))
+        await db._conn.commit()
 
         async def _fake_dm(evt, gid, season, participant):
             raise AssertionError("must not DM an account unlinked before the send loop reached it")

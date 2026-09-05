@@ -34,7 +34,7 @@ class TestGetHoursUntilWarEnd:
     def test_future_datetime_returns_correct_hours(self):
         """Datetime component is parsed; stale seconds_until is ignored."""
         import datetime as dt
-        future = dt.datetime.utcnow() + dt.timedelta(hours=2)
+        future = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=2)
         end_str = (
             f"<Timestamp time=datetime.datetime({future.year}, {future.month}, {future.day}, "
             f"{future.hour}, {future.minute}, {future.second}) seconds_until=99999>"

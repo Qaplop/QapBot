@@ -3,7 +3,6 @@ Final coverage push to reach 70%.
 Targets the remaining uncovered lines in db_manager and war_notifications.
 """
 # pyright: reportPrivateUsage=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportReturnType=false
-import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,23 +14,6 @@ from qapbot.db_manager import WarHistoryDB
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _make_record(**overrides):
-    rec = {
-        "WarID": "war_1",
-        "Date": "2025-01-01",
-        "Player": "Alice",
-        "PlayerID": "#A1",
-        "TH_lvl": 15,
-        "Stars": 3,
-        "Attacks": 1,
-        "Missed_Attacks": 0,
-        "Max_Attacks": 1,
-        "Defensive_Stars": 0,
-    }
-    rec.update(overrides)
-    return rec
-
 
 async def _init_db(tmp_path):
     """Create and initialize a real WarHistoryDB."""

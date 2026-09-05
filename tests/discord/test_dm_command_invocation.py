@@ -199,6 +199,9 @@ async def test_subscriptions_server_wide_dm_resolves_single_guild(mock_interacti
 class _FakeLeaderboardCache:
     def __init__(self) -> None:
         self.leaderboard_messages: Dict[str, Dict[str, Any]] = {}
+        self.user_accounts: Dict[str, Any] = {}
+        self.clan_families: Dict[str, Any] = {}
+        self.subscriptions: Dict[str, Any] = {}
 
     async def set_leaderboard_message(self, key: str, entry: Dict[str, Any]) -> None:
         self.leaderboard_messages[key] = entry
@@ -302,8 +305,8 @@ async def test_leaderboard_dm_default_text_sends_directly_without_tracking(mock_
     post_leaderboard_mock = AsyncMock()
     monkeypatch.setattr(QBdiscordcmds, "post_leaderboard_to_discord", post_leaderboard_mock)
 
-    await QBdiscordcmds.leaderboard.callback(  # type: ignore[arg-type]
-        mock_interaction, clan="#CLAN1", scope="own",
+    await QBdiscordcmds.leaderboard.callback(
+        mock_interaction, clan="#CLAN1", scope="own",  # type: ignore[arg-type]
     )
 
     # Routed through send_and_track (is_dm-aware), never the guild-channel-typed helper.
@@ -440,7 +443,6 @@ async def test_help_dm_filters_to_dm_available_commands(mock_interaction, monkey
     mock_interaction.followup.send.assert_awaited_once()
     embed = mock_interaction.followup.send.await_args.kwargs.get("embed")
     assert embed is not None
-    field_names = {f.name for f in embed.fields}
     field_values = " ".join(f.value for f in embed.fields)
     # DM-available commands appear...
     assert "/status" in field_values or "status" in field_values
@@ -468,7 +470,7 @@ async def test_help_dm_rejects_detail_request_for_guild_only_command(mock_intera
 async def test_help_command_autocomplete_dm_excludes_guild_only(mock_interaction):
     mock_interaction.guild = None
 
-    choices = await QBdiscordcmds.help_command_autocomplete(mock_interaction, "")
+    choices = await QBdiscordcmds.help_command_autocomplete(mock_interaction, "")  # type: ignore[arg-type]
 
     values = {c.value for c in choices}
     assert "status" in values
@@ -483,7 +485,7 @@ async def test_help_command_autocomplete_guild_includes_all():
     guild_interaction = MagicMock()
     guild_interaction.guild = MagicMock()
 
-    choices = await QBdiscordcmds.help_command_autocomplete(guild_interaction, "")
+    choices = await QBdiscordcmds.help_command_autocomplete(guild_interaction, "")  # type: ignore[arg-type]
 
     values = {c.value for c in choices}
     assert "subscribe" in values
@@ -640,7 +642,7 @@ async def test_leaderboard_clan_autocomplete_dm_offers_all_linked_guilds_clans(m
     import qapbot.cache_manager as cache_manager_module
     monkeypatch.setattr(cache_manager_module, "CACHE", fake_cache)
 
-    choices = await QBdiscordcmds.leaderboard_clan_autocomplete(mock_interaction, "")
+    choices = await QBdiscordcmds.leaderboard_clan_autocomplete(mock_interaction, "")  # type: ignore[arg-type]
 
     values = {c.value for c in choices}
     assert values == {"#CLANA", "#CLANB"}
@@ -659,7 +661,7 @@ async def test_leaderboard_clan_autocomplete_guild_unaffected(mock_interaction, 
     import qapbot.cache_manager as cache_manager_module
     monkeypatch.setattr(cache_manager_module, "CACHE", fake_cache)
 
-    choices = await QBdiscordcmds.leaderboard_clan_autocomplete(mock_interaction, "")
+    choices = await QBdiscordcmds.leaderboard_clan_autocomplete(mock_interaction, "")  # type: ignore[arg-type]
 
     values = {c.value for c in choices}
     assert values == {"#CLANC"}

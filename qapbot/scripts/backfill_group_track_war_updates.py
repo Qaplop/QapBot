@@ -80,7 +80,7 @@ import argparse
 import os
 import sqlite3
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import List
 
 load_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
 if load_path not in sys.path:

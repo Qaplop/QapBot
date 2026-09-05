@@ -325,7 +325,7 @@ class ClanManagementView(discord.ui.View):
         # through the anchored CWL Management Hub message must be able to update this ephemeral
         # session too, not just itself) — see CACHE.cwl_settings_open_view's own docstring
         # (cache_manager.py) for the full design and its single-slot-per-guild limitation.
-        if mode in ("cwl_settings", "cwl_management") and sent_message is not None and sent_message.guild is not None:
+        if mode in ("cwl_settings", "cwl_management") and sent_message.guild is not None:
             from qapbot.cache_manager import CACHE
             CACHE.cwl_settings_open_view[str(sent_message.guild.id)] = self
 
@@ -1312,6 +1312,9 @@ class ClanManagementView(discord.ui.View):
 
         await interaction.response.defer(thinking=True, ephemeral=True)
 
+        if not interaction.guild:
+            return
+
         # Fetch a fresh linked-players list for this clan (self.linked_players isn't
         # tracked on the view — only unlinked_players is — so re-derive it here, same
         # as every other refresh path in this view does via format_clan_management_message)
@@ -1446,6 +1449,9 @@ class ClanManagementView(discord.ui.View):
             return
 
         await interaction.response.defer(thinking=True, ephemeral=True)
+
+        if not interaction.guild:
+            return
 
         from qapbot.cache_manager import CACHE
         from qapbot.i18n import t
@@ -2521,7 +2527,7 @@ class ClanManagementView(discord.ui.View):
             timeout=300
         )
         
-        header_msg = channel_config_view._format_header()
+        header_msg = channel_config_view._format_header()  # pyright: ignore[reportPrivateUsage]
         
         # Use followup.send() to get a proper discord.Message object
         msg = await interaction.followup.send(
@@ -3844,7 +3850,7 @@ class CustodianConfigurationView(discord.ui.View):
 
         guild_id = str(self.guild.id)
 
-        await CACHE.db_manager.save_guild_clan_custodians(guild_id, self.clan_tag, self.custodian_ids)
+        await CACHE.db_manager.save_guild_clan_custodians(guild_id, self.clan_tag, self.custodian_ids)  # type: ignore[union-attr]
 
         if guild_id not in CACHE.server_config:
             CACHE.server_config[guild_id] = {}
@@ -4905,7 +4911,7 @@ class CwlLineupRemovalConfirmView(discord.ui.View):
 
         from qapbot.cache_manager import CACHE
 
-        await self.member_clans_view._apply_member_clans_changes(interaction)
+        await self.member_clans_view._apply_member_clans_changes(interaction)  # pyright: ignore[reportPrivateUsage]
 
         db = CACHE.db_manager
         if db is not None:

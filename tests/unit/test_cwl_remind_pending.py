@@ -26,24 +26,25 @@ async def db(tmp_path):
 
 
 async def _seed(db: WarHistoryDB, guild_id: str, clan_tag: str) -> int:
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
+    await db._conn.commit()
     event_id = db.create_cwl_event_sync(guild_id, "2026-09", "admin1")
+    assert event_id is not None
     db.set_cwl_event_clans_sync(event_id, [{"clan_tag": clan_tag, "participating": True}])
     return event_id
 
 
 async def _link(db: WarHistoryDB, discord_id: str, player_tag: str, optout: bool = False) -> None:
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id)
     )
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO user_players (discord_id, player_tag, player_name, verified, cwl_permanent_optout) "
         "VALUES (?, ?, ?, 0, ?)",
         (discord_id, player_tag, f"Player-{player_tag}", int(optout)),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
 
 # ---------------------------------------------------------------------------

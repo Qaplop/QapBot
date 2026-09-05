@@ -704,7 +704,7 @@ def check_database_consistency(db_path: str, data_dir: str, include_integrity: b
     """
     from qapbot.cache_manager import CACHE
     
-    results = {
+    results: Dict[str, Any] = {
         'integrity_ok': False,
         'integrity_errors': [],
         'duplicate_wars': {},

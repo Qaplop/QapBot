@@ -13,7 +13,7 @@ polling pressure, while the cap still bounds memory in every case.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any, Dict, Set
+from typing import Any, Set
 from unittest.mock import MagicMock
 
 import pytest

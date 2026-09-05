@@ -300,8 +300,7 @@ def get_namespace(namespace: str, language: Optional[str] = None) -> Dict[str, s
 
     Returns `{}` for a namespace that doesn't exist in either language — never raises.
     """
-    if not _translation_manager._loaded:
-        _translation_manager.load_translations()
+    _translation_manager.load_translations()
     if language is None:
         language = _translation_manager.default_language
 

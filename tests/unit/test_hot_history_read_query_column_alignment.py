@@ -52,8 +52,8 @@ async def _rebuild_history_war_attacks_with_real_drift_order(db: WarHistoryDB) -
     come first and `map_position`/`defender_th`/`defender_map_position`/`duration`/`is_fresh`/
     `times_defended`/`best_def_destruction` are appended at the end instead — i.e. a real,
     already-observed divergence, not a hypothetical one."""
-    await db.conn.execute("DROP TABLE history.war_attacks")
-    await db.conn.execute("""
+    await db._conn.execute("DROP TABLE history.war_attacks")
+    await db._conn.execute("""
         CREATE TABLE history.war_attacks (
             id                     INTEGER PRIMARY KEY AUTOINCREMENT,
             war_id                 TEXT    NOT NULL,
@@ -80,7 +80,7 @@ async def _rebuild_history_war_attacks_with_real_drift_order(db: WarHistoryDB) -
             UNIQUE(war_id, player_tag, attack_order)
         )
     """)
-    await db.conn.commit()
+    await db._conn.commit()
 
 
 @pytest.mark.integration
@@ -95,14 +95,14 @@ class TestReadQueriesSurviveHistoryColumnDrift:
 
             # A CWL attack (max_attacks=1) old enough to have already migrated to `history` —
             # named columns on INSERT, so this is correct regardless of physical order.
-            await db.conn.execute(
+            await db._conn.execute(
                 "INSERT INTO history.war_attacks "
                 "(war_id, clan_tag, date, player_name, player_tag, th_level, attack_order, "
                 " stars, max_attacks, missed_attacks, defensive_stars) "
                 "VALUES ('war_1', '#CLAN', '2020-01-01', 'Butterblume', '#P1', 18, 1, "
                 " 3, 1, 0, 2)",
             )
-            await db.conn.commit()
+            await db._conn.commit()
 
             records = db.get_player_attack_history_sync(["#P1"], month=1, year=2020)
             assert len(records) == 1
@@ -126,14 +126,14 @@ class TestReadQueriesSurviveHistoryColumnDrift:
         try:
             await _rebuild_history_war_attacks_with_real_drift_order(db)
 
-            await db.conn.execute(
+            await db._conn.execute(
                 "INSERT INTO history.war_attacks "
                 "(war_id, clan_tag, date, player_name, player_tag, th_level, attack_order, "
                 " stars, max_attacks, missed_attacks, defensive_stars) "
                 "VALUES ('war_2', '#CLAN', '2020-02-01', 'Killer', '#P2', 17, 1, "
                 " 2, 1, 0, 1)",
             )
-            await db.conn.commit()
+            await db._conn.commit()
 
             records = db.get_clan_attack_history_sync("#CLAN", month=2, year=2020)
             assert len(records) == 1

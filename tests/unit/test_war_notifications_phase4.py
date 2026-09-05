@@ -2,7 +2,6 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock
 

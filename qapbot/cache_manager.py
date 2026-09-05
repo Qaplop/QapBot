@@ -1699,7 +1699,7 @@ class CacheManager:
         last_error: Optional[Exception] = None
         for attempt in range(1, DM_SEND_MAX_RETRIES + 1):
             try:
-                sent_message = await user.send(message, view=view, embed=embed)
+                sent_message = await user.send(message, view=view, embed=embed)  # type: ignore[arg-type]
                 if sent_message_out is not None:
                     sent_message_out.append(sent_message)
                 # Preview is truncated, not the full message, to keep this readable and avoid
@@ -1809,9 +1809,8 @@ class CacheManager:
                 _fetch_player,
                 operation_name=f"get_player({normalized_tag})"
             )
-            if player is not None:
-                player_cache[normalized_tag] = (player, time.time())
-                self._enforce_player_cache_cap()
+            player_cache[normalized_tag] = (player, time.time())
+            self._enforce_player_cache_cap()
             return player
 
         except Exception as e:

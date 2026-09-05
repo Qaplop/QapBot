@@ -110,7 +110,7 @@ _API_STATE = {
 
 def reconstruct_war(payload: Dict[str, Any], client: Any) -> Any:
     _raw_state = str(payload.get("state") or "in_war")
-    api = {
+    api: Dict[str, Any] = {
         "state": _API_STATE.get(_raw_state, _raw_state),
         "teamSize": payload.get("team_size") or 0,
         "attacksPerMember": payload.get("attacks_per_member") or 2,

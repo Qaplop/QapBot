@@ -290,7 +290,7 @@ def _build_clan_config_payload_sync(guild_id: int) -> Dict[str, Any]:
 
     def _owner_row_for(owner_event_id: int, clan_tag: str) -> Optional[Dict[str, Any]]:
         if owner_event_id not in owner_clan_rows_cache:
-            owner_clan_rows_cache[owner_event_id] = {r["clan_tag"]: r for r in db.get_cwl_event_clans_sync(owner_event_id)}
+            owner_clan_rows_cache[owner_event_id] = {r["clan_tag"]: r for r in db.get_cwl_event_clans_sync(owner_event_id)}  # type: ignore[union-attr]
         return owner_clan_rows_cache[owner_event_id].get(clan_tag)
 
     clans: List[Dict[str, Any]] = []
@@ -831,7 +831,7 @@ async def notify_new_cwl_pool_members(guild_id: int, season: str) -> Dict[str, A
     so the two drifted, and tracker #0079 caught it live (the line said 1, the action listed 2).
     Shared resolution beats shared intent."""
     from qapbot.QBdiscocmdshelper_cwl import (
-        _send_cwl_enrollment_dm_batch,
+        _send_cwl_enrollment_dm_batch,  # pyright: ignore[reportPrivateUsage]  # deliberately shared with start_cwl_enrollment, see docstring above
         resolve_cwl_pool_dm_targets_sync,
         resolve_cwl_pool_tags_missing_dm_sync,
         resolve_seeded_cwl_signup_status,
@@ -911,8 +911,8 @@ async def remind_pending_cwl_players(guild_id: int, season: str) -> Dict[str, An
     not a reuse of resolve_cwl_pool_dm_targets_sync — that one's global dm_sent dedup would skip
     everyone already DMed, which is precisely who this action needs to re-reach."""
     from qapbot.QBdiscocmdshelper_cwl import (
-        _dm_guard_blocks,
-        _retract_enrollment_dms_for_tags,
+        _dm_guard_blocks,  # pyright: ignore[reportPrivateUsage]  # deliberately shared with QBdiscocmdshelper_cwl's own DM-sending paths
+        _retract_enrollment_dms_for_tags,  # pyright: ignore[reportPrivateUsage]
         resolve_cwl_pending_reminder_targets_sync,
         send_cwl_reminder_dm_group,
     )
@@ -1033,7 +1033,6 @@ def _search_cwl_guests_sync(guild_id: int, query: str) -> List[Dict[str, Any]]:
     round-robining one-of-each into the final list) guarantees both kinds of matches are visible
     without scrolling through a wall of same-type rows first. Doesn't apply to the `@`-restricted
     path since that's single-type by construction."""
-    from qapbot.config import CONFIG
     from qapbot.QBdiscocmdshelper_cwl import resolve_cwl_pool_clan_tags_sync, resolve_selected_cwl_season
 
     db = CACHE.db_manager
@@ -1154,9 +1153,8 @@ def _search_cwl_guests_sync(guild_id: int, query: str) -> List[Dict[str, Any]]:
         # PLAYER_NAME_INDEX_RETIREMENT_PLAN.md Steps 5-6, once DEV+PROD burn-in confirmed parity
         # with the retired in-memory scan) — index-backed on player_name_search's own PK, no
         # in-memory scan at all.
-        if db is not None:
-            for match in db.search_player_tags_by_prefix_sync(upper_query, limit=GUEST_SEARCH_CAP):
-                player_hits.setdefault(match["player_tag"], match)
+        for match in db.search_player_tags_by_prefix_sync(upper_query, limit=GUEST_SEARCH_CAP):
+            player_hits.setdefault(match["player_tag"], match)
         # A tag typed exactly that the index doesn't know about at all — still offered as a raw
         # hit (name falls back to the tag itself) so the admin can add it directly. Marked
         # `unverified` so handle_get_cwl_guest_search() can tell "the DB found nothing real" from
@@ -1320,7 +1318,7 @@ async def _resolve_guest_tag_via_coc_api(guild_id: int, query: str) -> Optional[
     player_name_index entry finds nothing "real" in the DB and falls through to here). Callers
     keep whatever the DB search produced in that case (including its raw unverified placeholder),
     so an API outage degrades to exactly the pre-2026-08-20 behavior."""
-    import coc
+    import coc  # type: ignore[import-untyped]
 
     from qapbot.QBdiscocmdshelper import normalize_clan_tag
 
@@ -1633,7 +1631,7 @@ async def handle_post_cwl_player_prefs_status(request: web.Request) -> web.Respo
         return web.json_response({"error": f"unsupported action '{action}'"}, status=400)
 
     from qapbot.QBdiscocmdshelper_cwl import get_current_cwl_event_sync
-    from qapbot.ui_cwl_roster import _apply_cwl_signup_response, rerender_cwl_dm_after_response
+    from qapbot.ui_cwl_roster import _apply_cwl_signup_response, rerender_cwl_dm_after_response  # pyright: ignore[reportPrivateUsage]  # deliberately shared, see comment above
 
     event = await asyncio.to_thread(get_current_cwl_event_sync, guild_id)
     if event is None:
@@ -1908,7 +1906,7 @@ async def handle_post_cwl_enrollment_status(request: web.Request) -> web.Respons
     from datetime import datetime, timezone
 
     from qapbot.QBdiscocmdshelper_cwl import (
-        _send_cwl_enrollment_dm_batch,
+        _send_cwl_enrollment_dm_batch,  # pyright: ignore[reportPrivateUsage]  # deliberately shared, see docstring above
         cleanup_stale_cwl_enrollment_dms,
         propagate_cwl_player_response,
         resolve_selected_cwl_season,
@@ -2299,7 +2297,7 @@ async def handle_post_cwl_enrollment_guest(request: web.Request) -> web.Response
         # A guest invited AFTER they already answered another guild's DM must show that real
         # response, not a fresh 'pending' contradicting it (rule h) — same seeding
         # start_cwl_enrollment does. 2026-08-22.
-        from qapbot.QBdiscocmdshelper_cwl import _seed_status_from_global_sync
+        from qapbot.QBdiscocmdshelper_cwl import _seed_status_from_global_sync  # pyright: ignore[reportPrivateUsage]  # deliberately shared with start_cwl_enrollment's own seeding, see comment above
 
         db.upsert_cwl_signup_sync(
             event["id"], player_tag, player_name, guest_discord_id, None,
@@ -3327,6 +3325,8 @@ async def handle_post_tracker_testcase_pass(request: web.Request) -> web.Respons
 
     result = await mark_environment_passed_and_refresh(item_number, environment, _tracker_admin_label(request))
     item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
+    if item is None:
+        return web.json_response({"error": "not found"}, status=404)
     testcases = await CACHE.db_manager.get_tracker_testcases(item_number)  # type: ignore[union-attr]
     linked_item = result.get("linked_item")
     return web.json_response({
@@ -3353,6 +3353,8 @@ async def handle_post_tracker_testcase_fail(request: web.Request) -> web.Respons
 
     await mark_testing_failed(item_number, _tracker_admin_label(request))
     item = await CACHE.db_manager.get_tracker_item(item_number)  # type: ignore[union-attr]
+    if item is None:
+        return web.json_response({"error": "not found"}, status=404)
     return web.json_response({"ok": True, "item": dict(item)})
 
 

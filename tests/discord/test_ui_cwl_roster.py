@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -44,10 +44,10 @@ def _bypass_cwl_admin_check(monkeypatch):
 
 
 async def _seed_guild_and_clans(db: WarHistoryDB, guild_id: str, clan_tags: Dict[str, str]) -> None:
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
     for tag, name in clan_tags.items():
-        await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (tag, name))
-    await db.conn.commit()
+        await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (tag, name))
+    await db._conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +196,7 @@ async def test_format_clan_management_message_dispatches_cwl_management(monkeypa
     guild.id = 556
     guild.name = "Test Guild"
 
-    embed, secondary, linked, unlinked = await format_clan_management_message("#CLAN1", guild, mode="cwl_management")
+    embed, _, _, _ = await format_clan_management_message("#CLAN1", guild, mode="cwl_management")
 
     assert isinstance(embed, discord.Embed)
     assert "CWL Management" in (embed.title or "")
@@ -266,7 +266,7 @@ def test_player_hub_toggle_button_present_disabled_state():
 
     add_cwl_settings_components(view, 557)
 
-    button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_player_hub")
+    button = cast(discord.ui.Button, next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_player_hub"))
     assert button.label == "Activate Player CWL Settings Hub Message"
     assert button.style == discord.ButtonStyle.success  # tracker #0067: activate = green
 
@@ -281,7 +281,7 @@ def test_player_hub_toggle_button_present_enabled_state():
 
     add_cwl_settings_components(view, 558)
 
-    button = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_player_hub")
+    button = cast(discord.ui.Button, next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_settings_toggle_player_hub"))
     assert button.label == "Deactivate Player CWL Settings Hub Message"
     assert button.style == discord.ButtonStyle.danger  # tracker #0067: deactivate = red
 
@@ -315,7 +315,7 @@ def test_toggle_button_color_reflects_its_own_action_not_current_state(
 
         add_cwl_settings_components(view, guild_id)
 
-        button = next(c for c in view.children if getattr(c, "custom_id", None) == custom_id)
+        button = cast(discord.ui.Button, next(c for c in view.children if getattr(c, "custom_id", None) == custom_id))
         assert button.style == expected_style
         if expected_prefix is not None:
             assert button.label.startswith(expected_prefix)  # type: ignore[union-attr]
@@ -707,7 +707,7 @@ async def test_channel_configuration_view_apply_refreshes_hub_and_closes_ephemer
 
     config_view = ChannelConfigurationView(
         guild=mock_interaction.guild,
-        clan_management_view=hub_view,
+        clan_management_view=hub_view,  # type: ignore[arg-type]  # duck-typed: only needs .refresh_cwl_view()
         original_interaction=mock_interaction,
         current_channels={"cwl_management": None},
         slots=CWL_CONFIG_CHANNEL_SLOTS,
@@ -758,7 +758,7 @@ async def test_channel_apply_triggers_immediate_repost_for_cwl_slots(db, mock_in
 
     config_view = ChannelConfigurationView(
         guild=mock_interaction.guild,
-        clan_management_view=hub_view,
+        clan_management_view=hub_view,  # type: ignore[arg-type]  # duck-typed: only needs .refresh_cwl_view()
         original_interaction=mock_interaction,
         current_channels={"cwl_management": None, "cwl_player_hub": None},
         slots=CWL_CONFIG_CHANNEL_SLOTS,
@@ -1284,7 +1284,7 @@ def test_get_clan_war_league_reads_from_clan_name_cache():
     CACHE.clan_name_cache = {
         "#CLAN1": {"name": "Alpha", "war_league": "Crystal League I"},
         "#CLAN2": {"name": "Beta"},  # never synced a war_league yet
-        "#CLAN3": "LegacyStringFormat",  # pre-dict cache format
+        "#CLAN3": "LegacyStringFormat",  # type: ignore[dict-item]  # pre-dict cache format
     }
 
     assert CACHE.get_clan_war_league("#CLAN1") == "Crystal League I"
@@ -1385,7 +1385,8 @@ async def test_format_clan_management_cwl_management_sorts_by_tier_and_renders_c
 
     embed, _, _, _ = await format_clan_management_cwl_management(guild)
 
-    clans_field = next(f for f in embed.fields if "Clan" in f.name)
+    clans_field = next(f for f in embed.fields if "Clan" in (f.name or ""))
+    assert clans_field.value is not None
     # Champion (higher tier) must be listed before Bronze.
     assert clans_field.value.index("Champion Clan") < clans_field.value.index("Bronze Clan")
     # Monospaced code-block table, not bullet lines.
@@ -1422,7 +1423,8 @@ async def test_format_clan_management_cwl_management_shifts_start_time_by_guild_
 
     embed, _, _, _ = await format_clan_management_cwl_management(guild)
 
-    clans_field = next(f for f in embed.fields if "Clan" in f.name)
+    clans_field = next(f for f in embed.fields if "Clan" in (f.name or ""))
+    assert clans_field.value is not None
     assert "CWL Start (IST)" in clans_field.value  # abbreviation, not the full zone name
     assert "26-05-01 15:30" in clans_field.value  # 10:00 UTC + 5:30
 
@@ -1454,7 +1456,8 @@ async def test_format_clan_management_cwl_management_applies_dst_correctly(db):
 
     embed, _, _, _ = await format_clan_management_cwl_management(guild)
 
-    clans_field = next(f for f in embed.fields if "Clan" in f.name)
+    clans_field = next(f for f in embed.fields if "Clan" in (f.name or ""))
+    assert clans_field.value is not None
     assert "26-09-01 12:00" in clans_field.value  # summer: UTC+2
     assert "26-11-01 11:00" in clans_field.value  # winter: UTC+1
 
@@ -1534,6 +1537,7 @@ async def test_cwl_delete_season_confirm_view_retracts_stale_enrollment_dms(db, 
 
     cleanup_mock.assert_awaited_once()
     call_args = cleanup_mock.await_args
+    assert call_args is not None
     assert call_args.args[0] is mock_interaction.client
     assert call_args.args[1] == [
         {"player_tag": "#P1", "dmed_discord_id": "10", "message_id": "msg1", "channel_id": "chan1"}
@@ -2574,6 +2578,7 @@ class TestCwlSignupResponseButton:
         from qapbot.ui_cwl_roster import CWL_SIGNUP_RESPONSE_TEMPLATE, CwlSignupResponseButton
 
         match = re.match(CWL_SIGNUP_RESPONSE_TEMPLATE, "cwl:signup:optout:7:#ZZZ1")
+        assert match is not None
         item = await CwlSignupResponseButton.from_custom_id(MagicMock(), MagicMock(), match)
         assert item.action == "optout"
         assert item.event_id == 7
@@ -2933,6 +2938,7 @@ class TestCwlReminderResponseButton:
         from qapbot.ui_cwl_roster import CWL_REMINDER_RESPONSE_TEMPLATE, CwlReminderResponseButton
 
         match = re.match(CWL_REMINDER_RESPONSE_TEMPLATE, "cwl:remind:optout:7:#ZZZ1")
+        assert match is not None
         item = await CwlReminderResponseButton.from_custom_id(MagicMock(), MagicMock(), match)
         assert item.action == "optout"
         assert item.event_id == 7
@@ -3145,7 +3151,6 @@ async def test_clan_management_view_refresh_cwl_view_also_refreshes_the_hub(monk
     CWL Management Hub message (entry point b) stale — this is the actual live-testing gap the
     project owner reported."""
     from qapbot.cache_manager import CACHE
-    from qapbot.QBdiscocmdshelper import format_clan_management_message
     from qapbot.ui_clan_management import ClanManagementView
 
     CACHE.server_config["9210"] = {}
@@ -3182,7 +3187,7 @@ async def test_clan_management_view_refresh_cwl_view_also_refreshes_the_hub(monk
 # ---------------------------------------------------------------------------
 
 async def _seed_cwl_war(
-    db, clan_tag: str, players: list, date: str = "2026-07-01T08:00", war_id: str = None,
+    db, clan_tag: str, players: list, date: str = "2026-07-01T08:00", war_id: Optional[str] = None,
     attack_order: int = 1,
 ) -> None:
     """Seeds one CWL war_summary row plus one war_attacks row per player. attack_order defaults
@@ -3411,7 +3416,7 @@ def test_league_weight_unknown_tier_returns_baseline():
 
 async def _seed_cwl_attack_with_league(
     db, clan_tag: str, cwl_season: str, league_rank: str, player_tag: str, stars: int,
-    date: str = "2026-07-01T08:00", war_id: str = None, league_group_id: str = None,
+    date: str = "2026-07-01T08:00", war_id: Optional[str] = None, league_group_id: Optional[str] = None,
 ) -> None:
     """Seeds one CWL war_attacks row plus the league-reconstruction chain
     (cwl_league_rounds -> cwl_league_groups) get_recent_cwl_attacks_with_league_sync() needs."""
@@ -3639,7 +3644,7 @@ def test_cwl_player_hub_view_constructs_with_exactly_one_button():
     view = CwlPlayerHubView()
 
     assert len(view.children) == 1
-    button = view.children[0]
+    button = cast(discord.ui.Button, view.children[0])
     assert button.custom_id == "cwl_player_hub_open_prefs"
     assert button.label == "Your CWL Preferences"
     assert button.style == discord.ButtonStyle.primary
@@ -4336,13 +4341,13 @@ def test_notify_button_starts_disabled_and_enables_after_a_change_is_recorded():
     view = CwlCoordinatorConfigurationView(
         guild=guild, clan_tags=["#CLAN1"], current_coordinator_ids_by_clan={"#CLAN1": []},
     )
-    notify = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_coordinator_notify")
+    notify = cast(discord.ui.Button, next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_coordinator_notify"))
     assert notify.disabled is True
 
     view._record_pending_notification("#CLAN1", [], ["111"])
     view._rebuild_view()
 
-    notify = next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_coordinator_notify")
+    notify = cast(discord.ui.Button, next(c for c in view.children if getattr(c, "custom_id", None) == "cwl_coordinator_notify"))
     assert notify.disabled is False
 
 

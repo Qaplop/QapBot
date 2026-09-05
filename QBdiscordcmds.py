@@ -1564,10 +1564,26 @@ async def admin(
             return
 
         class WarPredictModal(discord.ui.Modal, title="War Prediction"):
-            clan1 = discord.ui.TextInput(label="Clan 1 Tag (treated as \"our\" clan)", placeholder="#CLAN1TAG", max_length=15)  # type: ignore[var-annotated]
-            clan2 = discord.ui.TextInput(label="Clan 2 Tag (opponent)", placeholder="#CLAN2TAG", max_length=15)  # type: ignore[var-annotated]
-            participants = discord.ui.TextInput(label="Players per side (e.g. 5, 10, 15)", placeholder="15", max_length=3, required=False)  # type: ignore[var-annotated]
-            attacks_input = discord.ui.TextInput(label="Attacks per player (2 = regular CW, 1 = CWL)", placeholder="2", max_length=1, required=False)  # type: ignore[var-annotated]
+            # Label-wrapped (discord.py 2.7+): TextInput.label's getter/setter are deprecated in
+            # favor of wrapping in discord.ui.Label, which now supplies the visible label instead
+            # (same idiom as qapbot/ui_tracker.py's TrackerItemModal). Every touch-point below
+            # moved under `.component` accordingly (`.value`).
+            clan1 = discord.ui.Label(
+                text="Clan 1 Tag (treated as \"our\" clan)",
+                component=discord.ui.TextInput(placeholder="#CLAN1TAG", max_length=15),
+            )
+            clan2 = discord.ui.Label(
+                text="Clan 2 Tag (opponent)",
+                component=discord.ui.TextInput(placeholder="#CLAN2TAG", max_length=15),
+            )
+            participants = discord.ui.Label(
+                text="Players per side (e.g. 5, 10, 15)",
+                component=discord.ui.TextInput(placeholder="15", max_length=3, required=False),
+            )
+            attacks_input = discord.ui.Label(
+                text="Attacks per player (2 = regular CW, 1 = CWL)",
+                component=discord.ui.TextInput(placeholder="2", max_length=1, required=False),
+            )
 
             async def on_submit(self, modal_interaction: discord.Interaction) -> None:
                 if not await _safe_defer(modal_interaction, thinking=True, ephemeral=True):
@@ -1575,8 +1591,8 @@ async def admin(
                 from qapbot.QBdiscocmdshelper import normalize_clan_tag as _norm
                 guild_id = modal_interaction.guild.id if modal_interaction.guild else None
 
-                tag1 = _norm(str(self.clan1.value))  # type: ignore[attr-defined]
-                tag2 = _norm(str(self.clan2.value))  # type: ignore[attr-defined]
+                tag1 = _norm(str(self.clan1.component.value))  # type: ignore[attr-defined]
+                tag2 = _norm(str(self.clan2.component.value))  # type: ignore[attr-defined]
                 if not tag1:
                     await modal_interaction.followup.send(
                         t('commands.errors.invalid_clan_tag_format', guild_id=guild_id), ephemeral=True
@@ -1588,7 +1604,7 @@ async def admin(
                     )
                     return
 
-                raw_n = str(self.participants.value).strip()  # type: ignore[attr-defined]
+                raw_n = str(self.participants.component.value).strip()  # type: ignore[attr-defined]
                 try:
                     n_players = int(raw_n)
                     if n_players < 1 or n_players > 50:
@@ -1599,7 +1615,7 @@ async def admin(
                 # tracker #0068: regular CW is 2 attacks per member, CWL is 1 -- blank/anything
                 # but "1" defaults to the more common regular-CW case, matching this field's
                 # placeholder of "2".
-                raw_apm = str(self.attacks_input.value).strip()  # type: ignore[attr-defined]
+                raw_apm = str(self.attacks_input.component.value).strip()  # type: ignore[attr-defined]
                 apm = 1 if raw_apm == "1" else 2
 
                 from QBhelperfunctions import predict_war_between_clans  # type: ignore[attr-defined]
@@ -3430,7 +3446,7 @@ async def cwl_preferences(interaction: discord.Interaction) -> None:
     docstring (ui_cwl_roster.py) — a slash-command interaction is subject to the exact same rule
     every component-click caller of it already follows.
     """
-    from qapbot.ui_cwl_roster import _launch_cwl_activity
+    from qapbot.ui_cwl_roster import _launch_cwl_activity  # pyright: ignore[reportPrivateUsage]  # deliberately shared, see docstring above
 
     if interaction.guild is None:
         return

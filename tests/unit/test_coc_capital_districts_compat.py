@@ -16,7 +16,7 @@ key to an empty district list is lossless for this bot.
 # pyright: reportPrivateUsage=false, reportUnknownMemberType=false, reportMissingParameterType=false, reportUnknownVariableType=false, reportAttributeAccessIssue=false
 from __future__ import annotations
 
-import coc
+import coc  # type: ignore[import-untyped]
 import pytest
 
 from qapbot.coc_health import apply_coc_library_patches

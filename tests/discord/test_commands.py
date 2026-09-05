@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Dict
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -217,12 +217,12 @@ async def test_war_predict_modal_apm_matches_corrected_label(
     mock_interaction.response.send_modal.assert_awaited_once()
     modal = mock_interaction.response.send_modal.await_args.args[0]
 
-    assert "2 = regular CW, 1 = CWL" in modal.attacks_input.label
+    assert "2 = regular CW, 1 = CWL" in modal.attacks_input.text
 
-    modal.clan1._value = "#ABCDE12"  # type: ignore[attr-defined]
-    modal.clan2._value = "#FGHJK34"  # type: ignore[attr-defined]
-    modal.participants._value = "15"  # type: ignore[attr-defined]
-    modal.attacks_input._value = attacks_field_value  # type: ignore[attr-defined]
+    modal.clan1.component._value = "#ABCDE12"  # type: ignore[attr-defined]
+    modal.clan2.component._value = "#FGHJK34"  # type: ignore[attr-defined]
+    modal.participants.component._value = "15"  # type: ignore[attr-defined]
+    modal.attacks_input.component._value = attacks_field_value  # type: ignore[attr-defined]
 
     await modal.on_submit(mock_interaction)
 
@@ -328,7 +328,7 @@ async def test_admin_check_data_calls_checker_when_bot_admin(monkeypatch: pytest
 
     await QBdiscordcmds.admin.callback(mock_interaction, action="CHECK_DATA")  # type: ignore[arg-type]
     mock_interaction.followup.send.assert_awaited()
-    args, kwargs = mock_interaction.followup.send.await_args
+    args, _ = mock_interaction.followup.send.await_args
     assert "DATA OK" in args[0]
 
 
@@ -373,7 +373,7 @@ async def test_list_managed_cwls_defaults_to_next_upcoming_season(monkeypatch: p
             ]
 
     fake_cache = _FakeCache()
-    fake_cache.db_manager = _FakeDb()
+    fake_cache.db_manager = _FakeDb()  # type: ignore[assignment]  # deliberately narrower stub for this test
     monkeypatch.setattr(QBdiscordcmds, "SERVER_ADMIN", "BotAdmin")
     monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
     monkeypatch.setattr(helper, "check_bot_admin_only", lambda interaction, server_admin: True)
@@ -428,7 +428,7 @@ async def test_list_managed_cwls_no_data_message(monkeypatch: pytest.MonkeyPatch
             return []
 
     fake_cache = _FakeCache()
-    fake_cache.db_manager = _FakeDb()
+    fake_cache.db_manager = _FakeDb()  # type: ignore[assignment]  # deliberately narrower stub for this test
     monkeypatch.setattr(QBdiscordcmds, "SERVER_ADMIN", "BotAdmin")
     monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
     monkeypatch.setattr(helper, "check_bot_admin_only", lambda interaction, server_admin: True)

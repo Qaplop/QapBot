@@ -13,6 +13,7 @@ from qapbot.db_manager import WarHistoryDB
 
 _SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "qapbot", "scripts", "repair_history_schema_drift.py")
 _spec = importlib.util.spec_from_file_location("repair_history_schema_drift", _SCRIPT_PATH)
+assert _spec is not None and _spec.loader is not None
 repair_module = importlib.util.module_from_spec(_spec)
 sys.modules["repair_history_schema_drift"] = repair_module
 _spec.loader.exec_module(repair_module)

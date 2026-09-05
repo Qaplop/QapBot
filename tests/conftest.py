@@ -67,7 +67,7 @@ def review_timeout_seconds(pytestconfig: pytest.Config) -> int:
     """Configured review timeout for live-smoke tests (CLI-only)."""
     value = pytestconfig.getoption("review_timeout_seconds")
     try:
-        return max(0, int(value))
+        return max(0, int(value))  # type: ignore[arg-type]
     except Exception:
         return 0
 

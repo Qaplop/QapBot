@@ -13,7 +13,6 @@ from __future__ import annotations
 import os
 from unittest.mock import AsyncMock, MagicMock
 
-import discord
 import pytest
 
 os.environ.setdefault("DISCORD_TOKEN", "test-token")
@@ -43,9 +42,9 @@ def _bypass_admin_check(monkeypatch):
 
 
 async def _seed_guild_and_clan(db: WarHistoryDB, guild_id: str, clan_tag: str = "#CLAN1") -> None:
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
+    await db._conn.commit()
 
 
 def _make_member_clans_view(guild, current_member_clans, current_member_families=None):

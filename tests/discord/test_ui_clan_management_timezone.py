@@ -9,7 +9,6 @@ from __future__ import annotations
 import os
 from unittest.mock import AsyncMock, MagicMock
 
-import discord
 import pytest
 
 os.environ.setdefault("DISCORD_TOKEN", "test-token")
@@ -145,7 +144,7 @@ async def test_basic_config_embed_shows_configured_timezone_between_language_and
 
     embed, _, _, _ = await format_clan_management_message("#CLAN1", guild, mode="config")
 
-    field_values = [f.value for f in embed.fields]
+    field_values = [f.value or "" for f in embed.fields]
     timezone_index = next(i for i, v in enumerate(field_values) if "Europe/Berlin" in v)
     language_index = next(i for i, v in enumerate(field_values) if "Server Language" in v)
     registration_index = next(i for i, v in enumerate(field_values) if "Registration Message" in v)

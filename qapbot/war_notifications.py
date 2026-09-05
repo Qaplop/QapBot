@@ -331,7 +331,7 @@ def _get_active_wars() -> List[Tuple[str, str, Dict[str, Any]]]:
     return active_wars
 
 
-def parse_war_timestamp_field(ts_str: str) -> Tuple[Optional[datetime], Optional[int]]:
+def parse_war_timestamp_field(ts_str: Any) -> Tuple[Optional[datetime], Optional[int]]:
     """
     Parse a QapBot war-JSON Timestamp string, e.g.:
     "<Timestamp time=datetime.datetime(2025, 8, 29, 13, 20, 53) seconds_until=-72658>"

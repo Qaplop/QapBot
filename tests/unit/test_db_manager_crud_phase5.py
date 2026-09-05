@@ -43,21 +43,6 @@ async def db(tmp_path):
         await inst.conn.close()
 
 
-async def _insert_war_record(db, clan_tag="#TEST123", war_id="W1",
-                              date="2025-06-15", player_name="Alice",
-                              player_tag="#P1", th_level=16, stars=3,
-                              attacks=2, missed=0, max_atk=2, def_stars=1):
-    """Helper to insert a single war_history row."""
-    await db.conn.execute("""
-        INSERT INTO war_history
-        (war_id, clan_tag, date, player_name, player_tag, th_level,
-         stars, attacks, missed_attacks, max_attacks, defensive_stars)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    """, (war_id, clan_tag, date, player_name, player_tag, th_level,
-          stars, attacks, missed, max_atk, def_stars))
-    await db.conn.commit()
-
-
 # ===================================================================
 # get_clan_history (async)
 # ===================================================================

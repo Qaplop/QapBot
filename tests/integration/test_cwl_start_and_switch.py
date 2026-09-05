@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from typing import Optional
 from unittest.mock import AsyncMock
 
 import pytest
@@ -60,36 +61,37 @@ def _dm_guard_off(monkeypatch):
 async def _seed_guild_and_clans(db: WarHistoryDB, guild_id: str, clan_tags=("#CLAN1",)) -> None:
     from qapbot.cache_manager import CACHE
 
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
     for tag in clan_tags:
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (tag, f"Clan {tag[-1]}")
         )
-    await db.conn.commit()
+    await db._conn.commit()
     CACHE.server_config[guild_id] = {"member_clans": list(clan_tags), "member_families": []}
 
 
 async def _seed_player(
-    db: WarHistoryDB, discord_id: str | None, player_tag: str, current_clan_tag: str,
+    db: WarHistoryDB, discord_id: str | None, player_tag: str, current_clan_tag: Optional[str],
     player_name: str = "Player",
 ) -> None:
     """A linked account (discord_id set) or an unlinked one in the UNASSIGNED pool."""
     owner = discord_id or "UNASSIGNED"
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (owner, owner)
     )
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
         "VALUES (?, ?, ?, 1, ?)",
         (owner, player_tag, player_name, current_clan_tag),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
 
 async def _make_announced_event(
     db: WarHistoryDB, guild_id: str, clan_configs, status: str = "signup_open",
 ) -> int:
     event_id = db.create_cwl_event_sync(guild_id, SEASON, "creator")
+    assert event_id is not None
     db.set_cwl_event_clans_sync(event_id, clan_configs)
     db.update_cwl_event_status_sync(event_id, status)
     return event_id
@@ -293,6 +295,7 @@ async def test_start_cwl_sends_marks_notified_and_announces(db, monkeypatch):
     assert result["contacted"] == 1
     assert result["contacted_users"] == 1
     assert sent.await_count == 1
+    assert sent.await_args is not None
     body = sent.await_args.args[1]
     assert "Green" in body
     assert "<t:" in body  # per-viewer timestamp markup, not a server-rendered date
@@ -325,6 +328,7 @@ async def test_start_cwl_amber_dm_carries_the_clan_join_link(db, monkeypatch):
 
     await announce_cwl_rosters(int(guild_id), SEASON)
 
+    assert sent.await_args is not None
     body = sent.await_args.args[1]
     assert "link.clashofclans.com" in body
     assert "%23CLAN1" in body  # the ASSIGNED clan, never the current one
@@ -414,10 +418,10 @@ async def test_switch_sweep_records_a_player_who_moved(db, monkeypatch):
     assert db.get_cwl_assignments_sync(event_id)[0]["switched_at"] is None
 
     # They transfer; the next sweep records it.
-    await db.conn.execute(
+    await db._conn.execute(
         "UPDATE user_players SET current_clan_tag = ? WHERE player_tag = ?", ("#CLAN1", "#P1")
     )
-    await db.conn.commit()
+    await db._conn.commit()
     counters = await check_cwl_roster_switches()
 
     assert counters["switched"] == 1
@@ -470,12 +474,12 @@ async def test_switch_sweep_stops_once_the_clan_roster_locks(db, monkeypatch):
     monkeypatch.setattr(CACHE, "send_user_dm_detailed", sent, raising=False)
 
     # Primary trigger: a real is_cwl war row for this clan and season.
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
         "VALUES (?, ?, ?, 1, ?, ?)",
         ("w1", "#CLAN1", "#OPP", SEASON, f"{SEASON}-01T08:00"),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
     counters = await check_cwl_roster_switches()
 
@@ -497,11 +501,11 @@ async def test_lock_fallback_trigger_is_the_league_group_row(db):
     event_id = await _make_announced_event(
         db, guild_id, [{"clan_tag": "#CLAN1", "cwl_start_at": f"{SEASON}-01T08:00Z"}], status="announced",
     )
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO cwl_league_groups (league_group_id, cwl_season, clan_tag) VALUES (?, ?, ?)",
         ("grp1", SEASON, "#CLAN1"),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
     counters = await check_cwl_roster_switches()
 
@@ -518,11 +522,11 @@ async def test_lock_is_write_once_across_repeated_sweeps(db):
     event_id = await _make_announced_event(
         db, guild_id, [{"clan_tag": "#CLAN1", "cwl_start_at": f"{SEASON}-01T08:00Z"}], status="announced",
     )
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO cwl_league_groups (league_group_id, cwl_season, clan_tag) VALUES (?, ?, ?)",
         ("grp1", SEASON, "#CLAN1"),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
     first = await check_cwl_roster_switches()
     locked_at = db.get_cwl_event_clans_sync(event_id)[0]["locked_at"]
@@ -614,10 +618,10 @@ async def test_still_missing_section_lists_players_and_locked_clans(db, monkeypa
         [{"clan_tag": "#CLAN1", "cwl_start_at": f"{SEASON}-28T08:00Z"}],
         status="announced",
     )
-    await db.conn.execute(
+    await db._conn.execute(
         "UPDATE guild_config SET cwl_selected_season = ? WHERE guild_id = ?", (SEASON, guild_id)
     )
-    await db.conn.commit()
+    await db._conn.commit()
     from qapbot.cache_manager import CACHE
     CACHE.server_config[guild_id]["cwl_selected_season"] = SEASON
     await _seed_player(db, "u1", "#P1", "#CLAN2", "Straggler")
@@ -628,19 +632,20 @@ async def test_still_missing_section_lists_players_and_locked_clans(db, monkeypa
     guild.id = int(guild_id)
     embed, _, _, _ = await format_clan_management_cwl_management(guild)
     missing = [f for f in embed.fields if "Still Missing" in (f.name or "")]
-    assert missing and "Straggler" in missing[0].value
+    assert missing and missing[0].value is not None and "Straggler" in missing[0].value
 
     # Once the clan's roster locks, the section stops showing a stale missing-count.
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO cwl_league_groups (league_group_id, cwl_season, clan_tag) VALUES (?, ?, ?)",
         ("grp1", SEASON, "#CLAN1"),
     )
-    await db.conn.commit()
+    await db._conn.commit()
     await check_cwl_roster_switches()
 
     embed2, _, _, _ = await format_clan_management_cwl_management(guild)
     missing2 = [f for f in embed2.fields if "Still Missing" in (f.name or "")]
-    assert missing2 and "roster locked" in missing2[0].value
+    assert missing2 and missing2[0].value is not None
+    assert "roster locked" in missing2[0].value
     assert "Straggler" not in missing2[0].value
 
 

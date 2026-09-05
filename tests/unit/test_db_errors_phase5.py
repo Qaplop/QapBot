@@ -29,17 +29,6 @@ async def db(tmp_path):
         await inst.conn.close()
 
 
-def _make_record(**overrides):
-    """Build a single war record dict with defaults."""
-    base = {
-        "WarID": "W1", "Date": "2025-06-01", "Player": "Alice",
-        "PlayerID": "#P1", "TH_lvl": 16, "Stars": 3, "Attacks": 2,
-        "Missed_Attacks": 0, "Max_Attacks": 2, "Defensive_Stars": 1,
-    }
-    base.update(overrides)
-    return base
-
-
 # ===================================================================
 
 class TestDeleteClanError:

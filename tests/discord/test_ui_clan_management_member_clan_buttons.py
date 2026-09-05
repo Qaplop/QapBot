@@ -49,7 +49,7 @@ def _make_view(guild, guild_clans, current_member_clans, current_member_families
 
 def _clan_button_tags(view) -> set:
     return {
-        child.custom_id.removeprefix("member_clan_")
+        (child.custom_id or "").removeprefix("member_clan_")
         for child in view.children
         if isinstance(child, discord.ui.Button) and (child.custom_id or "").startswith("member_clan_")
     }

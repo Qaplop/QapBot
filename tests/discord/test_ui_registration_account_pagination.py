@@ -89,6 +89,7 @@ async def test_page_next_and_prev_walk_through_all_accounts(monkeypatch: pytest.
     monkeypatch.setattr(ui, "t", identity_t)
 
     view = ui.AccountManagementView(user_id="123", guild_id=1, display_name="Alice")
+    assert view.prev_button is not None and view.next_button is not None
     interaction = make_interaction(user_id=123)
 
     first_page_tags = {o.value for o in view.player_select.options}
@@ -199,7 +200,7 @@ async def test_action_view_select_paginates_unverified_players(monkeypatch: pyte
 
     view = ui.AccountActionView(_players(30), interaction.guild.id, interaction)
 
-    assert view.next_button is not None
+    assert view.next_button is not None and view.prev_button is not None
     assert view.prev_button.disabled is True
 
     await view._on_page_next(interaction)
@@ -239,7 +240,7 @@ async def test_refresh_click_guards_against_reentrant_second_click(monkeypatch: 
         await release.wait()
         return None
 
-    cache.get_player = _slow_get_player
+    cache.get_player = AsyncMock(side_effect=_slow_get_player)
 
     view = ui.AccountManagementView(user_id="123", guild_id=1, display_name="Alice")
     refresh_interaction = make_interaction(user_id=123)

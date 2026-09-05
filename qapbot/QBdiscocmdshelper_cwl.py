@@ -978,8 +978,6 @@ async def resolve_cwl_clan_owner(
                     member = await guild.fetch_member(int(discord_id))
                 except (discord.NotFound, discord.HTTPException):
                     continue
-            if member is None:
-                continue
             is_native_family = clan_tag in resolve_guild_member_clan_tags(guild_id)
             candidate = (role_priority, verified, is_native_family, str(guild_id), resolution_method)
             if best is None or candidate[:3] > best[:3]:
@@ -2608,8 +2606,6 @@ async def _start_cwl_enrollment_locked(guild_id: int, season: str) -> Dict[str, 
     CONFIG.is_dev_mode (set separately per host from the shared .env file) precisely so it can
     also be enabled on PROD while live-testing there.
     """
-    from qapbot.config import CONFIG
-
     summary: Dict[str, Any] = {
         "ok": False, "error": None, "seeded": 0, "contacted": 0, "assigned": 0,
         "skipped_optout": 0, "skipped_unlinked": 0, "skipped_dm_guard": 0,
@@ -3223,6 +3219,7 @@ async def _send_cwl_enrollment_dm_batch(
     # applied at pool-build time (see _merge's authoritative_discord_id), just applied again here
     # at send time. Done BEFORE the row-seeding block below so an unlinked player never gets a
     # cwl_signups row seeded with a dmed_discord_id that was never actually DMed.
+    live_links: Dict[str, Any] = {}
     if db is not None and to_dm:
         live_links = await asyncio.to_thread(db.get_player_links_sync, [p["player_tag"] for p in to_dm])
         still_linked: List[Dict[str, Any]] = []
@@ -3941,7 +3938,7 @@ async def send_cwl_roster_updates(guild_id: int, season: str) -> Dict[str, Any]:
             names = [a["player_name"] for _kind, a in entries]
             summary[outcome].extend(names)
             continue
-        if never_asked and db is not None:
+        if never_asked:
             # Record the DM globally so "Notify New Pool Members" doesn't send them a second,
             # redundant invitation — this message already asked the question.
             sent_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
@@ -4608,7 +4605,7 @@ async def check_cwl_roster_switches() -> Dict[str, int]:
                 # write-once on its own, and each guild still has to clean up ITS OWN board.
                 await snapshot_cwl_locked_clan_roster(clan_tag, season)
                 reconciled = await reconcile_cwl_locked_clan_roster(
-                    guild_id, event["id"], season, clan_tag, clan_names.get(clan_tag, clan_tag)
+                    guild_id, event["id"], season, clan_tag, clan_names.get(clan_tag) or clan_tag
                 )
                 counters["no_shows_dropped"] += reconciled["dropped"]
 

@@ -163,6 +163,7 @@ async def test_check_maintenance_block_blocks_during_maintenance(monkeypatch: py
     result = await check_maintenance_block(cast(Any, interaction))
     assert result is True
     send_msg.assert_awaited_once()
+    assert send_msg.await_args is not None
     _, kwargs = send_msg.await_args
     assert kwargs.get("ephemeral") is True
 

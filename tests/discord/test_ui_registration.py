@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from typing import cast
 from unittest.mock import AsyncMock
 
+import discord
 import pytest
 
 
@@ -11,7 +13,7 @@ async def test_registration_view_labels_are_translated():
     from qapbot.ui_registration import RegistrationView
 
     view = RegistrationView(guild_id=123)
-    labels = [c.label for c in view.children]
+    labels = [cast(discord.ui.Button, c).label for c in view.children]
     assert "🔗 Link Accounts" in labels
     assert "⚙️ War Notifications" in labels
 
@@ -64,6 +66,7 @@ async def test_registration_view_blocks_before_fully_initialized(monkeypatch: py
 
     assert allowed is False
     send_msg.assert_awaited_once()
+    assert send_msg.await_args is not None
     args, kwargs = send_msg.await_args
     assert "starting up" in args[0].lower()
     assert kwargs.get("ephemeral") is True

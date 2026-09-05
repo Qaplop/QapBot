@@ -6,6 +6,8 @@ carry-over query, and the guild_config CWL columns' save/get roundtrip.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import pytest
 
 from qapbot.db_manager import WarHistoryDB
@@ -23,31 +25,31 @@ async def db(tmp_path):
 
 
 async def _seed_guild_and_clan(db: WarHistoryDB, guild_id: str = "111", clan_tag: str = "#CLAN1") -> None:
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
+    await db._conn.commit()
 
 
 async def _seed_cwl_war(
-    db: WarHistoryDB, clan_tag: str, cwl_season: str, players: list, date: str = "2026-07-01T08:00", war_id: str = None,
+    db: WarHistoryDB, clan_tag: str, cwl_season: str, players: list, date: str = "2026-07-01T08:00", war_id: Optional[str] = None,
     attack_order: int = 1,
 ) -> None:
     """Seed a minimal is_cwl=1 war_summary + war_attacks pair. players: list of
     (player_tag, player_name, th_level, map_position) tuples. All attacks share `date`.
     attack_order defaults to 1 (a real attack) — pass 0 to seed a "missed attack" sentinel row."""
     war_id = war_id or f"war_{clan_tag}_{cwl_season}_{date}"
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) VALUES (?, ?, ?, 1, ?, ?)",
         (war_id, clan_tag, "#OPP", cwl_season, date),
     )
     for player_tag, player_name, th_level, map_position in players:
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO war_attacks "
             "(war_id, clan_tag, date, player_name, player_tag, th_level, map_position, attack_order, stars) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
             (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, attack_order),
         )
-    await db.conn.commit()
+    await db._conn.commit()
 
 
 async def _seed_clan(db: WarHistoryDB, clan_tag: str, name: str = "Some Clan") -> None:
@@ -55,8 +57,8 @@ async def _seed_clan(db: WarHistoryDB, clan_tag: str, name: str = "Some Clan") -
     player_tag can be seeded as currently in it, even one this test deliberately keeps out of
     any guild's member_clans/member_families (i.e. "known to the bot, but not this guild's own
     family" — see get_all_players_for_discord_ids_sync's docstring)."""
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, name))
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, name))
+    await db._conn.commit()
 
 
 async def _seed_user_player(
@@ -66,12 +68,12 @@ async def _seed_user_player(
     player_name: str = "Player",
     verified: bool = True,
     cwl_permanent_optout: bool = False,
-    cwl_default_preferred_league_rank: str = None,
-    current_clan_tag: str = None,
-    th_level: int = None,
+    cwl_default_preferred_league_rank: Optional[str] = None,
+    current_clan_tag: Optional[str] = None,
+    th_level: Optional[int] = None,
 ) -> None:
-    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
-    await db.conn.execute(
+    await db._conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
+    await db._conn.execute(
         """
         INSERT INTO user_players
             (discord_id, player_tag, player_name, verified, cwl_permanent_optout, cwl_default_preferred_league_rank, current_clan_tag, th_level)
@@ -79,7 +81,7 @@ async def _seed_user_player(
         """,
         (discord_id, player_tag, player_name, 1 if verified else 0, 1 if cwl_permanent_optout else 0, cwl_default_preferred_league_rank, current_clan_tag, th_level),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
 
 class TestCwlEventCrud:
@@ -342,26 +344,26 @@ class TestCwlCascadeDelete:
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
         event_id = db.create_cwl_event_sync("111", "2026-08", "discordid1")
         db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1"}])
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO cwl_signups (event_id, player_tag, source, status) VALUES (?, ?, ?, ?)",
             (event_id, "#PLAYER1", "self_signup", "confirmed"),
         )
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO cwl_assignments (event_id, player_tag, assigned_clan_tag) VALUES (?, ?, ?)",
             (event_id, "#PLAYER1", "#CLAN1"),
         )
-        await db.conn.commit()
+        await db._conn.commit()
 
         assert len(db.get_cwl_event_clans_sync(event_id)) == 1
 
-        await db.conn.execute("DELETE FROM cwl_events WHERE id = ?", (event_id,))
-        await db.conn.commit()
+        await db._conn.execute("DELETE FROM cwl_events WHERE id = ?", (event_id,))
+        await db._conn.commit()
 
         assert db.get_cwl_event_clans_sync(event_id) == []
-        cursor = await db.conn.execute("SELECT COUNT(*) AS n FROM cwl_signups WHERE event_id = ?", (event_id,))
+        cursor = await db._conn.execute("SELECT COUNT(*) AS n FROM cwl_signups WHERE event_id = ?", (event_id,))
         row = await cursor.fetchone()
         assert row["n"] == 0
-        cursor2 = await db.conn.execute("SELECT COUNT(*) AS n FROM cwl_assignments WHERE event_id = ?", (event_id,))
+        cursor2 = await db._conn.execute("SELECT COUNT(*) AS n FROM cwl_assignments WHERE event_id = ?", (event_id,))
         row2 = await cursor2.fetchone()
         assert row2["n"] == 0
 
@@ -401,8 +403,8 @@ class TestCwlCascadeDelete:
         shared-clan case) must keep their dm_sent record — deleting THIS event must not make
         them eligible for a duplicate DM through the other, still-live event."""
         await _seed_guild_and_clan(db, guild_id="224", clan_tag="#CLAN1")
-        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('225')")
-        await db.conn.commit()
+        await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('225')")
+        await db._conn.commit()
         event_id = db.create_cwl_event_sync("224", "2026-09", "discordid1")
         other_event_id = db.create_cwl_event_sync("225", "2026-09", "discordid1")
         db.mark_cwl_player_dm_sent_sync(
@@ -421,8 +423,8 @@ class TestCwlCascadeDelete:
 
     async def test_get_cwl_player_season_status_dm_refs_for_event_sync(self, db):
         await _seed_guild_and_clan(db, guild_id="226", clan_tag="#CLAN1")
-        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('227')")
-        await db.conn.commit()
+        await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('227')")
+        await db._conn.commit()
         event_id = db.create_cwl_event_sync("226", "2026-09", "discordid1")
         other_event_id = db.create_cwl_event_sync("227", "2026-09", "discordid1")
         db.mark_cwl_player_dm_sent_sync(
@@ -665,15 +667,15 @@ class TestGetMostRecentCwlWarRoster:
     @pytest.mark.integration
     async def test_ignores_non_cwl_wars(self, db):
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
             "VALUES ('regular_war', '#CLAN1', '#OPP', 0, '', '2026-07-15T10:00')"
         )
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
             "VALUES ('regular_war', '#CLAN1', '2026-07-15T10:00', 'Alpha', '#P1', 15, 1, 0)"
         )
-        await db.conn.commit()
+        await db._conn.commit()
         assert db.get_most_recent_cwl_war_roster_sync("#CLAN1") == []
 
     @pytest.mark.integration
@@ -724,16 +726,16 @@ class TestGetLastRealCwlAttackClan:
     @pytest.mark.integration
     async def test_excludes_non_cwl_wars(self, db):
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
             "VALUES ('regular_war', '#CLAN1', '#OPP', 0, '', '2026-07-15T10:00')"
         )
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO war_attacks "
             "(war_id, clan_tag, date, player_name, player_tag, th_level, map_position, attack_order, stars) "
             "VALUES ('regular_war', '#CLAN1', '2026-07-15T10:00', 'Alpha', '#P1', 15, 1, 1, 3)"
         )
-        await db.conn.commit()
+        await db._conn.commit()
         assert db.get_last_real_cwl_attack_clan_sync(["#P1"]) == {}
 
     @pytest.mark.integration
@@ -779,15 +781,15 @@ class TestGetMostRecentThLevels:
     @pytest.mark.integration
     async def test_returns_th_level_from_regular_war_not_just_cwl(self, db):
         await _seed_guild_and_clan(db, clan_tag="#CLAN1")
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) "
             "VALUES ('regular_war', '#CLAN1', '#OPP', 0, '', '2026-07-15T10:00')"
         )
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
             "VALUES ('regular_war', '#CLAN1', '2026-07-15T10:00', 'Alpha', '#P1', 15, 1, 0)"
         )
-        await db.conn.commit()
+        await db._conn.commit()
         assert db.get_most_recent_th_levels_sync(["#P1"]) == {"#P1": 15}
 
     @pytest.mark.integration
@@ -811,7 +813,7 @@ class TestGetMostRecentThLevels:
 
 async def _seed_cwl_attack_with_league(
     db, clan_tag: str, cwl_season: str, league_rank: str, player_tag: str, stars: int,
-    date: str = "2026-07-01T08:00", war_id: str = None, league_group_id: str = None,
+    date: str = "2026-07-01T08:00", war_id: Optional[str] = None, league_group_id: Optional[str] = None,
 ) -> None:
     """Seeds one CWL war_attacks row plus the league-reconstruction chain
     (cwl_league_rounds -> cwl_league_groups) get_recent_cwl_attacks_with_league_sync() needs.
@@ -819,24 +821,24 @@ async def _seed_cwl_attack_with_league(
     '' if omitted, and is exactly what the league-tier join keys off."""
     war_id = war_id or f"war_{clan_tag}_{date}"
     league_group_id = league_group_id or f"group_{cwl_season}_{clan_tag}"
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date, war_tag) VALUES (?, ?, ?, 1, ?, ?, ?)",
         (war_id, clan_tag, "#OPP", cwl_season, date, war_id),
     )
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (war_id, clan_tag, date, player_tag, player_tag, 15, 1, stars),
     )
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO cwl_league_rounds (war_tag, cwl_season, cwl_round, league_group_id) VALUES (?, ?, 1, ?)",
         (war_id, cwl_season, league_group_id),
     )
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT OR IGNORE INTO cwl_league_groups (league_group_id, cwl_season, clan_tag, league_rank) VALUES (?, ?, ?, ?)",
         (league_group_id, cwl_season, clan_tag, league_rank),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
 
 class TestGetRecentCwlAttacksWithLeague:
@@ -875,35 +877,35 @@ class TestGetRecentCwlAttacksWithLeague:
         await _seed_guild_and_clan(db, guild_id="111", clan_tag="#CLAN2")
         # Both clans in the same group_id/season; #CLAN1's own row is the one carrying
         # league_rank, but #CLAN2's attack must resolve it too via the shared group.
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date, war_tag) "
             "VALUES ('w1', '#CLAN1', '#OPP', 1, '2026-07', '2026-07-01T08:00', 'w1')"
         )
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
             "VALUES ('w1', '#CLAN1', '2026-07-01T08:00', '#P1', '#P1', 15, 1, 2)"
         )
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date, war_tag) "
             "VALUES ('w2', '#CLAN2', '#OPP', 1, '2026-07', '2026-07-01T08:00', 'w2')"
         )
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO war_attacks (war_id, clan_tag, date, player_name, player_tag, th_level, map_position, stars) "
             "VALUES ('w2', '#CLAN2', '2026-07-01T08:00', '#P2', '#P2', 15, 1, 2)"
         )
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO cwl_league_rounds (war_tag, cwl_season, cwl_round, league_group_id) VALUES ('w1', '2026-07', 1, 'grp')"
         )
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO cwl_league_rounds (war_tag, cwl_season, cwl_round, league_group_id) VALUES ('w2', '2026-07', 1, 'grp')"
         )
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO cwl_league_groups (league_group_id, cwl_season, clan_tag, league_rank) VALUES ('grp', '2026-07', '#CLAN1', 'Titan League I')"
         )
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO cwl_league_groups (league_group_id, cwl_season, clan_tag, league_rank) VALUES ('grp', '2026-07', '#CLAN2', 'Titan League I')"
         )
-        await db.conn.commit()
+        await db._conn.commit()
 
         result = db.get_recent_cwl_attacks_with_league_sync(["#P1", "#P2"])
         assert result["#P1"][0]["league_rank"] == "Titan League I"
@@ -1067,8 +1069,8 @@ class TestGuildConfigIncludeAllLinkedAccounts:
 
     @pytest.mark.integration
     async def test_defaults_to_false_for_a_guild_that_never_set_it(self, db):
-        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('111')")
-        await db.conn.commit()
+        await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('111')")
+        await db._conn.commit()
         config = await db.get_guild_config("111")
         assert config["cwl_enrollment_include_all_linked_accounts"] is False
 
@@ -1178,15 +1180,15 @@ class TestChunkedInQuery:
         raise and must return exactly the linked subset, correctly merged across chunks."""
         tags = [f"#P{i:05d}" for i in range(2000)]
         linked_indices = list(range(0, 2000, 3))
-        await db.conn.executemany(
+        await db._conn.executemany(
             "INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)",
             [(f"#C{i:05d}", "Clan") for i in linked_indices],
         )
-        await db.conn.executemany(
+        await db._conn.executemany(
             "INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)",
             [(f"d{i}", f"d{i}") for i in linked_indices],
         )
-        await db.conn.executemany(
+        await db._conn.executemany(
             """
             INSERT INTO user_players
                 (discord_id, player_tag, player_name, verified, current_clan_tag)
@@ -1194,7 +1196,7 @@ class TestChunkedInQuery:
             """,
             [(f"d{i}", tags[i], f"Player{i}", f"#C{i:05d}") for i in linked_indices],
         )
-        await db.conn.commit()
+        await db._conn.commit()
 
         links = db.get_player_links_sync(tags)
 
@@ -1220,11 +1222,11 @@ class TestChunkedInQuery:
         clan_tags = [chunk_a_tag] + filler_tags + [chunk_b_tag]  # 901 total: chunk_b lands in chunk 2
         assert len(clan_tags) == 901
 
-        await db.conn.executemany(
+        await db._conn.executemany(
             "INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)",
             [(t, "Clan") for t in clan_tags],
         )
-        await db.conn.commit()
+        await db._conn.commit()
         # Disputed player_tag: an unverified link claims it's in the FIRST-chunk clan, a verified
         # link claims it's in the SECOND-chunk clan.
         await _seed_user_player(db, "d1", "#P1", current_clan_tag=chunk_a_tag, verified=False)
@@ -1295,8 +1297,8 @@ class TestCwlPlayerSeasonStatus:
 
         # Simulates the pre-fix delete_cwl_event_sync(): removes the event WITHOUT touching
         # cwl_player_season_status at all, leaving dm_sent=1 pointing at a now-nonexistent event.
-        await db.conn.execute("DELETE FROM cwl_events WHERE id = ?", (event_id,))
-        await db.conn.commit()
+        await db._conn.execute("DELETE FROM cwl_events WHERE id = ?", (event_id,))
+        await db._conn.commit()
 
         assert db.get_cwl_player_season_dm_status_bulk_sync(["#P1"], "2026-08") == {}
 
@@ -1331,9 +1333,9 @@ class TestCwlPlayerSeasonStatus:
         assert bulk["#P1"]["status"] == "confirmed"
 
     async def test_fan_out_target_lookups_are_season_scoped(self, db):
-        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('501')")
-        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('502')")
-        await db.conn.commit()
+        await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('501')")
+        await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('502')")
+        await db._conn.commit()
 
         event_a = db.create_cwl_event_sync("501", "2026-08", "creator")
         event_b = db.create_cwl_event_sync("502", "2026-08", "creator")
@@ -1355,8 +1357,8 @@ class TestCwlPlayerSeasonStatus:
         assert db.find_cwl_shared_clan_ids_for_player_and_season_sync("#P2", "2026-08") == []
 
     async def test_update_cwl_signup_status_only_fills_a_gap_never_creates(self, db):
-        await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('503')")
-        await db.conn.commit()
+        await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('503')")
+        await db._conn.commit()
         event_id = db.create_cwl_event_sync("503", "2026-08", "creator")
         db.upsert_cwl_signup_sync(event_id, "#P1", "Player One", "d1", None, "template_confirm", "pending")
 
@@ -1395,7 +1397,7 @@ class TestUserPlayersCwlPreferenceSurvival:
 
     async def test_preference_survives_a_save_user_roundtrip_for_a_different_account(self, db):
         discord_id = "601"
-        await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, "Tester"))
+        await db._conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, "Tester"))
         await _seed_user_player(
             db, discord_id, "#PREF1", player_name="Preferred One",
             cwl_permanent_optout=True, cwl_default_preferred_league_rank="Master League II",
@@ -1432,7 +1434,7 @@ class TestUserPlayersCwlPreferenceSurvival:
         players list before calling save_user(), which still triggers the same
         delete-everything+reinsert-the-rest path for the accounts that remain."""
         discord_id = "602"
-        await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, "Tester"))
+        await db._conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, "Tester"))
         await _seed_user_player(
             db, discord_id, "#KEEP", player_name="Keep Me",
             cwl_permanent_optout=True, cwl_default_preferred_league_rank="Crystal League I",
@@ -1454,7 +1456,7 @@ async def _read_prefs(db: "WarHistoryDB", discord_id: str, player_tag: str) -> d
     """Raw read of the four preference columns for one row, bypassing the higher-level read
     methods under test elsewhere in this file — used so set_cwl_preferences_sync's own tests
     don't depend on get_player_links_sync also being correct."""
-    cursor = await db.conn.execute(
+    cursor = await db._conn.execute(
         "SELECT cwl_permanent_optout, cwl_permanent_optin, cwl_optout_send_dm_anyway, "
         "cwl_default_preferred_league_rank FROM user_players WHERE discord_id = ? AND player_tag = ?",
         (discord_id, player_tag),
@@ -1600,8 +1602,8 @@ def test_retention_cutoff_season_arithmetic():
 @pytest.mark.asyncio
 async def test_purge_removes_only_seasons_past_retention(db):
     await _seed_guild_and_clan(db, "801")
-    await db.conn.execute("UPDATE guild_config SET cwl_retention_months = 12 WHERE guild_id = ?", ("801",))
-    await db.conn.commit()
+    await db._conn.execute("UPDATE guild_config SET cwl_retention_months = 12 WHERE guild_id = ?", ("801",))
+    await db._conn.commit()
 
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
@@ -1638,8 +1640,8 @@ async def test_purge_skips_guilds_keeping_data_indefinitely(db):
 @pytest.mark.asyncio
 async def test_purge_cascades_to_child_tables(db):
     await _seed_guild_and_clan(db, "803")
-    await db.conn.execute("UPDATE guild_config SET cwl_retention_months = 6 WHERE guild_id = ?", ("803",))
-    await db.conn.commit()
+    await db._conn.execute("UPDATE guild_config SET cwl_retention_months = 6 WHERE guild_id = ?", ("803",))
+    await db._conn.commit()
 
     from datetime import datetime, timezone
     ancient = f"{datetime.now(timezone.utc).year - 3}-01"
@@ -1649,9 +1651,9 @@ async def test_purge_cascades_to_child_tables(db):
 
     await db.purge_expired_cwl_events()
 
-    cur = await db.conn.execute("SELECT COUNT(*) FROM cwl_event_clans WHERE event_id = ?", (event_id,))
+    cur = await db._conn.execute("SELECT COUNT(*) FROM cwl_event_clans WHERE event_id = ?", (event_id,))
     assert (await cur.fetchone())[0] == 0
-    cur = await db.conn.execute("SELECT COUNT(*) FROM cwl_signups WHERE event_id = ?", (event_id,))
+    cur = await db._conn.execute("SELECT COUNT(*) FROM cwl_signups WHERE event_id = ?", (event_id,))
     assert (await cur.fetchone())[0] == 0
 
 
@@ -1661,27 +1663,27 @@ async def test_purge_keeps_cross_guild_rows_another_guild_still_retains(db):
     cwl_events. One guild's retention expiring must NOT destroy a season another guild is still
     keeping — they are swept referentially, only once no event anywhere references the season."""
     await _seed_guild_and_clan(db, "804")
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", ("805",))
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", ("805",))
     # 804 purges aggressively; 805 keeps everything.
-    await db.conn.execute("UPDATE guild_config SET cwl_retention_months = 1 WHERE guild_id = ?", ("804",))
-    await db.conn.commit()
+    await db._conn.execute("UPDATE guild_config SET cwl_retention_months = 1 WHERE guild_id = ?", ("804",))
+    await db._conn.commit()
 
     from datetime import datetime, timezone
     shared_season = f"{datetime.now(timezone.utc).year - 3}-01"
     db.create_cwl_event_sync("804", shared_season, "u1")
     db.create_cwl_event_sync("805", shared_season, "u1")   # 805 still holds this season
 
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO cwl_locked_clan_members (cwl_season, clan_tag, player_tag, source) VALUES (?, ?, ?, ?)",
         (shared_season, "#CLAN1", "#P1", "league_group"),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
     result = await db.purge_expired_cwl_events()
 
     assert result["events"] == 1               # only 804's event went
     assert result["locked_members"] == 0       # 805 still references the season
-    cur = await db.conn.execute(
+    cur = await db._conn.execute(
         "SELECT COUNT(*) FROM cwl_locked_clan_members WHERE cwl_season = ?", (shared_season,)
     )
     assert (await cur.fetchone())[0] == 1
@@ -1690,20 +1692,20 @@ async def test_purge_keeps_cross_guild_rows_another_guild_still_retains(db):
 @pytest.mark.asyncio
 async def test_purge_sweeps_cross_guild_rows_once_no_event_references_the_season(db):
     await _seed_guild_and_clan(db, "806")
-    await db.conn.execute("UPDATE guild_config SET cwl_retention_months = 1 WHERE guild_id = ?", ("806",))
-    await db.conn.commit()
+    await db._conn.execute("UPDATE guild_config SET cwl_retention_months = 1 WHERE guild_id = ?", ("806",))
+    await db._conn.commit()
 
     from datetime import datetime, timezone
     season = f"{datetime.now(timezone.utc).year - 3}-01"
     db.create_cwl_event_sync("806", season, "u1")
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO cwl_locked_clan_members (cwl_season, clan_tag, player_tag, source) VALUES (?, ?, ?, ?)",
         (season, "#CLAN1", "#P1", "league_group"),
     )
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO cwl_player_season_status (player_tag, cwl_season) VALUES (?, ?)", ("#P1", season)
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
     result = await db.purge_expired_cwl_events()
 

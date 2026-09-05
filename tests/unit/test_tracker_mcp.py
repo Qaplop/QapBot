@@ -139,12 +139,14 @@ async def test_handle_request_notifications_initialized_returns_none():
 @pytest.mark.asyncio
 async def test_handle_request_tools_list_returns_all_tools():
     response = await tracker_mcp.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    assert response is not None
     assert len(response["result"]["tools"]) == len(tracker_mcp.TOOLS)
 
 
 @pytest.mark.asyncio
 async def test_handle_request_unknown_method_returns_error():
     response = await tracker_mcp.handle_request({"jsonrpc": "2.0", "id": 3, "method": "not/a/real/method"})
+    assert response is not None
     assert response["error"]["code"] == -32601
 
 
@@ -164,6 +166,7 @@ async def test_handle_request_tools_call_dispatches_and_wraps_errors(monkeypatch
         "jsonrpc": "2.0", "id": 4, "method": "tools/call",
         "params": {"name": "tracker_list_items", "arguments": {}},
     })
+    assert response is not None
     assert response["result"]["isError"] is True
     assert "bridge unreachable" in response["result"]["content"][0]["text"]
 
@@ -178,6 +181,7 @@ async def test_handle_request_tools_call_success(monkeypatch):
         "jsonrpc": "2.0", "id": 5, "method": "tools/call",
         "params": {"name": "tracker_list_items", "arguments": {}},
     })
+    assert response is not None
     assert response["result"]["isError"] is False
     assert response["result"]["content"][0]["text"] == "no items"
 

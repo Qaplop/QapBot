@@ -171,8 +171,10 @@ async def bulk_sync_global_commands(bot: discord.Client, tree_payload: list) -> 
     everything else (`tree_payload=[]`).
     """
     app_id = bot.application_id
+    if app_id is None:
+        raise RuntimeError("bulk_sync_global_commands() called before the bot has an application_id (not logged in yet)")
     existing = await bot.http.get_global_commands(app_id)
-    entry_points = [cmd for cmd in existing if cmd.get('type') == PRIMARY_ENTRY_POINT_TYPE]
+    entry_points = [cmd for cmd in existing if cmd.get('type') == PRIMARY_ENTRY_POINT_TYPE]  # type: ignore[comparison-overlap]
     return await bot.http.bulk_upsert_global_commands(app_id, payload=tree_payload + entry_points)
 
 def get_simple_discord_stats() -> Dict[str, Any]:

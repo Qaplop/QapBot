@@ -110,6 +110,7 @@ async def test_coordinator_role_removed_from_a_former_coordinator(monkeypatch):
     added, removed = await grm.sync_cwl_coordinator_role(guild)
 
     remove.assert_awaited_once()
+    assert remove.await_args is not None
     assert remove.await_args.args[0].id == 999
     assert (added, removed) == (0, 1)
 
@@ -243,7 +244,7 @@ async def test_cwl_settings_embed_shows_the_linked_coordinator_role():
 
     embed, _, _, _ = await format_clan_management_cwl_settings(guild)
 
-    blocks = "\n".join(f.value for f in embed.fields)
+    blocks = "\n".join(f.value or "" for f in embed.fields)
     assert "@cwl-coordinator" in blocks
     guild.get_role.assert_called_once_with(424242)
 
@@ -266,6 +267,6 @@ async def test_cwl_settings_embed_reports_a_deleted_role_as_not_linked():
 
     embed, _, _, _ = await format_clan_management_cwl_settings(guild)
 
-    blocks = "\n".join(f.value for f in embed.fields)
+    blocks = "\n".join(f.value or "" for f in embed.fields)
     assert "424242" not in blocks
     assert "Not linked" in blocks

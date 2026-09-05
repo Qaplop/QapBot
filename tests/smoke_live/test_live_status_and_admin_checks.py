@@ -104,7 +104,9 @@ class _FakeInteraction:
 
 @pytest.mark.live
 @pytest.mark.asyncio
-async def test_live_status_handler_posts_message_and_can_be_fetched(review_timeout_seconds: int):
+async def test_live_status_handler_posts_message_and_can_be_fetched(
+    review_timeout_seconds: int, monkeypatch: pytest.MonkeyPatch
+):
     import discord
 
     _required_env("DISCORD_TOKEN_DEV")
@@ -134,8 +136,8 @@ async def test_live_status_handler_posts_message_and_can_be_fetched(review_timeo
             import QBdiscordcmds
             import qapbot.QBdiscocmdshelper as helper
 
-            QBdiscordcmds.CACHE = fake_cache  # type: ignore[assignment]
-            helper.CACHE = fake_cache  # type: ignore[assignment]
+            monkeypatch.setattr(QBdiscordcmds, "CACHE", fake_cache)
+            monkeypatch.setattr(helper, "CACHE", fake_cache)
 
             # Avoid depending on a fully started bot instance
             class _BotStub:
@@ -143,14 +145,19 @@ async def test_live_status_handler_posts_message_and_can_be_fetched(review_timeo
                 last_sync = None
                 fully_initialized = True
 
-            QBdiscordcmds.QBcore.bot = _BotStub()  # type: ignore[assignment]
-            QBdiscordcmds.GLOBAL_GUILD_ID = guild_id  # type: ignore[assignment]
-            QBdiscordcmds.get_simple_discord_stats = lambda: {
+            # QBcore.bot is shared, mutable global state (Cardinal Rule — see other live tests'
+            # own monkeypatch usage): a raw assignment here left it permanently stubbed for every
+            # test that ran after this one in the same session, since nothing ever restored the
+            # real bot. monkeypatch.setattr reverts it at this test's teardown regardless of
+            # outcome.
+            monkeypatch.setattr(QBdiscordcmds.QBcore, "bot", _BotStub())
+            monkeypatch.setattr(QBdiscordcmds, "GLOBAL_GUILD_ID", guild_id)
+            monkeypatch.setattr(QBdiscordcmds, "get_simple_discord_stats", lambda: {
                 "total_calls": 0,
                 "success_rate": 0,
                 "rate_limits": 0,
                 "api_errors": 0,
-            }
+            })
 
             interaction = _FakeInteraction(
                 channel=channel,

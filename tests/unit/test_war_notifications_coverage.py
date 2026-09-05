@@ -11,7 +11,7 @@ Focuses on testable helpers that don't require live Discord connections.
 # pyright: reportReturnType=false
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -27,7 +27,7 @@ class TestGetHoursUntilWarEnd:
         """Actual UTC datetime is parsed; stale seconds_until is ignored."""
         from datetime import timedelta
         from qapbot.war_notifications import _get_hours_until_war_end
-        future = datetime.utcnow() + timedelta(hours=2)
+        future = datetime.now(timezone.utc) + timedelta(hours=2)
         end_str = (
             f"<Timestamp time=datetime.datetime({future.year}, {future.month}, {future.day}, "
             f"{future.hour}, {future.minute}, {future.second}) seconds_until=99999>"
@@ -40,7 +40,7 @@ class TestGetHoursUntilWarEnd:
         """War that ended hours ago returns negative value → filtered out."""
         from datetime import timedelta
         from qapbot.war_notifications import _get_hours_until_war_end
-        past = datetime.utcnow() - timedelta(hours=4)
+        past = datetime.now(timezone.utc) - timedelta(hours=4)
         end_str = (
             f"<Timestamp time=datetime.datetime({past.year}, {past.month}, {past.day}, "
             f"{past.hour}, {past.minute}, {past.second}) seconds_until=14400>"
@@ -53,7 +53,7 @@ class TestGetHoursUntilWarEnd:
         """Datetime with only 5 fields (no seconds component) is handled."""
         from datetime import timedelta
         from qapbot.war_notifications import _get_hours_until_war_end
-        future = datetime.utcnow() + timedelta(hours=3)
+        future = datetime.now(timezone.utc) + timedelta(hours=3)
         # Omit seconds field intentionally
         end_str = (
             f"<Timestamp time=datetime.datetime({future.year}, {future.month}, {future.day}, "

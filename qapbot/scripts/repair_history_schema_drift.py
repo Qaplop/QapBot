@@ -496,7 +496,8 @@ async def _run(
 
     db = WarHistoryDB()
     await db.initialize(db_path, history_db_path)
-    conn = db._conn
+    assert db.conn is not None, "WarHistoryDB.initialize() did not establish a connection"
+    conn = db.conn
     try:
         plans = await _collect_plans(conn, require_no_backup=(mode == "apply"), force=force)
         if not plans:

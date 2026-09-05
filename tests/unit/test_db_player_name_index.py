@@ -69,6 +69,12 @@ def _make_db(tmp_path) -> WarHistoryDB:
     return dm
 
 
+def _path(dm: WarHistoryDB) -> str:
+    """Non-Optional view of dm.db_path -- always set by _make_db() above."""
+    assert dm.db_path is not None
+    return dm.db_path
+
+
 # ---------------------------------------------------------------------------
 # Tests: _upsert_player_name_index_in_conn (private helper)
 # ---------------------------------------------------------------------------
@@ -87,7 +93,7 @@ class TestUpsertPlayerNameIndexInConn:
             {"PlayerID": "#A1", "Player": "Alice", "Date": "2025-01-01T10:00", "attack_order": 1},
             {"PlayerID": "#B1", "Player": "Bob",   "Date": "2025-01-02T10:00", "attack_order": 2},
         ]
-        conn = self._open_conn(dm.db_path)
+        conn = self._open_conn(_path(dm))
         dm._upsert_player_name_index_in_conn(conn, rows)
         conn.commit()
         all_rows = conn.execute("SELECT player_tag, player_name FROM player_name_index").fetchall()
@@ -103,7 +109,7 @@ class TestUpsertPlayerNameIndexInConn:
         rows = [
             ("W1", "#CLAN", "2025-03-01T10:00", "Charlie", "#C1", 15, 1, 1, 3, 100, "#DEF", 15, 1, 30, 1, 0, 0, 2, 0, 0),
         ]
-        conn = self._open_conn(dm.db_path)
+        conn = self._open_conn(_path(dm))
         dm._upsert_player_name_index_in_conn(conn, rows)
         conn.commit()
         row = conn.execute("SELECT player_name FROM player_name_index WHERE player_tag='#C1'").fetchone()
@@ -116,7 +122,7 @@ class TestUpsertPlayerNameIndexInConn:
         rows = [
             {"PlayerID": "#G1", "Player": "Ghost", "Date": "2025-01-01T10:00", "attack_order": 0},
         ]
-        conn = self._open_conn(dm.db_path)
+        conn = self._open_conn(_path(dm))
         dm._upsert_player_name_index_in_conn(conn, rows)
         conn.commit()
         count = conn.execute("SELECT COUNT(*) AS cnt FROM player_name_index").fetchone()["cnt"]
@@ -128,7 +134,7 @@ class TestUpsertPlayerNameIndexInConn:
         dm = _make_db(tmp_path)
         rows_old = [{"PlayerID": "#P1", "Player": "OldName", "Date": "2024-01-01T00:00", "attack_order": 1}]
         rows_new = [{"PlayerID": "#P1", "Player": "NewName", "Date": "2025-06-01T00:00", "attack_order": 1}]
-        conn = self._open_conn(dm.db_path)
+        conn = self._open_conn(_path(dm))
         dm._upsert_player_name_index_in_conn(conn, rows_old)
         conn.commit()
         dm._upsert_player_name_index_in_conn(conn, rows_new)
@@ -142,7 +148,7 @@ class TestUpsertPlayerNameIndexInConn:
         dm = _make_db(tmp_path)
         rows_new = [{"PlayerID": "#P1", "Player": "CurrentName", "Date": "2025-06-01T00:00", "attack_order": 1}]
         rows_old = [{"PlayerID": "#P1", "Player": "StaleOldName", "Date": "2023-01-01T00:00", "attack_order": 1}]
-        conn = self._open_conn(dm.db_path)
+        conn = self._open_conn(_path(dm))
         dm._upsert_player_name_index_in_conn(conn, rows_new)
         conn.commit()
         dm._upsert_player_name_index_in_conn(conn, rows_old)
@@ -154,7 +160,7 @@ class TestUpsertPlayerNameIndexInConn:
     def test_empty_rows_no_error(self, tmp_path):
         """Calling with an empty iterable is a no-op (no error, no rows inserted)."""
         dm = _make_db(tmp_path)
-        conn = self._open_conn(dm.db_path)
+        conn = self._open_conn(_path(dm))
         dm._upsert_player_name_index_in_conn(conn, [])  # must not raise
         conn.commit()
         count = conn.execute("SELECT COUNT(*) AS cnt FROM player_name_index").fetchone()["cnt"]
@@ -179,7 +185,7 @@ class TestLoadPlayerNameIndexSync:
 
     def test_returns_dict(self, tmp_path):
         dm = _make_db(tmp_path)
-        self._seed_index(dm.db_path, {"#A1": "Alice", "#B1": "Bob"})
+        self._seed_index(_path(dm), {"#A1": "Alice", "#B1": "Bob"})
         result = dm.load_player_name_index_sync()
         assert result == {"#A1": "Alice", "#B1": "Bob"}
 
@@ -205,7 +211,7 @@ class TestUpdatePlayerNameIndexSync:
     def test_upserts_new_entry(self, tmp_path):
         dm = _make_db(tmp_path)
         dm.update_player_name_index_sync([("#A1", "Alice", "2025-01-01T10:00")])
-        conn = sqlite3.connect(dm.db_path)
+        conn = sqlite3.connect(_path(dm))
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT player_name FROM player_name_index WHERE player_tag='#A1'").fetchone()
         conn.close()
@@ -215,7 +221,7 @@ class TestUpdatePlayerNameIndexSync:
         dm = _make_db(tmp_path)
         dm.update_player_name_index_sync([("#A1", "OldName", "2024-01-01T00:00")])
         dm.update_player_name_index_sync([("#A1", "NewName", "2025-06-01T00:00")])
-        conn = sqlite3.connect(dm.db_path)
+        conn = sqlite3.connect(_path(dm))
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT player_name FROM player_name_index WHERE player_tag='#A1'").fetchone()
         conn.close()
@@ -225,7 +231,7 @@ class TestUpdatePlayerNameIndexSync:
         dm = _make_db(tmp_path)
         dm.update_player_name_index_sync([("#A1", "CurrentName", "2025-06-01T00:00")])
         dm.update_player_name_index_sync([("#A1", "StaleOldName", "2023-01-01T00:00")])
-        conn = sqlite3.connect(dm.db_path)
+        conn = sqlite3.connect(_path(dm))
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT player_name FROM player_name_index WHERE player_tag='#A1'").fetchone()
         conn.close()

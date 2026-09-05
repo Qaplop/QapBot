@@ -37,9 +37,9 @@ async def db(tmp_path):
 async def _seed_guild_and_clan(db: WarHistoryDB, guild_id: str, clan_tag: str = "#CLAN1") -> None:
     from qapbot.cache_manager import CACHE
 
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (clan_tag, "Test Clan"))
+    await db._conn.commit()
     # resolve_guild_member_clan_tags() (2026-08-14 auto-assignment redesign) reads the guild's
     # member clans from CACHE.server_config, not the DB directly (matching production — that
     # cache is normally kept in sync by save_guild_config()) — mirror it here so
@@ -52,8 +52,8 @@ async def _seed_current_clan_member(
     verified: bool = True, cwl_permanent_optout: bool = False,
     cwl_permanent_optin: bool = False, cwl_optout_send_dm_anyway: bool = False,
 ) -> None:
-    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
-    await db.conn.execute(
+    await db._conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (discord_id, discord_id))
+    await db._conn.execute(
         "INSERT INTO user_players "
         "(discord_id, player_tag, player_name, verified, cwl_permanent_optout, current_clan_tag, "
         " cwl_permanent_optin, cwl_optout_send_dm_anyway) "
@@ -63,11 +63,12 @@ async def _seed_current_clan_member(
             1 if cwl_permanent_optin else 0, 1 if cwl_optout_send_dm_anyway else 0,
         ),
     )
-    await db.conn.commit()
+    await db._conn.commit()
 
 
 async def _make_event(db: WarHistoryDB, guild_id: str, season: str, clan_tag: str = "#CLAN1") -> int:
     event_id = db.create_cwl_event_sync(guild_id, season, "creator")
+    assert event_id is not None
     db.set_cwl_event_clans_sync(event_id, [{"clan_tag": clan_tag}])
     return event_id
 
@@ -76,18 +77,18 @@ async def _seed_cwl_war(db: WarHistoryDB, clan_tag: str, players: list, date: st
     """attack_order=1 (a real attack) — get_last_real_cwl_attack_clan_sync's auto-assignment
     source excludes 0-attack "missed attack" sentinel rows, see its own docstring."""
     war_id = f"war_{clan_tag}_{date}"
-    await db.conn.execute(
+    await db._conn.execute(
         "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, is_cwl, cwl_season, date) VALUES (?, ?, ?, 1, ?, ?)",
         (war_id, clan_tag, "#OPP", date[:7], date),
     )
     for player_tag, player_name in players:
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO war_attacks "
             "(war_id, clan_tag, date, player_name, player_tag, th_level, map_position, attack_order, stars) "
             "VALUES (?, ?, ?, ?, ?, 15, 1, 1, 0)",
             (war_id, clan_tag, date, player_name, player_tag),
         )
-    await db.conn.commit()
+    await db._conn.commit()
 
 
 @pytest.mark.asyncio
@@ -221,8 +222,8 @@ async def test_dms_a_guest_player_invited_during_draft(db, monkeypatch):
 
     await _seed_guild_and_clan(db, "1015")
     monkeypatch.setattr(CACHE, "db_manager", db)
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHERCLAN', 'Other')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHERCLAN', 'Other')")
+    await db._conn.commit()
     await _seed_current_clan_member(db, "d1", "#P1")
     # The guest: linked, but plays in a clan this guild has nothing to do with.
     await _seed_current_clan_member(db, "d9", "#GUEST", clan_tag="#OTHERCLAN")
@@ -266,8 +267,8 @@ async def test_skips_a_permanently_opted_out_guest_player(db, monkeypatch):
 
     await _seed_guild_and_clan(db, "1016")
     monkeypatch.setattr(CACHE, "db_manager", db)
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHERCLAN', 'Other')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHERCLAN', 'Other')")
+    await db._conn.commit()
     await _seed_current_clan_member(
         db, "d9", "#GUEST", clan_tag="#OTHERCLAN", cwl_permanent_optout=True,
     )
@@ -447,11 +448,11 @@ async def test_non_participating_family_clan_members_are_still_pooled_and_dmed(d
     )
 
     guild_id = "1031"
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#CLAN1', 'Clan One')")
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#CLAN2', 'Clan Two')")
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHER_CLAN', 'Unrelated Clan')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#CLAN1', 'Clan One')")
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#CLAN2', 'Clan Two')")
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHER_CLAN', 'Unrelated Clan')")
+    await db._conn.commit()
     # Both #CLAN1 and #CLAN2 are this guild's own family — #OTHER_CLAN is not.
     CACHE.server_config[guild_id] = {"member_clans": ["#CLAN1", "#CLAN2"], "member_families": []}
     monkeypatch.setattr(CACHE, "db_manager", db)
@@ -512,8 +513,8 @@ async def test_globally_already_dmed_player_is_seeded_with_real_status_but_not_r
     # a dm_sent=1 row if it's still traceable to a live cwl_events row — see
     # get_cwl_player_season_dm_status_bulk_sync's own docstring) — this is what "some OTHER
     # guild's Start Enrollment already DMed and they confirmed" actually looks like in production.
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('999')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('999')")
+    await db._conn.commit()
     other_event_id = db.create_cwl_event_sync("999", "2026-08", "otherdiscordid")
     db.mark_cwl_player_dm_sent_sync("#P1", "2026-08", "Player", "d1", other_event_id, 999, "2026-08-17T09:00Z")
     db.set_cwl_player_response_status_sync(
@@ -551,8 +552,8 @@ async def test_departed_member_is_not_seeded(db, monkeypatch):
     from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
 
     await _seed_guild_and_clan(db, "1009", clan_tag="#CLAN1")
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHER_CLAN', 'Other Clan')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHER_CLAN', 'Other Clan')")
+    await db._conn.commit()
     monkeypatch.setattr(CACHE, "db_manager", db)
     await _seed_current_clan_member(db, "d1", "#P1", clan_tag="#OTHER_CLAN")
     await _make_event(db, "1009", "2026-08", clan_tag="#CLAN1")
@@ -953,8 +954,8 @@ async def test_seeds_auto_assignments_for_a_guest_clans_own_current_members(db, 
     guild_id = 10102
     await _seed_guild_and_clan(db, str(guild_id), clan_tag="#CLAN1")  # "The QCrew" — the only family clan
     monkeypatch.setattr(CACHE, "db_manager", db)
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#GUESTCLAN', 'StayCalm')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#GUESTCLAN', 'StayCalm')")
+    await db._conn.commit()
     # #P1 is a current member of #GUESTCLAN only — never part of this guild's own family.
     await _seed_current_clan_member(db, "d1", "#P1", "#GUESTCLAN")
     await _seed_cwl_war(db, "#GUESTCLAN", [("#P1", "Alpha")])
@@ -990,8 +991,8 @@ async def test_current_family_clan_membership_beats_stale_history_for_a_guest_cl
     guild_id = 10103
     await _seed_guild_and_clan(db, str(guild_id), clan_tag="#CLAN1")  # "The QCrew"
     monkeypatch.setattr(CACHE, "db_manager", db)
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#GUESTCLAN', 'StayCalm')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#GUESTCLAN', 'StayCalm')")
+    await db._conn.commit()
     # #P1 is a genuine CURRENT member of the guild's own family clan (#CLAN1)...
     await _seed_current_clan_member(db, "d1", "#P1", "#CLAN1")
     # ...but their last REAL CWL attack on record was for #GUESTCLAN (StayCalm) — e.g. from
@@ -1029,10 +1030,10 @@ async def test_current_clan_does_not_beat_history_pointing_at_another_family_cla
     from qapbot.QBdiscocmdshelper_cwl import start_cwl_enrollment
 
     guild_id = 10104
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (str(guild_id),))
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (str(guild_id),))
     for tag, name in [("#MARINES1", "The Marines"), ("#MARINES2", "The Marines II")]:
-        await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (tag, name))
-    await db.conn.commit()
+        await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (tag, name))
+    await db._conn.commit()
     CACHE.server_config[str(guild_id)] = {"member_clans": ["#MARINES1", "#MARINES2"], "member_families": []}
     monkeypatch.setattr(CACHE, "db_manager", db)
 
@@ -1126,8 +1127,8 @@ async def test_account_wide_expansion_off_by_default(db, monkeypatch):
     # d1 has one player in the participating clan (#CLAN1) and one in a clan this guild's own
     # family never included (Qaplop/Marines+QCrew scenario) — still needs a `clans` row
     # (user_players.current_clan_tag FK), just not in guild "1013"'s member_clans.
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#QCREW', 'QCrew')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#QCREW', 'QCrew')")
+    await db._conn.commit()
     await _seed_current_clan_member(db, "d1", "#P1", clan_tag="#CLAN1")
     await _seed_current_clan_member(db, "d1", "#P2", clan_tag="#QCREW")
     await _make_event(db, "1013", "2026-08")
@@ -1159,9 +1160,9 @@ async def test_account_wide_expansion_pulls_in_other_clan_players_when_enabled(d
     await _seed_guild_and_clan(db, "1014")
     monkeypatch.setattr(CACHE, "db_manager", db)
     CACHE.server_config["1014"]["cwl_enrollment_include_all_linked_accounts"] = True
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#QCREW', 'QCrew')")
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHER', 'Other')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#QCREW', 'QCrew')")
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#OTHER', 'Other')")
+    await db._conn.commit()
     await _seed_current_clan_member(db, "d1", "#P1", clan_tag="#CLAN1")
     await _seed_current_clan_member(db, "d1", "#P2", clan_tag="#QCREW")
     # d2 has no player in the participating clan at all — must not qualify d2's own other
@@ -1194,8 +1195,8 @@ async def test_start_enrollment_detects_and_reports_shared_clan(db, monkeypatch)
     monkeypatch.setattr(CACHE, "db_manager", db)
 
     # Guild 9999 already has #CLAN1 as a participating clan for the same season.
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('9999')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('9999')")
+    await db._conn.commit()
     other_event_id = db.create_cwl_event_sync("9999", "2026-08", "otherdiscordid")
     db.set_cwl_event_clans_sync(other_event_id, [{"clan_tag": "#CLAN1", "participating": True}])
 
@@ -1234,8 +1235,8 @@ async def test_start_enrollment_never_double_books_a_confirmed_shared_clan_guest
 
     await _seed_guild_and_clan(db, "1020", clan_tag="#CLAN1")  # "The QCrew"
     monkeypatch.setattr(CACHE, "db_manager", db)
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#SHAREDCLAN', 'StayCalm')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#SHAREDCLAN', 'StayCalm')")
+    await db._conn.commit()
 
     event_id = db.create_cwl_event_sync("1020", "2026-08", "creator")
     db.set_cwl_event_clans_sync(event_id, [
@@ -1283,13 +1284,13 @@ async def test_start_enrollment_shows_confirmed_shared_guest_as_orphaned_when_sh
 
     await _seed_guild_and_clan(db, "1021", clan_tag="#CLAN1")  # "The QCrew"
     monkeypatch.setattr(CACHE, "db_manager", db)
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#SHAREDCLAN', 'StayCalm')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#SHAREDCLAN', 'StayCalm')")
+    await db._conn.commit()
 
     # #SHAREDCLAN already exists as a shared clan (from an earlier season/round) but this NEW
     # event only has #CLAN1 participating — StayCalm isn't on this event's roster at all.
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('1020a')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES ('1020a')")
+    await db._conn.commit()
     other_event_id = db.create_cwl_event_sync("1020a", "2026-08", "other-creator")
     shared_id = db.create_cwl_shared_clan_sync("#SHAREDCLAN", "2026-08", "1020a", other_event_id, "unresolved_first_claimer")
     db.set_cwl_shared_clan_player_assignment_sync(shared_id, "#QMANIAC", "QManiac", "d1", True, "admin_override", "1020a")
@@ -1329,8 +1330,8 @@ async def test_start_enrollment_current_clan_beats_a_stale_non_deliberate_shared
 
     await _seed_guild_and_clan(db, "1022", clan_tag="#CLAN1")  # "The QCrew"
     monkeypatch.setattr(CACHE, "db_manager", db)
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#SHAREDCLAN', 'StayCalm')")
-    await db.conn.commit()
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#SHAREDCLAN', 'StayCalm')")
+    await db._conn.commit()
 
     event_id = db.create_cwl_event_sync("1022", "2026-08", "creator")
     db.set_cwl_event_clans_sync(event_id, [
@@ -1384,10 +1385,10 @@ async def test_start_enrollment_never_assigns_a_player_into_an_unrelated_shared_
     monkeypatch.setattr(CACHE, "db_manager", db)
 
     gid = "1023"
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (gid,))
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (gid,))
     for tag, name in [("#CLAN1", "QCrew"), ("#CLAN2", "QCrew2"), ("#SHAREDCLAN", "StayCalm")]:
-        await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (tag, name))
-    await db.conn.commit()
+        await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES (?, ?)", (tag, name))
+    await db._conn.commit()
     CACHE.server_config[gid] = {"member_clans": ["#CLAN1", "#CLAN2"], "member_families": []}
     CACHE.clan_families = {}
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
-from typing import Any, Dict, List
+from typing import Dict, List
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -91,19 +91,19 @@ async def _seed(
     (None = unlinked, "UNASSIGNED" = in the unassigned pool). Returns the event_id."""
     from qapbot.cache_manager import CACHE
 
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#CLAN1', 'Alpha')")
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#CLAN1', 'Alpha')")
     for uid in {old_owner, new_owner} - {None}:
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT OR IGNORE INTO users (discord_id, display_name) VALUES (?, ?)", (uid, uid)
         )
     if new_owner is not None:
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
             "VALUES (?, '#P1', 'PlayerOne', 1, '#CLAN1')",
             (new_owner,),
         )
-    await db.conn.commit()
+    await db._conn.commit()
 
     CACHE.db_manager = db
     CACHE.server_config[guild_id] = {"member_clans": ["#CLAN1"], "member_families": []}
@@ -111,6 +111,7 @@ async def _seed(
     CACHE.clan_families = {}
 
     event_id = db.create_cwl_event_sync(guild_id, season, "creator")
+    assert event_id is not None
     db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
     db.update_cwl_event_status_sync(event_id, event_status)
 
@@ -348,25 +349,26 @@ async def test_per_cycle_cap_bounds_the_dm_burst(db, monkeypatch):
     from qapbot.cache_manager import CACHE
 
     guild_id, season = "901", "2026-09"
-    await db.conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
-    await db.conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#CLAN1', 'Alpha')")
-    await db.conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('222', 'New')")
+    await db._conn.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
+    await db._conn.execute("INSERT OR IGNORE INTO clans (clan_tag, name) VALUES ('#CLAN1', 'Alpha')")
+    await db._conn.execute("INSERT OR IGNORE INTO users (discord_id, display_name) VALUES ('222', 'New')")
     total = 5
     for i in range(total):
-        await db.conn.execute(
+        await db._conn.execute(
             "INSERT INTO user_players (discord_id, player_tag, player_name, verified, current_clan_tag) "
             "VALUES ('222', ?, ?, 1, '#CLAN1')",
             (f"#P{i}", f"Player{i}"),
         )
     # Commit every async write BEFORE any sync writer runs — the sync connection is a separate
     # sqlite3 handle and would otherwise hit "database is locked" on the open async transaction.
-    await db.conn.commit()
+    await db._conn.commit()
     CACHE.db_manager = db
     CACHE.server_config[guild_id] = {"member_clans": ["#CLAN1"], "member_families": []}
     CACHE.subscriptions = {}
     CACHE.clan_families = {}
 
     event_id = db.create_cwl_event_sync(guild_id, season, "creator")
+    assert event_id is not None
     db.set_cwl_event_clans_sync(event_id, [{"clan_tag": "#CLAN1", "participating": True}])
     db.update_cwl_event_status_sync(event_id, "signup_open")
 
