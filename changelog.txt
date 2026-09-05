@@ -1,6 +1,47 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (5)
+- BUG FIX (build 21), found by auditing every war-finalization and CoC-API path in the update
+  cycle: release_war_object() could sever a CACHED, SHARED coc.ClanWar. fetch_clan_war_data()
+  normally owns its war object (get_current_war_from_api() is explicitly uncached, "always
+  single-use"), but all four §5.3 CWL fallbacks replace coc_war_obj with a war returned by
+  _find_active_cwl_war_for_clan() -> CACHE.get_league_war(), which serves the SAME object
+  identity out of CACHE._league_war_cache (TTL 2h, cap 1000, war_ended served from cache for the
+  whole TTL). ~29 call sites outside cache_manager read that cache: CWL leaderboards, group
+  stats, orphan processing. Severing one leaves the cache entry serving an object whose
+  back-references are gone, so the next reader of member.war / attack.member /
+  best_opponent_attack silently gets None. That is a wrong number in war history, not a crash.
+- PRE-EXISTING, not introduced by Stage 3: build 14 added this call unguarded at the Phase-3
+  site (release_war_object(war_data.get('war_obj'))), and Stage 3 moved it into
+  fetch_clan_war_data() equally unguarded. It has never fired because the CWL fallback is rare —
+  zero [CWL-FALLBACK] occurrences across every observed window. A latent correctness bug that
+  logs nothing when it triggers.
+- Fix: fetch_clan_war_data() tracks provenance in _war_obj_is_shared (False for the owned
+  get_current_war_from_api() object, True at each of the four fallback reassignments) and severs
+  only when it owns the object. Cached league wars are left to evict_stale_cwl_caches() and the
+  collector: a shorter GC pause is not worth a silent wrong-data bug in CWL leaderboards.
+- Tests: TestCachedWarsAreNeverSevered in tests/unit/test_release_war_object.py — a control
+  proving severing really is destructive on a real coc.ClanWar graph, a guard test proving a
+  shared war survives, and a structural test pinning the guard in the source (the function needs
+  live API objects to run, and an unguarded sever raises nothing, so the source is what can be
+  asserted). The count of 4 fallback markers is asserted so a NEW fallback that forgets the flag
+  fails the suite.
+- AUDIT RESULT for the rest of the cycle (the question was: do other paths still hold coc
+  objects we forgot?). Long-lived coc object stores are _league_war_cache (coc.ClanWar, cap
+  1000), _league_group_cache (coc.ClanWarLeagueGroup, cap 200) and coc_clan_cache (coc.Clan).
+  All three are bounded, deliberately SHARED caches, so severing them is unsafe by design, not
+  an oversight — they are the same category as the coc.Clan objects that maybe_chunk_collect()
+  covers rather than severs. temp_war_objects was checked and holds payload DICTS, not coc
+  objects (already migrated by §3 Step 2). History writes funnel through a single door
+  (db_manager.add_war_records via flush_pending_war_writes), fed by two producers: the regular
+  war_ended path and process_orphaned_cwl_wars(); both finalize from temp files, i.e. from the
+  payload, which is why the DEV/PROD diff matched on both.
+- Note on the remaining GC exposure: the 1000 cached league wars are ~195 objects each and are
+  NOT in the frozen permanent generation (they are created after startup), so a full sweep walks
+  them. Evicted entries (208 in the observed cycle) become cyclic garbage no one severs. Not
+  addressed here; recorded so the next GC pass starts from a measurement rather than a guess.
+
 2026-09-05 (4)
 - Stage 3 validation EXTENDED to the CWL orphan finalization path, which dominates the workload
   and which the first comparison never isolated. In the DEV build-20 cycle, 2,196 of the 2,947

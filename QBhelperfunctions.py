@@ -7340,8 +7340,19 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
                     context={"clan_tag": clan_tag, "error_type": type(e).__name__}
                 )
         
-        # Fetch current war data from API
+        # Fetch current war data from API.
+        #
+        # `_war_obj_is_shared` tracks PROVENANCE, and it gates the release_war_object() call at
+        # the end of this function. get_current_war_from_api() is explicitly uncached ("always
+        # single-use"), so that object is ours alone and severing it is safe. Every §5.3 CWL
+        # fallback below instead returns an object straight out of CACHE._league_war_cache —
+        # the SAME reference the cache holds and hands to ~29 other call sites (CWL
+        # leaderboards, group stats, orphan processing), retained up to 2h and permanently for
+        # war_ended. Severing one of those would leave the cached entry with its back-references
+        # nulled, and the next reader of member.war / attack.attacker / best_opponent_attack
+        # would silently see None — §5.1's silent-zero failure, in a cache hit.
         coc_war_obj = None
+        _war_obj_is_shared = False
         try:
             coc_war_obj = await CACHE.get_current_war_from_api(clan_tag)
             logging.debug(f"[COC-API-CALL] Fetching of current war for clan {clan_tag} from API COMPLETED successfully!")
@@ -7386,6 +7397,7 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
             )
             if _fallback_result:
                 coc_war_obj = _fallback_result[0]
+                _war_obj_is_shared = True  # cached league war — must not be severed
 
             if not coc_war_obj:
                 # No CWL war found either — update last_war_update and skip this cycle
@@ -7439,6 +7451,7 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
                 )
                 if _notinwar_cwl:
                     coc_war_obj = _notinwar_cwl[0]
+                    _war_obj_is_shared = True  # cached league war — must not be severed
                     logging.info(
                         f"[CWL-NOTINWAR-FALLBACK] {clan_tag} - found active CWL war "
                         f"(public-warlog clan returned notInWar on /currentwar)"
@@ -7474,6 +7487,7 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
                 )
                 if _notinwar_cwl2:
                     coc_war_obj = _notinwar_cwl2[0]
+                    _war_obj_is_shared = True  # cached league war — must not be severed
                     state = getattr(coc_war_obj, 'state', '')
                     my_clan = getattr(coc_war_obj, 'clan', None)
                     opp_clan = getattr(coc_war_obj, 'opponent', None)
@@ -7530,6 +7544,7 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
                 if _fallback2_result:
                     # Replace war object and re-derive metadata from the active CWL war
                     coc_war_obj = _fallback2_result[0]
+                    _war_obj_is_shared = True  # cached league war — must not be severed
                     state = getattr(coc_war_obj, 'state', '')
                     my_clan = getattr(coc_war_obj, 'clan', None)
                     opp_clan = getattr(coc_war_obj, 'opponent', None)
@@ -7638,9 +7653,17 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
         # The coc.ClanWar's last use is the line above. Sever its back-references HERE rather
         # than in Phase 3 (where Stage 2 did it): the graph is cyclic, so refcounting alone can
         # never free it, and this is now the only place that still holds a reference.
-        # Safe because get_current_war_from_api() explicitly does not cache war data
-        # ("always single-use"), so no other holder can be reading this object.
-        release_war_object(coc_war_obj)
+        #
+        # ONLY when we exclusively own it. A §5.3 CWL fallback replaces coc_war_obj with a
+        # CACHED league war that ~29 other call sites share; severing that would corrupt the
+        # cache entry for every later reader. Build 14 introduced this call unguarded (at the
+        # Phase-3 site) and Stage 3 moved it here still unguarded — the bug never fired only
+        # because the fallback is rare (zero occurrences in the observed PROD windows). The
+        # cached objects are bounded and evicted by evict_stale_cwl_caches(), so leaving them
+        # to the collector is the correct trade: a shorter GC pause is not worth a silent
+        # wrong-data bug in CWL leaderboards.
+        if not _war_obj_is_shared:
+            release_war_object(coc_war_obj)
         return _result
 
     except Exception as e:

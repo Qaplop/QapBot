@@ -2770,3 +2770,49 @@ not earned it.
 
 **See also:** Pitfall 59 for the related failure of treating an unreachable observation as
 evidence — both are cases of a verification that looked rigorous while measuring the wrong thing.
+
+---
+
+## Pitfall 61: before mutating an object to help the GC, prove you OWN it — a shared cache can hand you the same reference it keeps serving
+
+**Symptom:** a destructive optimisation (severing back-references, clearing a container,
+reusing a buffer) is applied at what looks like an object's last use. It is correct on the path
+you tested. On a rarer path the same variable holds an object a cache still owns, and the
+mutation corrupts every later reader — silently, because a severed graph returns `None` rather
+than raising.
+
+**What happened (2026-09-05):** `release_war_object()` severs coc.py's cyclic back-references so
+a war dies by refcount instead of waiting for a sweep. `fetch_clan_war_data()` normally owns its
+war — `get_current_war_from_api()` is explicitly uncached ("always single-use"), which is what
+made the call look safe. But all four §5.3 CWL fallbacks reassign the same variable from
+`CACHE.get_league_war()`, which returns **the same object identity it stores** in
+`_league_war_cache` (TTL 2h, cap 1000, `war_ended` served from cache for the whole TTL), read by
+~29 call sites — CWL leaderboards, group stats, orphan processing. Severing one of those leaves
+the cache serving a war whose `member.war`, `attack.member` and `best_opponent_attack` are gone,
+so the next reader gets `None` and writes a wrong number into war history.
+
+The call had been unguarded since build 14 and survived a whole staged migration that moved it
+to a new home. It never fired because the fallback is rare — **zero occurrences in every
+observed window**. Rarity is what made it invisible, not harmless.
+
+**How to apply:**
+
+- **"Who else holds a reference?" is a different question from "am I done with it?"** Being the
+  last *user* on your path does not make you the *owner*. Answer it per assignment, not per
+  variable — a variable that is safe where it is initialised can be unsafe three reassignments
+  later.
+- **Track provenance explicitly when a variable can be filled from more than one source.** A
+  boolean set at each assignment site beats reasoning about which branch ran. Assert the count
+  of assignment sites in a test so a newly added branch that forgets the flag fails the suite.
+- **Check the accessor, not the variable name.** `get_current_war_from_api()` and
+  `get_league_war()` return the same type; only one of them is cached. The type system will not
+  tell you which.
+- **A destructive optimisation on a rare path needs a test, not a log line.** It emits nothing
+  when it goes wrong, so absence of errors is not evidence — see Pitfall 59.
+- **When ownership is genuinely unclear, do not mutate.** Bounded, evicted caches cost a sweep;
+  a corrupted cache costs wrong data with no signal. Prefer making collection cheaper
+  (chunking/slicing) over severing anything you share — that is the same call already made for
+  `coc_clan_cache`.
+
+**See also:** Pitfall 58 for why severing is worth doing at all, and Pitfall 60 for the sampling
+mistake that led to the audit which found this.

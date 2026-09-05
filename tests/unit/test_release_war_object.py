@@ -175,3 +175,60 @@ class TestDefensive:
         assert not hasattr(war.clan, "_cs_members"), (
             "release_war_object() forced lazy member construction"
         )
+
+
+class TestCachedWarsAreNeverSevered:
+    """A CWL fallback hands back a war straight out of `CACHE._league_war_cache` — the same
+    object ~29 other call sites read (CWL leaderboards, group stats, orphan processing),
+    retained up to 2h and permanently for `war_ended`.
+
+    `fetch_clan_war_data()` severs the war it owns. If it ever severs a CACHED one, the cache
+    keeps serving an object whose back-references are gone, and the next reader of
+    `member.war` / `attack.member` / `best_opponent_attack` silently sees None — a wrong number
+    in a CWL leaderboard rather than a crash.
+
+    Build 14 introduced the sever unguarded at the Phase-3 site; Stage 3 moved it into
+    fetch_clan_war_data() still unguarded. It never fired because the CWL fallback is rare (zero
+    occurrences across the observed PROD windows) — which is exactly why it needs a test and not
+    a log line.
+    """
+
+    def test_severing_a_shared_war_is_destructive(self, client) -> None:
+        """Control: establishes that the thing being guarded against is real and damaging."""
+        war = _build(client)
+        member = war.clan.members[0]
+
+        release_war_object(war)
+
+        assert member.war is None, "release_war_object stopped severing — the guard is moot"
+
+    def test_the_guard_leaves_a_cached_war_intact(self, client) -> None:
+        """With the provenance flag set, an object the cache still holds must be untouched."""
+        war = _build(client)
+        member = war.clan.members[0]
+
+        _war_obj_is_shared = True            # what a CWL fallback sets
+        if not _war_obj_is_shared:           # the guard in fetch_clan_war_data()
+            release_war_object(war)
+
+        assert member.war is war, "a CACHED league war was severed — every later cache hit is corrupt"
+        assert member.attacks is not None
+
+    def test_the_guard_is_present_in_the_source(self) -> None:
+        """Structural. The surrounding function needs live API objects to execute, and an
+        unguarded sever raises nothing — it only produces quietly wrong data later — so pin the
+        guard itself."""
+        import inspect
+        import re
+        import QBhelperfunctions as H
+
+        src = inspect.getsource(H.fetch_clan_war_data)
+
+        assert "_war_obj_is_shared" in src, "provenance flag gone from fetch_clan_war_data()"
+        assert re.search(r"if not _war_obj_is_shared:\s*\n\s*release_war_object\(", src), (
+            "release_war_object() is no longer guarded by the provenance check"
+        )
+        assert src.count("_war_obj_is_shared = True") == 4, (
+            "a CWL fallback reassigns coc_war_obj without marking it shared — "
+            "that path would sever a cached league war"
+        )
