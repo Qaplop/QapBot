@@ -1,6 +1,19 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-06 (4)
+- Added [CWL-CACHE-SIZE] -- logs _league_war_cache/_league_group_cache population every cycle,
+  unconditionally (unlike the eviction lines, which only fire when something was purged), the
+  same way [COC-CACHE-CLEANUP] already does for coc_clan_cache. Feeds bug #0106's investigation
+  (RSS growth vs. concurrent-active-war count), which previously only had a single nightly
+  snapshot of these caches' size.
+- Fixed bug #0107: [GC-ATTRIBUTION] reported an impossible 53300.8% on its first real PROD
+  reading. Root cause: gc.get_objects() excludes frozen objects by design, but this codebase
+  freezes millions of objects nightly and measure_cwl_cache_gc_footprint()'s walk counts frozen
+  and unfrozen objects alike -- the frozen-exclusive denominator undercounted against the
+  frozen-inclusive numerator. Fixed by adding gc.get_freeze_count() into the denominator. Two new
+  regression tests in test_cwl_cache_gc_footprint.py reproduce the exact failure mode.
+
 2026-09-06 (3)
 - Tracker #0009: measured the _MAX_INACTIVE_PER_CYCLE throttle cap's actual influence on RSS from
   a 13.5h uninterrupted PROD run (build 26/27, 159 cycles) -- it has none. RSS vs. per-cycle clan
