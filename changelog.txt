@@ -1,6 +1,15 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-06 (5)
+- The tracker MCP server's attribution label (comment author, agent-filed reporter, etc.) was a
+  static TRACKER_ADMIN_ID env var -- accurate only until the next model-picker change, then
+  silently stale. Every tracker_* MCP tool now accepts an optional `model` argument that overrides
+  it for just that call, so the calling agent hands over its own live identity (e.g.
+  "claude-sonnet-5") on each call instead. web_bridge.py needed no changes -- it already reads
+  X-Tracker-Admin fresh per request. TRACKER_ADMIN_ID remains the fallback for a client that
+  omits `model`. Build 34.
+
 2026-09-06 (4)
 - Added [CWL-CACHE-SIZE] -- logs _league_war_cache/_league_group_cache population every cycle,
   unconditionally (unlike the eviction lines, which only fire when something was purged), the
