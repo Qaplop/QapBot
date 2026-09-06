@@ -2,16 +2,17 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
 ===========
 
 2026-09-06 (2)
-- Fixed tracker #0104 follow-up (found live-testing #0104 on ticket #0107): the "no ephemeral
-  should be output at all" ask was implemented as an info ephemeral instead of true silence.
+- Fixed tracker #0108, found live-testing #0104 (against ticket #0107 -- an unrelated agent-filed
+  item used only as the manual-test target, not itself about this bug): the "no ephemeral should
+  be output at all" ask was implemented as an info ephemeral instead of true silence.
   TrackerReplyModal.on_submit() now sends NO followup at all for the "no_reporter"/
   "already_has_access" outcomes -- removed the now-dead grant_access_no_reporter/
   grant_access_already_has_access translation keys and _render_grant_access_message branches
   along with it. Build 33.
-- Fixed tracker #0107 (also found live-testing #0104): replying to an agent-filed item showed
-  only the admin's own mention with no indication the reply was addressed to the filing agent.
-  post_comment() now unconditionally prepends <@{reporter_id}> (dropped the isdigit() gate added
-  for #0091) -- for a non-numeric agent reporter_id this renders as inert literal text, same as
+- Also part of #0108: replying to an agent-filed item showed only the admin's own mention with
+  no indication the reply was addressed to the filing agent. post_comment() now unconditionally
+  prepends <@{reporter_id}> (dropped the isdigit() gate added for #0091) -- for a non-numeric
+  agent reporter_id this renders as inert literal text, same as
   the item embed's own "Reported by <@reporter_id>" header already does. Build 33.
 
 2026-09-06 (1)

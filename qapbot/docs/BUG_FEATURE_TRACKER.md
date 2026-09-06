@@ -142,8 +142,9 @@ exists (the old thread otherwise becomes unreachable once its parent message is 
 `_move_item_to_implemented_channel()`.
 
 **Grant/revoke requestor access (2026-08-22, ticket #0021; reply modal added 2026-09-05, ticket
-#0102; modal always opens + skips needless grants, 2026-09-06, ticket #0104, retested and
-corrected against ticket #0107; Label length fix, ticket #0105)**: reporters normally can't see
+#0102; modal always opens + skips needless grants, 2026-09-06, ticket #0104, corrected by #0108
+after live-testing against unrelated ticket #0107; Label length fix, ticket #0105)**: reporters
+normally can't see
 the reports channel their item was posted in (it isn't open to `@everyone`), so a staff `@mention`
 reply gets no push notification and the reporter can't read the thread. The **"Reply to
 requestor"** button on `TrackerItemButton` (`grantaccess` action, admin-only,
@@ -157,7 +158,7 @@ Discord user" warning, no modal at all) for an agent-filed item's non-digit `rep
 the admin no way to reply either. Whether a grant/invite is even needed is decided inside the
 modal submit instead: on submit, `TrackerReplyModal.on_submit()` posts any reply text via
 `post_comment()` — which unconditionally @-addresses the reporter (tracker item #0091, widened by
-#0107 below) so Discord actually notifies a real reporter the moment they can see the channel —
+#0108 below) so Discord actually notifies a real reporter the moment they can see the channel —
 then calls `_grant_or_invite_from_interaction()`, which returns two no-op outcomes for the cases
 where there's genuinely nothing to grant: `"no_reporter"` (non-digit `reporter_id` — bot/agent-filed
 item) and `"already_has_access"` (a real member who can already see the channel via
@@ -165,9 +166,10 @@ item) and `"already_has_access"` (a real member who can already see the channel 
 click after an earlier grant — checked inside the shared `_apply_requestor_grant()` before it
 re-applies the overwrite, so the agent-facing `grant_access_for_agent()` path gets the same
 treatment for free). For those two, `on_submit()` sends **no ephemeral at all** — a first pass
-(shipped, then retested live against ticket #0107) sent an info ephemeral instead of the old
-false "granted" claim, but the operator's actual ask was silence: nothing happened worth telling
-the admin about, and their own reply (if any) is already visible in the thread above. Otherwise
+(shipped, then corrected by #0108 after live-testing against unrelated ticket #0107) sent an info
+ephemeral instead of the old false "granted" claim, but the operator's actual ask was silence:
+nothing happened worth telling the admin about, and their own reply (if any) is already visible
+in the thread above. Otherwise
 it gives the reporter a member-specific Discord permission overwrite on that channel
 (`view_channel`/`read_message_history`/`send_messages_in_threads`) via `_apply_requestor_grant()`,
 and finally replies (ephemeral, to the admin) with a jump link to the item's discussion thread (or
@@ -176,8 +178,9 @@ response (Cardinal Rule 10), so `_handle_grant_access()` itself does only the up
 gating and opening the modal — none of the actual grant/invite/reply side effects, which all
 happen once the modal is submitted.
 
-**Addressing a reply to an agent-filed item (2026-09-06, ticket #0107, found live-testing #0104)**:
-`post_comment()` prepends `<@{reporter_id}>` to every comment UNCONDITIONALLY, not just when
+**Addressing a reply to an agent-filed item (2026-09-06, ticket #0108, found live-testing #0104
+against unrelated ticket #0107)**: `post_comment()` prepends `<@{reporter_id}>` to every comment
+UNCONDITIONALLY, not just when
 `reporter_id` is a real numeric Discord id. An admin's reply to an agent-filed item (non-numeric
 `reporter_id` like `"agent:Qaplop"`) used to only show `<@{author_id}>` — the admin's OWN mention,
 since they're the one who typed it in Discord — with nothing indicating who the reply was actually

@@ -1505,7 +1505,7 @@ async def test_post_comment_always_mentions_the_reporter(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_post_comment_addresses_agent_filed_item_to_the_agent(db, monkeypatch):
-    """tracker item #0107 live test follow-up to #0104: replying to an agent-filed item (a
+    """tracker item #0108, found live-testing #0104: replying to an agent-filed item (a
     non-numeric "agent:<label>" reporter_id) previously showed only `<@{author_id}>` -- the
     admin's OWN mention, since they're the one who typed it in Discord -- with nothing indicating
     who the reply was actually addressed to. Must not crash building the id either. Discord can't
@@ -2511,7 +2511,7 @@ async def test_grant_or_invite_from_interaction_no_reporter_for_agent_filed_item
 async def test_reply_modal_agent_filed_item_posts_reply_addressed_to_agent_with_no_ephemeral(
     db, monkeypatch, mock_interaction
 ):
-    """tracker item #0104 (live test on #0107): a reply to an agent-filed item must (a) post the
+    """tracker item #0108, found live-testing #0104: a reply to an agent-filed item must (a) post the
     reply addressed to the filing agent, not just show the admin's own mention, and (b) show NO
     ephemeral at all afterwards -- there's nothing to grant, and the reply itself is already
     visible in the thread, so an info ephemeral would just be noise."""

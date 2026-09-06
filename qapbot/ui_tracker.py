@@ -1526,9 +1526,9 @@ def _render_grant_access_message(
     outcome differently.
 
     Never called for "no_reporter"/"already_has_access" -- `TrackerReplyModal.on_submit()`
-    (tracker item #0104 live test, #0107) short-circuits before this for those two, since neither
-    is worth an ephemeral at all: nothing happened that the admin needs telling about, and their
-    own reply (if any) already posted visibly into the channel/thread."""
+    (tracker item #0108, found live-testing #0104) short-circuits before this for those two,
+    since neither is worth an ephemeral at all: nothing happened that the admin needs telling
+    about, and their own reply (if any) already posted visibly into the channel/thread."""
     outcome = result["outcome"]
     if outcome == "granted":
         return t(
@@ -1696,7 +1696,7 @@ async def post_comment(item_number: int, text: str, author_id: str) -> None:
     Unconditionally prepends `<@{reporter_id}>` -- for a real Discord reporter this is a live,
     notifying mention; for an agent-filed item's non-numeric `reporter_id` (e.g. "agent:Qaplop")
     Discord just renders it as inert literal text, exactly like the item embed's own "Reported by
-    <@{reporter_id}>" header already does (tracker item #0107 live test follow-up to #0104: an
+    <@{reporter_id}>" header already does (tracker item #0108, found live-testing #0104: an
     admin's reply to an agent-filed item showed only `<@{author_id}>` -- the admin's OWN mention,
     since they're the one who typed it in Discord -- with no indication at all that the reply was
     addressed to the filing agent; this previously had an `isdigit()` gate specifically to avoid
@@ -2039,7 +2039,7 @@ class TrackerReplyModal(discord.ui.Modal, title="Reply to requestor"):
 
         result = await _grant_or_invite_from_interaction(interaction, item)
         if result["outcome"] in ("no_reporter", "already_has_access"):
-            # tracker item #0104/#0107 live test: nothing happened here worth an ephemeral --
+            # tracker item #0108, found live-testing #0104: nothing happened here worth an ephemeral --
             # a bot/agent-filed item has nobody to grant, and a reporter who already has access
             # needed no change. Stay silent instead (the reply itself, if any, already posted
             # visibly above); the interaction was already deferred non-visibly, so this leaves no
