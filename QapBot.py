@@ -1412,11 +1412,15 @@ async def main() -> None:
     # historical context for why a cap exists at all, NOT as a current bound, and do not derive a
     # new number from them.
     #
-    # What "observed safe at 5000" is and is not: it is an operational observation (cycle time and
-    # memory both stayed within budget on PROD), not a measured cost model. Nobody has yet
-    # measured single-cycle RSS delta against cycle size under the current code, so there is still
-    # no number saying where the ceiling actually is — only evidence that 5000 is below it. Do
-    # that measurement before raising further.
+    # MEASURED 2026-09-06 (tracker #0009, PROD build 26/27, 13.5h uninterrupted, 159 cycles): this
+    # cap does NOT have a significant influence on RSS. Pairing each cycle's RSS against its clan
+    # count gives r=-0.83 (ANTI-correlated) — the single highest-N cycle (4376 clans, near this
+    # cap) had the LOWEST RSS of the whole run (1721 MB), while RSS climbed to 7481 MB overnight as
+    # clan-count-per-cycle fell. There is no per-clan slope to derive here, and no ceiling to find
+    # by raising this cap further — 5000 stays as-is; the actual RSS driver (concurrent-active-war
+    # count and/or the still-coc.py-object-based CWL league-war/group caches, NOT this throttle)
+    # is tracked separately as bug #0106. Do not re-run this cap-vs-RSS comparison expecting a
+    # different relationship to emerge — the data says this isn't where the cost lives.
     #
     # Historical (pre-Stage-3, 2026-08-29, tracker #0009), retained for context only: the cap was
     # lowered 5000 -> 1500 as a memory bound rather than a runtime one, because every clan polled

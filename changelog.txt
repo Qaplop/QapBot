@@ -1,6 +1,17 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-06 (3)
+- Tracker #0009: measured the _MAX_INACTIVE_PER_CYCLE throttle cap's actual influence on RSS from
+  a 13.5h uninterrupted PROD run (build 26/27, 159 cycles) -- it has none. RSS vs. per-cycle clan
+  count is ANTI-correlated (r=-0.83); the highest-N cycle (4376, near the 5000 cap) had the LOWEST
+  RSS of the run. Updated the cap's comment block in QapBot.py to record this and stop pointing at
+  "measure this before raising further" now that it's measured. Cap stays at 5000, unchanged. The
+  real RSS driver (concurrent-active-war count / CWL league-war+group caches, not this cap) is
+  tracked as bug #0106; a separate GC-ATTRIBUTION math bug found in the same investigation is
+  #0107. All 6 of #0009's test cases individually signed off (4 passed, 2 failed -> the two bugs
+  above) using the new per-test-case tracker_mark_testcase_result tool.
+
 2026-09-06 (2)
 - Fixed tracker #0108, found live-testing #0104 (against ticket #0107 -- an unrelated agent-filed
   item used only as the manual-test target, not itself about this bug): the "no ephemeral should
