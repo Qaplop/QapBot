@@ -490,7 +490,9 @@ mimetype-confusion 500 that made the original bug hard to diagnose from the MCP 
 Reuses the existing `X-Bridge-Secret` (no second secret — accepted trade-off for a
 single-admin setup: holding it grants tracker-admin *and* CWL-endpoint access).
 `X-Tracker-Admin` is attribution-only (shows up as `last_edited_by`/comment author), never
-authentication — it's self-asserted.
+authentication — it's self-asserted. The bridge already reads it fresh per-request (no server-side
+caching), which is what makes the MCP layer's `model` argument (below) a drop-in: nothing here
+needed to change for it to work.
 
 ```
 GET  /api/tracker/items?status=&type=&limit=
@@ -613,6 +615,12 @@ directory.
   `${env:...}`/`${workspaceFolder}`, which VS Code resolves against its own environment;
   `.mcp.json` (Claude Code CLI) does *not* reliably expand `${env:...}`/`${workspaceFolder}` —
   it uses a literal `command`/`cwd` path and relies on `.env` alone for the secrets.
+  `TRACKER_ADMIN_ID` is only a fallback now (tracker item #0108 follow-up, 2026-09-06): setting it
+  to a specific model name (`claude-sonnet-5`, say) is static config that's wrong the moment the
+  model picker changes, so every tool now also accepts a per-call `model` argument that overrides
+  it. The calling agent should pass its own current model id on every call rather than relying on
+  this env var — `.env` keeps the generic literal `agent` as the fallback for a client that
+  doesn't supply one.
 - **After editing `.mcp.json`**: Claude Code only re-reads MCP server config at CLI startup —
   restart the session (`claude`) and approve the server (it shows "⏸ Pending approval" until
   then) before the tracker tools become available.

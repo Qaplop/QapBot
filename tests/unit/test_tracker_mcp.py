@@ -193,7 +193,7 @@ async def test_handle_request_tools_call_success(monkeypatch):
 @pytest.fixture
 def fake_client(monkeypatch):
     client = AsyncMock()
-    monkeypatch.setattr(tracker_mcp, "_client_from_env", lambda: client)
+    monkeypatch.setattr(tracker_mcp, "_client_from_env", lambda model=None: client)
     return client
 
 
@@ -540,3 +540,36 @@ def test_client_from_env_builds_client(monkeypatch):
     assert client.base_url == "http://127.0.0.1:9999"
     assert client.secret == "s3cr3t"
     assert client.admin_label == "claude"
+
+
+def test_client_from_env_model_argument_overrides_static_admin_id(monkeypatch):
+    """tracker item #0108 follow-up: a live `model` argument must win over the static
+    TRACKER_ADMIN_ID env var -- that's the whole point of accepting it per call instead of
+    only ever reading a config value set once at server startup."""
+    monkeypatch.setenv("TRACKER_BRIDGE_URL", "http://127.0.0.1:9999")
+    monkeypatch.setenv("TRACKER_BRIDGE_SECRET", "s3cr3t")
+    monkeypatch.setenv("TRACKER_ADMIN_ID", "agent")
+
+    client = tracker_mcp._client_from_env("claude-sonnet-5")
+
+    assert client.admin_label == "claude-sonnet-5"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_threads_model_argument_into_the_client(monkeypatch):
+    """The `model` argument on a tool call must reach `_client_from_env()` -- this is what lets
+    the calling model hand over its own live identity on every call instead of the caller being
+    stuck with whatever TRACKER_ADMIN_ID was set to when the MCP server process started."""
+    seen = {}
+
+    def _fake_client_from_env(model=None):
+        seen["model"] = model
+        client = AsyncMock()
+        client.list_items = AsyncMock(return_value=[])
+        return client
+
+    monkeypatch.setattr(tracker_mcp, "_client_from_env", _fake_client_from_env)
+
+    await tracker_mcp.call_tool("tracker_list_items", {"model": "claude-opus-5"})
+
+    assert seen["model"] == "claude-opus-5"

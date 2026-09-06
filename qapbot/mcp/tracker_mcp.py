@@ -12,8 +12,12 @@ guaranteed to see the user's shell environment):
     TRACKER_BRIDGE_URL     e.g. `http://127.0.0.1:PORT` for a DEV-owned tracker, or the PROD
                            cloudflared tunnel hostname (plan §3.1/§6.4).
     TRACKER_BRIDGE_SECRET  the bridge's shared X-Bridge-Secret.
-    TRACKER_ADMIN_ID       attribution label sent as X-Tracker-Admin (self-asserted, never
-                           authentication — see plan §6.4).
+    TRACKER_ADMIN_ID       fallback attribution label sent as X-Tracker-Admin (self-asserted,
+                           never authentication — see plan §6.4) when a tool call doesn't supply
+                           its own `model` argument. Every tool accepts `model` (tracker item
+                           #0108 follow-up) so the calling agent can hand over its own live
+                           identity (e.g. "claude-sonnet-5") on each call instead of this static
+                           config value going stale the moment the model picker changes.
 
 Twelve tools now, nine of them writes (tracker item #0015 added `tracker_create_item`; a
 follow-up added `tracker_mark_testcase_passed`/`tracker_mark_testcase_failed` so the pass/fail
@@ -58,6 +62,22 @@ SERVER_NAME = "qapbot-tracker"
 SERVER_VERSION = "1.0.0"
 CACHE_DIR_NAME = ".tracker-cache"
 
+# Shared property, spliced into every tool's inputSchema below (tracker item #0108 follow-up:
+# "Could not the submitting model hand its name live?") -- one dict instance reused everywhere
+# rather than repeating this description 12 times, same as the module docstring's TRACKER_ADMIN_ID
+# entry describes the static fallback this overrides.
+_MODEL_PARAM: Dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "The language model/agent identity actually making this call right now (e.g. "
+        "'claude-sonnet-5') -- used for Discord attribution (comment/reply author, the reporter "
+        "label on an agent-filed item, etc.) in place of this server's static TRACKER_ADMIN_ID "
+        "env var. Always pass your own current model id here: unlike the env var, this can never "
+        "go stale when the model picker changes, because it's supplied fresh on every call "
+        "instead of read once from a config file. Falls back to TRACKER_ADMIN_ID if omitted."
+    ),
+}
+
 TOOLS: List[Dict[str, Any]] = [
     {
         "name": "tracker_list_items",
@@ -71,6 +91,7 @@ TOOLS: List[Dict[str, Any]] = [
                 },
                 "type": {"type": "string", "enum": ["bug", "feature"]},
                 "limit": {"type": "integer", "default": 50},
+                "model": _MODEL_PARAM,
             },
         },
     },
@@ -79,8 +100,8 @@ TOOLS: List[Dict[str, Any]] = [
         "description": (
             "File a new bug or feature request into the tracker, posting it to the configured "
             "Discord reports channel exactly like a human-filed /bug or /feature. Attributed "
-            "to this MCP session's TRACKER_ADMIN_ID, not a Discord user — use this instead of "
-            "asking the project owner to file it manually."
+            "to the calling model (see the `model` argument), not a Discord user — use this "
+            "instead of asking the project owner to file it manually."
         ),
         "inputSchema": {
             "type": "object",
@@ -94,6 +115,7 @@ TOOLS: List[Dict[str, Any]] = [
                     "description": "Bug items only; ignored for features.",
                 },
                 "priority": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"], "description": "Defaults to MEDIUM if omitted."},
+                "model": _MODEL_PARAM,
             },
             "required": ["item_type", "title", "description"],
         },
@@ -108,7 +130,7 @@ TOOLS: List[Dict[str, Any]] = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"item_number": {"type": "integer"}},
+            "properties": {"item_number": {"type": "integer"}, "model": _MODEL_PARAM},
             "required": ["item_number"],
         },
     },
@@ -127,6 +149,7 @@ TOOLS: List[Dict[str, Any]] = [
                     "type": "string",
                     "description": "Optional note (e.g. commit/PR reference) — shown as 'Implemented in' when status is 'implemented'.",
                 },
+                "model": _MODEL_PARAM,
             },
             "required": ["item_number", "status"],
         },
@@ -136,7 +159,7 @@ TOOLS: List[Dict[str, Any]] = [
         "description": "Post a comment into a tracker item's Discord discussion thread.",
         "inputSchema": {
             "type": "object",
-            "properties": {"item_number": {"type": "integer"}, "text": {"type": "string"}},
+            "properties": {"item_number": {"type": "integer"}, "text": {"type": "string"}, "model": _MODEL_PARAM},
             "required": ["item_number", "text"],
         },
     },
@@ -157,6 +180,7 @@ TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "item_number": {"type": "integer"},
                 "text": {"type": "string", "description": "The message to post, addressed to the reporter."},
+                "model": _MODEL_PARAM,
             },
             "required": ["item_number", "text"],
         },
@@ -179,6 +203,7 @@ TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "item_number": {"type": "integer"},
                 "limit": {"type": "integer", "default": 50, "description": "Most recent N messages, returned oldest first."},
+                "model": _MODEL_PARAM,
             },
             "required": ["item_number"],
         },
@@ -211,6 +236,7 @@ TOOLS: List[Dict[str, Any]] = [
                         "required": ["environment", "description"],
                     },
                 },
+                "model": _MODEL_PARAM,
             },
             "required": ["item_number", "cases"],
         },
@@ -231,6 +257,7 @@ TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "item_number": {"type": "integer"},
                 "environment": {"type": "string", "enum": ["DEV", "PROD"]},
+                "model": _MODEL_PARAM,
             },
             "required": ["item_number", "environment"],
         },
@@ -244,7 +271,7 @@ TOOLS: List[Dict[str, Any]] = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"item_number": {"type": "integer"}},
+            "properties": {"item_number": {"type": "integer"}, "model": _MODEL_PARAM},
             "required": ["item_number"],
         },
     },
@@ -271,6 +298,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "testcase_id": {"type": "integer", "description": "The case's `id`, from tracker_get_item's test case list."},
                 "result": {"type": "string", "enum": ["passed", "failed"]},
                 "note": {"type": "string", "description": "Optional reason, shown inline in the checklist — most useful for a failed result."},
+                "model": _MODEL_PARAM,
             },
             "required": ["item_number", "testcase_id", "result"],
         },
@@ -289,6 +317,7 @@ TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "item_number": {"type": "integer"},
                 "force": {"type": "boolean", "description": "Move anyway even if cases are still unchecked. Defaults to false."},
+                "model": _MODEL_PARAM,
             },
             "required": ["item_number"],
         },
@@ -296,10 +325,15 @@ TOOLS: List[Dict[str, Any]] = [
 ]
 
 
-def _client_from_env() -> TrackerBridgeClient:
+def _client_from_env(model: Optional[str] = None) -> TrackerBridgeClient:
+    """*model* is this call's `model` argument (tracker item #0108 follow-up) -- the calling
+    agent's own live identity, e.g. "claude-sonnet-5", taking priority over the static
+    TRACKER_ADMIN_ID env var so attribution never goes stale the moment a model-picker change
+    makes that config value wrong. Falls back to TRACKER_ADMIN_ID (then the literal "agent")
+    when omitted, e.g. for an older client that predates the `model` argument."""
     base_url = os.environ.get("TRACKER_BRIDGE_URL", "")
     secret = os.environ.get("TRACKER_BRIDGE_SECRET", "")
-    admin_label = os.environ.get("TRACKER_ADMIN_ID", "agent")
+    admin_label = model or os.environ.get("TRACKER_ADMIN_ID", "agent")
     if not base_url or not secret:
         raise RuntimeError("TRACKER_BRIDGE_URL and TRACKER_BRIDGE_SECRET must both be set")
     return TrackerBridgeClient(base_url, secret, admin_label)
@@ -405,7 +439,7 @@ async def render_thread_markdown(client: TrackerBridgeClient, item_number: int, 
 
 
 async def call_tool(name: str, arguments: Dict[str, Any]) -> str:
-    client = _client_from_env()
+    client = _client_from_env(arguments.get("model"))
 
     if name == "tracker_list_items":
         items = await client.list_items(
