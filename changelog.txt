@@ -1,7 +1,19 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
-2026-09-06 (5)
+2026-09-06 (6)
+- Bug #0106: two on-demand /admin Memory Profile reports taken minutes apart at 8.5-8.8 GB RSS
+  (PROD, build 34, ~8h uptime) found [CACHE STRUCTURE SIZES] (real deep-sampled byte sizes for
+  temp_war_stats/temp_war_objects/clan_name_cache/coc_clan_cache) summing to well under 900 MB --
+  under 11% of actual RSS, refuting the leading "it's the named CACHE structures" hypothesis from
+  this ticket's own prior comment. Added two diagnostics to close the gap: (1) a glibc
+  mallinfo2() allocator snapshot (_get_malloc_info(), new [ALLOCATOR] report section) to tell
+  "genuinely-live memory our census tools can't reach" apart from "freed-but-not-returned heap
+  fragmentation malloc_trim() isn't clearing" -- two very different fixes; (2) a top-15-by-total-
+  shallow-SIZE GC type ranking alongside the existing top-15-by-COUNT one
+  (_build_gc_type_counts() now returns both), since a count-only ranking structurally cannot
+  surface a small number of large objects. Both wired into save_memtrace_snapshot()'s file report
+  and the live Discord summary. 5 new tests in test_memory_report_instrumentation.py.
 - The tracker MCP server's attribution label (comment author, agent-filed reporter, etc.) was a
   static TRACKER_ADMIN_ID env var -- accurate only until the next model-picker change, then
   silently stale. Every tracker_* MCP tool now accepts an optional `model` argument that overrides

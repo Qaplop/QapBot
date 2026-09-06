@@ -1461,8 +1461,10 @@ def _build_cache_summary(cache: Any) -> list[str]:
     return lines
 
 
-def _build_gc_type_counts(top_n: int = 15, max_scan: int = 5_000_000) -> list[tuple[str, int]]:
-    """Return top-N GC object types by count.
+def _build_gc_type_counts(
+    top_n: int = 15, max_scan: int = 5_000_000
+) -> tuple[list[tuple[str, int]], list[tuple[str, int, int]]]:
+    """Return (top-N GC object types by COUNT, top-N GC object types by total shallow SIZE).
 
     max_scan caps the number of objects iterated so this never hangs during
     CWL season when millions of cached objects are live (4+ GB RSS).
@@ -1472,16 +1474,80 @@ def _build_gc_type_counts(top_n: int = 15, max_scan: int = 5_000_000) -> list[tu
     nothing about the actual heap composition. Counting types is cheap per object (no deep
     traversal), so a limit high enough to actually finish on a multi-GB heap is worth the extra
     fraction of a second on what is an explicitly-requested admin diagnostic.
+
+    Added a by-SIZE ranking 2026-09-06 (tracker #0106): two on-demand profiles at 8.5-8.8 GB RSS
+    found [CACHE STRUCTURE SIZES] + this function's original count-only ranking summing to well
+    under 2 GB combined — millions of objects accounted for, most of the RSS not. A ranking by
+    COUNT structurally cannot surface the other explanation: a comparatively small number of
+    large objects (e.g. big `bytes`/`str` payloads) that never crack the top 15 by instance count
+    but could dominate by size. `sys.getsizeof()` per object is shallow (no recursion, unlike
+    `_estimate_dict_size_mb`) but costs almost nothing extra since the loop already visits every
+    object — worth it to close this blind spot rather than guess again.
     """
     import gc
+    import sys
     type_counts: dict[str, int] = {}
+    type_sizes: dict[str, int] = {}
     for i, obj in enumerate(gc.get_objects()):
         if i >= max_scan:
             type_counts['<scan capped>'] = type_counts.get('<scan capped>', 0) + 1
             break
         t = type(obj).__name__
         type_counts[t] = type_counts.get(t, 0) + 1
-    return sorted(type_counts.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+        try:
+            type_sizes[t] = type_sizes.get(t, 0) + sys.getsizeof(obj)
+        except Exception:
+            pass  # a handful of hostile __sizeof__ implementations must not abort the scan
+    by_count = sorted(type_counts.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+    by_size = sorted(
+        ((t, type_counts[t], sz) for t, sz in type_sizes.items()),
+        key=lambda kv: kv[2], reverse=True,
+    )[:top_n]
+    return by_count, by_size
+
+
+def _get_malloc_info() -> dict[str, float]:
+    """glibc `mallinfo2()` snapshot, in MB — distinguishes two very different explanations for
+    RSS that [CACHE STRUCTURE SIZES] and the GC census can't account for (tracker #0106, added
+    2026-09-06 after two on-demand profiles found those sections summing to well under 2 GB
+    against 8.5-8.8 GB actual RSS):
+
+    - If `in_use_mb` tracks close to RSS, the allocator itself considers that memory genuinely
+      allocated to something — the gap is a Python (or C-extension) object our census tools
+      simply aren't reaching, not an allocator artifact.
+    - If `in_use_mb` is far below RSS, most of the gap is `free_mb` (freed back to malloc but
+      not `madvise`'d/returned to the OS — classic heap fragmentation that `malloc_trim()`
+      already runs every cycle and evidently isn't fully clearing) or memory outside malloc's
+      arena entirely (`mmap_mb`, or growth mallinfo2 doesn't count at all). That points at
+      allocator tuning (`MALLOC_ARENA_MAX`, `MALLOC_TRIM_THRESHOLD_`) rather than a Python data
+      structure to shrink.
+
+    glibc-only (`ctypes.CDLL("libc.so.6")`); returns {} anywhere else (dev machines, musl) or on
+    any failure — this is a best-effort diagnostic and must never break the rest of the report.
+    """
+    try:
+        import ctypes
+
+        class _MallInfo2(ctypes.Structure):
+            _fields_ = [
+                (f, ctypes.c_size_t) for f in (
+                    "arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks",
+                    "fsmblks", "uordblks", "fordblks", "keepcost",
+                )
+            ]
+
+        libc = ctypes.CDLL("libc.so.6")
+        libc.mallinfo2.restype = _MallInfo2
+        info = libc.mallinfo2()
+        _mb = 1024 * 1024
+        return {
+            "arena_mb": info.arena / _mb,      # non-mmap'd heap under malloc's control
+            "in_use_mb": info.uordblks / _mb,  # of that, actually handed out
+            "free_mb": info.fordblks / _mb,    # of that, freed but not returned to the OS
+            "mmap_mb": info.hblkhd / _mb,      # large allocations malloc routed to mmap directly
+        }
+    except Exception:
+        return {}
 
 
 def _get_process_memory_mb() -> tuple[float, float]:
@@ -1554,8 +1620,9 @@ def save_memtrace_snapshot(cache: Any) -> str:
     diff_stats = snapshot.compare_to(baseline, "lineno") if baseline is not None else None  # type: ignore[arg-type]
 
     cache_summary = _build_cache_summary(cache)
-    top_types = _build_gc_type_counts(15)
+    top_types, top_types_by_size = _build_gc_type_counts(15)
     rss_mb, vms_mb = _get_process_memory_mb()
+    malloc_info = _get_malloc_info()
 
     # Uptime
     uptime_str = "unknown"
@@ -1575,6 +1642,26 @@ def save_memtrace_snapshot(cache: Any) -> str:
     lines.append("=" * 70)
     nframes = tracemalloc.get_traceback_limit()
     lines.append(f"tracemalloc nframe={nframes}  |  RSS={rss_mb:.1f} MB  VMS={vms_mb:.1f} MB  |  uptime={uptime_str}")
+
+    lines.append("\n[ALLOCATOR — glibc mallinfo2()]")
+    if malloc_info:
+        lines.append(
+            f"  arena={malloc_info['arena_mb']:.1f} MB  in_use={malloc_info['in_use_mb']:.1f} MB  "
+            f"free_not_returned={malloc_info['free_mb']:.1f} MB  large_mmap={malloc_info['mmap_mb']:.1f} MB"
+        )
+        _unaccounted = rss_mb - malloc_info['arena_mb'] - malloc_info['mmap_mb']
+        lines.append(
+            f"  RSS - arena - large_mmap = {_unaccounted:.1f} MB unaccounted for by malloc "
+            "entirely (thread stacks, shared libs, or memory outside glibc's allocator)."
+        )
+        lines.append(
+            "  Read this against [CACHE STRUCTURE SIZES] below: if in_use tracks close to RSS, "
+            "the gap is a real allocation our census tools aren't reaching yet. If free_not_returned "
+            "is the big number instead, this is heap fragmentation malloc_trim() isn't clearing, "
+            "not a Python object to go hunting for."
+        )
+    else:
+        lines.append("  (unavailable — not glibc, or mallinfo2() failed)")
 
     lines.append("\n[CACHE STRUCTURE SIZES]")
     lines.extend(cache_summary)
@@ -1602,6 +1689,16 @@ def save_memtrace_snapshot(cache: Any) -> str:
         )
     for tname, cnt in top_types:
         lines.append(f"  {tname:<40} {cnt:>10,}")
+
+    lines.append("\n[GC OBJECT COUNTS — top 15 by shallow SIZE]")
+    lines.append(
+        "  sys.getsizeof() per object, NOT recursive (unlike [CACHE STRUCTURE SIZES] above) — "
+        "still enough to catch a small number of large objects the by-count ranking above "
+        "cannot: a type with far fewer instances than tuple/dict but bigger ones can dominate "
+        "RSS while never reaching the top 15 by count."
+    )
+    for tname, cnt, sz in top_types_by_size:
+        lines.append(f"  {tname:<40} {cnt:>10,}  ~{sz / 1_048_576:>8.1f} MB")
 
     # Trace-window warning (2026-08-21, tracker #0009). tracemalloc is started ON DEMAND, minutes
     # before this snapshot — NOT at process start — so the totals below cover only that short
@@ -1941,15 +2038,22 @@ async def handle_memory_profile(cache: Any) -> str:
         top_stats = snapshot.statistics("lineno")
         cache_summary = _build_cache_summary(cache)
         rss_mb, _ = _get_process_memory_mb()
+        malloc_info = _get_malloc_info()
 
         total_top10_mb = sum(s.size for s in top_stats[:10]) / 1_048_576
         discord_lines: list[str] = [
             f"**Memory Profile** — `{os.path.basename(report_path)}`",
             f"Full report saved to `{report_path}`",
             f"RSS: {rss_mb:.1f} MB  |  nframe={tracemalloc.get_traceback_limit()}",
-            "",
-            "**CACHE sizes:**",
         ]
+        if malloc_info:
+            discord_lines.append(
+                f"Allocator: in_use={malloc_info['in_use_mb']:.0f} MB  "
+                f"free_not_returned={malloc_info['free_mb']:.0f} MB  "
+                f"large_mmap={malloc_info['mmap_mb']:.0f} MB"
+            )
+        discord_lines.append("")
+        discord_lines.append("**CACHE sizes:**")
         discord_lines.extend(f"`{l.strip()}`" for l in cache_summary)
         discord_lines.append("")
         discord_lines.append(f"**Top 10 tracemalloc sites** ({total_top10_mb:.1f} MB combined):")

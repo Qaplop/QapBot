@@ -14,7 +14,9 @@ from unittest.mock import MagicMock
 
 from qapbot.QBdiscocmdshelper_admin_command import (
     _build_cache_summary,
+    _build_gc_type_counts,
     _estimate_dict_size_mb,
+    _get_malloc_info,
 )
 
 
@@ -258,6 +260,82 @@ class TestSharedReferenceAccounting:
         small = _estimate_dict_size_mb(_unique(300))
         large = _estimate_dict_size_mb(_unique(3_000))
         assert large > small * 5
+
+
+class TestGcTypeCountsBySize:
+    """tracker #0106, 2026-09-06: two on-demand profiles at 8.5-8.8 GB RSS found the by-COUNT
+    ranking (the only one that existed) plus [CACHE STRUCTURE SIZES] summing to well under 2 GB
+    combined. A ranking sorted by instance count structurally cannot surface a smaller number of
+    much bigger objects — exactly the failure mode this adds a second ranking to catch.
+    """
+
+    def test_returns_both_a_count_ranking_and_a_size_ranking(self):
+        by_count, by_size = _build_gc_type_counts(top_n=5, max_scan=10_000)
+        assert isinstance(by_count, list) and isinstance(by_size, list)
+        assert all(len(row) == 2 for row in by_count)
+        assert all(len(row) == 3 for row in by_size)
+
+    def test_size_ranking_surfaces_a_low_count_high_size_type_the_count_ranking_hides(self):
+        """The motivating scenario: many tiny objects of one gc-tracked type (outnumbers the
+        other by instance count) alongside a handful of a different, much bigger type (loses on
+        count but dominates actual bytes). `object()`/`str` are NOT gc-tracked in CPython, so
+        this uses `dict`/`list` — both always tracked, whatever their contents.
+
+        Uses top_n large enough to include every distinct type rather than asserting a top-N
+        position, since the live process already holds an unknown, environment-dependent mix of
+        other objects — including, when this file's earlier tests ran first, dicts left alive by
+        their own fixtures — that a tight margin would make this test order-sensitive to. The
+        list side is sized to dominate any plausible such baseline.
+        """
+        many_tiny_dicts = [{} for _ in range(5_000)]
+        few_huge_lists = [[0] * 500_000 for _ in range(30)]
+
+        by_count, by_size = _build_gc_type_counts(top_n=1_000_000)
+
+        count_by_type = dict(by_count)
+        size_by_type = {t: sz for t, _cnt, sz in by_size}
+
+        assert count_by_type["dict"] > count_by_type["list"], (
+            "fixture invariant broken: the 5,000 tiny dicts must outnumber the 3 huge lists"
+        )
+        assert size_by_type["list"] > size_by_type["dict"], (
+            "the 3 huge lists must out-weigh the 5,000 tiny dicts in total shallow bytes — "
+            "this is exactly what a count-only ranking cannot show"
+        )
+        del many_tiny_dicts, few_huge_lists
+
+    def test_never_raises_on_a_hostile_sizeof(self):
+        """A diagnostic must not be the thing that breaks /admin — including when some live
+        object's __sizeof__ misbehaves."""
+        class _Hostile:
+            def __sizeof__(self):
+                raise RuntimeError("boom")
+
+        hostile = _Hostile()
+        by_count, by_size = _build_gc_type_counts(top_n=5, max_scan=1_000_000)
+        assert isinstance(by_count, list) and isinstance(by_size, list)
+        del hostile
+
+
+class TestMallocInfo:
+    """tracker #0106, 2026-09-06: the single most diagnostic addition — whether glibc's own
+    allocator considers the missing memory 'in use' (a real allocation our census tools aren't
+    reaching) or 'freed but not returned to the OS' (fragmentation, not a Python object at all).
+    """
+
+    def test_never_raises_and_returns_a_well_shaped_result(self):
+        result = _get_malloc_info()
+        assert isinstance(result, dict)
+        if result:  # glibc available (Linux CI/PROD); {} is the valid non-glibc answer
+            for key in ("arena_mb", "in_use_mb", "free_mb", "mmap_mb"):
+                assert key in result
+                assert isinstance(result[key], float)
+                assert result[key] >= 0.0
+
+    def test_survives_ctypes_failure(self, monkeypatch):
+        import ctypes as _ctypes
+        monkeypatch.setattr(_ctypes, "CDLL", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("no libc")))
+        assert _get_malloc_info() == {}
 
 
 class TestSlotsAndGeneratorWalking:
