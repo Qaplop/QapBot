@@ -459,8 +459,6 @@
       "grant_access_denied": "🔒 Nur ein Bot-Administrator kann Zugriff für den Melder gewähren.",
       "grant_access_member_not_found": "⚠️ Dieses Mitglied wurde auf diesem Server nicht gefunden.",
       "grant_access_granted": "✅ <@{reporter_id}> hat nun Zugriff auf diesen Kanal und seine Threads: {jump_link}",
-      "grant_access_already_has_access": "ℹ️ <@{reporter_id}> hat bereits Zugriff auf diesen Kanal — keine Änderung nötig.",
-      "grant_access_no_reporter": "ℹ️ Dieser Eintrag hat keinen verknüpften Discord-Nutzer — keine Zugriffsänderung nötig.",
       "grant_access_failed": "⚠️ Zugriff konnte nicht gewährt werden — prüfe meine Berechtigungen in diesem Kanal.",
       "grant_access_invite_failed": "⚠️ Einladung konnte nicht erstellt werden — prüfe meine „Einladung erstellen“-Berechtigung in diesem Kanal.",
       "grant_access_invite_dm": "👋 Ein Administrator hat auf deine Meldung **#{item_number}** geantwortet — tritt dem Server bei, um sie zu sehen und zu antworten: {invite_url}",

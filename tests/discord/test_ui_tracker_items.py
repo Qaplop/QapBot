@@ -1504,9 +1504,14 @@ async def test_post_comment_always_mentions_the_reporter(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_post_comment_no_mention_for_agent_filed_item(db, monkeypatch):
-    """An agent-filed item's reporter_id ("agent:<label>") has no real Discord user to mention --
-    must not crash trying to build one, and must not emit a broken '<@agent:...>' mention."""
+async def test_post_comment_addresses_agent_filed_item_to_the_agent(db, monkeypatch):
+    """tracker item #0107 live test follow-up to #0104: replying to an agent-filed item (a
+    non-numeric "agent:<label>" reporter_id) previously showed only `<@{author_id}>` -- the
+    admin's OWN mention, since they're the one who typed it in Discord -- with nothing indicating
+    who the reply was actually addressed to. Must not crash building the id either. Discord can't
+    render `<@agent:claude>` as a live mention (no real snowflake), but shows it as inert literal
+    text exactly like the item embed's own "Reported by <@agent:claude>" header already does --
+    that's an accepted, informative convention here, not a bug to hide."""
     thread = _fake_channel()
     _wire_bot(monkeypatch, channel=thread)
     item_number = await _make_item(db, reporter_id="agent:claude")
@@ -1515,7 +1520,7 @@ async def test_post_comment_no_mention_for_agent_filed_item(db, monkeypatch):
     await post_comment(item_number, "internal note", "Qaplop")
 
     posted = thread.send.call_args[0][0]
-    assert "<@agent:claude>" not in posted
+    assert "<@agent:claude>" in posted
 
 
 @pytest.mark.asyncio
@@ -2503,7 +2508,13 @@ async def test_grant_or_invite_from_interaction_no_reporter_for_agent_filed_item
     mock_interaction.guild.get_member.assert_not_called()
 
 
-async def test_reply_modal_agent_filed_item_posts_reply_without_touching_access(db, monkeypatch, mock_interaction):
+async def test_reply_modal_agent_filed_item_posts_reply_addressed_to_agent_with_no_ephemeral(
+    db, monkeypatch, mock_interaction
+):
+    """tracker item #0104 (live test on #0107): a reply to an agent-filed item must (a) post the
+    reply addressed to the filing agent, not just show the admin's own mention, and (b) show NO
+    ephemeral at all afterwards -- there's nothing to grant, and the reply itself is already
+    visible in the thread, so an info ephemeral would just be noise."""
     thread = _fake_channel()
     _wire_bot(monkeypatch, channel=thread)
     item_number = await _make_item(db, reporter_id="agent:tester")
@@ -2516,9 +2527,11 @@ async def test_reply_modal_agent_filed_item_posts_reply_without_touching_access(
     await modal.on_submit(mock_interaction)
 
     thread.send.assert_awaited_once()
+    posted = thread.send.call_args[0][0]
+    assert "<@agent:tester>" in posted  # addressed to the filing agent, not just the admin author
+    assert "Thanks for the report!" in posted
     mock_interaction.channel.set_permissions.assert_not_awaited()
-    text = mock_interaction.followup.send.call_args[0][0]
-    assert "no access changes needed" in text.lower()
+    mock_interaction.followup.send.assert_not_awaited()
 
 
 async def test_grant_or_invite_from_interaction_already_has_access_skips_overwrite(db, monkeypatch, mock_interaction):
@@ -2539,7 +2552,9 @@ async def test_grant_or_invite_from_interaction_already_has_access_skips_overwri
     mock_interaction.channel.set_permissions.assert_not_awaited()
 
 
-async def test_reply_modal_already_has_access_message(db, monkeypatch, mock_interaction):
+async def test_reply_modal_already_has_access_shows_no_ephemeral(db, monkeypatch, mock_interaction):
+    """tracker item #0104: a reporter who already has channel access needs no overwrite AND no
+    ephemeral -- nothing changed, so there's nothing to tell the admin."""
     item_number = await _make_item(db, reporter_id="222")
     item = await db.get_tracker_item(item_number)
     mock_interaction.user.id = int(ADMIN_ID)
@@ -2553,9 +2568,7 @@ async def test_reply_modal_already_has_access_message(db, monkeypatch, mock_inte
     await modal.on_submit(mock_interaction)
 
     mock_interaction.channel.set_permissions.assert_not_awaited()
-    text = mock_interaction.followup.send.call_args[0][0]
-    assert "222" in text
-    assert "no changes needed" in text.lower()
+    mock_interaction.followup.send.assert_not_awaited()
 
 
 # -- _grant_or_invite_from_interaction double-call guard (tracker item #0036 follow-up) ------

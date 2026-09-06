@@ -1523,20 +1523,18 @@ def _render_grant_access_message(
     """Maps a `_grant_or_invite_from_interaction()` result onto the admin-facing ephemeral
     message -- shared by `TrackerItemButton._handle_grant_access()` and
     `TrackerReplyModal.on_submit()` so a button click and a modal submit never describe the same
-    outcome differently."""
+    outcome differently.
+
+    Never called for "no_reporter"/"already_has_access" -- `TrackerReplyModal.on_submit()`
+    (tracker item #0104 live test, #0107) short-circuits before this for those two, since neither
+    is worth an ephemeral at all: nothing happened that the admin needs telling about, and their
+    own reply (if any) already posted visibly into the channel/thread."""
     outcome = result["outcome"]
     if outcome == "granted":
         return t(
             'ui_components.tracker.grant_access_granted', user_id=user_id, guild_id=guild_id,
             reporter_id=item["reporter_id"], jump_link=result["jump_link"],
         )
-    if outcome == "already_has_access":
-        return t(
-            'ui_components.tracker.grant_access_already_has_access', user_id=user_id, guild_id=guild_id,
-            reporter_id=item["reporter_id"],
-        )
-    if outcome == "no_reporter":
-        return t('ui_components.tracker.grant_access_no_reporter', user_id=user_id, guild_id=guild_id)
     if outcome == "invited":
         return t(
             'ui_components.tracker.grant_access_invited', user_id=user_id, guild_id=guild_id,
@@ -1687,13 +1685,23 @@ async def apply_status_change(
 
 async def post_comment(item_number: int, text: str, author_id: str) -> None:
     """Post into the item's discussion thread (plan §6.4's `/comment` endpoint). The reporter is
-    always @-mentioned directly (tracker item #0091 live bug report: "shouldn't the ticket
-    creator have been mentioned in this post?" -- a duplicate-closure comment showed only
+    always addressed directly (tracker item #0091 live bug report: "shouldn't the ticket creator
+    have been mentioned in this post?" -- a duplicate-closure comment showed only
     `<@{author_id}>`, and for an agent-driven comment `author_id` is typically a non-numeric
     label like "Qaplop", not a real Discord snowflake, so it was never a clickable mention at
     all -- the actual reporter was never notified their ticket had moved). Same reasoning as the
     passive done-confirm prompt's own mention: a plain, unmentioned message doesn't ping anyone
-    in Discord. No-op prefix when the reporter has no real Discord id (agent-filed items)."""
+    in Discord.
+
+    Unconditionally prepends `<@{reporter_id}>` -- for a real Discord reporter this is a live,
+    notifying mention; for an agent-filed item's non-numeric `reporter_id` (e.g. "agent:Qaplop")
+    Discord just renders it as inert literal text, exactly like the item embed's own "Reported by
+    <@{reporter_id}>" header already does (tracker item #0107 live test follow-up to #0104: an
+    admin's reply to an agent-filed item showed only `<@{author_id}>` -- the admin's OWN mention,
+    since they're the one who typed it in Discord -- with no indication at all that the reply was
+    addressed to the filing agent; this previously had an `isdigit()` gate specifically to avoid
+    that raw text, but hiding who it's addressed to was worse than the inert-but-informative text
+    the header already shows without complaint)."""
     from qapbot.cache_manager import CACHE
     import QBcore
 
@@ -1705,8 +1713,7 @@ async def post_comment(item_number: int, text: str, author_id: str) -> None:
     if thread is None:
         thread = await QBcore.bot.fetch_channel(int(item["thread_id"]))
     message = t('ui_components.tracker.comment_posted', guild_id=_lang_guild_id(item), author_id=author_id, text=text)
-    if item["reporter_id"].isdigit():
-        message = f"<@{item['reporter_id']}> {message}"
+    message = f"<@{item['reporter_id']}> {message}"
     # Chunked, not one unguarded send() (2026-08-23, tracker #0028 — same root cause as the
     # test-case message: an over-2000-char comment raised discord.HTTPException, which propagated
     # as an unhandled exception and surfaced to the caller as a bare 500). Reuses
@@ -2031,6 +2038,13 @@ class TrackerReplyModal(discord.ui.Modal, title="Reply to requestor"):
                 return
 
         result = await _grant_or_invite_from_interaction(interaction, item)
+        if result["outcome"] in ("no_reporter", "already_has_access"):
+            # tracker item #0104/#0107 live test: nothing happened here worth an ephemeral --
+            # a bot/agent-filed item has nobody to grant, and a reporter who already has access
+            # needed no change. Stay silent instead (the reply itself, if any, already posted
+            # visibly above); the interaction was already deferred non-visibly, so this leaves no
+            # trace in Discord at all, matching "no ephemeral should be output" exactly.
+            return
         await interaction.followup.send(
             _render_grant_access_message(result, item, self.admin_id, guild_id), ephemeral=True
         )
