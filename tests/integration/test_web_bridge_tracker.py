@@ -732,6 +732,119 @@ async def test_post_testcase_fail_404_for_missing_item(client, monkeypatch):
     assert resp.status == 404
 
 
+# -- per-case result (tracker item request 2026-09-05) ----------------------
+
+async def test_post_testcase_result_requires_secret(client):
+    resp = await client.post("/api/tracker/items/1/testcases/2/result", json={"result": "passed"})
+    assert resp.status == 403
+
+
+async def test_post_testcase_result_marks_single_case_passed(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [
+        {"environment": "PROD", "description": "a"}, {"environment": "PROD", "description": "b"},
+    ])
+    cases = await db.get_tracker_testcases(item_number)
+    target_id = cases[0]["id"]
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/{target_id}/result",
+        json={"result": "passed"},
+        headers={"X-Bridge-Secret": SECRET, "X-Tracker-Admin": "claude"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["testcase"]["passed"] == 1
+    assert body["testcase"]["passed_by"] == "claude"
+    assert body["testcases_just_completed"] is False  # the other case is still pending
+
+    remaining = await db.get_tracker_testcases(item_number)
+    other = next(c for c in remaining if c["id"] != target_id)
+    assert other["passed"] == 0  # untouched
+
+
+async def test_post_testcase_result_marks_single_case_failed_with_note(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, status="testing")
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "a"}])
+    cases = await db.get_tracker_testcases(item_number)
+    target_id = cases[0]["id"]
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/{target_id}/result",
+        json={"result": "failed", "note": "crashes on submit"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["testcase"]["failed"] == 1
+    assert body["testcase"]["fail_note"] == "crashes on submit"
+
+    item = await db.get_tracker_item(item_number)
+    assert item["status"] == "testing"  # a single failure never reverts the item
+
+
+async def test_post_testcase_result_last_case_passed_reports_completion(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.update_tracker_item(item_number, status="testing")
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "a"}])
+    cases = await db.get_tracker_testcases(item_number)
+    target_id = cases[0]["id"]
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/{target_id}/result",
+        json={"result": "passed"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["testcases_just_completed"] is True
+    assert body["linked_item"]["item_number"] == item_number
+
+
+async def test_post_testcase_result_rejects_invalid_result_value(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "a"}])
+    cases = await db.get_tracker_testcases(item_number)
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/{cases[0]['id']}/result",
+        json={"result": "maybe"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 400
+
+
+async def test_post_testcase_result_404_for_unknown_testcase(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    resp = await client.post(
+        f"/api/tracker/items/{item_number}/testcases/999999/result",
+        json={"result": "passed"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 404
+
+
+async def test_post_testcase_result_404_for_testcase_belonging_to_different_item(client, db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_a = await _make_item(db)
+    item_b = await _make_item(db)
+    await db.set_tracker_testcases(item_a, [{"environment": "PROD", "description": "a"}])
+    cases = await db.get_tracker_testcases(item_a)
+
+    resp = await client.post(
+        f"/api/tracker/items/{item_b}/testcases/{cases[0]['id']}/result",
+        json={"result": "passed"},
+        headers={"X-Bridge-Secret": SECRET},
+    )
+    assert resp.status == 404
+
+
 # -- move-done (manual archive, decoupled from item status) ----------------
 
 async def test_post_testcase_move_done_requires_secret(client):

@@ -1,6 +1,30 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-05 (16)
+- Added per-test-case sign-off for the bug/feature tracker: neither existing tool could
+  correctly represent "4 of 6 PROD cases passed, 2 genuinely failed" -- tracker_mark_testcase_
+  passed would incorrectly sign off the failures too, and the whole-item "revert to in_progress"
+  Fail button is too blunt (reverts cases that are fine). tracker_testcases gained
+  failed/failed_by/failed_at/fail_note columns (mutually exclusive with passed/passed_by/
+  passed_at -- re-marking a case the other way undoes a mistake). New shared entry point
+  ui_tracker.mark_testcase_by_id_and_refresh() -- a failed result never touches item status or
+  archival, same "each object moves on its own trigger" convention as the rest of the tracker.
+- Agent surface: new MCP tool tracker_mark_testcase_result / bridge POST /api/tracker/items/{n}/
+  testcases/{testcase_id}/result. render_item_markdown()'s test-case lines now show id= so an
+  agent can address one.
+- Human UX: new persistent Discord dropdown TrackerTestCaseActionSelect (one extra row in the
+  test-case message) -- follows this codebase's existing "Select keyed by id, not per-row
+  buttons" pattern (ui_clan_management.py's clan_select/family_select) rather than adding one
+  button per case, which doesn't scale past Discord's 5-row/25-button view cap. Each option
+  offers only the action that would change a case's state (undo built in for free). Picking
+  "Fail" opens a small optional-reason modal, TrackerTestCaseFailNoteModal.
+- qapbot/db_manager.py, qapbot/ui_tracker.py, qapbot/web_bridge.py, qapbot/mcp/tracker_mcp.py,
+  qapbot/mcp/tracker_bridge_client.py, QapBot.py, qapbot/translations/{en,de}.json,
+  qapbot/docs/BUG_FEATURE_TRACKER.md, tests/unit/test_tracker_db.py,
+  tests/discord/test_ui_tracker_items.py, tests/integration/test_web_bridge_tracker.py,
+  tests/unit/test_tracker_mcp.py (30 new tests). 3116 tests pass. pyright clean. Build 31.
+
 2026-09-05 (15)
 - Fixed tracker #0091: a tracker comment posted via the plain tracker_comment bridge/MCP path
   showed only "<@{author_id}>" -- for an agent-driven comment, author_id is typically a

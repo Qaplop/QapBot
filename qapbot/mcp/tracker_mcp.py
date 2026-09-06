@@ -15,7 +15,7 @@ guaranteed to see the user's shell environment):
     TRACKER_ADMIN_ID       attribution label sent as X-Tracker-Admin (self-asserted, never
                            authentication — see plan §6.4).
 
-Eleven tools now, eight of them writes (tracker item #0015 added `tracker_create_item`; a
+Twelve tools now, nine of them writes (tracker item #0015 added `tracker_create_item`; a
 follow-up added `tracker_mark_testcase_passed`/`tracker_mark_testcase_failed` so the pass/fail
 sign-off loop, previously Discord-button-only, is agent-drivable too; a second follow-up
 decoupled the item's own `done` transition from the test-case message's archive move — each
@@ -23,9 +23,12 @@ object now moves on its own trigger only — and added `tracker_move_testcases_d
 manual/forced archive; tracker item #0102 added `tracker_reply_and_invite` — the agent-drivable
 equivalent of the Discord "Reply to requestor" button, for replying to a reporter and making
 sure they can actually see/answer it, sharing its grant/invite side effects with that button via
-`ui_tracker.py`'s `_apply_requestor_grant()`/`_invite_requestor_core()`): create / status /
-comment / reply-and-invite / testcases / mark-passed / mark-failed / move-testcases-done. The
-three read tools are list / get-item / get-thread — `tracker_get_thread` (2026-08-22) closed the
+`ui_tracker.py`'s `_apply_requestor_grant()`/`_invite_requestor_core()`; a 2026-09-05 follow-up
+added `tracker_mark_testcase_result` — marking exactly ONE test case passed/failed by id, for a
+mixed pass/fail round neither bulk tool can correctly represent, sharing its logic with a new
+Discord dropdown, `TrackerTestCaseActionSelect`): create / status / comment / reply-and-invite /
+testcases / mark-passed / mark-failed / mark-testcase-result / move-testcases-done. The three
+read tools are list / get-item / get-thread — `tracker_get_thread` (2026-08-22) closed the
 last one-way gap: `tracker_comment` could only ever WRITE into an item's discussion thread, with
 no way for an agent to read a human's replies posted there. Still no filesystem, shell, git, or
 deployment tool exposed here — only tracker state changes (plan §6.6's original read-mostly
@@ -246,6 +249,33 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "tracker_mark_testcase_result",
+        "description": (
+            "Mark exactly ONE test case passed or failed, by its id (from tracker_get_item's "
+            "test case list) — for a testing round with a genuine mix of results, where neither "
+            "bulk tool is correct: tracker_mark_testcase_passed would incorrectly sign off the "
+            "failing cases too, and tracker_mark_testcase_failed reverts the WHOLE item to "
+            "'in_progress' even for cases that are actually fine. A failed result only records "
+            "that one case didn't pass (with an optional reason) — it never touches the item's "
+            "status or any other case; file separate bug reports for genuine failures and use "
+            "tracker_set_status yourself if you decide the item itself needs to go back to "
+            "in_progress. Re-marking a case (either direction) undoes a previous mistake — "
+            "passed/failed are mutually exclusive per case. Marking the last remaining pending "
+            "case passed still triggers the same 'test-case message archived, item done?' "
+            "follow-up as the bulk tool."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_number": {"type": "integer"},
+                "testcase_id": {"type": "integer", "description": "The case's `id`, from tracker_get_item's test case list."},
+                "result": {"type": "string", "enum": ["passed", "failed"]},
+                "note": {"type": "string", "description": "Optional reason, shown inline in the checklist — most useful for a failed result."},
+            },
+            "required": ["item_number", "testcase_id", "result"],
+        },
+    },
+    {
         "name": "tracker_move_testcases_done",
         "description": (
             "Manually archive a tracker item's test-case message to the Done Testing channel, "
@@ -320,7 +350,9 @@ async def render_item_markdown(client: TrackerBridgeClient, item_number: int) ->
 
     testcases = detail.get("testcases", [])
     testcase_lines = [
-        f"- [{'x' if c['passed'] else ' '}] ({c['environment']}, {c.get('priority') or 'MEDIUM'}) {c['description']}"
+        f"- [{'x' if c['passed'] else ('!' if c.get('failed') else ' ')}] "
+        f"(id={c['id']}, {c['environment']}, {c.get('priority') or 'MEDIUM'}) {c['description']}"
+        + (f" — FAILED: {c['fail_note']}" if c.get("failed") and c.get("fail_note") else "")
         for c in testcases
     ]
 
@@ -431,6 +463,17 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> str:
     if name == "tracker_mark_testcase_failed":
         result = await client.mark_testcase_failed(int(arguments["item_number"]))
         return f"Marked #{int(arguments['item_number']):04d} testing failed — status is now {result['item']['status']}."
+
+    if name == "tracker_mark_testcase_result":
+        item_number = int(arguments["item_number"])
+        testcase_id = int(arguments["testcase_id"])
+        result_value = arguments["result"]
+        result = await client.mark_testcase_result(item_number, testcase_id, result_value, arguments.get("note"))
+        lines = [f"Marked test case {testcase_id} {result_value} on #{item_number:04d}."]
+        if result.get("testcases_just_completed"):
+            lines.append(_testcases_moved_summary(result))
+            lines.append(_linked_item_hint(result.get("linked_item")))
+        return "\n".join(line for line in lines if line)
 
     if name == "tracker_move_testcases_done":
         result = await client.move_testcases_done(int(arguments["item_number"]), arguments.get("force", False))

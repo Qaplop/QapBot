@@ -3495,8 +3495,14 @@ async def _setup_hook():
     # component INTERACTION, which Discord delivers only to the bot application that actually
     # owns the message, so DEV's own copy of these DynamicItems is simply never invoked for a
     # PROD-authored message no matter what DEV's own tracker DB contains.
-    from qapbot.ui_tracker import TrackerItemButton, TrackerTestPassButton, TrackerTestFailButton, TrackerTestMoveDoneButton
-    QBcore.bot.add_dynamic_items(TrackerItemButton, TrackerTestPassButton, TrackerTestFailButton, TrackerTestMoveDoneButton)
+    from qapbot.ui_tracker import (
+        TrackerItemButton, TrackerTestPassButton, TrackerTestFailButton, TrackerTestMoveDoneButton,
+        TrackerTestCaseActionSelect,
+    )
+    QBcore.bot.add_dynamic_items(
+        TrackerItemButton, TrackerTestPassButton, TrackerTestFailButton, TrackerTestMoveDoneButton,
+        TrackerTestCaseActionSelect,
+    )
     logging.info("[SETUP_HOOK] Registered persistent tracker item/test-case dynamic items for restart-surviving buttons")
 
     # CWL clan-config web bridge (CWL_CLAN_CONFIG_ACTIVITY_PLAN.md Phase B) — no-ops unless

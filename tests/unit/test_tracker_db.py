@@ -284,6 +284,92 @@ async def test_mark_tracker_testcase_passed(db):
 
 
 @pytest.mark.asyncio
+async def test_mark_tracker_testcase_failed(db):
+    item_number = await db.create_tracker_item(
+        item_type="bug", title="t", description="d", reporter_id="1", reporter_name="A"
+    )
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "case 1"}])
+    cases = await db.get_tracker_testcases(item_number)
+    await db.mark_tracker_testcase_failed(cases[0]["id"], user_id="42", note="crashed on submit")
+    cases = await db.get_tracker_testcases(item_number)
+    assert cases[0]["failed"] == 1
+    assert cases[0]["failed_by"] == "42"
+    assert cases[0]["failed_at"] is not None
+    assert cases[0]["fail_note"] == "crashed on submit"
+    assert cases[0]["passed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_mark_tracker_testcase_failed_note_is_optional(db):
+    item_number = await db.create_tracker_item(
+        item_type="bug", title="t", description="d", reporter_id="1", reporter_name="A"
+    )
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "case 1"}])
+    cases = await db.get_tracker_testcases(item_number)
+    await db.mark_tracker_testcase_failed(cases[0]["id"], user_id="42")
+    cases = await db.get_tracker_testcases(item_number)
+    assert cases[0]["failed"] == 1
+    assert cases[0]["fail_note"] is None
+
+
+@pytest.mark.asyncio
+async def test_mark_tracker_testcase_passed_clears_prior_failed_state(db):
+    """passed/failed are mutually exclusive per row -- re-marking a previously-failed case
+    passed is the (only) undo path, so it must clear the failed fields, not just flip `passed`."""
+    item_number = await db.create_tracker_item(
+        item_type="bug", title="t", description="d", reporter_id="1", reporter_name="A"
+    )
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "case 1"}])
+    cases = await db.get_tracker_testcases(item_number)
+    testcase_id = cases[0]["id"]
+    await db.mark_tracker_testcase_failed(testcase_id, user_id="1", note="oops")
+    await db.mark_tracker_testcase_passed(testcase_id, user_id="2")
+    cases = await db.get_tracker_testcases(item_number)
+    assert cases[0]["passed"] == 1
+    assert cases[0]["passed_by"] == "2"
+    assert cases[0]["failed"] == 0
+    assert cases[0]["failed_by"] is None
+    assert cases[0]["failed_at"] is None
+    assert cases[0]["fail_note"] is None
+
+
+@pytest.mark.asyncio
+async def test_mark_tracker_testcase_failed_clears_prior_passed_state(db):
+    item_number = await db.create_tracker_item(
+        item_type="bug", title="t", description="d", reporter_id="1", reporter_name="A"
+    )
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "case 1"}])
+    cases = await db.get_tracker_testcases(item_number)
+    testcase_id = cases[0]["id"]
+    await db.mark_tracker_testcase_passed(testcase_id, user_id="1")
+    await db.mark_tracker_testcase_failed(testcase_id, user_id="2", note="regressed")
+    cases = await db.get_tracker_testcases(item_number)
+    assert cases[0]["failed"] == 1
+    assert cases[0]["fail_note"] == "regressed"
+    assert cases[0]["passed"] == 0
+    assert cases[0]["passed_by"] is None
+    assert cases[0]["passed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_tracker_testcase_by_id_found(db):
+    item_number = await db.create_tracker_item(
+        item_type="bug", title="t", description="d", reporter_id="1", reporter_name="A"
+    )
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "case 1"}])
+    cases = await db.get_tracker_testcases(item_number)
+    fetched = await db.get_tracker_testcase_by_id(cases[0]["id"])
+    assert fetched is not None
+    assert fetched["item_number"] == item_number
+    assert fetched["description"] == "case 1"
+
+
+@pytest.mark.asyncio
+async def test_get_tracker_testcase_by_id_missing_returns_none(db):
+    assert await db.get_tracker_testcase_by_id(999999) is None
+
+
+@pytest.mark.asyncio
 async def test_mark_tracker_environment_passed_only_affects_that_environment(db):
     item_number = await db.create_tracker_item(
         item_type="bug", title="t", description="d", reporter_id="1", reporter_name="A"

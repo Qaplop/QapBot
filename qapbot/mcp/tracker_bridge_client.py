@@ -98,5 +98,13 @@ class TrackerBridgeClient:
     async def mark_testcase_failed(self, item_number: int) -> Dict[str, Any]:
         return await self._post(f"/api/tracker/items/{item_number}/testcases/fail", {})
 
+    async def mark_testcase_result(
+        self, item_number: int, testcase_id: int, result: str, note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"result": result}
+        if note:
+            payload["note"] = note
+        return await self._post(f"/api/tracker/items/{item_number}/testcases/{testcase_id}/result", payload)
+
     async def move_testcases_done(self, item_number: int, force: bool = False) -> Dict[str, Any]:
         return await self._post(f"/api/tracker/items/{item_number}/testcases/move-done", {"force": force})

@@ -2094,9 +2094,17 @@ def _format_testcase_lines(item: Dict[str, Any], testcases: List[Dict[str, Any]]
     for env in sorted(by_env):
         lines.append(f"**{env}**")
         for case in by_env[env]:
-            box = "☑" if case["passed"] else "☐"
+            if case["passed"]:
+                box = "☑"
+            elif case.get("failed"):
+                box = "☒"
+            else:
+                box = "☐"
             priority = _normalize_priority(case.get("priority"))
-            lines.append(f"{box} {PRIORITY_EMOJI[priority]} {case['seq']}. {case['description']}")
+            line = f"{box} {PRIORITY_EMOJI[priority]} {case['seq']}. {case['description']}"
+            if case.get("failed") and case.get("fail_note"):
+                line += f" — ❌ {case['fail_note']}"
+            lines.append(line)
         lines.append("")
     lines.append(t('ui_components.tracker.testcase_signoff_hint', guild_id=guild_id))
     return lines
@@ -2261,6 +2269,11 @@ def build_tracker_testcase_view(item_number: int, testcases: List[Dict[str, Any]
         view.add_item(TrackerTestPassButton(item_number, env))
     view.add_item(TrackerTestFailButton(item_number))
     view.add_item(TrackerTestMoveDoneButton(item_number))
+    # Only when there's at least one case -- Discord rejects a Select with zero options, and an
+    # empty test-case list already can't happen here in practice (post_test_cases() never posts
+    # a message for an empty set), but this guard costs nothing and avoids relying on that.
+    if testcases:
+        view.add_item(TrackerTestCaseActionSelect(item_number, testcases))
     return view
 
 
@@ -2497,6 +2510,54 @@ async def mark_environment_passed_and_refresh(item_number: int, environment: str
     return {"just_completed": False, "moved": False, "linked_item": None}
 
 
+async def mark_testcase_by_id_and_refresh(
+    item_number: int, testcase_id: int, result: str, actor_id: str, note: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Sign off exactly ONE test case, passed or failed (tracker item request 2026-09-05) --
+    the granular sibling of mark_environment_passed_and_refresh()'s bulk per-environment
+    sign-off, for the case that motivated it: a tester with some cases genuinely passing and
+    others genuinely failing has no correct way to use the bulk tool (it would incorrectly sign
+    off the failures too), and the whole-item `mark_testing_failed()` is too blunt (it reverts
+    status for cases that are actually fine).
+
+    A `result="failed"` never touches the item's status or the test-case message's archival --
+    deliberately decoupled, same "each object moves on its own trigger only" convention as the
+    rest of this module (tracker item #0015 follow-up). Only `result="passed"` can complete the
+    item's test suite, using the exact same before/after "every case now passed" edge-trigger
+    mark_environment_passed_and_refresh() already uses (checked across ALL cases/environments,
+    not just this one's) -- so signing off the very last remaining case here still correctly
+    triggers finalize_testcases_move() exactly as if it had gone through the bulk button.
+
+    Returns {"testcase": <the updated row>, "just_completed", "moved", "linked_item"}. Raises
+    ValueError if testcase_id doesn't exist or belongs to a different item."""
+    from qapbot.cache_manager import CACHE
+
+    db = CACHE.db_manager
+    testcase = await db.get_tracker_testcase_by_id(testcase_id)  # type: ignore[union-attr]
+    if testcase is None or testcase["item_number"] != item_number:
+        raise ValueError(f"test case #{testcase_id} not found on tracker item #{item_number}")
+    if result not in ("passed", "failed"):
+        raise ValueError(f"result must be 'passed' or 'failed', got {result!r}")
+
+    before = await db.get_tracker_testcases(item_number)  # type: ignore[union-attr]
+    was_fully_passed = bool(before) and all(c["passed"] for c in before)
+
+    if result == "passed":
+        await db.mark_tracker_testcase_passed(testcase_id, actor_id)  # type: ignore[union-attr]
+    else:
+        await db.mark_tracker_testcase_failed(testcase_id, actor_id, note)  # type: ignore[union-attr]
+    await _refresh_testcase_message(item_number)
+
+    updated = await db.get_tracker_testcase_by_id(testcase_id)  # type: ignore[union-attr]
+    after = await db.get_tracker_testcases(item_number)  # type: ignore[union-attr]
+    now_fully_passed = bool(after) and all(c["passed"] for c in after)
+
+    if now_fully_passed and not was_fully_passed:
+        finalize_result = await finalize_testcases_move(item_number)
+        return {"testcase": updated, "just_completed": True, **finalize_result}
+    return {"testcase": updated, "just_completed": False, "moved": False, "linked_item": None}
+
+
 async def mark_testing_failed(item_number: int, actor_id: str) -> None:
     """❌ Failed: revert to in_progress; already-passed environments keep their sign-off (never
     reset), and a note lands in the discussion thread (plan §8.10)."""
@@ -2609,6 +2670,7 @@ class ConfirmItemDoneView(discord.ui.View):
 TRACKER_TEST_PASS_TEMPLATE = r'^tracker:test:pass:(?P<item_number>\d+):(?P<environment>DEV|PROD)$'
 TRACKER_TEST_FAIL_TEMPLATE = r'^tracker:test:fail:(?P<item_number>\d+)$'
 TRACKER_TEST_MOVEDONE_TEMPLATE = r'^tracker:test:movedone:(?P<item_number>\d+)$'
+TRACKER_TEST_CASE_TEMPLATE = r'^tracker:test:case:(?P<item_number>\d+)$'
 
 
 
@@ -2713,6 +2775,157 @@ class TrackerTestFailButton(
             return
         await interaction.response.defer(thinking=False, ephemeral=True)
         await mark_testing_failed(self.item_number, user_id)
+
+
+def _build_testcase_action_options(testcases: List[Dict[str, Any]]) -> List[discord.SelectOption]:
+    """One option per (case, action) pair for TrackerTestCaseActionSelect -- but only the action
+    that would actually CHANGE that case's state, never the no-op matching its current one. A
+    resolved case (passed or failed) still offers exactly the one option that reverses it, which
+    is the only "undo a mistake" path this feature needs (tracker item request 2026-09-05).
+    Truncated to Discord's 25-option Select cap if ever exceeded -- same defensive `[:25]` idiom
+    ui_clan_management.py already uses for its family_select ("Discord limit")."""
+    options: List[discord.SelectOption] = []
+    for case in sorted(testcases, key=lambda c: (c["environment"], c["seq"])):
+        label_base = f"{case['environment']} #{case['seq']}: {case['description']}"
+        if len(label_base) > 90:
+            label_base = label_base[:89] + "…"
+        if not case["passed"]:
+            options.append(discord.SelectOption(label=f"✅ Pass — {label_base}"[:100], value=f"pass:{case['id']}"))
+        if not case.get("failed"):
+            options.append(discord.SelectOption(label=f"❌ Fail — {label_base}"[:100], value=f"fail:{case['id']}"))
+    return options[:25]
+
+
+class TrackerTestCaseActionSelect(
+    discord.ui.DynamicItem[discord.ui.Select],  # type: ignore[type-arg]
+    template=TRACKER_TEST_CASE_TEMPLATE,
+):
+    """A single dropdown for marking exactly ONE test case passed or failed (tracker item
+    request 2026-09-05) -- the human-UX counterpart to mark_testcase_by_id_and_refresh(), for
+    the case the bulk per-environment buttons can't handle: some cases genuinely pass, others
+    genuinely fail, and neither "sign off everything pending" nor the whole-item "revert to
+    in_progress" button records that split correctly.
+
+    One combined select rather than one button per case: Discord caps a view at 5 rows / 25
+    buttons, and this codebase's own established pattern for "act on one row out of a list" is a
+    Select keyed by id, not per-row buttons (ui_clan_management.py's clan_select/family_select).
+    Each option encodes both the target case and the action in its value (`pass:<id>` /
+    `fail:<id>`) so one select handles both directions without needing state remembered between
+    two separate interactions (a "which case did they last pick" button pair would be unreliable
+    across concurrent users or a bot restart on this restart-safe DynamicItem)."""
+
+    def __init__(self, item_number: int, testcases: List[Dict[str, Any]]):
+        self.item_number = item_number
+        options = _build_testcase_action_options(testcases) or [
+            discord.SelectOption(label="No actionable test cases", value="noop:0")
+        ]
+        super().__init__(
+            discord.ui.Select(
+                custom_id=f"tracker:test:case:{item_number}",
+                placeholder=t('ui_components.tracker.testcase_select_placeholder'),
+                options=options,
+                min_values=1, max_values=1,
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls, interaction: discord.Interaction, item: discord.ui.Item[Any], match: 're.Match[str]', /
+    ) -> 'TrackerTestCaseActionSelect':
+        # Dispatch only needs a validly-constructed Select to invoke callback() on -- the actual
+        # chosen value is resolved by discord.py from the interaction itself, keyed by custom_id
+        # (discord/ui/select.py's `values` property reads a context-var populated during
+        # dispatch), independent of whatever options this throwaway reconstruction claims to
+        # have -- so no DB round trip is needed just to rebuild the "real" option list here.
+        return cls(item_number=int(match["item_number"]), testcases=[])
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        import QBcore
+        if not getattr(QBcore.bot, 'fully_initialized', False):
+            guild_id = interaction.guild.id if interaction.guild else None
+            await interaction.response.send_message(_startup_gate_message(guild_id), ephemeral=True)
+            return False
+        return True
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        from qapbot.config import CONFIG
+        from qapbot.QBdiscocmdshelper import check_bot_admin_or_tester
+
+        user_id = str(interaction.user.id)
+        guild_id = interaction.guild.id if interaction.guild else None
+        if not check_bot_admin_or_tester(interaction, CONFIG.server_admin):
+            await interaction.response.send_message(
+                t('ui_components.tracker.testcase_signoff_denied', user_id=user_id, guild_id=guild_id), ephemeral=True
+            )
+            return
+
+        values = self.item.values
+        action, _, raw_id = (values[0] if values else "").partition(":")
+        if action not in ("pass", "fail") or not raw_id.isdigit():
+            await interaction.response.send_message(
+                t('ui_components.tracker.testcase_no_actionable_cases', guild_id=guild_id), ephemeral=True
+            )
+            return
+        testcase_id = int(raw_id)
+
+        if action == "fail":
+            await interaction.response.send_modal(
+                TrackerTestCaseFailNoteModal(self.item_number, testcase_id, user_id)
+            )
+            return
+
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        try:
+            result = await mark_testcase_by_id_and_refresh(self.item_number, testcase_id, "passed", user_id)
+        except ValueError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
+        if result["just_completed"]:
+            await _send_testcases_moved_followup(interaction, self.item_number, result, guild_id)
+        else:
+            await interaction.followup.send(
+                t(
+                    'ui_components.tracker.testcase_single_pass_ack', guild_id=guild_id,
+                    seq=result["testcase"]["seq"],
+                ),
+                ephemeral=True,
+            )
+
+
+class TrackerTestCaseFailNoteModal(discord.ui.Modal, title="Mark test case failed"):
+    """Opened when a tester picks a "❌ Fail — ..." option from TrackerTestCaseActionSelect. The
+    reason is optional -- the MCP `tracker_mark_testcase_result` tool can already attach a note
+    directly with no modal involved; this is purely the human-UX path to the same field."""
+
+    note_input = discord.ui.Label(
+        text="Reason (optional)",
+        component=discord.ui.TextInput(style=discord.TextStyle.paragraph, required=False, max_length=500),
+    )
+
+    def __init__(self, item_number: int, testcase_id: int, admin_id: str):
+        super().__init__()
+        self.item_number = item_number
+        self.testcase_id = testcase_id
+        self.admin_id = admin_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        guild_id = interaction.guild.id if interaction.guild else None
+        note = (cast(discord.ui.TextInput, self.note_input.component).value or "").strip() or None
+        try:
+            result = await mark_testcase_by_id_and_refresh(
+                self.item_number, self.testcase_id, "failed", self.admin_id, note=note
+            )
+        except ValueError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
+        await interaction.followup.send(
+            t(
+                'ui_components.tracker.testcase_single_fail_ack', guild_id=guild_id,
+                seq=result["testcase"]["seq"],
+            ),
+            ephemeral=True,
+        )
 
 
 def _build_testcases_moved_message(

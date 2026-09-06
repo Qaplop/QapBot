@@ -2998,6 +2998,18 @@ class WarHistoryDB:
         await self._add_column_if_missing("tracker_items", "priority", "TEXT NOT NULL DEFAULT 'MEDIUM'")
         await self._add_column_if_missing("tracker_testcases", "priority", "TEXT NOT NULL DEFAULT 'MEDIUM'")
 
+        # Per-case failed state (mutually exclusive with passed) -- lets a single test case be
+        # flagged failed without touching any other case or the item's own status (tracker item
+        # request 2026-09-05: a tester with 4 passed + 2 genuinely-failed PROD cases had no way
+        # to record that split -- the only bulk tools were "mark every pending case passed"
+        # (wrong for the 2 failures) or the whole-item "revert to in_progress" button (too blunt,
+        # reverts cases that are fine). mark_tracker_testcase_failed() sets these; marking a case
+        # passed again (mark_tracker_testcase_passed()) clears them, so re-marking is a free undo.
+        await self._add_column_if_missing("tracker_testcases", "failed", "BOOLEAN NOT NULL DEFAULT 0")
+        await self._add_column_if_missing("tracker_testcases", "failed_by", "TEXT")
+        await self._add_column_if_missing("tracker_testcases", "failed_at", "TEXT")
+        await self._add_column_if_missing("tracker_testcases", "fail_note", "TEXT")
+
         # Set by _handle_grant_access() (ui_tracker.py) when "Reply to requestor" is clicked for
         # a reporter who isn't a guild member yet -- they get DM'd an invite instead of failing
         # outright, and apply_pending_requestor_access() (called from QapBot.py's on_member_join)
@@ -3244,14 +3256,46 @@ class WarHistoryDB:
         )
         return [dict(row) for row in await cursor.fetchall()]
 
+    async def get_tracker_testcase_by_id(self, testcase_id: int) -> Optional[Dict[str, Any]]:
+        """One test case row by its PK, or None -- used to validate a testcase_id actually
+        belongs to the item an agent/UI action names before mutating it (tracker item request
+        2026-09-05, per-case sign-off)."""
+        await self._ensure_connection()
+        cursor = await self._conn.execute(
+            "SELECT * FROM tracker_testcases WHERE id = ?", (testcase_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
     async def mark_tracker_testcase_passed(self, testcase_id: int, user_id: str) -> None:
-        """Mark a single test case passed (per-testcase sign-off)."""
+        """Mark a single test case passed (per-testcase sign-off). Clears any prior failed state
+        (tracker item request 2026-09-05) -- passed/failed are mutually exclusive per row, so
+        re-marking a previously-failed case passed is how a mistaken fail gets undone."""
         await self._ensure_connection()
         async with self._write_lock:
             await self._conn.execute(
-                "UPDATE tracker_testcases SET passed = 1, passed_by = ?, passed_at = datetime('now') "
+                "UPDATE tracker_testcases SET passed = 1, passed_by = ?, passed_at = datetime('now'), "
+                "failed = 0, failed_by = NULL, failed_at = NULL, fail_note = NULL "
                 "WHERE id = ?",
                 (user_id, testcase_id),
+            )
+            await self._conn.commit()
+
+    async def mark_tracker_testcase_failed(
+        self, testcase_id: int, user_id: str, note: Optional[str] = None,
+    ) -> None:
+        """Mark a single test case failed (per-testcase sign-off, tracker item request
+        2026-09-05) -- distinct from mark_testing_failed()'s whole-item revert to `in_progress`:
+        this only records that ONE case did not pass, with an optional reason, and deliberately
+        never touches the item's status or any other case. Clears any prior passed state
+        (mutually exclusive per row); re-marking passed later undoes this the same way."""
+        await self._ensure_connection()
+        async with self._write_lock:
+            await self._conn.execute(
+                "UPDATE tracker_testcases SET failed = 1, failed_by = ?, failed_at = datetime('now'), "
+                "fail_note = ?, passed = 0, passed_by = NULL, passed_at = NULL "
+                "WHERE id = ?",
+                (user_id, note, testcase_id),
             )
             await self._conn.commit()
 

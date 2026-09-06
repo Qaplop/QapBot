@@ -3389,6 +3389,42 @@ async def handle_post_tracker_testcase_fail(request: web.Request) -> web.Respons
     return web.json_response({"ok": True, "item": dict(item)})
 
 
+async def handle_post_tracker_testcase_result(request: web.Request) -> web.Response:
+    """Mark exactly ONE test case's result (tracker item request 2026-09-05) -- the per-case
+    sibling of handle_post_tracker_testcase_pass/fail above, for a tester with a genuine mix of
+    passing and failing cases in one round who can't correctly use either whole-environment
+    bulk tool."""
+    if not _check_secret(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from qapbot.ui_tracker import mark_testcase_by_id_and_refresh
+
+    try:
+        item_number = int(request.match_info["item_number"])
+        testcase_id = int(request.match_info["testcase_id"])
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid body"}, status=400)
+    result = body.get("result")
+    if result not in ("passed", "failed"):
+        return web.json_response({"error": "result must be 'passed' or 'failed'"}, status=400)
+    note = body.get("note")
+
+    try:
+        mark_result = await mark_testcase_by_id_and_refresh(
+            item_number, testcase_id, result, _tracker_admin_label(request), note=note
+        )
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=404)
+
+    linked_item = mark_result.get("linked_item")
+    return web.json_response({
+        "ok": True, "testcase": dict(mark_result["testcase"]),
+        "testcases_just_completed": mark_result["just_completed"],
+        "moved": mark_result["moved"],
+        "linked_item": dict(linked_item) if linked_item is not None else None,
+    })
+
+
 async def handle_post_tracker_testcase_move_done(request: web.Request) -> web.Response:
     if not _check_secret(request):
         return web.json_response({"error": "forbidden"}, status=403)
@@ -3460,6 +3496,9 @@ def create_app() -> web.Application:
     app.router.add_post("/api/tracker/items/{item_number}/testcases", handle_post_tracker_testcases)
     app.router.add_post("/api/tracker/items/{item_number}/testcases/pass", handle_post_tracker_testcase_pass)
     app.router.add_post("/api/tracker/items/{item_number}/testcases/fail", handle_post_tracker_testcase_fail)
+    app.router.add_post(
+        "/api/tracker/items/{item_number}/testcases/{testcase_id}/result", handle_post_tracker_testcase_result
+    )
     app.router.add_post("/api/tracker/items/{item_number}/testcases/move-done", handle_post_tracker_testcase_move_done)
     return app
 

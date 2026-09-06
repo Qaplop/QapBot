@@ -29,12 +29,15 @@ from qapbot.ui_tracker import (
     TrackerItemModal,
     TrackerReplyModal,
     TrackerStatusSelectView,
+    TrackerTestCaseActionSelect,
+    TrackerTestCaseFailNoteModal,
     TrackerTestMoveDoneButton,
     TrackerTestPassButton,
     _sanitize_attachment_filename,
     apply_pending_requestor_access,
     apply_status_change,
     build_tracker_embed,
+    build_tracker_testcase_view,
     create_tracker_item_for_agent,
     finalize_testcases_move,
     get_thread_messages,
@@ -42,12 +45,15 @@ from qapbot.ui_tracker import (
     handle_tracker_test_reaction,
     handle_tracker_upload_message,
     mark_environment_passed_and_refresh,
+    mark_testcase_by_id_and_refresh,
     mark_testing_failed,
     post_comment,
     post_test_cases,
     reply_and_invite_for_agent,
     start_tracker_item,
+    _build_testcase_action_options,
     _chunk_lines_for_discord,
+    _format_testcase_lines,
     _grant_or_invite_from_interaction,
     _register_upload_window,
     _send_testcases_moved_followup,
@@ -1631,6 +1637,239 @@ async def test_mark_environment_passed_does_not_transition_with_pending_environm
 
     item = await db.get_tracker_item(item_number)
     assert item["status"] == "testing"
+
+
+# -- mark_testcase_by_id_and_refresh (per-case sign-off, 2026-09-05) -------------------------
+
+@pytest.mark.asyncio
+async def test_mark_testcase_by_id_passed_completes_only_on_last_pending_case(db, monkeypatch):
+    """Mirrors test_mark_environment_passed_no_longer_touches_item_status's shape: the
+    item-wide "every case now passed" edge-trigger fires for the per-case path too, on
+    whichever case happens to be the LAST one pending -- across all environments, not just
+    the one this case belongs to."""
+    message = _fake_message()
+    channel = _fake_channel(fetch_message=message)
+    channel.id = 1  # must be a real int -- _refresh_testcase_message persists str(channel.id) back
+    _wire_bot(monkeypatch, channel=channel)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [
+        {"environment": "DEV", "description": "x"}, {"environment": "PROD", "description": "y"},
+    ])
+    await db.update_tracker_item(item_number, test_channel_id="1", test_message_id="999", status="testing")
+    cases = await db.get_tracker_testcases(item_number)
+    dev_id = next(c["id"] for c in cases if c["environment"] == "DEV")
+    prod_id = next(c["id"] for c in cases if c["environment"] == "PROD")
+
+    first = await mark_testcase_by_id_and_refresh(item_number, dev_id, "passed", "1")
+    assert first["just_completed"] is False  # PROD case still pending
+
+    second = await mark_testcase_by_id_and_refresh(item_number, prod_id, "passed", "1")
+    assert second["just_completed"] is True  # that was the last one
+    item = await db.get_tracker_item(item_number)
+    assert item["status"] == "testing"  # never touched, same as the bulk path
+
+
+@pytest.mark.asyncio
+async def test_mark_testcase_by_id_failed_never_touches_item_status_or_other_cases(db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [
+        {"environment": "PROD", "description": "x"}, {"environment": "PROD", "description": "y"},
+    ])
+    await db.update_tracker_item(item_number, status="testing")
+    cases = await db.get_tracker_testcases(item_number)
+    target_id = cases[0]["id"]
+    other_id = cases[1]["id"]
+
+    result = await mark_testcase_by_id_and_refresh(item_number, target_id, "failed", "1", note="broke")
+
+    assert result["just_completed"] is False
+    assert result["testcase"]["failed"] == 1
+    assert result["testcase"]["fail_note"] == "broke"
+    item = await db.get_tracker_item(item_number)
+    assert item["status"] == "testing"  # a single failure never reverts the item
+    other = await db.get_tracker_testcase_by_id(other_id)
+    assert other["failed"] == 0 and other["passed"] == 0  # untouched
+
+
+@pytest.mark.asyncio
+async def test_mark_testcase_by_id_raises_for_wrong_item(db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_a = await _make_item(db)
+    item_b = await _make_item(db)
+    await db.set_tracker_testcases(item_a, [{"environment": "DEV", "description": "x"}])
+    cases = await db.get_tracker_testcases(item_a)
+
+    with pytest.raises(ValueError):
+        await mark_testcase_by_id_and_refresh(item_b, cases[0]["id"], "passed", "1")
+
+
+@pytest.mark.asyncio
+async def test_mark_testcase_by_id_raises_for_unknown_testcase(db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    with pytest.raises(ValueError):
+        await mark_testcase_by_id_and_refresh(item_number, 999999, "passed", "1")
+
+
+@pytest.mark.asyncio
+async def test_mark_testcase_by_id_rejects_invalid_result(db, monkeypatch):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "DEV", "description": "x"}])
+    cases = await db.get_tracker_testcases(item_number)
+
+    with pytest.raises(ValueError):
+        await mark_testcase_by_id_and_refresh(item_number, cases[0]["id"], "maybe", "1")
+
+
+# -- _format_testcase_lines: three states (2026-09-05) --------------------------------------
+
+def test_format_testcase_lines_shows_failed_box_and_note():
+    item = {"item_number": 1, "title": "t", "status": "testing"}
+    testcases = [
+        {"environment": "PROD", "seq": 1, "description": "case one", "passed": 1, "failed": 0,
+         "fail_note": None, "priority": "MEDIUM"},
+        {"environment": "PROD", "seq": 2, "description": "case two", "passed": 0, "failed": 1,
+         "fail_note": "crashed", "priority": "MEDIUM"},
+        {"environment": "PROD", "seq": 3, "description": "case three", "passed": 0, "failed": 0,
+         "fail_note": None, "priority": "MEDIUM"},
+    ]
+    lines = _format_testcase_lines(item, testcases)
+    text = "\n".join(lines)
+    assert "☑" in text and "case one" in text
+    assert "☒ " in text and "case two" in text and "— ❌ crashed" in text
+    assert "☐" in text and "case three" in text
+
+
+# -- TrackerTestCaseActionSelect option-building (2026-09-05) --------------------------------
+
+def test_build_testcase_action_options_offers_reversal_only():
+    testcases = [
+        {"id": 1, "environment": "DEV", "seq": 1, "description": "pending", "passed": 0, "failed": 0},
+        {"id": 2, "environment": "DEV", "seq": 2, "description": "already passed", "passed": 1, "failed": 0},
+        {"id": 3, "environment": "PROD", "seq": 1, "description": "already failed", "passed": 0, "failed": 1},
+    ]
+    options = _build_testcase_action_options(testcases)
+    values = {o.value for o in options}
+    assert values == {"pass:1", "fail:1", "fail:2", "pass:3"}
+
+
+def test_build_testcase_action_options_truncates_to_25():
+    testcases = [
+        {"id": i, "environment": "DEV", "seq": i, "description": f"case {i}", "passed": 0, "failed": 0}
+        for i in range(1, 20)
+    ]
+    options = _build_testcase_action_options(testcases)
+    assert len(options) == 25  # 19 cases * 2 options each = 38, truncated
+
+
+def test_build_tracker_testcase_view_includes_case_select():
+    view = build_tracker_testcase_view(1, [
+        {"id": 1, "environment": "DEV", "seq": 1, "description": "x", "passed": 0, "failed": 0},
+    ])
+    assert any(isinstance(item, TrackerTestCaseActionSelect) for item in view.children)
+
+
+def test_build_tracker_testcase_view_skips_select_when_no_cases():
+    view = build_tracker_testcase_view(1, [])
+    assert not any(isinstance(item, TrackerTestCaseActionSelect) for item in view.children)
+
+
+# -- TrackerTestCaseActionSelect.callback / TrackerTestCaseFailNoteModal (2026-09-05) --------
+
+@pytest.mark.asyncio
+async def test_testcase_select_pass_action_marks_passed(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    mock_interaction.user.id = int(ADMIN_ID)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "x"}])
+    await db.update_tracker_item(item_number, status="testing")
+    cases = await db.get_tracker_testcases(item_number)
+    testcase_id = cases[0]["id"]
+
+    select = TrackerTestCaseActionSelect(item_number, cases)
+    select.item._values = [f"pass:{testcase_id}"]
+
+    await select.callback(mock_interaction)
+
+    updated = await db.get_tracker_testcase_by_id(testcase_id)
+    assert updated["passed"] == 1
+    mock_interaction.followup.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_testcase_select_fail_action_opens_modal_without_mutating_yet(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    mock_interaction.user.id = int(ADMIN_ID)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "x"}])
+    cases = await db.get_tracker_testcases(item_number)
+    testcase_id = cases[0]["id"]
+
+    select = TrackerTestCaseActionSelect(item_number, cases)
+    select.item._values = [f"fail:{testcase_id}"]
+
+    await select.callback(mock_interaction)
+
+    mock_interaction.response.send_modal.assert_awaited_once()
+    modal = mock_interaction.response.send_modal.call_args[0][0]
+    assert isinstance(modal, TrackerTestCaseFailNoteModal)
+    assert modal.testcase_id == testcase_id
+    updated = await db.get_tracker_testcase_by_id(testcase_id)
+    assert updated["failed"] == 0  # only the modal submit actually marks it
+
+
+@pytest.mark.asyncio
+async def test_testcase_select_denies_non_admin_non_tester(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "x"}])
+    cases = await db.get_tracker_testcases(item_number)
+    testcase_id = cases[0]["id"]
+
+    select = TrackerTestCaseActionSelect(item_number, cases)
+    select.item._values = [f"pass:{testcase_id}"]
+
+    await select.callback(mock_interaction)  # mock_interaction.user.id defaults to a non-admin id
+
+    mock_interaction.response.send_message.assert_awaited_once()
+    updated = await db.get_tracker_testcase_by_id(testcase_id)
+    assert updated["passed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_testcase_fail_note_modal_marks_failed_with_note(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "x"}])
+    cases = await db.get_tracker_testcases(item_number)
+    testcase_id = cases[0]["id"]
+
+    modal = TrackerTestCaseFailNoteModal(item_number, testcase_id, str(ADMIN_ID))
+    cast(discord.ui.TextInput, modal.note_input.component)._value = "regressed on submit"
+    await modal.on_submit(mock_interaction)
+
+    updated = await db.get_tracker_testcase_by_id(testcase_id)
+    assert updated["failed"] == 1
+    assert updated["fail_note"] == "regressed on submit"
+    mock_interaction.followup.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_testcase_fail_note_modal_note_optional(db, monkeypatch, mock_interaction):
+    _wire_bot(monkeypatch, channel=None)
+    item_number = await _make_item(db)
+    await db.set_tracker_testcases(item_number, [{"environment": "PROD", "description": "x"}])
+    cases = await db.get_tracker_testcases(item_number)
+    testcase_id = cases[0]["id"]
+
+    modal = TrackerTestCaseFailNoteModal(item_number, testcase_id, str(ADMIN_ID))
+    await modal.on_submit(mock_interaction)
+
+    updated = await db.get_tracker_testcase_by_id(testcase_id)
+    assert updated["failed"] == 1
+    assert updated["fail_note"] is None
 
 
 @pytest.mark.asyncio

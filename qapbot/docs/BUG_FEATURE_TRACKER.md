@@ -19,7 +19,7 @@ CACHE.db_manager (db_manager.py)   ── bot_settings / tracker_items / tracker
 qapbot/web_bridge.py  /api/tracker/*   ── HTTP surface for the agent side, X-Bridge-Secret gated
         │
         ▼
-qapbot/mcp/tracker_mcp.py   ── stdio MCP server, 11 tools, used by Copilot Chat / Claude Code
+qapbot/mcp/tracker_mcp.py   ── stdio MCP server, 12 tools, used by Copilot Chat / Claude Code
 ```
 
 Only PROD ever owns the tracker: `CONFIG.tracker_enabled` is hard-coded to `not is_dev_mode`
@@ -360,6 +360,45 @@ also now logs `was_fully_passed`/`now_fully_passed` at INFO on every call, since
 no logging at all before and a *genuine* miscount (a click that should have completed the item but
 didn't) was previously undiagnosable after the fact.
 
+**Per-test-case sign-off, additive to the per-environment bulk tools (2026-09-05)**: the bulk
+`[✅ DEV/PROD passed]` buttons and `tracker_mark_testcase_passed`/`tracker_mark_testcase_failed`
+sign off (or revert) *every* case in an environment/item at once — no way to represent "4 of 6
+PROD cases passed, 2 genuinely failed" without either incorrectly passing the failures or
+reverting the whole item to `in_progress` for cases that are actually fine. `tracker_testcases`
+gained `failed`/`failed_by`/`failed_at`/`fail_note` columns (mutually exclusive with
+`passed`/`passed_by`/`passed_at` — re-marking a case the other way is how a mistake gets undone,
+each side's DB method clears the other's fields) and two new per-row primitives in
+`db_manager.py`: `mark_tracker_testcase_failed(testcase_id, user_id, note=None)`, and
+`get_tracker_testcase_by_id(testcase_id)`. (`mark_tracker_testcase_passed(testcase_id, user_id)`
+already existed at the DB layer but had never been wired to any UI/agent surface until now.)
+
+`ui_tracker.py`'s `mark_testcase_by_id_and_refresh(item_number, testcase_id, result, actor_id,
+note=None)` is the shared business-logic entry point — it mirrors
+`mark_environment_passed_and_refresh()`'s existing before/after "every case across every
+environment now passed" edge-trigger check (so signing off the last remaining case here still
+correctly archives the test-case message via `finalize_testcases_move()`), but a `failed` result
+deliberately never touches the item's status or any other case — same "each object moves on its
+own trigger only" convention as the rest of this module (tracker item #0015 follow-up above).
+Exposed three ways:
+
+- **Agent**: MCP `tracker_mark_testcase_result` / bridge `POST /api/tracker/items/{n}/testcases/
+  {testcase_id}/result`, body `{result: "passed"|"failed", note?}`. `render_item_markdown()`'s
+  test-case lines now include `id=` so an agent can address a specific case at all.
+- **Human, Discord UI**: a new persistent dropdown, `TrackerTestCaseActionSelect`
+  (`discord.ui.DynamicItem[discord.ui.Select]`, one extra row in `build_tracker_testcase_view()`).
+  Discord caps a view at 5 rows / 25 buttons, and this codebase's own established pattern for
+  "act on one row out of a list" is already a `Select` keyed by id, not per-row buttons (see
+  `ui_clan_management.py`'s `clan_select`/`family_select`) — so this follows that precedent
+  rather than adding one button per test case. Each option encodes both the target case and the
+  action in its value (`pass:<id>` / `fail:<id>`), and only offers the action that would actually
+  *change* a case's state — a resolved case still shows the one option that reverses it, never
+  the no-op matching its current state. Picking a `pass:` option applies immediately (same snappy
+  no-modal UX as the bulk Pass button); picking a `fail:` option opens `TrackerTestCaseFailNoteModal`
+  (one optional "Reason" text field) first, so a human can record *why* without that requiring a
+  separate full thread comment.
+- **Rendering**: `_format_testcase_lines()` now has three states — `☑` passed, `☒` failed (new),
+  `☐` pending — with `— ❌ {fail_note}` appended inline for a failed case that has one.
+
 **Agent-filed items never get a status-change DM — must no-op, not warn (2026-08-23, live bug
 report)**: `create_tracker_item_for_agent()` gives an agent-filed item a non-numeric `reporter_id`
 (`agent:<label>`, e.g. `agent:claude` — deliberately, so it can never collide with a real Discord
@@ -427,6 +466,7 @@ POST /api/tracker/items/{n}/reply-and-invite  {text}
 POST /api/tracker/items/{n}/testcases  {cases: [{environment, description, priority?}]}
 POST /api/tracker/items/{n}/testcases/pass  {environment}
 POST /api/tracker/items/{n}/testcases/fail  {}
+POST /api/tracker/items/{n}/testcases/{testcase_id}/result  {result: "passed"|"failed", note?}
 POST /api/tracker/items/{n}/testcases/move-done  {force?}
 ```
 
@@ -443,11 +483,11 @@ and `.vscode/mcp.json` (VS Code Copilot Chat). Hand-rolled JSON-RPC 2.0 — the 
 package is **not** a project dependency; the wire surface needed (`initialize`, `tools/list`,
 `tools/call`) is small enough that adding a new dependency wasn't worth it.
 
-Eleven tools: `tracker_list_items`, `tracker_get_item`, `tracker_get_thread`, `tracker_create_item`,
+Twelve tools: `tracker_list_items`, `tracker_get_item`, `tracker_get_thread`, `tracker_create_item`,
 `tracker_set_status`, `tracker_comment`, `tracker_reply_and_invite`, `tracker_add_testcases`,
-`tracker_mark_testcase_passed`, `tracker_mark_testcase_failed`, `tracker_move_testcases_done`.
-Only the first three are read-only — no filesystem/shell/git/deploy tool is exposed here
-(plan §6.6).
+`tracker_mark_testcase_passed`, `tracker_mark_testcase_failed`, `tracker_mark_testcase_result`,
+`tracker_move_testcases_done`. Only the first three are read-only — no filesystem/shell/git/deploy
+tool is exposed here (plan §6.6).
 
 `tracker_reply_and_invite` (2026-09-05, ticket #0102) is the agent-drivable equivalent of the
 Discord "Reply to requestor" button + its reply modal: it posts `text` addressed directly to the

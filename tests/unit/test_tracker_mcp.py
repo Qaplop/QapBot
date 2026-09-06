@@ -108,15 +108,15 @@ def test_tool_names_are_unique():
     assert len(names) == len(set(names))
 
 
-def test_write_tools_are_exactly_eight():
+def test_write_tools_are_exactly_nine():
     """Plan §6.6, extended by tracker item #0015 (create_item), the pass/fail follow-up
-    (mark_testcase_passed/failed), the decoupling follow-up (move_testcases_done), and tracker
-    item #0102 (reply_and_invite): these eight are the only tools that change tracker state.
-    Everything else is read-only."""
+    (mark_testcase_passed/failed), the decoupling follow-up (move_testcases_done), tracker
+    item #0102 (reply_and_invite), and the 2026-09-05 follow-up (mark_testcase_result): these
+    nine are the only tools that change tracker state. Everything else is read-only."""
     write_tools = {
         "tracker_create_item", "tracker_set_status", "tracker_comment", "tracker_reply_and_invite",
         "tracker_add_testcases", "tracker_mark_testcase_passed", "tracker_mark_testcase_failed",
-        "tracker_move_testcases_done",
+        "tracker_mark_testcase_result", "tracker_move_testcases_done",
     }
     read_tools = {"tracker_list_items", "tracker_get_item", "tracker_get_thread"}
     names = {t["name"] for t in tracker_mcp.TOOLS}
@@ -269,12 +269,12 @@ async def test_call_tool_get_item_renders_testcase_priority(fake_client, monkeyp
             "reporter_name": "A", "created_at": "2026-08-20",
         },
         "attachments": [],
-        "testcases": [{"environment": "DEV", "description": "check it", "passed": False, "priority": "HIGH"}],
+        "testcases": [{"id": 42, "environment": "DEV", "description": "check it", "passed": False, "priority": "HIGH"}],
     })
 
     markdown = await tracker_mcp.call_tool("tracker_get_item", {"item_number": 9})
     assert "priority: LOW" in markdown
-    assert "(DEV, HIGH) check it" in markdown
+    assert "(id=42, DEV, HIGH) check it" in markdown
 
 
 @pytest.mark.asyncio
@@ -468,6 +468,32 @@ async def test_call_tool_mark_testcase_failed(fake_client):
     result = await tracker_mcp.call_tool("tracker_mark_testcase_failed", {"item_number": 3})
     assert "in_progress" in result
     fake_client.mark_testcase_failed.assert_awaited_once_with(3)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_mark_testcase_result_not_yet_complete(fake_client):
+    fake_client.mark_testcase_result = AsyncMock(return_value={"testcases_just_completed": False})
+    result = await tracker_mcp.call_tool(
+        "tracker_mark_testcase_result", {"item_number": 3, "testcase_id": 42, "result": "failed", "note": "boom"}
+    )
+    assert "42" in result
+    assert "failed" in result
+    assert "#0003" in result
+    fake_client.mark_testcase_result.assert_awaited_once_with(3, 42, "failed", "boom")
+
+
+@pytest.mark.asyncio
+async def test_call_tool_mark_testcase_result_completes_and_suggests_linked_item(fake_client):
+    fake_client.mark_testcase_result = AsyncMock(return_value={
+        "testcases_just_completed": True, "moved": True,
+        "linked_item": {"item_number": 3, "status": "testing"},
+    })
+    result = await tracker_mcp.call_tool(
+        "tracker_mark_testcase_result", {"item_number": 3, "testcase_id": 42, "result": "passed"}
+    )
+    assert "Done Testing channel" in result
+    assert "tracker_set_status(3, 'done')" in result
+    fake_client.mark_testcase_result.assert_awaited_once_with(3, 42, "passed", None)
 
 
 @pytest.mark.asyncio
