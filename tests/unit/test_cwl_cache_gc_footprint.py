@@ -13,6 +13,7 @@ under-reports is worse than none: it would be used to justify a change.
 from __future__ import annotations
 
 import asyncio
+import gc
 from typing import Any
 
 import pytest
@@ -143,6 +144,46 @@ class TestTheNumberIsTrustworthy:
         fp = cm.measure_cwl_cache_gc_footprint()
 
         assert "war_objects" in fp
+
+
+class TestFrozenObjectsDontInflateThePercentage:
+    """Bug #0107: PROD's first-ever [GC-ATTRIBUTION] reading said CWL caches held 53300.8% of
+    live tracked objects -- impossible on its face. Root cause: gc.get_objects() excludes frozen
+    objects by design, but _walk() (this module's own graph walk) counts them via
+    gc.get_referents() regardless of frozen state. This codebase freezes millions of objects
+    nightly (a GC-pause-avoidance strategy), so once a meaningful share of a cached war's own
+    graph has itself been frozen by a PREVIOUS nightly run, the frozen-exclusive denominator
+    undercounts against the frozen-inclusive numerator and the ratio can exceed 100%.
+    """
+
+    def test_pct_of_live_stays_bounded_when_the_cached_war_is_frozen(self, cm, client) -> None:
+        war = _war(client)
+        cm._league_war_cache["#W1"] = (war, 0.0, "inwar")
+        try:
+            gc.freeze()  # simulates a war that survived to a previous nightly freeze
+            fp = cm.measure_cwl_cache_gc_footprint()
+        finally:
+            gc.unfreeze()
+
+        assert fp["war_objects"] > 0, "the walk must still find the frozen graph's objects"
+        assert fp["pct_of_live"] <= 100.0, (
+            f"pct_of_live={fp['pct_of_live']} — a frozen-inclusive numerator was compared "
+            "against a frozen-exclusive denominator again"
+        )
+
+    def test_total_tracked_accounts_for_the_frozen_population(self, cm) -> None:
+        """Directly pins the fix: total_tracked = get_objects() + get_freeze_count(), not
+        get_objects() alone."""
+        before = gc.get_freeze_count()
+        try:
+            gc.freeze()
+            fp = cm.measure_cwl_cache_gc_footprint()
+            assert fp["total_tracked"] >= gc.get_freeze_count() - before, (
+                "total_tracked did not grow with the frozen population — get_freeze_count() "
+                "is not being added back in"
+            )
+        finally:
+            gc.unfreeze()
 
 
 class TestSampling:

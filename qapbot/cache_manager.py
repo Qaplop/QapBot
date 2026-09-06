@@ -3929,6 +3929,19 @@ class CacheManager:
                 f"{self._evicted_objects_note(0, _grp_over)}"
             )
 
+        # Unconditional (unlike the eviction lines above, which only fire when something was
+        # actually purged) so this pairs against [CYCLE-END] RSS every single cycle, the same way
+        # [COC-CACHE-CLEANUP]'s size=N/CAP already does for coc_clan_cache. Added 2026-09-06
+        # (tracker #0009 / bug #0106): a 13.5h PROD run found RSS growth uncorrelated with
+        # per-cycle clan count but correlated with concurrent-active-war count, and these two
+        # caches are the leading suspect (still hold full coc.py object graphs) — this line is
+        # the population-size-over-time data that measurement was missing.
+        logging.info(
+            "[CWL-CACHE-SIZE] league_war=%d/%d league_group=%d/%d",
+            len(self._league_war_cache), self._LEAGUE_WAR_CACHE_MAX_ENTRIES,
+            len(self._league_group_cache), self._LEAGUE_GROUP_CACHE_MAX_ENTRIES,
+        )
+
     # Objects-per-entry from the most recent measure_cwl_cache_gc_footprint() call, so the
     # per-cycle eviction log can report orphaned-object counts without paying for a graph walk
     # on the hot path. None until the first nightly measurement has run.
@@ -4050,7 +4063,16 @@ class CacheManager:
             if _out["group_entries"]:
                 type(self)._cwl_objs_per_group = _out["group_objects"] / _out["group_entries"]
 
-            _out["total_tracked"] = len(_gc.get_objects())
+            # gc.get_objects() excludes frozen objects (CPython, by design -- freezing exists
+            # specifically to keep it fast). This codebase freezes millions of objects nightly
+            # (see [GC-POLICY]/[NIGHTLY-MAINTENANCE] "re-froze N object(s)") as a GC-pause-avoidance
+            # strategy, and _walk() above counts frozen and unfrozen objects alike by following
+            # references directly rather than going through get_objects(). Comparing that
+            # frozen-inclusive numerator against a frozen-exclusive get_objects() denominator
+            # produced percentages over 100% the first time this ran against real PROD data with a
+            # non-trivial frozen population (bug #0107) -- add the frozen count back in so both
+            # sides of the ratio cover the same population.
+            _out["total_tracked"] = len(_gc.get_objects()) + _gc.get_freeze_count()
             _held = _out["war_objects"] + _out["group_objects"]
             if _out["total_tracked"]:
                 _out["pct_of_live"] = 100.0 * _held / _out["total_tracked"]
