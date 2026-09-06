@@ -17,6 +17,7 @@ from qapbot.QBdiscocmdshelper_admin_command import (
     _build_gc_type_counts,
     _estimate_dict_size_mb,
     _get_malloc_info,
+    _get_rss_breakdown,
 )
 
 
@@ -336,6 +337,60 @@ class TestMallocInfo:
         import ctypes as _ctypes
         monkeypatch.setattr(_ctypes, "CDLL", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("no libc")))
         assert _get_malloc_info() == {}
+
+
+class TestRssBreakdown:
+    """tracker #0106, 2026-09-06: splits VmRSS into anonymous (Python/C heap) vs. file-backed
+    (e.g. SQLite's mmap I/O — db_manager.py sets mmap_size=8 GB per connection, per schema, on
+    9 separate connections against a 25 GB main DB + 36 GB history DB) vs. shared memory. This is
+    the single most decisive read in the whole report: every other diagnostic here — [CACHE
+    STRUCTURE SIZES], the GC census, tracemalloc, [ALLOCATOR] — can only see the anonymous half.
+    """
+
+    @staticmethod
+    def _patch_proc_status(monkeypatch, content: str | None) -> None:
+        import builtins
+        real_open = builtins.open
+
+        def _fake_open(path, *a, **kw):
+            if path == '/proc/self/status':
+                if content is None:
+                    raise FileNotFoundError("no /proc on this platform")
+                import io
+                return io.StringIO(content)
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", _fake_open)
+
+    def test_never_raises_and_returns_a_well_shaped_result(self):
+        result = _get_rss_breakdown()
+        assert isinstance(result, dict)
+        if result:  # Linux with /proc/self/status; {} is the valid non-Linux answer
+            for key in ("anon_mb", "file_mb", "shmem_mb"):
+                assert key in result
+                assert isinstance(result[key], float)
+                assert result[key] >= 0.0
+
+    def test_parses_a_realistic_proc_status_file(self, monkeypatch):
+        self._patch_proc_status(monkeypatch, (
+            "Name:\tpython3.14\n"
+            "VmRSS:\t 8793600 kB\n"
+            "RssAnon:\t 1843200 kB\n"
+            "RssFile:\t 6912000 kB\n"
+            "RssShmem:\t   38400 kB\n"
+            "VmSize:\t49485824 kB\n"
+        ))
+        assert _get_rss_breakdown() == {"anon_mb": 1800.0, "file_mb": 6750.0, "shmem_mb": 37.5}
+
+    def test_missing_fields_yield_empty_dict_rather_than_a_misleading_partial_result(self, monkeypatch):
+        """An older kernel without RssShmem (pre-4.5) must not report a partial split as if
+        complete — the report's 'read this first' framing depends on all three being present."""
+        self._patch_proc_status(monkeypatch, "Name:\tpython3.14\nVmRSS:\t 100 kB\nRssAnon:\t 50 kB\n")
+        assert _get_rss_breakdown() == {}
+
+    def test_survives_unreadable_file(self, monkeypatch):
+        self._patch_proc_status(monkeypatch, None)
+        assert _get_rss_breakdown() == {}
 
 
 class TestSlotsAndGeneratorWalking:

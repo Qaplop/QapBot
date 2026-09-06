@@ -1,6 +1,19 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-06 (7)
+- Bug #0106: found a strong candidate for the still-unexplained RSS gap. qapbot/db_manager.py
+  sets PRAGMA mmap_size=8 GB on the async connection AND all 8 pooled sync connections (9 total),
+  per schema (main + attached history) -- against a 25 GB main DB and 36 GB history DB as of
+  2026-09-06, both far past the 8 GB ceiling. Resident mmap'd pages count toward this process's
+  own RSS, and with 9 independent mappings of the same two files, the same physical page can
+  count once per connection that has touched it. Added _get_rss_breakdown() -- parses
+  RssAnon/RssFile/RssShmem from /proc/self/status, new [RSS BREAKDOWN] report section (placed
+  first, ahead of [ALLOCATOR]) plus a live Discord summary line -- to directly test this: a large
+  RssFile against a small RssAnon would confirm the "missing" memory is mmap'd database pages
+  (mostly kernel-reclaimable, not a leak) rather than a Python/C object our other tools can't
+  reach. 4 new tests. Wired into the same build as 2026-09-06 (6) below.
+
 2026-09-06 (6)
 - Bug #0106: two on-demand /admin Memory Profile reports taken minutes apart at 8.5-8.8 GB RSS
   (PROD, build 34, ~8h uptime) found [CACHE STRUCTURE SIZES] (real deep-sampled byte sizes for

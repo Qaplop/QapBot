@@ -1550,6 +1550,47 @@ def _get_malloc_info() -> dict[str, float]:
         return {}
 
 
+def _get_rss_breakdown() -> dict[str, float]:
+    """Split VmRSS into anonymous vs. file-backed vs. shared memory, in MB (Linux 4.5+,
+    `/proc/self/status`'s RssAnon/RssFile/RssShmem lines). Added 2026-09-06 (tracker #0106) as
+    the most decisive diagnostic yet: every other tool in this report — [CACHE STRUCTURE SIZES],
+    the GC census, tracemalloc, [ALLOCATOR]'s mallinfo2() — can only see Python-managed or
+    glibc-malloc-managed memory. None of them can see resident pages from SQLite's own mmap I/O.
+
+    qapbot/db_manager.py sets `PRAGMA mmap_size=8589934592` (8 GB) on the async connection AND
+    every one of the 8 pooled sync connections, per schema (main + attached history) — 9
+    independent mmap views of the SAME two files, deliberately (see the `_SyncConnectionPool`
+    rationale: "the kernel deduplicates pages across all connections... so the entire RAM can
+    serve as a shared read cache"). On 2026-09-06 those two files were 25 GB (main) and 36 GB
+    (history) — both far bigger than the 8 GB per-connection ceiling, so that ceiling is what
+    actually binds. Resident mmap'd pages count toward THIS process's VmRSS like any other
+    mapping, and because each connection holds its own separate mapping of the same files, a
+    naive VmRSS read can count the *same physical page* once per connection that has touched it
+    — RSS inflating without any additional physical memory being used system-wide, let alone any
+    Python object growing.
+
+    Read this section first: RssFile large, RssAnon small -> the "6-7 GB unexplained" gap from
+    the two 2026-09-06 profiles is very plausibly mmap'd database pages, not a leak — mostly
+    reclaimable by the kernel under real pressure, and the fix (if any) is tuning mmap_size /
+    pool_size, not hunting for a cache to shrink. RssAnon large -> still a genuine heap-memory
+    question; that's what [ALLOCATOR] and [CACHE STRUCTURE SIZES] below are for.
+
+    Returns {} on any non-Linux platform or failure — best-effort, must never break the report.
+    """
+    try:
+        with open('/proc/self/status', 'r') as _f:
+            _status = _f.read()
+        _wanted = {"RssAnon:": "anon_mb", "RssFile:": "file_mb", "RssShmem:": "shmem_mb"}
+        _out: dict[str, float] = {}
+        for _line in _status.splitlines():
+            for _prefix, _key in _wanted.items():
+                if _line.startswith(_prefix):
+                    _out[_key] = int(_line.split()[1]) / 1024
+        return _out if len(_out) == 3 else {}
+    except Exception:
+        return {}
+
+
 def _get_process_memory_mb() -> tuple[float, float]:
     """Return (current RSS_MB, VMS_MB) for the current process.
 
@@ -1623,6 +1664,7 @@ def save_memtrace_snapshot(cache: Any) -> str:
     top_types, top_types_by_size = _build_gc_type_counts(15)
     rss_mb, vms_mb = _get_process_memory_mb()
     malloc_info = _get_malloc_info()
+    rss_breakdown = _get_rss_breakdown()
 
     # Uptime
     uptime_str = "unknown"
@@ -1643,6 +1685,27 @@ def save_memtrace_snapshot(cache: Any) -> str:
     nframes = tracemalloc.get_traceback_limit()
     lines.append(f"tracemalloc nframe={nframes}  |  RSS={rss_mb:.1f} MB  VMS={vms_mb:.1f} MB  |  uptime={uptime_str}")
 
+    lines.append("\n[RSS BREAKDOWN — /proc/self/status]")
+    if rss_breakdown:
+        lines.append(
+            f"  anon={rss_breakdown['anon_mb']:.1f} MB  file={rss_breakdown['file_mb']:.1f} MB  "
+            f"shmem={rss_breakdown['shmem_mb']:.1f} MB"
+        )
+        lines.append(
+            "  READ THIS FIRST. 'anon' is heap memory (Python objects, malloc) -- everything "
+            "else in this report can only see that half. 'file' is resident pages from mmap'd "
+            "files, e.g. SQLite's mmap_size=8 GB-per-connection I/O (qapbot/db_manager.py) "
+            "against a 25 GB main DB + 36 GB history DB as of 2026-09-06, mapped independently "
+            "by the async connection AND all 8 pooled sync connections -- 9 separate mappings of "
+            "the same two files, which can each count the same physical page toward THIS "
+            "process's RSS. If 'file' is the big number, the missing memory from a prior "
+            "[CACHE STRUCTURE SIZES]/GC-census gap is very plausibly database pages, not a leak "
+            "-- reclaimable by the kernel under real pressure, and the fix (if one is even "
+            "needed) is tuning mmap_size/pool_size, not hunting for a Python cache to shrink."
+        )
+    else:
+        lines.append("  (unavailable — not Linux, or /proc/self/status unreadable)")
+
     lines.append("\n[ALLOCATOR — glibc mallinfo2()]")
     if malloc_info:
         lines.append(
@@ -1652,7 +1715,9 @@ def save_memtrace_snapshot(cache: Any) -> str:
         _unaccounted = rss_mb - malloc_info['arena_mb'] - malloc_info['mmap_mb']
         lines.append(
             f"  RSS - arena - large_mmap = {_unaccounted:.1f} MB unaccounted for by malloc "
-            "entirely (thread stacks, shared libs, or memory outside glibc's allocator)."
+            "entirely — expect this to be dominated by [RSS BREAKDOWN]'s 'file' figure above "
+            "plus CPython's own pymalloc arenas (mmap'd directly, bypassing glibc malloc "
+            "entirely, so invisible here by construction) rather than thread stacks/shared libs."
         )
         lines.append(
             "  Read this against [CACHE STRUCTURE SIZES] below: if in_use tracks close to RSS, "
@@ -2039,6 +2104,7 @@ async def handle_memory_profile(cache: Any) -> str:
         cache_summary = _build_cache_summary(cache)
         rss_mb, _ = _get_process_memory_mb()
         malloc_info = _get_malloc_info()
+        rss_breakdown = _get_rss_breakdown()
 
         total_top10_mb = sum(s.size for s in top_stats[:10]) / 1_048_576
         discord_lines: list[str] = [
@@ -2046,6 +2112,12 @@ async def handle_memory_profile(cache: Any) -> str:
             f"Full report saved to `{report_path}`",
             f"RSS: {rss_mb:.1f} MB  |  nframe={tracemalloc.get_traceback_limit()}",
         ]
+        if rss_breakdown:
+            discord_lines.append(
+                f"RSS split: anon={rss_breakdown['anon_mb']:.0f} MB (heap)  "
+                f"file={rss_breakdown['file_mb']:.0f} MB (mmap'd files, e.g. SQLite)  "
+                f"shmem={rss_breakdown['shmem_mb']:.0f} MB"
+            )
         if malloc_info:
             discord_lines.append(
                 f"Allocator: in_use={malloc_info['in_use_mb']:.0f} MB  "
