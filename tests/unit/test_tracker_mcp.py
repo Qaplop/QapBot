@@ -375,8 +375,9 @@ def test_describe_access_outcome_covers_every_outcome():
     an unmapped one degrading to a generic-but-visible fallback is acceptable, a KeyError/crash
     is not."""
     outcomes = [
-        "granted", "invited", "invite_dm_failed", "already_invited", "member_not_found",
-        "no_reporter", "grant_failed", "invite_failed", "not_configured", "something_new",
+        "granted", "already_has_access", "invited", "invite_dm_failed", "already_invited",
+        "member_not_found", "no_reporter", "grant_failed", "invite_failed", "not_configured",
+        "something_new",
     ]
     for outcome in outcomes:
         text = tracker_mcp._describe_access_outcome({"outcome": outcome, "invite_url": "https://x"})

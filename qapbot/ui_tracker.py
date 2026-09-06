@@ -1415,12 +1415,20 @@ async def _apply_requestor_grant(
     arguments their own way; this is the one place the overwrite itself is applied, so the two
     surfaces can never grant something subtly different.
 
-    Returns {"outcome": "granted" | "grant_failed", "jump_link": Optional[str]}."""
+    Checks `channel.permissions_for(member)` first (tracker item #0104: "Reply to requestor" is
+    primarily about the reply, not the invite) -- a member who can already see the channel (an
+    admin who filed their own item, or a repeat click after an earlier grant) gets left alone
+    instead of a needless re-applied overwrite, and the caller can skip showing an "access
+    granted" message that would misdescribe what actually happened.
+
+    Returns {"outcome": "granted" | "already_has_access" | "grant_failed", "jump_link": Optional[str]}."""
+    if channel is not None and channel.permissions_for(member).view_channel:
+        return {"outcome": "already_has_access", "jump_link": None}
     overwrite = discord.PermissionOverwrite(
         view_channel=True, read_message_history=True, send_messages_in_threads=True,
     )
     try:
-        await channel.set_permissions(
+        await channel.set_permissions(  # type: ignore[union-attr]
             member, overwrite=overwrite, reason=f"Tracker #{item['item_number']}: grant requestor access to reply"
         )
     except (discord.Forbidden, discord.HTTPException) as e:
@@ -1472,12 +1480,18 @@ async def _grant_or_invite_from_interaction(interaction: discord.Interaction, it
     the case Discord itself denies opening the modal) and `TrackerReplyModal.on_submit()`, so a
     plain grant and a grant-with-reply can never disagree about what actually happens.
 
-    Caller must already have gated on `check_bot_admin_only()` and `item["reporter_id"].isdigit()`
-    -- this assumes both already passed. Returns {"outcome": ..., "invite_url": Optional[str],
+    Caller must already have gated on `check_bot_admin_only()` -- this assumes that passed, but
+    NOT that `item["reporter_id"].isdigit()` does (tracker item #0104: an agent-filed item has
+    nobody to grant/invite, but the reply itself -- already posted by the caller before this runs
+    -- is still the point of the click, so this degrades to "no_reporter" instead of the caller
+    refusing to open the modal at all). Returns {"outcome": ..., "invite_url": Optional[str],
     "jump_link": Optional[str]} -- the same outcome vocabulary as grant_access_for_agent()."""
     import QBcore
 
     reporter_id = item["reporter_id"]
+    if not reporter_id.isdigit():
+        return {"outcome": "no_reporter", "invite_url": None, "jump_link": None}
+
     member = interaction.guild.get_member(int(reporter_id)) if interaction.guild else None
     if member is None and interaction.guild is not None:
         try:
@@ -1516,6 +1530,13 @@ def _render_grant_access_message(
             'ui_components.tracker.grant_access_granted', user_id=user_id, guild_id=guild_id,
             reporter_id=item["reporter_id"], jump_link=result["jump_link"],
         )
+    if outcome == "already_has_access":
+        return t(
+            'ui_components.tracker.grant_access_already_has_access', user_id=user_id, guild_id=guild_id,
+            reporter_id=item["reporter_id"],
+        )
+    if outcome == "no_reporter":
+        return t('ui_components.tracker.grant_access_no_reporter', user_id=user_id, guild_id=guild_id)
     if outcome == "invited":
         return t(
             'ui_components.tracker.grant_access_invited', user_id=user_id, guild_id=guild_id,
@@ -1548,8 +1569,8 @@ async def grant_access_for_agent(item_number: int) -> Dict[str, Any]:
     guild is the tracker's configured home guild (`_tracker_home_guild_id()`) and the channel is
     resolved from the item's own `channel_id`, rather than read off the interaction.
 
-    Returns {"outcome": "granted" | "grant_failed" | "invited" | "invite_failed" |
-    "invite_dm_failed" | "already_invited" | "member_not_found" | "no_reporter" |
+    Returns {"outcome": "granted" | "already_has_access" | "grant_failed" | "invited" |
+    "invite_failed" | "invite_dm_failed" | "already_invited" | "member_not_found" | "no_reporter" |
     "not_configured", "reporter_id": str, "invite_url": Optional[str], "jump_link": Optional[str]}.
     Raises ValueError if item_number doesn't exist, mirroring this module's other agent-facing
     functions."""
@@ -1931,7 +1952,14 @@ class TrackerItemButton(
         into themselves, never an actual compose box). The modal's own submit handles the
         grant/invite side of things (via `_grant_or_invite_from_interaction()`) after optionally
         posting the reply text -- this method only does the up-front gating, since a modal must
-        be the interaction's very first response (Cardinal Rule 10)."""
+        be the interaction's very first response (Cardinal Rule 10).
+
+        Gating stops at the admin-permission check (tracker item #0104: "the primary purpose is
+        the Reply, not the invite") -- this used to also refuse to open the modal at all for a
+        bot/agent-filed item (no digit `reporter_id` to grant/invite), showing an ephemeral
+        warning instead and leaving the admin with no way to reply either. Whether a grant/invite
+        is even needed is now decided inside the modal submit, which silently skips it (no
+        ephemeral warning) for that case or for a reporter who already has channel access."""
         from qapbot.config import CONFIG
         from qapbot.QBdiscocmdshelper import check_bot_admin_only
 
@@ -1940,13 +1968,6 @@ class TrackerItemButton(
         if not check_bot_admin_only(interaction, CONFIG.server_admin):
             await interaction.response.send_message(
                 t('ui_components.tracker.grant_access_denied', user_id=user_id, guild_id=guild_id), ephemeral=True
-            )
-            return
-
-        reporter_id = item["reporter_id"]
-        if not reporter_id.isdigit():
-            await interaction.response.send_message(
-                t('ui_components.tracker.grant_access_no_user', user_id=user_id, guild_id=guild_id), ephemeral=True
             )
             return
 
@@ -1962,9 +1983,18 @@ class TrackerReplyModal(discord.ui.Modal, title="Reply to requestor"):
     plain button used to run inline (`_grant_or_invite_from_interaction()`), so the two things
     "reply" and "make sure they can see it" always happen together in one step."""
 
+    # tracker item #0105: `Label.text` is capped at 45 chars by Discord (see
+    # qapbot/docs/CODE_STRUCTURE.md's "Text Input Labels" section) -- the original text here was
+    # 76 chars, so every click of "Reply to requestor" 400'd with `discord.errors.HTTPException:
+    # In data.components.0.label: Must be between 1 and 45 in length` the instant this modal was
+    # constructed, never actually reaching Discord. The dropped detail moves to `placeholder`,
+    # which has no such limit.
     reply_input = discord.ui.Label(
-        text="Your reply (optional — leave blank to just grant/invite without a message)",
-        component=discord.ui.TextInput(style=discord.TextStyle.paragraph, required=False, max_length=2000),
+        text="Your reply (optional)",
+        component=discord.ui.TextInput(
+            style=discord.TextStyle.paragraph, required=False, max_length=2000,
+            placeholder="Leave blank to just grant/invite without a message",
+        ),
     )
 
     def __init__(self, item: Dict[str, Any], admin_id: str):

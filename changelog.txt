@@ -1,6 +1,24 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-06 (1)
+- Fixed tracker #0105: "Reply to requestor" 400'd on EVERY click (discord.errors.HTTPException:
+  In data.components.0.label: Must be between 1 and 45 in length) because TrackerReplyModal's
+  reply_input Label.text was 76 chars against Discord's 45-char cap for that field, added two
+  days ago for #0102. Shortened the label; moved the dropped detail to the TextInput's
+  placeholder= instead, which has no such limit. Build 32.
+- Fixed tracker #0104: "the primary purpose is the Reply, not the invite" -- the button used to
+  refuse outright (ephemeral "no linked Discord user" warning, no modal at all) for an
+  agent-filed item's non-digit reporter_id, leaving the admin no way to reply either.
+  _handle_grant_access() now only gates on admin permission before opening the modal; whether a
+  grant/invite is even needed is decided inside the modal submit instead.
+  _grant_or_invite_from_interaction() degrades to a silent, no-warning no-op for the two cases
+  where there's genuinely nothing to grant: a bot/agent-filed item (new "no_reporter" outcome)
+  and a reporter who already has channel access (new "already_has_access" outcome, checked via
+  channel.permissions_for(member).view_channel inside the shared _apply_requestor_grant() so the
+  agent-facing grant_access_for_agent()/tracker_reply_and_invite path gets the same treatment for
+  free instead of needlessly re-applying the permission overwrite). Build 32.
+
 2026-09-05 (16)
 - Added per-test-case sign-off for the bug/feature tracker: neither existing tool could
   correctly represent "4 of 6 PROD cases passed, 2 genuinely failed" -- tracker_mark_testcase_

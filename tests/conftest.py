@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
+import discord
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -120,6 +121,13 @@ def mock_interaction():
 
     interaction.channel = AsyncMock()
     interaction.channel.id = 111222333
+    # permissions_for() is sync in real discord.py and its return value's boolean-flag attributes
+    # (view_channel, etc.) are real bools -- left as an auto-generated AsyncMock attribute, both
+    # the call itself and `.view_channel` on the result would be perpetually-truthy Mock objects,
+    # which silently short-circuits any "does this member already have access" check (tracker
+    # item #0104) to always true. Default to no access; tests that need a member who already can
+    # see the channel override this per-test.
+    interaction.channel.permissions_for = MagicMock(return_value=discord.Permissions.none())
     interaction.delete_original_response = AsyncMock()
 
     return interaction

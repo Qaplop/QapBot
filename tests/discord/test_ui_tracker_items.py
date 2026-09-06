@@ -111,6 +111,10 @@ def _fake_channel(send_message=None, fetch_message=None):
     channel = AsyncMock()
     channel.send = AsyncMock(return_value=send_message or _fake_message())
     channel.fetch_message = AsyncMock(return_value=fetch_message)
+    # See conftest.mock_interaction's matching comment (tracker item #0104) -- permissions_for()
+    # is sync in real discord.py; default to no access so grant-path tests keep exercising the
+    # grant, not the new "already_has_access" short-circuit, unless a test opts in.
+    channel.permissions_for = MagicMock(return_value=discord.Permissions.none())
     return channel
 
 
@@ -2245,7 +2249,11 @@ async def test_grant_access_denied_for_non_admin(db, monkeypatch, mock_interacti
     mock_interaction.response.send_message.assert_awaited_once()
 
 
-async def test_grant_access_no_user_for_agent_filed_item(db, monkeypatch, mock_interaction):
+async def test_grant_access_opens_reply_modal_for_agent_filed_item(db, monkeypatch, mock_interaction):
+    """tracker item #0104: replying is the button's primary purpose, so it must still open for
+    an agent-filed item (non-digit reporter_id) with nobody to grant/invite -- it used to refuse
+    outright with an ephemeral "no linked Discord user" warning and never open the modal at all,
+    leaving the admin no way to reply either."""
     _wire_bot(monkeypatch, channel=None)
     item_number = await _make_item(db, reporter_id="agent:tester")
     item = await db.get_tracker_item(item_number)
@@ -2254,9 +2262,9 @@ async def test_grant_access_no_user_for_agent_filed_item(db, monkeypatch, mock_i
     button = TrackerItemButton("grantaccess", item_number)
     await button._handle_grant_access(mock_interaction, item)
 
-    mock_interaction.response.send_modal.assert_not_awaited()
-    text = mock_interaction.response.send_message.call_args[0][0]
-    assert "no linked discord user" in text.lower()
+    mock_interaction.response.send_modal.assert_awaited_once()
+    modal = mock_interaction.response.send_modal.call_args[0][0]
+    assert isinstance(modal, TrackerReplyModal)
 
 
 async def test_grant_access_opens_reply_modal_for_admin(db, monkeypatch, mock_interaction):
@@ -2466,6 +2474,90 @@ async def test_reply_modal_comment_post_failure_stops_before_granting(db, monkey
     assert "couldn't post your reply" in text.lower()
 
 
+async def test_reply_modal_label_text_within_discords_45_char_limit(db, monkeypatch):
+    """tracker item #0105 regression: `discord.ui.Label.text` over 45 chars makes Discord 400 the
+    ENTIRE modal on open (`In data.components.0.label: Must be between 1 and 45 in length`) --
+    the original text here ("Your reply (optional — leave blank to just grant/invite without a
+    message)") was 76 chars, so every single click of "Reply to requestor" crashed before the
+    admin ever saw a compose box."""
+    item_number = await _make_item(db, reporter_id="222")
+    item = await db.get_tracker_item(item_number)
+
+    modal = TrackerReplyModal(item, str(ADMIN_ID))
+
+    assert len(modal.reply_input.text) <= 45
+
+
+# -- reporter needs no grant/invite: bot/agent-filed item or already has access (#0104) -----
+
+async def test_grant_or_invite_from_interaction_no_reporter_for_agent_filed_item(db, monkeypatch, mock_interaction):
+    """A non-digit reporter_id (agent-filed item) must degrade to "no_reporter" without ever
+    calling int() on it (which would raise) -- the reply the caller already posted is the whole
+    point of the click, nothing to grant."""
+    item_number = await _make_item(db, reporter_id="agent:tester")
+    item = await db.get_tracker_item(item_number)
+
+    result = await _grant_or_invite_from_interaction(mock_interaction, item)
+
+    assert result["outcome"] == "no_reporter"
+    mock_interaction.guild.get_member.assert_not_called()
+
+
+async def test_reply_modal_agent_filed_item_posts_reply_without_touching_access(db, monkeypatch, mock_interaction):
+    thread = _fake_channel()
+    _wire_bot(monkeypatch, channel=thread)
+    item_number = await _make_item(db, reporter_id="agent:tester")
+    await db.update_tracker_item(item_number, thread_id="777")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+
+    modal = TrackerReplyModal(item, str(ADMIN_ID))
+    cast(discord.ui.TextInput, modal.reply_input.component)._value = "Thanks for the report!"
+    await modal.on_submit(mock_interaction)
+
+    thread.send.assert_awaited_once()
+    mock_interaction.channel.set_permissions.assert_not_awaited()
+    text = mock_interaction.followup.send.call_args[0][0]
+    assert "no access changes needed" in text.lower()
+
+
+async def test_grant_or_invite_from_interaction_already_has_access_skips_overwrite(db, monkeypatch, mock_interaction):
+    """A reporter who's a guild member AND can already see the channel (e.g. they're an admin
+    filing their own item) must not get a needless re-applied permission overwrite, and the
+    outcome must not claim "granted" when nothing changed."""
+    item_number = await _make_item(db, reporter_id="222")
+    item = await db.get_tracker_item(item_number)
+    member = MagicMock()
+    member.id = 222
+    mock_interaction.guild.get_member = MagicMock(return_value=member)
+    mock_interaction.channel.permissions_for = MagicMock(return_value=discord.Permissions.all())
+    mock_interaction.channel.set_permissions = AsyncMock()
+
+    result = await _grant_or_invite_from_interaction(mock_interaction, item)
+
+    assert result["outcome"] == "already_has_access"
+    mock_interaction.channel.set_permissions.assert_not_awaited()
+
+
+async def test_reply_modal_already_has_access_message(db, monkeypatch, mock_interaction):
+    item_number = await _make_item(db, reporter_id="222")
+    item = await db.get_tracker_item(item_number)
+    mock_interaction.user.id = int(ADMIN_ID)
+    member = MagicMock()
+    member.id = 222
+    mock_interaction.guild.get_member = MagicMock(return_value=member)
+    mock_interaction.channel.permissions_for = MagicMock(return_value=discord.Permissions.all())
+    mock_interaction.channel.set_permissions = AsyncMock()
+
+    modal = TrackerReplyModal(item, str(ADMIN_ID))
+    await modal.on_submit(mock_interaction)
+
+    mock_interaction.channel.set_permissions.assert_not_awaited()
+    text = mock_interaction.followup.send.call_args[0][0]
+    assert "222" in text
+    assert "no changes needed" in text.lower()
+
+
 # -- _grant_or_invite_from_interaction double-call guard (tracker item #0036 follow-up) ------
 
 async def test_grant_or_invite_from_interaction_second_call_does_not_resend_invite(db, monkeypatch, mock_interaction):
@@ -2585,6 +2677,32 @@ async def test_grant_access_for_agent_grants_when_already_member(db, monkeypatch
     channel.set_permissions.assert_awaited_once()
     assert result["outcome"] == "granted"
     assert result["jump_link"]
+
+
+async def test_grant_access_for_agent_already_has_access_skips_overwrite(db, monkeypatch):
+    """Shared `_apply_requestor_grant()` behavior (tracker item #0104): the agent-facing path
+    must get the same "don't re-grant what's already granted" treatment as the Discord button's,
+    since both funnel through the same function."""
+    from qapbot.cache_manager import CACHE
+    CACHE.tracker_settings[TRACKER_SETTING_GUILD_ID] = "999"
+
+    channel = _fake_channel()
+    channel.permissions_for = MagicMock(return_value=discord.Permissions.all())
+    channel.set_permissions = AsyncMock()
+    bot = _wire_bot(monkeypatch, channel=channel)
+    guild = MagicMock()
+    member = MagicMock()
+    member.id = 222
+    guild.get_member = MagicMock(return_value=member)
+    bot.get_guild = MagicMock(return_value=guild)
+
+    item_number = await _make_item(db, reporter_id="222", guild_id="999")
+    await db.update_tracker_item(item_number, channel_id="10", message_id="100")
+
+    result = await grant_access_for_agent(item_number)
+
+    channel.set_permissions.assert_not_awaited()
+    assert result["outcome"] == "already_has_access"
 
 
 async def test_grant_access_for_agent_invites_non_member(db, monkeypatch):

@@ -142,24 +142,43 @@ exists (the old thread otherwise becomes unreachable once its parent message is 
 `_move_item_to_implemented_channel()`.
 
 **Grant/revoke requestor access (2026-08-22, ticket #0021; reply modal added 2026-09-05, ticket
-#0102)**: reporters normally can't see the reports channel their item was posted in (it isn't
-open to `@everyone`), so a staff `@mention` reply gets no push notification and the reporter
+#0102; modal always opens + skips needless grants, 2026-09-06, ticket #0104; Label length fix,
+ticket #0105)**: reporters normally can't see the reports channel their item was posted in (it
+isn't open to `@everyone`), so a staff `@mention` reply gets no push notification and the reporter
 can't read the thread. The **"Reply to requestor"** button on `TrackerItemButton` (`grantaccess`
 action, admin-only, `_handle_grant_access()`) opens `TrackerReplyModal` — a text box for an
 actual reply, taken literally from the button's own name (live bug report: it used to only ever
 grant access/send an invite and hand back a jump link for the admin to type into themselves,
 never a compose box). The reply field is optional: submitting it blank preserves the original
-grant-only behavior. On submit, `TrackerReplyModal.on_submit()` posts any reply text via
-`post_comment()` — which always @-mentions the reporter (tracker item #0091) so Discord actually
-notifies them the moment they can see the channel, not just a plain unmentioned message —
-then gives the reporter a member-specific Discord permission overwrite on that channel
-(`view_channel`/`read_message_history`/`send_messages_in_threads`) via
-`_grant_or_invite_from_interaction()`/`_apply_requestor_grant()`, and finally replies (ephemeral,
-to the admin) with a jump link to the item's discussion thread (or the item message itself if it
-has no thread). A modal must be the interaction's very first response (Cardinal Rule 10), so
-`_handle_grant_access()` itself does only the up-front admin/reporter gating and opening the
-modal — none of the actual grant/invite/reply side effects, which all happen once the modal is
-submitted.
+grant-only behavior. Replying is the button's PRIMARY purpose (ticket #0104): `_handle_grant_access()`
+only gates on admin permission before opening the modal — it used to also refuse outright (an
+ephemeral "no linked Discord user" warning, no modal at all) for an agent-filed item's non-digit
+`reporter_id`, leaving the admin no way to reply either. Whether a grant/invite is even needed is
+decided inside the modal submit instead: on submit, `TrackerReplyModal.on_submit()` posts any
+reply text via `post_comment()` — which always @-mentions the reporter (tracker item #0091) so
+Discord actually notifies them the moment they can see the channel, not just a plain unmentioned
+message — then calls `_grant_or_invite_from_interaction()`, which degrades to a silent, no-warning
+no-op for the two cases where there's genuinely nothing to grant: `"no_reporter"` (non-digit
+`reporter_id` — bot/agent-filed item) and `"already_has_access"` (a real member who can already
+see the channel via `channel.permissions_for(member).view_channel` — e.g. an admin filing their
+own item, or a repeat click after an earlier grant — checked inside the shared
+`_apply_requestor_grant()` before it re-applies the overwrite, so the agent-facing
+`grant_access_for_agent()` path gets the same treatment for free). Otherwise it gives the reporter
+a member-specific Discord permission overwrite on that channel
+(`view_channel`/`read_message_history`/`send_messages_in_threads`) via `_apply_requestor_grant()`,
+and finally replies (ephemeral, to the admin) with a jump link to the item's discussion thread (or
+the item message itself if it has no thread) — or, for the two no-op outcomes, a plain
+"nothing to grant"/"already has access" ephemeral instead of a false "granted" claim. A modal must
+be the interaction's very first response (Cardinal Rule 10), so `_handle_grant_access()` itself
+does only the up-front admin gating and opening the modal — none of the actual grant/invite/reply
+side effects, which all happen once the modal is submitted.
+
+`TrackerReplyModal.reply_input` is a `discord.ui.Label`-wrapped `TextInput` (see
+`qapbot/docs/CODE_STRUCTURE.md`'s "Text Input Labels" section) — ticket #0105 was a live crash
+from a `Label.text` over Discord's 45-char cap (`In data.components.0.label: Must be between 1
+and 45 in length`), which 400'd the modal open on literally every click since the label text is
+baked into the class body and evaluated at import time, not per-request. Extra guidance text
+belongs in the `TextInput`'s `placeholder=`, which has no such limit.
 This is deliberately **channel-wide**, not scoped to just their own message/thread — Discord's
 narrower primitive for that would be a standalone **private thread** with `thread.add_user()`
 (membership on a private thread grants access independent of the parent channel's own view

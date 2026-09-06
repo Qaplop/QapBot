@@ -71,6 +71,10 @@ def _fake_channel():
     message.jump_url = "https://discord.com/channels/1/2/999"
     channel.send = AsyncMock(return_value=message)
     channel.fetch_message = AsyncMock(return_value=None)
+    # permissions_for() is sync in real discord.py -- left as an auto-generated AsyncMock
+    # attribute, calling it returns an unawaited coroutine and `.view_channel` on that raises
+    # AttributeError (tracker item #0104's "already has access" check calls this for real).
+    channel.permissions_for = MagicMock(return_value=discord.Permissions.none())
     return channel
 
 

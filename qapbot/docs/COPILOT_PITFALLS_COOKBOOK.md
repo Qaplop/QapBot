@@ -3015,3 +3015,38 @@ wasn't a preexisting bug being reproduced — it would have been a brand new one
   like the established, trusted `QapBot.py:1216` pattern), and would only have surfaced live in
   PROD the next time `/status` ran with a mutating `clan_name_cache` mid-call. Running pyright on
   every touched file before calling a fix done — not just the test suite — is what caught it here.
+
+## Pitfall 66: a `discord.ui.Label.text` over 45 characters 400s the WHOLE modal on open, even though it's already documented elsewhere
+
+**Symptom:** every single click of a button that opens a modal fails silently from the user's
+point of view (the modal just never appears) while the bot log shows `discord.errors.HTTPException:
+400 Bad Request (error code: 50035): Invalid Form Body In data.components.0.label: Must be between
+1 and 45 in length`.
+
+**What happened (2026-09-06, tracker item #0105):** `TrackerReplyModal.reply_input`
+(`qapbot/ui_tracker.py`, added for ticket #0102 two days earlier) was built with
+`discord.ui.Label(text="Your reply (optional — leave blank to just grant/invite without a
+message)", ...)` — 76 characters. `qapbot/docs/CODE_STRUCTURE.md` already documents "`Label.text`
+is the visible field label (max 45 chars)" in its Select-Menus-Inside-Modals section, but that
+line describes the LIMIT, not a way to catch a violation of it — nothing in the test suite
+constructs `TrackerReplyModal` and asserts on `reply_input.text`'s length, and neither pyright nor
+discord.py's own client-side type hints reject an over-length string (`Label.text` is just
+`str`). The class body executes at import time, so the 400 wasn't a one-off — it fired on
+literally every admin click of "Reply to requestor" from the moment this shipped until the fix,
+with no exception surfaced anywhere the admin could see (Discord just never opened a dialog).
+
+**How to apply:**
+- Any new `discord.ui.Label(text="...", ...)` needs its `text=` checked against the 45-char cap
+  BEFORE relying on manual testing to catch it — manual testing here meant "click the button,
+  watch nothing happen," which is easy to misread as network flakiness rather than a hard 400.
+  If the natural label reads long, that's a sign the extra detail belongs in the wrapped
+  component's `placeholder=` instead (uncapped), not in `text=`.
+  Prefer a cheap import-time assertion or a unit test asserting `len(my_label.text) <= 45` for
+  any Label carrying non-trivial guidance text, mirroring [[test_reply_modal_label_text_within_discords_45_char_limit]]
+  in `tests/discord/test_ui_tracker_items.py` — this is the kind of length constraint a linter
+  won't catch and a human skim of the string easily misjudges ("that doesn't LOOK like 76 chars").
+- **Documenting a limit once, in one file, does not mean future code respects it.** This same
+  repo already had the 45-char cap written down (`CODE_STRUCTURE.md`) when this bug shipped two
+  days after the doc was updated for the SAME feature area. A rule worth documenting for
+  discovery is also worth a cheap runtime/test check wherever the pattern gets reused, not just a
+  comment for the next reader to remember.

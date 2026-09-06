@@ -496,6 +496,8 @@ def _describe_access_outcome(access: Dict[str, Any]) -> str:
     outcome = access.get("outcome")
     if outcome == "granted":
         return "They're already a member -- granted them access to the channel and thread."
+    if outcome == "already_has_access":
+        return "They already have access to the channel -- nothing more to do."
     if outcome == "invited":
         return "They haven't joined yet -- sent them a DM invite; access applies automatically once they join."
     if outcome == "invite_dm_failed":
