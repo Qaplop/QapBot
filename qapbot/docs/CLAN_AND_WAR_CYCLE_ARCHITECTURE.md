@@ -304,7 +304,9 @@ UPSERT (INSERT ... ON CONFLICT):
 
 1. Create async connection with aiosqlite
 2. Enable WAL mode (journal_mode=WAL)
-3. Set pragmas: synchronous=NORMAL, busy_timeout=30000, foreign_keys=ON, mmap_size=8GB
+3. Set pragmas: synchronous=NORMAL, busy_timeout=30000, foreign_keys=ON, plus the per-schema
+   memory budget via `db_memory_pragmas()` (main 1 GB mmap / 32 MB cache, history 256 MB / 8 MB
+   — retuned from a flat 8 GB mmap on 2026-09-07, tracker #0106; see PERFORMANCE_TUNING.md)
 4. Call `_create_schema()` → all migrations
 
 ### _create_schema() / _create_maindata_schema()

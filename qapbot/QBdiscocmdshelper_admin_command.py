@@ -1557,23 +1557,23 @@ def _get_rss_breakdown() -> dict[str, float]:
     the GC census, tracemalloc, [ALLOCATOR]'s mallinfo2() — can only see Python-managed or
     glibc-malloc-managed memory. None of them can see resident pages from SQLite's own mmap I/O.
 
-    qapbot/db_manager.py sets `PRAGMA mmap_size=8589934592` (8 GB) on the async connection AND
-    every one of the 8 pooled sync connections, per schema (main + attached history) — 9
-    independent mmap views of the SAME two files, deliberately (see the `_SyncConnectionPool`
-    rationale: "the kernel deduplicates pages across all connections... so the entire RAM can
-    serve as a shared read cache"). On 2026-09-06 those two files were 25 GB (main) and 36 GB
-    (history) — both far bigger than the 8 GB per-connection ceiling, so that ceiling is what
-    actually binds. Resident mmap'd pages count toward THIS process's VmRSS like any other
-    mapping, and because each connection holds its own separate mapping of the same files, a
-    naive VmRSS read can count the *same physical page* once per connection that has touched it
-    — RSS inflating without any additional physical memory being used system-wide, let alone any
-    Python object growing.
+    qapbot/db_manager.py mmap's the DB via `db_memory_pragmas()` (main 1 GB, history 256 MB as
+    of 2026-09-07) on the async connection and every pooled sync connection. Those resident
+    pages count toward this process's VmRSS like any other mapping, so they inflate RSS without
+    being Python objects — but note they do NOT multiply physical memory across connections:
+    every connection maps the SAME two files and therefore shares the same physical pages. Only
+    address space multiplies, which is why VMS reads far larger than RSS. (An earlier version of
+    this docstring claimed the opposite; that reasoning was wrong and is corrected here.)
 
-    Read this section first: RssFile large, RssAnon small -> the "6-7 GB unexplained" gap from
-    the two 2026-09-06 profiles is very plausibly mmap'd database pages, not a leak — mostly
-    reclaimable by the kernel under real pressure, and the fix (if any) is tuning mmap_size /
-    pool_size, not hunting for a cache to shrink. RssAnon large -> still a genuine heap-memory
-    question; that's what [ALLOCATOR] and [CACHE STRUCTURE SIZES] below are for.
+    Reading order:
+    - `swap` first. Swap on this box lives on the HDD, not the SSD holding the DB, so a swapped
+      page costs ~10 ms against ~100 us to re-read a dropped DB page. Non-trivial and rising =
+      the 2026-09-07 incident recurring.
+    - then `anon` vs `file`. `anon` is heap (Python objects, malloc) — the only half every other
+      section of this report can see, and the only half that can reach swap. `file` is mmap'd
+      DB pages: dropped and re-read from SSD under pressure, never swapped. A large `file` is
+      normally benign; a large or rising `anon` is what to chase, via [ALLOCATOR] and
+      [CACHE STRUCTURE SIZES].
 
     Falls back to summing `/proc/self/smaps`'s per-mapping `Anonymous:`/`Rss:` fields when the
     fast path is unavailable (2026-09-07: PROD's NAS runs kernel 4.4.302, which predates the
@@ -1597,12 +1597,22 @@ def _get_rss_breakdown() -> dict[str, float]:
             _status = _f.read()
         _wanted = {"RssAnon:": "anon_mb", "RssFile:": "file_mb", "RssShmem:": "shmem_mb"}
         _out: dict[str, float] = {}
+        _swap_kb: int | None = None
         for _line in _status.splitlines():
+            # VmSwap is parsed independently of the three Rss* fields: it exists since Linux
+            # 2.6.34, far older than the 4.5 those need, so it is available even on the kernel
+            # that forces the smaps fallback below. Kept out of the len()==3 completeness
+            # check for exactly that reason.
+            if _line.startswith("VmSwap:"):
+                _swap_kb = int(_line.split()[1])
+                continue
             for _prefix, _key in _wanted.items():
                 if _line.startswith(_prefix):
                     _out[_key] = int(_line.split()[1]) / 1024
         if len(_out) == 3:
             _out["source"] = "status"
+            if _swap_kb is not None:
+                _out["swap_mb"] = _swap_kb / 1024
             return _out
     except Exception:
         pass
@@ -1610,18 +1620,28 @@ def _get_rss_breakdown() -> dict[str, float]:
     try:
         _total_rss_kb = 0
         _total_anon_kb = 0
+        _total_swap_kb = 0
+        _saw_swap = False
         with open('/proc/self/smaps', 'r') as _f:
             for _line in _f:
                 if _line.startswith("Rss:"):
                     _total_rss_kb += int(_line.split()[1])
                 elif _line.startswith("Anonymous:"):
                     _total_anon_kb += int(_line.split()[1])
+                elif _line.startswith("Swap:"):
+                    # NOT "SwapPss:" — startswith("Swap:") excludes it, and double-counting
+                    # the two would overstate swap by roughly 2x.
+                    _total_swap_kb += int(_line.split()[1])
+                    _saw_swap = True
         if _total_rss_kb:
-            return {
+            _result = {
                 "anon_mb": _total_anon_kb / 1024,
                 "file_mb": (_total_rss_kb - _total_anon_kb) / 1024,
                 "source": "smaps",
             }
+            if _saw_swap:
+                _result["swap_mb"] = _total_swap_kb / 1024
+            return _result
     except Exception:
         pass
     return {}
@@ -1729,26 +1749,37 @@ def save_memtrace_snapshot(cache: Any) -> str:
     if rss_breakdown:
         _shmem_part = (
             f"  shmem={rss_breakdown['shmem_mb']:.1f} MB" if "shmem_mb" in rss_breakdown
-            else "  shmem=n/a (kernel too old for a per-mapping shmem field, see smaps fallback note)"
+            else "  shmem=n/a (kernel too old for a per-mapping shmem field)"
+        )
+        _swap_part = (
+            f"  swap={rss_breakdown['swap_mb']:.1f} MB" if "swap_mb" in rss_breakdown
+            else "  swap=n/a"
         )
         lines.append(
             f"  anon={rss_breakdown['anon_mb']:.1f} MB  file={rss_breakdown['file_mb']:.1f} MB"
-            f"{_shmem_part}"
+            f"{_shmem_part}{_swap_part}"
         )
         lines.append(
-            "  READ THIS FIRST. 'anon' is heap memory (Python objects, malloc) -- everything "
-            "else in this report can only see that half. 'file' is resident pages from mmap'd "
-            "files, e.g. SQLite's mmap_size=8 GB-per-connection I/O (qapbot/db_manager.py) "
-            "against a 25 GB main DB + 36 GB history DB as of 2026-09-06, mapped independently "
-            "by the async connection AND all 8 pooled sync connections -- 9 separate mappings of "
-            "the same two files, which can each count the same physical page toward THIS "
-            "process's RSS. If 'file' is the big number, the missing memory from a prior "
-            "[CACHE STRUCTURE SIZES]/GC-census gap is very plausibly database pages, not a leak "
-            "-- reclaimable by the kernel under real pressure, and the fix (if one is even "
-            "needed) is tuning mmap_size/pool_size, not hunting for a Python cache to shrink."
+            "  READ 'swap' FIRST. This box's swap file is on the HDD, not the SSD holding the "
+            "DB, so a swapped page costs ~10 ms to fault back versus ~100 us to re-read a "
+            "dropped DB page. Any non-trivial, GROWING swap figure is the 2026-09-07 incident "
+            "recurring (wall time exploding while cpu stays flat, cores_busy collapsing, "
+            "zero-I/O in-memory walks going 100x slower). NOTE: that incident was diagnosed "
+            "purely by inference from wall-vs-cpu divergence -- swap was never actually "
+            "measured, which is why this field now exists."
+        )
+        lines.append(
+            "  Then 'anon' vs 'file'. 'anon' is heap (Python objects, malloc) -- it is the ONLY "
+            "half every other section of this report can see, and the only half that can be "
+            "pushed to HDD swap. 'file' is resident pages from mmap'd files, mostly SQLite's "
+            "mmap I/O: those are dropped and re-read from SSD under pressure, never swapped, "
+            "and they do NOT multiply across the pooled connections (all connections map the "
+            "same files and share the same physical pages -- only address space multiplies, "
+            "which is why VMS reads far larger than RSS). So a large 'file' figure is normally "
+            "benign; a large or rising 'anon' is the one to chase."
         )
     else:
-        lines.append("  (unavailable — not Linux, or /proc/self/status unreadable)")
+        lines.append("  (unavailable — no /proc/self/status or /proc/self/smaps)")
 
     lines.append("\n[ALLOCATOR — glibc mallinfo2()]")
     if malloc_info:
@@ -2171,6 +2202,12 @@ async def handle_memory_profile(cache: Any) -> str:
                 f"file={rss_breakdown['file_mb']:.0f} MB (mmap'd files, e.g. SQLite)"
                 f"{_shmem_part}"
             )
+            if "swap_mb" in rss_breakdown:
+                # Swap is on the HDD here — a non-zero, growing figure is the memory-pressure
+                # incident recurring. Flagged separately so it can't get lost in the split line.
+                _swap_mb = rss_breakdown["swap_mb"]
+                _flag = "  ⚠️" if _swap_mb >= 50 else ""
+                discord_lines.append(f"Swapped out: {_swap_mb:.0f} MB (HDD-backed){_flag}")
         if malloc_info:
             discord_lines.append(
                 f"Allocator: in_use={malloc_info['in_use_mb']:.0f} MB  "

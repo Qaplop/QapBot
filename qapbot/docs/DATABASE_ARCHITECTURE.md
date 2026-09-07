@@ -42,9 +42,23 @@ PRAGMA busy_timeout=5000;         -- Sync connections: wait 5s for locks (server
                                   -- Async connection uses 30000 (30s) for bulk-write bursts
 PRAGMA foreign_keys=ON;           -- Data integrity enforcement
 PRAGMA temp_store=MEMORY;         -- Faster temp operations
-PRAGMA cache_size=-65536;         -- 64 MB page cache (server-machine I/O reduction)
-PRAGMA mmap_size=8589934592;      -- 8 GB shared kernel page cache (HDD/server-machine seek reduction)
+
+-- Memory budget: set per schema, NEVER hand-written — always via
+-- db_manager.db_memory_pragmas(schema), which reads CONFIG. Retuned 2026-09-07
+-- (tracker #0106) when the DB moved from spinning disks to an eSATA SSD and the box
+-- started page-fault thrashing. See PERFORMANCE_TUNING.md, "The DB cache strategy,
+-- and why the intuitive version is backwards".
+PRAGMA cache_size=-32768;         -- main:    32 MB  (anonymous -> can reach HDD swap)
+PRAGMA mmap_size=1073741824;      -- main:  1024 MB  (file-backed -> dropped, never swapped)
+PRAGMA history.cache_size=-8192;  -- history:  8 MB  } smaller share: not in the per-cycle
+PRAGMA history.mmap_size=268435456; -- history: 256 MB } write path, bigger + colder file
 ```
+
+⚠️ `cache_size` is per-pager and does **not** inherit across `ATTACH`, while an unqualified
+`mmap_size` **does** become the default for later-attached databases — so `history` must be
+pinned explicitly for both, or the 35 GB cold DB silently inherits `main`'s larger ceiling.
+The former values (`cache_size=-65536`, `mmap_size=8589934592` on all 9 connections) were sized
+for HDD seek reduction and are what caused the 2026-09-07 incident.
 
 **Why Critical:**
 - Production environment on server-machine (`<PROD_BOT_ROOT>`; `data/` and `archive/` typically live on an SSD referenced by `${PROD_DATA_DIR}/data`)

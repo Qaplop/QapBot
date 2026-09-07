@@ -460,6 +460,41 @@ class TestRssBreakdown:
         self._patch_proc_files(monkeypatch, status=None, smaps=None)
         assert _get_rss_breakdown() == {}
 
+    def test_swap_is_reported_from_the_status_path(self, monkeypatch):
+        """The 2026-09-07 incident was diagnosed entirely by inferring memory pressure from
+        wall-vs-cpu divergence — swap itself was never measured. VmSwap has existed since Linux
+        2.6.34, so it was available the whole time on this kernel and simply wasn't read."""
+        self._patch_proc_files(monkeypatch, status=(
+            "VmRSS:\t 4096000 kB\n"
+            "RssAnon:\t 2048000 kB\n"
+            "RssFile:\t 2048000 kB\n"
+            "RssShmem:\t       0 kB\n"
+            "VmSwap:\t  512000 kB\n"
+        ))
+        assert _get_rss_breakdown()["swap_mb"] == pytest.approx(500.0)
+
+    def test_swap_is_summed_from_the_smaps_fallback(self, monkeypatch):
+        self._patch_proc_files(monkeypatch, status=None, smaps=(
+            "r1\nRss:  1000 kB\nAnonymous:  1000 kB\nSwap:  200 kB\n"
+            "r2\nRss:  1000 kB\nAnonymous:   500 kB\nSwap:  300 kB\n"
+        ))
+        assert _get_rss_breakdown()["swap_mb"] == pytest.approx(500 / 1024)
+
+    def test_smaps_swap_does_not_double_count_swappss(self, monkeypatch):
+        """`SwapPss:` sits directly under `Swap:` in every smaps block. A naive
+        startswith("Swap") would add both and roughly double the reported figure — on the one
+        number the whole HDD-swap strategy is judged by."""
+        self._patch_proc_files(monkeypatch, status=None, smaps=(
+            "r1\nRss:  1000 kB\nAnonymous:  1000 kB\nSwap:  400 kB\nSwapPss:  400 kB\n"
+        ))
+        assert _get_rss_breakdown()["swap_mb"] == pytest.approx(400 / 1024)
+
+    def test_swap_key_absent_when_the_kernel_does_not_report_it(self, monkeypatch):
+        """Must be absent, not 0.0 — reporting a confident 'no swap' when the field simply
+        wasn't there would be exactly the wrong signal during an incident."""
+        self._patch_proc_files(monkeypatch, status=None, smaps="r1\nRss: 100 kB\nAnonymous: 100 kB\n")
+        assert "swap_mb" not in _get_rss_breakdown()
+
     def test_survives_a_smaps_file_with_no_usable_lines(self, monkeypatch):
         """Rss: total of 0 must not be treated as 'measured zero usage' — it means the parse
         found nothing, so report unavailable rather than a bogus 0 MB."""

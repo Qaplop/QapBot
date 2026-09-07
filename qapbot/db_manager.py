@@ -1257,19 +1257,24 @@ class WarHistoryDB:
             # reclaimable instead of pinned to us.
             for _pragma in db_memory_pragmas():
                 await self._conn.execute(_pragma)
-            # Log what actually took effect (mmap_size may be capped by compile-time MAX_MMAP_SIZE)
+            # Log what actually took effect (mmap_size may be capped by compile-time
+            # MAX_MMAP_SIZE). Reports MAIN only — history is not attached yet at this point,
+            # and since 2026-09-07 the two schemas get deliberately different budgets, so this
+            # must not be phrased as if it covered both (it previously said "per schema" while
+            # history was on a different number entirely — see the history line after ATTACH).
             from qapbot.config import CONFIG as _MEM_CONFIG  # module-local, see db_memory_pragmas
             async with self._conn.execute("PRAGMA mmap_size") as _mmap_cur:
                 _effective_mmap = (await _mmap_cur.fetchone())[0]
                 if _effective_mmap < _MEM_CONFIG.db_mmap_size_mb * 1024 * 1024:
                     logging.info(
-                        f"[DB-INIT] mmap_size capped by SQLite build: {_effective_mmap / 1024**2:.0f} MB "
-                        f"(requested {_MEM_CONFIG.db_mmap_size_mb} MB)"
+                        f"[DB-INIT] main: mmap_size capped by SQLite build: "
+                        f"{_effective_mmap / 1024**2:.0f} MB (requested {_MEM_CONFIG.db_mmap_size_mb} MB), "
+                        f"cache_size: {_MEM_CONFIG.db_cache_size_mb} MB"
                     )
                 else:
                     logging.info(
-                        f"[DB-INIT] mmap_size: {_effective_mmap / 1024**2:.0f} MB, "
-                        f"cache_size: {_MEM_CONFIG.db_cache_size_mb} MB per schema"
+                        f"[DB-INIT] main: mmap_size: {_effective_mmap / 1024**2:.0f} MB, "
+                        f"cache_size: {_MEM_CONFIG.db_cache_size_mb} MB"
                     )
 
             # ATTACH the history database as schema 'history' (hot/history DB split)
@@ -1284,7 +1289,18 @@ class WarHistoryDB:
             await self._conn.execute("PRAGMA history.synchronous=NORMAL")
             for _pragma in db_memory_pragmas("history"):
                 await self._conn.execute(_pragma)
-            logging.info(f"[DB-INIT] Attached history database as schema 'history': {self.history_db_path}")
+            # Report history's OWN effective values, not main's. This is the line that catches
+            # the failure mode the per-schema split exists to prevent: an unqualified
+            # mmap_size becomes the default for later-ATTACHed databases, so if the explicit
+            # history pragmas above ever stop being applied, history silently inherits main's
+            # larger ceiling and this line is where that shows up.
+            async with self._conn.execute("PRAGMA history.mmap_size") as _hist_mmap_cur:
+                _hist_mmap = (await _hist_mmap_cur.fetchone())[0]
+            logging.info(
+                f"[DB-INIT] Attached history database as schema 'history': {self.history_db_path} "
+                f"(mmap_size: {_hist_mmap / 1024**2:.0f} MB, "
+                f"cache_size: {_MEM_CONFIG.db_history_cache_size_mb} MB)"
+            )
             
             # Create schema (idempotent) — creates both main.* and history.* tables
             await self._create_schema()

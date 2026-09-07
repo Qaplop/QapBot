@@ -1,6 +1,45 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-07 (7)  Build 36.
+- Re-audited the whole #0106 analysis and the work done for it. Three real defects found, all
+  of the same class: artefacts that outlived the reasoning that produced them.
+- (a) THE POST-FIX VALIDATION WAS INVALID and its conclusion has been retracted from the
+  tracker. "MALLOC_ARENA_MAX=2 confirmed working: arena 2280->834 MB (-63%), free_not_returned
+  1908->407 MB (-79%)" compared a profile at 10h57m uptime against one at 0h32m uptime. Arena
+  fragmentation accumulates over process lifetime, so most or all of that delta is an UPTIME
+  artefact, not the env var. There is no valid before/after in existing data at all: only two
+  profiles have an [ALLOCATOR] section (it was added 2026-09-06 evening) and they sit at wildly
+  different uptimes. The mechanism is still sound and the change is still probably right — but
+  it is UNVALIDATED. Needs a profile at ~8-11h uptime to compare like with like.
+- (b) The [DB-INIT] startup line said "cache_size: 32 MB per schema" while history was actually
+  on 8 MB, and was emitted BEFORE history was even attached so it could not have reported it.
+  Wording predated the per-schema split. Now logs main and history separately, each with its
+  OWN effective values, and the history line queries PRAGMA history.mmap_size directly — which
+  is the check that catches the failure mode the split exists to prevent (an unqualified
+  mmap_size becomes the default for later-ATTACHed databases, so if the explicit history
+  pragmas ever stop being applied, history silently inherits main's ceiling). This also produced
+  the first actual runtime verification that the split works: main 1024/32, history 256/8.
+- (c) Stale docs describing CURRENT state incorrectly: DATABASE_ARCHITECTURE.md and
+  CLAN_AND_WAR_CYCLE_ARCHITECTURE.md still documented mmap_size=8GB as the live config, and
+  _get_rss_breakdown()'s docstring still taught the superseded "9 connections each reserve 8 GB,
+  RSS counts the same physical page once per connection" model that was already established to
+  be wrong. All corrected; historical references in PERFORMANCE_TUNING.md left alone (they are
+  accurate as history).
+- Closed the biggest evidence gap in the original investigation: SWAP WAS NEVER MEASURED. The
+  entire thrashing diagnosis rested on inferring memory pressure from wall-vs-cpu divergence.
+  VmSwap has existed since Linux 2.6.34 — available on this 4.4 kernel the whole time, simply
+  never read. [RSS BREAKDOWN] now reports it from both paths (VmSwap on the status path, summed
+  per-mapping Swap: on the smaps fallback, with SwapPss: explicitly excluded so the figure is
+  not doubled), it leads the section's reading order, and the Discord summary flags it with a
+  warning marker past 50 MB. Absent rather than 0.0 when the kernel does not report it —
+  a confident "no swap" would be exactly the wrong signal mid-incident. 4 new tests.
+- Also measured, not assumed: post-fix DB write throughput is NOT better. 1.53s mean / 1.19s
+  median per 50-war batch at RSS 2.6-4.0 GB, against a 1.08s pre-fix baseline in the <5 GB band
+  (work per batch comparable, ~920 vs 841-957 attack rows). Too confounded by the catch-up
+  workload to call a regression, but there is no evidence the cache_size reduction helped
+  throughput, and a hint it may cost a little. Worth watching rather than assuming settled.
+
 2026-09-07 (6)  Build 35.
 - PROCESS FAILURE, recorded deliberately: BOT_BUILD was not bumped across ANY of this session's
   earlier .py changes (Cardinal Rule 17 -- roughly 8 separate batches: the mallinfo2/by-size GC
