@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-07 (3)
+- SECURITY: the web bridge's shared-secret gate (_check_secret, qapbot/web_bridge.py) compared
+  the X-Bridge-Secret header with ==, which short-circuits at the first differing byte and so
+  leaks through response timing how many leading bytes of a guess were correct — turning an
+  infeasible-by-length search into a byte-at-a-time one. "Bound to 127.0.0.1" is not the
+  boundary it looks like here: a cloudflared tunnel deliberately makes this endpoint reachable
+  from the Cloudflare Worker. Now hmac.compare_digest, with both sides encoded to bytes first
+  (compare_digest raises TypeError on non-ASCII str, and the secret is operator-supplied, so an
+  accented character would have turned every request into a 500 instead of a clean 403 — itself
+  an oracle). The empty-configured-secret guard is kept explicitly ahead of the comparison
+  rather than folded into it, because compare_digest("", "") is True and an unset secret must
+  never authenticate anyone. One chokepoint, so this covers all ~20 bridge handlers. 13 new
+  tests; the mechanism test was verified to FAIL against the reverted == version first — the
+  other 12 pass either way, which is precisely why the mechanism needed pinning directly.
+
 2026-09-07 (2)
 - SECURITY: BotConfig's auto-generated dataclass __repr__ printed every field verbatim, so
   PROD's live discord_token and coc_password were rendered by anything that displayed the

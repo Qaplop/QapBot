@@ -85,10 +85,36 @@ async def _access_log_middleware(request: web.Request, handler: Any) -> web.Stre
 
 
 def _check_secret(request: web.Request) -> bool:
+    """Authenticate a bridge request against the shared ``X-Bridge-Secret``.
+
+    The single chokepoint for every bridge handler (~20 call sites), so the comparison only has
+    to be right here.
+
+    ``hmac.compare_digest`` rather than ``==`` (2026-09-07): Python's ``==`` on str/bytes short-
+    circuits at the first differing byte, so the time it takes to reject a wrong secret reveals
+    how many leading bytes were correct. That turns guessing the secret from an
+    infeasible-by-length search into a byte-at-a-time one. The endpoint is bound to 127.0.0.1,
+    but a cloudflared tunnel (not this bot) deliberately makes it reachable from the Cloudflare
+    Worker — so "localhost only" is not the boundary it looks like, and remote timing attacks
+    over a tunnel are impractical-but-not-impossible. This costs nothing to get right.
+
+    Both sides are encoded to bytes first: ``compare_digest`` raises TypeError on str arguments
+    containing non-ASCII, and the secret is operator-supplied, so an accented character in it
+    would otherwise turn every request into a 500 instead of a clean 401.
+    """
+    import hmac
+
     from qapbot.config import CONFIG
 
+    configured = CONFIG.web_bridge_secret
+    # Guarded before the comparison, not folded into it: an unset secret must never
+    # authenticate anyone, and `compare_digest("", "")` is True. Not attacker-controlled, so
+    # short-circuiting here leaks nothing.
+    if not configured:
+        return False
+
     provided = request.headers.get("X-Bridge-Secret", "")
-    return bool(CONFIG.web_bridge_secret) and provided == CONFIG.web_bridge_secret
+    return hmac.compare_digest(provided.encode("utf-8"), configured.encode("utf-8"))
 
 
 async def _resolve_admin(guild_id: int, discord_user_id: int) -> bool:
