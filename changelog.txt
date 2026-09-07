@@ -1,6 +1,41 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-07 (1)
+- ROOT CAUSE FOUND for tracker #0106 (memory) and the new extreme [LOOP-LAG] stalls: the box is
+  page-fault thrashing, not leaking. PROD has 10 GB RAM; the bot ran 6.5-8.4 GB of RSS and the
+  NAS sat at 94%. At 16:53 it crossed over and wall time exploded while CPU time did NOT --
+  cores_busy fell 0.63 -> 0.19, _get_active_wars() (documented zero-I/O, pure in-memory) went
+  3.3s -> 626s for the same ~22k wars, categorizing 465k clans took 144.7s wall for 5.8s cpu
+  (cores_busy=0.04), and one gen-1 gc.collect() took 502s freeing the same ~20k objects it
+  frees every cycle. RSS was FLAT (6.67 -> 6.58 GB) throughout the collapse, so this is the
+  kernel reclaiming the bot's pages, not the bot growing. A Python thread that takes a major
+  page fault holds the GIL while it blocks, which is why the whole process froze for 21s at a
+  time. Unprecedented: max gc_collect by day was 0.02s (09-01), 0.04s (09-03), 3.3s (09-04),
+  11.8s (09-05), 2.6s (09-06), then 502s today.
+- Two feedback loops turned it into a runaway rather than a plateau: (a) longer cycle -> more
+  garbage accrued -> gen-1 GC scans more -> longer cycle (freed 20k -> 414k -> 568k), and (b)
+  longer cycle -> more clans cross their 22h recheck deadline -> Phase-1 batch grows (2,028 ->
+  6,592 clans) -> longer cycle. Cycle duration went 170s -> 381s -> 484s -> 849s -> 1242s.
+- Fixed the memory side: SQLite's mmap_size (8 GB) and cache_size (64 MB) were set on all 9
+  connections (1 async + 8 pooled), per schema, against a 25 GB main + 36 GB history DB. Both
+  were tuned for the ORIGINAL spinning NAS disks (the code comment says so: "kernel page cache
+  for HDD seek reduction"); PROD's DB now lives on an eSATA Samsung SSD, where the ~10 ms seek
+  those values bought off costs ~50-100 us instead. mmap'd DB pages are file-backed but charged
+  to the process's RSS, so the kernel swaps out the ANONYMOUS Python heap to keep serving them
+  -- exactly backwards for a bot whose working set is the heap. Now config-driven with SSD-era
+  defaults: CONFIG.db_mmap_size_mb 8192 -> 0 (SQLite's own default; the OS still caches the DB
+  through ordinary read(), those pages are just reclaimable instead of pinned to us) and
+  CONFIG.db_cache_size_mb 64 -> 16. All four pragma sites now go through one db_memory_pragmas()
+  helper instead of four copies of the same literals -- which is how the 8 GB reservation ended
+  up on all 9 connections unnoticed -- and the history schema is now pinned explicitly, since
+  cache_size does NOT inherit across ATTACH. Env-overridable (DB_MMAP_SIZE_MB, DB_CACHE_SIZE_MB,
+  DB_POOL_SIZE) so PROD can retune without a deploy. 12 new tests; suite 2067 pass.
+- Confirmed the correlation qaplop asked about: RSS vs. per-batch DB write time r = +0.752,
+  with work per batch essentially constant all day (841-957 attack rows per 50-war batch). Time
+  per batch: 1.08s below 5 GB RSS -> 3.18s above 7.5 GB, inflecting at ~6-6.5 GB. That is a
+  genuine ~3x throughput loss per unit of work, not more work.
+
 2026-09-06 (7)
 - Bug #0106: found a strong candidate for the still-unexplained RSS gap. qapbot/db_manager.py
   sets PRAGMA mmap_size=8 GB on the async connection AND all 8 pooled sync connections (9 total),

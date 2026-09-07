@@ -539,3 +539,87 @@ threshold2 of 20 vs 1000 produced the same gen-2 count). Both halves were dead.
 
 **Rule:** never carry a `gc.set_threshold()` call across a Python upgrade without re-measuring.
 The defaults *and* the collector have both changed since 3.11.
+
+---
+
+## Memory pressure looks exactly like a CPU problem — until you read `cores_busy` (2026-09-07)
+
+The single highest-signal diagnostic on this box. When PROD slows down, the first question is
+**"did wall time rise while CPU time stayed flat?"** — because that one comparison separates the
+two failure modes that otherwise look identical in the logs.
+
+`[CYCLE-END] [CPU] wall=Xs cpu=Ys cores_busy=Z` already logs both. Read it:
+
+| Pattern | Meaning |
+|---|---|
+| wall up, cpu up, `cores_busy` steady | genuinely more work — profile the phase |
+| wall up, cpu **flat**, `cores_busy` **collapses** | the process is **blocked**, not computing |
+
+On 2026-09-07 the second pattern appeared for the first time and was unmistakable:
+
+| time | RSS | wall | cpu | cores_busy | `get_active_wars` | active_wars |
+|---|---|---|---|---|---|---|
+| 16:44 | 6671 MB | 170.9s | 108.0s | 0.63 | 3.3s | 22,364 |
+| 16:53 | 6589 MB | 381.6s | 118.5s | **0.31** | **151.0s** | 22,289 |
+| 17:20 | 6640 MB | 848.7s | 186.5s | **0.22** | **416.9s** | 22,759 |
+| 17:44 | 6576 MB | 1241.8s | 242.0s | **0.19** | **626.1s** | 23,244 |
+
+`_get_active_wars()` is documented zero-I/O — it walks `CACHE.in_war_clan_tags` /
+`temp_war_metadata` / `temp_war_stats` and touches no file. It got **190x slower on the same
+amount of work** while the CPU sat idle. Categorizing 465k clans took **144.7s wall for 5.8s of
+CPU** (`cores_busy=0.04`). A gen-1 `gc.collect()` took **502s** freeing the same ~20,000 objects
+it frees every cycle. Nothing in Python got slower; the memory those walks touch stopped being
+resident.
+
+**RSS was flat (6.67 → 6.58 GB) across the whole collapse.** That is the tell that it is not the
+bot growing — it is the kernel reclaiming the bot's pages. The box has **10 GB total**; the bot
+was using 6.5–8.4 GB of it and the NAS reported 94%.
+
+### Why this freezes Discord too, not just the cycle
+
+**A Python thread that takes a major page fault holds the GIL while it blocks on disk.** So
+thrashing does not merely slow the faulting thread — it stops the entire interpreter, including
+the asyncio event loop and the Discord heartbeat. That is the mechanism behind
+`[LOOP-LAG] Event loop stalled 21.22s`. Do not go looking for a blocking call in the event loop
+when the stalls correlate with memory pressure; there isn't one.
+
+### It compounds — two feedback loops turn a slowdown into a runaway
+
+1. Longer cycle → more garbage accrued before the per-cycle gen-1 collect → the collect scans
+   more → longer cycle. (`freed=` went 20k → 414k → 568k.)
+2. Longer cycle → more clans cross their 22 h recheck deadline → Phase-1 batch grows
+   (2,028 → 6,592 clans) → longer cycle.
+
+Cycle duration went 170s → 381s → 484s → 849s → 1242s and did not recover on its own. **Once
+`cores_busy` drops below ~0.4 with flat CPU, the run will not recover without intervention.**
+
+### The cause here: DB cache tuned for the storage PROD no longer has
+
+`mmap_size=8 GB` and `cache_size=64 MB` were set on **all 9 connections** (1 async + 8 pooled),
+**per schema**, against a **25 GB main + 36 GB history** DB. Those values were chosen when the
+DB lived on spinning NAS disks, where a ~10 ms seek justified spending almost any amount of RAM
+to avoid it. The DB now lives on an **eSATA SSD** (~50–100 µs random read) — the penalty they
+insure against fell ~100x while their cost did not move.
+
+The decisive detail is *not* the size, it is the **kind** of memory:
+
+> mmap'd DB pages are **file-backed but charged to this process's RSS**. Under pressure the
+> kernel will swap out **anonymous** memory — the Python heap — to keep serving them. For a bot
+> whose entire working set *is* the heap, that is exactly backwards.
+
+At `mmap_size=0` (SQLite's own default) the OS still caches the DB through ordinary `read()`;
+those pages simply become reclaimable instead of pinned to us. Now config-driven:
+`CONFIG.db_mmap_size_mb` / `db_cache_size_mb` / `db_pool_size`, env-overridable as
+`DB_MMAP_SIZE_MB` / `DB_CACHE_SIZE_MB` / `DB_POOL_SIZE`.
+
+**Rule:** storage-latency-derived tuning is only valid for the storage it was measured on.
+Re-derive every RAM-for-I/O trade after a disk change, and prefer knobs whose memory the kernel
+can reclaim over knobs that pin memory to the process.
+
+### Corollary: per-connection settings multiply
+
+`cache_size` is **per pager**, and it does **not** inherit across `ATTACH` — the history schema
+needs its own statement. `mmap_size` *does* propagate to subsequently attached databases. Both
+multiply by connection count. One helper (`db_manager.db_memory_pragmas()`) now owns all four
+call sites; four hand-maintained copies of the same literal is how 8 GB × 9 connections × 2
+schemas went unnoticed for weeks.

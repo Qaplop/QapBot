@@ -204,7 +204,31 @@ class BotConfig:
     # commands (it sets QBcore.db_migration_active, not db_maintenance_mode), so this no longer
     # gates availability — it now only bounds how long the write lock is contended.
     history_migration_time_budget_minutes: float = 30.0
-    
+
+    # --- SQLite memory budget (tracker #0106, 2026-09-07) -----------------------------------
+    # Both of these were sized for the ORIGINAL storage: spinning NAS disks, where a seek cost
+    # ~10 ms and buying it off with RAM was worth almost any price. PROD's DB now lives on an
+    # eSATA Samsung SSD (~50-100 us random read), so the penalty they insure against dropped by
+    # roughly two orders of magnitude — while their cost stayed the same, on a box with 10 GB of
+    # RAM total and a 25 GB main + 36 GB history DB.
+    #
+    # What that cost turned into, measured on 2026-09-07: RSS ran 6.5-8.4 GB against 10 GB of
+    # RAM, the NAS sat at 94%, and at 16:53 the box crossed into page-fault thrashing. Wall time
+    # exploded while CPU time did NOT — cores_busy fell 0.63 -> 0.19, `_get_active_wars()` (a
+    # documented zero-I/O in-memory walk) went 3.3s -> 626s, and categorizing 465k clans took
+    # 144.7s wall for 5.8s of CPU (cores_busy=0.04). A Python thread that takes a major page
+    # fault holds the GIL while it blocks, so the whole process freezes: [LOOP-LAG] logged 21s
+    # stalls and one gen-1 gc.collect() took 502s freeing the same ~20k objects it always frees.
+    #
+    # mmap_size is the one that matters most, and not because of its size alone: mmap'd DB pages
+    # are FILE-backed and charged to this process's RSS, so the kernel's reclaim will happily
+    # swap out the ANONYMOUS Python heap to keep serving them — exactly backwards for a bot whose
+    # working set is the heap. At 0 (SQLite's own default) the OS page cache still caches the DB
+    # via ordinary read(); those pages are simply reclaimable and not charged to us.
+    db_mmap_size_mb: int = 0        # was 8192 per connection, per schema, across 9 connections
+    db_cache_size_mb: int = 16      # was 64, private and duplicated per connection
+    db_pool_size: int = 8           # connections in _SyncConnectionPool; each pays cache_size
+
     # DEV-only: Skip CoC API connection entirely (for testing without valid API token)
     no_coc_api: bool = False
 
@@ -402,6 +426,22 @@ def load_config() -> BotConfig:
     except ValueError:
         history_migration_time_budget_minutes = 30.0
 
+    # SQLite memory budget — see the dataclass fields for the 2026-09-07 measurements behind
+    # these defaults. Env-overridable so PROD can be retuned without a code change if the
+    # storage or the box's RAM changes again.
+    try:
+        db_mmap_size_mb = max(0, int(os.getenv("DB_MMAP_SIZE_MB", "0")))
+    except ValueError:
+        db_mmap_size_mb = 0
+    try:
+        db_cache_size_mb = max(1, int(os.getenv("DB_CACHE_SIZE_MB", "16")))
+    except ValueError:
+        db_cache_size_mb = 16
+    try:
+        db_pool_size = max(1, int(os.getenv("DB_POOL_SIZE", "8")))
+    except ValueError:
+        db_pool_size = 8
+
     # DEV-only: Skip CoC API connection (for testing without valid API token)
     no_coc_api = os.getenv("NO_COC_API", "false").lower() in ("true", "1", "yes")
 
@@ -461,6 +501,9 @@ def load_config() -> BotConfig:
         history_retention_days=history_retention_days,
         history_migration_nightly_row_budget=history_migration_nightly_row_budget,
         history_migration_time_budget_minutes=history_migration_time_budget_minutes,
+        db_mmap_size_mb=db_mmap_size_mb,
+        db_cache_size_mb=db_cache_size_mb,
+        db_pool_size=db_pool_size,
         is_dev_mode=is_dev_mode,
         discord_guild_id=discord_guild_id,
         dev_playerregistration_channel_id=dev_playerregistration_channel_id,

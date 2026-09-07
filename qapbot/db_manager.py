@@ -342,6 +342,35 @@ def attach_history_db(conn: Any, db_path: str, history_db_path: Optional[str] = 
     return resolved
 
 
+def db_memory_pragmas(schema: str = "") -> list[str]:
+    """The two pragmas that decide how much RAM SQLite takes, as executable statements.
+
+    Kept in one place because they are set from four separate paths (``_apply_sync_pragmas``,
+    ``initialize()``, ``_reconnect()``, and the pooled ``_create_conn``) that had drifted into
+    repeating the same two hard-coded literals — which is how PROD ended up running 9
+    connections that each reserved 8 GB of mmap against a 25 GB main + 36 GB history DB on a
+    10 GB box. See ``CONFIG.db_mmap_size_mb`` for the 2026-09-07 thrashing measurements and why
+    the SSD migration inverted the original HDD-era tuning.
+
+    Args:
+        schema: ``""`` for the unqualified form (applies to ``main``, and — for ``mmap_size``
+            specifically — becomes the default for databases ATTACHed later), or a schema name
+            such as ``"history"`` to pin that attached database explicitly. ``cache_size`` is
+            per-pager and does NOT inherit across ATTACH, so the history schema needs its own.
+    """
+    # Imported inside the function, not at module scope: every other CONFIG use in this module
+    # does the same (see nightly_db_maintenance / the VACUUM path), because db_manager is
+    # imported early enough that a module-level import risks a circular import through config.
+    from qapbot.config import CONFIG
+
+    prefix = f"{schema}." if schema else ""
+    return [
+        # Negative = kibibytes rather than pages, so this is page_size-independent.
+        f"PRAGMA {prefix}cache_size=-{CONFIG.db_cache_size_mb * 1024}",
+        f"PRAGMA {prefix}mmap_size={CONFIG.db_mmap_size_mb * 1024 * 1024}",
+    ]
+
+
 class _SyncConnectionPool:
     """Bounded pool of ``sqlite3`` connections for threaded DB access.
 
@@ -379,6 +408,8 @@ class _SyncConnectionPool:
             # (unqualified journal_mode=WAL set before ATTACH doesn't carry over).
             conn.execute("PRAGMA history.journal_mode=WAL")
             conn.execute("PRAGMA history.synchronous=NORMAL")
+            for _pragma in db_memory_pragmas("history"):
+                conn.execute(_pragma)
             # build_expensive_indexes=False: pool-fill runs synchronously on the
             # event-loop thread (see initialize()) — see that flag's docstring above
             # for why this stays False here defensively even though _create_schema()/
@@ -575,8 +606,8 @@ class WarHistoryDB:
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA foreign_keys=ON")      # Data integrity — match async connection
         conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute("PRAGMA cache_size=-65536")    # 64 MB page cache (server-machine I/O reduction)
-        conn.execute("PRAGMA mmap_size=8589934592")  # 8 GB — shared kernel page cache (see initialize())
+        for _pragma in db_memory_pragmas():
+            conn.execute(_pragma)
 
     @contextmanager
     def _sync_conn(self):
@@ -1201,23 +1232,32 @@ class WarHistoryDB:
             await self._conn.execute("PRAGMA busy_timeout=30000")   # Wait 30s for locks (server-machine + bulk-write bursts)
             await self._conn.execute("PRAGMA foreign_keys=ON")      # Data integrity
             await self._conn.execute("PRAGMA temp_store=MEMORY")    # Faster temp ops
-            await self._conn.execute("PRAGMA cache_size=-65536")    # 64 MB page cache (server-machine I/O reduction)
-            # Memory-mapped I/O: let the Linux kernel manage DB page caching in
-            # the unified OS page cache instead of SQLite's per-connection heap
-            # pool.  On HDD/server-machine this is critical — the kernel deduplicates pages
-            # across all connections (async + sync workers) so the entire 10 GB
-            # server-machine RAM can serve as a shared read cache, vs. 64 MB × N isolated
-            # pools.  The 8 GB value is a virtual address reservation; physical
-            # RAM is only consumed for actually-touched pages.
-            await self._conn.execute("PRAGMA mmap_size=8589934592")  # 8 GB — kernel page cache for HDD seek reduction
-            # Log effective mmap_size (may be capped by compile-time MAX_MMAP_SIZE)
+            # Page cache + memory-mapped I/O. Both were sized for spinning NAS disks, where
+            # trading RAM for avoided seeks was worth almost any price; PROD's DB now lives on
+            # an eSATA SSD and that trade inverted — see CONFIG.db_mmap_size_mb for the
+            # 2026-09-07 measurements (RSS 6.5-8.4 GB against 10 GB of RAM, then page-fault
+            # thrashing: cores_busy 0.63 -> 0.19, a zero-I/O in-memory walk going 3.3s -> 626s,
+            # one gen-1 gc.collect() taking 502s). mmap'd DB pages are file-backed but charged
+            # to this process's RSS, so the kernel swaps out the anonymous Python heap to keep
+            # serving them — backwards for a bot whose working set IS the heap. At mmap_size=0
+            # the OS still caches the DB through ordinary read(); those pages just become
+            # reclaimable instead of pinned to us.
+            for _pragma in db_memory_pragmas():
+                await self._conn.execute(_pragma)
+            # Log what actually took effect (mmap_size may be capped by compile-time MAX_MMAP_SIZE)
+            from qapbot.config import CONFIG as _MEM_CONFIG  # module-local, see db_memory_pragmas
             async with self._conn.execute("PRAGMA mmap_size") as _mmap_cur:
                 _effective_mmap = (await _mmap_cur.fetchone())[0]
-                _mmap_mb = _effective_mmap / 1024**2
-                if _effective_mmap < 8589934592:
-                    logging.info(f"[DB-INIT] mmap_size capped by SQLite build: {_mmap_mb:.0f} MB (requested 8192 MB)")
+                if _effective_mmap < _MEM_CONFIG.db_mmap_size_mb * 1024 * 1024:
+                    logging.info(
+                        f"[DB-INIT] mmap_size capped by SQLite build: {_effective_mmap / 1024**2:.0f} MB "
+                        f"(requested {_MEM_CONFIG.db_mmap_size_mb} MB)"
+                    )
                 else:
-                    logging.info(f"[DB-INIT] mmap_size: {_mmap_mb:.0f} MB")
+                    logging.info(
+                        f"[DB-INIT] mmap_size: {_effective_mmap / 1024**2:.0f} MB, "
+                        f"cache_size: {_MEM_CONFIG.db_cache_size_mb} MB per schema"
+                    )
 
             # ATTACH the history database as schema 'history' (hot/history DB split)
             await self._conn.execute("ATTACH DATABASE ? AS history", (self.history_db_path,))
@@ -1229,13 +1269,18 @@ class WarHistoryDB:
             # storage (root cause of the 2026-07 migration slowdown incident).
             await self._conn.execute("PRAGMA history.journal_mode=WAL")
             await self._conn.execute("PRAGMA history.synchronous=NORMAL")
+            for _pragma in db_memory_pragmas("history"):
+                await self._conn.execute(_pragma)
             logging.info(f"[DB-INIT] Attached history database as schema 'history': {self.history_db_path}")
             
             # Create schema (idempotent) — creates both main.* and history.* tables
             await self._create_schema()
             
             # Create sync connection pool (bounded, pre-configured connections, each with 'history' attached)
-            self._pool = _SyncConnectionPool(db_path, self._apply_sync_pragmas, pool_size=8, history_db_path=self.history_db_path)
+            self._pool = _SyncConnectionPool(
+                db_path, self._apply_sync_pragmas,
+                pool_size=_MEM_CONFIG.db_pool_size, history_db_path=self.history_db_path,
+            )
 
             self._initialized = True
             logging.info("[DB-INIT] Database initialized successfully")
@@ -1314,13 +1359,15 @@ class WarHistoryDB:
             await self._conn.execute("PRAGMA busy_timeout=30000")    # Match initialize() — 30s for server-machine + bulk-write bursts
             await self._conn.execute("PRAGMA foreign_keys=ON")
             await self._conn.execute("PRAGMA temp_store=MEMORY")
-            await self._conn.execute("PRAGMA cache_size=-65536")     # 64 MB page cache
-            await self._conn.execute("PRAGMA mmap_size=8589934592")  # 8 GB — kernel page cache
+            for _pragma in db_memory_pragmas():   # see CONFIG.db_mmap_size_mb
+                await self._conn.execute(_pragma)
             if self.history_db_path:
                 await self._conn.execute("ATTACH DATABASE ? AS history", (self.history_db_path,))
                 # Schema-qualified — see initialize() for why this is required.
                 await self._conn.execute("PRAGMA history.journal_mode=WAL")
                 await self._conn.execute("PRAGMA history.synchronous=NORMAL")
+                for _pragma in db_memory_pragmas("history"):
+                    await self._conn.execute(_pragma)
             logging.info("[DB-RECONNECT] Successfully reconnected to database")
         except aiosqlite.Error as e:
             logging.error(f"[DB-RECONNECT] Failed to reconnect: {e}")
