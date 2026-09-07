@@ -13,9 +13,13 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   lives in BotConfig._SECRET_FIELDS and a test derives from it, so a credential added later
   fails a test rather than quietly inheriting the print-me default. 10 new tests covering
   repr/str/f-string/%-interpolation/traceback rendering. Written up as Cardinal Rule 19.
-  NOTE: the exposed values were only ever rendered locally (dev terminal + PROD log files), but
-  they should still be treated as disclosed and rotated — the PROD log files have carried them
-  for as long as any traceback did.
+  EXPOSURE, as actually verified rather than assumed: scanned every qapbot.log* on DEV (current
+  + all rotated) for the live token and password — NONE contain either, so no traceback has in
+  fact rendered the config into a log file to date. Neither .env nor any log file is tracked by
+  git (only .env.example templates). The one confirmed disclosure is today's dev-terminal pytest
+  output, which reached the agent session transcript. Rotating both is still the prudent call —
+  a terminal/transcript is not a trustworthy boundary — but this was a latent exposure that had
+  not yet fired into persistent logs, not an ongoing leak.
 - Filed tracker #0111 (update cycle has no circuit breaker — the two feedback loops that turned
   today's memory pressure into an unrecoverable runaway), #0112 (_get_active_wars() rebuilds all
   ~23k wars every cycle, now the largest in-cycle cost and growing linearly with CWL size) and
