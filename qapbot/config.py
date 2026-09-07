@@ -38,7 +38,7 @@ Example:
 """
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields as dataclass_fields
 from dotenv import load_dotenv
 
 # Load environment variables from .env file (override=False: OS env vars take priority,
@@ -110,9 +110,17 @@ class BotConfig:
             ...
         )
     """
-    coc_email: str
-    coc_password: str
-    discord_token: str
+    # repr=False on every credential below (2026-09-07). A frozen dataclass gets an
+    # auto-generated __repr__ that prints every field verbatim, so the live Discord token and
+    # CoC password went into any output that rendered this object — and that is not a
+    # hypothetical: a pytest assertion failure printed the real token and password to the
+    # terminal, and the same repr reaches log files through any traceback carrying a BotConfig
+    # (frames in a traceback carry their locals, so `config` being in scope anywhere up the
+    # stack is enough). __repr__ below re-adds them masked, so debugging can still tell "set"
+    # from "empty" without ever rendering the value.
+    coc_email: str = field(repr=False)
+    coc_password: str = field(repr=False)
+    discord_token: str = field(repr=False)
     sleep_interval: int
     server_admin: str
     max_clan_subscriptions: int = 7
@@ -244,7 +252,7 @@ class BotConfig:
     # WEB_BRIDGE_PORT/WEB_BRIDGE_SECRET. Each must match the corresponding Worker environment's
     # BRIDGE_URL/BRIDGE_SECRET (env.dev vs env.prod in activity/server/wrangler.toml).
     web_bridge_port: int = 0
-    web_bridge_secret: str = ""
+    web_bridge_secret: str = field(default="", repr=False)  # see the repr=False note on coc_email
 
     # CWL roster-planning feature (CWL_ROSTER_PLANNING_PLAN.md): while True, any CWL-related DM
     # (signup confirm/opt-out blast, enrollment/assignment notifications) is only actually
@@ -268,6 +276,33 @@ class BotConfig:
     tracker_data_dir: str = "tracker"  # Where per-item attachment copies live (§3.3) — project
     # root (HDD), not under data_dir/PROD_DATA_DIR (SSD): not performance-critical, and the
     # HDD's much larger free space fits growing attachment history better (2026-08-20 follow-up).
+
+    #: Fields whose value must never be rendered. Kept as a class-level constant rather than
+    #: inlined into __repr__ so that adding a credential field is a one-line change in one
+    #: obvious place — the failure mode being guarded against is a NEW secret being added later
+    #: and quietly inheriting the default "print me" behaviour.
+    _SECRET_FIELDS = ("coc_email", "coc_password", "discord_token", "web_bridge_secret")
+
+    def __repr__(self) -> str:
+        """Render every field, with credentials masked to set/empty rather than shown.
+
+        Replaces the dataclass-generated __repr__, which printed the live Discord token and CoC
+        password verbatim into anything that rendered this object — pytest failure output and
+        any traceback whose frames hold a BotConfig, both of which reach log files.
+
+        Masking rather than omitting (the plain `repr=False` behaviour) keeps the diagnostic
+        value: "is the token actually loaded?" is a real question during startup debugging, and
+        `<set>` vs `<empty>` answers it without disclosing anything. No length or prefix is
+        included on purpose — both narrow a brute-force search.
+        """
+        parts = []
+        for f in dataclass_fields(self):
+            value = getattr(self, f.name, None)
+            if f.name in self._SECRET_FIELDS:
+                parts.append(f"{f.name}=<{'set' if value else 'empty'}>")
+            elif f.repr:
+                parts.append(f"{f.name}={value!r}")
+        return f"{type(self).__name__}({', '.join(parts)})"
 
 
 def load_config() -> BotConfig:

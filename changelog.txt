@@ -1,6 +1,27 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-07 (2)
+- SECURITY: BotConfig's auto-generated dataclass __repr__ printed every field verbatim, so
+  PROD's live discord_token and coc_password were rendered by anything that displayed the
+  config object. Not theoretical — a pytest assertion failure printed both in plain text to the
+  terminal today, and the same repr reaches log files through any traceback carrying a
+  BotConfig, since traceback frames serialize their locals (nobody has to log it deliberately).
+  coc_email, coc_password, discord_token and web_bridge_secret are now field(repr=False) AND
+  covered by an explicit __repr__ that renders <set>/<empty> — masked to a constant, with no
+  length or prefix disclosed, since either would narrow a brute-force search. The secret list
+  lives in BotConfig._SECRET_FIELDS and a test derives from it, so a credential added later
+  fails a test rather than quietly inheriting the print-me default. 10 new tests covering
+  repr/str/f-string/%-interpolation/traceback rendering. Written up as Cardinal Rule 19.
+  NOTE: the exposed values were only ever rendered locally (dev terminal + PROD log files), but
+  they should still be treated as disclosed and rotated — the PROD log files have carried them
+  for as long as any traceback did.
+- Filed tracker #0111 (update cycle has no circuit breaker — the two feedback loops that turned
+  today's memory pressure into an unrecoverable runaway), #0112 (_get_active_wars() rebuilds all
+  ~23k wars every cycle, now the largest in-cycle cost and growing linearly with CWL size) and
+  #0113 (passive-clan war appends pollute the DB page cache). All three are deliberately filed
+  WITHOUT a proposed fix — each needs its strategy investigated first, and each ticket says so.
+
 2026-09-07 (1)
 - ROOT CAUSE FOUND for tracker #0106 (memory) and the new extreme [LOOP-LAG] stalls: the box is
   page-fault thrashing, not leaking. PROD has 10 GB RAM; the bot ran 6.5-8.4 GB of RSS and the

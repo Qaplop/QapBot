@@ -286,6 +286,34 @@ off-limits; exclusive-mode connections only when PROD is confirmed stopped, kept
 
 ---
 
+### 19. A credential must never be renderable — mask it at the type, not at each call site
+
+Any object holding a secret needs its `__repr__`/`__str__` to mask that secret. Never rely on
+call sites "not logging the config" — you cannot audit every future call site, and the paths
+that leak are ones nobody wrote deliberately:
+
+- **Tracebacks carry frame locals.** An exception anywhere below a function where a
+  credential-bearing object is a local can serialize it into a crash log. Nobody logged it.
+- **Test output.** `BotConfig`'s auto-generated dataclass `__repr__` printed PROD's live Discord
+  token and CoC password to the terminal on 2026-09-07 — from an unrelated assertion failure.
+- **`%s` / f-strings / `.format()`** all fall through to `__repr__` for a dataclass.
+
+**Rule:** `@dataclass` gives every field to `__repr__` by default, which is the wrong default for
+secrets. Mark each credential `field(repr=False)` **and** give the class an explicit `__repr__`
+that renders `<set>`/`<empty>`. Both, not either — `repr=False` alone silently drops the field
+(losing "is it even loaded?" during startup debugging), and a custom `__repr__` alone leaves the
+generated fallback exposed if the method is ever removed.
+
+**Mask to a constant.** Never include the length, a prefix, or the last N characters — each
+narrows a brute-force search. `<set>` vs `<empty>` is the entire useful signal.
+
+**Keep the secret list on the class** (`_SECRET_FIELDS` in `qapbot/config.py`) rather than
+inlined in `__repr__`, and pin it with a test that derives from it — so a credential added later
+fails a test instead of quietly inheriting the print-me default. See
+`tests/unit/test_config_secret_masking.py`.
+
+---
+
 ## Quick reference (most common)
 
 - User-facing text → `t('key', user_id=..., guild_id=...)`
