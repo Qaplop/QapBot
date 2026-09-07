@@ -1575,7 +1575,22 @@ def _get_rss_breakdown() -> dict[str, float]:
     pool_size, not hunting for a cache to shrink. RssAnon large -> still a genuine heap-memory
     question; that's what [ALLOCATOR] and [CACHE STRUCTURE SIZES] below are for.
 
+    Falls back to summing `/proc/self/smaps`'s per-mapping `Anonymous:`/`Rss:` fields when the
+    fast path is unavailable (2026-09-07: PROD's NAS runs kernel 4.4.302, which predates the
+    RssAnon/RssFile/RssShmem lines added in Linux 4.5 — confirmed via `uname -r` and
+    `grep -i rss /proc/self/status` showing only VmRSS). `Anonymous:` has existed since Linux
+    2.6.28, so this covers this NAS and effectively every real Linux box. `file = total_rss -
+    anonymous` gives the same split; `shmem` has no equivalent per-mapping field in old smaps
+    (a VMA's Shared_Clean/Shared_Dirty conflate shared *file* mappings with shared *anonymous*
+    ones, so there is no way to isolate shmem specifically), so the smaps path omits `shmem_mb`
+    entirely rather than report a fabricated 0 — silently implying "no shared memory" would be
+    actively misleading once SIM_MULTIPROCESS_ENABLED workers are running, since multiprocessing
+    can use POSIX shared memory. Slower than the status path (parses one block per mapping,
+    potentially thousands for a process with heavy mmap use) — acceptable here since this only
+    runs on an explicit /admin request, never on the per-cycle path.
+
     Returns {} on any non-Linux platform or failure — best-effort, must never break the report.
+    A `source` key ("status" or "smaps") records which path actually supplied the numbers.
     """
     try:
         with open('/proc/self/status', 'r') as _f:
@@ -1586,9 +1601,30 @@ def _get_rss_breakdown() -> dict[str, float]:
             for _prefix, _key in _wanted.items():
                 if _line.startswith(_prefix):
                     _out[_key] = int(_line.split()[1]) / 1024
-        return _out if len(_out) == 3 else {}
+        if len(_out) == 3:
+            _out["source"] = "status"
+            return _out
     except Exception:
-        return {}
+        pass
+
+    try:
+        _total_rss_kb = 0
+        _total_anon_kb = 0
+        with open('/proc/self/smaps', 'r') as _f:
+            for _line in _f:
+                if _line.startswith("Rss:"):
+                    _total_rss_kb += int(_line.split()[1])
+                elif _line.startswith("Anonymous:"):
+                    _total_anon_kb += int(_line.split()[1])
+        if _total_rss_kb:
+            return {
+                "anon_mb": _total_anon_kb / 1024,
+                "file_mb": (_total_rss_kb - _total_anon_kb) / 1024,
+                "source": "smaps",
+            }
+    except Exception:
+        pass
+    return {}
 
 
 def _get_process_memory_mb() -> tuple[float, float]:
@@ -1685,11 +1721,19 @@ def save_memtrace_snapshot(cache: Any) -> str:
     nframes = tracemalloc.get_traceback_limit()
     lines.append(f"tracemalloc nframe={nframes}  |  RSS={rss_mb:.1f} MB  VMS={vms_mb:.1f} MB  |  uptime={uptime_str}")
 
-    lines.append("\n[RSS BREAKDOWN — /proc/self/status]")
+    _rss_source = rss_breakdown.get("source")
+    _rss_source_label = {
+        "status": "/proc/self/status", "smaps": "/proc/self/smaps (older-kernel fallback)",
+    }.get(_rss_source, "unavailable")
+    lines.append(f"\n[RSS BREAKDOWN — {_rss_source_label}]")
     if rss_breakdown:
+        _shmem_part = (
+            f"  shmem={rss_breakdown['shmem_mb']:.1f} MB" if "shmem_mb" in rss_breakdown
+            else "  shmem=n/a (kernel too old for a per-mapping shmem field, see smaps fallback note)"
+        )
         lines.append(
-            f"  anon={rss_breakdown['anon_mb']:.1f} MB  file={rss_breakdown['file_mb']:.1f} MB  "
-            f"shmem={rss_breakdown['shmem_mb']:.1f} MB"
+            f"  anon={rss_breakdown['anon_mb']:.1f} MB  file={rss_breakdown['file_mb']:.1f} MB"
+            f"{_shmem_part}"
         )
         lines.append(
             "  READ THIS FIRST. 'anon' is heap memory (Python objects, malloc) -- everything "
@@ -2113,10 +2157,13 @@ async def handle_memory_profile(cache: Any) -> str:
             f"RSS: {rss_mb:.1f} MB  |  nframe={tracemalloc.get_traceback_limit()}",
         ]
         if rss_breakdown:
+            _shmem_part = (
+                f"  shmem={rss_breakdown['shmem_mb']:.0f} MB" if "shmem_mb" in rss_breakdown else ""
+            )
             discord_lines.append(
                 f"RSS split: anon={rss_breakdown['anon_mb']:.0f} MB (heap)  "
-                f"file={rss_breakdown['file_mb']:.0f} MB (mmap'd files, e.g. SQLite)  "
-                f"shmem={rss_breakdown['shmem_mb']:.0f} MB"
+                f"file={rss_breakdown['file_mb']:.0f} MB (mmap'd files, e.g. SQLite)"
+                f"{_shmem_part}"
             )
         if malloc_info:
             discord_lines.append(

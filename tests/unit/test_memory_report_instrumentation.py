@@ -12,6 +12,8 @@ from __future__ import annotations
 from typing import Any, Dict
 from unittest.mock import MagicMock
 
+import pytest
+
 from qapbot.QBdiscocmdshelper_admin_command import (
     _build_cache_summary,
     _build_gc_type_counts,
@@ -340,39 +342,60 @@ class TestMallocInfo:
 
 
 class TestRssBreakdown:
-    """tracker #0106, 2026-09-06: splits VmRSS into anonymous (Python/C heap) vs. file-backed
-    (e.g. SQLite's mmap I/O — db_manager.py sets mmap_size=8 GB per connection, per schema, on
-    9 separate connections against a 25 GB main DB + 36 GB history DB) vs. shared memory. This is
-    the single most decisive read in the whole report: every other diagnostic here — [CACHE
-    STRUCTURE SIZES], the GC census, tracemalloc, [ALLOCATOR] — can only see the anonymous half.
+    """tracker #0106, 2026-09-06/07: splits VmRSS into anonymous (Python/C heap) vs. file-backed
+    (e.g. SQLite's mmap I/O — db_manager.py sets mmap_size on the async connection AND every
+    pooled sync connection, per schema, against a 25 GB main DB + 36 GB history DB) vs. shared
+    memory. This is the single most decisive read in the whole report: every other diagnostic
+    here — [CACHE STRUCTURE SIZES], the GC census, tracemalloc, [ALLOCATOR] — can only see the
+    anonymous half.
+
+    Two independent sources, tried in order:
+    - `/proc/self/status`'s RssAnon/RssFile/RssShmem (Linux 4.5+, fast, gives all three figures).
+    - `/proc/self/smaps`'s per-mapping Rss:/Anonymous: fields, summed (Linux 2.6.28+, slower,
+      no shmem figure — confirmed needed 2026-09-07 when PROD's NAS turned out to run kernel
+      4.4.302, predating the status fields; `grep -i rss /proc/self/status` there showed only
+      VmRSS, nothing else).
     """
 
     @staticmethod
-    def _patch_proc_status(monkeypatch, content: str | None) -> None:
+    def _patch_proc_files(monkeypatch, *, status: str | None = None, smaps: str | None = None) -> None:
+        """Patch open() for /proc/self/status and /proc/self/smaps independently. Each is
+        `None` (absent, raises FileNotFoundError — the default) or a string body.
+
+        Deliberately routes BOTH paths through this fake regardless of the host OS: on a Linux
+        CI runner, an un-patched /proc/self/smaps would return that runner's OWN real process
+        data instead of {}, silently making a test that expects a controlled fallback result
+        both non-deterministic and dependent on what happens to be running the test.
+        """
         import builtins
         real_open = builtins.open
 
         def _fake_open(path, *a, **kw):
-            if path == '/proc/self/status':
-                if content is None:
-                    raise FileNotFoundError("no /proc on this platform")
-                import io
-                return io.StringIO(content)
+            for _target, _content in (('/proc/self/status', status), ('/proc/self/smaps', smaps)):
+                if path == _target:
+                    if _content is None:
+                        raise FileNotFoundError(f"{_target} not available in this test")
+                    import io
+                    return io.StringIO(_content)
             return real_open(path, *a, **kw)
 
         monkeypatch.setattr(builtins, "open", _fake_open)
 
     def test_never_raises_and_returns_a_well_shaped_result(self):
+        """Runs against whatever this machine actually has — no patching."""
         result = _get_rss_breakdown()
         assert isinstance(result, dict)
-        if result:  # Linux with /proc/self/status; {} is the valid non-Linux answer
-            for key in ("anon_mb", "file_mb", "shmem_mb"):
+        if result:  # {} is the valid answer on a platform with neither proc file
+            assert result["source"] in ("status", "smaps")
+            for key in ("anon_mb", "file_mb"):
                 assert key in result
                 assert isinstance(result[key], float)
                 assert result[key] >= 0.0
+            if "shmem_mb" in result:  # only the status path reports it
+                assert isinstance(result["shmem_mb"], float)
 
     def test_parses_a_realistic_proc_status_file(self, monkeypatch):
-        self._patch_proc_status(monkeypatch, (
+        self._patch_proc_files(monkeypatch, status=(
             "Name:\tpython3.14\n"
             "VmRSS:\t 8793600 kB\n"
             "RssAnon:\t 1843200 kB\n"
@@ -380,16 +403,67 @@ class TestRssBreakdown:
             "RssShmem:\t   38400 kB\n"
             "VmSize:\t49485824 kB\n"
         ))
-        assert _get_rss_breakdown() == {"anon_mb": 1800.0, "file_mb": 6750.0, "shmem_mb": 37.5}
+        assert _get_rss_breakdown() == {
+            "anon_mb": 1800.0, "file_mb": 6750.0, "shmem_mb": 37.5, "source": "status",
+        }
 
-    def test_missing_fields_yield_empty_dict_rather_than_a_misleading_partial_result(self, monkeypatch):
-        """An older kernel without RssShmem (pre-4.5) must not report a partial split as if
-        complete — the report's 'read this first' framing depends on all three being present."""
-        self._patch_proc_status(monkeypatch, "Name:\tpython3.14\nVmRSS:\t 100 kB\nRssAnon:\t 50 kB\n")
+    def test_status_path_is_preferred_when_both_are_available(self, monkeypatch):
+        self._patch_proc_files(
+            monkeypatch,
+            status="RssAnon:\t 1000 kB\nRssFile:\t 2000 kB\nRssShmem:\t 0 kB\n",
+            smaps="Rss:      99999 kB\nAnonymous:      99999 kB\n",
+        )
+        result = _get_rss_breakdown()
+        assert result["source"] == "status"
+        assert result["anon_mb"] == pytest.approx(1000 / 1024)
+
+    def test_falls_back_to_smaps_when_status_lacks_the_modern_fields(self, monkeypatch):
+        """The exact scenario found on PROD's NAS (kernel 4.4.302): /proc/self/status exists
+        and is readable, but has no RssAnon/RssFile/RssShmem lines at all — only VmRSS."""
+        self._patch_proc_files(
+            monkeypatch,
+            status="Name:\tpython3.14\nVmRSS:\t 4096000 kB\nVmSize:\t 16000000 kB\n",
+            smaps=(
+                "00400000-0040b000 r-xp 00000000 08:01 1 /usr/bin/python3.14\n"
+                "Rss:                  40 kB\n"
+                "Anonymous:              0 kB\n"
+                "7f0000000000-7f0000100000 rw-p 00000000 00:00 0 [heap]\n"
+                "Rss:                 512 kB\n"
+                "Anonymous:            512 kB\n"
+            ),
+        )
+        result = _get_rss_breakdown()
+        assert result["source"] == "smaps"
+        assert result["anon_mb"] == pytest.approx(512 / 1024)
+        assert result["file_mb"] == pytest.approx((40 + 512 - 512) / 1024)
+        assert "shmem_mb" not in result, (
+            "smaps has no per-mapping shmem field — reporting 0 here would silently imply "
+            "'no shared memory', which is wrong once multiprocessing workers are running"
+        )
+
+    def test_smaps_fallback_sums_across_many_mappings(self, monkeypatch):
+        """A real process has thousands of mappings (shared libs, thread stacks, every SQLite
+        mmap region) — the parser must accumulate across all of them, not just the first."""
+        blocks = "".join(
+            f"region{i}\nRss:  {10} kB\nAnonymous:  {4 if i % 2 == 0 else 0} kB\n"
+            for i in range(500)
+        )
+        self._patch_proc_files(monkeypatch, status=None, smaps=blocks)
+
+        result = _get_rss_breakdown()
+
+        assert result["source"] == "smaps"
+        assert result["anon_mb"] == pytest.approx(250 * 4 / 1024)          # 250 even i's, 4 kB each
+        assert result["file_mb"] == pytest.approx((500 * 10 - 250 * 4) / 1024)
+
+    def test_survives_both_proc_files_unavailable(self, monkeypatch):
+        self._patch_proc_files(monkeypatch, status=None, smaps=None)
         assert _get_rss_breakdown() == {}
 
-    def test_survives_unreadable_file(self, monkeypatch):
-        self._patch_proc_status(monkeypatch, None)
+    def test_survives_a_smaps_file_with_no_usable_lines(self, monkeypatch):
+        """Rss: total of 0 must not be treated as 'measured zero usage' — it means the parse
+        found nothing, so report unavailable rather than a bogus 0 MB."""
+        self._patch_proc_files(monkeypatch, status=None, smaps="garbage\nNothingUseful: 1\n")
         assert _get_rss_breakdown() == {}
 
 

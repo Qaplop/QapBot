@@ -1,6 +1,31 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-07 (5)
+- Tracker #0106: validated the fix via a real NAS reboot. Both settings confirmed persisted
+  (sysctl vm.swappiness=10; MALLOC_ARENA_MAX=2 in the QapBot Autostart process's own environ)
+  and [DB-INIT] mmap_size: 1024 MB, cache_size: 32 MB per schema confirms SQLite accepted the
+  new per-schema budget uncapped. First 6 cycles post-reboot: cores_busy held 0.66-0.87
+  throughout (yesterday's thrashing collapsed this to 0.19-0.31), the inherited 5921-clan
+  throttle backlog cleared in 3 cycles, gc_collect stayed 1-7s (vs up to 502s). Direct
+  before/after on the arena fix from /admin Memory Profile: arena 2280.3 MB -> 834.4 MB (-63%),
+  free_not_returned 1907.9 MB -> 406.7 MB (-79%) -- MALLOC_ARENA_MAX=2 confirmed working exactly
+  as predicted. Remaining LOOP-LAG stalls all traced to either the Memory Profile action's own
+  gc.collect() calls or pre-existing documented CPU-bound Phase-1 behavior, not a thrashing
+  recurrence.
+- Fixed a real gap the reboot check surfaced: [RSS BREAKDOWN] came back "unavailable" on PROD.
+  Root cause confirmed via `uname -r` (4.4.302) and `grep -i rss /proc/self/status` (only VmRSS
+  present) -- PROD's NAS kernel predates Linux 4.5, which is when RssAnon/RssFile/RssShmem were
+  added. Added a fallback to /proc/self/smaps's per-mapping Rss:/Anonymous: fields (present
+  since Linux 2.6.28), summed across every mapping -- covers this NAS and effectively every real
+  Linux box. No per-mapping shmem field exists in old smaps, so the fallback omits shmem_mb
+  entirely rather than report a fabricated 0 (which would misleadingly imply "no shared memory"
+  once SIM_MULTIPROCESS_ENABLED workers are running). Both report consumers (the file report and
+  the live Discord summary) updated to render the shmem figure only when actually available, and
+  the report section header now names which source supplied the numbers. 7 new tests including
+  the exact PROD scenario (status present but fields-incomplete -> smaps fallback). 2099 tests
+  pass.
+
 2026-09-07 (4)
 - Revised the #0106 DB cache strategy after qaplop challenged it, and after learning the
   governing constraint: the NAS's SWAP FILE IS ON THE HDD root volume, not on the SSD holding
