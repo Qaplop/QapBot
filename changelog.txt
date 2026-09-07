@@ -1,6 +1,37 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-07 (6)  Build 35.
+- PROCESS FAILURE, recorded deliberately: BOT_BUILD was not bumped across ANY of this session's
+  earlier .py changes (Cardinal Rule 17 -- roughly 8 separate batches: the mallinfo2/by-size GC
+  diagnostics, the RSS breakdown, the SQLite pragma retune, the BotConfig secret masking, the
+  web_bridge constant-time comparison, the DB cache strategy revision, the smaps fallback). It
+  went unnoticed until qaplop asked directly. The consequence is visible in PROD's own startup
+  lines: `build 34 src 4647499f` (2026-09-06) vs `build 34 src 2cb591c2` (2026-09-07 20:14) --
+  the same build number covering two materially different code states, which is exactly the
+  ambiguity the rule exists to prevent. The source_fingerprint() safety net worked as designed
+  and is what makes tonight's logs still interpretable. WHEN READING ANY LOG FROM THE 2026-09-07
+  WINDOW: trust `src`, not the build number; build 34 there means at least two different code
+  states. Bumped once now (34 -> 35) for the batch being handed over rather than inventing 8
+  retroactive numbers for builds that never existed as distinct deployables -- past numbers are
+  never renumbered per the same rule.
+- Fixed the 16.6s Discord freeze every /admin Memory Profile self-inflicted on starting a fresh
+  trace (handle_memory_profile). The proposed fix was wrapping its gc.collect() in
+  asyncio.to_thread() to match save_memtrace_snapshot()'s existing pattern -- looked right, but
+  doesn't work: gc.collect() holds the GIL for its whole sweep regardless of which OS thread
+  calls it, and tonight's own log already proved this (save_memtrace_snapshot()'s gc.collect()
+  IS thread-offloaded and still produced an 8.852s stall minutes later). The real bug: it was a
+  bare gc.collect(), a full gen-2 sweep, which is exactly what this process's [GC-POLICY]
+  disables automatic collection to avoid outside the nightly window. Rescoped to gc.collect(1)
+  (gen-0+1, matching the routine per-cycle [CYCLE-CLEANUP] scope) -- appropriate since this call
+  only primes a differential baseline, not the actual report. Kept the thread-offload anyway for
+  coroutine hygiene, corrected the comment that had implied it was the fix. Caught a second,
+  self-inflicted bug while writing the regression test: the rewrite had dropped the
+  tracemalloc.start(1) call entirely, which the "does the trace actually start" test failed on
+  immediately -- fixed in the same pass. 3 new tests pin the actual mechanism (the gc.collect()
+  generation argument, the calling thread, and that starting a trace still works), not just the
+  end-to-end outcome. 2102 tests pass.
+
 2026-09-07 (5)
 - Tracker #0106: validated the fix via a real NAS reboot. Both settings confirmed persisted
   (sysctl vm.swappiness=10; MALLOC_ARENA_MAX=2 in the QapBot Autostart process's own environ)

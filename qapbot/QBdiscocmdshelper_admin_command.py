@@ -2130,18 +2130,24 @@ async def handle_memory_profile(cache: Any) -> str:
     import gc
     import os
     import glob as _glob
+    import asyncio as _asyncio
 
     # --- Already tracing (DEV mode or 2nd-cycle PROD) → immediate snapshot ---
-    # NOTE: do NOT call gc.collect() here — it runs on the event loop and with
-    # tracemalloc active every freed object's trace is deallocated synchronously,
-    # making it extremely slow (seconds→minutes at 4+ GB RSS).  save_memtrace_snapshot
-    # calls gc.collect() inside asyncio.to_thread() where it's safe.
+    # NOTE: do NOT call gc.collect() here directly on the coroutine — with tracemalloc
+    # active, every freed object's trace is deallocated synchronously, making it extremely
+    # slow (seconds→minutes at 4+ GB RSS). save_memtrace_snapshot() calls its own
+    # gc.collect() inside asyncio.to_thread(), and the fresh-trace branch below does the
+    # same — mainly for coroutine hygiene (a blocking call has no business running
+    # synchronously in async code), NOT because threading avoids the freeze itself: the GIL
+    # is held for a gc.collect() sweep regardless of which OS thread calls it, so a slow
+    # collect blocks discord.py's heartbeat either way. See the fresh-trace branch's own
+    # comment (2026-09-07, tracker #0106) for the fix that actually reduces the freeze —
+    # scoping the collect to gen(1) instead of a bare/full one.
     if tracemalloc.is_tracing():
         # Offload CPU-heavy work (gc.collect, tracemalloc.take_snapshot,
-        # gc.get_objects loop) to a thread so the event loop stays free
-        # for discord.py heartbeats.  save_memtrace_snapshot() already
+        # gc.get_objects loop) to a thread — mainly hygiene, not a GIL-blocking fix (see
+        # above).  save_memtrace_snapshot() already
         # takes its own snapshot internally.
-        import asyncio as _asyncio
         report_path = await _asyncio.to_thread(save_memtrace_snapshot, cache)
         snapshot = tracemalloc.take_snapshot()
         top_stats = snapshot.statistics("lineno")
@@ -2201,7 +2207,27 @@ async def handle_memory_profile(cache: Any) -> str:
     # Take a baseline snapshot immediately so save_memtrace_snapshot() can
     # emit a differential section showing only what grew since tracing started.
     tracemalloc.start(1)
-    gc.collect()
+    #
+    # Scoped to gen(1), not a bare gc.collect() (2026-09-07, tracker #0106). This process
+    # disables automatic collection specifically to avoid unscoped full sweeps outside the
+    # nightly maintenance window ([GC-POLICY]: young-gen only per cycle, full gen-2 sweep
+    # nightly) -- a bare gc.collect() here broke that policy and cost exactly what a stray
+    # full sweep costs: measured on PROD at 16.552s, `[GC-SCHEDULED] Deliberate gen-2
+    # collection ... collected=1,854,123`, freezing Discord for the whole duration.
+    #
+    # asyncio.to_thread() alone would NOT have fixed that: gc.collect() holds the GIL for
+    # its entire sweep regardless of which OS thread calls it (releasing it mid-collection
+    # would let another thread mutate refcounts while the collector is tracing reachability,
+    # corrupting the pass) -- confirmed the same night by save_memtrace_snapshot()'s OWN
+    # gc.collect(), which IS already thread-offloaded and still produced an 8.852s
+    # `[GC-SCHEDULED] Deliberate gen-2 collection` stall minutes later. The fix that
+    # actually matters is not sweeping gen-2 here at all: gen(1) catches recently-created
+    # garbage -- which is what a "growth since baseline" diff cares about -- without paying
+    # for the deep, rarely-relevant old-generation cycles a full sweep also chases, matching
+    # the per-cycle [CYCLE-CLEANUP] collect's own scope. Still offloaded to a thread on top
+    # of that: harmless, keeps this consistent with every other gc.collect() in this module,
+    # and correct hygiene for a coroutine regardless of the GIL nuance above.
+    await _asyncio.to_thread(gc.collect, 1)
     from datetime import datetime as _dt2
     QBcore.memtrace_baseline = tracemalloc.take_snapshot()
     QBcore._memtrace_baseline_time = _dt2.now().strftime("%Y-%m-%dT%H:%M:%S")  # type: ignore[attr-defined]
