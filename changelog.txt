@@ -1,6 +1,41 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-07 (4)
+- Revised the #0106 DB cache strategy after qaplop challenged it, and after learning the
+  governing constraint: the NAS's SWAP FILE IS ON THE HDD root volume, not on the SSD holding
+  the DB. Swapping a page in costs ~10 ms; dropping a DB page and re-reading it from SSD costs
+  ~100 us. Everything follows from "never give the kernel a reason to swap".
+- That rule sorts the two knobs COUNTER-INTUITIVELY, and my first pass had it backwards:
+  cache_size is malloc'd (ANONYMOUS -> reclaimable only by writing to HDD swap = dangerous),
+  while mmap'd pages are clean and file-backed (dropped and re-read from SSD, can never swap =
+  safe). So the budget now goes to generous mmap + modest cache_size, not the reverse.
+- Two errors in the 2026-09-07 (1) reasoning, corrected here. (a) "8 GB x 9 connections x 2
+  schemas" implied mmap multiplies memory. It does not: nine connections mapping the same file
+  share the same physical pages. Only address space multiplies (hence VMS=47 GB), and RSS
+  over-reports because it counts a shared page once per mapping that faulted it in — so RSS was
+  never good evidence about mmap pressure. cache_size, being private per connection, IS the one
+  that multiplies. (b) mmap=0 forces double-caching: every page then exists in the OS page cache
+  AND memcpy'd into SQLite's private cache. On a RAM-starved box that is backwards.
+- New defaults, per schema, since the two do different jobs. main (24.5 GB, 16 KB pages, all
+  per-cycle writes): mmap 1024 MB, cache 32 MB. history (35.3 GB, 4 KB pages, nightly migration
+  + user-command UNION ALL reads only): mmap 256 MB, cache 8 MB. Sizing note: main.war_attacks
+  is 57M rows across 7 indexes, so a 50-war batch does ~45k inserts x 7 index descents; the
+  interior B-tree nodes those walk are ~40-50 MB (from sqlite_stat1) and are served from the
+  MAPPING -- which is why cache_size does not have to cover them and 32 MB is enough for the
+  dirty set. Total anonymous cost across 8 pooled connections: 320 MB (was ~600 MB).
+  db_memory_pragmas() now selects per schema; history is pinned explicitly for BOTH pragmas,
+  because cache_size does not inherit across ATTACH while an unqualified mmap_size does -- so
+  without pinning, the 35 GB cold DB would silently inherit main's larger ceiling.
+- HANDED TO OPERATOR (cannot be set from Python): vm.swappiness ~1-10 is the single biggest
+  lever -- DSM's default ~60 swaps anon memory to keep file pages, exactly backwards with swap
+  on HDD; if it is set, the mmap ceilings can safely rise again. And MALLOC_ARENA_MAX=2 (must be
+  in the launch environment, .env is too late for glibc): today's mallinfo2 showed arena=2280 MB
+  with in_use=372 MB, i.e. 1.9 GB (~19% of the machine) of anonymous, swap-eligible memory freed
+  but never returned. That is a bigger and more certain win than any SQLite pragma here. Both
+  are verifiable from /admin Memory Profile's [ALLOCATOR] section. Written up in
+  qapbot/docs/PERFORMANCE_TUNING.md. 17 tests on the pragma layer; suite 2096 pass.
+
 2026-09-07 (3)
 - SECURITY: the web bridge's shared-secret gate (_check_secret, qapbot/web_bridge.py) compared
   the X-Bridge-Secret header with ==, which short-circuits at the first differing byte and so

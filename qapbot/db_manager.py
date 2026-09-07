@@ -352,22 +352,35 @@ def db_memory_pragmas(schema: str = "") -> list[str]:
     10 GB box. See ``CONFIG.db_mmap_size_mb`` for the 2026-09-07 thrashing measurements and why
     the SSD migration inverted the original HDD-era tuning.
 
+    The two schemas get DIFFERENT budgets because they do different jobs: ``main`` (24.5 GB,
+    16 KB pages) carries every per-cycle write, while ``history`` (35.3 GB, 4 KB pages) is
+    touched only by the nightly migration and user-command ``UNION ALL`` reads. Bigger file,
+    colder access, smaller share.
+
     Args:
         schema: ``""`` for the unqualified form (applies to ``main``, and — for ``mmap_size``
             specifically — becomes the default for databases ATTACHed later), or a schema name
             such as ``"history"`` to pin that attached database explicitly. ``cache_size`` is
-            per-pager and does NOT inherit across ATTACH, so the history schema needs its own.
+            per-pager and does NOT inherit across ATTACH, so the history schema needs its own —
+            and since the unqualified ``mmap_size`` would otherwise leak main's larger ceiling
+            onto history via that inheritance, history must be pinned for both.
     """
     # Imported inside the function, not at module scope: every other CONFIG use in this module
     # does the same (see nightly_db_maintenance / the VACUUM path), because db_manager is
     # imported early enough that a module-level import risks a circular import through config.
     from qapbot.config import CONFIG
 
+    if schema == "history":
+        cache_mb, mmap_mb = CONFIG.db_history_cache_size_mb, CONFIG.db_history_mmap_size_mb
+    else:
+        cache_mb, mmap_mb = CONFIG.db_cache_size_mb, CONFIG.db_mmap_size_mb
+
     prefix = f"{schema}." if schema else ""
     return [
-        # Negative = kibibytes rather than pages, so this is page_size-independent.
-        f"PRAGMA {prefix}cache_size=-{CONFIG.db_cache_size_mb * 1024}",
-        f"PRAGMA {prefix}mmap_size={CONFIG.db_mmap_size_mb * 1024 * 1024}",
+        # Negative = kibibytes rather than pages, so this is page_size-independent — which
+        # matters here, because main is on 16 KB pages and history is still on 4 KB.
+        f"PRAGMA {prefix}cache_size=-{cache_mb * 1024}",
+        f"PRAGMA {prefix}mmap_size={mmap_mb * 1024 * 1024}",
     ]
 
 

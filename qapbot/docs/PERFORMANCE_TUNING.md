@@ -623,3 +623,86 @@ needs its own statement. `mmap_size` *does* propagate to subsequently attached d
 multiply by connection count. One helper (`db_manager.db_memory_pragmas()`) now owns all four
 call sites; four hand-maintained copies of the same literal is how 8 GB × 9 connections × 2
 schemas went unnoticed for weeks.
+
+### The DB cache strategy, and why the intuitive version is backwards (2026-09-07)
+
+**The governing constraint is not the SSD — it is where swap lives.** PROD's DB sits on an
+eSATA Samsung SSD, but the NAS's **swap file is on the HDD root volume**. So:
+
+| Reclaim path | Cost |
+|---|---|
+| Drop a clean DB page, re-read from SSD later | **~100 µs** |
+| Swap an anonymous page out to HDD, fault it back | **~10 ms** |
+
+A ~100× gap. Every tuning decision follows from one rule: **never give the kernel a reason to
+swap.** A colder cache or a slower query is cheap next to a single HDD swap-in — and once the
+box starts swapping, the GIL-holding-page-fault effect above freezes the whole process.
+
+That rule sorts SQLite's two memory knobs, and **the sort is counter-intuitive**:
+
+| Knob | Memory kind | Under pressure | Verdict |
+|---|---|---|---|
+| `cache_size` | `malloc`'d → **anonymous** | Reclaimed only by **writing to HDD swap** | **dangerous** |
+| `mmap_size` | clean → **file-backed** | **Dropped**, re-read from SSD. Can never swap | **safe** |
+
+So the budget goes to **generous `mmap`, modest `cache_size`** — not the reverse. Two further
+reasons `mmap` wins on a RAM-starved box:
+
+- **It avoids double-caching.** A page read through the mapping exists **once** in RAM. With
+  `mmap_size=0`, `read()` copies it into SQLite's private cache *on top of* the OS page cache —
+  **two copies of every page**.
+- **It does not multiply across connections.** Nine connections mapping the same file share the
+  same physical pages; only address space multiplies (which is free, and is why `VMS` reads
+  ~47 GB). `cache_size`, being private per connection, **does** multiply — it is the one that
+  must be counted × `db_pool_size`.
+
+> **The trap that caused the incident:** RSS counts a shared physical page once per mapping that
+> has faulted it in, so nine mappings make RSS look ~9× worse than the real memory cost. Do not
+> reason about mmap pressure from RSS alone — it over-reports mapped pages and under-reports the
+> anonymous memory that actually matters.
+
+**But bound it anyway.** The old `mmap_size=8 GB` against 24.5 GB + 35.3 GB let SQLite map
+arbitrarily much of the corpus, and a large *actively-referenced* mapped set looks hot to the
+kernel — which, at DSM's default `vm.swappiness`, biases reclaim toward swapping anonymous
+memory (the Python heap) instead. Bounding to roughly the hot working set keeps the benefit
+without handing reclaim that excuse.
+
+**Per-schema, because the two schemas do different jobs:**
+
+| | `main` | `history` |
+|---|---|---|
+| Size / page size | 24.5 GB, 16 KB | 35.3 GB, 4 KB |
+| Role | **every per-cycle write** | nightly migration + user-command `UNION ALL` reads |
+| `mmap_size` | 1024 MB | 256 MB |
+| `cache_size` | 32 MB | 8 MB |
+
+`main.war_attacks` is 57M rows across 7 indexes, so one 50-war batch does ~45k row inserts ×
+7 index descents. The interior B-tree nodes those descents walk are ~40–50 MB (estimated from
+`sqlite_stat1`) — served from the **mapping**, which is exactly why `cache_size` does *not* have
+to cover them. `cache_size` only needs to hold a batch's dirty pages.
+
+⚠️ `cache_size` does **not** inherit across `ATTACH` (it is per-pager), while an unqualified
+`mmap_size` **does** become the default for later-attached databases. So `history` must be
+pinned explicitly for both, or the 35 GB cold DB silently inherits `main`'s larger ceiling.
+`db_manager.db_memory_pragmas(schema)` owns this; do not hand-write these pragmas.
+
+### Operator-side settings that matter more than any pragma
+
+Neither can be set from Python — `MALLOC_ARENA_MAX` must exist in the environment *before*
+glibc initialises (so `.env` is too late; it belongs in the launch command), and `vm.swappiness`
+is a kernel setting.
+
+1. **`vm.swappiness` (biggest single lever).** DSM's default (~60) lets the kernel swap
+   anonymous memory to keep file pages cached. With swap on HDD that is precisely backwards.
+   Lowering it to ~1–10 tells the kernel to drop DB page cache (re-read from SSD, ~100 µs)
+   rather than swap the heap (~10 ms). **If this is set, the `mmap` ceilings above can safely go
+   up again** — low swappiness is what actually removes the hazard.
+2. **`MALLOC_ARENA_MAX=2`.** The 2026-09-07 `mallinfo2` reading was
+   `arena=2280 MB, in_use=372 MB, free_not_returned=1908 MB` — **1.9 GB (~19% of the machine) of
+   anonymous memory freed but never returned to the OS**, and anonymous means swap-eligible.
+   glibc creates up to `8 × ncores` arenas that each fragment independently; with 261
+   `to_thread`/executor sites on a 2-core box the process is at that ceiling. Capping arenas is
+   a bigger, more certain win than any SQLite pragma here, and it costs one env var.
+
+Verify both from the `/admin` Memory Profile: `[ALLOCATOR]` reports `arena`/`in_use`/
+`free_not_returned` directly, so the fragmentation change is visible in one before/after.

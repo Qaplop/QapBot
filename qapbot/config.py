@@ -214,28 +214,55 @@ class BotConfig:
     history_migration_time_budget_minutes: float = 30.0
 
     # --- SQLite memory budget (tracker #0106, 2026-09-07) -----------------------------------
-    # Both of these were sized for the ORIGINAL storage: spinning NAS disks, where a seek cost
-    # ~10 ms and buying it off with RAM was worth almost any price. PROD's DB now lives on an
-    # eSATA Samsung SSD (~50-100 us random read), so the penalty they insure against dropped by
-    # roughly two orders of magnitude — while their cost stayed the same, on a box with 10 GB of
-    # RAM total and a 25 GB main + 36 GB history DB.
+    # THE GOVERNING CONSTRAINT: the NAS's swap file lives on the HDD root volume, not on the
+    # eSATA SSD that holds the DB. So a swapped-out page costs ~10 ms to fault back in, while a
+    # dropped DB page costs ~100 us to re-read from the SSD — a ~100x difference. The strategy
+    # below is therefore built around one rule: NEVER let the box need to swap. Everything else
+    # (a slower query, a colder cache) is cheap by comparison.
     #
-    # What that cost turned into, measured on 2026-09-07: RSS ran 6.5-8.4 GB against 10 GB of
-    # RAM, the NAS sat at 94%, and at 16:53 the box crossed into page-fault thrashing. Wall time
-    # exploded while CPU time did NOT — cores_busy fell 0.63 -> 0.19, `_get_active_wars()` (a
-    # documented zero-I/O in-memory walk) went 3.3s -> 626s, and categorizing 465k clans took
-    # 144.7s wall for 5.8s of CPU (cores_busy=0.04). A Python thread that takes a major page
-    # fault holds the GIL while it blocks, so the whole process freezes: [LOOP-LAG] logged 21s
-    # stalls and one gen-1 gc.collect() took 502s freeing the same ~20k objects it always frees.
+    # That rule sorts the two knobs into "safe" and "dangerous", and the sort is NOT intuitive:
     #
-    # mmap_size is the one that matters most, and not because of its size alone: mmap'd DB pages
-    # are FILE-backed and charged to this process's RSS, so the kernel's reclaim will happily
-    # swap out the ANONYMOUS Python heap to keep serving them — exactly backwards for a bot whose
-    # working set is the heap. At 0 (SQLite's own default) the OS page cache still caches the DB
-    # via ordinary read(); those pages are simply reclaimable and not charged to us.
-    db_mmap_size_mb: int = 0        # was 8192 per connection, per schema, across 9 connections
-    db_cache_size_mb: int = 16      # was 64, private and duplicated per connection
-    db_pool_size: int = 8           # connections in _SyncConnectionPool; each pays cache_size
+    #   cache_size  -> SQLite malloc()s it. ANONYMOUS memory. Under pressure the kernel's only
+    #                  way to reclaim it is to write it to swap == the HDD. This is the
+    #                  dangerous one, and it is the one that was set generously (64 MB x 9
+    #                  connections) before today.
+    #   mmap_size   -> clean, FILE-backed pages. The kernel reclaims them by simply dropping
+    #                  them; they are re-read from the SSD on next use and can NEVER go to swap.
+    #                  This is the safe one. It also avoids double-caching: a page read through
+    #                  the mapping exists once in RAM, whereas a read() copies it into SQLite's
+    #                  private cache on top of the OS page cache — two copies of every page.
+    #
+    # So the budget goes: generous mmap (safe, reclaimable, single-copy), modest cache_size
+    # (dangerous, swappable), rather than the other way round.
+    #
+    # WHY THE PREVIOUS 8 GB VALUE STILL HAD TO GO, despite mmap being the safe knob: with an
+    # 8 GB ceiling per schema against 24.5 GB + 35.3 GB of DB, SQLite will map arbitrarily much
+    # of the file. A large, actively-referenced mapped working set makes those file pages look
+    # hot to the kernel, which — at DSM's default vm.swappiness — biases reclaim toward swapping
+    # ANONYMOUS memory (the Python heap) instead. Bounding mmap to roughly the hot working set
+    # keeps the benefit without giving reclaim that excuse. If vm.swappiness is ever lowered to
+    # ~1-10 on the NAS, these ceilings can safely go up again; the low-swappiness setting is what
+    # actually removes the hazard, and it is a DSM-side change, not a code one.
+    #
+    # SIZING, per schema, because the two have completely different jobs:
+    #   main    24.5 GB, 16 KB pages. ALL per-cycle write traffic. war_attacks alone is 57M rows
+    #           with 7 indexes, so a 50-war batch does ~45k row inserts x 7 index descents. The
+    #           interior (non-leaf) B-tree nodes those descents walk are ~40-50 MB (estimated
+    #           from sqlite_stat1) -- served from the MAPPING, which is why cache_size does not
+    #           have to cover them. cache_size only needs to hold a batch's dirty pages.
+    #   history 35.3 GB, 4 KB pages. Not in the per-cycle write path at all: nightly migration
+    #           plus user-command UNION ALL reads. Bigger file, colder access -- it gets the
+    #           smaller share of both budgets.
+    #
+    # Total anonymous cost is what matters for the swap rule: (32 + 8) MB x 9 connections
+    # = ~360 MB, versus ~600 MB before. Mapped pages are shared across all 9 connections (they
+    # map the same files, so the physical pages are the same), so mmap does NOT multiply by
+    # connection count -- only the address space does, which is free.
+    db_mmap_size_mb: int = 1024              # main: hot index upper levels + recent writes
+    db_history_mmap_size_mb: int = 256       # history: cold, user-query only
+    db_cache_size_mb: int = 32               # main: dirty-page capacity for a bulk batch
+    db_history_cache_size_mb: int = 8        # history
+    db_pool_size: int = 8                    # each connection pays cache_size in ANON memory
 
     # DEV-only: Skip CoC API connection entirely (for testing without valid API token)
     no_coc_api: bool = False
@@ -465,13 +492,21 @@ def load_config() -> BotConfig:
     # these defaults. Env-overridable so PROD can be retuned without a code change if the
     # storage or the box's RAM changes again.
     try:
-        db_mmap_size_mb = max(0, int(os.getenv("DB_MMAP_SIZE_MB", "0")))
+        db_mmap_size_mb = max(0, int(os.getenv("DB_MMAP_SIZE_MB", "1024")))
     except ValueError:
-        db_mmap_size_mb = 0
+        db_mmap_size_mb = 1024
     try:
-        db_cache_size_mb = max(1, int(os.getenv("DB_CACHE_SIZE_MB", "16")))
+        db_history_mmap_size_mb = max(0, int(os.getenv("DB_HISTORY_MMAP_SIZE_MB", "256")))
     except ValueError:
-        db_cache_size_mb = 16
+        db_history_mmap_size_mb = 256
+    try:
+        db_cache_size_mb = max(1, int(os.getenv("DB_CACHE_SIZE_MB", "32")))
+    except ValueError:
+        db_cache_size_mb = 32
+    try:
+        db_history_cache_size_mb = max(1, int(os.getenv("DB_HISTORY_CACHE_SIZE_MB", "8")))
+    except ValueError:
+        db_history_cache_size_mb = 8
     try:
         db_pool_size = max(1, int(os.getenv("DB_POOL_SIZE", "8")))
     except ValueError:
@@ -537,7 +572,9 @@ def load_config() -> BotConfig:
         history_migration_nightly_row_budget=history_migration_nightly_row_budget,
         history_migration_time_budget_minutes=history_migration_time_budget_minutes,
         db_mmap_size_mb=db_mmap_size_mb,
+        db_history_mmap_size_mb=db_history_mmap_size_mb,
         db_cache_size_mb=db_cache_size_mb,
+        db_history_cache_size_mb=db_history_cache_size_mb,
         db_pool_size=db_pool_size,
         is_dev_mode=is_dev_mode,
         discord_guild_id=discord_guild_id,

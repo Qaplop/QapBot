@@ -63,12 +63,92 @@ class TestPragmaGeneration:
         assert "PRAGMA mmap_size=134217728" in stmts   # 128 MB expressed in bytes
 
     def test_mmap_can_be_fully_disabled(self, monkeypatch):
-        """mmap_size=0 is SQLite's own default and the point of the 2026-09-07 change: the OS
-        still caches the DB through ordinary read(), but those pages stay reclaimable instead of
-        being charged to this process's RSS and pushing the Python heap into swap."""
+        """mmap_size=0 must stay reachable — it is SQLite's own default and the fallback if the
+        mapped working set ever turns out to be what pressures the box."""
         self._with_config(monkeypatch, db_mmap_size_mb=0)
 
         assert "PRAGMA mmap_size=0" in db_memory_pragmas()
+
+
+class TestPerSchemaBudgets:
+    """main and history do different jobs: main (24.5 GB, 16 KB pages) carries every per-cycle
+    write; history (35.3 GB, 4 KB pages) sees only the nightly migration and user-command
+    UNION ALL reads. Bigger file, colder access, smaller share of both budgets."""
+
+    @staticmethod
+    def _mb_from(stmts, kind):
+        stmt = next(s for s in stmts if kind in s)
+        raw = int(stmt.split("=")[1])
+        return abs(raw) // 1024 if kind == "cache_size" else raw // (1024 * 1024)
+
+    def test_history_gets_a_smaller_budget_than_main(self):
+        main, history = db_memory_pragmas(), db_memory_pragmas("history")
+
+        assert self._mb_from(history, "cache_size") < self._mb_from(main, "cache_size")
+        assert self._mb_from(history, "mmap_size") < self._mb_from(main, "mmap_size")
+
+    def test_history_mmap_is_pinned_not_inherited(self, monkeypatch):
+        """An unqualified PRAGMA mmap_size becomes the default for databases ATTACHed later, so
+        without an explicit history statement the 35 GB cold DB would silently inherit main's
+        larger ceiling — the same shape as the original bug, one schema over."""
+        import dataclasses
+        import qapbot.config as cfg
+        monkeypatch.setattr(cfg, "CONFIG", dataclasses.replace(
+            cfg.CONFIG, db_mmap_size_mb=4096, db_history_mmap_size_mb=64,
+        ))
+
+        assert "PRAGMA history.mmap_size=67108864" in db_memory_pragmas("history")
+
+    def test_an_unknown_schema_falls_back_to_the_main_budget(self):
+        """Defensive: a future ATTACH of some other schema should get main's numbers rather than
+        silently landing on history's deliberately-small ones."""
+        other = db_memory_pragmas("scratch")
+        assert self._mb_from(other, "cache_size") == self._mb_from(db_memory_pragmas(), "cache_size")
+
+
+class TestSwapAvoidanceInvariants:
+    """THE governing constraint: the NAS's swap file is on the HDD root volume, not on the SSD
+    that holds the DB. A swapped page costs ~10 ms to fault back in; a dropped DB page costs
+    ~100 us to re-read from SSD. So the whole strategy is "never give the kernel a reason to
+    swap", and that sorts the two knobs counter-intuitively:
+
+      cache_size -> malloc'd, ANONYMOUS -> reclaimable only by writing to HDD swap. Dangerous.
+      mmap_size  -> clean, FILE-backed  -> dropped and re-read from SSD, never swapped. Safe.
+
+    These pin the resulting invariants so a future "let's give SQLite more cache" has to argue
+    with them explicitly rather than quietly re-creating 2026-09-07.
+    """
+
+    def test_anonymous_cache_total_stays_bounded(self):
+        """cache_size is paid per connection in anonymous memory, so it multiplies by pool size
+        — unlike mmap, where all connections map the same files and share the physical pages."""
+        from qapbot.config import CONFIG
+        total_anon_mb = (
+            CONFIG.db_cache_size_mb + CONFIG.db_history_cache_size_mb
+        ) * CONFIG.db_pool_size
+
+        assert total_anon_mb <= 512, (
+            f"{total_anon_mb} MB of anonymous SQLite cache across {CONFIG.db_pool_size} "
+            "connections — this is precisely the memory that can be pushed to HDD swap"
+        )
+
+    def test_the_safe_knob_carries_more_of_the_budget_than_the_dangerous_one(self):
+        from qapbot.config import CONFIG
+        mapped = CONFIG.db_mmap_size_mb + CONFIG.db_history_mmap_size_mb
+        anon = (CONFIG.db_cache_size_mb + CONFIG.db_history_cache_size_mb) * CONFIG.db_pool_size
+
+        assert mapped > anon, (
+            f"mapped ceiling {mapped} MB should exceed anonymous cache {anon} MB — "
+            "the file-backed cache is the one that cannot reach HDD swap"
+        )
+
+    def test_mmap_ceiling_stays_far_below_the_database_size(self):
+        """Bounded, not unlimited. The original 8 GB let SQLite map arbitrarily much of a
+        24.5 + 35.3 GB corpus; a large actively-referenced mapped set looks hot to the kernel
+        and biases reclaim toward swapping the anonymous Python heap instead."""
+        from qapbot.config import CONFIG
+        assert CONFIG.db_mmap_size_mb <= 4096
+        assert CONFIG.db_history_mmap_size_mb <= CONFIG.db_mmap_size_mb
 
 
 class TestAppliedEverywhere:
@@ -102,8 +182,10 @@ class TestConfigDefaults:
 
     def test_ssd_era_defaults(self):
         from qapbot.config import CONFIG
-        assert CONFIG.db_mmap_size_mb == 0, "mmap should default off on SSD-backed storage"
-        assert CONFIG.db_cache_size_mb == 16
+        assert CONFIG.db_mmap_size_mb == 1024
+        assert CONFIG.db_history_mmap_size_mb == 256
+        assert CONFIG.db_cache_size_mb == 32
+        assert CONFIG.db_history_cache_size_mb == 8
         assert CONFIG.db_pool_size >= 1
 
     def test_env_overrides_are_parsed_and_clamped(self, monkeypatch):
@@ -126,4 +208,4 @@ class TestConfigDefaults:
         from qapbot.config import load_config
         monkeypatch.setenv("DB_MMAP_SIZE_MB", "not-a-number")
 
-        assert load_config().db_mmap_size_mb == 0
+        assert load_config().db_mmap_size_mb == 1024
