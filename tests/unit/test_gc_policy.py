@@ -6,12 +6,23 @@ build 11, 11 of 11 `[LOOP-LAG]` stalls matched a `[GC-AUTO]` pause within the wa
 
 coc.py's war graph is cyclic by construction (`WarClan._war`, `ClanWarMember.war`/`.clan`,
 `WarAttack.war`/`.member`), so refcounting cannot free a war *as coc.py hands it to us* — it
-survives until a sweep walks it. The policy is therefore about WHICH sweep runs WHEN:
+survives until a sweep walks it. The policy is therefore about WHICH sweep runs WHEN.
 
-  - automatic collection off, so nothing fires mid-cycle or during the sleep window
-  - a young-generation collect per cycle, which reclaims that whole population cheaply
-    because nothing has been promoted
-  - the one full sweep per day in the nightly maintenance window, where commands are blocked
+⚠️ SUPERSEDED 2026-09-08 (tracker #0106). This file was written for the 2026-09-04 policy —
+"automatic collection off, a young-generation collect per cycle, one full sweep nightly" —
+and that policy was REVERSED because it caused a ~1 GB/hour heap climb. `gc.collect(1)`
+promotes every survivor to the next generation, so firing it each cycle while that cycle's
+war population was still live pumped ~20k objects/cycle into generation 2, which automatic
+collection being off then left undrained until 03:00 UTC.
+
+The current policy is the established pattern for latency-sensitive Python:
+
+  - automatic collection ON, with threshold0 raised well above CPython's default so most
+    objects die by refcounting before any collection sees them (promotion attacked at source)
+  - gc.freeze() after startup, keeping the large static caches out of every scan
+  - the nightly full sweep kept as a backstop, plus an RSS-triggered restart as a safety net
+
+See qapbot/docs/PERFORMANCE_TUNING.md and tests/unit/test_gc_policy_promotion.py.
 
 NOTE this is only half the story. An earlier version of this docstring called the garbage
 "unavoidable"; that was wrong. `release_war_object()` severs those back-references after the
@@ -32,13 +43,26 @@ import pytest
 
 
 def _war_graph(wars: int = 40, members: int = 20) -> None:
-    """Build and drop coc.py-shaped war graphs: cyclic, so refcounting cannot free them."""
+    """Build and drop coc.py-shaped war graphs: cyclic, so refcounting cannot free them.
+
+    NOTE the graphs are dropped immediately here, so nothing is ever live at a subsequent
+    collection. That is fine for tests about whether the garbage EXISTS, but it cannot model
+    promotion — use `_war_graph_into()` for anything about accumulation across cycles. See
+    the note in test_repeated_cycles_do_not_accumulate.
+    """
+    _war_graph_into([], wars, members)
+
+
+def _war_graph_into(sink: List[Any], wars: int = 40, members: int = 20) -> None:
+    """Same graphs, but retained by `sink` — models the bot holding a cycle's war population
+    in temp_war_objects/temp_war_stats across the per-cycle cleanup point."""
     for _ in range(wars):
         war: Dict[str, Any] = {"tag": "w", "members": []}
         for j in range(members):
             m: Dict[str, Any] = {"tag": j, "war": war, "attacks": []}
             m["attacks"].append({"attacker": m, "war": war})  # back-refs, exactly like coc.py
             war["members"].append(m)
+        sink.append(war)
 
 
 @pytest.fixture
@@ -88,17 +112,48 @@ class TestYoungCollectSuffices:
         )
 
     def test_repeated_cycles_do_not_accumulate(self, isolated_gc) -> None:
-        """No pile-up: every cycle must reclaim its own garbage, not defer it."""
-        gc.disable()
-        gc.collect()
+        """No pile-up: every cycle must reclaim its own garbage, not defer it.
 
-        freed = []
+        REWRITTEN 2026-09-08 (tracker #0106). The original version of this test asserted
+        exactly the right property and still passed all the way through the incident that
+        proved it false in production — PROD accumulated 10-11.5M objects per day while this
+        was green. The reason is in the setup, not the assertion:
+
+            for _ in range(6):
+                _war_graph()            # <- result never bound; garbage immediately
+                freed.append(gc.collect(1))
+
+        With nothing live at the moment of the collect, nothing SURVIVES it, so nothing is
+        promoted — and promotion is the entire failure mode. The real bot holds each cycle's
+        war population live across that point (temp_war_objects / temp_war_stats keep it
+        until the next cycle replaces it), so its survivors were promoted into generation 2,
+        where a gen-1 collect can never reach them again.
+
+        The fix here is to hold the graph across the collect, exactly as the bot does, and to
+        model the CURRENT policy (automatic collection on, threshold0 raised) rather than the
+        withdrawn one. Verified 2026-09-08: with the old policy substituted back in, this same
+        body strands ~14,880 objects in generation 2 and the assertion fires.
+
+        The explicit old-vs-new comparison lives in test_gc_policy_promotion.py.
+        """
+        gc.collect(2)
+        gc.enable()                      # the policy since 2026-09-08: automatic, not manual
+        _, t1, t2 = gc.get_threshold()
+        gc.set_threshold(50_000, t1, t2)
+
+        held: List[Any] = []
         for _ in range(6):
-            _war_graph()
-            freed.append(gc.collect(1))
+            graph: List[Any] = []
+            _war_graph_into(graph)
+            held = graph                 # LIVE across the cleanup point, as temp_war_* is
+        del held, graph
 
-        assert all(f > 0 for f in freed), f"a cycle reclaimed nothing: {freed}"
-        assert gc.collect(2) == 0, "backlog accumulated across cycles despite per-cycle collects"
+        gc.collect(1)
+        assert gc.collect(2) == 0, (
+            "backlog accumulated across cycles: objects live at a collection got promoted to "
+            "generation 2, where a gen-1 collect can no longer reach them. That is tracker "
+            "#0106's root cause and it must not come back."
+        )
 
 
 class TestFreezeProtectsTheStaticCaches:

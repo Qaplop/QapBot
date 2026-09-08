@@ -264,6 +264,43 @@ class BotConfig:
     db_history_cache_size_mb: int = 8        # history
     db_pool_size: int = 8                    # each connection pays cache_size in ANON memory
 
+    # --- GC policy (tracker #0106, 2026-09-08) ---------------------------------------------
+    # ROOT CAUSE of the ~1 GB/hour heap climb, found 2026-09-08 and confirmed by direct
+    # experiment on 3.14.7 (the version PROD runs): the 2026-09-04 policy of
+    # `gc.disable()` + a per-cycle `gc.collect(1)` was not merely failing to reclaim
+    # generation-2 garbage — it was MANUFACTURING it.
+    #
+    # In CPython, surviving objects are PROMOTED to the next generation by every collection.
+    # `gc.collect(1)` fires at cycle end, when that cycle's war population is still live, so
+    # every survivor is promoted straight into generation 2. With automatic collection off,
+    # gen-2 was then drained only by the 03:00 UTC nightly sweep. Measured experiment: after
+    # surviving even ONE gc.collect(1), a cyclic object is unreachable to all further
+    # gc.collect(1) calls (they free 0 and return in 0.0ms) and only gc.collect(2) frees it.
+    #
+    # The arithmetic matches PROD exactly: ~480 cycles/day x ~20k survivors promoted per
+    # collect = ~9.6M objects/day, against the 10.1-11.5M the nightly sweep actually
+    # reclaimed. The nightly reclaim count jumped 211,262 -> 11,457,899 at the first sweep
+    # after that policy shipped.
+    #
+    # THE FIX is the established pattern for latency-sensitive Python (see
+    # qapbot/docs/PERFORMANCE_TUNING.md for sources): keep automatic collection ENABLED and
+    # make it cheap, rather than turning it off and hand-rolling a schedule.
+    #   1. gc.freeze() after startup — already done, keeps the big static caches out of every
+    #      scan. This is why PROD's live-set walk is only ~0.9-4.2s despite a large heap.
+    #   2. Raise threshold0 well above the default — this attacks PROMOTION at the source.
+    #      Objects are promoted only by surviving a collection, so collecting far less often
+    #      in gen-0 means the vast majority die by refcounting before any collection sees them.
+    #   3. Leave the nightly full sweep as a backstop and the RSS-restart as a safety net.
+    #
+    # CPython's own gen-0 default is 2000 (raised from 700 in 3.12). 50,000 is the value the
+    # widely-cited Close.com writeup landed on; it is a starting point to be tuned against
+    # PROD's [GC-AUTO]/[LOOP-LAG] lines, not a proven optimum for this workload.
+    gc_automatic: bool = True          # was disabled 2026-09-04; that is what caused the climb
+    gc_threshold0: int = 50_000        # 0 = leave CPython's default (2000 on 3.12+) alone
+    # The per-cycle collect is the promotion pump described above. Off by default now. Kept as
+    # a switch purely so the old behaviour can be restored for comparison without a code edit.
+    gc_per_cycle_collect: bool = False
+
     # --- RSS-triggered self-restart (tracker #0106, 2026-09-08) ----------------------------
     # A STOPGAP, not a fix. The Python heap still grows ~1 GB/hour on PROD and nothing found so
     # far explains it (the SQLite retuning above reduced SQLite's own footprint but did not
@@ -539,6 +576,18 @@ def load_config() -> BotConfig:
     except ValueError:
         db_pool_size = 8
 
+    # GC policy — see the dataclass fields for the root-cause analysis behind these defaults.
+    # GC_AUTOMATIC keeps its historical name/meaning (=1 forces automatic collection on), but
+    # the DEFAULT is now on rather than off; set GC_AUTOMATIC=0 to restore the 2026-09-04
+    # disabled-collector behaviour for comparison.
+    _gc_auto_env = os.getenv("GC_AUTOMATIC", "").strip()
+    gc_automatic = True if _gc_auto_env == "" else _gc_auto_env not in ("0", "false", "no")
+    try:
+        gc_threshold0 = max(0, int(os.getenv("GC_THRESHOLD0", "50000")))
+    except ValueError:
+        gc_threshold0 = 50_000
+    gc_per_cycle_collect = os.getenv("GC_PER_CYCLE_COLLECT", "").strip().lower() in ("1", "true", "yes")
+
     # RSS-triggered self-restart — see the dataclass fields for why this exists.
     rss_restart_enabled = os.getenv("RSS_RESTART_ENABLED", "true").lower() in ("true", "1", "yes")
     try:
@@ -614,6 +663,9 @@ def load_config() -> BotConfig:
         db_cache_size_mb=db_cache_size_mb,
         db_history_cache_size_mb=db_history_cache_size_mb,
         db_pool_size=db_pool_size,
+        gc_automatic=gc_automatic,
+        gc_threshold0=gc_threshold0,
+        gc_per_cycle_collect=gc_per_cycle_collect,
         rss_restart_enabled=rss_restart_enabled,
         rss_restart_threshold_mb=rss_restart_threshold_mb,
         rss_restart_min_uptime_minutes=rss_restart_min_uptime_minutes,

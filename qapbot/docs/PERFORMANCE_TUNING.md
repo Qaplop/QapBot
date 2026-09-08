@@ -706,3 +706,98 @@ is a kernel setting.
 
 Verify both from the `/admin` Memory Profile: `[ALLOCATOR]` reports `arena`/`in_use`/
 `free_not_returned` directly, so the fragmentation change is visible in one before/after.
+
+---
+
+## `gc.collect(1)` per cycle is a promotion pump, not a cleanup (2026-09-08, tracker #0106)
+
+The 2026-09-04 policy — `gc.disable()` plus a per-cycle `gc.collect(1)` — caused a ~1 GB/hour
+heap climb. It was reversed. The mechanism is worth internalising because the reasoning that
+produced it was careful and still wrong.
+
+**CPython promotes every surviving object to the next generation on each collection.** So a
+collection is not only a reclaim, it is a *promotion event*. Firing `gc.collect(1)` at cycle
+end — while that cycle's war population is still referenced by `temp_war_objects` /
+`temp_war_stats` — promoted every survivor straight into generation 2. With automatic
+collection disabled, nothing then drained generation 2 until the 03:00 UTC nightly sweep.
+
+Measured on 3.14.7 (PROD's version): after surviving **one** `gc.collect(1)`, a cyclic object
+is unreachable to every later `gc.collect(1)` — they free 0 and return in 0.0 ms — and only
+`gc.collect(2)` frees it.
+
+### The evidence trail
+
+| Signal | Before | After the 2026-09-04 deploy |
+|---|---|---|
+| RSS climb (per continuous run) | ~1.4 MB/min | **~19 MB/min** (run starting 11 min after) |
+| Nightly sweep reclaim | 211,262 | **11,457,899** (first night after) |
+| Objects in gen-2 at day's end | ~200k | **10.1–11.5M** |
+
+The arithmetic closes: ~480 cycles/day × ~20k survivors promoted per collect ≈ **9.6M/day**,
+against the 10.1–11.5M the nightly sweep actually reclaimed.
+
+### Why the existing test did not catch it
+
+`test_gc_policy.py::test_repeated_cycles_do_not_accumulate` asserted exactly the right
+property — "backlog accumulated across cycles despite per-cycle collects" — and stayed green
+through the whole incident. The setup was the problem:
+
+```python
+for _ in range(6):
+    _war_graph()              # result never bound -> garbage immediately
+    freed.append(gc.collect(1))
+```
+
+Nothing is **live** at the collect, so nothing survives, so nothing is promoted. The failure
+mode was unreproducible by construction. It now holds the graph across the collect, as the bot
+does, and fails against the old policy (~14,880 objects stranded).
+
+**Rule:** a GC test that never holds objects live across a collection cannot test promotion —
+and promotion is where the bugs are.
+
+### The policy that replaced it
+
+The established pattern for latency-sensitive Python: **keep automatic collection enabled and
+make it cheap**, rather than turning it off and hand-rolling a schedule.
+
+```python
+gc.collect(2)
+gc.freeze()                                  # already done at startup
+_, gen1, gen2 = gc.get_threshold()
+gc.set_threshold(50_000, gen1, gen2)         # CPython's default is 2000 since 3.12
+```
+
+1. **`gc.freeze()`** keeps the large static caches out of every scan — this is why PROD's
+   live-set walk is only 0.9–4.2 s despite a multi-million-object heap.
+2. **Raising `threshold0`** attacks promotion *at source*: objects are promoted only by
+   surviving a collection, so collecting far less often in gen-0 means the vast majority die
+   by refcounting before any collection sees them.
+3. **Nightly full sweep** stays as a backstop; the RSS-triggered restart stays as a safety net.
+
+Config: `CONFIG.gc_automatic` / `gc_threshold0` / `gc_per_cycle_collect`, env-overridable as
+`GC_AUTOMATIC` / `GC_THRESHOLD0` / `GC_PER_CYCLE_COLLECT`. `GC_AUTOMATIC=0` restores the
+withdrawn 2026-09-04 behaviour for comparison.
+
+### PROD gen-2 cost model (measured, for tuning)
+
+From the nightly two-pass timings (`total` vs a second back-to-back sweep = pure live-set walk):
+
+`total ≈ 1.75 s fixed + live-set walk + 6.7 µs × N_garbage`
+
+with the walk itself **0.9 s on a drained heap vs 3.4–4.2 s on a bloated one** — i.e. keeping
+the heap small makes every subsequent collection cheaper. There is a **~2.7 s floor per full
+collection** that no amount of extra frequency removes.
+
+**Tuning instrument:** `[GC-STATS]` logs per-generation `collections/collected` deltas every
+cycle. `[GC-AUTO]` only fires for collections ≥0.5 s, so it cannot answer "how often is CPython
+collecting?" — which is the question `threshold0` tuning actually needs. Watch `[GC-STATS]`
+`gen2=` alongside `[CYCLE-END] RSS=` and `[LOOP-LAG]`.
+
+**Sources:** [Close — Taming the Python GC](https://making.close.com/posts/taming-the-python-gc/) ·
+[CPython GC internals](https://github.com/python/cpython/blob/3.14/InternalDocs/garbage_collector.md) ·
+[Python `gc` docs](https://docs.python.org/3/library/gc.html)
+
+⚠️ **Version note:** the incremental collector landed in 3.14.0 and was
+[rolled back in 3.14.5](https://pydevtools.com/blog/python-3145-rolls-back-the-incremental-garbage-collector/).
+PROD and dev both run **3.14.7** (post-rollback, classic generational), confirmed from the
+startup banner's `Python:` line — so dev GC *semantics* transfer. Timings still do not.

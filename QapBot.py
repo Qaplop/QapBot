@@ -115,6 +115,35 @@ _gc_pause_start: dict[int, float] = {}
 # GIL and never overlap.
 _gc_deliberate: bool = False
 
+#: Previous gc.get_stats() snapshot, for the per-cycle [GC-STATS] delta (2026-09-08,
+#: tracker #0106). The [GC-AUTO] callback above only fires for collections >=0.5s, so on its
+#: own it cannot answer "how OFTEN is CPython collecting?" — which is exactly the question
+#: threshold0 tuning needs. gc.get_stats() gives per-generation collection counts, so the
+#: delta across a cycle shows frequency and reclaim volume even when every collection is too
+#: fast to log individually.
+_gc_stats_prev: list[dict] | None = None  # type: ignore[type-arg]
+
+
+def _gc_stats_delta() -> str:
+    """Per-generation 'collections/collected' since the previous call, as a compact string.
+
+    Returns "n/a" on the first call (no baseline yet) or if gc.get_stats() is unavailable.
+    Never raises: this is diagnostics on the per-cycle path.
+    """
+    global _gc_stats_prev
+    try:
+        cur = gc.get_stats()
+        prev, _gc_stats_prev = _gc_stats_prev, cur
+        if prev is None or len(prev) != len(cur):
+            return "n/a (baseline)"
+        return " ".join(
+            f"gen{i}={c['collections'] - p['collections']}/{c['collected'] - p['collected']}"
+            for i, (p, c) in enumerate(zip(prev, cur))
+        )
+    except Exception:
+        return "n/a"
+
+
 def _log_slow_gc(phase: str, info: dict) -> None:  # type: ignore[type-arg]
     gen = info.get("generation", -1)
     if phase == "start":
@@ -3011,21 +3040,29 @@ async def periodic_main() -> None:
                 clear_player_stats_cache()
                 _t1 = time.perf_counter()
                 import gc as _gc
-                # Load-bearing since 2026-09-04: automatic collection is disabled at startup
-                # (see [GC-POLICY] near the startup gc.freeze()), so this is now the ONLY thing
-                # reclaiming the ~300K cyclic objects coc.py's war graph produces each cycle —
-                # it used to be a no-op costing 0.000s because the automatic collector had
-                # already swept. Generation 1 (not 2) on purpose: with nothing being promoted on
-                # CPython's schedule the whole war population is still young, so this reclaims
-                # all of it without walking the long-lived heap. Measured identical in cost to
-                # collect(0) while also catching objects promoted by the previous cycle's call.
-                # The full sweep happens nightly, where a multi-second pause is acceptable.
-                global _gc_deliberate
-                _gc_deliberate = True
-                try:
-                    _gc_collected = _gc.collect(1)
-                finally:
-                    _gc_deliberate = False
+                # OFF by default since 2026-09-08 (tracker #0106) — this call was the leak.
+                #
+                # It was introduced 2026-09-04 as "the ONLY thing reclaiming the ~300K cyclic
+                # objects coc.py's war graph produces each cycle". It did reclaim those. What
+                # was missed is that CPython PROMOTES every survivor to the next generation on
+                # each collection: fired here at cycle end, with this cycle's war population
+                # still live, it promoted ~20k survivors per cycle into generation 2 — which,
+                # with automatic collection disabled, nothing then drained until 03:00 UTC.
+                # Confirmed by experiment on 3.14.7: once promoted, an object is invisible to
+                # every later gc.collect(1) (they free 0 in 0.0ms); only gc.collect(2) frees it.
+                #
+                # With automatic collection re-enabled and threshold0 raised (see [GC-POLICY]),
+                # CPython reclaims this on its own schedule and nothing accumulates, so this
+                # call is not merely unnecessary — running it actively re-creates the problem.
+                # Kept behind a flag purely so the old behaviour can be A/B'd without an edit.
+                _gc_collected = -1
+                if CONFIG.gc_per_cycle_collect:
+                    global _gc_deliberate
+                    _gc_deliberate = True
+                    try:
+                        _gc_collected = _gc.collect(1)
+                    finally:
+                        _gc_deliberate = False
                 _t2 = time.perf_counter()
                 # Return fragmented free arenas to the OS (Linux/glibc only).
                 # Python's pymalloc never releases arenas until fully empty, so
@@ -3046,10 +3083,21 @@ async def periodic_main() -> None:
                 # Timing breakdown so future slowdowns can be pinpointed at a
                 # glance instead of re-instrumenting; cheap (one log call/cycle).
                 logging.info(
-                    "[CYCLE-CLEANUP] clear_expired=%.3fs gc_collect=%.3fs (freed=%d) "
+                    "[CYCLE-CLEANUP] clear_expired=%.3fs gc_collect=%.3fs (%s) "
                     "malloc_trim=%.3fs total=%.3fs (expired=%d)",
-                    _t1 - _t0, _t2 - _t1, _gc_collected, _t3 - _t2, _t3 - _t0, expired,
+                    _t1 - _t0, _t2 - _t1,
+                    # -1 is the "didn't run" sentinel: with automatic collection back on, the
+                    # per-cycle collect is deliberately skipped (it was the promotion pump).
+                    "skipped — automatic GC on" if _gc_collected < 0 else f"freed={_gc_collected}",
+                    _t3 - _t2, _t3 - _t0, expired,
                 )
+                # collections/collected per generation since the last cycle. This is the
+                # instrument for tuning CONFIG.gc_threshold0: gen0 count shows how often
+                # CPython is collecting, and gen2 count shows whether full sweeps are
+                # happening often enough to keep generation 2 from accumulating (the
+                # tracker #0106 failure mode). Pairs with [GC-AUTO] (which only logs
+                # collections >=0.5s) and [CYCLE-END] RSS.
+                logging.info("[GC-STATS] since last cycle: %s", _gc_stats_delta())
                 return expired
             await asyncio.to_thread(_post_cycle_cleanup)
 
@@ -4058,18 +4106,55 @@ async def _run_startup_initialization() -> None:
             # cycle. Freezing that would make its garbage permanent — the exact pile-up we are
             # avoiding.
             #
-            # Escape hatch: set GC_AUTOMATIC=1 to restore CPython's scheduling.
-            if os.getenv("GC_AUTOMATIC", "").strip() == "1":
-                logging.warning(
-                    "[GC-POLICY] GC_AUTOMATIC=1 — leaving automatic collection on CPython's "
-                    "schedule; expect multi-second [GC-AUTO] pauses mid-cycle"
+            # REVERSED 2026-09-08 (tracker #0106). Everything above this line is the 2026-09-04
+            # rationale and it is preserved because the LOOP-LAG measurements in it are real.
+            # What it got wrong is the conclusion, and the error is worth stating plainly:
+            #
+            #   `gc.collect(1)` does not merely fail to reclaim generation-2 garbage — it
+            #   CREATES it. CPython promotes every surviving object to the next generation on
+            #   each collection. Called at cycle end, while that cycle's war population is
+            #   still live, it promoted ~20k survivors per cycle straight into generation 2,
+            #   which automatic collection being off then left undrained until 03:00 UTC.
+            #
+            # Confirmed by direct experiment on 3.14.7 (PROD's version): after surviving even
+            # ONE gc.collect(1), a cyclic object is unreachable to every later gc.collect(1)
+            # — they free 0 and return in 0.0ms — and only gc.collect(2) frees it. The
+            # arithmetic matches PROD: ~480 cycles/day x ~20k promoted = ~9.6M/day, against the
+            # 10.1-11.5M the nightly sweep reclaimed. That sweep's own count jumped
+            # 211,262 -> 11,457,899 on the first night after the policy shipped, and RSS climb
+            # went from ~1.4 MB/min to ~19 MB/min at the run starting 11 minutes after the
+            # deploy.
+            #
+            # The replacement is the established pattern for latency-sensitive Python: keep
+            # automatic collection ON and make it cheap, instead of hand-rolling a schedule.
+            # gc.freeze() above already removes the large static caches from every scan; the
+            # missing half was never freezing but THRESHOLD — objects are promoted only by
+            # surviving a collection, so collecting far less often in gen-0 means most die by
+            # refcounting before any collection sees them. See qapbot/docs/PERFORMANCE_TUNING.md
+            # for the sources and the full measurement trail.
+            if CONFIG.gc_automatic:
+                if CONFIG.gc_threshold0 > 0:
+                    _t0_old, _t1_old, _t2_old = gc.get_threshold()
+                    gc.set_threshold(CONFIG.gc_threshold0, _t1_old, _t2_old)
+                    _gc_thresholds = gc.get_threshold()
+                if not gc.isenabled():
+                    gc.enable()
+                logging.info(
+                    "[GC-POLICY] Automatic collection ENABLED with thresholds %s (gen-0 default "
+                    "on this Python is %d), %s object(s) frozen out of every scan. Per-cycle "
+                    "collect: %s. Nightly full sweep remains as a backstop. Set GC_AUTOMATIC=0 "
+                    "to restore the 2026-09-04 disabled-collector behaviour.",
+                    _gc_thresholds, _t0_old if CONFIG.gc_threshold0 > 0 else _gc_thresholds[0],
+                    f"{_frozen_count:,}",
+                    "ON (promotion pump — for comparison only)" if CONFIG.gc_per_cycle_collect else "off",
                 )
             else:
                 gc.disable()
-                logging.info(
-                    "[GC-POLICY] Automatic collection disabled — young-gen collect per cycle in "
-                    "[CYCLE-CLEANUP], full sweep nightly (thresholds %s, %s object(s) frozen). "
-                    "Set GC_AUTOMATIC=1 to revert.",
+                logging.warning(
+                    "[GC-POLICY] GC_AUTOMATIC=0 — automatic collection DISABLED (the 2026-09-04 "
+                    "policy). This is what caused tracker #0106's ~1 GB/hour heap climb; expect "
+                    "generation-2 garbage to accumulate until the nightly sweep. Thresholds %s, "
+                    "%s object(s) frozen.",
                     _gc_thresholds, f"{_frozen_count:,}",
                 )
 

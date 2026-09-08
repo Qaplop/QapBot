@@ -1,6 +1,47 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-08 (2)  Build 38.
+- ROOT CAUSE of tracker #0106's ~1 GB/hour heap climb found, and the policy that caused it
+  reversed. The 2026-09-04 change (gc.disable() + a per-cycle gc.collect(1)) was not merely
+  failing to reclaim generation-2 garbage -- it was CREATING it. CPython promotes every
+  surviving object to the next generation on each collection, so firing gc.collect(1) at cycle
+  end, while that cycle's war population was still live in temp_war_objects/temp_war_stats,
+  promoted ~20k survivors per cycle straight into generation 2 -- which, with automatic
+  collection off, nothing drained until the 03:00 UTC nightly sweep.
+- Confirmed by direct experiment on 3.14.7 (the version BOTH prod and dev run, per the startup
+  banner's "Python:" line -- so GC semantics transfer, timings still do not): after surviving
+  even ONE gc.collect(1), a cyclic object is unreachable to every later gc.collect(1) (they
+  free 0 and return in 0.0ms); only gc.collect(2) frees it. Simulating the bot's shape over 30
+  cycles: old policy strands 180,000 objects in gen-2, new policy strands 0.
+- Evidence trail, all from PROD: RSS climb per continuous run went ~1.4 MB/min -> ~19 MB/min at
+  the run starting 11 min after the 09-04 16:38 deploy; the nightly sweep's own reclaim count
+  jumped 211,262 -> 11,457,899 on the first night after; and the arithmetic closes (~480
+  cycles/day x ~20k promoted = ~9.6M/day vs the 10.1-11.5M actually reclaimed nightly).
+- THE FIX is the established pattern for latency-sensitive Python (sources in
+  PERFORMANCE_TUNING.md): keep automatic collection ENABLED and make it cheap, rather than
+  turning it off and hand-rolling a schedule. gc.freeze() at startup already keeps the large
+  static caches out of every scan; the missing half was never freezing but THRESHOLD --
+  objects are promoted only by surviving a collection, so raising threshold0 (CPython's
+  default is 2000 since 3.12) means most die by refcounting before any collection sees them.
+  New: CONFIG.gc_automatic=True, gc_threshold0=50000, gc_per_cycle_collect=False, all
+  env-overridable (GC_AUTOMATIC=0 restores the withdrawn behaviour for A/B). The nightly full
+  sweep stays as a backstop and the RSS-restart as the safety net.
+- Added [GC-STATS], a per-cycle per-generation collections/collected delta. [GC-AUTO] only
+  fires for collections >=0.5s, so on its own it cannot answer "how often is CPython
+  collecting?" -- which is exactly what threshold0 tuning needs. Watch gen2= against
+  [CYCLE-END] RSS= and [LOOP-LAG].
+- FIXED THE TEST THAT SHOULD HAVE CAUGHT THIS. test_gc_policy.py's
+  test_repeated_cycles_do_not_accumulate asserted precisely the right property ("backlog
+  accumulated across cycles despite per-cycle collects") and stayed GREEN through the entire
+  incident, because its loop never bound the war graph to a name -- nothing was live at the
+  collect, so nothing survived, so nothing was promoted, and the failure mode was
+  unreproducible by construction. It now holds the graph across the collect as the bot does;
+  verified to fail (~14,880 stranded) against the old policy. Rule recorded: a GC test that
+  never holds objects live across a collection cannot test promotion, and promotion is where
+  the bugs are. The file's docstring, which still described the withdrawn policy as current,
+  was corrected too. 14 new tests in test_gc_policy_promotion.py; suite 2137 pass.
+
 2026-09-08 (1)  Build 37.
 - Added an RSS-triggered self-restart. This is a STOPGAP, not a fix: the Python heap still
   climbs ~1 GB/hour for reasons unfound, and last night proved the DB retuning did not touch it
