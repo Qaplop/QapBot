@@ -154,10 +154,13 @@ def _log_slow_gc(phase: str, info: dict) -> None:  # type: ignore[type-arg]
         return
     elapsed = _gc_time.perf_counter() - t0
     if elapsed >= 0.5:  # gen-0 collections are frequent and normally sub-ms; only the rare slow ones matter
-        # INFO, not WARNING: expected/monitored background behavior (mitigated by the
-        # startup gc.freeze() + nightly re-freeze), not an actionable error on its own.
-        # [GC-AUTO] means CPython chose the moment and is what the GC policy is meant to
-        # eliminate; [GC-SCHEDULED] means we chose it and is expected.
+        # INFO, not WARNING: expected/monitored background behavior (mitigated by the startup
+        # gc.freeze() plus a raised threshold0), not an actionable error on its own.
+        # [GC-AUTO] means CPython chose the moment; since 2026-09-08 that is the NORMAL and
+        # intended path (see [GC-POLICY]) rather than something the policy exists to
+        # eliminate — a rising count here is the signal to raise CONFIG.gc_threshold0
+        # further, not to disable the collector again. [GC-SCHEDULED] means we chose it
+        # (the nightly backstop sweep, or an /admin Memory Profile).
         # `not gc.isenabled()` is the authoritative half: while automatic collection is off,
         # ANY collection is by definition one we asked for. The _gc_deliberate flag only adds
         # the GC_AUTOMATIC=1 case, where both kinds can occur. Build 14 shipped with the flag
@@ -2627,65 +2630,75 @@ async def run_nightly_maintenance_routine(db_mgr: Any, run_migration: bool) -> s
         # and stays warm for the full 25h TTL until the next nightly run.
         await _warm_global_db_stats_cache(force_refresh=True)
 
-        # Step 5: full GC sweep + re-freeze. THIS IS NOW THE ONLY FULL SWEEP THE PROCESS EVER
-        # RUNS (2026-09-04): automatic collection is disabled at startup and the per-cycle
-        # [CYCLE-CLEANUP] collect is young-generation only, so everything promoted out of the
-        # young generations over the day is reclaimed here and nowhere else. Do not weaken or
-        # skip this step without re-enabling automatic collection — see the [GC-POLICY] block
-        # near the startup gc.freeze() for the full rationale and measurements. This window is
-        # the right home for a multi-second pause precisely because db_maintenance_mode already
-        # blocks Discord commands; the update cycle's own sleep window is NOT a safe substitute
+        # Step 5: nightly full GC sweep — a BACKSTOP since 2026-09-08, no longer the only
+        # reclaim path. Automatic collection is enabled again (see the [GC-POLICY] block near
+        # the startup gc.freeze()), so CPython reclaims continuously and this exists to catch
+        # anything that policy misses, and to give a measured full-sweep datapoint per day.
+        # This window is the right home for a multi-second pause because db_maintenance_mode
+        # already blocks Discord commands; the update cycle's sleep window is NOT a substitute
         # (the bot is idle then, which is when users are most likely to be interacting).
-        # Nightly-only counterpart to the startup gc.freeze() (see [GC-FREEZE] near on_ready)
-        # and the per-cycle scoped gc.collect(1) (see the [GC-AUTO] pause logger registered
-        # near the top of this file / _post_cycle_cleanup). Every cycle promotes newly-created
-        # long-lived CACHE growth (new clans, new war metadata — substantial during a CWL
-        # season, e.g. 7000+ active wars) into gen-2, which the one-time startup freeze does
-        # NOT cover, so automatic gen-2 sweeps re-grow expensive over the following days
-        # (confirmed via prod [GC-AUTO] pauses recurring even after the startup freeze —
-        # Issue 3, 2026-08-08). Fix: (a) gc.unfreeze() + a real full gc.collect() here actually
-        # frees any genuine reference cycles that only a full sweep catches — the per-cycle
-        # gc.collect(1) intentionally skips gen-2 every time, so those need SOME real collection
-        # point or they'd become permanent floating garbage once re-frozen; then (b) re-freezing
-        # folds today's legitimate CACHE growth back into the permanent generation, shrinking
-        # what tomorrow's automatic sweeps need to walk. Runs during this maintenance window
-        # (db_maintenance_mode=True, Discord commands already blocked) since a real full collect
-        # over the whole heap costs the same multi-second price the per-cycle scoping exists to
-        # avoid during live cycles. asyncio.to_thread() here only keeps the Discord heartbeat
-        # *task* schedulable while it runs (Pitfall 16) — best-effort, never fails maintenance.
+        #
+        # NO LONGER unfreeze()/re-freeze() (2026-09-08, tracker #0106). It used to do
+        # unfreeze -> collect -> collect -> freeze, and the re-freeze was the problem:
+        # gc.freeze() moves EVERYTHING currently tracked into the permanent generation, so
+        # running it at 03:00 froze whatever happened to be live at that instant — the
+        # in-flight war population, coc_clan_cache, the CWL caches — not just the permanent
+        # baseline. Measured: the startup freeze covers ~616k objects (clan_name_cache +
+        # temp_war_metadata + discord.py's caches, all genuinely permanent), while the nightly
+        # re-freeze covered 1,282,713-2,903,579 — 2 to 4.7x as many.
+        #
+        # Those extra 0.7-2.3M objects are transient, and freezing them is not harmless:
+        # frozen objects are exempt from cyclic collection. Acyclic garbage still dies by
+        # refcounting, but coc.py's graphs are cyclic by construction, so a coc.Clan frozen at
+        # 03:00 and TTL-evicted at 03:10 became garbage the collector could not see until the
+        # NEXT night's unfreeze, 24h later. Under the old disabled-collector policy that was
+        # dwarfed by the ~10M/day promotion leak; with automatic collection restored it would
+        # be the largest remaining surface the GC cannot see.
+        #
+        # Dropping the unfreeze/re-freeze pair keeps the startup freeze PURE — only the
+        # genuinely-permanent caches, which produce no garbage — while the full collect below
+        # still covers everything not frozen. What this gives up is folding post-startup
+        # permanent growth into the frozen set (clan_name_cache gained ~400 entries across a
+        # day), which is a trivial cost against a six-figure nightly leak.
+        #
+        # asyncio.to_thread() here only keeps the Discord heartbeat *task* schedulable while it
+        # runs (Pitfall 16) — best-effort, never fails maintenance.
         try:
             def _nightly_gc_refresh() -> tuple[int, float, float]:
                 global _gc_deliberate
                 _gc_t0 = time.perf_counter()
                 _gc_deliberate = True
                 try:
-                    gc.unfreeze()
                     collected = gc.collect()
                     _gc_t1 = time.perf_counter()
                     # Second back-to-back sweep. The first one both FINDS garbage and WALKS the
                     # live set; this one has no garbage left to find, so its duration is the
                     # pure cost of walking what is still alive. That is the number the CWL-cache
                     # attribution below is a fraction of — without it we would be scaling a
-                    # total that includes work the caches are not responsible for.
+                    # total that includes work the caches are not responsible for. It is also
+                    # the per-collection floor that decides how often a full sweep can afford
+                    # to run at all (see PERFORMANCE_TUNING.md's PROD cost model).
                     gc.collect()
                     _live_walk = time.perf_counter() - _gc_t1
-                    gc.freeze()
                 finally:
                     _gc_deliberate = False
                 return collected, time.perf_counter() - _gc_t0, _live_walk
             _gc_collected, _gc_elapsed, _gc_live_walk = await asyncio.to_thread(_nightly_gc_refresh)
             logging.info(
                 "[NIGHTLY-MAINTENANCE] GC refresh: collected=%d unreachable object(s) in %.3fs "
-                "(live-set walk %.3fs), re-froze %d object(s) into the permanent generation",
+                "(live-set walk %.3fs); %d object(s) remain frozen from startup (no re-freeze "
+                "since 2026-09-08 — it captured transient data, see the comment above)",
                 _gc_collected, _gc_elapsed, _gc_live_walk, gc.get_freeze_count(),
             )
 
             # tracker-0009 follow-up: what Stage 3 did NOT remove. The CWL caches hold
-            # coc.ClanWar / ClanWarLeagueGroup graphs created after startup, so gc.freeze()
-            # never covers them and every full sweep walks them. Measure it here rather than
-            # guess: this is the only full sweep in the process, commands are already blocked,
-            # and the walk is far too expensive for a live cycle. Sampled so a full cache
-            # (1000 wars) cannot stretch the maintenance window.
+            # coc.ClanWar / ClanWarLeagueGroup graphs created after startup, so the startup
+            # gc.freeze() never covers them and every full sweep walks them — deliberately, and
+            # more so since 2026-09-08 removed the nightly re-freeze that used to sweep them
+            # into the permanent generation (where, being cyclic, they became uncollectable for
+            # 24h; see the Step 5 comment). Measure it here rather than guess: commands are
+            # already blocked in this window and the walk is far too expensive for a live
+            # cycle. Sampled so a full cache (1000 wars) cannot stretch the maintenance window.
             try:
                 _fp = await asyncio.to_thread(CACHE.measure_cwl_cache_gc_footprint, 120)
                 _held = _fp["war_objects"] + _fp["group_objects"]

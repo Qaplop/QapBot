@@ -1,6 +1,36 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-08 (3)  Build 39.
+- Removed the nightly gc.unfreeze()/re-freeze() pair (tracker #0106 follow-up). Found while
+  checking whether the startup gc.freeze() covers what it should -- it does; the nightly one
+  did NOT, in the opposite direction: it over-captured. gc.freeze() moves EVERYTHING currently
+  tracked into the permanent generation, so running it at 03:00 froze whatever happened to be
+  live at that instant -- the in-flight war population, coc_clan_cache, the CWL caches -- not
+  just the permanent baseline. Measured on PROD: startup freeze covers 616,678 objects
+  (clan_name_cache 465,610 + temp_war_metadata 42,704 + discord.py's caches, all genuinely
+  permanent), while the nightly re-freeze covered 1,282,713-2,903,579, i.e. 2 to 4.7x as many.
+- Why that is not harmless: frozen objects are exempt from cyclic collection. Acyclic garbage
+  still dies by refcounting, but coc.py's graphs are cyclic by construction, so a coc.Clan
+  frozen at 03:00 and TTL-evicted at 03:10 became garbage the collector could not see until the
+  NEXT night's unfreeze, 24h later. Under the disabled-collector policy this was dwarfed by the
+  ~10M/day promotion leak; with automatic collection restored (build 38) it would have been the
+  largest remaining surface the GC cannot see.
+- The nightly is now a plain full gc.collect() -- no unfreeze, no re-freeze -- which keeps the
+  startup freeze pure and leaves everything transient collectable. It also remains the
+  measured full-sweep datapoint (two-pass: total vs pure live-set walk) that the PROD cost
+  model in PERFORMANCE_TUNING.md is derived from. Gives up folding post-startup permanent
+  growth into the frozen set (clan_name_cache gains ~400 entries/day) -- trivial against a
+  six-figure nightly leak, and a restart re-establishes the freeze anyway.
+- Verified the startup freeze itself is correctly placed and cannot double-fire: it runs after
+  CACHE.load_all() and before the INIT-STEPs, and on_ready returns early on both
+  on_ready_lock.locked() and fully_initialized -- which matters because on_ready fires again on
+  every reconnect, and a second freeze would capture live war data permanently.
+- 4 new tests pinning the hazard directly (frozen cyclic garbage is never collected; acyclic
+  frozen garbage still dies by refcounting; the nightly path no longer unfreezes/refreezes;
+  exactly one gc.freeze() call exists). Also corrected two comments that still described the
+  removed re-freeze as current. Suite 2141 pass.
+
 2026-09-08 (2)  Build 38.
 - ROOT CAUSE of tracker #0106's ~1 GB/hour heap climb found, and the policy that caused it
   reversed. The 2026-09-04 change (gc.disable() + a per-cycle gc.collect(1)) was not merely

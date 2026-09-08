@@ -801,3 +801,40 @@ collecting?" — which is the question `threshold0` tuning actually needs. Watch
 [rolled back in 3.14.5](https://pydevtools.com/blog/python-3145-rolls-back-the-incremental-garbage-collector/).
 PROD and dev both run **3.14.7** (post-rollback, classic generational), confirmed from the
 startup banner's `Python:` line — so dev GC *semantics* transfer. Timings still do not.
+
+### `gc.freeze()` must only ever cover genuinely-permanent objects (2026-09-08)
+
+Placement matters, and so does *not* running it a second time.
+
+**Startup freeze — correct.** It runs after `CACHE.load_all()` and before the INIT-STEPs, so it
+covers `clan_name_cache`, `temp_war_metadata` and discord.py's guild/member caches (populated
+before `on_ready` fires, because discord.py chunks guild members first). Measured: **616,678**
+objects against 465,610 clan entries + 42,704 temp-war-metadata entries. It cannot run twice —
+`on_ready` returns early on both `on_ready_lock.locked()` and `fully_initialized`, which matters
+because `on_ready` fires again on every reconnect.
+
+**Nightly re-freeze — removed.** The nightly used to do
+`unfreeze → collect → collect → freeze`. That re-`freeze()` covered **1,282,713–2,903,579**
+objects — 2 to 4.7× the startup figure — because `gc.freeze()` captures *everything currently
+tracked*, which at 03:00 means the in-flight war population, `coc_clan_cache` and the CWL
+caches, not just the permanent baseline.
+
+That is not harmless:
+
+> **Frozen objects are exempt from cyclic collection.** Acyclic garbage still dies by
+> refcounting, but coc.py's graphs are cyclic by construction — so a `coc.Clan` frozen at 03:00
+> and TTL-evicted at 03:10 was garbage the collector could not see until the *next* night's
+> `unfreeze()`, 24 hours later.
+
+Under the disabled-collector policy this was dwarfed by the ~10M/day promotion leak. With
+automatic collection restored it would have been the largest remaining surface the GC cannot
+see. The nightly is now a plain full `gc.collect()` — no unfreeze, no re-freeze — which keeps
+the startup freeze pure and leaves everything transient collectable.
+
+What this gives up: post-startup permanent growth is no longer folded into the frozen set
+(`clan_name_cache` gains ~400 entries/day). That is a trivial cost against a six-figure nightly
+leak, and a restart re-establishes the freeze anyway.
+
+**Rule:** freeze once, over a set you can argue is permanent. Never freeze on a schedule that
+happens to catch live working data — "what is tracked right now" is not the same question as
+"what is permanent".

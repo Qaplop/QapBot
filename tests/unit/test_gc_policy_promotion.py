@@ -132,6 +132,82 @@ class TestPolicyOutcome:
         assert stranded == 0, f"{stranded} objects stranded in gen-2 under the new policy"
 
 
+class TestFreezeMustNotCaptureTransientData:
+    """Second finding of 2026-09-08: the NIGHTLY re-freeze was over-capturing.
+
+    `gc.freeze()` moves everything currently tracked into the permanent generation, so running
+    it at 03:00 froze whatever happened to be live at that instant — the in-flight war
+    population, coc_clan_cache, the CWL caches — not just the permanent baseline. Measured on
+    PROD: the startup freeze covers ~616k objects; the nightly re-freeze covered
+    1,282,713-2,903,579, i.e. 2-4.7x as many.
+
+    That is not harmless, because frozen objects are exempt from cyclic collection. These tests
+    pin why, and pin that the nightly path no longer does it.
+    """
+
+    def test_frozen_cyclic_garbage_is_never_collected(self):
+        """The hazard itself. Acyclic frozen garbage still dies by refcounting, but coc.py's
+        graphs are cyclic by construction — so a coc.Clan frozen at 03:00 and TTL-evicted at
+        03:10 was garbage the collector could not see until the next night's unfreeze."""
+        gc.collect(2)
+        objs = _make_cycles(5_000)
+        try:
+            gc.freeze()                 # as the nightly re-freeze did, while this was live
+            del objs                    # now unreachable cyclic garbage
+            assert gc.collect(2) == 0, (
+                "frozen cyclic garbage was collected — if CPython changed this, the reason "
+                "for dropping the nightly re-freeze needs re-deriving"
+            )
+        finally:
+            gc.unfreeze()
+        # Once unfrozen it is reclaimable again — which is exactly what the old nightly
+        # unfreeze did, 24 hours late.
+        assert gc.collect(2) == 10_000
+
+    def test_acyclic_frozen_garbage_still_dies_by_refcounting(self):
+        """The control, and why this was survivable rather than catastrophic: only the cyclic
+        share leaked. War payload dicts (build_war_payload output) are acyclic."""
+        gc.collect(2)
+        payloads = [{"tag": i, "members": [{"n": j} for j in range(10)]} for i in range(2_000)]
+        try:
+            gc.freeze()
+            frozen_before = gc.get_freeze_count()
+            del payloads                # refcounting frees these even though frozen
+            assert gc.get_freeze_count() < frozen_before
+        finally:
+            gc.unfreeze()
+
+    @staticmethod
+    def _code_only(src: str) -> str:
+        """Strip comment lines. These assertions are about what EXECUTES — the surrounding
+        comments deliberately discuss gc.freeze()/unfreeze() at length, and matching those
+        would make the test fire on its own documentation."""
+        return "\n".join(
+            line for line in src.splitlines() if not line.lstrip().startswith("#")
+        )
+
+    def test_nightly_path_no_longer_unfreezes_or_refreezes(self):
+        import inspect
+        import QapBot
+        code = self._code_only(inspect.getsource(QapBot.run_nightly_maintenance_routine))
+        assert "gc.unfreeze()" not in code, "the nightly unfreeze is back"
+        assert "gc.freeze()" not in code, (
+            "the nightly re-freeze is back — it captures whatever is live at 03:00, and the "
+            "cyclic share of that becomes uncollectable for 24 hours"
+        )
+
+    def test_startup_freeze_is_the_only_freeze(self):
+        """One freeze, at startup, covering only the genuinely-permanent caches."""
+        import inspect
+        import QapBot
+        code = self._code_only(inspect.getsource(QapBot))
+        assert code.count("gc.freeze()") == 1, (
+            "expected exactly one gc.freeze() call (the startup one); found "
+            f"{code.count('gc.freeze()')}"
+        )
+        assert "gc.unfreeze()" not in code, "no unfreeze should remain anywhere"
+
+
 class TestConfigDefaults:
     def test_automatic_collection_is_on_by_default(self):
         """This is the reversal. Disabling it is what caused #0106."""
