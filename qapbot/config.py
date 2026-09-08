@@ -264,6 +264,33 @@ class BotConfig:
     db_history_cache_size_mb: int = 8        # history
     db_pool_size: int = 8                    # each connection pays cache_size in ANON memory
 
+    # --- RSS-triggered self-restart (tracker #0106, 2026-09-08) ----------------------------
+    # A STOPGAP, not a fix. The Python heap still grows ~1 GB/hour on PROD and nothing found so
+    # far explains it (the SQLite retuning above reduced SQLite's own footprint but did not
+    # touch the climb: RSS still went 4.0 GB -> 8.5 GB overnight on 2026-09-07/08). A process
+    # restart is the only mechanism PROVEN to reclaim it, and the bot already has a safe,
+    # battle-tested restart path — /admin Maintenance Start (close DB with a FULL checkpoint)
+    # followed by Maintenance End (exit 42, which start_qapbot.sh's loop restarts).
+    #
+    # Restarting BEFORE the box is in trouble is what makes this worth doing. The 2026-09-07/08
+    # incident showed the failure sequence is: RSS climbs -> box hits ~94-96% RAM -> kernel
+    # swaps the Python heap to the HDD-backed swap file -> every GC/in-memory walk becomes
+    # seek-bound -> the 03:00 UTC nightly full GC sweep runs on a swapped-out heap and hangs the
+    # NAS for hours. Cutting in at 6 GB keeps RSS below where that spiral starts.
+    #
+    # Each restart also captures a memory profile at HIGH RSS first, which is diagnostic data we
+    # have never had — every profile so far was either at low uptime or taken after the fact.
+    # That is the point of the two-phase arm/fire below: the profile has to be written to disk
+    # before the process goes away.
+    rss_restart_enabled: bool = True
+    rss_restart_threshold_mb: int = 6144        # 6 GB of 10 GB total; thrashing began ~6.5-7 GB
+    # Guard against a hot restart loop: if RSS is already over the threshold shortly after
+    # startup, restarting again immediately would achieve nothing and would take the bot down
+    # permanently. Normal climb takes ~3 h to reach 6 GB, so 45 min is comfortably clear of it
+    # while still catching a genuinely pathological early climb (which would then just log,
+    # since arming also requires the threshold).
+    rss_restart_min_uptime_minutes: int = 45
+
     # DEV-only: Skip CoC API connection entirely (for testing without valid API token)
     no_coc_api: bool = False
 
@@ -512,6 +539,17 @@ def load_config() -> BotConfig:
     except ValueError:
         db_pool_size = 8
 
+    # RSS-triggered self-restart — see the dataclass fields for why this exists.
+    rss_restart_enabled = os.getenv("RSS_RESTART_ENABLED", "true").lower() in ("true", "1", "yes")
+    try:
+        rss_restart_threshold_mb = max(0, int(os.getenv("RSS_RESTART_THRESHOLD_MB", "6144")))
+    except ValueError:
+        rss_restart_threshold_mb = 6144
+    try:
+        rss_restart_min_uptime_minutes = max(0, int(os.getenv("RSS_RESTART_MIN_UPTIME_MINUTES", "45")))
+    except ValueError:
+        rss_restart_min_uptime_minutes = 45
+
     # DEV-only: Skip CoC API connection (for testing without valid API token)
     no_coc_api = os.getenv("NO_COC_API", "false").lower() in ("true", "1", "yes")
 
@@ -576,6 +614,9 @@ def load_config() -> BotConfig:
         db_cache_size_mb=db_cache_size_mb,
         db_history_cache_size_mb=db_history_cache_size_mb,
         db_pool_size=db_pool_size,
+        rss_restart_enabled=rss_restart_enabled,
+        rss_restart_threshold_mb=rss_restart_threshold_mb,
+        rss_restart_min_uptime_minutes=rss_restart_min_uptime_minutes,
         is_dev_mode=is_dev_mode,
         discord_guild_id=discord_guild_id,
         dev_playerregistration_channel_id=dev_playerregistration_channel_id,

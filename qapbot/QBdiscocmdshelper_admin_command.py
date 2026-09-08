@@ -2137,6 +2137,51 @@ async def _handle_backfill_cwl_groups_inner(cache: Any, season: str) -> str:
     return "\n".join(lines)
 
 
+async def start_memtrace_baseline() -> None:
+    """Start an on-demand tracemalloc trace and record the differential baseline.
+
+    Shared by the two things that start a trace: ``/admin Memory Profile`` (interactive) and
+    periodic_main's RSS-threshold self-restart (automatic, tracker #0106). One implementation
+    on purpose — the gen(1) scoping below is subtle and easy to get wrong, and this module has
+    already been bitten once by the same logic living in several hand-maintained copies.
+
+    Leaves ``QBcore.memtrace_pending = True``; periodic_main takes the snapshot at the end of
+    the next cycle, writes the report, stops tracing, and clears the flag. Callers that need to
+    know the report is on disk should wait for that flag to go back to False.
+
+    1 frame of traceback = ~2-3% CPU for the one cycle it stays active.
+
+    The priming collect is scoped to gen(1), NOT a bare ``gc.collect()`` (2026-09-07). This
+    process disables automatic collection precisely to keep full gen-2 sweeps inside the
+    nightly window ([GC-POLICY]: young-gen per cycle, full sweep nightly); a bare collect here
+    broke that and cost what a stray full sweep costs — measured on PROD at 16.552s
+    (``[GC-SCHEDULED] Deliberate gen-2 collection ... collected=1,854,123``), freezing Discord
+    for the whole duration. gen(1) catches recently-created garbage, which is exactly what a
+    "growth since baseline" diff cares about, without chasing old-generation cycles.
+
+    ``asyncio.to_thread()`` would NOT have fixed that on its own: ``gc.collect()`` holds the GIL
+    for its entire sweep whichever OS thread calls it (releasing it mid-collection would let
+    another thread mutate refcounts while the collector traces reachability). It is kept anyway
+    for coroutine hygiene and consistency with every other collect in this module.
+    """
+    import asyncio as _asyncio
+    import gc
+    import tracemalloc
+    from datetime import datetime as _dt
+
+    import QBcore  # type: ignore[import-untyped]
+
+    tracemalloc.start(1)
+    await _asyncio.to_thread(gc.collect, 1)
+    QBcore.memtrace_baseline = tracemalloc.take_snapshot()
+    QBcore._memtrace_baseline_time = _dt.now().strftime("%Y-%m-%dT%H:%M:%S")  # type: ignore[attr-defined]
+    QBcore.memtrace_pending = True
+    logging.info(
+        "[MEMTRACE] On-demand trace started (nframe=1) — baseline snapshot taken, "
+        "will diff after next cycle"
+    )
+
+
 async def handle_memory_profile(cache: Any) -> str:
     """
     Memory profiling with two modes:
@@ -2240,36 +2285,7 @@ async def handle_memory_profile(cache: Any) -> str:
     log_dir = os.path.join(CONFIG.data_dir, "logs")
     existing = sorted(_glob.glob(os.path.join(log_dir, "memprofile_*.txt")), reverse=True)
 
-    # Start on-demand trace: 1 frame = ~2-3% CPU for ONE cycle.
-    # Take a baseline snapshot immediately so save_memtrace_snapshot() can
-    # emit a differential section showing only what grew since tracing started.
-    tracemalloc.start(1)
-    #
-    # Scoped to gen(1), not a bare gc.collect() (2026-09-07, tracker #0106). This process
-    # disables automatic collection specifically to avoid unscoped full sweeps outside the
-    # nightly maintenance window ([GC-POLICY]: young-gen only per cycle, full gen-2 sweep
-    # nightly) -- a bare gc.collect() here broke that policy and cost exactly what a stray
-    # full sweep costs: measured on PROD at 16.552s, `[GC-SCHEDULED] Deliberate gen-2
-    # collection ... collected=1,854,123`, freezing Discord for the whole duration.
-    #
-    # asyncio.to_thread() alone would NOT have fixed that: gc.collect() holds the GIL for
-    # its entire sweep regardless of which OS thread calls it (releasing it mid-collection
-    # would let another thread mutate refcounts while the collector is tracing reachability,
-    # corrupting the pass) -- confirmed the same night by save_memtrace_snapshot()'s OWN
-    # gc.collect(), which IS already thread-offloaded and still produced an 8.852s
-    # `[GC-SCHEDULED] Deliberate gen-2 collection` stall minutes later. The fix that
-    # actually matters is not sweeping gen-2 here at all: gen(1) catches recently-created
-    # garbage -- which is what a "growth since baseline" diff cares about -- without paying
-    # for the deep, rarely-relevant old-generation cycles a full sweep also chases, matching
-    # the per-cycle [CYCLE-CLEANUP] collect's own scope. Still offloaded to a thread on top
-    # of that: harmless, keeps this consistent with every other gc.collect() in this module,
-    # and correct hygiene for a coroutine regardless of the GIL nuance above.
-    await _asyncio.to_thread(gc.collect, 1)
-    from datetime import datetime as _dt2
-    QBcore.memtrace_baseline = tracemalloc.take_snapshot()
-    QBcore._memtrace_baseline_time = _dt2.now().strftime("%Y-%m-%dT%H:%M:%S")  # type: ignore[attr-defined]
-    QBcore.memtrace_pending = True
-    logging.info("[MEMTRACE] On-demand trace started (nframe=1) — baseline snapshot taken, will diff after next cycle")
+    await start_memtrace_baseline()
 
     msg_lines = [
         "🔬 **Memory trace started** (1-frame, ~2-3% CPU overhead).",

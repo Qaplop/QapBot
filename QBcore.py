@@ -87,7 +87,7 @@ BOT_VERSION: str = "1.3.32"
 # .github/copilot-instructions.md.  BOT_VERSION answers "which release is this?";
 # BOT_BUILD answers "which edit of it is actually running?", which is the question that
 # matters when reading the server-machine's log after a file-copy deploy.
-BOT_BUILD: int = 36
+BOT_BUILD: int = 37
 
 
 def source_fingerprint() -> str:
@@ -754,6 +754,22 @@ EXIT_CODE_MAINTENANCE: int = 42
 Exit code written to sys.exit() when /admin MAINTENANCE_END is issued.
 The start.sh wrapper script detects this code and immediately restarts the bot,
 skipping the normal "stopped — not restarting" path.
+"""
+
+rss_restart_armed: bool = False
+"""
+True once the per-cycle RSS check (periodic_main) has seen RSS cross
+``CONFIG.rss_restart_threshold_mb`` and has started a memory trace in response.
+
+Two-phase on purpose: the whole value of the restart is the memory profile captured at HIGH
+RSS just before it, and tracemalloc needs a full cycle between ``start()`` and the snapshot to
+have anything to report. So arming starts the trace, the next cycle runs traced, that cycle's
+end writes the profile to disk (the existing ``memtrace_pending`` handler), and only THEN does
+the restart fire — gated on ``memtrace_pending`` having gone back to False, which is the signal
+that the report is safely on disk.
+
+Never reset to False at runtime: once armed, the only exits are the restart itself or a crash.
+See CONFIG.rss_restart_enabled for why this stopgap exists (tracker #0106).
 """
 
 # --- On-demand memory profiling (PROD-safe) ---

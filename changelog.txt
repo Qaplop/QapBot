@@ -1,6 +1,45 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-08 (1)  Build 37.
+- Added an RSS-triggered self-restart. This is a STOPGAP, not a fix: the Python heap still
+  climbs ~1 GB/hour for reasons unfound, and last night proved the DB retuning did not touch it
+  (RSS 4.0 GB at 20:47 -> 8.5 GB by 02:05). A restart is the only mechanism proven to reclaim
+  the memory, so the bot now does it to itself before the box gets into trouble.
+- WHY BEFORE, not after: the 2026-09-07/08 failure sequence is RSS climbs -> NAS hits ~94-96%
+  RAM -> kernel swaps the Python heap to the HDD-backed swap file -> every GC and in-memory walk
+  becomes seek-bound -> the 03:00 UTC nightly full GC sweep runs on a swapped-out heap and hangs
+  the entire NAS for hours (this morning: REINDEX and ANALYZE actually completed fine at 05:23,
+  then Step 5's full sweep ran for 60+ minutes with the box at 96% RAM). Cutting in at 6 GB of
+  10 GB keeps RSS below where that spiral starts.
+- Reuses the existing, battle-tested restart path rather than inventing one — the same two steps
+  /admin Maintenance Start and Maintenance End perform, called directly (no faked Discord
+  interactions): maintenance_mode=True, then do_maintenance_shutdown() to close the CoC client
+  and the DB with a FULL WAL checkpoint, then exit code 42, which start_qapbot.sh's loop
+  restarts. do_maintenance_shutdown() sets cleaned_up so the async_cleanup() on the way out is
+  a no-op and nothing double-closes.
+- TWO-PHASE, because the profile is the point. Every memory profile so far has been at low
+  uptime or taken after the fact; none captured the heap AT the pathological size. tracemalloc
+  needs a full cycle between start() and the snapshot, so crossing the threshold ARMS (starts
+  the trace), the next cycle runs traced, that cycle's end writes the report via the existing
+  memtrace_pending handler, and only then does the restart fire — gated on memtrace_pending
+  going back to False, which is periodic_main's own signal that the report is on disk. So every
+  restart now leaves behind a profile of the heap at 6+ GB.
+- Guards, because a stopgap must not become the outage: does not fire while maintenance_mode or
+  db_maintenance_mode is set (never restarts mid-REINDEX/VACUUM); requires 45 min uptime, so an
+  RSS already over threshold shortly after a restart logs an ERROR instead of looping forever
+  (normal climb takes ~3 h, so the guard is clear of real firings); the whole block is wrapped
+  so any failure degrades to "no restart" rather than killing the update cycle; placed after
+  _post_cycle_cleanup() so the reading is retained memory rather than transient garbage, and
+  after every pending-flag branch so it cannot collide with queued admin work.
+- Config: CONFIG.rss_restart_enabled / rss_restart_threshold_mb (6144) /
+  rss_restart_min_uptime_minutes (45), all env-overridable (RSS_RESTART_*) so PROD can retune
+  or switch it off without a deploy. Expect roughly one restart every 3-5 h at the current
+  climb rate.
+- Also extracted start_memtrace_baseline(), now shared by /admin Memory Profile and the
+  automatic path. Two hand-maintained copies is precisely how yesterday's gen(1) scoping fix
+  would have silently regressed on one path only. 17 new tests; suite 2123 pass.
+
 2026-09-07 (7)  Build 36.
 - Re-audited the whole #0106 analysis and the work done for it. Three real defects found, all
   of the same class: artefacts that outlived the reasoning that produced them.

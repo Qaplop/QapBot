@@ -3214,6 +3214,87 @@ async def periodic_main() -> None:
                 except Exception:
                     pass
 
+                # --- RSS-triggered self-restart (tracker #0106, 2026-09-08) ---
+                # A STOPGAP for an unexplained ~1 GB/hour heap climb. A restart is the only
+                # mechanism proven to reclaim it, and this reuses the bot's existing, tested
+                # restart path rather than inventing one: maintenance_mode -> close everything
+                # with a FULL DB checkpoint -> exit 42 -> start_qapbot.sh's loop restarts us.
+                #
+                # Placed HERE deliberately: the cycle has fully finished, _post_cycle_cleanup()
+                # has already run its gen(1) collect + malloc_trim (so _rss_mb is retained
+                # memory, not transient garbage), the memtrace handler above has had its turn,
+                # and every "pending" branch that would `continue` has already been taken. The
+                # nightly-maintenance block starts right after this, so firing here also means
+                # we never restart with DB maintenance in flight.
+                #
+                # Two phases, because the profile is the point: tracemalloc needs a full cycle
+                # between start() and the snapshot, so arming starts a trace, the next cycle
+                # runs traced, that cycle's end writes the report, and only then do we restart.
+                # `memtrace_pending` going back to False is the signal that the report is on
+                # disk — that is what phase 2 gates on.
+                try:
+                    if (
+                        CONFIG.rss_restart_enabled
+                        and CONFIG.rss_restart_threshold_mb > 0
+                        and _rss_mb > 0
+                        and not QBcore.maintenance_mode
+                        and not QBcore.db_maintenance_mode
+                    ):
+                        if QBcore.rss_restart_armed and not QBcore.memtrace_pending:
+                            # Phase 2 — profile is written; restart now.
+                            logging.warning(
+                                f"[RSS-RESTART] Memory profile written. Restarting: "
+                                f"RSS={_rss_mb:.1f} MB >= {CONFIG.rss_restart_threshold_mb} MB "
+                                f"threshold. Closing resources, then exiting with code "
+                                f"{QBcore.EXIT_CODE_MAINTENANCE} for the wrapper to restart."
+                            )
+                            # Same two steps /admin Maintenance Start + End perform, called
+                            # directly. do_maintenance_shutdown() is what makes this safe: it
+                            # closes the CoC client and the DB with a full WAL checkpoint. Set
+                            # maintenance_mode first so nothing new can start against a
+                            # closing DB.
+                            QBcore.maintenance_mode = True
+                            from QBdiscordcmds import do_maintenance_shutdown
+                            await do_maintenance_shutdown()
+                            QBcore.exit_code = QBcore.EXIT_CODE_MAINTENANCE
+                            QBcore.shutdown_event.set()
+                            break
+                        if (
+                            not QBcore.rss_restart_armed
+                            and _rss_mb >= CONFIG.rss_restart_threshold_mb
+                        ):
+                            # Guard against a hot restart loop: if RSS is already over the
+                            # threshold minutes after a restart, restarting again achieves
+                            # nothing and would take the bot down for good. Log it instead —
+                            # that state is itself the finding.
+                            _uptime_min = (
+                                (datetime.now().timestamp() - QBcore.bot_start_time) / 60.0
+                                if QBcore.bot_start_time else 0.0
+                            )
+                            if _uptime_min < CONFIG.rss_restart_min_uptime_minutes:
+                                logging.error(
+                                    f"[RSS-RESTART] RSS={_rss_mb:.1f} MB is already over the "
+                                    f"{CONFIG.rss_restart_threshold_mb} MB threshold after only "
+                                    f"{_uptime_min:.0f} min of uptime — NOT restarting (would "
+                                    f"loop). This is worse than the climb it guards against; "
+                                    f"investigate rather than raising the threshold."
+                                )
+                            else:
+                                logging.warning(
+                                    f"[RSS-RESTART] RSS={_rss_mb:.1f} MB crossed the "
+                                    f"{CONFIG.rss_restart_threshold_mb} MB threshold after "
+                                    f"{_uptime_min:.0f} min. Arming: tracing the next cycle, "
+                                    f"then restarting once its profile is on disk."
+                                )
+                                QBcore.rss_restart_armed = True
+                                from qapbot.QBdiscocmdshelper_admin_command import (
+                                    start_memtrace_baseline,
+                                )
+                                await start_memtrace_baseline()
+                except Exception as _rss_ex:
+                    # Never let the stopgap be the thing that breaks the cycle.
+                    logging.error(f"[RSS-RESTART] Check failed (non-fatal): {_rss_ex}", exc_info=True)
+
                 # --- Nightly DB maintenance ---
                 # Run once per 24 h at exactly 03:00 UTC (hour == 3, minute == 0).
                 # Chosen at 03:00 UTC because CWL wars end before ~01:00 UTC, so the
