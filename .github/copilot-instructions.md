@@ -452,6 +452,7 @@ All pitfalls: short snippets + details in ../qapbot/docs/COPILOT_PITFALLS_COOKBO
 - **Content**: Short and crisp — a few lines stating what changed (Fixed/Added/Changed) and why, plus the file(s) touched and the test result. Not a multi-paragraph blow-by-blow of every branch/file touched.
 - **Documentation Updates**: See Cardinal Rule 15 — update the relevant doc(s) in the same pass, not as a follow-up.
 - **Tests**: Run `.\run_tests.ps1` (see "After Writing Code" above) and report the real pass count in the entry — never a raw `pytest` count, which misreports deliberately-deselected tests as failures.
+  - **Quote the WHOLE-suite total, not the `tests/unit` subset.** `run_tests.ps1` collects `tests/unit`, `tests/discord` and `tests/integration` together and prints one total on its last line - use that number verbatim. (2026-09-08: entries from 2026-09-06 onward quoted 2123/2137/2141, which is `tests/unit` alone; the real totals were ~1,000 higher. A count that silently means a different thing each time is worse than none, since it cannot be compared across entries.)
 - **Build number**: Bump `BOT_BUILD` (Cardinal Rule 17) in the same pass, and state it in the entry as `Build N.` so a log line can be traced back to exactly this changelog entry.
 
 **Example** (see `changelog.txt` itself for the full live convention):

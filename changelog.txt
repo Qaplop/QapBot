@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-08 (4)
+- Fixed: CI marked run 34249818747 as failed although every test step passed. The
+  "Upload coverage.xml" step hit `Failed to FinalizeArtifact: (403) Forbidden: Error from
+  intermediary` -- GitHub's edge proxy rejecting the finalize call AFTER the blob upload had
+  already succeeded (76102 bytes written). Not a config problem: the identical workflow and
+  `permissions: contents: read` block passed 28 min earlier on fd1d595, the repo is public so
+  no storage quota applies, and an auth failure would abort before the blob write. Known
+  intermittent v4 backend fault, actions/upload-artifact#560.
+- The artifact is explicitly informational, so `continue-on-error: true` on that step now keeps
+  a flaky upload from turning the run red. A genuine test failure still fails the run.
+  File: .github/workflows/test.yml. No BOT_BUILD bump -- CI-only, nothing that ships in the bot.
+- Note on the pass count below: previous entries quoting ~2137-2141 were reporting the
+  `tests/unit` subset only. `.un_tests.ps1` runs all three directories. Suite 3220 pass
+  (unit 2141 + discord 772 + integration 307).
+
 2026-09-08 (3)  Build 39.
 - Removed the nightly gc.unfreeze()/re-freeze() pair (tracker #0106 follow-up). Found while
   checking whether the startup gc.freeze() covers what it should -- it does; the nightly one
