@@ -4029,22 +4029,30 @@ async def _run_startup_initialization() -> None:
             }
             logging.info(f"📊 Cache stats: {stats}")
 
-            # GC thresholds: leave CPython's defaults alone. (2026-09-04)
+            # GC thresholds are set further down, in the [GC-POLICY] block. (2026-09-09)
             #
-            # This used to call gc.set_threshold(700, 10, 20) — "raise the gen-2 multiplier to
-            # 20, gen-0/gen-1 left at their defaults" (2026-08-17,
-            # CWL_PROD_PERFORMANCE_FIX_PLAN.md P2 Step 10). That comment was written against
-            # Python <=3.11, whose default really was (700, 10, 10). **Python 3.12 raised the
-            # gen-0 default to 2000**, so on PROD's 3.14 that call was silently *lowering* gen-0
-            # from 2000 to 700 — tripling how often gen-0 runs (measured: 1,214 gen-0 collections
-            # vs 425 for the same workload) while buying nothing. And the gen-2 multiplier no
-            # longer does what the comment claims either: 3.13 replaced the old three-generation
-            # collector with an incremental one, and threshold2 no longer reliably gates full
-            # sweeps (measured: threshold2 of 20 vs 1000 produced the same number of gen-2
-            # collections). Both halves of that mitigation were inoperative-to-harmful.
+            # History, because two separate wrong mental models have been coded here already:
             #
-            # Do not re-add a set_threshold() call without re-measuring on the *deployed* Python
-            # version — the defaults and the collector itself have changed twice since 3.11.
+            # 1. This used to call gc.set_threshold(700, 10, 20) — "raise the gen-2 multiplier
+            #    to 20, gen-0/gen-1 left at their defaults" (2026-08-17,
+            #    CWL_PROD_PERFORMANCE_FIX_PLAN.md P2 Step 10). Written against Python <=3.11,
+            #    whose default really was (700, 10, 10). **Python 3.12 raised the gen-0 default
+            #    to 2000**, so on 3.14 that call silently *lowered* gen-0 from 2000 to 700,
+            #    tripling how often gen-0 runs (measured: 1,214 gen-0 collections vs 425 for the
+            #    same workload) while buying nothing.
+            #
+            # 2. The 2026-09-04 replacement comment then claimed threshold2 no longer gates full
+            #    sweeps at all, because "3.13 replaced the three-generation collector with an
+            #    incremental one". **That is not true of the deployed interpreter.** The
+            #    incremental collector landed in 3.14.0 and was ROLLED BACK in 3.14.5; PROD runs
+            #    3.14.7, i.e. the classic generational collector, where thresholds gate exactly
+            #    what the docs say they gate. The measurement behind that claim (threshold2 of 20
+            #    vs 1000 producing the same gen-2 count) is better explained by the
+            #    long_lived_pending heuristic, which gates full sweeps independently of
+            #    threshold2.
+            #
+            # The rule both mistakes violate: re-measure on the *deployed* Python version, and
+            # check whether a CPython change was later reverted before reasoning from it.
             _gc_thresholds = gc.get_threshold()
 
             # Freeze the just-loaded CACHE state into gc's permanent generation.
@@ -4146,18 +4154,26 @@ async def _run_startup_initialization() -> None:
             # refcounting before any collection sees them. See qapbot/docs/PERFORMANCE_TUNING.md
             # for the sources and the full measurement trail.
             if CONFIG.gc_automatic:
-                if CONFIG.gc_threshold0 > 0:
+                if CONFIG.gc_threshold0 > 0 or CONFIG.gc_threshold1 > 0:
                     _t0_old, _t1_old, _t2_old = gc.get_threshold()
-                    gc.set_threshold(CONFIG.gc_threshold0, _t1_old, _t2_old)
+                    # threshold1 gates gen-2 frequency as well as gen-1: CPython bumps
+                    # count[2] once per gen-1 collection. See CONFIG.gc_threshold1 for the
+                    # 25h PROD measurement this was set from (gen-1 = 51% of stall time for
+                    # 12% of the reclaim; every >=3s ACK breach was gen-2, none were gen-1).
+                    gc.set_threshold(
+                        CONFIG.gc_threshold0 or _t0_old,
+                        CONFIG.gc_threshold1 or _t1_old,
+                        _t2_old,
+                    )
                     _gc_thresholds = gc.get_threshold()
                 if not gc.isenabled():
                     gc.enable()
                 logging.info(
-                    "[GC-POLICY] Automatic collection ENABLED with thresholds %s (gen-0 default "
-                    "on this Python is %d), %s object(s) frozen out of every scan. Per-cycle "
+                    "[GC-POLICY] Automatic collection ENABLED with thresholds %s (gen-0/gen-1 "
+                    "defaults on this Python are %s), %s object(s) frozen out of every scan. Per-cycle "
                     "collect: %s. Nightly full sweep remains as a backstop. Set GC_AUTOMATIC=0 "
                     "to restore the 2026-09-04 disabled-collector behaviour.",
-                    _gc_thresholds, _t0_old if CONFIG.gc_threshold0 > 0 else _gc_thresholds[0],
+                    _gc_thresholds, (_t0_old, _t1_old) if (CONFIG.gc_threshold0 > 0 or CONFIG.gc_threshold1 > 0) else _gc_thresholds[:2],
                     f"{_frozen_count:,}",
                     "ON (promotion pump — for comparison only)" if CONFIG.gc_per_cycle_collect else "off",
                 )

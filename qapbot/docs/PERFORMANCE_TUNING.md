@@ -763,8 +763,8 @@ make it cheap**, rather than turning it off and hand-rolling a schedule.
 ```python
 gc.collect(2)
 gc.freeze()                                  # already done at startup
-_, gen1, gen2 = gc.get_threshold()
-gc.set_threshold(50_000, gen1, gen2)         # CPython's default is 2000 since 3.12
+_, _, gen2 = gc.get_threshold()
+gc.set_threshold(50_000, 30, gen2)           # CPython's defaults: 2000 since 3.12, and 10
 ```
 
 1. **`gc.freeze()`** keeps the large static caches out of every scan — this is why PROD's
@@ -772,11 +772,54 @@ gc.set_threshold(50_000, gen1, gen2)         # CPython's default is 2000 since 3
 2. **Raising `threshold0`** attacks promotion *at source*: objects are promoted only by
    surviving a collection, so collecting far less often in gen-0 means the vast majority die
    by refcounting before any collection sees them.
-3. **Nightly full sweep** stays as a backstop; the RSS-triggered restart stays as a safety net.
+3. **Raising `threshold1`** (2026-09-09, build 40) cuts gen-2 frequency as well as gen-1,
+   because CPython bumps `count[2]` once per gen-1 collection.
+4. **Nightly full sweep** stays as a backstop; the RSS-triggered restart stays as a safety net.
 
-Config: `CONFIG.gc_automatic` / `gc_threshold0` / `gc_per_cycle_collect`, env-overridable as
-`GC_AUTOMATIC` / `GC_THRESHOLD0` / `GC_PER_CYCLE_COLLECT`. `GC_AUTOMATIC=0` restores the
-withdrawn 2026-09-04 behaviour for comparison.
+Config: `CONFIG.gc_automatic` / `gc_threshold0` / `gc_threshold1` / `gc_per_cycle_collect`,
+env-overridable as `GC_AUTOMATIC` / `GC_THRESHOLD0` / `GC_THRESHOLD1` /
+`GC_PER_CYCLE_COLLECT`. `GC_AUTOMATIC=0` restores the withdrawn 2026-09-04 behaviour for
+comparison.
+
+### Why `threshold1` was raised 10 -> 30 (measured over 25 h on PROD, build 39)
+
+981 logged pauses over one continuous 25 h 20 m run:
+
+| | events | total pause | share of stall | objects reclaimed | efficiency |
+|---|---|---|---|---|---|
+| gen-1 | 875 | 760 s | 51% | 3,748,895 | 4,930 obj/s |
+| gen-2 | 96 | 737 s | 49% | 30,901,837 | **41,931 obj/s** |
+
+Total 1503 s of 90,360 s wall = **1.66%**. p95 loop lag 0.053 s.
+
+**gen-1 spent half the stall budget to reclaim 12% of the objects** — gen-2 is 8.5x more
+efficient per second of pause. Same mechanism as #0106's root cause: at gen-1 time the
+cycle's war population is still *live*, so gen-1 walks it, finds it alive and promotes it,
+reclaiming little; it dies at cycle end and gen-2 sweeps it in bulk.
+
+The Discord-ACK damage was **entirely** gen-2: 95 of 96 gen-2 collections exceeded 3 s;
+**zero** of 875 gen-1 collections did. So the target is gen-2 frequency, and `threshold1`
+is the knob that gates it.
+
+> **What is NOT yet measured:** each gen-1 now walks ~3x the accumulated content, so total
+> gen-1 time will not fall 3x. The real saving is that objects get longer to die before
+> anything walks them. Re-run this same census after a day on build 40 before tuning further.
+
+Instruments that answer this, and the ones that do **not**:
+
+| Question | Instrument |
+|---|---|
+| How often does each generation collect? | `[GC-STATS]` per-cycle deltas |
+| What does a collection cost? | `[GC-AUTO]` (logs pauses >= 0.5 s) |
+| What does the user feel? | `[LOOP-LAG]` p95 + `over_500ms` |
+| What is resident, and what is frozen? | Memory Profile `[GC OBJECT COUNTS]` |
+| **Where does a GC pause come from?** | **NOT `PROFILE_PHASE1`** - see below |
+
+`PROFILE_PHASE1` cannot see a GC pause. cProfile instruments Python function *calls*, while a
+collection runs inside the allocator, triggered by whichever allocation happened to cross the
+threshold — so cProfile charges the 8-10 s to an essentially arbitrary victim function. It
+does not merely miss the answer, it manufactures a wrong one. Use it for cycle wall-time
+questions only, and read "The trap" section above first.
 
 ### PROD gen-2 cost model (measured, for tuning)
 

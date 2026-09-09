@@ -32,6 +32,18 @@ os.environ.setdefault("DISCORD_TOKEN", "test-token")
 import pytest
 
 
+def _code_only(src: str) -> str:
+    """Strip comment lines. These assertions are about what EXECUTES.
+
+    The surrounding comments deliberately quote gc.freeze()/unfreeze() and the historical
+    gc.set_threshold(700, 10, 20) call at length, so matching raw source would make these
+    tests fire on their own documentation. (It did, on 2026-09-09.)
+    """
+    return "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
 class _Node:
     """Cyclic by construction, like coc.py's war graph (WarAttack.war / WarClan._war point
     back at the ClanWar). Refcounting can never free these; only the cyclic collector can."""
@@ -177,19 +189,10 @@ class TestFreezeMustNotCaptureTransientData:
         finally:
             gc.unfreeze()
 
-    @staticmethod
-    def _code_only(src: str) -> str:
-        """Strip comment lines. These assertions are about what EXECUTES — the surrounding
-        comments deliberately discuss gc.freeze()/unfreeze() at length, and matching those
-        would make the test fire on its own documentation."""
-        return "\n".join(
-            line for line in src.splitlines() if not line.lstrip().startswith("#")
-        )
-
     def test_nightly_path_no_longer_unfreezes_or_refreezes(self):
         import inspect
         import QapBot
-        code = self._code_only(inspect.getsource(QapBot.run_nightly_maintenance_routine))
+        code = _code_only(inspect.getsource(QapBot.run_nightly_maintenance_routine))
         assert "gc.unfreeze()" not in code, "the nightly unfreeze is back"
         assert "gc.freeze()" not in code, (
             "the nightly re-freeze is back — it captures whatever is live at 03:00, and the "
@@ -200,7 +203,7 @@ class TestFreezeMustNotCaptureTransientData:
         """One freeze, at startup, covering only the genuinely-permanent caches."""
         import inspect
         import QapBot
-        code = self._code_only(inspect.getsource(QapBot))
+        code = _code_only(inspect.getsource(QapBot))
         assert code.count("gc.freeze()") == 1, (
             "expected exactly one gc.freeze() call (the startup one); found "
             f"{code.count('gc.freeze()')}"
@@ -239,6 +242,20 @@ class TestConfigDefaults:
         monkeypatch.setenv("GC_THRESHOLD0", "lots")
         assert load_config().gc_threshold0 == 50_000
 
+    def test_threshold1_is_raised_above_the_cpython_default(self):
+        """Raised 10 -> 30 on 2026-09-09. Measured over 25h on PROD (build 39): gen-1 spent
+        51% of the total stall budget to reclaim 12% of the objects, while every one of the
+        95 >=3s ACK-deadline breaches was a gen-2 collection and none were gen-1."""
+        from qapbot.config import CONFIG
+        assert CONFIG.gc_threshold1 > 10
+
+    def test_threshold1_override_and_bad_value_fallback(self, monkeypatch):
+        from qapbot.config import load_config
+        monkeypatch.setenv("GC_THRESHOLD1", "17")
+        assert load_config().gc_threshold1 == 17
+        monkeypatch.setenv("GC_THRESHOLD1", "plenty")
+        assert load_config().gc_threshold1 == 30
+
 
 class TestWiring:
     """Source-level: the real paths need a live bot, so pin the properties that would
@@ -252,6 +269,16 @@ class TestWiring:
             "the per-cycle gc.collect(1) is no longer gated — it would run unconditionally "
             "again, which is exactly the promotion pump"
         )
+
+    def test_startup_applies_both_thresholds_not_just_gen0(self):
+        """The bug this guards: the original block passed `_t1_old` straight through, so a
+        gc_threshold1 value would have been silently ignored."""
+        import inspect
+        import QapBot
+        src = _code_only(inspect.getsource(QapBot))
+        i = src.index("gc.set_threshold(")
+        call = src[i:i + 200]
+        assert "CONFIG.gc_threshold0" in call and "CONFIG.gc_threshold1" in call, call
 
     def test_gc_stats_delta_reports_per_generation_counts(self):
         """The tuning instrument: [GC-AUTO] only logs collections >=0.5s, so without this we

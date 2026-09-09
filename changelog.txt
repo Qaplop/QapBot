@@ -1,6 +1,41 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-09 (1)  Build 40.
+- Changed: GC threshold1 10 -> 30 (gen-0 collections between gen-1 collections). Derived from
+  a 25h 20m continuous PROD run on build 39 -- 981 logged pauses:
+      gen-1: 875 events, 760s total pause, 51% of all stall time, 3,748,895 objects (4,930/s)
+      gen-2:  96 events, 737s total pause, 49% of all stall time, 30,901,837 objects (41,931/s)
+  gen-1 spent HALF the stall budget to reclaim 12% of the objects; gen-2 is 8.5x more
+  efficient per second of pause. Same mechanism as #0106's root cause: at gen-1 time the
+  cycle's war population is still live, so gen-1 walks it, promotes it and reclaims little.
+  The Discord-ACK damage is entirely gen-2 -- 95 of 96 gen-2 collections exceeded 3s, and
+  ZERO of 875 gen-1 collections did. threshold1 gates gen-2 frequency too (CPython bumps
+  count[2] once per gen-1 collection), so this targets the breaches directly. Expect gen-2
+  every ~48 min instead of ~16. MAGNITUDE UNMEASURED: each gen-1 now walks ~3x the
+  accumulated content, so total gen-1 time will not fall 3x -- re-run the same [GC-AUTO]
+  census after a day before tuning further.
+- Fixed: the startup block passed `_t1_old` straight through to gc.set_threshold(), so a
+  gc_threshold1 value would have been silently ignored. New test pins both thresholds reach
+  the call.
+- Fixed: stale comment in QapBot.py claimed threshold2 no longer gates full sweeps because
+  "3.13 replaced the collector with an incremental one". The incremental collector landed in
+  3.14.0 and was ROLLED BACK in 3.14.5; PROD runs 3.14.7, i.e. the classic generational
+  collector where thresholds gate exactly what the docs say. The measurement behind that
+  claim is better explained by the long_lived_pending heuristic.
+- Fixed: .env.example still documented the withdrawn 2026-09-04 policy (gc.disable() + a
+  per-cycle collect) as the default. Rewritten, and GC_THRESHOLD0/GC_THRESHOLD1 documented.
+- Also verified from the same log: build 39 ran 25h20m with no restart, RSS-restart never
+  armed, and the nightly reported collected=60,779 versus the 10.1-11.5 MILLION it reported
+  under the broken policy -- a 99.4% drop confirming the #0106 fix holds over a full day.
+  RSS is flat-to-declining post-step (-16.2 MB/h, 95% CI -20.1..-12.3).
+- Documented in PERFORMANCE_TUNING.md, including why PROFILE_PHASE1 cannot answer a GC-pause
+  question: cProfile instruments Python function calls, but a collection runs inside the
+  allocator triggered by whichever allocation crossed the threshold, so it charges the 8-10s
+  to an arbitrary victim function -- it manufactures a wrong answer rather than missing one.
+  Files: qapbot/config.py, QapBot.py, QBcore.py, .env.example,
+  qapbot/docs/PERFORMANCE_TUNING.md. 3 new tests; suite 3223 pass.
+
 2026-09-08 (4)
 - Fixed: CI marked run 34249818747 as failed although every test step passed. The
   "Upload coverage.xml" step hit `Failed to FinalizeArtifact: (403) Forbidden: Error from
@@ -13,7 +48,8 @@ Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but
   a flaky upload from turning the run red. A genuine test failure still fails the run.
   File: .github/workflows/test.yml. No BOT_BUILD bump -- CI-only, nothing that ships in the bot.
 - Note on the pass count below: previous entries quoting ~2137-2141 were reporting the
-  `tests/unit` subset only. `.un_tests.ps1` runs all three directories. Suite 3220 pass
+  `tests/unit` subset only. `.
+un_tests.ps1` runs all three directories. Suite 3220 pass
   (unit 2141 + discord 772 + integration 307).
 
 2026-09-08 (3)  Build 39.

@@ -297,6 +297,26 @@ class BotConfig:
     # PROD's [GC-AUTO]/[LOOP-LAG] lines, not a proven optimum for this workload.
     gc_automatic: bool = True          # was disabled 2026-09-04; that is what caused the climb
     gc_threshold0: int = 50_000        # 0 = leave CPython's default (2000 on 3.12+) alone
+    # threshold1 gates BOTH gen-1 and gen-2 frequency: CPython increments count[2] once per
+    # gen-1 collection, so gen-2 fires every threshold1 x threshold2 gen-0 collections.
+    # Raised 10 -> 30 on 2026-09-09 from a 25h PROD measurement (build 39, 981 logged pauses):
+    #
+    #            events   total pause   share of stall   objects reclaimed   efficiency
+    #   gen-1       875          760s              51%           3,748,895    4,930/s
+    #   gen-2        96          737s              49%          30,901,837   41,931/s
+    #
+    # gen-1 spent HALF the stall budget to reclaim 12% of the objects -- gen-2 is 8.5x more
+    # efficient per second of pause. The reason is the same mechanism as #0106's root cause:
+    # at gen-1 time the cycle's war population is still LIVE, so gen-1 walks it, finds it
+    # alive and promotes it, reclaiming little. It dies at cycle end and gen-2 sweeps it in
+    # bulk. All 95 of the >=3s Discord-ACK breaches were gen-2; ZERO were gen-1.
+    #
+    # Expected: gen-1 and gen-2 both ~3x rarer (gen-2 every ~48 min instead of ~16). Each
+    # gen-1 then walks more accumulated content, so total gen-1 time will NOT fall 3x -- the
+    # real saving is that objects get longer to die before anything walks them. Direction is
+    # well-supported by the table above; MAGNITUDE IS UNMEASURED. Re-run the same [GC-AUTO]
+    # census after a day and compare before tuning further.
+    gc_threshold1: int = 30            # 0 = leave CPython's default (10) alone
     # The per-cycle collect is the promotion pump described above. Off by default now. Kept as
     # a switch purely so the old behaviour can be restored for comparison without a code edit.
     gc_per_cycle_collect: bool = False
@@ -586,6 +606,10 @@ def load_config() -> BotConfig:
         gc_threshold0 = max(0, int(os.getenv("GC_THRESHOLD0", "50000")))
     except ValueError:
         gc_threshold0 = 50_000
+    try:
+        gc_threshold1 = max(0, int(os.getenv("GC_THRESHOLD1", "30")))
+    except ValueError:
+        gc_threshold1 = 30
     gc_per_cycle_collect = os.getenv("GC_PER_CYCLE_COLLECT", "").strip().lower() in ("1", "true", "yes")
 
     # RSS-triggered self-restart — see the dataclass fields for why this exists.
@@ -665,6 +689,7 @@ def load_config() -> BotConfig:
         db_pool_size=db_pool_size,
         gc_automatic=gc_automatic,
         gc_threshold0=gc_threshold0,
+        gc_threshold1=gc_threshold1,
         gc_per_cycle_collect=gc_per_cycle_collect,
         rss_restart_enabled=rss_restart_enabled,
         rss_restart_threshold_mb=rss_restart_threshold_mb,
