@@ -1,6 +1,32 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-12 (3)  Build 43.
+- Added: instrumentation-only re-measurement for tracker #0113 (SQLite page-cache
+  pollution from passive-clan war-append writes). No behaviour change. Ticket was filed
+  explicitly asking to re-measure on post-#0106 PROD before designing any fix -- this is
+  that measurement.
+  * [DB-BULK-WRITE] now logs elapsed= for each append batch's params-build + executemany +
+    commit critical section. The ticket's original "1.08s -> 3.18s" figure was derived from
+    timestamps BETWEEN log lines (noisy -- includes whatever ran between batches); this is a
+    real measured duration for just the write itself.
+  * New [DB-READ-TIMING] line on get_player_war_history_sync (the actual Discord-command
+    hot-path read backing a player's war-stats lookup) and get_war_summaries_sync (broader,
+    some call sites possibly cycle-driven -- see the code comment), logged unconditionally
+    at INFO rather than threshold-gated, since call volume is bounded by Discord command
+    usage and the correlation analysis needs the full distribution, not just tail events.
+  * Corrected two stale numbers found while reading the ticket against current code: the
+    ticket's premise cites cache_size 16MB/schema (the first #0106 pass); the shipped
+    default is now 32MB main / 8MB history (the later HDD-swap revision). And `history` is
+    confirmed OUT of the per-cycle write path (DATABASE_ARCHITECTURE.md) -- the append flood
+    writes only to main.*, which is also what the hot reads above hit for recent data.
+  Files: qapbot/db_manager.py. 7 new tests (test_db_bulk_write_timing.py,
+  TestReadPathTimingInstrumentation in test_db_player_attack_history.py). Suite 3230 pass.
+- Also clarified during this pass: the "#0113" label was used informally in an earlier
+  session to describe the UNRELATED temp_war_objects/temp_war_stats in-memory leak
+  (confirmed over 60.6h on build 40: 8,232 -> 30,486 entries, no TTL). That has no tracker
+  item yet -- to be filed and scoped separately once this #0113 measurement is deployed.
+
 2026-09-12 (2)  Build 42.
 - Verified: qapbot/scripts/analyze_cwl_rounds.py is fully functional. Runs end-to-end against
   the current 2026-09 season; all three imports resolve (normalize_cwl_season,

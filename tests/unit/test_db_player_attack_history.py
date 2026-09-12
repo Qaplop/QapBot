@@ -223,6 +223,90 @@ class TestGetWarSummariesSyncCrossClan:
         assert rows[0]["clan_tag"] == "#OLD"
 
 
+class TestReadPathTimingInstrumentation:
+    """#0113 re-measurement (2026-09-12): pin the [DB-READ-TIMING] log format for the
+    two hot-path read functions, since the correlation analysis on PROD parses these
+    fields by name. A silent format drift here would corrupt that analysis without
+    any test failing to say so."""
+
+    def test_get_player_war_history_sync_logs_elapsed_and_row_count(self, tmp_path, caplog):
+        dm = _make_db(tmp_path)
+        _insert_attack(_path(dm), war_id="W1", clan_tag="#OLD", date="2026-06-05T10:00",
+                        player_name="Alice", player_tag="#P1", stars=2)
+        _insert_attack(_path(dm), war_id="W2", clan_tag="#NEW", date="2026-06-20T10:00",
+                        player_name="Alice", player_tag="#P1", stars=3)
+
+        with caplog.at_level("INFO"):
+            rows = dm.get_player_war_history_sync("#P1")
+
+        assert len(rows) == 2
+        [line] = [r.message for r in caplog.records if "[DB-READ-TIMING]" in r.message]
+        assert "get_player_war_history_sync" in line
+        assert "player=#P1" in line
+        assert "rows=2" in line
+        elapsed = float(line.split("elapsed=")[1].split("s ")[0])
+        assert elapsed >= 0.0
+
+    def test_get_player_war_history_sync_logs_on_query_failure(self, tmp_path, caplog):
+        """The error path must ALSO log a timing line — an analysis that only sees the
+        success-path samples would systematically underestimate contention, since a
+        query slowed enough to error out is exactly the case we care about."""
+        dm = _make_db(tmp_path)
+        conn = sqlite3.connect(_path(dm))
+        conn.execute("DROP TABLE war_summary")
+        conn.commit()
+        conn.close()
+
+        with caplog.at_level("INFO"):
+            rows = dm.get_player_war_history_sync("#P1")
+
+        assert rows == []
+        [line] = [r.message for r in caplog.records if "[DB-READ-TIMING]" in r.message]
+        assert "rows=ERROR" in line
+
+    def test_get_war_summaries_sync_logs_elapsed_and_row_count(self, tmp_path, caplog):
+        dm = _make_db(tmp_path)
+        _insert_summary(_path(dm), war_id="W1", clan_tag="#OLD", cwl_season="2026-06")
+        _insert_summary(_path(dm), war_id="W2", clan_tag="#OLD", cwl_season="2026-06")
+
+        with caplog.at_level("INFO"):
+            rows = dm.get_war_summaries_sync("#OLD", season="2026-06")
+
+        assert len(rows) == 2
+        [line] = [r.message for r in caplog.records if "[DB-READ-TIMING]" in r.message]
+        assert "get_war_summaries_sync" in line
+        assert "clan=#OLD" in line
+        assert "season=2026-06" in line
+        assert "rows=2" in line
+
+    def test_get_war_summaries_sync_logs_all_when_clan_tag_none(self, tmp_path, caplog):
+        """clan=ALL is the readable form of clan_tag=None in the log — a raw 'clan=None'
+        would look like a bug (an unset field) rather than the deliberate cross-clan
+        query it actually is."""
+        dm = _make_db(tmp_path)
+        _insert_summary(_path(dm), war_id="W1", clan_tag="#OLD", cwl_season="2026-06")
+
+        with caplog.at_level("INFO"):
+            dm.get_war_summaries_sync(None, season="2026-06")
+
+        [line] = [r.message for r in caplog.records if "[DB-READ-TIMING]" in r.message]
+        assert "clan=ALL" in line
+
+    def test_get_war_summaries_sync_logs_on_query_failure(self, tmp_path, caplog):
+        dm = _make_db(tmp_path)
+        conn = sqlite3.connect(_path(dm))
+        conn.execute("DROP TABLE war_summary")
+        conn.commit()
+        conn.close()
+
+        with caplog.at_level("INFO"):
+            rows = dm.get_war_summaries_sync("#OLD", season="2026-06")
+
+        assert rows == []
+        [line] = [r.message for r in caplog.records if "[DB-READ-TIMING]" in r.message]
+        assert "rows=ERROR" in line
+
+
 class TestCompositePlayerTagDateIndex:
     """
     Regression test for the perf fix: get_player_attack_history_sync's WHERE clause

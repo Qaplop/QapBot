@@ -871,6 +871,12 @@ class WarHistoryDB:
                 batch = appends[i : i + batch_size]
                 with self._sync_write_lock:
                     conn.execute("PRAGMA wal_autocheckpoint=0")
+                    # #0113 re-measurement (2026-09-12): the pre-#0106 "1.08s -> 3.18s"
+                    # write-batch figure was derived from timestamps BETWEEN log lines, not
+                    # a measured duration -- noisy, since that also counts whatever ran
+                    # between batches. This timer covers exactly the params-build +
+                    # executemany + commit critical section below.
+                    _batch_t0 = _time.monotonic()
                     try:
                         # Flat list of all attack row tuples across the batch
                         all_attack_params: List[Tuple[Any, ...]] = []
@@ -944,7 +950,8 @@ class WarHistoryDB:
                         conn.commit()
                         logging.info(
                             f"[DB-BULK-WRITE] Flushed batch of {len(batch)} war appends "
-                            f"({len(all_attack_params)} attack rows, {len(all_summary_params)} summaries)"
+                            f"({len(all_attack_params)} attack rows, {len(all_summary_params)} summaries) "
+                            f"elapsed={_time.monotonic() - _batch_t0:.3f}s"
                         )
                     except sqlite3.Error:
                         conn.rollback()
@@ -7554,6 +7561,13 @@ class WarHistoryDB:
         if not self.db_path:
             raise RuntimeError("Database not initialized. Call initialize() first.")
 
+        # #0113 re-measurement (2026-09-12): second hot-path read signal, alongside
+        # get_player_war_history_sync — see the comment there. This one's call sites
+        # (QBhelperfunctions.py) are a mix of clan/season-scoped lookups; unlike the player
+        # path this one is not confirmed purely command-driven, so the post-hoc analysis
+        # needs to check each burst against [CYCLE-START]/[CYCLE-END] timestamps rather
+        # than assuming every sample here is a "hot path" one.
+        _t0 = _time.monotonic()
         clauses: list[str] = []
         params: list[Any] = []
         if clan_tag is not None:
@@ -7578,9 +7592,18 @@ class WarHistoryDB:
                 if limit:
                     sql += f" LIMIT {int(limit)}"
                 rows = conn.execute(sql, params).fetchall()
-                return [dict(row) for row in rows]
+                result = [dict(row) for row in rows]
+                logging.info(
+                    f"[DB-READ-TIMING] get_war_summaries_sync elapsed={_time.monotonic() - _t0:.3f}s "
+                    f"clan={clan_tag or 'ALL'} season={season or '-'} rows={len(result)}"
+                )
+                return result
             except sqlite3.Error as e:
                 logging.error(f"[DB-QUERY-SYNC] get_war_summaries_sync failed: {e}")
+                logging.info(
+                    f"[DB-READ-TIMING] get_war_summaries_sync elapsed={_time.monotonic() - _t0:.3f}s "
+                    f"clan={clan_tag or 'ALL'} season={season or '-'} rows=ERROR"
+                )
                 return []
 
     def get_cwl_attack_records_sync(
@@ -7980,6 +8003,13 @@ class WarHistoryDB:
         if not self.db_path:
             raise RuntimeError("Database not initialized. Call initialize() first.")
 
+        # #0113 re-measurement (2026-09-12): this is the hot-path read the ticket's
+        # premise is about — a real Discord-command-driven query (QBdiscordcmds.py) against
+        # the same main.* tables the per-cycle bulk-append flood writes to. Logged
+        # unconditionally at INFO (not threshold-gated like [COC-API-SLOW]) because call
+        # volume here is bounded by Discord command usage, not cycle/clan count, and the
+        # correlation analysis needs the full distribution, not just tail events.
+        _t0 = _time.monotonic()
         tag = player_tag.upper().lstrip("#")
         tag_with_hash = f"#{tag}"
 
@@ -8128,10 +8158,18 @@ class WarHistoryDB:
 
                 # Sort merged result newest-first
                 records.sort(key=lambda r: (r["date"], r["war_id"]), reverse=True)
+                logging.info(
+                    f"[DB-READ-TIMING] get_player_war_history_sync elapsed={_time.monotonic() - _t0:.3f}s "
+                    f"player={tag_with_hash} rows={len(records)}"
+                )
                 return records[:limit]
 
             except sqlite3.Error as e:
                 logging.error(f"[DB-QUERY-SYNC] get_player_war_history_sync failed: {e}")
+                logging.info(
+                    f"[DB-READ-TIMING] get_player_war_history_sync elapsed={_time.monotonic() - _t0:.3f}s "
+                    f"player={tag_with_hash} rows=ERROR"
+                )
                 return []
 
     def get_player_attack_summary_sync(self, player_tag: str, is_cwl: Optional[bool] = None) -> Dict[str, Any]:
