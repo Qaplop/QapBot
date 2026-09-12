@@ -14,11 +14,16 @@ Usage:
 
     YYYY-MM          Season to analyze (default: current month, e.g. 2026-05)
     --no-log         Print to stdout only; do not append to the log file
-    --fetch-missing  Identify clans with confirmed missing wars (round_number known,
-                     war count < max round), fetch their league groups via the CoC API,
-                     and append the missing war_tags to data/missing_cwl_war_tags.txt
-                     so the bot's recovery pipeline can fetch and archive them.
-    --concurrency N  Max parallel API calls with --fetch-missing (default: 30)
+    --fetch-missing  Cross-reference cwl_league_rounds against war_summary to find
+                     war_tags that are absent (0 rows) or asymmetric (1 row instead
+                     of 2), and append them to <data_dir>/missing_cwl_war_tags.txt so
+                     the bot's recovery pipeline can fetch and archive them.
+                     DB-ONLY -- this makes no CoC API calls. Prompts for whether the
+                     season has ended; dedups against the existing file, so re-running
+                     is safe. (Before 2026-09-12 this docstring claimed it fetched
+                     league groups over the API and documented a --concurrency flag;
+                     neither was true -- --concurrency exited with "unrecognized
+                     arguments".)
     --dry-run        With --fetch-missing: report what would be written, don't write
     Round     Total    Ended   In-War     Prep      Total    Ended   In-War     Prep
     1        80,388   80,388        0        0          2        0        2        0

@@ -1,6 +1,28 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-12 (2)  Build 42.
+- Verified: qapbot/scripts/analyze_cwl_rounds.py is fully functional. Runs end-to-end against
+  the current 2026-09 season; all three imports resolve (normalize_cwl_season,
+  explicit_column_list_from_conn, attach_history_db), every table it queries exists in the
+  main or history schema, and all DB connections are mode=ro.
+- Fixed: the module docstring described --fetch-missing as fetching league groups "via the
+  CoC API" and documented a --concurrency N flag. Both were wrong. The implementation is
+  DB-only (cross-references cwl_league_rounds against war_summary) and --concurrency was
+  never added to argparse -- passing it exits 2 with "unrecognized arguments". Docstring
+  corrected. File: qapbot/scripts/analyze_cwl_rounds.py. Suite 3223 pass.
+- Caveat recorded for whoever reads the output next: the "Round-count consistency" table
+  uses ROUND 1 as its reference, which overstates the deficit badly. Round 1 contains ~10,980
+  sub-Master-III wars (Crystal/Gold) that the bot discovers once and then deliberately never
+  follows, because WAR_UPDATE_LEAGUES is Master III and above. Rounds 2-7 carry only 194 such
+  wars combined. So of the "Confirmed missing >= 77,778 wars" it prints, 76% is that artifact;
+  the deficit among leagues the bot actually tracks is ~18,455, concentrated in round 3
+  (-9,656). The separate "Confirmed incomplete clans" figure does NOT have this flaw -- it
+  derives true_max per clan from that clan's own league group.
+- 2026-09 season completeness: 784,552 archived CWL wars, 100% with round_number, all
+  war_ended. 29,742 incomplete clans / 31,022 missing war records, of which 13,238 war_tags
+  are recoverable (6,090 absent entirely, 7,148 asymmetric with 1 of 2 rows).
+
 2026-09-12 (1)  Build 41.
 - Fixed: two "possibly unbound" defects Pylance flagged in QapBot.py, both real latent
   NameErrors rather than false positives.
