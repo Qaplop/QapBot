@@ -3264,8 +3264,13 @@ async def periodic_main() -> None:
                 # Log RSS once per cycle so memory trends are visible in plain logs
                 # without needing a /memprofile.  /proc/self/status is a single kernel
                 # read — negligible overhead even on the server-machine Celeron.
+                # Bound BEFORE the try: everything below reads _rss_mb after an
+                # `except: pass`, so an assignment inside the try leaves it unbound on any
+                # path where open() fails (a non-Linux dev box has no /proc/self/status).
+                # It happens to work today only because this assignment is the first
+                # statement in the try; moving one line would make it a startup NameError.
+                _rss_mb = 0.0
                 try:
-                    _rss_mb = 0.0
                     with open("/proc/self/status") as _pf:
                         for _pl in _pf:
                             if _pl.startswith("VmRSS:"):
@@ -4154,8 +4159,11 @@ async def _run_startup_initialization() -> None:
             # refcounting before any collection sees them. See qapbot/docs/PERFORMANCE_TUNING.md
             # for the sources and the full measurement trail.
             if CONFIG.gc_automatic:
+                # Read the interpreter defaults unconditionally: the log line below reports
+                # them either way, and binding them inside the `if` forced it to restate the
+                # same condition - two copies that must agree or startup raises NameError.
+                _t0_old, _t1_old, _t2_old = gc.get_threshold()
                 if CONFIG.gc_threshold0 > 0 or CONFIG.gc_threshold1 > 0:
-                    _t0_old, _t1_old, _t2_old = gc.get_threshold()
                     # threshold1 gates gen-2 frequency as well as gen-1: CPython bumps
                     # count[2] once per gen-1 collection. See CONFIG.gc_threshold1 for the
                     # 25h PROD measurement this was set from (gen-1 = 51% of stall time for
@@ -4173,7 +4181,7 @@ async def _run_startup_initialization() -> None:
                     "defaults on this Python are %s), %s object(s) frozen out of every scan. Per-cycle "
                     "collect: %s. Nightly full sweep remains as a backstop. Set GC_AUTOMATIC=0 "
                     "to restore the 2026-09-04 disabled-collector behaviour.",
-                    _gc_thresholds, (_t0_old, _t1_old) if (CONFIG.gc_threshold0 > 0 or CONFIG.gc_threshold1 > 0) else _gc_thresholds[:2],
+                    _gc_thresholds, (_t0_old, _t1_old),
                     f"{_frozen_count:,}",
                     "ON (promotion pump — for comparison only)" if CONFIG.gc_per_cycle_collect else "off",
                 )

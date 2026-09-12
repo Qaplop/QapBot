@@ -1,6 +1,40 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-12 (1)  Build 41.
+- Fixed: two "possibly unbound" defects Pylance flagged in QapBot.py, both real latent
+  NameErrors rather than false positives.
+  * `_rss_mb` was assigned as the FIRST statement inside a try whose `except` does `pass`,
+    then read by the whole RSS-restart block below it. It works today only because that
+    assignment happens to precede the `open()`; moving one line would make a non-Linux box
+    (no /proc/self/status) raise NameError at cycle end. Default hoisted above the try.
+  * `_t0_old`/`_t1_old` were bound inside `if gc_threshold0 > 0 or gc_threshold1 > 0` while
+    the [GC-POLICY] log line referenced them behind a RESTATED copy of the same condition --
+    two copies that must agree forever or startup raises NameError. Introduced by build 40.
+    gc.get_threshold() now runs unconditionally and the log line drops the conditional.
+  File: QapBot.py. No behaviour change. Suite 3223 pass.
+- Measured (build 40, one continuous 60.6h PROD run ending in an RSS-triggered restart):
+  the threshold1 10->30 change HOLDS and is not the memory problem.
+      gen-1: 763 events (12.6/h), 976s total, mean 1.28s, max 2.95s
+      gen-2:  77 events ( 1.3/h), 1038s total, mean 13.48s, max 19.41s
+      total stall 0.92% of wall (build 39: 1.66%); ACK breaches 30/day (build 39: 91/day)
+  The gen-1 ACK risk flagged on 2026-09-10 did NOT materialise -- gen-1 max DECLINED across
+  the run (2.95s at h12-24 -> 1.26s at h60-72), and gen-2 pauses stayed flat at 13-16s even
+  as RSS went 2.6 -> 6.5 GB. Pause tracks garbage volume, not live-set size, in this range.
+- Found: RSS climbed +52.98 MB/h (95% CI +51.58..+54.39) = +1.24 GB/day, with the FLOOR
+  rising monotonically (2636 -> 3851 -> 4532 -> 4795 -> 5658 MB per 12h window) -- a leak
+  signature, not a sawtooth. RSS-restart fired at 08:45 after 3632 min and reclaimed cleanly
+  (6526 -> 940 MB), so the stopgap works.
+  Root cause is NOT the GC: `temp_war_objects` grows unbounded. 8,232 -> 16,775 -> 30,486
+  entries over the run (448.0 -> 1036.9 MB at ~34 KB/entry; ~3.4 GB at the 100,000 cap),
+  with temp_war_stats tracking it (23,109 -> 30,493). Eviction is PULL-based -- an entry is
+  only popped when the bot re-polls that clan and observes war_ended -- while insertion is
+  discovery-driven (2,209 enemy clans upserted this run). No TTL, no prune below the cap.
+  Corroborated by `[PHASE-3B] ... (30311 unchanged, skipped)` and LIFETIME
+  passive_skipped=18283560 against only ~586 clans processed per cycle. This is tracker
+  #0113 (passive-clan cache), filed 2026-09-08 and still unstarted. Not fixed here -- it
+  needs its own design pass on the eviction policy.
+
 2026-09-09 (1)  Build 40.
 - Changed: GC threshold1 10 -> 30 (gen-0 collections between gen-1 collections). Derived from
   a 25h 20m continuous PROD run on build 39 -- 981 logged pauses:
