@@ -1,6 +1,34 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-12 (5)  Build 45.
+- Fixed: the [PAGECACHE] sampling point, found while checking build 44's first PROD log.
+  It sampled /proc/meminfo only at cycle end -- measured at ~14s after the last bulk-write
+  flush on PROD -- by which point the kernel had already written back whatever the write
+  dirtied. The first two samples duly read Dirty=3MB / Writeback=0MB, which says nothing
+  about the peak: under the memory pressure this measurement exists to detect, that sampling
+  point would have produced a systematic FALSE NEGATIVE for the OS-page-cache mechanism.
+  /proc/meminfo is now sampled either side of each write batch, and [DB-BULK-WRITE] /
+  [DB-BULK-UPDATE] report the DELTA (cached=NMB(+D) dirty=NMB(+D) writeback=NMB(+D)
+  avail=NMB(+D)). An absolute post-write figure is near-meaningless for Dirty, which the
+  kernel drains continuously; the delta across the write is the quantity of interest.
+  The cycle-end [PAGECACHE] line stays as the between-writes baseline, now sharing
+  db_manager's parser instead of re-implementing the field list and kB->MB conversion --
+  two copies would eventually disagree about units.
+- Corrected in the same pass: build 44's audit claimed all four get_war_summaries_sync call
+  sites are command-driven. They are not. PROD shows it firing 13x per cycle for the same 13
+  clans with no [CMD] line nearby -- the cwlinfo path is driven by the AUTOMATIC
+  per-subscription posting loop (QapBot.py:860 -> generate_cwlinfo_embeds), not by a user
+  command. The audit checked the call sites inside QBhelperfunctions.py and stopped there
+  instead of following generate_cwlinfo_embeds up to its caller. No code consequence -- log
+  volume is trivial at 13/cycle and it is a usable second dense signal -- but the claim was
+  wrong.
+- Structural finding from the same log, useful for interpreting the results: reads and
+  writes do NOT overlap. Every cycle runs writes (Phase-3) then leaderboard/cwlinfo reads,
+  then cycle end. So #0113's mechanism can only be "the write flood leaves the cache in a
+  worse state for the reads that follow", not concurrent contention.
+  Files: qapbot/db_manager.py, QapBot.py. 8 new tests. Suite 3246 pass.
+
 2026-09-12 (4)  Build 44.
 - Corrected the #0113 measurement from build 43 after an audit. The instrumentation itself
   was sound (timer placement, both return paths, additive, tested) and INFO-level logging

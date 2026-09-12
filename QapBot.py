@@ -3294,13 +3294,14 @@ async def periodic_main() -> None:
                 # [DB-BULK-WRITE] bursts is what would make the OS-cache mechanism real;
                 # flat values through a burst rule it out and leave only the per-connection
                 # one, which [DB-READ-TIMING]'s conn_mean_spread field measures.
+                # Shares db_manager's parser rather than re-implementing the field list and
+                # the kB->MB conversion: [DB-BULK-WRITE] reports the same fields per write
+                # batch, and two copies of this would eventually disagree about units.
+                # This line remains the BETWEEN-writes baseline the per-batch deltas are
+                # read against.
                 try:
-                    _mi: dict[str, int] = {}
-                    with open("/proc/meminfo") as _mf:
-                        for _ml in _mf:
-                            _k, _, _rest = _ml.partition(":")
-                            if _k in ("Cached", "Dirty", "Writeback", "MemAvailable"):
-                                _mi[_k] = int(_rest.split()[0]) // 1024   # kB -> MB
+                    from qapbot.db_manager import _meminfo_mb as _pc_meminfo
+                    _mi = _pc_meminfo()
                     if _mi:
                         logging.info(
                             "[PAGECACHE] Cached=%dMB Dirty=%dMB Writeback=%dMB MemAvailable=%dMB",

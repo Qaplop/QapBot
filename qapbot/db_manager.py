@@ -342,6 +342,62 @@ def attach_history_db(conn: Any, db_path: str, history_db_path: Optional[str] = 
     return resolved
 
 
+# ── #0113 page-cache sampling (2026-09-12) ────────────────────────────────────────────
+# The first cut sampled /proc/meminfo only at cycle end, which on PROD is ~14s after the
+# last bulk-write flush — long enough for the kernel to have written back and dropped
+# whatever the write dirtied. `Dirty=3MB` at that point says nothing about the peak, so the
+# measurement would have produced a false negative under exactly the memory pressure it
+# exists to detect. These are sampled either side of the write itself instead, and the log
+# reports the DELTA: an absolute post-write figure is near-meaningless for `Dirty`, which
+# the kernel drains continuously.
+_MEMINFO_FIELDS = ("Cached", "Dirty", "Writeback", "MemAvailable")
+
+
+def _parse_meminfo_mb(lines: Any) -> Dict[str, int]:
+    """Parse the fields of interest out of /proc/meminfo content, kB -> MB.
+
+    Split from the file read so it stays testable on a dev box that has no /proc.
+    """
+    out: Dict[str, int] = {}
+    for line in lines:
+        key, _, rest = line.partition(":")
+        # Exact match: 'SwapCached' must not be mistaken for 'Cached'.
+        if key in _MEMINFO_FIELDS:
+            try:
+                out[key] = int(rest.split()[0]) // 1024
+            except (ValueError, IndexError):
+                continue
+            if len(out) == len(_MEMINFO_FIELDS):
+                break
+    return out
+
+
+def _meminfo_mb() -> Dict[str, int]:
+    """Snapshot /proc/meminfo, or {} where it does not exist (non-Linux dev box)."""
+    try:
+        with open("/proc/meminfo") as fh:
+            return _parse_meminfo_mb(fh)
+    except Exception:
+        return {}
+
+
+def _meminfo_delta_str(before: Dict[str, int], after: Dict[str, int]) -> str:
+    """Render 'cached=NMB(+D) dirty=NMB(+D) ...', or '' when unavailable."""
+    if not after:
+        return ""
+    parts: List[str] = []
+    for key, label in (
+        ("Cached", "cached"), ("Dirty", "dirty"),
+        ("Writeback", "writeback"), ("MemAvailable", "avail"),
+    ):
+        val = after.get(key, 0)
+        if before:
+            parts.append(f"{label}={val}MB({val - before.get(key, 0):+d})")
+        else:
+            parts.append(f"{label}={val}MB")
+    return " " + " ".join(parts)
+
+
 # ── #0113 read-latency sampling (2026-09-12) ──────────────────────────────────────────
 # Windowed aggregate rather than per-call logging: the read this measures
 # (get_war_summary_state_sync) runs >=1,186 times/hour on PROD — measured from build 40's
@@ -938,6 +994,7 @@ class WarHistoryDB:
                     # between batches. This timer covers exactly the params-build +
                     # executemany + commit critical section below.
                     _batch_t0 = _time.monotonic()
+                    _batch_mem0 = _meminfo_mb()
                     try:
                         # Flat list of all attack row tuples across the batch
                         all_attack_params: List[Tuple[Any, ...]] = []
@@ -1013,6 +1070,7 @@ class WarHistoryDB:
                             f"[DB-BULK-WRITE] Flushed batch of {len(batch)} war appends "
                             f"({len(all_attack_params)} attack rows, {len(all_summary_params)} summaries) "
                             f"elapsed={_time.monotonic() - _batch_t0:.3f}s conn={id(conn)}"
+                            f"{_meminfo_delta_str(_batch_mem0, _meminfo_mb())}"
                         )
                     except sqlite3.Error:
                         conn.rollback()
@@ -1031,6 +1089,7 @@ class WarHistoryDB:
                     # latency spike can be attributed to the right kind of write instead of
                     # leaving update batches as an unmeasured confounder.
                     _upd_t0 = _time.monotonic()
+                    _upd_mem0 = _meminfo_mb()
                     try:
                         # Collect all delete keys and insert params across the batch
                         delete_keys: List[Tuple[str, str]] = []
@@ -1118,6 +1177,7 @@ class WarHistoryDB:
                             f"[DB-BULK-UPDATE] Flushed batch of {len(batch)} war updates "
                             f"({len(all_attack_params)} attack rows, {len(all_summary_params)} summaries) "
                             f"elapsed={_time.monotonic() - _upd_t0:.3f}s conn={id(conn)}"
+                            f"{_meminfo_delta_str(_upd_mem0, _meminfo_mb())}"
                         )
                     except sqlite3.Error:
                         conn.rollback()
