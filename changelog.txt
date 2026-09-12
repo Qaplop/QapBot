@@ -1,6 +1,50 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-12 (6)  Build 46.
+- Bundled three tracker items into the #0113 measurement deploy, so one 40-60h PROD run
+  yields data for six tickets instead of one. A separate deploy later would restart the
+  process and reset the RSS climb the run exists to observe.
+- RESOLVED #0094 (coc_clan_cache sizing) -- acted on, not just measured. The split
+  per-population hit rates the ticket was waiting for are now in from PROD:
+      protected: 17/93    hit_rate=18.3%
+      other:      0/11193 hit_rate= 0.0%
+  Zero across 11,193 requests is the large clean sample it required, and it is exactly what
+  the TTL-vs-gate analysis predicted: fetch_clan_war_data()'s own last_checked_via_api gate
+  (12h; 30min for role clans) is far longer than the cache's 600s TTL, so the poll loop
+  structurally cannot re-read its own writes. It now passes
+  store_result=(clan_tag in protected_tags). Expected ~1,300 entries -> ~120 (~95MB -> ~9MB).
+  Two safety properties, both pinned by tests: store_result gates only the WRITE (reads are
+  unaffected, so this can never cost an extra API call), and it is derived from
+  protected_tags rather than hardcoded (hardcoding False would stop caching the protected
+  population, the 18.3% one the cache exists for).
+  MAX_COC_CLAN_CACHE_ENTRIES deliberately left at 20000 rather than guessed: with the gate
+  applied, occupancy is bounded by the protected set, whose size was only logged at DEBUG and
+  so invisible in a PROD log running at INFO. [COC-CACHE-PROTECT] promoted to INFO (one line
+  per cycle) so the cap can be sized from a season's worth of data -- the protected set grows
+  during CWL, and a cap that binds inside the TTL is what made this cache useless before.
+  Files: QBhelperfunctions.py, QapBot.py, qapbot/docs/PERFORMANCE_TUNING.md.
+- #0099 (role-sync): [ROLE-SYNC] logged '15 synced, 0 errors' with no duration, so "is it
+  slow?" could only be answered by assumption. Now reports elapsed=. Timer starts AFTER the
+  disabled-guild early return, so guilds with the role system off do not contribute 0.000s
+  samples that would drag the mean toward zero. File: qapbot/guild_role_manager.py.
+- #0101 (leaderboard posting): had no timing at all. New [LB-TIMING] line reports elapsed=,
+  chars= and msgs=. Brackets the Discord post specifically rather than the whole function --
+  the ticket suspects API delete-then-repost latency, and including the local hash/format
+  work would blunt that signal. chars/msgs are logged so a slow post can be told apart from
+  a merely large one. File: QBhelperfunctions.py.
+- Riding along on instrumentation that already exists, needing no code at all: #0095
+  ([PHASE-1-CPU] wall/cpu/cores_busy/ms-per-clan), #0096 ([PHASE-3B-SCAN-TIMING] plus the
+  [DB-BULK-WRITE] elapsed= added for #0113), #0097 ([PRE-SCAN-TIMING]). #0097 may close as a
+  non-issue: it assumed ~12% of cycle, and current readings are total=2.548s against a
+  45-250s cycle.
+- NOT bundled, deliberately: #0111 (circuit breaker) and #0112 (_get_active_wars) are
+  behaviour changes, and #0111 in particular would alter cycle behaviour under memory
+  pressure -- the exact condition the #0113 measurement needs to observe undisturbed.
+  #0100 skipped: the Monte Carlo sim runs on demand, so it has the same sample-density
+  problem that made the Discord command paths unusable for #0113.
+  8 new tests. Suite 3254 pass.
+
 2026-09-12 (5)  Build 45.
 - Fixed: the [PAGECACHE] sampling point, found while checking build 44's first PROD log.
   It sampled /proc/meminfo only at cycle end -- measured at ~14s after the last bulk-write

@@ -614,8 +614,20 @@ async def post_leaderboard_to_discord(
         logging.info(f"Leaderboard too long ({len(leaderboard_text)} chars) for Discord limit ({DISCORD_MESSAGE_MAX_LENGTH}). Using intelligent table splitting...")
 
     # Post messages
+    #
+    # tracker #0101: this phase had no timing at all, so its suspected cost — Discord API
+    # delete-then-repost latency — could only be guessed at. Timed around the Discord work
+    # specifically (not the whole function), since that is what the ticket suspects; the
+    # hash/format work above is local and cheap. chars= and msgs= are logged alongside so a
+    # slow post can be told apart from a merely large one.
+    _lb_t0 = time.monotonic()
     try:
         messages_posted = await _split_and_post_leaderboard_helper(channel, leaderboard_text)
+        logging.info(
+            f"[LB-TIMING] leaderboard post clan={clan_tag} mode={mode_str} "
+            f"elapsed={time.monotonic() - _lb_t0:.3f}s "
+            f"chars={len(leaderboard_text)} msgs={len(messages_posted) if messages_posted else 0}"
+        )
         if messages_posted:
             await CACHE.set_leaderboard_message(timestamp, {
                 'clan_tag': clan_tag,
@@ -7330,13 +7342,30 @@ async def fetch_clan_war_data(clan_tag: str) -> Optional[Dict[str, Any]]:
         _clan_obj = None
         if should_fetch_from_api:
             try:
-                # NOTE: deliberately stores EVERY clan, including the ~55K/day this path
-                # streams that were assumed never to be re-read.  That assumption was made
-                # in the same breath as adding the hit-rate counters that exist to test it,
-                # which would have guaranteed the counters could only ever confirm it.
-                # get_clan(store_result=False) exists and is tested, but stays unused until
-                # the measured per-population hit rate says the assumption holds.
-                _clan_obj = await CACHE.coc_clan_cache.get_clan(clan_tag)
+                # tracker #0094, resolved 2026-09-12 from measured data.
+                #
+                # This used to store EVERY clan, including the ~55K/day this path streams.
+                # The original assumption that they are never re-read was made in the same
+                # change that added the counters meant to test it, so it was reverted and the
+                # decision deferred until real per-population hit rates existed. They now do,
+                # from PROD:
+                #     protected: 17/93    hit_rate=18.3%
+                #     other:      0/11193 hit_rate= 0.0%
+                # "other" — everything this poll loop streams — is zero across 11,193
+                # requests. That is the large, clean sample #0094 was waiting for, and it
+                # holds because this path's own last_checked_via_api gate (12h, 30min for
+                # role clans) is far longer than the cache's 600s TTL: it cannot re-read
+                # what it stores.
+                #
+                # Reads stay enabled either way (store_result only gates the WRITE), so this
+                # can never cost an extra API call — a fresh entry is still served if one
+                # exists. Protected clans (subscribed / family / CWL-group / their war
+                # opponents) keep storing, because they DO re-read: 18.3%.
+                #
+                # Membership test is the same one the hit-rate counters themselves use, so
+                # tag normalisation is already proven by those counters being non-zero.
+                _store = clan_tag in CACHE.coc_clan_cache.protected_tags
+                _clan_obj = await CACHE.coc_clan_cache.get_clan(clan_tag, store_result=_store)
                 if age:
                     logging.debug(f"[API CALL] get_clan fetch for {clan_tag} - last checked {age.total_seconds()/SECONDS_PER_HOUR:.1f} hours ago")
                 else:

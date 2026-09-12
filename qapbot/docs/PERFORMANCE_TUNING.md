@@ -224,6 +224,35 @@ swamp the smaller.
 **Read those two numbers before resizing anything, and do not act on a cache experiment
 whose own configuration is what the experiment is measuring.**
 
+### Outcome (2026-09-12, tracker #0094): the split rates settled it
+
+With the cap raised so it could not bind, the two populations separated cleanly on PROD:
+
+| population | hits / requests | hit rate |
+|---|---|---|
+| protected (subscribed / family / CWL-group / their war opponents) | 17 / 93 | **18.3%** |
+| other (everything the Phase-1 poll loop streams) | 0 / 11,193 | **0.0%** |
+
+Zero across 11,193 requests is the large clean sample the ticket was waiting for, and it is
+what the TTL-vs-gate argument above predicts. `fetch_clan_war_data()` now passes
+`store_result=clan_tag in protected_tags`, so the streamed population is fetched and used
+but never written. Expected resident effect: ~1,300 entries -> ~120, i.e. roughly 95 MB -> 9 MB.
+
+Two properties make this safe, and both must survive any future edit:
+
+* `store_result` gates only the **write**. Reads are unaffected, so a fresh entry is still
+  served if one exists and this can never cost an extra API call.
+* It is derived from `protected_tags`, never hardcoded. Hardcoding `False` would stop
+  caching the protected population too — the 18.3% one, which is the reason the cache exists.
+
+`MAX_COC_CLAN_CACHE_ENTRIES` is deliberately **still 20000**. With the gate applied,
+occupancy is bounded by the protected set rather than by the streamed flood, so the honest
+cap is a function of that set's size — which was only logged at DEBUG and therefore invisible
+in a PROD log running at INFO. `[COC-CACHE-PROTECT]` is now INFO for exactly that reason.
+Size the cap from a season's worth of it, not from a single reading: the protected set grows
+during CWL as group members are added, and a cap that binds inside the TTL is what made this
+cache useless in the first place.
+
 **Generalised:** before adding or tuning a cache, find the *caller's own* dedup window. A
 cache only earns its memory when something asks the same question twice inside its TTL.
 

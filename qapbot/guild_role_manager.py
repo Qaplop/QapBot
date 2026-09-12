@@ -871,6 +871,11 @@ async def sync_all_roles_for_guild(
     if not coc_role_enabled and not clan_role_enabled and not role_system_enabled:
         return
 
+    # tracker #0099: this phase had counts but no duration, so "is role sync slow?" could
+    # only ever be answered by assumption. Timed from AFTER the disabled-guild early return
+    # above, so a guild with the feature off contributes no misleading 0.000s sample.
+    _rs_t0 = time.monotonic()
+
     from qapbot.cache_manager import CACHE
 
     # ------------------------------------------------------------------
@@ -1016,7 +1021,10 @@ async def sync_all_roles_for_guild(
             elif _r is True:
                 synced += 1
 
-    logging.info(f"[ROLE-SYNC] Guild {guild.name} ({guild_id}) role sync complete: {synced} synced, {errors} errors")
+    logging.info(
+        f"[ROLE-SYNC] Guild {guild.name} ({guild_id}) role sync complete: "
+        f"{synced} synced, {errors} errors, elapsed={time.monotonic() - _rs_t0:.3f}s"
+    )
 
 
 async def sync_roles_for_clan_members(

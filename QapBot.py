@@ -1545,7 +1545,16 @@ async def main() -> None:
     # clan_name_cache scan.  Failure here must not cost a poll cycle.
     try:
         _n_protected = CACHE.refresh_protected_clan_tags(_group_member_tags)
-        logging.debug(f"[COC-CACHE-PROTECT] {_n_protected} clan(s) exempt from cap eviction")
+        # INFO, not DEBUG (2026-09-12): with #0094's store_result gate applied, the cache's
+        # occupancy is now bounded by THIS number rather than by the streamed population, so
+        # it is the input needed to size MAX_COC_CLAN_CACHE_ENTRIES honestly. #0094 asks for
+        # that cap to be set "for the population actually stored" — which was unmeasurable
+        # while this line was DEBUG and PROD runs at INFO. Deliberately left at 20000 for now
+        # rather than guessed: the cap must NEVER bind (evicting inside the TTL is what made
+        # this cache useless before), and the protected set grows during CWL season as group
+        # members are added, so it needs a season's worth of this line before being lowered.
+        # One line per cycle.
+        logging.info(f"[COC-CACHE-PROTECT] {_n_protected} clan(s) exempt from cap eviction")
     except Exception as _rpx:
         logging.warning(f"[COC-CACHE-PROTECT] Could not refresh protected clan tags: {_rpx}")
 
