@@ -1,6 +1,42 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-12 (4)  Build 44.
+- Corrected the #0113 measurement from build 43 after an audit. The instrumentation itself
+  was sound (timer placement, both return paths, additive, tested) and INFO-level logging
+  was verified safe -- all four get_war_summaries_sync call sites are command-driven with
+  history_cache memoisation, not per-clan loops. Three analysis errors were not:
+  * WRONG READ PATH (this one made the measurement unable to produce data). Build 43
+    instrumented the Discord command paths. PROD logs 10 commands on 2026-09-10, ZERO on
+    09-11, 5 on 09-12 -- against ~100 write batches/hour. A 24h run would have yielded
+    near-zero usable samples and no correlation could have been computed. The real
+    high-volume read is get_war_summary_state_sync (cache_manager.py:3052, inside
+    save_war_object's per-war loop): >=1,186 calls/hour measured from build 40's LIFETIME
+    counters (skip_finalized=71877 / 60.6h), i.e. ~3,000x the Discord rate, and interleaved
+    with the very appends under suspicion. Now sampled there, aggregated per 60s window
+    ([DB-READ-TIMING] name window= n= mean= p95= max= conns= conn_mean_spread=) so ~29k
+    lines/day of per-call logging becomes ~1,440.
+  * mmap IS NOT OFF. The ticket's premise says "mmap off, cache 64MB -> 16MB"; build 43
+    corrected the cache figure but repeated the mmap claim. PROD [DB-INIT] reports
+    mmap_size 1024 MB on main / 256 MB on history -- restored in the later HDD-swap
+    revision. Build 43's commit message consequently asserted the flood "only dirties
+    main's pager cache", which is wrong: with 1 GB mapped, reads go through the OS page
+    cache rather than around it.
+  * THE TICKET'S MECHANISM CANNOT OPERATE CROSS-CONNECTION. SQLite's pager cache is
+    per-connection; there is no shared_cache anywhere, the pool is 8 connections, and
+    _flush_pending_war_writes holds exactly one for the whole flush. Worse for the premise,
+    the pool is queue.Queue (FIFO), so a write-polluted connection is handed out LAST of 8
+    -- the arrangement that minimises carry-over. The only genuinely shared cache is the
+    OS page cache. New [PAGECACHE] line (Cached/Dirty/Writeback/MemAvailable from
+    /proc/meminfo, once per cycle) tests that path directly, and conn_mean_spread on the
+    read aggregate separates the two: one slow connection = per-pager pollution; all
+    connections rising together = OS page cache.
+- Also closed two gaps: [DB-BULK-UPDATE] was untimed (updates are rare -- 413 vs 116,235
+  appends over 60.6h -- but DELETE-then-reinsert churns more pages per row, so an untimed
+  update batch was an unmeasured confounder), and neither write line logged connection
+  identity. Both now carry elapsed= and conn=.
+  Files: qapbot/db_manager.py, QapBot.py. 8 new tests. Suite 3238 pass.
+
 2026-09-12 (3)  Build 43.
 - Added: instrumentation-only re-measurement for tracker #0113 (SQLite page-cache
   pollution from passive-clan war-append writes). No behaviour change. Ticket was filed

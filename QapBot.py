@@ -3280,6 +3280,36 @@ async def periodic_main() -> None:
                 except Exception:
                     pass
 
+                # --- OS page cache, for tracker #0113 (2026-09-12) ---------------------
+                # #0113 assumes the bulk war-append flood evicts hot pages from "the DB page
+                # cache". There are two distinct caches that phrase could mean, and the
+                # ticket does not separate them:
+                #   * SQLite's pager cache — PER-CONNECTION (no shared_cache; 8-conn FIFO
+                #     pool), so a write flush can only pollute the one connection it holds.
+                #   * The OS page cache — genuinely shared, and the only path by which a
+                #     write on one connection can slow a read on another.
+                # mmap_size is 1024 MB on main (the ticket's "mmap off" premise is stale —
+                # it was restored in the later HDD-swap revision), so reads go through this
+                # cache rather than around it. Dirty/Writeback rising in step with
+                # [DB-BULK-WRITE] bursts is what would make the OS-cache mechanism real;
+                # flat values through a burst rule it out and leave only the per-connection
+                # one, which [DB-READ-TIMING]'s conn_mean_spread field measures.
+                try:
+                    _mi: dict[str, int] = {}
+                    with open("/proc/meminfo") as _mf:
+                        for _ml in _mf:
+                            _k, _, _rest = _ml.partition(":")
+                            if _k in ("Cached", "Dirty", "Writeback", "MemAvailable"):
+                                _mi[_k] = int(_rest.split()[0]) // 1024   # kB -> MB
+                    if _mi:
+                        logging.info(
+                            "[PAGECACHE] Cached=%dMB Dirty=%dMB Writeback=%dMB MemAvailable=%dMB",
+                            _mi.get("Cached", 0), _mi.get("Dirty", 0),
+                            _mi.get("Writeback", 0), _mi.get("MemAvailable", 0),
+                        )
+                except Exception:
+                    pass  # non-Linux dev box has no /proc/meminfo
+
                 # --- RSS-triggered self-restart (tracker #0106, 2026-09-08) ---
                 # A STOPGAP for an unexplained ~1 GB/hour heap climb. A restart is the only
                 # mechanism proven to reclaim it, and this reuses the bot's existing, tested

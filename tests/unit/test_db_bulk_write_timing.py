@@ -13,6 +13,8 @@ from __future__ import annotations
 import sqlite3
 import threading
 
+import pytest
+
 from qapbot.db_manager import WarHistoryDB
 
 _CREATE_WAR_ATTACKS = """
@@ -92,6 +94,12 @@ def _make_db(tmp_path) -> WarHistoryDB:
     return dm
 
 
+def _path_of(dm: WarHistoryDB) -> str:
+    """Non-Optional view of dm.db_path — always set by _make_db() above."""
+    assert dm.db_path is not None
+    return dm.db_path
+
+
 class TestBulkWriteTimingInstrumentation:
     """Appends use empty attack_rows (summary only) deliberately — a non-empty
     attack_rows list also exercises _upsert_player_name_index_in_conn, which in
@@ -116,7 +124,9 @@ class TestBulkWriteTimingInstrumentation:
         assert "1 summaries" in line
         # The new field the #0113 re-measurement needs.
         assert "elapsed=" in line
-        elapsed = float(line.split("elapsed=")[1].rstrip("s"))
+        # elapsed= is no longer last on the line (conn= follows it), so split on the
+        # unit rather than rstrip'ping it.
+        elapsed = float(line.split("elapsed=")[1].split("s ")[0])
         assert elapsed >= 0.0
 
     def test_elapsed_logged_per_batch_not_once_for_the_whole_call(self, tmp_path, caplog):
@@ -136,3 +146,151 @@ class TestBulkWriteTimingInstrumentation:
         assert len(lines) == 2
         for line in lines:
             assert "elapsed=" in line
+
+
+class TestBulkUpdateTimingInstrumentation:
+    """The updates loop was left untimed by the first #0113 pass. Updates are rare on PROD
+    (413 vs 116,235 appends over build 40's 60.6h run) but DELETE-then-reinsert, churning
+    more pages per row than an append — so an untimed update batch is an unmeasured
+    confounder for any read-latency spike attributed to appends."""
+
+    def test_update_batch_logs_elapsed_and_conn(self, tmp_path, caplog):
+        dm = _make_db(tmp_path)
+        updates = [
+            ("#CLAN1", "W1", [], {"war_id": "W1", "date": "2026-09-12T10:00"}),
+        ]
+
+        with caplog.at_level("INFO"):
+            dm.flush_pending_war_writes([], updates, batch_size=50)
+
+        [line] = [r.message for r in caplog.records if "[DB-BULK-UPDATE]" in r.message]
+        assert "Flushed batch of 1 war updates" in line
+        assert "elapsed=" in line
+        assert "conn=" in line
+
+    def test_append_batch_logs_conn_identity(self, tmp_path, caplog):
+        """conn= is what separates the two mechanisms #0113 conflates: SQLite's pager cache
+        is per-connection, so a write can only pollute the one connection it held."""
+        dm = _make_db(tmp_path)
+        appends = [("#CLAN1", [], {"war_id": "W1", "date": "2026-09-12T10:00"})]
+
+        with caplog.at_level("INFO"):
+            dm.flush_pending_war_writes(appends, [], batch_size=50)
+
+        [line] = [r.message for r in caplog.records if "[DB-BULK-WRITE]" in r.message]
+        assert "conn=" in line
+
+
+class TestReadTimingAggregator:
+    """#0113 (2026-09-12): the windowed aggregator behind [DB-READ-TIMING].
+
+    Every test resets the module-level accumulator in a fixture. That global is shared
+    process-wide, so a leaked sample would silently corrupt an unrelated test's aggregate
+    — the same class of cross-test contamination that the GC-policy work hit in #0106.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_accumulator(self):
+        import qapbot.db_manager as dbm
+        dbm._read_timing_samples.clear()
+        dbm._read_timing_window_start = 0.0
+        yield
+        dbm._read_timing_samples.clear()
+        dbm._read_timing_window_start = 0.0
+
+    def test_does_not_log_until_the_window_elapses(self, caplog):
+        import qapbot.db_manager as dbm
+        with caplog.at_level("INFO"):
+            for _ in range(50):
+                dbm._record_read_timing("probe", 0.001, conn_id=1)
+
+        assert not [r for r in caplog.records if "[DB-READ-TIMING]" in r.message]
+        assert len(dbm._read_timing_samples["probe"]) == 50
+
+    def test_flushes_aggregate_once_the_window_has_passed(self, caplog):
+        import qapbot.db_manager as dbm
+        dbm._record_read_timing("probe", 0.010, conn_id=1)
+        dbm._record_read_timing("probe", 0.020, conn_id=1)
+        # Force the window open rather than sleeping 60s.
+        dbm._read_timing_window_start -= dbm._READ_TIMING_WINDOW_S + 1
+
+        with caplog.at_level("INFO"):
+            dbm._record_read_timing("probe", 0.030, conn_id=1)
+
+        [line] = [r.message for r in caplog.records if "[DB-READ-TIMING]" in r.message]
+        assert "probe" in line
+        assert "n=3" in line
+        assert "max=30.00ms" in line
+        # Accumulator must be emptied, or the next window double-counts these samples.
+        assert not dbm._read_timing_samples
+
+    def test_conn_mean_spread_is_zero_when_all_samples_share_a_connection(self, caplog):
+        """The OS-page-cache signature: every connection slows together, so the spread
+        between per-connection means stays flat."""
+        import qapbot.db_manager as dbm
+        for _ in range(5):
+            dbm._record_read_timing("probe", 0.010, conn_id=7)
+        dbm._read_timing_window_start -= dbm._READ_TIMING_WINDOW_S + 1
+
+        with caplog.at_level("INFO"):
+            dbm._record_read_timing("probe", 0.010, conn_id=7)
+
+        [line] = [r.message for r in caplog.records if "[DB-READ-TIMING]" in r.message]
+        assert "conns=1" in line
+        assert "conn_mean_spread=0.00ms" in line
+
+    def test_conn_mean_spread_exposes_one_slow_connection(self, caplog):
+        """The per-connection pager signature: one connection carries a polluted cache
+        while the others do not. This is the field that tells the two mechanisms apart."""
+        import qapbot.db_manager as dbm
+        for _ in range(5):
+            dbm._record_read_timing("probe", 0.001, conn_id=1)
+        for _ in range(5):
+            dbm._record_read_timing("probe", 0.051, conn_id=2)
+        dbm._read_timing_window_start -= dbm._READ_TIMING_WINDOW_S + 1
+
+        with caplog.at_level("INFO"):
+            dbm._record_read_timing("probe", 0.001, conn_id=1)
+
+        [line] = [r.message for r in caplog.records if "[DB-READ-TIMING]" in r.message]
+        assert "conns=2" in line
+        spread = float(line.split("conn_mean_spread=")[1].rstrip("ms"))
+        assert spread == pytest.approx(50.0, abs=1.0)
+
+
+class TestWarSummaryStateReadIsSampled:
+    @pytest.fixture(autouse=True)
+    def _reset_accumulator(self):
+        import qapbot.db_manager as dbm
+        dbm._read_timing_samples.clear()
+        dbm._read_timing_window_start = 0.0
+        yield
+        dbm._read_timing_samples.clear()
+        dbm._read_timing_window_start = 0.0
+
+    def test_successful_lookup_is_sampled(self, tmp_path):
+        import qapbot.db_manager as dbm
+        dm = _make_db(tmp_path)
+        conn = sqlite3.connect(_path_of(dm))
+        conn.execute(
+            "INSERT INTO war_summary (war_id, clan_tag, opponent_tag, state, date) "
+            "VALUES ('W1', '#C1', '#OPP', 'war_ended', '2026-09-12T10:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        assert dm.get_war_summary_state_sync("#C1", "W1") == "war_ended"
+        assert len(dbm._read_timing_samples["get_war_summary_state_sync"]) == 1
+
+    def test_failed_lookup_is_still_sampled(self, tmp_path):
+        """Recorded in `finally`: a read slow enough to error is exactly the case #0113
+        cares about, so dropping those samples would bias the aggregate optimistic."""
+        import qapbot.db_manager as dbm
+        dm = _make_db(tmp_path)
+        conn = sqlite3.connect(_path_of(dm))
+        conn.execute("DROP TABLE war_summary")
+        conn.commit()
+        conn.close()
+
+        assert dm.get_war_summary_state_sync("#C1", "W1") is None
+        assert len(dbm._read_timing_samples["get_war_summary_state_sync"]) == 1

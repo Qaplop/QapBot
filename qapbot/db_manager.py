@@ -342,6 +342,67 @@ def attach_history_db(conn: Any, db_path: str, history_db_path: Optional[str] = 
     return resolved
 
 
+# ── #0113 read-latency sampling (2026-09-12) ──────────────────────────────────────────
+# Windowed aggregate rather than per-call logging: the read this measures
+# (get_war_summary_state_sync) runs >=1,186 times/hour on PROD — measured from build 40's
+# LIFETIME counters (skip_finalized=71877 over 60.6h) — so per-call INFO lines would add
+# ~29k lines/day. One aggregate line per window keeps the log sane while still giving
+# enough time resolution to line each window up against [DB-BULK-WRITE] timestamps.
+#
+# `conn_mean_spread` is what separates the two candidate mechanisms, which the #0113 ticket
+# conflates:
+#   * SQLite's pager cache is PER-CONNECTION (no shared_cache anywhere; 8-connection FIFO
+#     pool). A write flush holds one connection, so it can only pollute that one — which the
+#     FIFO ordering then hands out LAST. That signature is a large spread between the
+#     slowest and fastest connection's mean.
+#   * The OS page cache IS shared, so write pressure there slows EVERY connection together.
+#     That signature is all connections rising during a burst with the spread staying flat.
+_READ_TIMING_WINDOW_S = 60.0
+_read_timing_lock = threading.Lock()
+_read_timing_samples: Dict[str, List[Tuple[float, int]]] = {}   # name -> [(elapsed, conn_id)]
+_read_timing_window_start: float = 0.0
+
+
+def _record_read_timing(name: str, elapsed: float, conn_id: int) -> None:
+    """Accumulate one read-latency sample; emit an aggregate once per window.
+
+    Called from worker threads (the save path runs under asyncio.to_thread), hence the
+    lock. Logging happens OUTSIDE the lock so a slow handler can never serialise the
+    callers it is measuring — that would make the instrument change the thing it measures.
+    """
+    global _read_timing_window_start
+    now = _time.monotonic()
+    flush: Optional[Dict[str, List[Tuple[float, int]]]] = None
+    with _read_timing_lock:
+        if _read_timing_window_start == 0.0:
+            _read_timing_window_start = now
+        _read_timing_samples.setdefault(name, []).append((elapsed, conn_id))
+        if now - _read_timing_window_start >= _READ_TIMING_WINDOW_S:
+            flush = dict(_read_timing_samples)
+            _read_timing_samples.clear()
+            _read_timing_window_start = now
+    if not flush:
+        return
+    for _name, samples in sorted(flush.items()):
+        if not samples:
+            continue
+        times = sorted(s[0] for s in samples)
+        n = len(times)
+        mean = sum(times) / n
+        p95 = times[min(n - 1, int(n * 0.95))]
+        # Per-connection means, to expose the per-pager signature described above.
+        per_conn: Dict[int, List[float]] = {}
+        for _el, _cid in samples:
+            per_conn.setdefault(_cid, []).append(_el)
+        conn_means = [sum(v) / len(v) for v in per_conn.values()]
+        spread = (max(conn_means) - min(conn_means)) if len(conn_means) > 1 else 0.0
+        logging.info(
+            f"[DB-READ-TIMING] {_name} window={_READ_TIMING_WINDOW_S:.0f}s n={n} "
+            f"mean={mean * 1000:.2f}ms p95={p95 * 1000:.2f}ms max={times[-1] * 1000:.2f}ms "
+            f"conns={len(per_conn)} conn_mean_spread={spread * 1000:.2f}ms"
+        )
+
+
 def db_memory_pragmas(schema: str = "") -> list[str]:
     """The two pragmas that decide how much RAM SQLite takes, as executable statements.
 
@@ -951,7 +1012,7 @@ class WarHistoryDB:
                         logging.info(
                             f"[DB-BULK-WRITE] Flushed batch of {len(batch)} war appends "
                             f"({len(all_attack_params)} attack rows, {len(all_summary_params)} summaries) "
-                            f"elapsed={_time.monotonic() - _batch_t0:.3f}s"
+                            f"elapsed={_time.monotonic() - _batch_t0:.3f}s conn={id(conn)}"
                         )
                     except sqlite3.Error:
                         conn.rollback()
@@ -964,6 +1025,12 @@ class WarHistoryDB:
                 batch = updates[i : i + batch_size]
                 with self._sync_write_lock:
                     conn.execute("PRAGMA wal_autocheckpoint=0")
+                    # #0113 (2026-09-12): updates are far rarer than appends on PROD (413 vs
+                    # 116,235 over build 40's 60.6h run) but they DELETE-then-reinsert, which
+                    # churns more pages per row than a plain append. Timed too, so a read
+                    # latency spike can be attributed to the right kind of write instead of
+                    # leaving update batches as an unmeasured confounder.
+                    _upd_t0 = _time.monotonic()
                     try:
                         # Collect all delete keys and insert params across the batch
                         delete_keys: List[Tuple[str, str]] = []
@@ -1048,7 +1115,9 @@ class WarHistoryDB:
                                 )
                         conn.commit()
                         logging.info(
-                            f"[DB-BULK-UPDATE] Flushed batch of {len(batch)} war updates"
+                            f"[DB-BULK-UPDATE] Flushed batch of {len(batch)} war updates "
+                            f"({len(all_attack_params)} attack rows, {len(all_summary_params)} summaries) "
+                            f"elapsed={_time.monotonic() - _upd_t0:.3f}s conn={id(conn)}"
                         )
                     except sqlite3.Error:
                         conn.rollback()
@@ -3939,6 +4008,15 @@ class WarHistoryDB:
         if not self.db_path:
             raise RuntimeError("Database not initialized. Call initialize() first.")
 
+        # #0113 (2026-09-12): THIS is the hot-path read the ticket is really about, not the
+        # Discord command paths instrumented first. It runs from inside save_war_object's
+        # per-war loop — i.e. interleaved with the very bulk appends the ticket suspects of
+        # evicting it, on the same 8-connection pool. Measured rate on PROD is >=1,186/h
+        # against 0-10 Discord commands PER DAY, so this is where an effect would be
+        # visible at all. Indexed point lookup on main.war_summary only (no history UNION),
+        # which makes it a clean cache-sensitivity probe: if the page it wants is resident
+        # the query is sub-millisecond, and if it was evicted it pays an SSD fault.
+        _t0 = _time.monotonic()
         with self._sync_conn() as conn:
             try:
                 conn.row_factory = sqlite3.Row
@@ -3951,6 +4029,12 @@ class WarHistoryDB:
             except sqlite3.Error as e:
                 logging.error(f"[DB-CHECK-SYNC] war_summary state check failed: {e}")
                 return None
+            finally:
+                # In `finally` so an errored query still contributes a sample — a read slow
+                # enough to fail is exactly the case this measurement cares about.
+                _record_read_timing(
+                    "get_war_summary_state_sync", _time.monotonic() - _t0, id(conn)
+                )
 
     def get_direct_cwl_attacks_sync(
         self, opp_clan_tag: str, cwl_season: str
