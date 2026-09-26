@@ -1129,14 +1129,14 @@ def _server_jump_link(client: discord.Client, guild_id: int) -> str:
 def _landing_fallback_text(interaction: discord.Interaction) -> str:
     """Tracker #0136: what /about says when the Activity can't be opened (refused launch): the
     landing page's essentials as text — install link, the first commands and the support invite."""
-    from clashcontrol.constants import SUPPORT_INVITE_URL
+    from clashcontrol.constants import SUPPORT_INVITE_URL, bot_install_url
     from clashcontrol.i18n import t
     from clashcontrol.QBdiscocmdshelper import command_mention
     return t(
         'commands.about.fallback',
         guild_id=interaction.guild.id if interaction.guild else None,
         user_id=str(interaction.user.id),
-        install_url=f"https://discord.com/oauth2/authorize?client_id={interaction.client.application_id}",
+        install_url=bot_install_url(interaction.client.application_id),
         registration=command_mention("registration"),
         cwl_preferences=command_mention("cwl preferences"),
         help=command_mention("help"),

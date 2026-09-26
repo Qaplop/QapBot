@@ -25,6 +25,17 @@ SUPPORT_INVITE_URL = "https://discord.gg/Eg3f7VQA2T"
 """Permanent invite to ClashControl's public support channel on The QCrew server (tracker #0135
 follow-up). Same link as SUPPORT_URL in activity/client/src/landingPage.ts."""
 
+
+def bot_install_url(application_id: object) -> str:
+    """The "Add to server" link for this bot (Discord's OAuth2 install page, which applies the
+    install settings from the Developer Portal). Shared by /about's fallback text and the greeting
+    DM (tracker #0141) so the link is built in one place.
+
+    Args:
+        application_id: The bot's application id (client.application_id).
+    """
+    return f"https://discord.com/oauth2/authorize?client_id={application_id}"
+
 # ============================================================================
 # Discord API Limits
 # ============================================================================

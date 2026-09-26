@@ -239,6 +239,7 @@
       "clan_option_overview": "部落概览",
       "clan_select_placeholder": "显示该部落的排行榜...",
       "clan_mode_failed": "⚠️ 无法为该部落生成 `{mode}` 排行榜。",
+      "clan_leaderboard_truncated": "……在此截断——{leaderboard} 可显示完整列表。",
       "clan_not_tracked": "❌ `{clan}` 不是 ClashControl 追踪的部落，因此没有保存的数据。请从建议中选择一个部落，或使用已追踪部落的标签。"
     },
     "link": {
@@ -293,7 +294,7 @@
         "detailed": "分析部落战联赛（CWL）联赛组中的所有部落，并按进攻和防守表现为每位玩家排名。\n\n**用法：**\n`/analyse cwl_league_group clan:<部落标签或名称>`\n\n**参数：**\n• `clan` - 用于查找其部落战联赛联赛组的部落标签或名称\n\n**显示的信息：**\n• ⚔️ 前 10 名最佳进攻者——对同等或更高大本营等级目标的平均星数最高\n• 🛡️ 前 10 名最佳防守者——每次防守被攻破的平均星数最少\n• 玩家名称、标签、部落、部落标签及表现数值\n\n**说明：**\n此命令在部落战联赛赛季期间或结束后不久有效。自动补全下拉菜单会建议已跟踪的部落；也可以直接输入任意部落标签。\n\n**示例：**\n`/analyse cwl_league_group clan:#L2J0C0PY`"
       },
       "analyse cwl_opponent": {
-        "short": "分析部落战联赛对手部落的阵容（技巧/可靠性/活跃度）",
+        "short": "分析部落战联赛对手部落的阵容",
         "title": "🛡️ Analyse CWL Opponent 命令",
         "detailed": "分析某个部落战联赛对手部落的阵容：每位玩家的技巧、可靠性和活跃度统计数据。\n\n**用法：**\n`/analyse cwl_opponent clan:<部落标签或名称>`\n\n**参数：**\n• `clan` - 你自己部落的标签或名称，用于查找其部落战联赛联赛组\n\n**流程：**\n1. 解析你部落当前（或最近一次）的部落战联赛联赛组\n2. 显示一个临时下拉菜单，列出该组中最多 7 个对手部落\n3. 选择一个对手部落以查看每位玩家的统计表\n\n**显示的统计数据（按玩家，链接到游戏内资料）：**\n• 部落战联赛攻击技巧 = (3★ − 1★) / 攻击次数 × 100%\n• 普通部落战攻击技巧 = 普通部落战使用同一公式\n• 可靠性 = 已用攻击次数 / 最大攻击次数 × 100%\n• 活跃度 = 按时间归一化的攻击参与率\n\n**说明：**\n阵容数据在可用时来自实时战争阵型，否则回退到最近一次归档的战争/赛季数据。\n\n**示例：**\n`/analyse cwl_opponent clan:#L2J0C0PY`"
       },
@@ -323,7 +324,7 @@
         "detailed": "列出各类数据：拥有已注册玩家的 Discord 账号、部落家族，或某个部落/家族中的所有玩家。\n\n**用法：**\n`/list action:<Accounts|Families|Players|Tracked Clans|Managed CWLs> [clan:<部落>] [family:<家族>] [season:<赛季>] [discord_user:<@用户>]`\n\n**操作：**\n\n**Accounts** - 列出所有 Discord 用户账号及其已注册玩家\n• 显示验证状态\n• 显示主账号\n• 包含大本营等级\n• `discord_user` 参数（可选）：仅显示该特定 Discord 用户的账号，而非所有人\n\n**Families** - 列出所有部落家族及其成员部落\n• 显示家族结构\n• 列出每个家族中的所有部落\n\n**Players** - 列出某个部落或家族中的所有玩家\n• `clan` 参数：指定部落标签或名称\n• `family` 参数：指定家族标签\n• 显示玩家名称、标签和大本营等级\n• 显示 Discord 绑定状态\n\n**Tracked Clans** - 按战争联赛分组的所有已跟踪部落的柱状图\n• 以图片形式发布到频道\n\n**Managed CWLs**（机器人管理员）- 列出每个为某赛季设置了受管理部落战联赛的服务器\n• `season` 参数：以 YYYY-MM 格式表示的部落战联赛赛季 — 省略时默认为下一个即将到来的赛季\n\n**示例：**\n`/list action:Accounts`\n`/list action:Accounts discord_user:@某用户`\n`/list action:Families`\n`/list action:Players clan:#L2J0C0PY`\n`/list action:Players family:#FAMILY123`\n`/list action:Tracked Clans`\n`/list action:Managed CWLs season:2026-09`"
       },
       "whois": {
-        "short": "查询 Discord 用户的部落冲突账号、某位玩家的战争历史或某个部落的数据",
+        "short": "查询 Discord 与部落冲突用户及部落统计",
         "title": "🔍 Whois 命令",
         "detailed": "查询某个 Discord 用户已注册的部落冲突账号，或显示任意部落冲突玩家的完整战争表现报告。\n\n**用法：**\n`/whois user:<@用户>` — 某个 Discord 用户已注册的部落冲突账号\n`/whois player:<#标签>` — 特定玩家标签的战争历史报告\n`/whois player:<名称>` — 按玩家名称搜索（不区分大小写的子字符串）；如有多个匹配则从列表中选择\n\n**右键菜单：**\n右键点击任意用户 → 应用 → **whois**\n右键点击任意消息 → 应用 → **whois**（查询消息作者）\n\n**用户查询（显示的信息）：**\n• 所有已注册的部落冲突玩家账号（按大本营等级排序）\n• 带图标的大本营等级\n• 英雄等级（野蛮人国王、弓箭手皇后、大法师、皇家champion、地精王子）\n• 部落身份组和部落名称\n• 验证状态（✅ 已验证 / 未验证）\n• 主账号标记\n\n**玩家报告（显示的信息）：**\n• 最后已知的部落（名称和标签）\n• 总战争数（普通部落战 / 部落战联赛）、胜负记录\n• 已用攻击次数与错过次数、可靠性百分比\n• 每次攻击平均星数、平均摧毁率\n• 完整星数分布（0★ / 1★ / 2★ / 3★）\n• 近期趋势（最近 10 场普通部落战对比总体）\n• 部落战联赛概况（赛季数、战争数、平均星数）\n• 最近 10 场战争的时间线\n\n**部落报告（`/whois clan:<部落>`，仅限已追踪的部落）：**\n• 成员、部落等级、部落战联赛和都城联赛、战争日志\n• ClashControl 保存的战争（普通部落战 / 部落战联赛），含战绩和联赛赛季\n• 追踪开始时间、战争追踪状态、订阅、部落家族以及作为成员部落所在的服务器\n• 下拉菜单：该部落的任意排行榜模式（本月），或返回概览\n\n**示例：**\n`/whois user:@某用户` - 查询某个特定用户的部落冲突账号\n`/whois player:#ABC123` - 某个部落冲突玩家标签的战争历史报告\n`/whois player:John` - 搜索所有名为 John 的玩家并选择一个\n`/whois clan:#2PP` - 某个已追踪部落的保存数据和排行榜"
       },
@@ -370,7 +371,7 @@
       "feature": {
         "short": "为 ClashControl 请求一个新功能（包括添加新语言）",
         "title": "💡 Feature 命令",
-        "detailed": "打开一个表单以请求新功能。适用于机器人所在的任何服务器，以及私信。\n\n**用法：**\n`/feature [attachment1:<文件>] [attachment2:<文件>] [attachment3:<文件>]`\n\n**参数：**\n• `attachment1`/`attachment2`/`attachment3` - 可选：截图或效果图（最多 3 个；之后可通过该条目的**添加文件**按钮继续添加）\n\n**流程：**\n1. 弹出一个表单，用于填写标题、描述以及“这为什么有用？”\n2. 提交后会显示草稿预览，附带 编辑 / 添加附件 / 提交 / 丢弃 按钮\n3. 提交后会将请求发布到跟踪频道，附带全局 `#NNNN` 编号，并打开一个讨论线程\n\n**示例：**\n`/feature`"
+        "detailed": "打开一个表单以请求新功能。适用于机器人所在的任何服务器，以及私信。\n\n**用法：**\n`/feature [attachment1:<文件>] [attachment2:<文件>] [attachment3:<文件>]`\n\n**参数：**\n• `attachment1`/`attachment2`/`attachment3` - 可选：截图或效果图（最多 3 个；之后可通过该条目的**添加文件**按钮继续添加）\n\n**流程：**\n1. 弹出一个表单，用于填写标题、描述以及“这为什么有用？”\n2. 提交后会显示草稿预览，附带 编辑 / 添加附件 / 提交 / 丢弃 按钮\n3. 提交后会将请求发布到跟踪频道，附带全局 `#NNNN` 编号，并打开一个讨论线程\n\n**语言：**\n没有你的语言？使用 `/feature` 提出请求——我们很乐意添加。\n\n**示例：**\n`/feature`"
       }
     },
     "subscribe": {},

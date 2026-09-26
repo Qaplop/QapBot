@@ -1,6 +1,20 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-26 (17)
+- Fixed (tracker #0140): /whois clan leaderboards wrapped every table row -- they were rendered
+  into embeds, which are narrower than chat. Text leaderboards now go into message content
+  (```ansi, full width, like /leaderboard): first part in the same message, the rest in up to 4
+  ephemeral follow-ups that are deleted again on the next pick / timeout; longer boards are cut
+  with a hint to /leaderboard (new key, 5 languages). cwlinfo/cwlgroup stay embeds/image.
+- Added (tracker #0141): the greeting DM (/dm me, /admin DM User) gets the landing page's
+  "Add to server" hint plus "Add to server" / "Open support channel" link buttons. The install
+  URL is now one helper, constants.bot_install_url(), shared with /about's fallback text.
+- Changed (tracker #0142, #0143): /help short texts for /analyse cwl_opponent and /whois; the
+  /feature help mentions that additional languages can be requested with it (5 languages).
+  Build 126. Files: QBdiscordcmds.py, clashcontrol/greeting_dm.py, clashcontrol/constants.py,
+  clashcontrol/ui_cwl_roster.py, clashcontrol/translations/*.json, tests. 3592 tests pass.
+
 2026-09-26 (16)
 - Added: WAR_SUMMARY_UNKNOWN (-1) = "data not available" for numeric war_summary columns
   (clashcontrol/constants.py). Prepares the reconstruction of the 317 legacy wars (2025-07-26 ..

@@ -5272,8 +5272,11 @@ async def _whois_player_select_callback(interaction: discord.Interaction, select
 
 # Select value for "back to the clan overview" — no MODE_REGISTRY key can collide with it.
 _WHOIS_CLAN_OVERVIEW = "__overview__"
-# Discord caps the embeds of ONE message at 6000 characters in total.
-_WHOIS_CLAN_EMBED_BUDGET = 5800
+# Tracker #0140: text leaderboards go into message CONTENT (full chat width — an embed is narrower
+# and wraps the table), so Discord's 2000-character content limit applies per message. A long board
+# continues in extra ephemeral messages, capped here so a huge clan can't flood the channel.
+_WHOIS_CLAN_MESSAGE_LIMIT = 2000
+_WHOIS_CLAN_MAX_MESSAGES = 5
 
 
 def _whois_discord_time(value: Any, style: str = "D") -> Optional[str]:
@@ -5415,13 +5418,25 @@ async def _build_whois_clan_embed(clan_tag: str, user_id: str, guild_id: Optiona
     return embed
 
 
-def _whois_leaderboard_text_to_embeds(text: str, title: Optional[str] = None) -> List[discord.Embed]:
-    """Pack /leaderboard text into embeds: plain-text sentinel sections (custom emoji) stay plain,
-    everything else goes into ```ansi blocks (the ANSI codes are the caller's own highlight).
-    Stays inside one message's 6000-character embed budget; the rest is cut with a hint."""
+def _whois_leaderboard_text_to_messages(text: str, truncated_hint: str) -> List[str]:
+    """Split /leaderboard text into message contents of at most _WHOIS_CLAN_MESSAGE_LIMIT
+    characters (tracker #0140): plain-text sentinel sections (custom emoji) stay plain, everything
+    else goes into ```ansi blocks (the ANSI codes are the caller's own highlight) — the same layout
+    /leaderboard posts, so the table gets the full chat width instead of an embed's.
+
+    Args:
+        text: generate_leaderboard_text() output.
+        truncated_hint: Line appended to the last message when the board had to be cut after
+            _WHOIS_CLAN_MAX_MESSAGES messages.
+
+    Returns:
+        1.._WHOIS_CLAN_MAX_MESSAGES message contents (never empty).
+    """
     import re
     from QBhelperfunctions import _PLAIN_SENTINEL_START, _PLAIN_SENTINEL_END  # type: ignore[attr-defined]
 
+    fence_overhead = len("```ansi\n\n```")
+    code_budget = _WHOIS_CLAN_MESSAGE_LIMIT - fence_overhead - 60  # room for the truncation hint
     blocks: List[str] = []
 
     def add_code(code: str) -> None:
@@ -5430,7 +5445,8 @@ def _whois_leaderboard_text_to_embeds(text: str, title: Optional[str] = None) ->
             return
         chunk = ""
         for line in code.split("\n"):
-            if chunk and len(chunk) + len(line) + 1 > 3800:
+            line = line[:code_budget]
+            if chunk and len(chunk) + len(line) + 1 > code_budget:
                 blocks.append(f"```ansi\n{chunk}\n```")
                 chunk = ""
             chunk = f"{chunk}\n{line}" if chunk else line
@@ -5442,41 +5458,39 @@ def _whois_leaderboard_text_to_embeds(text: str, title: Optional[str] = None) ->
     for i, part in enumerate(parts):
         if i % 2:
             if part.strip("\n"):
-                blocks.append(part.strip("\n")[:3900])
+                blocks.append(part.strip("\n")[:code_budget])
         else:
             add_code(part)
 
-    embeds: List[discord.Embed] = []
-    used = len(title or "")
+    messages: List[str] = []
     current = ""
-    truncated = False
     for block in blocks:
-        if used + len(current) + len(block) + 2 > _WHOIS_CLAN_EMBED_BUDGET:
-            truncated = True
-            break
-        if current and len(current) + len(block) + 1 > 4000:
-            embeds.append(discord.Embed(description=current, color=discord.Color.blue()))
-            used += len(current)
+        if current and len(current) + len(block) + 1 > code_budget + fence_overhead:
+            messages.append(current)
             current = ""
         current = f"{current}\n{block}" if current else block
-    if truncated:
-        current = f"{current}\n…"
     if current:
-        embeds.append(discord.Embed(description=current, color=discord.Color.blue()))
-    if not embeds:
-        embeds.append(discord.Embed(description="—", color=discord.Color.blue()))
-    if title:
-        embeds[0].title = title[:256]
-    return embeds[:10]
+        messages.append(current)
+    if not messages:
+        return ["—"]
+    if len(messages) > _WHOIS_CLAN_MAX_MESSAGES:
+        messages = messages[:_WHOIS_CLAN_MAX_MESSAGES]
+        messages[-1] = f"{messages[-1]}\n{truncated_hint}"
+    return messages
 
 
 async def _render_whois_clan_mode(
     clan_tag: str, mode: str, highlight_player_ids: Set[str], user_id: str, guild_id: Optional[int]
-) -> Tuple[List[discord.Embed], List[discord.File]]:
+) -> Tuple[List[str], List[discord.Embed], List[discord.File]]:
     """One /leaderboard mode for one clan with /leaderboard's defaults (current month, scope
-    "all"; raid modes: latest weekend; cwlgroup: latest season) — as embeds (+ image file) for
-    the /whois clan message instead of channel posts. Live modes are refreshed first, as in
-    /leaderboard."""
+    "all"; raid modes: latest weekend; cwlgroup: latest season) for the /whois clan message
+    instead of channel posts. Live modes are refreshed first, as in /leaderboard.
+
+    Returns:
+        (contents, embeds, files): text leaderboards come back as message contents (tracker
+        #0140 — full chat width, one entry per message); cwlinfo/cwlinfo_comp as their own embeds
+        and cwlgroup as an image, with an empty contents list.
+    """
     from clashcontrol.formatting import RAID_MODES  # type: ignore[attr-defined]
 
     if mode == "currentwar":
@@ -5491,15 +5505,15 @@ async def _render_whois_clan_mode(
                 logging.warning(f"[WHOIS-CLAN] currentraid refresh failed for {clan_tag}: {exc}")
 
     if mode == "cwlinfo":
-        return (await generate_cwlinfo_embeds(clan_tag))[:10], []
+        return [], (await generate_cwlinfo_embeds(clan_tag))[:10], []
     if mode == "cwlinfo_comp":
         embeds, _debug = await generate_cwlinfo_comp_embeds(clan_tag)
-        return embeds[:10], []
+        return [], embeds[:10], []
     if mode == "cwlgroup":
         season = await CACHE.db_manager.get_latest_cwl_season_for_clan(clan_tag) if CACHE.db_manager else None  # type: ignore[union-attr]
         standings = await update_cwl_group_stats(clan_tag, season) if season else None
         if not standings:
-            return [discord.Embed(
+            return [], [discord.Embed(
                 description=t('commands.errors.cwlgroup_no_data', user_id=user_id, guild_id=guild_id,
                               clan_name=CACHE.get_clan_name(clan_tag, clan_tag), tag=clan_tag, season=season or "—"),
                 color=discord.Color.orange(),
@@ -5507,7 +5521,7 @@ async def _render_whois_clan_mode(
         img_bytes = await asyncio.to_thread(generate_cwl_group_image, standings, season, clan_tag)
         embed = discord.Embed(color=discord.Color.blue())
         embed.set_image(url="attachment://cwlgroup.png")
-        return [embed], [discord.File(io.BytesIO(img_bytes), filename="cwlgroup.png")]
+        return [], [embed], [discord.File(io.BytesIO(img_bytes), filename="cwlgroup.png")]
 
     now = datetime.now(timezone.utc)
     period_month: Optional[int] = None if mode in RAID_MODES and mode != "raid" else now.month
@@ -5515,7 +5529,9 @@ async def _render_whois_clan_mode(
         generate_leaderboard_text, clan_tag, month=period_month, year=now.year,
         mode=mode, scope="all", highlight_player_ids=highlight_player_ids,
     )
-    return _whois_leaderboard_text_to_embeds(text), []
+    hint = t('commands.whois.clan_leaderboard_truncated', user_id=user_id, guild_id=guild_id,
+             leaderboard=command_mention("leaderboard"))
+    return _whois_leaderboard_text_to_messages(text, hint), [], []
 
 
 class _WhoisClanView(discord.ui.View):
@@ -5526,6 +5542,10 @@ class _WhoisClanView(discord.ui.View):
     responded on it, and each token dies 15 minutes after its interaction. Every pick answers on
     the message (a fresh token), and the timeout (10 min, restarted on every pick) stays below
     that, so on_timeout can still remove the dropdown through the last pick's token.
+
+    Tracker #0140: a long text leaderboard continues in extra ephemeral follow-ups
+    (self.extra_messages). They are deleted on the next pick and on timeout — both within
+    15 minutes of the pick that sent them, so their token is still valid.
     """
 
     def __init__(self, clan_tag: str, overview: discord.Embed, user_id: str, guild_id: Optional[int],
@@ -5538,6 +5558,7 @@ class _WhoisClanView(discord.ui.View):
         self.guild_id = guild_id
         self.highlight_player_ids = highlight_player_ids
         self.last_interaction: Optional[discord.Interaction] = None
+        self.extra_messages: List[discord.WebhookMessage] = []
         self._busy = False
 
         options = [discord.SelectOption(
@@ -5571,24 +5592,44 @@ class _WhoisClanView(discord.ui.View):
             if not await _safe_defer(interaction):
                 return
             self.last_interaction = interaction
+            await self._delete_extra_messages()
+            contents: List[str] = []
             if mode == _WHOIS_CLAN_OVERVIEW:
                 embeds, files = [self.overview], []
             else:
                 try:
-                    embeds, files = await _render_whois_clan_mode(
+                    contents, embeds, files = await _render_whois_clan_mode(
                         self.clan_tag, mode, self.highlight_player_ids, self.user_id, self.guild_id)
                 except Exception as exc:
                     logging.warning(f"[WHOIS-CLAN] rendering {mode} for {self.clan_tag} failed: {exc}", exc_info=True)
-                    embeds, files = [discord.Embed(
+                    contents, embeds, files = [], [discord.Embed(
                         description=t('commands.whois.clan_mode_failed', user_id=self.user_id,
                                       guild_id=self.guild_id, mode=mode),
                         color=discord.Color.red(),
                     )], []
-            await interaction.edit_original_response(content=None, embeds=embeds, attachments=files, view=self)
+            await interaction.edit_original_response(
+                content=contents[0] if contents else None, embeds=embeds, attachments=files, view=self)
+            for extra in contents[1:]:
+                try:
+                    self.extra_messages.append(
+                        await interaction.followup.send(extra, ephemeral=True, wait=True))
+                except discord.HTTPException as exc:
+                    logging.warning(f"[WHOIS-CLAN] could not send leaderboard part for {self.clan_tag}: {exc}")
+                    break
         finally:
             self._busy = False
 
+    async def _delete_extra_messages(self) -> None:
+        """Remove the previous pick's leaderboard continuation messages (tracker #0140)."""
+        extras, self.extra_messages = self.extra_messages, []
+        for message in extras:
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+
     async def on_timeout(self) -> None:
+        await self._delete_extra_messages()
         if self.last_interaction is None:
             return
         try:

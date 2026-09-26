@@ -37,6 +37,29 @@ def test_greeting_embed_resolves_every_text():
     assert len(embed) <= 6000
 
 
+def test_greeting_dm_has_install_and_support_buttons(monkeypatch):
+    """Tracker #0141: the DM carries the landing page's "Add to server" + support link buttons."""
+    import QBcore
+    from clashcontrol.constants import SUPPORT_INVITE_URL
+    from clashcontrol.greeting_dm import build_greeting_dm_embed, build_greeting_dm_view
+
+    monkeypatch.setattr(QBcore, "bot", MagicMock(application_id=1234))
+    urls = [b.url for b in build_greeting_dm_view("1", None).children]
+    assert urls == ["https://discord.com/oauth2/authorize?client_id=1234", SUPPORT_INVITE_URL]
+    assert any("➕" in f.name for f in build_greeting_dm_embed("1", None, "Qap").fields)
+
+
+def test_help_texts_tracker_142_143():
+    import json
+    from pathlib import Path
+
+    en = json.loads((Path(QBdiscordcmds.__file__).parent / "clashcontrol/translations/en.json").read_text(encoding="utf-8"))
+    helps = en["commands"]["help"]
+    assert helps["analyse cwl_opponent"]["short"] == "Analyse a CWL opponent clan's roster"
+    assert helps["whois"]["short"] == "Look up of Discord and CoC users and clan stats"
+    assert "Missing your language?" in helps["feature"]["detailed"]
+
+
 @pytest.mark.asyncio
 async def test_dm_me_confirms_with_jump_link(mock_interaction, monkeypatch):
     sent = MagicMock()
@@ -175,20 +198,49 @@ def test_leaderboard_text_keeps_plain_sections_outside_code():
     from QBhelperfunctions import _PLAIN_SENTINEL_START, _PLAIN_SENTINEL_END
 
     text = f"header\n{_PLAIN_SENTINEL_START}<:emoji:1> roster{_PLAIN_SENTINEL_END}table row"
-    embeds = QBdiscordcmds._whois_leaderboard_text_to_embeds(text)
-    desc = embeds[0].description or ""
-    assert "```ansi\nheader\n```" in desc
-    assert "\n<:emoji:1> roster\n" in desc
-    assert "```ansi\ntable row\n```" in desc
-    assert "\x00" not in desc
+    messages = QBdiscordcmds._whois_leaderboard_text_to_messages(text, "CUT")
+    assert len(messages) == 1
+    content = messages[0]
+    assert "```ansi\nheader\n```" in content
+    assert "\n<:emoji:1> roster\n" in content
+    assert "```ansi\ntable row\n```" in content
+    assert "\x00" not in content and "CUT" not in content
 
 
-def test_leaderboard_text_stays_inside_one_message_budget():
+def test_long_leaderboard_is_split_into_capped_messages():
+    """Tracker #0140: message content (full width), each <= 2000 chars, at most 5 messages; the
+    rest is cut with the hint pointing to /leaderboard."""
     text = "\n".join(f"{i:04d} " + "x" * 60 for i in range(400))  # ~26k chars
-    embeds = QBdiscordcmds._whois_leaderboard_text_to_embeds(text)
-    assert sum(len(e) for e in embeds) <= 6000
-    assert all(len(e.description or "") <= 4096 for e in embeds)
-    assert (embeds[-1].description or "").endswith("…")
+    messages = QBdiscordcmds._whois_leaderboard_text_to_messages(text, "CUT")
+    assert len(messages) == QBdiscordcmds._WHOIS_CLAN_MAX_MESSAGES
+    assert all(len(m) <= QBdiscordcmds._WHOIS_CLAN_MESSAGE_LIMIT for m in messages)
+    assert all(m.count("```") % 2 == 0 for m in messages)  # every code block is closed
+    assert messages[-1].endswith("CUT")
+
+    short = QBdiscordcmds._whois_leaderboard_text_to_messages("\n".join("row" for _ in range(40)), "CUT")
+    assert len(short) == 1 and not short[0].endswith("CUT")
+
+
+@pytest.mark.asyncio
+async def test_clan_view_replaces_previous_continuation_messages(mock_interaction, monkeypatch):
+    """A long board's extra messages go away on the next pick (tracker #0140)."""
+    from unittest.mock import AsyncMock as _AM
+
+    view = QBdiscordcmds._WhoisClanView("#CLAN", MagicMock(), "1", None, set())
+    old = MagicMock()
+    old.delete = _AM()
+    view.extra_messages = [old]
+    monkeypatch.setattr(QBdiscordcmds, "_render_whois_clan_mode", _AM(return_value=(["part1", "part2"], [], [])))
+    mock_interaction.data = {"values": ["attack"]}
+    mock_interaction.followup.send = _AM(return_value=MagicMock())
+
+    await view._on_select(mock_interaction)
+
+    old.delete.assert_awaited_once()
+    kwargs = mock_interaction.edit_original_response.await_args.kwargs
+    assert kwargs["content"] == "part1" and kwargs["embeds"] == []
+    mock_interaction.followup.send.assert_awaited_once_with("part2", ephemeral=True, wait=True)
+    assert len(view.extra_messages) == 1
 
 
 def test_clan_view_offers_overview_and_every_mode():
