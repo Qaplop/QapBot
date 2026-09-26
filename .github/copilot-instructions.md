@@ -344,6 +344,7 @@ fails a test instead of quietly inheriting the print-me default. See
 - Prefer minimal diffs and reuse existing patterns.
 - Preserve unknown keys when updating JSON-like dict structures in CACHE (avoid data loss).
 - Multi-step UI flows: prefer editing an existing message; avoid leaving behind many ephemeral messages.
+- One-off PROD data fixes that need heavy DB reads (scans over `war_attacks`/`war_summary`, both DBs): split them into a `generate` step that runs read-only against the synced PROD copy on DEV and writes a plain text/TSV file, and an `apply` step that PROD runs from that file — idempotent, explicit columns, PK-keyed writes only, dry run by default, run ON the DB machine (Cardinal Rule 18). This keeps the expensive work off PROD entirely (project owner's preference, 2026-09-26; used for the `clans.created_at` and legacy `war_summary` backfills). Test the apply on DEV first; delete script + data file afterwards (Rule 15).
 - Never `git checkout`/`git switch` another branch on the live working directory just to inspect or diff it — that swaps every tracked file on disk out from under any process watching this directory (IDE, a running bot, this repo's own multi-GB `data/*.db`). Use `git diff branch1 branch2`, `git show branch:path`, or `git worktree add` instead; only actually check out a branch when the user wants their working tree switched (2026-08-23 incident: an exploratory checkout of a stale branch briefly deleted several root-level `.bat` scripts that only ever existed on `main`).
 
 ---
