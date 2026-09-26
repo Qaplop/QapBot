@@ -240,6 +240,10 @@ def _create_history_schema_sync(conn: Any, build_expensive_indexes: bool = True)
     if build_expensive_indexes:
         conn.execute("CREATE INDEX IF NOT EXISTS history.idx_wa_player_tag_date ON war_attacks(player_tag, date)")
 
+    # Numeric columns may hold WAR_SUMMARY_UNKNOWN (-1) = "data not available": reconstructed
+    # legacy wars (2025-07..2026-01) store -1 in clan_stars, clan_destruction, opp_destruction and
+    # opp_attacks_used, and '' in result. Aggregates must exclude it (`col >= 0`) — see
+    # clashcontrol/constants.py WAR_SUMMARY_UNKNOWN.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS history.war_summary (
             id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1731,6 +1735,10 @@ class WarHistoryDB:
 
         # ── war_summary: one row per war per actively tracked clan ──
         logging.info("[DB-SCHEMA] Verifying war_summary table + indexes...")
+        # Numeric columns may hold WAR_SUMMARY_UNKNOWN (-1) = "data not available": reconstructed
+        # legacy wars (2025-07..2026-01) store -1 in clan_stars, clan_destruction, opp_destruction and
+        # opp_attacks_used, and '' in result. Aggregates must exclude it (`col >= 0`) — see
+        # clashcontrol/constants.py WAR_SUMMARY_UNKNOWN.
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS war_summary (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2141,6 +2149,10 @@ class WarHistoryDB:
             "CREATE INDEX IF NOT EXISTS history.idx_wa_player_tag_date ON war_attacks(player_tag, date)",
         )
 
+        # Numeric columns may hold WAR_SUMMARY_UNKNOWN (-1) = "data not available": reconstructed
+        # legacy wars (2025-07..2026-01) store -1 in clan_stars, clan_destruction, opp_destruction and
+        # opp_attacks_used, and '' in result. Aggregates must exclude it (`col >= 0`) — see
+        # clashcontrol/constants.py WAR_SUMMARY_UNKNOWN.
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS history.war_summary (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -9183,13 +9195,15 @@ class WarHistoryDB:
         Returns:
             ``{"clan": {...} or None, "cw": {...}, "cwl": {...}, "first_war": str, "last_war": str,
             "cwl_seasons": int}`` where ``cw``/``cwl`` hold ``wars``, ``wins``, ``losses``,
-            ``draws``. Empty aggregates are zeros / empty strings.
+            ``draws`` and ``unknown`` (wars without a stored result — result '' — i.e. the
+            reconstructed legacy wars whose outcome is not available, see WAR_SUMMARY_UNKNOWN).
+            Empty aggregates are zeros / empty strings.
         """
         if not self.db_path:
             raise RuntimeError("Database not initialized. Call initialize() first.")
 
         def _empty() -> Dict[str, int]:
-            return {"wars": 0, "wins": 0, "losses": 0, "draws": 0}
+            return {"wars": 0, "wins": 0, "losses": 0, "draws": 0, "unknown": 0}
 
         result: Dict[str, Any] = {
             "clan": None, "cw": _empty(), "cwl": _empty(),
@@ -9217,6 +9231,7 @@ class WarHistoryDB:
                            SUM(CASE WHEN result = 'win'  THEN 1 ELSE 0 END) AS wins,
                            SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END) AS losses,
                            SUM(CASE WHEN result = 'draw' THEN 1 ELSE 0 END) AS draws,
+                           SUM(CASE WHEN result = '' AND state = 'war_ended' THEN 1 ELSE 0 END) AS unknown,
                            MIN(date)                                       AS first_war,
                            MAX(date)                                       AS last_war
                     FROM {schema}.war_summary
@@ -9226,7 +9241,7 @@ class WarHistoryDB:
                     (clan_tag,),
                 ).fetchall():
                     bucket = result["cwl" if row["is_cwl"] else "cw"]
-                    for key in ("wars", "wins", "losses", "draws"):
+                    for key in ("wars", "wins", "losses", "draws", "unknown"):
                         bucket[key] += int(row[key] or 0)
                     if row["first_war"] and (not result["first_war"] or row["first_war"] < result["first_war"]):
                         result["first_war"] = row["first_war"]
@@ -10363,8 +10378,10 @@ class WarHistoryDB:
             f"SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary"
             f") "
             f"SELECT clan_tag, "
-            f"  SUM(clan_stars) + SUM(CASE WHEN result = 'win' THEN 10 ELSE 0 END) AS tot_stars, "
-            f"  SUM(clan_destruction * team_size) AS tot_destr, "
+            # WAR_SUMMARY_UNKNOWN (-1) = not available (reconstructed legacy wars): excluded, never summed.
+            f"  SUM(CASE WHEN clan_stars >= 0 THEN clan_stars ELSE 0 END)"
+            f" + SUM(CASE WHEN result = 'win' THEN 10 ELSE 0 END) AS tot_stars, "
+            f"  SUM(CASE WHEN clan_destruction >= 0 THEN clan_destruction * team_size ELSE 0 END) AS tot_destr, "
             f"  COUNT(*) AS ended_wars "
             f"FROM ws "
             f"WHERE cwl_season = ? AND is_cwl = 1 AND state = 'war_ended' AND clan_tag IN ({placeholders}) "
@@ -10414,8 +10431,10 @@ class WarHistoryDB:
                     f"SELECT {ws_cols} FROM main.war_summary UNION ALL SELECT {ws_cols} FROM history.war_summary"
                     f") "
                     f"SELECT clan_tag, "
-                    f"  SUM(clan_stars) + SUM(CASE WHEN result = 'win' THEN 10 ELSE 0 END) AS tot_stars, "
-                    f"  SUM(clan_destruction * team_size) AS tot_destr, "
+                    # WAR_SUMMARY_UNKNOWN (-1) = not available: excluded, never summed (as in the async twin).
+                    f"  SUM(CASE WHEN clan_stars >= 0 THEN clan_stars ELSE 0 END)"
+                    f" + SUM(CASE WHEN result = 'win' THEN 10 ELSE 0 END) AS tot_stars, "
+                    f"  SUM(CASE WHEN clan_destruction >= 0 THEN clan_destruction * team_size ELSE 0 END) AS tot_destr, "
                     f"  COUNT(*) AS ended_wars "
                     f"FROM ws "
                     f"WHERE cwl_season = ? AND is_cwl = 1 AND state = 'war_ended' "

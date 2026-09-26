@@ -1099,16 +1099,34 @@ def classify_war_result(my_stars: int, opp_stars: int, my_dest: float, opp_dest:
 
     Shared by every "war ended" CWL embed renderer so the tiebreak rule (and its emoji label)
     is defined once instead of being copy-pasted identically across each one.
+
+    A negative value is WAR_SUMMARY_UNKNOWN (-1, "data not available" — reconstructed legacy wars,
+    see clashcontrol/constants.py). Nothing is derived from it: unknown stars, or equal stars with
+    an unknown destruction tiebreak, give "❔ Unknown" instead of a guessed Win/Loss/Draw.
     """
+    if my_stars < 0 or opp_stars < 0:
+        return "❔ Unknown"
     if my_stars > opp_stars:
         return "✅ Win"
     if opp_stars > my_stars:
         return "❌ Loss"
+    if my_dest < 0 or opp_dest < 0:
+        return "❔ Unknown"
     if my_dest > opp_dest:
         return "✅ Win"
     if opp_dest > my_dest:
         return "❌ Loss"
     return "🤝 Draw"
+
+
+def _fmt_ws_stars(value: int) -> str:
+    """A war_summary star count for display — "?" for WAR_SUMMARY_UNKNOWN (-1, not available)."""
+    return "?" if value < 0 else str(value)
+
+
+def _fmt_ws_destruction(value: float) -> str:
+    """A war_summary destruction % for display (no "%") — "?" for WAR_SUMMARY_UNKNOWN (-1)."""
+    return "?" if value < 0 else f"{value:.1f}"
 
 
 def _generate_cwlinfo_archive_embeds(clan_tag: str) -> List[discord.Embed]:
@@ -1162,6 +1180,7 @@ def _generate_cwlinfo_archive_embeds(clan_tag: str) -> List[discord.Embed]:
     ]
 
     for round_idx, row in enumerate(season_wars, start=1):
+        # Numeric fields can be WAR_SUMMARY_UNKNOWN (-1, not available) — shown as "?" below.
         my_stars_a: int = int(row.get('clan_stars', 0) or 0)
         opp_stars_a: int = int(row.get('opponent_stars', 0) or 0)
         opp_tag_a: str = str(row.get('opponent_tag', '') or '')
@@ -1178,7 +1197,8 @@ def _generate_cwlinfo_archive_embeds(clan_tag: str) -> List[discord.Embed]:
 
         desc_lines.append(
             f"**Round {round_idx}**  \u00b7  {result_lbl_a}  "
-            f"`{my_stars_a}\u2b50 \u2013 {opp_stars_a}\u2b50 \u00b7 {my_dest_a:.1f}% \u2013 {opp_dest_a:.1f}%`"
+            f"`{_fmt_ws_stars(my_stars_a)}\u2b50 \u2013 {_fmt_ws_stars(opp_stars_a)}\u2b50 \u00b7 "
+            f"{_fmt_ws_destruction(my_dest_a)}% \u2013 {_fmt_ws_destruction(opp_dest_a)}%`"
         )
         desc_lines.append(
             f"vs. [\u200e{opp_name_a}\u200e]({opp_url_a})  \u200e`{opp_tag_a}`{opp_league_str_a}"
@@ -2074,6 +2094,7 @@ async def generate_cwlinfo_embeds(clan_tag: str, comp_mode: bool = False) -> Lis
             else None
         )
         if _db_past_row is not None:
+            # Numeric fields can be WAR_SUMMARY_UNKNOWN (-1, not available) — shown as "?" below.
             _r_my_stars: int = int(_db_past_row.get('clan_stars', 0) or 0)
             _r_opp_stars: int = int(_db_past_row.get('opponent_stars', 0) or 0)
             _r_opp_tag: str = str(_db_past_row.get('opponent_tag', '') or '')
@@ -2082,7 +2103,11 @@ async def generate_cwlinfo_embeds(clan_tag: str, comp_mode: bool = False) -> Lis
             _r_opp_dest: float = float(_db_past_row.get('opp_destruction', 0.0) or 0.0)
             _r_opp_url: str = coc_clan_profile_url(_r_opp_tag) if _r_opp_tag else ""
             _r_result_lbl = classify_war_result(_r_my_stars, _r_opp_stars, _r_my_dest, _r_opp_dest)
-            desc_lines.append(f"**Round {round_idx}**  \u00b7  {_r_result_lbl}  `{_r_my_stars}\u2b50 \u2013 {_r_opp_stars}\u2b50 \u00b7 {_r_my_dest:.1f}% \u2013 {_r_opp_dest:.1f}%`")
+            desc_lines.append(
+                f"**Round {round_idx}**  \u00b7  {_r_result_lbl}  `{_fmt_ws_stars(_r_my_stars)}\u2b50 \u2013 "
+                f"{_fmt_ws_stars(_r_opp_stars)}\u2b50 \u00b7 {_fmt_ws_destruction(_r_my_dest)}% \u2013 "
+                f"{_fmt_ws_destruction(_r_opp_dest)}%`"
+            )
             if _r_opp_url:
                 desc_lines.append(f"vs. [\u200e{_r_opp_name}\u200e]({_r_opp_url})  \u200e`{_r_opp_tag}`")
             else:

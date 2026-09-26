@@ -79,6 +79,36 @@ CWL_WAR_EXPIRY_DAYS = 60
 """Days after which CWL war data can be archived/cleaned."""
 
 WAR_END_NOTIFICATION_HOURS_BEFORE = 4
+
+WAR_SUMMARY_UNKNOWN = -1
+"""Marker value "data not available" in a numeric war_summary column (2026-09-26).
+
+Why it exists: wars from 2025-07-26 to 2026-01 survive only as legacy per-player rows in
+war_attacks (the retired war_history table, copied over on 2026-03-07 with no raw war JSON left to
+rebuild them from). Their war_summary rows were reconstructed from what those legacy rows DO hold
+(backfill_legacy_war_summaries.py): opponent tag (from war_id), team size, attacks per member, CWL
+flag/season, attacks used and opponent stars. Everything they do not hold is stored as -1:
+
+    clan_stars       — legacy rows keep each player's star TOTAL, so several attacks on the same base
+                       can't be deduplicated (the sum is exact in only ~5 % of regular wars)
+    clan_destruction, opp_destruction, opp_attacks_used — never stored for these wars
+    opponent_stars   — only for the bot's first week (before 2025-08-03), when stars conceded were
+                       not recorded yet (9 wars); real for every later legacy war
+
+`result` is '' for the same wars — the existing "no result known" convention for TEXT.
+
+Rules for readers (see also .github/copilot-instructions.md, pitfall 45, and
+clashcontrol/docs/DATABASE_ARCHITECTURE.md § war_summary: reconstructed legacy rows):
+  - A value < 0 in these columns means "not available", never a real number. Real values are
+    always >= 0, so `value >= 0` is the "is known" test.
+  - SQL aggregates must exclude it: SUM(CASE WHEN col >= 0 THEN col ELSE 0 END), never a bare
+    SUM(col) — a bare SUM silently subtracts 1 per legacy war.
+  - Display it as "?" and never derive a result from it (classify_war_result() returns an
+    "unknown" label when the deciding value is unavailable).
+-1 rather than 0 so a reader that forgets the rule shows an obviously wrong number instead of a
+plausible zero; rather than NULL because these columns are NOT NULL and relaxing that would mean
+rebuilding war_summary in both the hot and the history DB (Cardinal Rule 1).
+"""
 """Hours before war end to send notifications (default, overridden by CONFIG)."""
 
 WAR_UPDATE_LEAGUES: frozenset[str] = frozenset({

@@ -310,8 +310,10 @@ def _bulk_group_war_stats(conn: sqlite3.Connection, season: str) -> Dict[str, Tu
     rows = conn.execute(
         f"WITH ws AS ({ws_sql}) "
         "SELECT clan_tag, "
-        "  SUM(clan_stars) + SUM(CASE WHEN result = 'win' THEN 10 ELSE 0 END) AS tot_stars, "
-        "  SUM(clan_destruction * team_size) AS tot_destr, "
+        # WAR_SUMMARY_UNKNOWN (-1) = not available: excluded, same as get_cwl_group_war_stats().
+        "  SUM(CASE WHEN clan_stars >= 0 THEN clan_stars ELSE 0 END)"
+        " + SUM(CASE WHEN result = 'win' THEN 10 ELSE 0 END) AS tot_stars, "
+        "  SUM(CASE WHEN clan_destruction >= 0 THEN clan_destruction * team_size ELSE 0 END) AS tot_destr, "
         "  COUNT(*) AS ended_wars "
         "FROM ws WHERE cwl_season = ? AND is_cwl = 1 AND state = 'war_ended' "
         "GROUP BY clan_tag",

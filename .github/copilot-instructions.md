@@ -408,6 +408,8 @@ All pitfalls: short snippets + details in ../clashcontrol/docs/COPILOT_PITFALLS_
 
 44) On the async connection (`self._conn`), **every** DML statement opens a write transaction — a `DELETE`/`UPDATE` that matches 0 rows included (default isolation level). Always end it: `commit()` unconditionally (plus `rollback()` on error), never `if rows_changed: commit()`. A transaction left open holds the DB write lock, and every sync writer after it (`_sync_conn()`, separate connections) waits out `busy_timeout` and fails with "database is locked". Confirmed 2026-09-26: nightly Step 0.6 `purge_expired_cwl_events()` did exactly this and broke Steps 0.7/0.8 on every run where it had nothing to purge.
 
+45) `war_summary` numeric columns can hold **`WAR_SUMMARY_UNKNOWN` (-1) = "data not available"** (`clashcontrol/constants.py`): the 317 reconstructed legacy wars (2025-07-26 to 2026-01) store -1 in `clan_stars`, `clan_destruction`, `opp_destruction`, `opp_attacks_used` (and `opponent_stars` for the bot's first week), with `result = ''`. Any new reader must treat `< 0` as unknown: SQL aggregates use `SUM(CASE WHEN col >= 0 THEN col ELSE 0 END)` — a bare `SUM(col)` fails `tests/unit/test_war_summary_unknown.py` —, display it as `?`, and never derive a result from it (`classify_war_result()` returns `❔ Unknown`). 📖 ../clashcontrol/docs/DATABASE_ARCHITECTURE.md § war_summary: reconstructed legacy rows.
+
 ---
 
 ## Implementation Workflow

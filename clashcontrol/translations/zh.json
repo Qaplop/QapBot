@@ -221,6 +221,7 @@
       "clan_wars_total": "战争：共 **{total}** 场（{cw} 场普通部落战 / {cwl} 场部落战联赛）",
       "clan_record_cw": "普通部落战战绩：**{wins}** 胜，**{losses}** 负，**{draws}** 平",
       "clan_record_cwl": "部落战联赛战绩：**{wins}** 胜，**{losses}** 负，**{draws}** 平（{seasons} 个赛季）",
+      "clan_record_unknown": " · **{count}** 场无结果",
       "clan_war_range": "首场战争：{first} · 最近一场战争：{last}",
       "clan_section_tracking": "📡 追踪",
       "clan_tracked_since": "追踪开始于",

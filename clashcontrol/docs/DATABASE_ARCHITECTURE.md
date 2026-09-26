@@ -354,6 +354,41 @@ The `get_clan_attack_history_sync()` method in `db_manager.py` aggregates `SUM(s
 
 `_generate_cwlinfo_archive_embeds()` previously read from `archive/*.json`. It now reads from the `war_summary` table via `get_war_summaries_sync(clan_tag, is_cwl=True)`. Lineup emojis are rendered from the stored `clan_lineup_json` / `opp_lineup_json` columns (JSON arrays of TH levels). The `round_number` column (INTEGER, NULL for regular wars, 1-7 for CWL) was added 2026-05-09 and is populated at finalization time via `cwl_league_rounds` lookup; NULL for wars finalized before the CWL round tracking feature was deployed.
 
+### war_summary: reconstructed legacy rows (WAR_SUMMARY_UNKNOWN = -1)
+
+The bot's first wars (2025-07-26 to 2026-01, 317 wars across 10 clans) were stored only in the old
+aggregated `war_history` table (one row per player per war: star total, missed attacks, TH, stars
+conceded). The 2026-03-01 migration rebuilt `war_attacks` + `war_summary` only for wars whose raw
+JSON still existed (from about 2025-11 on); on 2026-03-07 the remaining `war_history` rows were
+copied into `history.war_attacks` as synthetic rows (`attack_order=1` carrying the star total,
+`destruction=0`, no defender) and `war_history` was dropped — without `war_summary` rows. No raw
+JSON exists for them and the CoC API has no history, so this is all the data there is.
+
+On 2026-09-26 their `war_summary` rows were reconstructed (`backfill_legacy_war_summaries.py`,
+one-off, generated on DEV, applied on PROD) with a sentinel for every value that is not available:
+
+| Column | Value in a reconstructed row |
+|---|---|
+| `opponent_tag` | real — `war_id` is `<OPPTAG>_<YYYYMMDDHHMM>` |
+| `team_size`, `attacks_per_member`, `is_cwl`/`war_type`, `cwl_season`, `clan_attacks_used`, `date` | real |
+| `opponent_stars` | real (sum of each player's stars conceded; exact in 895/902 checked modern wars) — `-1` for the 9 wars of the bot's first week, when conceded stars weren't recorded |
+| `opponent_name` | from `clans` when the opponent is known there (252/317), else `''` |
+| `clan_stars` | `-1` — per-player star totals can't be deduplicated per base (exact in ~5 % of regular wars) |
+| `clan_destruction`, `opp_destruction`, `opp_attacks_used` | `-1` — never stored |
+| `result` | `''` (the existing "no result" convention), `state` = `war_ended` |
+
+**`-1` = `WAR_SUMMARY_UNKNOWN` (`clashcontrol/constants.py`) means "data not available", never a
+number.** Real values are always `>= 0`. Readers must:
+- exclude it from SQL aggregates: `SUM(CASE WHEN col >= 0 THEN col ELSE 0 END)`, never a bare
+  `SUM(col)` (enforced repo-wide by `tests/unit/test_war_summary_unknown.py`);
+- show it as `?` (`_fmt_ws_stars()` / `_fmt_ws_destruction()` in `QBhelperfunctions.py`);
+- never derive a result from it (`classify_war_result()` returns `❔ Unknown`).
+
+`-1` rather than `0` so a reader that forgets the rule shows an obviously wrong value instead of a
+plausible zero; rather than `NULL` because the columns are `NOT NULL` and relaxing that would mean
+rebuilding `war_summary` in both DBs (Cardinal Rule 1). `/whois clan` reports these wars as
+"without result".
+
 **Maindata** (Phase 3 - Complete):
 - `clans` - Clan metadata and subscription tracking. Key columns: `has_active_subscriptions`, `track_war_updates`, `war_league`, `is_deleted` (BOOLEAN DEFAULT 0 — set when the clan no longer exists in the CoC API; cleared automatically on any successful `GET /clans/{tag}` response).
 - `clan_families` - Family definitions

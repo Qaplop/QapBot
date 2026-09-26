@@ -221,6 +221,7 @@
       "clan_wars_total": "Bella: **{total}** omnino ({cw} CW / {cwl} CWL)",
       "clan_record_cw": "Tabula CW: **{wins}** victoriae, **{losses}** clades, **{draws}** pares",
       "clan_record_cwl": "Tabula CWL: **{wins}** victoriae, **{losses}** clades, **{draws}** pares ({seasons} tempora)",
+      "clan_record_unknown": " · **{count}** sine exitu",
       "clan_war_range": "Primum bellum: {first} · Ultimum bellum: {last}",
       "clan_section_tracking": "📡 Observatio",
       "clan_tracked_since": "Observata ex",

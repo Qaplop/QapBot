@@ -221,6 +221,7 @@
       "clan_wars_total": "Guerras: **{total}** en total ({cw} GC / {cwl} LGC)",
       "clan_record_cw": "Récord GC: **{wins}** victorias, **{losses}** derrotas, **{draws}** empates",
       "clan_record_cwl": "Récord LGC: **{wins}** victorias, **{losses}** derrotas, **{draws}** empates ({seasons} temporadas)",
+      "clan_record_unknown": " · **{count}** sin resultado",
       "clan_war_range": "Primera guerra: {first} · Última guerra: {last}",
       "clan_section_tracking": "📡 Seguimiento",
       "clan_tracked_since": "Seguido desde",

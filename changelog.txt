@@ -1,6 +1,21 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-26 (16)
+- Added: WAR_SUMMARY_UNKNOWN (-1) = "data not available" for numeric war_summary columns
+  (clashcontrol/constants.py). Prepares the reconstruction of the 317 legacy wars (2025-07-26 ..
+  2026-01, 10 clans) that exist only as legacy per-player war_attacks rows: their summaries get
+  real opponent tag/team size/CWL flag+season/attacks used/opponent stars and -1 for clan_stars,
+  destruction and opp_attacks_used, result ''. Readers: CWL group standings (async + sync + audit
+  script) exclude -1 from SUM, CWL renderers show "?", classify_war_result() returns "Unknown"
+  instead of guessing; /whois clan shows "N without result" (new key, 5 languages). Repo-wide
+  structural test forbids a bare SUM() over these columns. Docs: DATABASE_ARCHITECTURE.md
+  § war_summary: reconstructed legacy rows, playbook pitfall 45. The rows themselves are inserted
+  by the one-off backfill_legacy_war_summaries.py (DEV-generated, PROD apply AFTER this build).
+  Build 125. Files: clashcontrol/constants.py, clashcontrol/db_manager.py, QBhelperfunctions.py,
+  QBdiscordcmds.py, clashcontrol/scripts/audit_cwl_league_rank.py, translations, docs, tests.
+  3589 tests pass.
+
 2026-09-26 (15)
 - Added: /admin Execute Nightly Maintenance takes an optional skip_db_maintenance:True -- runs the
   data steps (archive move, migration if due, CWL purge, DM-ref purge, clan created_at backfill)

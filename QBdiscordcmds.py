@@ -5367,11 +5367,16 @@ async def _build_whois_clan_embed(clan_tag: str, user_id: str, guild_id: Optiona
 
     # ── Wars stored in the DB ──
     cw, cwl = stats["cw"], stats["cwl"]
+
+    def _unknown(bucket: Dict[str, int]) -> str:
+        # Wars whose result isn't available (reconstructed legacy wars, WAR_SUMMARY_UNKNOWN).
+        return tr('clan_record_unknown', count=bucket["unknown"]) if bucket.get("unknown") else ""
+
     wars_lines = [
         tr('clan_wars_total', total=cw["wars"] + cwl["wars"], cw=cw["wars"], cwl=cwl["wars"]),
-        tr('clan_record_cw', wins=cw["wins"], losses=cw["losses"], draws=cw["draws"]),
+        tr('clan_record_cw', wins=cw["wins"], losses=cw["losses"], draws=cw["draws"]) + _unknown(cw),
         tr('clan_record_cwl', wins=cwl["wins"], losses=cwl["losses"], draws=cwl["draws"],
-           seasons=stats["cwl_seasons"]),
+           seasons=stats["cwl_seasons"]) + _unknown(cwl),
     ]
     if stats["first_war"]:
         wars_lines.append(tr('clan_war_range', first=str(stats["first_war"])[:10], last=str(stats["last_war"])[:10]))

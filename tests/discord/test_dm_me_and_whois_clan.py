@@ -109,8 +109,8 @@ async def test_clan_whois_stats_sum_main_and_history(db):
     stats = db.get_clan_whois_stats_sync("#CLAN")
 
     assert stats["clan"]["name"] == "Clan" and stats["clan"]["war_league"] == "Crystal League I"
-    assert stats["cw"] == {"wars": 2, "wins": 1, "losses": 0, "draws": 1}
-    assert stats["cwl"] == {"wars": 2, "wins": 1, "losses": 1, "draws": 0}
+    assert stats["cw"] == {"wars": 2, "wins": 1, "losses": 0, "draws": 1, "unknown": 0}
+    assert stats["cwl"] == {"wars": 2, "wins": 1, "losses": 1, "draws": 0, "unknown": 0}
     assert stats["first_war"] == "2025-01-10" and stats["last_war"] == "2026-09-05"
     assert stats["cwl_seasons"] == 2
 
