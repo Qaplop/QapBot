@@ -4427,6 +4427,11 @@ async def _run_startup_initialization() -> None:
         # Fire-and-forget: must not delay "fully_initialized" or on_ready.
         QBcore.spawn_tracked("warm-global-db-stats", _warm_global_db_stats_cache())
 
+        # Tracker #0144: daily error/warning summary DM to the bot admin (00:05 server time; also
+        # catches up on yesterday after a restart). Starts once per process — on_ready can re-run.
+        from clashcontrol.daily_log_summary import start_daily_log_summary_scheduler
+        start_daily_log_summary_scheduler(os.path.join(CONFIG.data_dir, "logs"))
+
         logging.info(f"🎉 Bot fully initialized and logged in as {QBcore.bot.user} ({mode_str} mode)")
         logging.info(f"🏠 Connected to {len(QBcore.bot.guilds)} guild(s)")
         logging.info("=== Bot initialization completed successfully ===")

@@ -1,6 +1,17 @@
 Change-Log: (The markers like "2026-03-08" are dates, so DON'T count them up but always use TODAY as the correct marker and always add the latest chang to the TOP of the file )
 ===========
 
+2026-09-26 (18)
+- Added (tracker #0144): daily error/warning summary DM to the bot admin (SERVER_ADMIN), 00:05
+  server time, for the previous day -- own background task, not part of nightly maintenance. Reads
+  the day's clashcontrol.log rotation, groups ERROR/WARNING lines by normalized pattern (tags, ids,
+  numbers), shows totals, bot starts, the 8 most frequent groups per level with count/time span/
+  sample and a traceback's last line; hard-capped below 4000 chars however bad the day. Sent once
+  per day (bot_metadata marker), catches up on yesterday after a restart (never older days), skips
+  maintenance mode. PROD by default; DEV via DAILY_LOG_SUMMARY_ENABLED=true. Texts in 5 languages.
+  Build 127. Files: clashcontrol/daily_log_summary.py (new), clashcontrol/config.py, ClashControl.py,
+  clashcontrol/translations/*.json, README.md, .env.example, tests. 3599 tests pass.
+
 2026-09-26 (17)
 - Fixed (tracker #0140): /whois clan leaderboards wrapped every table row -- they were rendered
   into embeds, which are narrower than chat. Text leaderboards now go into message content

@@ -475,7 +475,19 @@
       "admin_is_bot": "❌ {user} automatum est. Elige hominem."
     }
   },
-  "notifications": {},
+  "notifications": {
+    "daily_log_summary": {
+      "title": "📋 Summa diurna actorum — {day} ({env})",
+      "totals": "**Errores:** {errors} ({error_groups} diversi) · **Monita:** {warnings} ({warning_groups} diversa)",
+      "restarts": "🔄 Automatum {count}× incohatum (ultimum: build {build})",
+      "clean_day": "✅ Nulli errores nec monita — dies purus.",
+      "errors_title": "🔴 Errores frequentissimi",
+      "warnings_title": "🟠 Monita frequentissima",
+      "more_groups": "…et {count} alii nuntii diversi",
+      "no_log": "⚠️ Nullae lineae actorum pro {day} inventae — currebatne automatum?",
+      "footer": "Horae sunt tempus servitoris. Omnia singula: {file}"
+    }
+  },
   "errors": {},
   "ui_components": {
     "import_cancelled": "Importatio omissa — nihil mutatum est.",

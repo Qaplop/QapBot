@@ -340,6 +340,7 @@ migration job moves data older than the retention window from hot to history —
 | `COC_API_PASSWORD_DEV` | Clash of Clans API password (development) | Yes | - |
 | `SERVER_ADMIN` | Numeric Discord user ID of the bot administrator (username accepted as deprecated fallback) | Yes | - |
 | `CLASHCONTROL_LOG_LEVEL` | Logging level (DEBUG, INFO, WARNING, ERROR) | No | INFO |
+| `DAILY_LOG_SUMMARY_ENABLED` | Daily error/warning summary DM to `SERVER_ADMIN` at 00:05 server time, for the previous day (tracker #0144, `clashcontrol/daily_log_summary.py`). Set `true` on DEV to test it. | No | `true` on PROD, `false` on DEV |
 | `SLEEP_INTERVAL` | Main loop interval in seconds | No | 300 |
 | `NOTIFICATION_HOURS_BEFORE_END` | Hours before war end to send reminders | No | 4 |
 | `NOTIFICATION_BATCH_DELAY` | Seconds delay between notification batches | No | 2 |

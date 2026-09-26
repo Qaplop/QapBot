@@ -475,7 +475,19 @@
       "admin_is_bot": "❌ {user} 是一个机器人。请选择一个真人。"
     }
   },
-  "notifications": {},
+  "notifications": {
+    "daily_log_summary": {
+      "title": "📋 每日日志摘要 — {day}（{env}）",
+      "totals": "**错误：** {errors}（{error_groups} 种）· **警告：** {warnings}（{warning_groups} 种）",
+      "restarts": "🔄 机器人启动 {count} 次（最近：build {build}）",
+      "clean_day": "✅ 没有错误或警告——平稳的一天。",
+      "errors_title": "🔴 最常见的错误",
+      "warnings_title": "🟠 最常见的警告",
+      "more_groups": "……以及另外 {count} 种消息",
+      "no_log": "⚠️ 未找到 {day} 的日志行——机器人当时在运行吗？",
+      "footer": "时间为服务器时间。完整详情：{file}"
+    }
+  },
   "errors": {},
   "ui_components": {
     "import_cancelled": "导入已取消 — 未作任何更改。",

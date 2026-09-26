@@ -384,6 +384,10 @@ class BotConfig:
     # PROD's real tracker channels and, with an env-var toggle, could post real-looking
     # bug/feature items into PROD's actual channels using DEV test data. See load_config().
     tracker_enabled: bool = False
+    # Daily error/warning summary DM to the bot admin (tracker #0144, clashcontrol/daily_log_summary.py).
+    # DAILY_LOG_SUMMARY_ENABLED; default on for PROD, off for DEV (DEV restarts constantly and would
+    # DM a catch-up report of its test logs every day) — set it to true on DEV to test the feature.
+    daily_log_summary_enabled: bool = False
     tracker_data_dir: str = "tracker"  # Where per-item attachment copies live (§3.3) — project
     # root (HDD), not under data_dir/PROD_DATA_DIR (SSD): not performance-critical, and the
     # HDD's much larger free space fits growing attachment history better (2026-08-20 follow-up).
@@ -658,6 +662,9 @@ def load_config() -> BotConfig:
     # Bug/feature tracker — no env var, see BotConfig.tracker_enabled comment for why (PROD DB
     # copies to DEV carry PROD's real tracker channel IDs along with them).
     tracker_enabled = not is_dev_mode
+    daily_log_summary_enabled = os.getenv(
+        "DAILY_LOG_SUMMARY_ENABLED", "false" if is_dev_mode else "true"
+    ).lower() in ("true", "1", "yes")
     # Project root (HDD), like investigate_dir above — not under data_dir/PROD_DATA_DIR (SSD):
     # attachment storage isn't performance-critical and benefits from the HDD's larger free
     # space (2026-08-20 follow-up, project owner; tracker item #0004).
@@ -707,6 +714,7 @@ def load_config() -> BotConfig:
         web_bridge_secret=web_bridge_secret,
         cwl_dm_restrict_to_admin=cwl_dm_restrict_to_admin,
         tracker_enabled=tracker_enabled,
+        daily_log_summary_enabled=daily_log_summary_enabled,
         tracker_data_dir=tracker_data_dir,
     )
     

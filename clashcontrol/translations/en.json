@@ -475,7 +475,19 @@
       "admin_is_bot": "❌ {user} is a bot. Please pick a person."
     }
   },
-  "notifications": {},
+  "notifications": {
+    "daily_log_summary": {
+      "title": "📋 Daily log summary — {day} ({env})",
+      "totals": "**Errors:** {errors} ({error_groups} distinct) · **Warnings:** {warnings} ({warning_groups} distinct)",
+      "restarts": "🔄 Bot started {count}× (last: build {build})",
+      "clean_day": "✅ No errors or warnings — a clean day.",
+      "errors_title": "🔴 Most frequent errors",
+      "warnings_title": "🟠 Most frequent warnings",
+      "more_groups": "…and {count} more distinct message(s)",
+      "no_log": "⚠️ No log lines found for {day} — was the bot running?",
+      "footer": "Times are server time. Full details: {file}"
+    }
+  },
   "errors": {},
   "ui_components": {
     "import_cancelled": "Import cancelled — nothing was changed.",
